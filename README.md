@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **91 verbs, 12 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob: all load by default                                              |
+| **112 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,8 +63,8 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 12 packs load by default, giving **91 verbs** out of the box (updated from the
-current handler declarations, 2026-08-06; verify again with `request(ops="verbs()")`
+All 14 packs load by default, giving **112 verbs** out of the box (updated from the
+current handler declarations, 2026-09-08; verify again with `request(ops="verbs()")`
 before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                   |
@@ -77,6 +77,8 @@ before editing this table):
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
 | **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                     |
 | **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |
+| **tool**      | `tool.`      | 13    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)    |
+| **exec**      | `exec.`      | 8     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)   |
 | **git**       | `git.`       | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
 | **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
 | **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
@@ -152,6 +154,10 @@ records what's connected, in which direction, and why.
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
 │                        (3 verbs)                              │
+│  khive-pack-tool:      tool/skill/plugin registry, capability │
+│                        discovery, use policy (13 verbs)       │
+│  khive-pack-exec:      sandboxed run over a materialized tree │
+│                        (8 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -227,7 +233,10 @@ must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchm
 | `khive-pack-git`       | Git pack: provenance ingest and git write verbs                                                          |
 | `khive-pack-code`      | Code pack: L1 manifest + L1.5 import-scan source ingestion                                               |
 | `khive-pack-workspace` | Workspace pack: workspace entity kind + contains endpoint rules                                          |
+| `khive-pack-tool`      | Tool pack: capability registry, discovery, use policy (ADR-180)                                          |
+| `khive-pack-exec`      | Exec pack: sandboxed run of a registered tool over a materialized tree (ADR-181)                         |
 | `khive-pack-blob`      | Blob pack: content-addressed object storage                                                              |
+| `khive-pack-tool`      | Tool pack: registry of tools, skills, plugins and verbs; capability discovery; use policy and grants     |
 | `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
 | `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 
@@ -263,8 +272,8 @@ global):
 kkernel --version   # confirms the binary and version you just installed
 ```
 
-All 12 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 91-verb catalog.
+All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
+MCP client discovers the `request` tool with the full 112-verb catalog.
 
 ### Alternative: npm
 
@@ -396,7 +405,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 91 verbs across 12 packs, 9 entity kinds, 17 edge relations, daemon warm startup
+**Main after v0.7.0.** 112 verbs across 14 packs, 9 entity kinds, 17 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

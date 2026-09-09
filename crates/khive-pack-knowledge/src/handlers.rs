@@ -1067,6 +1067,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some("leo".to_string()),
+            exec: Default::default(),
         })
         .expect("in-memory runtime with actor");
 

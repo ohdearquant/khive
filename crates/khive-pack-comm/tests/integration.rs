@@ -3556,6 +3556,7 @@ fn build_crossns_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: allowed_outbound,
         actor_id: None,
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4498,6 +4499,7 @@ fn build_actor_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor_id.to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4794,6 +4796,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some("lambda:tenant-x".to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4911,6 +4914,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None, // anonymous
+        exec: Default::default(),
     };
     let rt_anon = KhiveRuntime::from_backend(backend, config_anon);
     let mut builder_anon = VerbRegistryBuilder::new();

@@ -197,6 +197,7 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
@@ -280,6 +281,7 @@ fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(CountingProvider {
@@ -305,6 +307,7 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
@@ -332,6 +335,7 @@ fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("file-backed runtime");
     rt.register_embedder(FakeDimProvider);

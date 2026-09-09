@@ -7576,6 +7576,7 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime with a configured default model");
     rt.register_embedder(FixtureEmbedProvider { dims });

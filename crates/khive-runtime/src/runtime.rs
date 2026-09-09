@@ -2132,6 +2132,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
         let data_dir = rt
@@ -2168,6 +2169,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
 
@@ -2223,6 +2225,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert!(rt.backend_data_dir().is_none());
@@ -2248,6 +2251,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -2277,6 +2281,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         {
             let writable = KhiveRuntime::new(base.clone()).expect("create migrated snapshot");
@@ -2337,6 +2342,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -2484,6 +2490,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             events_split: None,
+            exec: Default::default(),
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -2718,6 +2725,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             };
 
             let tilde_cfg = make_config(tilde_anchor.clone());
@@ -2766,6 +2774,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -2951,7 +2960,11 @@ mod tests {
         // needed, so its verbs are live in default deployments too (only an
         // in-memory backend leaves them unconfigured).
         assert!(cfg.packs.contains(&"blob".to_string()));
-        assert_eq!(cfg.packs.len(), 12);
+        // tool loads by default: the registry, discovery and use-policy verbs
+        // (ADR-180) are live in default deployments.
+        assert!(cfg.packs.contains(&"tool".to_string()));
+        assert!(cfg.packs.contains(&"exec".to_string()));
+        assert_eq!(cfg.packs.len(), 14);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
@@ -3016,6 +3029,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3044,6 +3058,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -3080,6 +3095,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3108,6 +3124,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -3154,6 +3171,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             display: crate::engine_config::DisplaySectionConfig {
@@ -3187,6 +3205,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig::default(); // no [display] section
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3320,6 +3339,7 @@ mod tests {
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
             git_write: Default::default(),
+            exec: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
@@ -3414,6 +3434,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
 
         let rt_main = KhiveRuntime::from_backend(main_arc.clone(), main_config);
@@ -3554,6 +3575,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             },
         );
         // from_backend with backend_id="lore" and no core_backend: core() returns

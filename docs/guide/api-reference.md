@@ -68,9 +68,14 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
+`tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
+`tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
+keeps a namespace-scoped registry of tools, skills, plugins and verbs as kg entities, joins them to
+capability concepts with `implements` edges, and answers what a caller may call (ADR-180).
+
 Pack selection resolves as `--pack` > `KHIVE_PACKS` > discovered `[runtime].packs` > the
 built-in production set. With no non-empty selection at any of the first three layers, the
-default binary loads all 12 packs. Use `verbs()` for the current aggregate rather than carrying
+default binary loads all 14 packs. Use `verbs()` for the current aggregate rather than carrying
 a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
@@ -2428,3 +2433,57 @@ request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+
+## `tool` pack — 13 verbs
+
+Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
+`tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges
+(ADR-180). Every decision answer carries `decision` (`allow`, `deny`, `ask`), `source` (`grant`,
+`policy`, `default`) and the row id it came from.
+
+### `tool.register` — Commissive
+
+`tool.register(name, kind="tool", description, schema, source, side_effect="write", trust="external", capabilities=[], tags=[])`.
+Creates the object or returns the existing one by name (`created: false`); capabilities are created when
+absent and linked.
+
+### `tool.ingest` — Commissive
+
+`tool.ingest(source="khive")` registers every loaded verb under `khive:<pack>` with one capability per
+pack; `tool.ingest(source="mcp", server, tools=[...])` registers an MCP `tools/list` payload under
+`mcp:<server>`. Returns `registered` and `existing` counts.
+
+### `tool.suggest` — Assertive
+
+`tool.suggest(query, limit=10, kind, actor)`: hybrid search over the registry merged with capability
+concepts expanded through `implements`; each hit carries `score`, `via` (capability names) and the
+caller's `decision`.
+
+### `tool.describe` / `tool.list` — Assertive
+
+`tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
+`tool.list(kind, limit=100, offset=0)` pages the registry.
+
+### `tool.check` — Assertive
+
+`tool.check(tool, actor)`: active grant, then the most specific matching policy (`deny` over `ask` over
+`allow` on ties), then the default (`allow` for `read` side effects, `ask` otherwise and for unregistered
+names).
+
+### `tool.request` — Directive
+
+`tool.request(tool, actor, scope, reason, notify)`: returns the decision with `request_id: null` when
+already allowed; otherwise inserts a `requested` row and, when `notify` names an actor and the comm pack
+is loaded, mails it.
+
+### `tool.grant` / `tool.deny` / `tool.revoke` — Declaration
+
+`tool.grant(id, expires_in_s, note)` from `requested` or `denied`; `tool.deny(id, note)` from
+`requested` or `granted`; `tool.revoke(id, note)` from `granted`. Any other transition is refused with the
+current status. A requester cannot grant its own request.
+
+### `tool.requests` / `tool.policy` / `tool.policies`
+
+`tool.requests(status, actor, tool, limit=50)` lists grant rows; `tool.policy(actor, tool, decision, note)`
+stores a rule where `actor` and `tool` are exact labels, trailing-`*` prefixes or `*`;
+`tool.policies(actor, limit=100)` lists rules.

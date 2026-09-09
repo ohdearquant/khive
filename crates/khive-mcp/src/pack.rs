@@ -18,6 +18,8 @@ pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
 pub use khive_pack_comm::CommPack as _CommPack;
 #[doc(hidden)]
+pub use khive_pack_exec::ExecPack as _ExecPack;
+#[doc(hidden)]
 pub use khive_pack_git::GitPack as _GitPack;
 #[doc(hidden)]
 pub use khive_pack_gtd::GtdPack as _GtdPack;
@@ -34,6 +36,8 @@ pub use khive_pack_moodboard::MoodboardPack as _MoodboardPack;
 pub use khive_pack_schedule::SchedulePack as _SchedulePack;
 #[doc(hidden)]
 pub use khive_pack_session::SessionPack as _SessionPack;
+#[doc(hidden)]
+pub use khive_pack_tool::ToolPack as _ToolPack;
 #[doc(hidden)]
 pub use khive_pack_web::WebPack as _WebPack;
 #[doc(hidden)]

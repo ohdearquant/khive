@@ -1749,6 +1749,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime with default embedder")
 }
@@ -2427,6 +2428,7 @@ mod embed_failure_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         // Override the lattice provider with our fake — same key, last-writer wins.
@@ -2616,6 +2618,7 @@ mod embed_failure_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(FixedVecProvider {
@@ -2933,6 +2936,7 @@ mod ann_bypass_regression {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -3534,6 +3538,7 @@ mod edit_inline_reembed {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(EmbedProvider);
@@ -3940,6 +3945,7 @@ mod ann_type_filter_regression {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -4347,6 +4353,7 @@ mod compose_explain_sections {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(UnitVecProvider);

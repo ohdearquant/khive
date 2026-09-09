@@ -5108,6 +5108,7 @@ mod tests {
             visible_namespaces: Vec::new(),
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         runtime.register_embedder(RecordingProvider {
@@ -5283,6 +5284,7 @@ mod tests {
             visible_namespaces: Vec::new(),
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         runtime.register_embedder(RoleAwareRecordingProvider {

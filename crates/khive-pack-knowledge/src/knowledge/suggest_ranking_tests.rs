@@ -181,6 +181,7 @@ fn rt_with_fixture_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(FixtureEmbedProvider);

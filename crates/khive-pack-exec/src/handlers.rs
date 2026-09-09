@@ -1,0 +1,877 @@
+//! Verb handlers for the exec pack. `run` is the pipeline of ADR-181 with
+//! Amendment 1: policy and identity checks first (every refusal writes a
+//! receipt and touches no disk), then materialize, sandbox, bound, capture,
+//! receipt.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use tokio::process::Command;
+use uuid::Uuid;
+
+use khive_pack_tool::policy::{actor_label, decide};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_storage::ContentRef;
+
+use crate::capture::{drain, walk, Tail};
+use crate::receipts;
+use crate::sandbox::{self, check_binary, render_profile, Resolved};
+use crate::tree::{self, digest_hex, Change, TreeEntry};
+
+// ── parameter helpers ────────────────────────────────────────────────────────
+
+fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.to_string())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string; got {other}"
+        ))),
+    }
+}
+
+fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
+    match opt_str(params, key)? {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err(RuntimeError::InvalidInput(format!("{key} is required"))),
+    }
+}
+
+fn opt_limit(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| (n as u32).clamp(1, max))
+            .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a positive integer"))),
+    }
+}
+
+fn opt_str_list(params: &Value, key: &str) -> Result<Option<Vec<String>>, RuntimeError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!("{key} must be an array of strings"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be an array of strings"
+        ))),
+    }
+}
+
+// ── tree verbs ───────────────────────────────────────────────────────────────
+
+pub async fn tree_store(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
+    let entries = params
+        .get("entries")
+        .ok_or_else(|| RuntimeError::InvalidInput("entries is required".into()))?;
+    let tree_ref = tree::store_from_value(rt, entries).await?;
+    Ok(json!({ "tree": tree_ref }))
+}
+
+pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
+    let tree_ref = req_str(&params, "tree")?;
+    let entries = tree::load(rt, &tree_ref).await?;
+    Ok(json!({ "tree": tree_ref, "entries": tree::entries_json(&entries) }))
+}
+
+pub async fn tree_diff(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
+    let base_ref = req_str(&params, "base")?;
+    let head_ref = req_str(&params, "head")?;
+    let base = tree::load(rt, &base_ref).await?;
+    let head = tree::load(rt, &head_ref).await?;
+    let changed: Vec<Value> = tree::diff(&base, &head)
+        .iter()
+        .map(Change::to_json)
+        .collect();
+    Ok(json!({ "base": base_ref, "head": head_ref, "changed": changed }))
+}
+
+// ── receipts ─────────────────────────────────────────────────────────────────
+
+pub async fn receipt(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let id = req_str(&params, "id")?;
+    receipts::get(rt, token.namespace().as_str(), &id).await
+}
+
+pub async fn runs(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let actor = req_str(&params, "actor")?;
+    let tool = opt_str(&params, "tool")?;
+    let session_id = opt_str(&params, "session_id")?;
+    let limit = opt_limit(&params, "limit", 20, 500)?;
+    let rows = receipts::list(
+        rt,
+        token.namespace().as_str(),
+        &actor,
+        tool.as_deref(),
+        session_id.as_deref(),
+        limit,
+    )
+    .await?;
+    Ok(json!({ "runs": rows, "count": rows.len() }))
+}
+
+pub async fn events(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let run_id = opt_str(&params, "run_id")?;
+    let limit = opt_limit(&params, "limit", 200, 5000)?;
+    let rows = receipts::events(rt, token.namespace().as_str(), run_id.as_deref(), limit).await?;
+    Ok(json!({ "events": rows, "count": rows.len() }))
+}
+
+pub fn identity(cfg: &Resolved) -> Value {
+    let roots: Vec<String> = cfg
+        .read_roots
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    json!({
+        "root": cfg.root.to_string_lossy(),
+        "read_roots": roots,
+        "read_roots_serialization": "compact JSON array of the sorted canonical read roots; digest = BLAKE3 hex",
+        "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
+        "profile_template_digest": sandbox::template_digest(),
+        "system_read_roots": sandbox::SYSTEM_READ_ROOTS,
+        "env_keys": cfg.env_keys,
+        "never": cfg.never.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "max_output_bytes": cfg.max_output_bytes,
+        "timeout_default_s": cfg.timeout_default_s,
+        "timeout_max_s": cfg.timeout_max_s,
+        "keep": cfg.keep,
+        "limits": cfg.limits.to_json(),
+        "digest": "blake3-hex",
+    })
+}
+
+// ── run ──────────────────────────────────────────────────────────────────────
+
+/// Everything a receipt carries; serialized once for the row and the wire.
+struct Receipt {
+    id: String,
+    actor: String,
+    tool: String,
+    argv: Vec<String>,
+    tree_in: String,
+    tree_out: Option<String>,
+    exit_code: Option<i64>,
+    exit_signal: Option<i64>,
+    timed_out: bool,
+    denied: bool,
+    success: bool,
+    reason: Option<String>,
+    decision: Option<Value>,
+    stdout_ref: Option<String>,
+    stderr_ref: Option<String>,
+    stdout_produced: u64,
+    stderr_produced: u64,
+    stdout_retained: u64,
+    stderr_retained: u64,
+    stdout_capture: &'static str,
+    stderr_capture: &'static str,
+    changed: Vec<Change>,
+    undeclared: Vec<String>,
+    skipped: Vec<String>,
+    cwd: String,
+    env_keys: Vec<String>,
+    session_id: Option<String>,
+    seq: Option<i64>,
+    sandbox: Option<Value>,
+    profile_ref: Option<String>,
+    limits: Value,
+    pids: Option<Value>,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+impl Receipt {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "actor": self.actor,
+            "tool": self.tool,
+            "argv": self.argv,
+            "tree_in": self.tree_in,
+            "tree_out": self.tree_out,
+            "exit_code": self.exit_code,
+            "exit_signal": self.exit_signal,
+            "timed_out": self.timed_out,
+            "denied": self.denied,
+            "success": self.success,
+            "reason": self.reason,
+            "decision": self.decision,
+            "stdout_ref": self.stdout_ref,
+            "stderr_ref": self.stderr_ref,
+            "stdout_produced_bytes": self.stdout_produced,
+            "stderr_produced_bytes": self.stderr_produced,
+            "stdout_retained_bytes": self.stdout_retained,
+            "stderr_retained_bytes": self.stderr_retained,
+            "stdout_capture": self.stdout_capture,
+            "stderr_capture": self.stderr_capture,
+            "changed": self.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
+            "undeclared_changes": self.undeclared,
+            "skipped": self.skipped,
+            "cwd": self.cwd,
+            "env_keys": self.env_keys,
+            "session_id": self.session_id,
+            "seq": self.seq,
+            "sandbox": self.sandbox,
+            "profile_ref": self.profile_ref,
+            "limits": self.limits,
+            "pids": self.pids,
+            "started_at": self.started_at.map(micros_to_iso),
+            "finished_at": self.finished_at.map(micros_to_iso),
+            "duration_ms": match (self.started_at, self.finished_at) {
+                (Some(s), Some(f)) => Some((f - s) / 1000),
+                _ => None,
+            },
+        })
+    }
+}
+
+/// Parsed and validated run request, before any policy decision.
+struct Request {
+    tree_in: String,
+    tool: String,
+    args: Vec<String>,
+    actor: String,
+    cwd: String,
+    env: BTreeMap<String, String>,
+    timeout: Duration,
+    session_id: Option<String>,
+    declared: Option<Vec<String>>,
+}
+
+fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError> {
+    let tree_in = req_str(params, "tree")?;
+    let tool = req_str(params, "tool")?;
+    let actor = req_str(params, "actor")?;
+    let args = opt_str_list(params, "args")?.unwrap_or_default();
+    let cwd = opt_str(params, "cwd")?.unwrap_or_else(|| ".".into());
+    let env = match params.get("env") {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(map)) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                let value = v.as_str().ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!("env[{k:?}] must be a string"))
+                })?;
+                out.insert(k.clone(), value.to_string());
+            }
+            out
+        }
+        Some(_) => return Err(RuntimeError::InvalidInput("env must be an object".into())),
+    };
+    let timeout_s = match params.get("timeout_s") {
+        None | Some(Value::Null) => cfg.timeout_default_s,
+        Some(v) => v.as_f64().filter(|t| *t > 0.0).ok_or_else(|| {
+            RuntimeError::InvalidInput("timeout_s must be a positive number".into())
+        })?,
+    };
+    if timeout_s > cfg.timeout_max_s {
+        return Err(RuntimeError::InvalidInput(format!(
+            "timeout_s {timeout_s} exceeds the configured ceiling {}",
+            cfg.timeout_max_s
+        )));
+    }
+    let session_id = opt_str(params, "session_id")?.filter(|s| !s.is_empty());
+    let declared = opt_str_list(params, "declared_write_paths")?;
+    if let Some(list) = &declared {
+        for p in list {
+            tree::validate_relative_path(p, "declared_write_paths")?;
+        }
+    }
+    Ok(Request {
+        tree_in,
+        tool,
+        args,
+        actor,
+        cwd,
+        env,
+        timeout: Duration::from_secs_f64(timeout_s),
+        session_id,
+        declared,
+    })
+}
+
+fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
+    let props = entity.properties.clone().unwrap_or(Value::Null);
+    if entity.entity_type.as_deref() != Some("tool") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "registry object {:?} is a {}, not a tool",
+            entity.name,
+            entity.entity_type.as_deref().unwrap_or("unknown kind")
+        )));
+    }
+    let source = props
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match source.strip_prefix("exec:") {
+        Some(path) if path.starts_with('/') => Ok(path.to_string()),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "tool {:?} has source {source:?}; exec.run needs source exec:<absolute path>",
+            entity.name
+        ))),
+    }
+}
+
+fn refusal_error(reason: &str, id: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("exec.run refused: {reason} (receipt_id={id})"))
+}
+
+pub async fn run(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    cfg: &Resolved,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let ns = token.namespace().as_str().to_string();
+    let id = Uuid::new_v4().to_string();
+    // Parse failures before the actor is known cannot be attributed; they
+    // are plain invalid input, not refusals.
+    let req = parse_request(&params, cfg)?;
+    let mut receipt = Receipt {
+        id: id.clone(),
+        actor: req.actor.clone(),
+        tool: req.tool.clone(),
+        argv: vec![],
+        tree_in: req.tree_in.clone(),
+        tree_out: None,
+        exit_code: None,
+        exit_signal: None,
+        timed_out: false,
+        denied: false,
+        success: false,
+        reason: None,
+        decision: None,
+        stdout_ref: None,
+        stderr_ref: None,
+        stdout_produced: 0,
+        stderr_produced: 0,
+        stdout_retained: 0,
+        stderr_retained: 0,
+        stdout_capture: "none",
+        stderr_capture: "none",
+        changed: vec![],
+        undeclared: vec![],
+        skipped: vec![],
+        cwd: req.cwd.clone(),
+        env_keys: vec![],
+        session_id: req.session_id.clone(),
+        seq: None,
+        sandbox: None,
+        profile_ref: None,
+        limits: json!({ "requested": cfg.limits.to_json(), "enforced": Value::Null }),
+        pids: None,
+        started_at: None,
+        finished_at: None,
+    };
+
+    match preflight(rt, token, cfg, &req, &mut receipt).await {
+        Ok(ready) => {
+            execute(rt, &ns, cfg, &req, ready, &mut receipt).await?;
+            let mut value = receipt.to_json();
+            let seq = receipts::insert(rt, &ns, &value).await?;
+            value["seq"] = seq.map_or(Value::Null, Value::from);
+            Ok(json!({
+                "receipt": value,
+                "changed": receipt.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
+            }))
+        }
+        Err(reason) => {
+            receipt.denied = true;
+            receipt.success = false;
+            receipt.reason = Some(reason.clone());
+            let value = receipt.to_json();
+            receipts::insert(rt, &ns, &value).await?;
+            Err(refusal_error(&reason, &id))
+        }
+    }
+}
+
+/// What preflight hands to execution once every refusal rule passed.
+struct Ready {
+    binary: PathBuf,
+    registered: String,
+    entries: Vec<TreeEntry>,
+}
+
+/// Every rule that refuses before the disk is touched. `Err(reason)` is the
+/// refusal reason; the receipt is filled with whatever was decided so far.
+async fn preflight(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    cfg: &Resolved,
+    req: &Request,
+    receipt: &mut Receipt,
+) -> Result<Ready, String> {
+    // Identity: the actor parameter must be the authenticated caller.
+    let caller = actor_label(token);
+    if !token.actor().is_anonymous() && caller != req.actor {
+        return Err(format!(
+            "actor {:?} does not match the authenticated caller {caller:?}",
+            req.actor
+        ));
+    }
+    // Registration.
+    let entity = khive_pack_tool::resolve_registered(rt, token, &req.tool)
+        .await
+        .map_err(|e| format!("tool {:?} is not registered: {e}", req.tool))?;
+    let registered = tool_binary(&entity).map_err(|e| e.to_string())?;
+    // Binary identity (Amendment 1 item 8) before policy: a forbidden binary
+    // is refused whatever the policy says.
+    let binary = check_binary(&registered, &cfg.never).map_err(|e| e.to_string())?;
+    receipt.argv = std::iter::once(registered.clone())
+        .chain(req.args.iter().cloned())
+        .collect();
+    // Policy.
+    let side_effect = serde_json::to_value(&entity.properties).ok().and_then(|p| {
+        p.get("side_effect")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let decision = decide(
+        rt,
+        token.namespace().as_str(),
+        &req.actor,
+        &entity.name,
+        side_effect.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("policy evaluation failed: {e}"))?;
+    let decision_json = json!({
+        "decision": decision.decision,
+        "source": decision.source,
+        "id": decision.grant_id.clone().or(decision.policy_id.clone()),
+    });
+    receipt.decision = Some(decision_json);
+    if decision.decision != "allow" {
+        return Err(format!(
+            "tool.check({:?}, {:?}) = {} from {}",
+            req.actor, entity.name, decision.decision, decision.source
+        ));
+    }
+    // Tree and cwd.
+    let entries = tree::load(rt, &req.tree_in)
+        .await
+        .map_err(|e| format!("tree: {e}"))?;
+    tree::verify_blobs(rt, &entries)
+        .await
+        .map_err(|e| format!("tree: {e}"))?;
+    let cwd = tree::validate_cwd(&req.cwd).map_err(|e| e.to_string())?;
+    receipt.cwd = cwd;
+    Ok(Ready {
+        binary,
+        registered,
+        entries,
+    })
+}
+
+fn materialize(
+    run_dir: &Path,
+    entries: &[TreeEntry],
+    bytes: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(run_dir)?;
+    for entry in entries {
+        let target = run_dir.join(&entry.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = bytes
+            .get(&entry.content_ref)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        std::fs::write(&target, data)?;
+        let mode = if entry.mode == 755 { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+fn declared_covers(declared: &[String], path: &str) -> bool {
+    declared
+        .iter()
+        .any(|d| d == path || path.starts_with(&format!("{d}/")))
+}
+
+async fn execute(
+    rt: &KhiveRuntime,
+    ns: &str,
+    cfg: &Resolved,
+    req: &Request,
+    ready: Ready,
+    receipt: &mut Receipt,
+) -> Result<(), RuntimeError> {
+    let store = tree::blob_store(rt)?;
+    // Hydrate every input blob before creating the run directory so a store
+    // failure leaves no directory behind.
+    let mut bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for entry in &ready.entries {
+        if bytes.contains_key(&entry.content_ref) {
+            continue;
+        }
+        let content_ref = ContentRef::from_hex(&entry.content_ref)
+            .map_err(|e| RuntimeError::InvalidInput(format!("entry {:?} ref: {e}", entry.path)))?;
+        let data = store
+            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await?;
+        bytes.insert(entry.content_ref.clone(), data);
+    }
+
+    std::fs::create_dir_all(&cfg.root).map_err(|e| {
+        RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
+    })?;
+    let root = std::fs::canonicalize(&cfg.root).map_err(|e| {
+        RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
+    })?;
+    let run_dir = root.join(&receipt.id);
+    materialize(&run_dir, &ready.entries, &bytes).map_err(|e| {
+        RuntimeError::Unconfigured(format!("materialize {}: {e}", run_dir.display()))
+    })?;
+    receipts::event(
+        rt,
+        ns,
+        &receipt.id,
+        "materialized",
+        json!({ "run_dir": run_dir.to_string_lossy(), "entries": ready.entries.len() }),
+    )
+    .await?;
+
+    // Profile: rendered per run, stored as a blob, written beside the run
+    // directory for sandbox-exec to read, removed with it.
+    let profile = render_profile(&run_dir, &cfg.read_roots, &cfg.never);
+    let profile_ref = store.put(profile.clone().into_bytes()).await?;
+    let profile_path = root.join(format!("{}.sb", receipt.id));
+    std::fs::write(&profile_path, &profile).map_err(|e| {
+        RuntimeError::Unconfigured(format!("profile {}: {e}", profile_path.display()))
+    })?;
+    let binary_bytes = std::fs::read(&ready.binary).unwrap_or_default();
+    receipt.sandbox = Some(json!({
+        "profile_digest": profile_ref.as_str(),
+        "tool_binary_digest": digest_hex(&binary_bytes),
+        "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
+    }));
+    receipt.profile_ref = Some(profile_ref.as_str().to_string());
+
+    // Environment: caller values for allow-listed keys only, plus HOME.
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in &req.env {
+        if cfg.env_keys.iter().any(|allowed| allowed == k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    env.insert("HOME".into(), run_dir.to_string_lossy().to_string());
+    receipt.env_keys = env.keys().cloned().collect();
+
+    let work_dir = if receipt.cwd == "." {
+        run_dir.clone()
+    } else {
+        run_dir.join(&receipt.cwd)
+    };
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .arg("-f")
+        .arg(&profile_path)
+        .arg(&ready.registered)
+        .args(&req.args)
+        .env_clear()
+        .envs(&env)
+        .current_dir(&work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let limits = cfg.limits.clone();
+    let (limit_reader, limit_writer) = limit_pipe()?;
+    // SAFETY: the closure runs in the forked child before exec and only
+    // calls async-signal-safe libc functions.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut report = String::from("{");
+            let mut first = true;
+            let mut apply =
+                |name: &str, resource: libc::c_int, value: u64| -> std::io::Result<()> {
+                    let lim = libc::rlimit {
+                        rlim_cur: value as libc::rlim_t,
+                        rlim_max: value as libc::rlim_t,
+                    };
+                    if libc::setrlimit(resource, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut back = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(resource, &mut back) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if !first {
+                        report.push(',');
+                    }
+                    first = false;
+                    report.push_str(&format!("\"{name}\":{}", back.rlim_cur));
+                    Ok(())
+                };
+            if let Some(v) = limits.cpu_seconds {
+                apply("cpu_seconds", libc::RLIMIT_CPU, v)?;
+            }
+            if let Some(v) = limits.file_size {
+                apply("file_size", libc::RLIMIT_FSIZE, v)?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Some(v) = limits.address_space {
+                    apply("address_space", libc::RLIMIT_AS, v)?;
+                }
+                if let Some(v) = limits.nproc {
+                    apply("nproc", libc::RLIMIT_NPROC, v)?;
+                }
+            }
+            report.push('}');
+            let bytes = report.as_bytes();
+            libc::write(
+                limit_writer,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+            );
+            libc::close(limit_writer);
+            Ok(())
+        });
+    }
+
+    let started = Instant::now();
+    receipt.started_at = Some(receipts::now_micros());
+    let spawn = command.spawn();
+    // Parent side of the pipe: close the writer, read the child's report.
+    unsafe {
+        libc::close(limit_writer);
+    }
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                libc::close(limit_reader);
+            }
+            cleanup(&run_dir, &profile_path, cfg.keep);
+            return Err(RuntimeError::Unconfigured(format!(
+                "spawning sandbox-exec for {}: {e}",
+                ready.registered
+            )));
+        }
+    };
+    let enforced = read_limit_report(limit_reader);
+    receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
+    let pid = child.id().unwrap_or_default() as i32;
+    receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
+    receipts::event(
+        rt,
+        ns,
+        &receipt.id,
+        "launched",
+        json!({ "pid": pid, "pgid": pid, "argv": receipt.argv }),
+    )
+    .await?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let cap = cfg.max_output_bytes;
+    let out_task = tokio::spawn(async move { drain(stdout, cap).await });
+    let err_task = tokio::spawn(async move { drain(stderr, cap).await });
+
+    let status = match tokio::time::timeout(req.timeout, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            receipt.timed_out = true;
+            kill_group(pid);
+            let _ = child.wait().await;
+            None
+        }
+    };
+    // Whatever the child left behind in its group ends with the run.
+    kill_group(pid);
+    let out: Tail = out_task.await.unwrap_or_else(|_| Tail::new(cap));
+    let err: Tail = err_task.await.unwrap_or_else(|_| Tail::new(cap));
+    receipt.finished_at = Some(receipts::now_micros());
+    receipts::event(
+        rt,
+        ns,
+        &receipt.id,
+        "exited",
+        json!({ "pid": pid, "timed_out": receipt.timed_out, "elapsed_ms": started.elapsed().as_millis() as u64 }),
+    )
+    .await?;
+
+    if let Some(status) = status {
+        use std::os::unix::process::ExitStatusExt;
+        receipt.exit_code = status.code().map(i64::from);
+        receipt.exit_signal = status.signal().map(i64::from);
+    }
+
+    // Outputs.
+    receipt.stdout_produced = out.produced();
+    receipt.stderr_produced = err.produced();
+    let out_bytes = out.retained();
+    let err_bytes = err.retained();
+    receipt.stdout_retained = out_bytes.len() as u64;
+    receipt.stderr_retained = err_bytes.len() as u64;
+    receipt.stdout_capture = if out.complete() {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    receipt.stderr_capture = if err.complete() {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    receipt.stdout_ref = Some(store.put(out_bytes).await?.as_str().to_string());
+    receipt.stderr_ref = Some(store.put(err_bytes).await?.as_str().to_string());
+
+    // Capture the tree.
+    let (found, skipped) = walk(&run_dir).unwrap_or_default();
+    receipt.skipped = skipped;
+    let input: BTreeMap<&str, &TreeEntry> =
+        ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let mut out_entries: Vec<TreeEntry> = Vec::new();
+    let mut changes: Vec<Change> = Vec::new();
+    let mut undeclared: BTreeSet<String> = BTreeSet::new();
+    for (path, file) in &found {
+        let data = std::fs::read(&file.abs).unwrap_or_default();
+        let digest = digest_hex(&data);
+        match input.get(path.as_str()) {
+            Some(old) if old.content_ref == digest && old.mode == file.mode => {
+                out_entries.push((*old).clone());
+            }
+            existing => {
+                let allowed = req
+                    .declared
+                    .as_ref()
+                    .is_none_or(|d| declared_covers(d, path));
+                if !allowed {
+                    undeclared.insert(path.clone());
+                    if let Some(old) = existing {
+                        out_entries.push((*old).clone());
+                    }
+                    continue;
+                }
+                let stored = store.put(data).await?;
+                let entry = TreeEntry {
+                    path: path.clone(),
+                    content_ref: stored.as_str().to_string(),
+                    mode: file.mode,
+                };
+                changes.push(Change {
+                    path: path.clone(),
+                    op: if existing.is_some() {
+                        "modified"
+                    } else {
+                        "added"
+                    },
+                    content_ref: Some(entry.content_ref.clone()),
+                    base_ref: existing.map(|e| e.content_ref.clone()),
+                });
+                out_entries.push(entry);
+            }
+        }
+    }
+    for (path, old) in &input {
+        if found.contains_key(*path) {
+            continue;
+        }
+        let allowed = req
+            .declared
+            .as_ref()
+            .is_none_or(|d| declared_covers(d, path));
+        if !allowed {
+            undeclared.insert(path.to_string());
+            out_entries.push((*old).clone());
+            continue;
+        }
+        changes.push(Change {
+            path: path.to_string(),
+            op: "deleted",
+            content_ref: None,
+            base_ref: Some(old.content_ref.clone()),
+        });
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    receipt.changed = changes;
+    receipt.undeclared = undeclared.into_iter().collect();
+    receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
+    receipt.success =
+        !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+
+    cleanup(&run_dir, &profile_path, cfg.keep);
+    Ok(())
+}
+
+fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) {
+    let _ = std::fs::remove_file(profile_path);
+    if !keep {
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+}
+
+fn kill_group(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+}
+
+fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: plain pipe creation; both ends are marked close-on-exec so the
+    // writer closes in the child at exec and the reader never leaks.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(RuntimeError::Unconfigured(format!(
+                "pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        for fd in fds {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+fn read_limit_report(reader: libc::c_int) -> Value {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: we own the descriptor and close it exactly once through File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(reader) };
+    let mut text = String::new();
+    let _ = file.read_to_string(&mut text);
+    serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+}

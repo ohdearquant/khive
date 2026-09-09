@@ -41,6 +41,7 @@ fn rt_with_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime with embedder")
 }

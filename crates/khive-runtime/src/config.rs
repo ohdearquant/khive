@@ -368,6 +368,9 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
+    /// `git_write` so the exec pack reads an already-resolved config.
+    pub exec: crate::engine_config::ExecSectionConfig,
     /// Resolved rendering timezone (ADR-169), consumed today by date-only
     /// `parse_due` anchoring. Populated from `[display] timezone` in
     /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
@@ -465,6 +468,7 @@ impl Default for RuntimeConfig {
             allowed_outbound_namespaces: vec![],
             actor_id,
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            exec: crate::engine_config::ExecSectionConfig::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
         }
@@ -484,6 +488,8 @@ impl RuntimeConfig {
             "schedule",
             "knowledge",
             "session",
+            "tool",
+            "exec",
             "git",
             "code",
             "workspace",
@@ -810,6 +816,7 @@ pub fn runtime_config_from_khive_config(
         .unwrap_or_else(|| base.gate.clone());
 
     let git_write = khive_cfg.git_write.clone();
+    let exec = khive_cfg.exec.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -835,6 +842,7 @@ pub fn runtime_config_from_khive_config(
             actor_id,
             gate,
             git_write,
+            exec,
             blob_hydration_bytes,
             display_timezone,
             ..base
@@ -873,6 +881,7 @@ pub fn runtime_config_from_khive_config(
         actor_id,
         gate,
         git_write,
+        exec,
         blob_hydration_bytes,
         display_timezone,
         ..base

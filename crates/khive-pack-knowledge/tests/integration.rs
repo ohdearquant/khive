@@ -2297,6 +2297,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime");
     rt.register_embedder(RecordingEmbedProvider {
@@ -4695,6 +4696,7 @@ mod kg_blend {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(MarkerEmbedProvider { recorded });
@@ -5056,6 +5058,7 @@ mod kg_blend {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(CountingEmbedProvider {
@@ -5472,6 +5475,7 @@ mod kg_blend {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(FailingBlendEmbedProvider);

@@ -4861,6 +4861,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("test runtime");
         rt.register_embedder(TestEmbedderProvider);

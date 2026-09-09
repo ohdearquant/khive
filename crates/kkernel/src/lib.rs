@@ -39,6 +39,7 @@ mod _pack_links {
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
     use khive_pack_git::GitPack as _;
@@ -50,6 +51,7 @@ mod _pack_links {
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    use khive_pack_tool::ToolPack as _;
     use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;
 }
