@@ -45,8 +45,21 @@ fn executable(path: &Path, source: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod fixture");
 }
 
+/// Directory name of the PATH shim one case installs. Named here because the resolver below has
+/// to know it.
+const SHIM_DIR: &str = "shim-bin";
+
+/// The native git binary, resolved from PATH but never from a fixture's shim directory.
+///
+/// One case puts a shim on PATH for the length of its own body and takes it off again. PATH is
+/// process-global, so a fixture built concurrently resolves git through the shim and CACHES that
+/// path; the shim's temporary directory is then removed with its fixture and every later spawn of
+/// the cached path fails with ENOENT. Skipping the shim directory here keeps that case's PATH
+/// mutation invisible to every other fixture, which is what serialising the whole file would
+/// otherwise be needed for.
 fn git_program() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .filter(|dir| dir.file_name() != Some(std::ffi::OsStr::new(SHIM_DIR)))
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
         .and_then(|path| std::fs::canonicalize(path).ok())
@@ -145,6 +158,8 @@ struct Fixture {
     registry: VerbRegistry,
     rt: KhiveRuntime,
     repo: PathBuf,
+    /// A second allowlisted path that exists and holds no repository: git.init's only legal target.
+    blank: PathBuf,
     git: PathBuf,
     base: String,
     resolver_calls: PathBuf,
@@ -162,6 +177,9 @@ impl Fixture {
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).expect("repo directory");
         let repo = std::fs::canonicalize(repo).expect("canonical repo");
+        let blank = dir.path().join("blank");
+        std::fs::create_dir(&blank).expect("blank directory");
+        let blank = std::fs::canonicalize(blank).expect("canonical blank");
         let git = git_program();
         output(
             command(&git, &repo, &["init", "-q", "-b", "work"], true),
@@ -212,10 +230,17 @@ impl Fixture {
             db_path: Some(dir.path().join("runtime.db")),
             git_write: GitWriteSectionConfig {
                 allowed: if allowlisted {
-                    vec![GitWriteEntryConfig {
-                        repo: repo.display().to_string(),
-                        branches: vec!["*".into()],
-                    }]
+                    // `blank` is listed second on purpose: every existing arm asserts gate.id 0.
+                    vec![
+                        GitWriteEntryConfig {
+                            repo: repo.display().to_string(),
+                            branches: vec!["*".into()],
+                        },
+                        GitWriteEntryConfig {
+                            repo: blank.display().to_string(),
+                            branches: vec!["*".into()],
+                        },
+                    ]
                 } else {
                     vec![]
                 },
@@ -255,6 +280,7 @@ impl Fixture {
             registry,
             rt,
             repo,
+            blank,
             git,
             base,
             resolver_calls,
@@ -1385,4 +1411,572 @@ async fn arm31_reflog_append_without_ref_install_stays_unknown_until_descendant_
     assert_eq!(f.receipt(&id).await["disposition"], "committed");
     assert_eq!(f.git_bytes(&["show-ref"]), refs);
     assert_eq!(f.resolver_count(), 0);
+}
+
+// -- ADR-182 Amendment 8: git.status and git.log ------------------------------------------------
+
+/// Native porcelain v2 records, headers dropped, so a count here is the population `total` claims.
+fn native_status_paths(fixture: &Fixture, untracked: &str) -> Vec<String> {
+    let bytes = fixture.git_bytes(&[
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--no-renames",
+        &format!("--untracked-files={untracked}"),
+        "-z",
+    ]);
+    String::from_utf8(bytes)
+        .expect("porcelain UTF-8 in this fixture")
+        .split('\0')
+        .filter(|record| !record.is_empty() && !record.starts_with("# "))
+        .map(|record| {
+            let (token, rest) = record.split_once(' ').unwrap_or((record, ""));
+            match token {
+                "?" | "!" => rest.to_string(),
+                "1" => rest.splitn(8, ' ').nth(7).unwrap_or_default().to_string(),
+                "u" => rest.splitn(10, ' ').nth(9).unwrap_or_default().to_string(),
+                _ => panic!("unhandled porcelain token {token:?}"),
+            }
+        })
+        .collect()
+}
+
+fn status_paths(result: &Value) -> Vec<String> {
+    result["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("entry path").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn status_agrees_with_native_porcelain_and_changes_nothing_on_disk() {
+    let f = Fixture::new(true, true).await;
+    for verb in ["git.status", "git.log"] {
+        f.policy(verb, "allow").await;
+    }
+    let clean = f.call("git.status", json!({"repo": f.repo})).await;
+    assert_eq!(clean["clean"], json!(true), "{clean}");
+    assert_eq!(clean["total"], json!(0));
+    assert_eq!(clean["branch"]["head"], json!("work"));
+    assert_eq!(clean["branch"]["oid"], json!(f.base));
+    assert_eq!(clean["gate"]["source"], json!("git_write.allowed"));
+
+    std::fs::write(f.repo.join("a.txt"), b"changed\n").expect("dirty a tracked file");
+    std::fs::write(f.repo.join("fresh.txt"), b"new\n").expect("an untracked file");
+    let index_before = std::fs::read(f.repo.join(".git/index")).expect("index before");
+    let dirty = f
+        .call("git.status", json!({"repo": f.repo, "untracked": "all"}))
+        .await;
+    let index_after = std::fs::read(f.repo.join(".git/index")).expect("index after");
+
+    assert_eq!(
+        index_before, index_after,
+        "git.status refreshed the index; GIT_OPTIONAL_LOCKS=0 is what keeps this read inert"
+    );
+    assert_eq!(dirty["clean"], json!(false));
+    let mut mine = status_paths(&dirty);
+    let mut native = native_status_paths(&f, "all");
+    mine.sort();
+    native.sort();
+    assert_eq!(mine, native, "khive and native porcelain disagree");
+    assert_eq!(dirty["total"], json!(native.len()));
+    assert_eq!(dirty["truncated"], json!(false));
+    assert!(
+        status_paths(&dirty).contains(&"fresh.txt".to_string()),
+        "untracked=all must report an untracked file: {dirty}"
+    );
+}
+
+#[tokio::test]
+async fn status_total_counts_the_whole_repository_even_when_entries_are_capped() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.status", "allow").await;
+    for n in 0..7 {
+        std::fs::write(f.repo.join(format!("u{n}.txt")), b"x\n").expect("untracked file");
+    }
+    let capped = f
+        .call(
+            "git.status",
+            json!({"repo": f.repo, "untracked": "all", "limit": 2}),
+        )
+        .await;
+    assert_eq!(capped["entries"].as_array().expect("entries").len(), 2);
+    assert_eq!(capped["total"], json!(7), "{capped}");
+    assert_eq!(capped["truncated"], json!(true));
+    assert_eq!(
+        capped["clean"],
+        json!(false),
+        "a capped page must never report a clean repository"
+    );
+}
+
+#[tokio::test]
+async fn status_keeps_a_path_holding_a_newline_a_space_and_non_ascii_as_one_entry() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.status", "allow").await;
+    // A space would split a whitespace parser, a newline would split a line parser, and the CJK
+    // and accented characters catch a byte-wise parser that assumes ASCII. `-z` is the only
+    // reason all three survive as one record.
+    let awkward = "a file\nwith a newline \u{4e2d}\u{6587} caf\u{e9}.txt";
+    std::fs::write(f.repo.join(awkward), b"x\n").expect("awkward untracked name");
+    let result = f
+        .call("git.status", json!({"repo": f.repo, "untracked": "all"}))
+        .await;
+    assert_eq!(result["total"], json!(1), "{result}");
+    assert_eq!(status_paths(&result), vec![awkward.to_string()]);
+}
+
+#[tokio::test]
+async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.status", "allow").await;
+    let attached = f.call("git.status", json!({"repo": f.repo})).await;
+    assert_eq!(
+        attached["branch"]["head"],
+        json!("work"),
+        "control: {attached}"
+    );
+
+    output(
+        command(
+            &f.git,
+            &f.repo,
+            &["checkout", "-q", "--detach", "HEAD"],
+            true,
+        ),
+        None,
+    );
+    let detached = f.call("git.status", json!({"repo": f.repo})).await;
+    assert_eq!(
+        detached["branch"]["head"],
+        json!(null),
+        "a detached head is an absent branch name, never the porcelain sentinel: {detached}"
+    );
+    assert_eq!(
+        detached["branch"]["oid"],
+        json!(f.base),
+        "the sha is still readable while detached: {detached}"
+    );
+}
+
+#[tokio::test]
+async fn log_agrees_with_native_rev_list_and_bounds_its_page() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.log", "allow").await;
+    let page = f
+        .call("git.log", json!({"repo": f.repo, "limit": 10}))
+        .await;
+    let mine: Vec<String> = page["commits"]
+        .as_array()
+        .expect("commits array")
+        .iter()
+        .map(|c| c["sha"].as_str().expect("sha").to_string())
+        .collect();
+    let native: Vec<String> = f
+        .git_text(&["rev-list", "-n", "10", "HEAD"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(mine, native, "{page}");
+    let head = &page["commits"][0];
+    assert_eq!(head["sha"], json!(f.base));
+    assert!(
+        head["subject"].as_str().is_some_and(|s| !s.is_empty()),
+        "subject must be populated: {head}"
+    );
+    assert!(
+        head["committed_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
+        "committed_at must be ISO 8601: {head}"
+    );
+
+    let one = f.call("git.log", json!({"repo": f.repo, "limit": 1})).await;
+    assert_eq!(one["commits"].as_array().expect("commits").len(), 1);
+    assert_eq!(one["truncated"], json!(true));
+    for bad in [json!(0), json!(501), json!("10"), json!(null)] {
+        let error = f
+            .err("git.log", json!({"repo": f.repo, "limit": bad}))
+            .await;
+        assert!(error.contains("invalid_params"), "limit {bad}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn log_treats_a_path_filter_literally_rather_than_as_a_glob() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.log", "allow").await;
+    std::fs::write(f.repo.join("*.txt"), b"star\n").expect("a file literally named *.txt");
+    output(
+        command(&f.git, &f.repo, &["add", "--", "*.txt"], true),
+        None,
+    );
+    output(
+        command(
+            &f.git,
+            &f.repo,
+            &["commit", "-q", "-m", "the literal star file"],
+            true,
+        ),
+        None,
+    );
+    let literal = f
+        .call(
+            "git.log",
+            json!({"repo": f.repo, "path": "*.txt", "limit": 50}),
+        )
+        .await;
+    let commits = literal["commits"].as_array().expect("commits array");
+    assert_eq!(
+        commits.len(),
+        1,
+        "a glob would also match a.txt and removed.txt: {literal}"
+    );
+    assert_eq!(commits[0]["subject"], json!("the literal star file"));
+}
+
+#[tokio::test]
+async fn status_and_log_refuse_off_allowlist_and_on_deny_and_write_no_receipt() {
+    // No status/log grant is made here on purpose. The allowlist is consulted before the policy,
+    // so the off-allowlist arm below refuses without one, which is what proves that ordering.
+    let f = Fixture::new(true, true).await;
+    let before = f
+        .call("git.receipts", json!({"limit":500,"offset":0}))
+        .await["receipts"]
+        .as_array()
+        .expect("receipts array")
+        .len();
+
+    let outside = f.dir.path().join("not-listed");
+    std::fs::create_dir(&outside).expect("unlisted directory");
+    for verb in ["git.status", "git.log"] {
+        let error = f.err(verb, json!({"repo": outside})).await;
+        assert!(
+            error.contains("repo_not_allowlisted"),
+            "{verb} off the allowlist: {error}"
+        );
+    }
+    // Control first, and it has to be first: tool policies are append-only rows and a deny is not
+    // reversible by a later allow, so a control placed after the deny arm would fail on a healthy
+    // pack. The same repo and the same call shape succeed while the decision is allow, which is
+    // what makes the refusals below the policy's doing rather than a broken fixture.
+    for verb in ["git.status", "git.log"] {
+        f.policy(verb, "allow").await;
+        f.call(verb, json!({"repo": f.repo})).await;
+    }
+    for verb in ["git.status", "git.log"] {
+        f.policy(verb, "deny").await;
+        let error = f.err(verb, json!({"repo": f.repo})).await;
+        assert!(error.contains("policy_denied"), "{verb} denied: {error}");
+    }
+
+    let after = f
+        .call("git.receipts", json!({"limit":500,"offset":0}))
+        .await["receipts"]
+        .as_array()
+        .expect("receipts array")
+        .len();
+    assert_eq!(
+        before, after,
+        "git.status and git.log write no receipt, allowed or refused"
+    );
+}
+
+#[tokio::test]
+async fn init_makes_an_allowlisted_empty_directory_a_repository_and_records_a_receipt() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.init", "allow").await;
+    f.policy("git.status", "allow").await;
+    assert!(
+        !f.blank.join(".git").exists(),
+        "precondition: the target is not a repository yet"
+    );
+    let before = f
+        .call("git.receipts", json!({"limit":500,"offset":0}))
+        .await["receipts"]
+        .as_array()
+        .expect("receipts array")
+        .len();
+
+    let created = f
+        .call("git.init", json!({"repo": f.blank, "branch": "trunk"}))
+        .await;
+    assert_eq!(created["branch"], json!("trunk"), "{created}");
+    assert!(created["receipt_id"].as_str().is_some(), "{created}");
+    assert!(f.blank.join(".git").exists(), "the repository was created");
+    assert!(
+        !f.blank.join(".git/hooks/pre-commit.sample").exists(),
+        "--template= must leave no sample hooks behind"
+    );
+
+    let after = f
+        .call("git.receipts", json!({"limit":500,"offset":0}))
+        .await["receipts"]
+        .as_array()
+        .expect("receipts array")
+        .len();
+    assert_eq!(after, before + 1, "git.init is a write and takes a receipt");
+
+    // The new repository is readable through the same pack that made it.
+    let status = f.call("git.status", json!({"repo": f.blank})).await;
+    assert_eq!(status["branch"]["head"], json!("trunk"), "{status}");
+    assert_eq!(
+        status["branch"]["oid"],
+        json!(null),
+        "an unborn branch reports a null oid, not the porcelain sentinel: {status}"
+    );
+}
+
+#[tokio::test]
+async fn init_refuses_a_target_that_already_holds_a_repository_and_leaves_it_untouched() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.init", "allow").await;
+    let head_before = f.git_text(&["rev-parse", "HEAD"]);
+    let config_before = std::fs::read(f.repo.join(".git/config")).expect("config before");
+
+    let error = f.err("git.init", json!({"repo": f.repo})).await;
+    assert!(
+        error.contains("already_initialized"),
+        "reinitializing a live repository must refuse: {error}"
+    );
+    assert_eq!(
+        head_before,
+        f.git_text(&["rev-parse", "HEAD"]),
+        "the refused init moved HEAD"
+    );
+    assert_eq!(
+        config_before,
+        std::fs::read(f.repo.join(".git/config")).expect("config after"),
+        "the refused init rewrote configuration in place, which is the reason it refuses"
+    );
+
+    // Control: the same call shape succeeds against a target that holds no repository, so the
+    // refusal above is the precondition and not a broken fixture.
+    f.call("git.init", json!({"repo": f.blank})).await;
+}
+
+#[tokio::test]
+async fn init_refuses_a_directory_that_is_not_allowlisted() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.init", "allow").await;
+    let outside = f.dir.path().join("unlisted-target");
+    std::fs::create_dir(&outside).expect("unlisted directory");
+    let error = f.err("git.init", json!({"repo": outside})).await;
+    assert!(
+        error.contains("repo_not_allowlisted"),
+        "the operator's allowlist is what decides where a repository may appear: {error}"
+    );
+    assert!(
+        !outside.join(".git").exists(),
+        "a refused init created a repository anyway"
+    );
+}
+
+// -- ADR-182 Amendment 8, hardening: a read verb never runs a program the REPOSITORY names -------
+
+/// `git.status` and `git.log` reach repository-configured programs by two different doors, and
+/// both are opened by ordinary config in the repository being read: a content filter driver runs
+/// on the clean path when `status` has to hash a worktree file, and a signature verifier runs on
+/// `log` when `log.showSignature` is set and the commit carries a signature. Each arm here fires
+/// the marker on the unhardened control first, because a marker that never fires proves nothing
+/// about the hardened call.
+#[tokio::test]
+async fn read_verbs_never_execute_repository_configured_filters_or_signers() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.status", "allow").await;
+    f.policy("git.log", "allow").await;
+    let filter_marker = f.dir.path().join("read-filter.marker");
+    let signer_marker = f.dir.path().join("read-signer.marker");
+    let filter = f.dir.path().join("read-filter");
+    executable(
+        &filter,
+        &format!(
+            "#!/bin/sh\nprintf filter >> {}\ncat\n",
+            quoted(&filter_marker)
+        ),
+    );
+    // Signs on request and verifies on request, so it is reached from both directions. A signer
+    // stands in for gpg on both paths: on the signing path git reads `[GNUPG:] SIG_CREATED ` from
+    // the status descriptor and takes the armour on stdout as the signature, and on the verifying
+    // path it passes `--verify` and reads the exit status.
+    let signer = f.dir.path().join("read-signer");
+    executable(
+        &signer,
+        &format!(
+            r#"#!/bin/sh
+printf signer >> {}
+# Drain the payload git streams in before exiting, as gpg does; a signer that exits with the
+# payload unread leaves git's write racing the exit and failing with EPIPE.
+cat >/dev/null
+for a in "$@"; do
+  if [ "$a" = --verify ]; then exit 0; fi
+done
+printf '\n[GNUPG:] SIG_CREATED B fixture\n' >&2
+printf -- '-----BEGIN PGP SIGNATURE-----\n\nfixture\n-----END PGP SIGNATURE-----\n'
+exit 0
+"#,
+            quoted(&signer_marker)
+        ),
+    );
+
+    // A tracked file the attributes bind to the driver, then a worktree change, so status has to
+    // hash the file rather than trust the stat cache.
+    std::fs::write(
+        f.repo.join(".gitattributes"),
+        b"tracked.txt filter=hostile\n",
+    )
+    .expect("attributes");
+    std::fs::write(f.repo.join("tracked.txt"), b"one\n").expect("tracked file");
+    f.git_bytes(&["add", "tracked.txt", ".gitattributes"]);
+    f.git_bytes(&["commit", "-m", "tracked"]);
+    f.git_bytes(&["config", "filter.hostile.clean", filter.to_str().unwrap()]);
+    f.git_bytes(&["config", "filter.hostile.smudge", filter.to_str().unwrap()]);
+    f.git_bytes(&["config", "filter.hostile.required", "true"]);
+    f.git_bytes(&["config", "log.showSignature", "true"]);
+    f.git_bytes(&["config", "gpg.program", signer.to_str().unwrap()]);
+    // The signed commit is made through UNHARDENED git: the fixture's hardened helper passes
+    // commit.gpgsign=false, which is the very door this arm is about.
+    output(
+        command(
+            &f.git,
+            &f.repo,
+            &["commit", "--allow-empty", "-S", "-m", "signed"],
+            false,
+        ),
+        None,
+    );
+    std::fs::write(f.repo.join("tracked.txt"), b"two\n").expect("modify tracked file");
+    assert!(
+        signer_marker.exists(),
+        "the signing side of the control never ran, so the commit carries no signature"
+    );
+    std::fs::remove_file(&signer_marker).expect("clear signer marker after signing");
+
+    // Positive controls, native git with none of the pack's hardening.
+    output(
+        command(&f.git, &f.repo, &["status", "--porcelain=v2"], false),
+        None,
+    );
+    assert!(
+        filter_marker.exists(),
+        "clean-filter control is inert: this arm would pass with the defect present"
+    );
+    output(
+        command(
+            &f.git,
+            &f.repo,
+            &["log", "-n", "1", "--show-signature"],
+            false,
+        ),
+        None,
+    );
+    assert!(
+        signer_marker.exists(),
+        "signature-verifier control is inert: this arm would pass with the defect present"
+    );
+    std::fs::remove_file(&filter_marker).expect("clear filter marker");
+    std::fs::remove_file(&signer_marker).expect("clear signer marker");
+
+    let status = f.call("git.status", json!({"repo": f.repo})).await;
+    assert!(
+        !filter_marker.exists(),
+        "git.status ran the repository's clean filter"
+    );
+    assert!(
+        status_paths(&status).contains(&"tracked.txt".to_string()),
+        "the neutralised filter also neutralised the answer: {status}"
+    );
+    let log = f.call("git.log", json!({"repo": f.repo, "limit": 1})).await;
+    assert!(
+        !signer_marker.exists(),
+        "git.log ran the repository's signature verifier"
+    );
+    assert_eq!(log["commits"][0]["subject"], "signed");
+}
+
+/// `git init` creates the repository directory and then writes and reads HEAD. A failure after the
+/// directory exists must not settle as `not_committed`, because the directory is there. The shim
+/// makes that reachable by refusing exactly the second step, on exactly this repository: it is on
+/// PATH for the whole process, so a shim that refused for everyone would break whatever else is
+/// running beside this test.
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn init_reports_an_unestablished_outcome_when_it_leaves_a_repository_behind() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.init", "allow").await;
+    let shim_dir = f.dir.path().join(SHIM_DIR);
+    std::fs::create_dir(&shim_dir).expect("shim directory");
+    executable(
+        &shim_dir.join("git"),
+        &format!(
+            "#!/bin/sh\nmine=0\nfor a in \"$@\"; do\n  if [ \"$a\" = {} ]; then mine=1; fi\n             done\nif [ \"$mine\" = 1 ]; then\n  for a in \"$@\"; do\n                 if [ \"$a\" = symbolic-ref ]; then exit 1; fi\n  done\nfi\nexec {} \"$@\"\n",
+            quoted(&f.blank),
+            quoted(&f.git)
+        ),
+    );
+    let path = std::env::join_paths([
+        shim_dir.clone(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .expect("shim PATH");
+    let _env = EnvGuard::set(&[("PATH", path)]);
+
+    let error = f.err("git.init", json!({"repo": f.blank})).await;
+    assert!(
+        f.blank.join(".git").exists(),
+        "the shim did not reach the state this arm is about: no repository was created"
+    );
+    assert!(
+        error.contains("init_partial_repository"),
+        "a half-made repository settled without naming the condition: {error}"
+    );
+    let id: String = error
+        .split("receipt_id=")
+        .nth(1)
+        .expect("error names receipt")
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+        .collect();
+    let receipt = f.receipt(&id).await;
+    assert_eq!(
+        receipt["disposition"], "unknown",
+        "a repository that exists is not a write that did not happen: {receipt}"
+    );
+    assert_eq!(
+        receipt["repo"],
+        json!(f.blank.to_str().unwrap()),
+        "the receipt has to name the directory somebody now has to look at: {receipt}"
+    );
+}
+
+/// The resolver's own guard, because the failure it prevents is invisible from any single test:
+/// PATH is process-global, so while the shim case above holds it, a fixture built concurrently
+/// resolves git through the shim and caches a path that is deleted with that case's fixture.
+#[test]
+#[serial_test::serial(git_dev_loop_env)]
+fn the_native_git_resolver_never_answers_a_fixture_shim() {
+    let native = git_program();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let shim_dir = dir.path().join(SHIM_DIR);
+    std::fs::create_dir(&shim_dir).expect("shim directory");
+    executable(&shim_dir.join("git"), "#!/bin/sh\nexit 7\n");
+    // Control: the shim IS what a PATH search would find first, so this arm is not vacuous.
+    assert!(shim_dir.join("git").is_file());
+    // The shim goes in FRONT of the real PATH rather than replacing it, so the only difference
+    // between the two resolutions is the shim itself.
+    let mut entries = vec![shim_dir.clone()];
+    entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    ));
+    let path = std::env::join_paths(entries).expect("shim PATH");
+    let _env = EnvGuard::set(&[("PATH", path)]);
+    let resolved = git_program();
+    assert!(
+        !resolved.starts_with(dir.path()),
+        "a fixture would have cached {resolved:?}, which disappears with this directory"
+    );
+    assert_eq!(resolved, native, "the resolver moved off the native binary");
 }

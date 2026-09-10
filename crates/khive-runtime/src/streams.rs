@@ -21,7 +21,9 @@ use crate::atomic_runner::{
     apply_plan, atomic_unit_error_allows_recorded_refusal, AtomicOpFailure, AtomicOpPlan,
     CommittedPostCommitEffects,
 };
-use crate::note_write::{NoteFence, NoteWriteGuard, NoteWriteOptions};
+use crate::note_write::{
+    NoteFence, NoteFences, NoteWriteConflict, NoteWriteGuard, NoteWriteOptions,
+};
 use crate::{
     micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
     VerbRegistry,
@@ -78,6 +80,7 @@ pub struct StreamAppendSpec {
     pub expected_seq: Option<i64>,
     pub note_kind: String,
     pub tags: Option<Vec<String>>,
+    pub fence: Option<NoteFences>,
 }
 
 /// A keyed document write. Kinds are canonical note-kind names. A missing
@@ -143,6 +146,7 @@ struct PreparedAppend {
     expected_seq: Option<i64>,
     note: Note,
     statements: Vec<PlanStatement>,
+    guard: NoteWriteGuard,
 }
 
 fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
@@ -152,6 +156,7 @@ fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
 enum BatchOutcome {
     Appended(Vec<i64>),
     Conflict { next: i64 },
+    FenceConflict { conflict: NoteWriteConflict },
 }
 
 struct PreparedBatchMember {
@@ -165,6 +170,7 @@ enum PreparedBatchAction {
         expected_seq: Option<i64>,
         note: Box<Note>,
         plan: AtomicOpPlan,
+        fence: Option<NoteFences>,
     },
     Write {
         key: String,
@@ -290,7 +296,7 @@ async fn run_prepared_stream_batch(
                 namespace: namespace.clone(),
                 target_id: Uuid::nil(),
                 expected_version: None,
-                fence,
+                fence: fence.map(Into::into),
                 create_key: None,
             };
             let predicate_error = if let Some(conflict) = guard.check_fence(writer).await? {
@@ -309,6 +315,26 @@ async fn run_prepared_stream_batch(
             }
             let mut results = Vec::with_capacity(members.len());
             let mut effects = Vec::new();
+            // Member fences observe the transaction's initial state, even when
+            // an earlier keyed write changes a fenced note in this batch.
+            for member in &members {
+                if let PreparedBatchAction::Append { fence, .. } = &member.action {
+                    let guard = NoteWriteGuard {
+                        namespace: namespace.clone(),
+                        target_id: Uuid::nil(),
+                        expected_version: None,
+                        fence: fence.clone(),
+                        create_key: None,
+                    };
+                    if let Some(conflict) = guard.check_fence(writer).await? {
+                        *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
+                            member: Some(member.index),
+                            error: conflict.into_error().into(),
+                        });
+                        return Err(StorageError::Internal("stream append fence refused".into()));
+                    }
+                }
+            }
             for member in members {
                 let result = apply_stream_member(writer, &namespace, member.action).await;
                 match result {
@@ -369,6 +395,7 @@ async fn apply_stream_member(
             expected_seq,
             note,
             plan,
+            ..
         } => {
             let head = writer.query_scalar(statement(
                 "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
@@ -445,6 +472,12 @@ impl KhiveRuntime {
         let mut contents = Vec::with_capacity(specs.len());
         for spec in specs {
             validate_stream(&spec.stream)?;
+            if let Some(fences) = &spec.fence {
+                fences.validate()?;
+                for fence in fences.entries() {
+                    self.validate_note_kind(&fence.kind)?;
+                }
+            }
             contents.push(
                 serde_json::to_string(&spec.record)
                     .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
@@ -471,11 +504,16 @@ impl KhiveRuntime {
                     "stream preparation did not produce a note".into(),
                 ));
             };
+            let mut guard = plan.note_guard.ok_or_else(|| {
+                RuntimeError::Internal("stream preparation did not produce a note guard".into())
+            })?;
+            guard.fence = spec.fence.clone();
             out.push(PreparedAppend {
                 stream: spec.stream.clone(),
                 expected_seq: spec.expected_seq,
                 note,
                 statements: plan.statements,
+                guard,
             });
         }
         Ok(out)
@@ -491,7 +529,7 @@ impl KhiveRuntime {
         appends: &[PreparedAppend],
     ) -> RuntimeResult<BatchOutcome> {
         let ns = token.namespace().as_str().to_string();
-        let entries: Vec<(String, Option<i64>, String, Vec<PlanStatement>)> = appends
+        let entries: Vec<_> = appends
             .iter()
             .map(|a| {
                 (
@@ -499,13 +537,14 @@ impl KhiveRuntime {
                     a.expected_seq,
                     a.note.id.to_string(),
                     a.statements.clone(),
+                    a.guard.clone(),
                 )
             })
             .collect();
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
                 let mut heads: Vec<(String, i64)> = Vec::new();
-                for (stream, _, _, _) in &entries {
+                for (stream, _, _, _, _) in &entries {
                     if heads.iter().any(|(known, _)| known == stream) {
                         continue;
                     }
@@ -521,7 +560,11 @@ impl KhiveRuntime {
                     heads.push((stream.clone(), head));
                 }
                 let mut assigned = Vec::with_capacity(entries.len());
-                for (stream, expected_seq, _, _) in &entries {
+                for (stream, expected_seq, _, _, guard) in &entries {
+                    if let Some(conflict) = guard.check_fence(writer).await? {
+                        return Ok(Box::new(BatchOutcome::FenceConflict { conflict })
+                            as Box<dyn Any + Send>);
+                    }
                     let head = heads
                         .iter_mut()
                         .find(|(known, _)| known == stream)
@@ -536,7 +579,7 @@ impl KhiveRuntime {
                     *head = next;
                     assigned.push(next);
                 }
-                for ((stream, _, note_id, statements), seq) in
+                for ((stream, _, note_id, statements, _), seq) in
                     entries.into_iter().zip(assigned.iter().copied())
                 {
                     for planned in statements {
@@ -574,6 +617,7 @@ impl KhiveRuntime {
 
     /// Append a JSON value as an immutable note. The sequence precondition and
     /// every note/index/ledger statement share the same writer transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_append(
         &self,
         token: &NamespaceToken,
@@ -582,6 +626,7 @@ impl KhiveRuntime {
         expected_seq: Option<i64>,
         note_kind: &str,
         tags: Option<Vec<String>>,
+        fence: Option<NoteFences>,
     ) -> RuntimeResult<Value> {
         let spec = StreamAppendSpec {
             stream: stream.to_string(),
@@ -589,10 +634,12 @@ impl KhiveRuntime {
             expected_seq,
             note_kind: note_kind.to_string(),
             tags,
+            fence,
         };
         let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
         match self.run_stream_appends(token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
+            BatchOutcome::FenceConflict { conflict } => Err(conflict.into_error().into()),
             BatchOutcome::Conflict { next } => Err(seq_conflict(
                 stream,
                 expected_seq.expect("only conditional appends conflict"),
@@ -615,6 +662,12 @@ impl KhiveRuntime {
                 StreamBatchMember::Append(spec) => {
                     validate_stream(&spec.stream)?;
                     self.validate_note_kind(&spec.note_kind)?;
+                    if let Some(fences) = &spec.fence {
+                        fences.validate()?;
+                        for fence in fences.entries() {
+                            self.validate_note_kind(&fence.kind)?;
+                        }
+                    }
                     crate::secret_gate::check(
                         &serde_json::to_string(&spec.record)
                             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
@@ -834,6 +887,7 @@ impl KhiveRuntime {
                         expected_seq: spec.expected_seq,
                         note: Box::new(note),
                         plan,
+                        fence: spec.fence,
                     }
                 }
             };
@@ -1053,7 +1107,15 @@ mod tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let appended = rt
-            .stream_append(&token, "cas", &json!({"n": 1}), None, "observation", None)
+            .stream_append(
+                &token,
+                "cas",
+                &json!({"n": 1}),
+                None,
+                "observation",
+                None,
+                None,
+            )
             .await
             .unwrap();
         let id = uuid::Uuid::parse_str(appended["id"].as_str().unwrap()).unwrap();
@@ -1123,6 +1185,7 @@ mod tests {
                     &json!(token.namespace().as_str()),
                     Some(1),
                     "observation",
+                    None,
                     None
                 )
                 .await

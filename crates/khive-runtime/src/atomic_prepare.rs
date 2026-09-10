@@ -804,7 +804,6 @@ async fn prepare_note_update_plan_from_snapshot(
             .transpose()?,
         fence: obj(args)?
             .get("fence")
-            .filter(|v| !v.is_null())
             .map(|v| {
                 serde_json::from_value(v.clone())
                     .map_err(|error| RuntimeError::InvalidInput(format!("invalid fence: {error}")))

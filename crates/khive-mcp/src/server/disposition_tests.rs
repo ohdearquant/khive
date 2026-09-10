@@ -1683,3 +1683,21 @@ fn a_gate_refusal_projects_its_audit_receipt_beside_the_denial_text() {
         .unwrap()
         .starts_with("permission denied for verb"));
 }
+#[test]
+fn ordered_fences_refusal_has_no_domain_commit() {
+    for index in [None, Some("0"), Some("1")] {
+        let mut details = vec![
+            ("reason", "fence_conflict".to_owned()),
+            ("key", "lease".to_owned()),
+            ("expected_version", "1".to_owned()),
+        ];
+        if let Some(index) = index {
+            details.push(("index", index.to_owned()));
+        }
+        let error = khive_types::KhiveError::conflict("note fence precondition failed")
+            .with_details(khive_types::Details::new_owned(details));
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"].get("index").and_then(Value::as_str), index);
+    }
+}

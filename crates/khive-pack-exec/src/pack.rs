@@ -110,6 +110,7 @@ impl PackRuntime for ExecPack {
         match verb {
             "exec.tree" => handlers::tree_store(rt, params).await,
             "exec.tree_get" => handlers::tree_get(rt, params).await,
+            "exec.tree_put" => handlers::tree_put(rt, params).await,
             "exec.tree_diff" => handlers::tree_diff(rt, params).await,
             "exec.run" => handlers::run(rt, token, &self.config, params).await,
             "exec.receipt" => handlers::receipt(rt, token, params).await,

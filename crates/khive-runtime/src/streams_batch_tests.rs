@@ -73,7 +73,16 @@ fn append(stream: &str, expected_seq: Option<i64>) -> StreamBatchMember {
         expected_seq,
         note_kind: "observation".into(),
         tags: None,
+        fence: None,
     })
+}
+
+fn fenced_append(stream: &str, fences: Vec<NoteFence>) -> StreamBatchMember {
+    let StreamBatchMember::Append(mut spec) = append(stream, None) else {
+        unreachable!()
+    };
+    spec.fence = Some(NoteFences::Many(fences));
+    StreamBatchMember::Append(spec)
 }
 
 async fn batch_write(
@@ -427,6 +436,79 @@ async fn stream_batch_observation_rechecks_cross_connection_change_at_admission(
     );
 }
 
+#[tokio::test]
+async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission() {
+    let (_dir, runtime, peer, token, registry) = file_fixture();
+    batch_write(&runtime, &token, &registry, write("stable", None)).await;
+    let renewed = batch_write(&runtime, &token, &registry, write("renewed", None)).await;
+    let prepared = runtime
+        .prepare_stream_batch(
+            &token,
+            vec![
+                append("member-race", None),
+                fenced_append(
+                    "member-race",
+                    vec![
+                        NoteFence {
+                            key: "stable".into(),
+                            kind: "head".into(),
+                            expected_version: 1,
+                        },
+                        NoteFence {
+                            key: "renewed".into(),
+                            kind: "head".into(),
+                            expected_version: 1,
+                        },
+                    ],
+                ),
+            ],
+            &registry,
+        )
+        .await
+        .unwrap();
+    let access = AdmissionChange {
+        inner: runtime.sql(),
+        changer: peer.sql(),
+        change: Mutex::new(Some(statement(
+            "UPDATE notes SET content=?1 WHERE id=?2",
+            vec![
+                SqlValue::Text("{\"revision\":1}".into()),
+                SqlValue::Text(renewed["id"].as_str().unwrap().into()),
+            ],
+        ))),
+    };
+    let result = run_prepared_stream_batch(
+        &access,
+        token.namespace().as_str().into(),
+        prepared,
+        None,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let Err(refusal) = result else {
+        panic!("late append-member fence change must refuse")
+    };
+    assert_eq!(refusal.member, 1);
+    let details = serde_json::to_value(refusal.error.details().unwrap()).unwrap();
+    assert_eq!(details["reason"], "fence_conflict");
+    assert_eq!(details["member"], "1");
+    assert_eq!(details["index"], "1");
+    assert_eq!(details["current_version"], "2");
+    assert_eq!(
+        runtime.stream_stat(&token, "member-race").await.unwrap()["count"],
+        0
+    );
+    assert_eq!(
+        runtime
+            .get_note_by_key(&token, "renewed", Some("head"), false)
+            .await
+            .unwrap()
+            .version,
+        2
+    );
+}
+
 // This writer records statements, not rolled-back row counts: moving an
 // observation after an INSERT must be visible even if the unit later rolls back.
 #[derive(Clone)]
@@ -539,6 +621,74 @@ async fn stream_batch_observed_statement_trace_precedes_first_member_insert() {
             assert!(
                 observations[1] < first_insert.unwrap(),
                 "all observations precede first member INSERT"
+            );
+        }
+        assert_eq!(trace[0].sql, "BEGIN");
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_append_member_fences_precede_every_member_insert() {
+    let (runtime, token, registry) = fixture();
+    for stale in [false, true] {
+        let prepared = runtime
+            .prepare_stream_batch(
+                &token,
+                vec![
+                    append("member-trace", None),
+                    fenced_append(
+                        "member-trace",
+                        vec![
+                            NoteFence {
+                                key: "first".into(),
+                                kind: "head".into(),
+                                expected_version: 1,
+                            },
+                            NoteFence {
+                                key: "second".into(),
+                                kind: "head".into(),
+                                expected_version: if stale { 2 } else { 1 },
+                            },
+                        ],
+                    ),
+                ],
+                &registry,
+            )
+            .await
+            .unwrap();
+        let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
+        let result = run_prepared_stream_batch(
+            &trace,
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.is_ok(), !stale);
+        let trace = trace.0.lock().unwrap();
+        let checks: Vec<_> = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.label.as_deref() == Some("note-write-guard")
+                    && s.sql.starts_with("SELECT version")
+            })
+            .collect();
+        assert_eq!(checks.len(), 2, "each append-member fence checked once");
+        assert!(matches!(&checks[0].1.params[2], SqlValue::Text(key) if key == "first"));
+        assert!(matches!(&checks[1].1.params[2], SqlValue::Text(key) if key == "second"));
+        let first_insert = trace.iter().position(|s| s.sql.starts_with("INSERT"));
+        if stale {
+            assert!(
+                first_insert.is_none(),
+                "stale append-member fences precede every INSERT, even rolled-back writes"
+            );
+        } else {
+            assert!(
+                checks[1].0 < first_insert.unwrap(),
+                "all append-member fences precede first member INSERT"
             );
         }
         assert_eq!(trace[0].sql, "BEGIN");
