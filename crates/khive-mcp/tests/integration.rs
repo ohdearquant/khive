@@ -3361,6 +3361,48 @@ async fn help_brain_feedback_params_non_empty_with_target_and_signal() -> anyhow
 }
 
 #[tokio::test]
+async fn help_brain_actor_reads_expose_caller_scope_and_fleet_gate() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    for verb in ["brain.event_counts", "brain.resolve", "brain.bindings"] {
+        let schema = help_schema(&client, verb).await?;
+        let description = schema["description"]
+            .as_str()
+            .expect("verb help description")
+            .to_ascii_lowercase();
+        assert!(description.contains("caller"), "{verb}: {description}");
+        let params = schema["params"].as_array().expect("help params");
+        let actor = params
+            .iter()
+            .find(|param| param["name"] == "actor")
+            .expect("actor read help includes actor");
+        assert_eq!(actor["type"], "string", "{verb}: {actor}");
+        assert_eq!(actor["required"], false, "{verb}: {actor}");
+        let actor_scope = actor["description"]
+            .as_str()
+            .expect("actor scope description")
+            .to_ascii_lowercase();
+        assert!(actor_scope.contains("caller"), "{verb}: {actor_scope}");
+        assert!(actor_scope.contains("visible"), "{verb}: {actor_scope}");
+
+        let all_actors = params.iter().find(|param| param["name"] == "all_actors");
+        if verb == "brain.event_counts" {
+            let all_actors = all_actors.expect("event counts advertises fleet reads");
+            assert_eq!(all_actors["type"], "boolean");
+            assert_eq!(all_actors["required"], false);
+            let fleet_scope = all_actors["description"]
+                .as_str()
+                .expect("fleet read scope description")
+                .to_ascii_lowercase();
+            assert!(fleet_scope.contains("fleet_readers"), "{fleet_scope}");
+            assert!(fleet_scope.contains("actor"), "{fleet_scope}");
+        } else {
+            assert!(all_actors.is_none(), "{verb} has no fleet read parameter");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn help_propose_params_non_empty_with_title_description_changeset() -> anyhow::Result<()> {
     let client = connect_full().await?;
     let schema = help_schema(&client, "propose").await?;

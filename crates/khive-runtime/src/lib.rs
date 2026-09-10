@@ -92,9 +92,9 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
-    GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig,
-    StorageSectionConfig,
+    config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+    PackConfig, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,

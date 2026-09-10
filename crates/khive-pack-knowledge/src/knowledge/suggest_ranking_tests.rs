@@ -167,6 +167,7 @@ impl EmbedderProvider for FixtureEmbedProvider {
 fn rt_with_fixture_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
         mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,

@@ -14,13 +14,14 @@
 #   4. ~/.khive/config.toml                           (user-global)
 #
 # Unknown keys are ignored (forward-compatible), except inside the security-sensitive
-# [gate] table: its schema is closed, so misspelled or unknown policy keys fail startup.
+# [gate] and [brain] tables: their schemas are closed, so unknown keys fail startup.
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
 #   [runtime]       brain profile + default output format
 #   [display]       rendering timezone (ADR-169)
 #   [gate]          optional static caller-enrollment allowlist
+#   [brain]         actor ids permitted to request aggregate event counts
 #   [[engines]]     embedding engines (replaces the KHIVE_EMBEDDING_MODEL env pair)
 #   [[backends]]    named storage backends (ADR-028)
 #   [packs.<name>]  per-pack backend assignment (ADR-028)
@@ -118,6 +119,21 @@
 # [gate]
 # granted_actors = ["lambda:khive", "service:indexer"]
 # grant_unattributed = false
+
+# -- [brain] -- aggregate event-count read permission ----------------------------
+#
+# Brain reads default to the authorized caller. This exact actor-id allowlist
+# permits brain.event_counts(all_actors=true), not automatic aggregate reads.
+# The serving process's resolved configuration is authoritative; a client's local
+# list cannot grant access on a daemon. This does not grant Gate enrollment or
+# change [actor].visible_namespaces. Unknown keys in this table fail startup.
+
+[brain]
+# List of strings (Vec<String>). Absent table or key defaults to the empty list,
+# which grants no aggregate readers. Use actor ids, not prefixed event-row labels.
+fleet_readers = []
+# Example granting one aggregate reader instead:
+# fleet_readers = ["service:metrics"]
 
 # ── Embedding engines ──────────────────────────────────────────────────────────
 #

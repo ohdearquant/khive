@@ -408,6 +408,15 @@ pub struct StorageSectionConfig {
     pub blob: Option<BlobConfig>,
 }
 
+/// `[brain]` read policy resolved by the serving process.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BrainSectionConfig {
+    /// Actor ids permitted to request fleet-wide `brain.event_counts` reads.
+    #[serde(default)]
+    pub fleet_readers: Vec<String>,
+}
+
 // ---- git-write policy (ADR-108 Amendment) ----
 
 /// One `[[git_write.allowed]]` entry: a repo this operator has declared
@@ -718,12 +727,13 @@ pub struct ExecSectionConfig {
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
+/// - `[brain]`: actor read policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The security-sensitive `[gate]` table itself is closed with
+/// compatibility. The security-sensitive `[gate]` and `[brain]` tables are closed with
 /// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
@@ -776,6 +786,10 @@ pub struct KhiveConfig {
     /// must appear in `backends`.
     #[serde(default)]
     pub packs: std::collections::HashMap<String, PackConfig>,
+
+    /// Actor read policy. An absent or empty list grants no fleet-wide reads.
+    #[serde(default)]
+    pub brain: BrainSectionConfig,
 
     /// Git-write policy allowlist (ADR-108 Amendment). Absent or empty
     /// `allowed` fails closed — `khive-pack-git`'s write verbs are
@@ -2792,6 +2806,71 @@ grant_unattributed = false
         KhiveConfig::load(Some(&path))
             .expect("unrelated future config stays forward compatible")
             .expect("config exists");
+    }
+
+    #[test]
+    fn brain_fleet_readers_default_to_empty() {
+        assert!(KhiveConfig::default().brain.fleet_readers.is_empty());
+        assert!(in_memory_runtime_config().brain.fleet_readers.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            for brain in ["", "[brain]\n", "[brain]\nfleet_readers = []\n"] {
+                let path = write_toml(&dir, &format!("{engines}\n{brain}"));
+                let config = KhiveConfig::load(Some(&path))
+                    .expect("load")
+                    .expect("config exists");
+                assert!(config.brain.fleet_readers.is_empty());
+
+                let mut base = in_memory_runtime_config();
+                base.brain.fleet_readers = vec!["lambda:previous".to_string()];
+                let resolved = crate::runtime_config_from_khive_config(&config, base);
+                assert!(resolved.brain.fleet_readers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn brain_fleet_readers_parse_and_resolve_with_or_without_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    "{engines}\n[brain]\nfleet_readers = [\"lambda:reader\", \"lambda:auditor\"]\n"
+                ),
+            );
+            let config = KhiveConfig::load(Some(&path))
+                .expect("load")
+                .expect("config exists");
+            assert_eq!(
+                config.brain.fleet_readers,
+                vec!["lambda:reader", "lambda:auditor"]
+            );
+
+            let mut base = in_memory_runtime_config();
+            base.brain.fleet_readers = vec!["lambda:previous".to_string()];
+            let resolved = crate::runtime_config_from_khive_config(&config, base);
+            assert_eq!(
+                resolved.brain.fleet_readers,
+                vec!["lambda:reader", "lambda:auditor"]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_brain_key_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[brain]\nfleet_reader = [\"lambda:reader\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown brain key must fail");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────

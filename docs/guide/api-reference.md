@@ -1219,16 +1219,29 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 `truncated` is `true`, these sums are computed over the fetched page only, same as the other
 `counts_by_*` fields.
 
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
+| Param        | Type   | Required | Notes                                                                                                                                                                                                                                                       |
+| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `since`      | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                                                                                                                        |
+| `until`      | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                                                                                                                         |
+| `actor`      | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. A bare filter (`service:indexer`) matches bare and `actor:`-prefixed event labels; a prefixed filter (`actor:service:indexer`) matches exactly. |
+| `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                             |
+| `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                      |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
 ```
+
+For an actor of kind `actor`, the default `counts_by_actor` combines the caller's
+historical bare and prefixed event aliases under one caller-label key, or has no
+keys when no events match. Other actor kinds match their exact caller label.
+Explicit `actor` and `all_actors=true` reads preserve stored actor keys. The caller
+label is the actor id for kind `actor`, otherwise `kind:id`; an anonymous caller
+therefore defaults to `anonymous:local`. A visible foreign actor is readable only
+when explicitly requested. An allowlisted aggregate reader also defaults to its
+own events unless it supplies `all_actors=true`. Client-local configuration cannot
+grant aggregate access on a serving daemon. See
+[configuration](../configuration.md#brain-read-scope) and
+[ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
 
 ### `brain.profiles` — Assertive
 
@@ -1258,15 +1271,20 @@ request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 
 Show which profile would serve a caller context.
 
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
+| Param           | Type   | Required | Notes                                                                                                       |
+| --------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`).                                                |
+| `actor`         | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       | Default `*` (wildcard match).                                                                               |
 
 ```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
+request(ops="brain.resolve(consumer_kind=\"recall\")")
 ```
+
+Resolution retains wildcard binding fallback. For anonymous callers, an omitted
+actor remains wildcard-only and does not match explicit `local` or
+`anonymous:local` bindings. An explicit caller label is permitted; other actor ids
+require visibility. There is no `all_actors` resolution mode.
 
 ### `brain.activate` — Commissive
 
@@ -1417,18 +1435,23 @@ the same count for compatibility.
 
 ### `brain.bindings` — Assertive
 
-List rows in the profile resolution table, optionally filtered.
+List the authorized caller's rows in the profile resolution table, optionally
+narrowed by profile, namespace, and consumer kind. The actor filter matches exact
+binding rows; wildcard fallback belongs to profile resolution, not this listing.
 
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
+| Param           | Type   | Required | Notes                                                                                                                                              |
+| --------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `profile_id`    | string | no       |                                                                                                                                                    |
+| `actor`         | string | no       | Defaults to the caller label (`anonymous:local` for an anonymous caller). An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       |                                                                                                                                                    |
+| `consumer_kind` | string | no       |                                                                                                                                                    |
 
 ```
 request(ops="brain.bindings(consumer_kind=\"recall\")")
 ```
+
+The caller's own label is always permitted as an explicit actor filter. There is
+no `all_actors` binding-list mode.
 
 ### `brain.create_profile` — Declaration
 

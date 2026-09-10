@@ -40,6 +40,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,

@@ -1113,3 +1113,60 @@ amendment signed before that branch lands. The census equality assertion enforce
 mechanically: a wider list fails the test until its amendment exists.
 
 ADR-133 Amendment 2 carries the corresponding qualification of D4/INV-1 scope.
+
+## Amendment 5 (2026-09-10): Caller-Scoped Brain Reads
+
+**Status**: Accepted.
+
+### Default and explicit actor scope
+
+`brain.event_counts`, `brain.resolve`, and `brain.bindings` derive their default
+actor scope from the authorized request token, not the identity that constructed
+the registry or started the serving process. The caller label is the actor id
+when its kind is `actor`, and `kind:id` for other actor kinds.
+
+- With `actor` omitted, `brain.event_counts` counts only that caller's events.
+  For kind `actor`, historical bare and `actor:`-prefixed event spellings both
+  match. Only this default view combines those aliases into one
+  `counts_by_actor` key, using the caller label; other kinds match their exact
+  caller label. An empty result has no actor keys.
+- With `actor` omitted, `brain.bindings` returns only binding rows whose actor is
+  the caller label. This is an exact row filter, not the wildcard fallback used
+  during profile resolution.
+- With `actor` omitted, `brain.resolve` resolves the caller's profile, retaining
+  the existing wildcard binding fallback. Anonymous callers remain the exception:
+  their absent actor resolves only wildcard bindings, never an explicit `local`
+  or `anonymous:local` binding. Anonymous event-count and binding-list reads still
+  default to their own `anonymous:local` label, not all actors.
+
+An explicit `actor` is allowed when it names the caller itself or when the
+requested actor id is in the token's visible namespace set. Other actor reads
+fail with `InvalidInput` naming the refused actor. A bare event-count actor filter
+matches bare and `actor:`-prefixed stored labels; an explicitly prefixed filter
+matches that stored label exactly. An exact caller label is permitted before
+prefix interpretation; foreign-actor visibility is checked against the unprefixed
+actor identity. This is a query-scope rule using the
+already-authorized token, not a new storage-isolation boundary. Existing namespace
+and consumer-kind filters retain their meaning.
+
+### Explicit aggregate event counts
+
+`brain.event_counts` accepts optional boolean `all_actors`, defaulting to false.
+`all_actors=true` removes the actor filter only when the serving runtime's
+`brain.fleet_readers` contains the caller's exact actor id. The corresponding
+`[brain] fleet_readers` configuration is a list of strings (`Vec<String>`) and
+defaults to empty. The serving process's resolved configuration is authoritative;
+neither a client's local configuration nor a wider visible namespace set grants
+aggregate access. Allowlisted callers still receive only their own events unless
+they explicitly request `all_actors=true`.
+
+`all_actors=true` and an explicit `actor` are mutually exclusive and fail with
+`InvalidInput`. False or omitted `all_actors` permits an authorized explicit actor
+filter. `all_actors` does not add an aggregate mode to profile resolution or
+binding listing.
+
+Explicit actor filters and aggregate reads preserve historical stored actor keys
+in `counts_by_actor`; alias collapse applies only to the omitted-actor default.
+All existing time-window, event-kind, pagination, truncation, and cost aggregation
+rules remain unchanged within the selected actor scope. No event rows are rewritten,
+and `brain.bind` and `brain.unbind` retain their write contracts.
