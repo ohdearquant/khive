@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
+/// Each fence adds a keyed read while holding the writer, like a batch observation.
+pub const MAX_NOTE_FENCES: usize = 100;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoteFence {
@@ -42,6 +45,15 @@ impl From<NoteFence> for NoteFences {
 }
 
 impl NoteFences {
+    fn validate_count(count: usize) -> RuntimeResult<()> {
+        if count > MAX_NOTE_FENCES {
+            return Err(RuntimeError::InvalidInput(format!(
+                "fence list admits at most {MAX_NOTE_FENCES} entries; this call sent {count}: each fence is a read taken while holding the writer"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn entries(&self) -> &[NoteFence] {
         match self {
             Self::One(fence) => std::slice::from_ref(fence),
@@ -50,6 +62,7 @@ impl NoteFences {
     }
 
     pub fn validate(&self) -> RuntimeResult<()> {
+        Self::validate_count(self.entries().len())?;
         if self.entries().is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "fence list must not be empty".into(),
@@ -76,7 +89,11 @@ impl<'de> Deserialize<'de> for NoteFences {
             One(NoteFence),
             Many(Vec<NoteFence>),
         }
-        let fences = match Shape::deserialize(deserializer)? {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(entries) = value.as_array() {
+            Self::validate_count(entries.len()).map_err(serde::de::Error::custom)?;
+        }
+        let fences = match Shape::deserialize(value).map_err(serde::de::Error::custom)? {
             Shape::One(fence) => Self::One(fence),
             Shape::Many(fences) => Self::Many(fences),
         };

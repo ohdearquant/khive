@@ -193,3 +193,118 @@ async fn ordered_fences_batch_validates_all_members_before_writing() {
         }
     }
 }
+
+#[tokio::test]
+async fn ordered_fences_cap_accepts_exactly_100_on_every_write_surface() {
+    let (_, registry) = batch_surface();
+    let mut fences = Vec::new();
+    for index in 0..100 {
+        let key = format!("fence-cap/{index}");
+        lease(&registry, &key).await;
+        fences.push(fence(&key, 1));
+    }
+    let target = registry
+        .dispatch(
+            "create",
+            json!({"kind":"head","content":"{}","fence":fences}),
+        )
+        .await
+        .unwrap();
+    registry
+        .dispatch(
+            "update",
+            json!({"id":target["id"],"content":"{\"updated\":true}","fence":fences}),
+        )
+        .await
+        .unwrap();
+    registry
+        .dispatch(
+            "stream.append",
+            json!({"stream":"fence-cap","record":1,"fence":fences}),
+        )
+        .await
+        .unwrap();
+    for atomic in [true, false] {
+        let result = registry
+            .dispatch(
+                "stream.batch",
+                json!({"atomic":atomic,"ops":[
+                    {"op":"append","stream":"fence-cap","record":2,"fence":fences}
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["committed"], true);
+    }
+    assert_eq!(heads(&registry, &["fence-cap"]).await, vec![3]);
+    let target = registry
+        .dispatch("get", json!({"id":target["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(target["version"], 2);
+}
+
+#[tokio::test]
+async fn ordered_fences_cap_refuses_before_entry_interpretation_and_writer_admission() {
+    let (rt, registry) = batch_surface();
+    let target = lease(&registry, "target").await;
+    let distinct: Vec<Value> = (0..101)
+        .map(|index| fence(&format!("fence-cap/{index}"), 1))
+        .collect();
+    for fences in [
+        json!(distinct),
+        json!(vec![Value::Null; 101]),
+        json!(vec![fence("duplicate", 0); 101]),
+    ] {
+        let before = population(&rt).await;
+        let before_writers = rt.backend().pool().writer_acquisition_snapshot();
+        for (verb, args) in [
+            (
+                "create",
+                json!({"kind":"head","content":"{}","fence":fences}),
+            ),
+            (
+                "update",
+                json!({"id":target["id"],"content":"{}","fence":fences}),
+            ),
+            (
+                "stream.append",
+                json!({"stream":"fence-cap","record":1,"fence":fences}),
+            ),
+            (
+                "stream.batch",
+                json!({"atomic":true,"ops":[
+                    {"op":"append","stream":"fence-cap","record":1},
+                    {"op":"append","stream":"fence-cap","record":2,"fence":fences}
+                ]}),
+            ),
+            (
+                "stream.batch",
+                json!({"atomic":false,"ops":[
+                    {"op":"append","stream":"fence-cap","record":1},
+                    {"op":"append","stream":"fence-cap","record":2,"fence":fences}
+                ]}),
+            ),
+        ] {
+            let error = registry.dispatch(verb, args).await.unwrap_err();
+            let RuntimeError::InvalidInput(message) = error else {
+                panic!("{verb} must refuse invalid_input: {error}");
+            };
+            assert!(message.contains("at most 100 entries"), "{verb}: {message}");
+            assert!(message.contains("sent 101"), "{verb}: {message}");
+            assert_eq!(population(&rt).await, before, "{verb}");
+            assert_eq!(
+                rt.backend().pool().writer_acquisition_snapshot(),
+                before_writers,
+                "{verb} must refuse before writer admission"
+            );
+        }
+    }
+    assert_eq!(heads(&registry, &["fence-cap"]).await, vec![0]);
+    let after = registry
+        .dispatch("get", json!({"id":target["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(after["version"], target["version"]);
+    assert_eq!(after["content"], target["content"]);
+}
