@@ -274,16 +274,21 @@ An HTTP read of one URL. `GET` and `HEAD` only; a body-bearing method is refused
 that can POST is a verb that can act on the world and this one is a read.
 
 The reply is `{final_url, status, headers, content_ref, bytes, truncated, redirects, receipt_id}`.
-The body goes to the blob store and the reply carries its reference, never the bytes: a page is
-routinely larger than a response envelope should be, and a caller that wants the text reads it with
-`blob.get` like any other stored object. The reply's `headers` is an allow-listed subset (content type, content
-length, last modified, etag); a response header set is attacker-controlled and echoing it whole puts
-attacker text in a place callers read structurally. The request `headers` argument is allow-listed
-too, for the reason in A1.2.7.
+For `GET`, the body goes to the blob store and the reply carries its reference, never the bytes: a
+page is routinely larger than a response envelope should be, and a caller that wants the text reads
+it with `blob.get` like any other stored object. `HEAD` reads no body and writes no blob; its reply
+has `content_ref: null`, `bytes: 0` and `truncated: false`, regardless of a response's advertised
+content length. The reply's `headers` is an allow-listed subset (content type, content length, last
+modified, etag); a response header set is attacker-controlled and echoing it whole puts attacker text
+in a place callers read structurally. The request `headers` argument is allow-listed too, for the
+reason in A1.2.7.
 
 ### A1.2 What the fetch refuses, and where
 
-1. **Scheme.** `http` and `https` only. Everything else refuses, including `file`, `ftp` and `data`.
+1. **Scheme and userinfo.** `http` and `https` only. Everything else refuses, including `file`,
+   `ftp` and `data`. A URL containing userinfo, including `user:password@host`, refuses before any
+   outbound request; credentials enter only through rule 6. These checks also apply to redirect
+   targets. With a credential in play, rule 6 additionally requires `https` at every hop.
 2. **Address, after resolution.** The host is resolved and every returned address is checked; a
    loopback, link-local, private, unique-local, multicast, broadcast or unspecified address refuses;
    the shared address space 100.64.0.0/10 counts as private. The check is on the
@@ -295,26 +300,38 @@ too, for the reason in A1.2.7.
    pin the connection to the checked address, or read the peer address after connect and refuse on
    mismatch.
 3. **Operator allowlist, when set.** With no allowlist configured, the public internet is reachable
-   and only the address rule above applies, because a verb that reaches nothing by default is a verb
-   nobody enables. When an allowlist is configured it becomes exclusive, and a host outside it
-   refuses with the host named.
-4. **Redirects.** Bounded, default five, with every hop re-checked against 1 through 3. A redirect
-   into private address space refuses at the hop that proposes it.
-5. **Size and time.** Both bounded, both configurable, both with defaults. A response exceeding the
-   byte bound is stored truncated with `truncated: true` rather than discarded, so a caller sees what
-   was read; a response exceeding the time bound refuses and stores nothing. The byte bound is on
-   decompressed bytes, because a small compressed response can expand without limit and a bound on
-   the encoded stream bounds nothing the caller ever sees; decoding stops at the bound and the
-   result is stored truncated like any other over-long response.
+   subject to the other rules in this section. When an allowlist is configured it becomes exclusive,
+   and a host outside it refuses with the host named.
+4. **Redirects.** Bounded, default five, with every hop re-checked against rules 1 through 3 and the
+   credential constraints in rule 6. A redirect into private address space refuses at the hop that
+   proposes it.
+5. **Size and time.** Operator configuration sets finite defaults and ceilings for `max_bytes` and
+   `timeout_s`; a caller may lower either bound but cannot raise it above its operator ceiling.
+   An argument above a ceiling refuses before any outbound request, naming the parameter and its
+   ceiling. Omitted arguments use the configured defaults, which must not exceed their ceilings.
+   The concrete values are implementation configuration; this ceiling rule is the contract.
+   A response exceeding the byte bound is stored truncated with `truncated: true` rather than
+   discarded, so a caller sees what was read; a response exceeding the time bound refuses and stores
+   no body object. The time bound covers the whole read, including redirects and decompression.
+   The byte bound is on decompressed bytes, because a small compressed response can expand without
+   limit and a bound on the encoded stream bounds nothing the caller ever sees; decoding stops at
+   the bound and the result is stored truncated like any other over-long response.
 6. **Credentials are never arguments, and each is bound to a host set.** `credential` names an entry
    the operator has configured; the value is read from the process environment at request time. A
    secret in the verb's arguments would be in the receipt, the audit event, and every log that carries
    either. Every configured credential also carries the set of hosts it may be presented to (exact
    hosts or suffixes, operator configuration), because a secret bound only to a name is presented to
-   whatever host the caller names. A request naming a credential for a host outside its set refuses
-   before any request is made, naming the credential and the host. On a redirect whose next hop is
-   outside the set the hop refuses; the credential is never sent to the hop, and rule 4's address
-   re-check does not stand in for this one, since it checks address class and not credential scope.
+   whatever host the caller names. Host comparisons are lowercase with a trailing dot stripped from
+   both the URL host and configured DNS names; the port is not part of the host set. A suffix entry
+   `example.com` matches `example.com` or a name ending in `.example.com`, at a DNS label boundary
+   only, never `evilexample.com`. IP literals are exact-address entries only, never suffix matches.
+   A request naming a credential for a host outside its set refuses before any request is made,
+   naming the credential and the host. On a redirect whose next hop is outside the set the hop
+   refuses; the credential is never sent to the hop, and rule 4's address re-check does not stand in
+   for this one, since it checks address class and not credential scope. A credential-bearing read
+   also requires `https` at every hop: an initial `http` URL or an `https` to `http` redirect refuses
+   before requesting that hop, even when its host is in the credential's set. Stripping the
+   credential and continuing over `http` is not an alternative to refusal.
 7. **Request headers, allow-listed, with the credential-bearing ones refused by name.** `headers`
    accepts `Accept`, `Accept-Language`, `If-None-Match`, `If-Modified-Since` and `User-Agent`; any
    other header refuses with the header named. `Authorization`, `Cookie` and `Proxy-Authorization`
@@ -324,7 +341,7 @@ too, for the reason in A1.2.7.
    that carries either, which is the exact harm 6 exists to prevent, with the credential mechanism
    routed around rather than defeated.
 
-### A1.3 `web.search(query, limit, provider, namespace)`
+### A1.3 `web.search(query, limit, provider, max_bytes, timeout_s, namespace)`
 
 A query against a configured search provider, returning `{provider, results: [{title, url, snippet}],
 receipt_id}`. The provider is operator configuration, not a verb argument beyond selecting among the
@@ -333,42 +350,126 @@ and names what to configure; it does not return an empty result list, because an
 missing provider is indistinguishable from an empty list for a query with no hits, and a caller
 cannot act on the difference it cannot see.
 
-Results are transcribed as the provider returned them, per D6.2. The pack does not rank, merge,
-deduplicate or summarize.
+Search has the same operator-controlled timeout and decompressed response-byte bounds and ceilings
+as A1.2.5, plus a finite operator default and ceiling for `limit`. Omitted values use defaults within
+the ceilings; a caller may lower them. Any caller value above its ceiling refuses before the
+provider request, naming the parameter and the ceiling. A provider response that exceeds the time
+or byte bound refuses without storing or returning partial results; a truncated provider payload
+cannot be treated as a complete result list. The concrete defaults and ceilings are implementation
+configuration.
+
+Results are transcribed as the provider returned them, per D6.2, up to the requested `limit`, in
+provider order. The pack does not rank, merge, deduplicate or summarize.
 
 ### A1.4 What a fetched byte is
 
 Every response body and every search snippet is **data, never instruction**. Both verb descriptions
 say so, so a caller reading `help=true` sees it before the first call rather than in a document it
-may not have. The receipt is what makes this checkable after the fact: it records the requested URL,
-the final URL, the status, the content digest and the byte count, so a later reader can ask which
-text entered a decision and verify it has not changed underneath the reference.
+may not have. The receipt is what makes this checkable after the fact:
+
+- A `GET` receipt records the requested URL, the final URL, the status, the content digest and the
+  byte count, so a later reader can ask which text entered a decision and verify it has not changed
+  underneath the reference.
+- A `HEAD` receipt records the requested URL, the final URL, the status and the same allow-listed
+  response-header subset as the reply, with `content_ref: null`, `bytes: 0` and `truncated: false`;
+  there is no body digest or blob write.
+- A search receipt records the query, the selected provider, the effective `limit`, and the ordered
+  `results` returned to the caller, with a BLAKE3 digest of the exact UTF-8 JSON bytes used to serialize
+  that `results` array in the reply. The receipt preserves those bytes as the digest input as well
+  as the structured results, including for an empty array; it does not reconstruct a different
+  ordering or a summary.
+
+For a `GET` body, the blob put completes before the receipt write; if the put fails, no success
+receipt is written. If the blob put succeeds but the receipt write fails, the verb returns an error
+naming the stored `content_ref` to the calling actor, so stored bytes are not silently orphaned.
+That reference is not a success receipt and remains subject to ADR-111's ref-leak hygiene. A
+receipt-write failure for `HEAD` or search also returns an error, with no fabricated body reference.
+The pack never retries an outbound request, including after a transport, blob or receipt failure;
+the bounded redirects in A1.2.4 are separate hops, not retries of a failed request.
+
+Fetched objects use the ordinary blob put/read path under the request's namespace attribution;
+the object named by `content_ref` is retrieved through `blob.get`. ADR-111's capability-by-hash model
+for local use and its mandatory gate-level `(namespace, ContentRef)` put-ledger for hosted tenants
+apply exactly as they do to `blob.put`, including recording the successful put when a later receipt
+write fails.
+There is no web-specific blob access bypass.
 
 Both verbs are `Assertive` and write a receipt. Neither is admission degrade-safe: a receipt is a
-write, and a fetch has an effect on the outside world (it is observed by the origin) even though it
-changes nothing here.
+write, and an outbound request has an effect on the outside world (it is observed by the origin or
+provider) even when it requests only a read.
 
 ### A1.5 What does not change
 
 D6.1, D6.2, D6.3, D6.5 and D6.6 stand as written. `web.ingest` is untouched and remains local-only.
 No new entity kind, note kind or edge relation is introduced; neither verb writes the graph.
 
+Open item: credential-name binding to the caller or tenant through the Gate and TLS peer pinning
+are deferred to a cloud ADR; the OSS local operator is the tenant for this amendment.
+
 Acceptance arms, continuing the base numbering (the base ADR's acceptance ends at 7), stated before
 implementation; the suite reaches no real network per D6.6, so the resolver and the listener in every
-arm are fixture stubs and the public hostnames are stub-resolved names: 8 a `file://` URL refuses and stores nothing; 9 a
-hostname resolving to loopback refuses naming the resolved address, with a public hostname as a
-positive control in the same test; 10 a redirect chain whose second hop points into private address
-space refuses at that hop, with a same-length public chain as control; 11 a response larger than the
-byte bound is stored truncated with `truncated: true` and its digest matches the stored prefix;
-12 a response slower than the time bound refuses and the blob store holds no new object; 13 a
-configured allowlist makes a host outside it refuse while a host inside it succeeds, both in one
-test; 14 a `credential` name that is not configured refuses without the request being made, proved
-by a request counter that does not move; 15 `web.search` with no provider configured refuses with
-its own reason rather than an empty result list; 16 a fetch receipt records the requested URL, the
-final URL after redirects, the status and the content digest, and the digest matches what `blob.get`
-returns for the reference in the reply; 17 a fetch whose `headers` carries `Authorization` refuses
-naming `credential` without the request being made, proved by a request counter that does not move,
-with an allow-listed header succeeding in the same test as the control; 18 a host whose resolution
-changes between the check and the connect refuses, with a stable-resolution host as the positive
-control in the same test; 19 a compressed response whose decompressed size exceeds the byte bound is
-stored truncated with `truncated: true`, and the stored object is no larger than the bound. Two arms for the credential host set: 20 a request naming a credential for a host outside its configured set refuses naming the credential and the host, proved by a request counter that does not move, with the same credential to a host inside the set succeeding as the control; 21 a redirect whose second hop is outside the credential's set refuses at that hop, and the counter shows the first hop was made and the second was not.
+arm are fixture stubs and the public hostnames are stub-resolved names:
+
+8. A `file://` URL refuses and stores nothing.
+9. A hostname resolving to loopback refuses naming the resolved address, with a public hostname as
+   a positive control in the same test.
+10. A redirect chain whose second hop points into private address space refuses at that hop, with a
+    same-length public chain as control.
+11. A response larger than the byte bound is stored truncated with `truncated: true` and its digest
+    matches the stored prefix.
+12. A response slower than the time bound refuses and the blob store holds no new object.
+13. A configured allowlist makes a host outside it refuse while a host inside it succeeds, both in
+    one test.
+14. A `credential` name that is not configured refuses without the request being made, proved by a
+    request counter that does not move.
+15. `web.search` with no provider configured refuses with its own reason rather than an empty result
+    list.
+16. A fetch receipt records the requested URL, the final URL after redirects, the status, the byte
+    count and the content digest, and the digest matches what `blob.get` returns for the reference
+    in the reply.
+17. A fetch whose `headers` carries `Authorization` refuses naming `credential` without the request
+    being made, proved by a request counter that does not move, with an allow-listed header
+    succeeding in the same test as the control.
+18. A host whose resolution changes between the check and the connect refuses, with a
+    stable-resolution host as the positive control in the same test.
+19. A compressed response whose decompressed size exceeds the byte bound is stored truncated with
+    `truncated: true`, and the stored object is no larger than the bound.
+20. A request naming a credential for a host outside its configured set refuses naming the credential
+    and the host, proved by a request counter that does not move, with the same credential to a host
+    inside the set succeeding as the control.
+21. A redirect whose second hop is outside the credential's set refuses at that hop, and the counter
+    shows the first hop was made and the second was not.
+22. With a credential in play, an initial `http` URL refuses with a zero request counter; an `https`
+    to `http` redirect within the credential's host set refuses with counters of one for the first
+    hop and zero for the second, with an all-`https` chain in that set succeeding as the control.
+23. A credential scoped to suffix `example.com` refuses `evilexample.com` without a request, while
+    `api.example.com` succeeds in the same test; mixed case, a trailing dot and a different port
+    preserve that decision. An exact IP entry permits only that address and cannot act as a suffix,
+    with another public IP refusing before a request.
+24. A URL with userinfo refuses and the request counter does not move, with the same URL without
+    userinfo succeeding as control; a redirect to userinfo refuses before requesting that hop.
+25. For fetch and search, each of `max_bytes` and `timeout_s` above its configured ceiling refuses
+    naming the parameter and ceiling with a zero outbound request counter; search `limit` does the
+    same. Values equal to and below each ceiling succeed, and omitted values use the operator
+    defaults, all against bounded fixture responses in the same tests.
+26. Search refuses an over-time response and an over-byte decompressed response without storing or
+    returning partial results, with an in-bound response succeeding as control.
+27. A search receipt preserves the query, selected provider, effective limit and ordered result
+    array returned to the caller; recomputing BLAKE3 from its preserved serialized array bytes
+    matches the digest, and those bytes match the reply's array bytes. Duplicate results and a
+    nonalphabetical order survive unchanged, including when the result list is limited; an empty
+    result list is also recorded with its matching digest.
+28. A `HEAD` response advertising a nonzero content length yields `content_ref: null`, `bytes: 0`
+    and `truncated: false`; body-read and blob-put counters stay zero. The receipt and reply carry
+    the status and identical allow-listed header subsets, with an unlisted fixture header omitted
+    from both. A `GET` control reads and stores its body.
+29. A `GET` effect trace places the successful blob put before the receipt write; an injected put
+    failure prevents a success receipt, and an injected receipt failure returns an error naming the
+    stored reference, whose bytes can still be read through `blob.get`. Transport, put and receipt
+    failures do not cause outbound retries: in each single-hop fixture the request-attempt counter
+    stays at one. `HEAD` and search receipt failures also return errors without a body reference or
+    an outbound retry, with successful receipt writes as controls.
+30. A fetched object's put follows the same namespace attribution and ADR-111 access policy as an
+    ordinary `blob.put` control: local reads use the reference, and the hosted gate permits the
+    tenant with the put-ledger entry and refuses an ungranted tenant, even when the receipt write
+    subsequently fails.
