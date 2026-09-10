@@ -1140,7 +1140,10 @@ when its kind is `actor`, and `kind:id` for other actor kinds.
   default to their own `anonymous:local` label, not all actors.
 
 An explicit `actor` is allowed when it names the caller itself or when the
-requested actor id is in the token's visible namespace set. Other actor reads
+requested actor id is in the token's visible namespace set. That visibility test
+is exact string equality between the requested actor id and one entry of the
+token's `visible_namespaces` list: no prefix match, no pattern, and no
+derivation of a namespace from the actor id. Other actor reads
 fail with `InvalidInput` naming the refused actor. A bare event-count actor filter
 matches bare and `actor:`-prefixed stored labels; an explicitly prefixed filter
 matches that stored label exactly. An exact caller label is permitted before
