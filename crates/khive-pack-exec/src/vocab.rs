@@ -55,11 +55,11 @@ const P_TREE: ParamDef = ParamDef {
 pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     HandlerDef {
         name: "exec.tree",
-        description: "Store a tree manifest from entries [{path, ref, mode}] and return its reference. Paths are relative and normalized, modes are 644 or 755, duplicates and symlinks are refused.",
+        description: "Store a tree manifest from entries [{path, ref, mode}] and return its reference. Paths are relative and normalized; modes are 644, 755 or 120000 (symlink with literal target bytes in its blob). Duplicates and entries below a file or symlink path are refused.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
-            ParamDef { name: "entries", param_type: "array", required: true, description: "Entries [{path, ref, mode}]; an empty array is the empty tree.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "entries", param_type: "array", required: true, description: "Entries [{path, ref, mode}]; modes 644/755 are files and 120000 is a symlink. An empty array is the empty tree.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },
@@ -77,7 +77,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
         category: VerbCategory::Declaration,
         params: &[
             P_TREE,
-            ParamDef { name: "edits", param_type: "array", required: true, description: "Edits [{path, and exactly one of ref | content | delete:true, plus optional mode}]; an empty array is refused.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "edits", param_type: "array", required: true, description: "Edits [{path, and exactly one of ref | content | delete:true, plus optional mode}]; modes are 644, 755 or 120000 (literal symlink target bytes). Omitted mode preserves an existing mode or defaults to 644; an empty array is refused.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },

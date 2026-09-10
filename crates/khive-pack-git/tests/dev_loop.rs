@@ -351,6 +351,36 @@ impl Fixture {
             .to_string()
     }
 
+    async fn indexed_tree(&self) -> String {
+        let blobs = tree::blob_store(&self.rt).expect("blob store");
+        let listing = self.git_bytes(&["ls-files", "-s", "-z"]);
+        let mut entries = Vec::new();
+        for record in listing
+            .split(|byte| *byte == 0)
+            .filter(|row| !row.is_empty())
+        {
+            let tab = record.iter().position(|byte| *byte == b'\t').unwrap();
+            let metadata = std::str::from_utf8(&record[..tab]).unwrap();
+            let fields: Vec<_> = metadata.split_whitespace().collect();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[2], "0", "fixture must have no unmerged entries");
+            let mode = match fields[0] {
+                "100644" => 644,
+                "100755" => 755,
+                "120000" => 120000,
+                mode => panic!("unexpected index mode {mode}"),
+            };
+            let path = std::str::from_utf8(&record[tab + 1..]).unwrap();
+            let bytes = self.git_bytes(&["cat-file", "blob", fields[1]]);
+            let content = blobs.put(bytes).await.expect("store index blob");
+            entries.push(json!({"path":path,"ref":content.as_str(),"mode":mode}));
+        }
+        self.call("exec.tree", json!({"entries":entries})).await["tree"]
+            .as_str()
+            .expect("tree ref")
+            .to_string()
+    }
+
     async fn blob(&self, reference: &str) -> Vec<u8> {
         tree::blob_store(&self.rt)
             .expect("blob store")
@@ -549,6 +579,43 @@ async fn arm14_ref_move_race_preserves_rival_with_atomic_compare() {
         .expect_err("CAS_CONTROL_COMPARE_MUST_REFUSE")
         .to_string();
     f.refusal_receipt(&error).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.commit", "allow").await;
+    let index = std::fs::read(f.repo.join(".git/index")).expect("index before");
+    let worktree = std::fs::read(f.repo.join("a.txt")).expect("worktree before");
+    let target = b"../missing-\xff\n";
+    let manifest = f.tree(&[("link", target, 120000)]).await;
+    let result = f.call("git.commit", f.commit_params(&manifest)).await;
+    let sha = result["sha"].as_str().expect("commit SHA");
+    assert_eq!(f.git_text(&["rev-parse", &format!("{sha}^")]), f.base);
+    assert_eq!(
+        f.git_bytes(&["ls-tree", "-r", "--name-only", sha]),
+        b"link\n"
+    );
+    assert!(f
+        .git_text(&["ls-tree", "-r", sha, "link"])
+        .starts_with("120000 blob "));
+    assert_eq!(
+        f.git_bytes(&["cat-file", "blob", &format!("{sha}:link")]),
+        target
+    );
+    assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), sha);
+    assert_eq!(std::fs::read(f.repo.join(".git/index")).unwrap(), index);
+    assert_eq!(std::fs::read(f.repo.join("a.txt")).unwrap(), worktree);
+    assert!(std::fs::symlink_metadata(f.repo.join("link")).is_err());
+    f.success_receipt(&result).await;
+    let error = f
+        .err("git.checkout", json!({"repo":f.repo,"ref":sha}))
+        .await;
+    assert!(error.contains("unsupported_entry"), "{error}");
+    let receipt = f.refusal_receipt(&error).await;
+    assert_eq!(receipt["verb"], "git.checkout");
+    assert_eq!(receipt["reason"], "unsupported_entry");
 }
 
 #[tokio::test]
@@ -972,6 +1039,87 @@ async fn diff_bytes_and_inputs_match_independent_native_oracle_for_commits_and_t
             row["inputs"],
             json!({"input_kind":kind,"base":base,"head":target})
         );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn tree_diff_symlink_changes_match_native_git_patches() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new(true, false).await;
+    let mut base = f.indexed_tree().await;
+    let mut base_git = f.git_text(&["write-tree"]);
+    let unchanged = f
+        .call(
+            "git.diff",
+            json!({"repo":f.repo,"input_kind":"trees","base":base,"head":base}),
+        )
+        .await;
+    assert!(f.blob(unchanged["diff"].as_str().unwrap()).await.is_empty());
+    assert_eq!(
+        unchanged["summary"],
+        json!({"files":0,"additions":0,"deletions":0})
+    );
+
+    for (change, mode, bytes) in [
+        ("add", Some(120000), b"./a.txt".as_slice()),
+        ("retarget", Some(120000), b"./removed.txt".as_slice()),
+        ("symlink_to_file", Some(644), b"./removed.txt".as_slice()),
+        ("file_to_symlink", Some(120000), b"./removed.txt".as_slice()),
+        ("remove", None, b"".as_slice()),
+    ] {
+        let link = f.repo.join("link");
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link).expect("remove previous entry");
+        }
+        match mode {
+            Some(120000) => symlink(OsStr::from_bytes(bytes), &link).expect("symlink"),
+            Some(644) => std::fs::write(&link, bytes).expect("regular file"),
+            None => {}
+            _ => unreachable!("fixture modes are fixed"),
+        }
+        f.git_bytes(&["add", "--all"]);
+        let head = f.indexed_tree().await;
+        let head_git = f.git_text(&["write-tree"]);
+        let oracle = f.git_bytes(&[
+            "diff-tree",
+            "-p",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-renames",
+            &base_git,
+            &head_git,
+        ]);
+        let result = f
+            .call(
+                "git.diff",
+                json!({"repo":f.repo,"input_kind":"trees","base":base,"head":head}),
+            )
+            .await;
+        let patch = f.blob(result["diff"].as_str().unwrap()).await;
+        assert_eq!(patch, oracle, "{change} must match native Git");
+        let text = std::str::from_utf8(&patch).expect("fixture diff is UTF-8");
+        let expected: &[&str] = match change {
+            "add" => &["new file mode 120000", "+./a.txt"],
+            "retarget" => &[" 120000", "-./a.txt", "+./removed.txt"],
+            "symlink_to_file" => &["deleted file mode 120000", "new file mode 100644"],
+            "file_to_symlink" => &["deleted file mode 100644", "new file mode 120000"],
+            "remove" => &["deleted file mode 120000", "-./removed.txt"],
+            _ => unreachable!("fixture changes are fixed"),
+        };
+        for marker in expected {
+            assert!(
+                text.contains(marker),
+                "{change}: missing {marker:?} in {text}"
+            );
+        }
+        f.success_receipt(&result).await;
+        base = head;
+        base_git = head_git;
     }
 }
 

@@ -19,6 +19,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_keep(false)
+}
+
+fn fixture_with_keep(keep: bool) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
@@ -32,7 +36,7 @@ fn fixture() -> Fixture {
             max_output_bytes: Some(128),
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
-            keep: false,
+            keep,
             limits: Default::default(),
         },
         // No embedding model: tool.register would otherwise build the default
@@ -262,6 +266,141 @@ async fn tree_put_applies_edits_and_leaves_the_base_tree_alone() {
 }
 
 #[tokio::test]
+async fn tree_put_preserves_symlink_targets_and_classifies_mode_flips() {
+    let f = fixture();
+    let base = f
+        .tree(&[("plain", b"target", 644), ("executable", b"target", 755)])
+        .await;
+    let target_ref = f.put(b"target").await;
+    let created = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "link", "content": "./target", "mode": 120000 },
+                { "path": "plain", "ref": target_ref, "mode": 120000 },
+                { "path": "executable", "ref": target_ref, "mode": 120000 },
+            ]}),
+        )
+        .await;
+    let linked = created["tree"].as_str().unwrap();
+    let entries = entries_of(&f, linked).await;
+    assert!(entries.iter().all(|(_, _, mode)| *mode == 120000));
+    assert_eq!(entries[1].1, f.put(b"./target").await);
+    let changes: Vec<(&str, &str)> = created["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["op"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("executable", "modified"),
+            ("link", "added"),
+            ("plain", "modified"),
+        ]
+    );
+    assert_eq!(
+        created["changed"],
+        f.call("exec.tree_diff", json!({ "base": base, "head": linked }))
+            .await["changed"]
+    );
+
+    let retargeted = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": linked, "edits": [
+                { "path": "link", "content": "../other" },
+                { "path": "plain", "content": "target", "mode": 644 },
+                { "path": "executable", "ref": target_ref, "mode": 755 },
+            ]}),
+        )
+        .await;
+    let head = retargeted["tree"].as_str().unwrap();
+    assert_eq!(
+        entries_of(&f, head).await,
+        vec![
+            ("executable".into(), target_ref.clone(), 755),
+            ("link".into(), f.put(b"../other").await, 120000),
+            ("plain".into(), target_ref.clone(), 644),
+        ]
+    );
+    assert_eq!(retargeted["changed"].as_array().unwrap().len(), 3);
+    assert!(retargeted["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|change| change["op"] == "modified"));
+    assert_eq!(
+        retargeted["changed"],
+        f.call("exec.tree_diff", json!({ "base": linked, "head": head }))
+            .await["changed"]
+    );
+
+    let deleted = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": head, "edits": [{ "path": "link", "delete": true }] }),
+        )
+        .await;
+    assert_eq!(deleted["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(deleted["changed"][0]["path"], "link");
+    assert_eq!(deleted["changed"][0]["op"], "deleted");
+    assert_eq!(
+        deleted["tree"], base,
+        "all original file modes are restored"
+    );
+    assert_eq!(entries_of(&f, linked).await, entries, "trees are immutable");
+}
+
+#[tokio::test]
+async fn tree_symlink_mode_does_not_allow_invalid_modes_or_descendant_entries() {
+    let f = fixture();
+    let target_ref = f.put(b"../outside").await;
+    let tree = f.tree(&[("link", b"../outside", 120000)]).await;
+    assert_eq!(
+        entries_of(&f, &tree).await,
+        vec![("link".into(), target_ref.clone(), 120000)]
+    );
+    for mode in [777, 0o120777, 0o120000, 100644] {
+        let err = f
+            .call_err(
+                "exec.tree",
+                json!({ "entries": [{ "path": "link", "ref": target_ref, "mode": mode }] }),
+            )
+            .await;
+        assert!(err.contains("mode"), "{err}");
+        let err = f
+            .call_err(
+                "exec.tree_put",
+                json!({ "tree": tree, "edits": [{ "path": "link", "ref": target_ref, "mode": mode }] }),
+            )
+            .await;
+        assert!(err.contains("mode"), "{err}");
+    }
+    let err = f
+        .call_err(
+            "exec.tree",
+            json!({ "entries": [
+                { "path": "link", "ref": target_ref, "mode": 120000 },
+                { "path": "link/child", "ref": target_ref, "mode": 644 },
+            ]}),
+        )
+        .await;
+    assert!(err.contains("link"), "{err}");
+    let before = blob_object_count(&f);
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": tree, "edits": [{ "path": "link/child", "content": "child" }] }),
+        )
+        .await;
+    assert!(err.contains("link"), "{err}");
+    assert_eq!(blob_object_count(&f), before);
+    assert_eq!(entries_of(&f, &tree).await.len(), 1);
+}
+
+#[tokio::test]
 async fn tree_put_deletes_only_paths_the_tree_holds() {
     let f = fixture();
     let base = f.tree(&[("a", b"1", 644), ("b", b"2", 644)]).await;
@@ -346,12 +485,12 @@ async fn tree_put_refuses_edits_that_do_not_name_exactly_one_action() {
         ),
         (
             json!([{ "path": "a", "content": "x", "mode": 777 }]),
-            "644 or 755",
+            "644, 755 or 120000",
         ),
         (json!([{ "path": "../escape", "content": "x" }]), "escape"),
         (
             json!([{ "path": "a", "content": "x", "mode": 0o644 }]),
-            "644 or 755",
+            "644, 755 or 120000",
         ),
     ] {
         let err = f
@@ -593,6 +732,397 @@ async fn refusals_write_receipts_and_touch_no_disk() {
     assert!(root_is_empty(&f));
 }
 
+#[tokio::test]
+async fn run_refuses_symlink_cwd_escapes_and_cycles_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let cases = [
+        vec![("link", b"/usr".as_slice(), 120000)],
+        vec![("link", b"../outside".as_slice(), 120000)],
+        vec![
+            ("link", b"links/hop".as_slice(), 120000),
+            ("links/hop", b"../../outside".as_slice(), 120000),
+        ],
+        // Lexically cancelling redirect/.. before following redirect would
+        // incorrectly hide this absolute escape.
+        vec![
+            ("link", b"redirect/..".as_slice(), 120000),
+            ("redirect", b"/usr".as_slice(), 120000),
+        ],
+        vec![
+            ("link", b"next".as_slice(), 120000),
+            ("next", b"link".as_slice(), 120000),
+        ],
+    ];
+    for entries in cases {
+        let tree = f.tree(&entries).await;
+        let error = f
+            .call_err(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","args":["-c","true"],
+                    "actor":"local","cwd":"link"}),
+            )
+            .await;
+        assert!(
+            error.contains("cwd") && error.contains("symlink"),
+            "{error}"
+        );
+        let id = error
+            .split("receipt_id=")
+            .nth(1)
+            .expect("refusal names its receipt")
+            .trim_end_matches(')');
+        let receipt = f.call("exec.receipt", json!({"id":id})).await;
+        assert_eq!(receipt["denied"], true, "{receipt}");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert!(receipt["reason"].as_str().unwrap().contains("cwd"));
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["started_at"].is_null());
+        assert!(root_is_empty(&f), "preflight must not materialize anything");
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":id})).await["count"],
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_deep_shared_prefix_manifest_refuses_missing_cwd_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let content_ref = f.put(b"x").await;
+    let mut tree = f
+        .tree(&[("a-sibling/file", b"x", 644), ("start", b"a", 120000)])
+        .await;
+    let prefix = "a/".repeat(250_000);
+    for leaf in 0..12 {
+        let params = json!({"tree":tree,"edits":[{
+            "path":format!("{prefix}leaf-{leaf}"),"ref":content_ref,"mode":644,
+        }]});
+        assert!(serde_json::to_vec(&params).unwrap().len() < 1024 * 1024);
+        let out = f.call("exec.tree_put", params).await;
+        assert_eq!(out["entries"], json!(leaf + 3));
+        tree = out["tree"].as_str().unwrap().to_string();
+    }
+    let stat = f.call("blob.stat", json!({"content_ref":tree})).await;
+    let manifest_bytes = stat["size"].as_u64().unwrap();
+    assert!(manifest_bytes >= 6_000_000, "{stat}");
+    assert!(manifest_bytes < 8 * 1024 * 1024, "{stat}");
+    assert!(!f.root.exists());
+
+    for (cwd, missing) in [
+        ("missing", "missing"),
+        ("a/missing", "a/missing"),
+        ("start/missing", "a/missing"),
+    ] {
+        let error = f
+            .call_err(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local","cwd":cwd,
+                    "args":["-c","printf launched > child-output"]}),
+            )
+            .await;
+        let id = error
+            .split("receipt_id=")
+            .nth(1)
+            .expect("missing-directory refusal names its durable receipt")
+            .trim_end_matches(')');
+        let receipt = f.call("exec.receipt", json!({"id":id})).await;
+        let reason = khive_runtime::RuntimeError::InvalidInput(format!(
+            "cwd {cwd:?} directory {missing:?} is absent from the manifest"
+        ))
+        .to_string();
+        assert_eq!(receipt["reason"], json!(reason));
+        assert!(error.contains(&reason), "{error}");
+        assert_eq!(receipt["denied"], true);
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert_eq!(receipt["cwd"], json!(cwd));
+        assert!(receipt["started_at"].is_null());
+        assert!(receipt["exit_code"].is_null());
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["profile_ref"].is_null());
+        assert!(receipt["sandbox"].is_null());
+        assert!(receipt["pids"].is_null());
+        assert!(receipt["stdout_ref"].is_null());
+        assert!(receipt["stderr_ref"].is_null());
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":id})).await["count"],
+            0
+        );
+        assert!(!f.root.join(id).exists());
+        assert!(!f.root.join(format!("{id}.sb")).exists());
+        assert!(!f.root.exists(), "preflight must not create the run root");
+    }
+}
+
+async fn cwd_preflight_refusal(f: &Fixture, tree: &str, cwd: &str) -> String {
+    let error = f
+        .call_err(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","args":["-c","true"],
+                "actor":"local","cwd":cwd}),
+        )
+        .await;
+    let id = error
+        .split("receipt_id=")
+        .nth(1)
+        .expect("refusal names its durable receipt")
+        .trim_end_matches(')');
+    let receipt = f.call("exec.receipt", json!({"id":id})).await;
+    assert_eq!(receipt["denied"], true, "{receipt}");
+    assert_eq!(receipt["success"], false);
+    assert_eq!(receipt["decision"]["decision"], "allow");
+    assert!(receipt["started_at"].is_null());
+    assert!(receipt["exit_code"].is_null());
+    assert!(receipt["tree_out"].is_null());
+    let reason = receipt["reason"]
+        .as_str()
+        .expect("preflight refusal reason");
+    assert!(
+        reason.contains("cwd") && reason.contains("symlink"),
+        "{reason}"
+    );
+    assert!(error.contains(reason), "{error}");
+    assert!(root_is_empty(f), "preflight must not materialize anything");
+    assert_eq!(
+        f.call("exec.events", json!({"run_id":id})).await["count"],
+        0
+    );
+    reason.to_string()
+}
+
+#[tokio::test]
+async fn run_refuses_oversized_symlink_cwd_target_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/".repeat(1024 * 1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(
+        reason.contains("target") && reason.contains("read"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("65536") && reason.contains("bytes"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cycle"), "{reason}");
+}
+
+#[tokio::test]
+async fn run_refuses_raw_cwd_path_budgets_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("dir/file", b"unchanged", 644)]).await;
+    for (cwd, unit) in [
+        ("x".repeat(64 * 1024 + 1), "bytes"),
+        (format!("dir{}", "/".repeat(1024)), "components"),
+    ] {
+        let reason = cwd_preflight_refusal(&f, &tree, &cwd).await;
+        assert!(
+            reason.contains("path exceeds") && reason.contains(unit),
+            "{reason}"
+        );
+        assert!(!reason.contains("cycle"), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn run_bounds_raw_symlink_components_and_skips_pending_noops() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/".repeat(1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(
+        reason.contains("path exceeds") && reason.contains("components"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cycle"), "{reason}");
+
+    for suffix in ["/", "/."] {
+        let target = format!("link{}", suffix.repeat(1023));
+        let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+        let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+        assert!(reason.contains("cycle"), "{reason}");
+        assert!(!reason.contains("budget"), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn run_refuses_symlink_cwd_pending_component_budget_before_cycle() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/..".repeat(1023));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(reason.contains("pending component budget"), "{reason}");
+    assert!(reason.contains("4096"), "{reason}");
+    assert!(!reason.contains("cycle"), "{reason}");
+}
+
+#[tokio::test]
+async fn run_refuses_symlink_cwd_pending_byte_budget_before_cycle() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link/{}", "x".repeat(32 * 1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(reason.contains("pending byte budget"), "{reason}");
+    assert!(reason.contains("262144"), "{reason}");
+    assert!(!reason.contains("cycle"), "{reason}");
+
+    let name = "x".repeat(32 * 1024);
+    let tree = f.tree(&[(name.as_str(), name.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, &name).await;
+    assert!(reason.contains("cycle"), "{reason}");
+    assert!(!reason.contains("budget"), "{reason}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_resolves_relative_symlink_cwd_chains_inside_the_manifest() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f
+        .tree(&[
+            ("dir/file", b"from directory", 644),
+            ("dir/inner/keep", b"nested", 644),
+            ("links/hop", b"../alias", 120000),
+            ("alias", b"dir/./inner/..", 120000),
+        ])
+        .await;
+    for cwd in ["dir", "links/hop"] {
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","args":["-c","cat file"],
+                    "actor":"local","cwd":cwd}),
+            )
+            .await;
+        assert_eq!(out["receipt"]["success"], true, "{out}");
+        assert_eq!(out["receipt"]["cwd"], "dir");
+        assert_eq!(
+            f.blob_text(&out["receipt"]["stdout_ref"]).await,
+            "from directory"
+        );
+        assert_eq!(out["receipt"]["tree_out"], tree);
+        assert!(root_is_empty(&f));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_materialize_symlink_failure_persists_receipt_and_cleans_up() {
+    for keep in [false, true] {
+        let f = fixture_with_keep(keep);
+        f.register_sh("sh", "allow").await;
+        let tree = f
+            .tree(&[
+                ("a-file", b"materialized before failure", 644),
+                ("b-link", b"a-file", 120000),
+                ("c-invalid-link", b"a-file\0suffix", 120000),
+            ])
+            .await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local","cwd":".",
+                    "args":["-c","printf launched > child-output"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["denied"], false, "{receipt}");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert!(receipt["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("materialize "));
+        assert!(receipt["finished_at"].is_string());
+        assert!(receipt["started_at"].is_null());
+        assert!(receipt["exit_code"].is_null());
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["profile_ref"].is_null());
+        assert!(receipt["sandbox"].is_null());
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(out["changed"], json!([]));
+        let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
+        assert_eq!(&stored, receipt, "the materialization failure is durable");
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":receipt["id"]})).await["count"],
+            0,
+            "a partial materialization is not a materialized or launched run"
+        );
+
+        let id = receipt["id"].as_str().unwrap();
+        let run_dir = f.root.join(id);
+        assert!(!f.root.join(format!("{id}.sb")).exists());
+        assert!(!run_dir.exists());
+        assert!(
+            root_is_empty(&f),
+            "partial trees must be removed even when keep={keep}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
+    // chmod 000 must make a real read fail; a root test runner is not a
+    // substitute for the daemon's unprivileged execution environment.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run this regression as a non-root user"
+    );
+    for keep in [false, true] {
+        let f = fixture_with_keep(keep);
+        f.register_sh("sh", "allow").await;
+        let tree = f.tree(&[]).await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local",
+                    "args":["-c","printf readable > a-readable && printf secret > z-unreadable && chmod 000 z-unreadable && printf created"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["exit_code"], 0, "the command completed: {receipt}");
+        assert_eq!(f.blob_text(&receipt["stdout_ref"]).await, "created");
+        assert_eq!(receipt["denied"], false);
+        assert_eq!(receipt["success"], false);
+        assert!(receipt["reason"]
+            .as_str()
+            .unwrap()
+            .contains("capture entry \"z-unreadable\""));
+        assert!(
+            receipt["tree_out"].is_null(),
+            "no partial tree may be claimed"
+        );
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(out["changed"], json!([]));
+        assert!(receipt["finished_at"].is_string());
+        let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
+        assert_eq!(&stored, receipt, "the failed receipt is durable");
+        let events = f.call("exec.events", json!({"run_id":receipt["id"]})).await;
+        let kinds: Vec<&str> = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["materialized", "launched", "exited"]);
+        assert!(
+            root_is_empty(&f),
+            "both the run directory and profile must be removed"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_captures_output_changes_and_receipt() {
@@ -673,6 +1203,263 @@ async fn run_captures_output_changes_and_receipt() {
         .collect();
     assert_eq!(kinds, vec!["materialized", "launched", "exited"]);
     assert!(root_is_empty(&f));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_captures_symlink_creation_retargeting_removal_and_mode_flips() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f
+        .tree(&[
+            ("target", b"body", 644),
+            ("dir/file", b"nested", 644),
+            ("retarget", b"target", 120000),
+            ("remove", b"target", 120000),
+            ("to-file", b"target", 120000),
+            ("to-link", b"target", 644),
+        ])
+        .await;
+    let script = "set -e; ln -s './dir/../target' created; \
+        rm retarget; ln -s dir/file retarget; rm remove; ln -s dir dir-link; \
+        rm to-file; printf target > to-file; rm to-link; ln -s target to-link";
+    let out = f
+        .call(
+            "exec.run",
+            json!({ "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local" }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["skipped"], json!([]));
+    let changed: Vec<(&str, &str)> = out["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["op"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        changed,
+        vec![
+            ("created", "added"),
+            ("dir-link", "added"),
+            ("remove", "deleted"),
+            ("retarget", "modified"),
+            ("to-file", "modified"),
+            ("to-link", "modified"),
+        ]
+    );
+    let head = receipt["tree_out"].as_str().unwrap();
+    assert_eq!(
+        entries_of(&f, head).await,
+        vec![
+            ("created".into(), f.put(b"./dir/../target").await, 120000),
+            ("dir-link".into(), f.put(b"dir").await, 120000),
+            ("dir/file".into(), f.put(b"nested").await, 644),
+            ("retarget".into(), f.put(b"dir/file").await, 120000),
+            ("target".into(), f.put(b"body").await, 644),
+            ("to-file".into(), f.put(b"target").await, 644),
+            ("to-link".into(), f.put(b"target").await, 120000),
+        ],
+        "directory links are entries, and their descendants are never captured"
+    );
+    assert_eq!(
+        out["changed"],
+        f.call("exec.tree_diff", json!({ "base": tree, "head": head }))
+            .await["changed"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_denies_writes_through_escaping_symlinks_and_allows_inside_targets() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let outside = f._dir.path().join("outside.txt");
+    std::fs::write(&outside, b"unchanged").expect("outside control file");
+    for target in [
+        b"../../outside.txt".as_slice(),
+        outside.as_os_str().as_bytes(),
+    ] {
+        let tree = f
+            .tree(&[
+                ("inside", b"before", 644),
+                ("inside-link", b"inside", 120000),
+                ("escape", target, 120000),
+            ])
+            .await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({
+                    "tree": tree, "tool": "sh", "actor": "local",
+                    "args": ["-c", "set -e; printf changed > inside-link; printf escaped > escape"],
+                    "declared_write_paths": ["inside", "inside-link", "escape"],
+                }),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_ne!(receipt["exit_code"], 0, "{receipt}");
+        assert_eq!(receipt["success"], false, "{receipt}");
+        assert_eq!(receipt["denied"], false, "the tool was launched: {receipt}");
+        let stderr = f.blob_text(&receipt["stderr_ref"]).await;
+        assert!(
+            stderr.contains("ermitted") || stderr.contains("ermission"),
+            "the kernel refusal must be reported in stderr: {stderr:?}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+        assert_eq!(receipt["undeclared_changes"], json!([]));
+        assert_eq!(
+            entries_of(&f, receipt["tree_out"].as_str().unwrap()).await,
+            vec![
+                ("escape".into(), f.put(target).await, 120000),
+                ("inside".into(), f.put(b"changed").await, 644),
+                ("inside-link".into(), f.put(b"inside").await, 120000),
+            ],
+            "the inside write control succeeds while the outside target stays unchanged"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_materialized_symlinks_round_trip_losslessly_through_git() {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::process::Command;
+
+    let f = fixture_with_keep(true);
+    f.register_sh("sh", "allow").await;
+    let repo = tempfile::tempdir().expect("git fixture");
+    let git_dir = repo.path().join(".git");
+    let git = |worktree: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("--work-tree")
+            .arg(worktree)
+            .args(["-c", "core.symlinks=true", "-c", "core.filemode=true"])
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .expect("launch fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(repo.path(), &["init", "--quiet"]);
+    std::fs::write(repo.path().join("target.txt"), b"payload\n").unwrap();
+    std::fs::create_dir(repo.path().join("dir")).unwrap();
+    std::fs::write(repo.path().join("dir/child.txt"), b"nested\n").unwrap();
+    for (name, target) in [
+        ("file-link", "target.txt"),
+        ("dir-link", "dir"),
+        ("dangling-link", "missing"),
+    ] {
+        symlink(target, repo.path().join(name)).expect("tracked fixture symlink");
+    }
+    git(repo.path(), &["add", "--force", "--all", "."]);
+    let original = String::from_utf8(git(repo.path(), &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let index = String::from_utf8(git(repo.path(), &["ls-files", "-s", "-z"]))
+        .expect("fixture index paths are UTF-8");
+    let mut manifest = Vec::new();
+    let mut symlinks = 0;
+    for entry in index.split('\0').filter(|entry| !entry.is_empty()) {
+        let (header, path) = entry.split_once('\t').expect("git index entry");
+        let mut fields = header.split_whitespace();
+        let mode = match fields.next().expect("git mode") {
+            "100644" => 644,
+            "100755" => 755,
+            "120000" => {
+                symlinks += 1;
+                120000
+            }
+            mode => panic!("unexpected fixture mode: {mode}"),
+        };
+        let object = fields.next().expect("git blob id");
+        assert_eq!(fields.next(), Some("0"));
+        let bytes = git(repo.path(), &["cat-file", "blob", object]);
+        manifest.push(json!({ "path": path, "ref": f.put(&bytes).await, "mode": mode }));
+    }
+    assert_eq!(symlinks, 3, "the source index must contain actual symlinks");
+    let input = f.call("exec.tree", json!({ "entries": manifest })).await;
+    let tree = input["tree"].as_str().unwrap();
+    let out = f
+        .call(
+            "exec.run",
+            json!({ "tree": tree, "tool": "sh", "args": ["-c", ":"], "actor": "local" }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], true, "{receipt}");
+    let materialized = f.root.join(receipt["id"].as_str().unwrap());
+
+    // Git reads the actual materialization, so matching target blobs cannot conceal a mode loss.
+    git(&materialized, &["add", "--force", "--all", "."]);
+    let rebuilt = String::from_utf8(git(&materialized, &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let diff = git(
+        &materialized,
+        &["diff-tree", "--no-commit-id", "-r", &original, &rebuilt],
+    );
+    assert!(
+        diff.is_empty(),
+        "materializing the manifest must preserve Git's tree: {}",
+        String::from_utf8_lossy(&diff)
+    );
+    assert_eq!(receipt["tree_out"], tree);
+    assert_eq!(receipt["skipped"], json!([]));
+    for (name, target) in [
+        ("file-link", "target.txt"),
+        ("dir-link", "dir"),
+        ("dangling-link", "missing"),
+    ] {
+        assert!(std::fs::symlink_metadata(materialized.join(name))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(materialized.join(name)).unwrap(),
+            Path::new(target)
+        );
+    }
+
+    std::fs::remove_file(materialized.join("file-link")).unwrap();
+    std::fs::write(materialized.join("file-link"), b"target.txt").unwrap();
+    git(&materialized, &["add", "--all", "."]);
+    let changed = String::from_utf8(git(&materialized, &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let patch = String::from_utf8(git(
+        &materialized,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "-p",
+            &original,
+            &changed,
+        ],
+    ))
+    .unwrap();
+    assert!(patch.contains("deleted file mode 120000"), "{patch}");
+    assert!(patch.contains("new file mode 100644"), "{patch}");
 }
 
 #[cfg(target_os = "macos")]

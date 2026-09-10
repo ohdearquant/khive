@@ -88,10 +88,10 @@ fn edit_mode(edit: &Value, index: usize) -> Result<Option<u64>, RuntimeError> {
             let mode = value.as_u64().ok_or_else(|| {
                 RuntimeError::InvalidInput(format!("edits[{index}].mode must be an integer"))
             })?;
-            // Modes here are the decimal 644 and 755 the manifest stores, not octal literals.
-            if mode != 644 && mode != 755 {
+            // Manifest modes are decimal spellings, not octal permission literals.
+            if mode != 644 && mode != 755 && mode != 120000 {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "edits[{index}].mode must be 644 or 755, got {mode}"
+                    "edits[{index}].mode must be 644, 755 or 120000, got {mode}"
                 )));
             }
             Ok(Some(mode))
@@ -642,7 +642,9 @@ async fn preflight(
     tree::verify_blobs(rt, &entries)
         .await
         .map_err(|e| format!("tree: {e}"))?;
-    let cwd = tree::validate_cwd(&req.cwd).map_err(|e| e.to_string())?;
+    let cwd = tree::resolve_cwd(rt, &entries, &req.cwd)
+        .await
+        .map_err(|e| e.to_string())?;
     receipt.cwd = cwd;
     Ok(Ready {
         binary,
@@ -656,22 +658,66 @@ fn materialize(
     entries: &[TreeEntry],
     bytes: &BTreeMap<String, Vec<u8>>,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(run_dir)?;
+    std::fs::create_dir(run_dir)?;
+    let result = materialize_entries(run_dir, entries, bytes);
+    if result.is_err() {
+        // Remove only the fresh root we own, never a pre-existing root whose
+        // create_dir failed. A partial input tree is not a keepable run.
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+    result
+}
+
+fn materialize_entries(
+    run_dir: &Path,
+    entries: &[TreeEntry],
+    bytes: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // Populate directories and files before creating any links. Filesystem aliases
+    // (including case-insensitive names) must not redirect a later materialization write.
     for entry in entries {
         let target = run_dir.join(&entry.path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        if entry.mode == 120000 {
+            continue;
+        }
         let data = bytes
             .get(&entry.content_ref)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        std::fs::write(&target, data)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
+        file.write_all(data)?;
         let mode = if entry.mode == 755 { 0o755 } else { 0o644 };
         #[cfg(unix)]
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         #[cfg(not(unix))]
         let _ = mode;
+    }
+    for entry in entries.iter().filter(|entry| entry.mode == 120000) {
+        let data = bytes
+            .get(&entry.content_ref)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::os::unix::fs::symlink(
+                std::ffi::OsStr::from_bytes(data),
+                run_dir.join(&entry.path),
+            )?;
+        }
+        #[cfg(not(unix))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink materialization requires a unix host",
+        ));
     }
     Ok(())
 }
@@ -738,9 +784,13 @@ async fn execute(
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
     let run_dir = root.join(&receipt.id);
-    materialize(&run_dir, &ready.entries, &bytes).map_err(|e| {
-        RuntimeError::Unconfigured(format!("materialize {}: {e}", run_dir.display()))
-    })?;
+    if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
+        receipt.success = false;
+        receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
+        receipt.finished_at = Some(receipts::now_micros());
+        // No profile or child exists yet. Return through run's receipt insertion.
+        return Ok(());
+    }
     receipts::event(
         rt,
         ns,
@@ -944,79 +994,99 @@ async fn execute(
     receipt.stdout_ref = Some(store.put(out_bytes).await?.as_str().to_string());
     receipt.stderr_ref = Some(store.put(err_bytes).await?.as_str().to_string());
 
-    // Capture the tree.
-    let (found, skipped) = walk(&run_dir).unwrap_or_default();
-    receipt.skipped = skipped;
-    let input: BTreeMap<&str, &TreeEntry> =
-        ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let mut out_entries: Vec<TreeEntry> = Vec::new();
-    let mut changes: Vec<Change> = Vec::new();
-    let mut undeclared: BTreeSet<String> = BTreeSet::new();
-    for (path, file) in &found {
-        let data = std::fs::read(&file.abs).unwrap_or_default();
-        let digest = digest_hex(&data);
-        match input.get(path.as_str()) {
-            Some(old) if old.content_ref == digest && old.mode == file.mode => {
-                out_entries.push((*old).clone());
-            }
-            existing => {
-                let allowed = req
-                    .declared
-                    .as_ref()
-                    .is_none_or(|d| declared_covers(d, path));
-                if !allowed {
-                    undeclared.insert(path.clone());
-                    if let Some(old) = existing {
-                        out_entries.push((*old).clone());
-                    }
-                    continue;
+    // Capture errors describe a completed, unsuccessful run. Finalize its
+    // receipt rather than propagating past receipt insertion in `run`.
+    let captured: Result<(), RuntimeError> = async {
+        let (found, skipped) =
+            walk(&run_dir).map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+        receipt.skipped = skipped;
+        let input: BTreeMap<&str, &TreeEntry> =
+            ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+        let mut out_entries: Vec<TreeEntry> = Vec::new();
+        let mut changes: Vec<Change> = Vec::new();
+        let mut undeclared: BTreeSet<String> = BTreeSet::new();
+        for (path, file) in &found {
+            let data = file
+                .read_content()
+                .map_err(|e| RuntimeError::Unconfigured(format!("capture entry {path:?}: {e}")))?;
+            let digest = digest_hex(&data);
+            match input.get(path.as_str()) {
+                Some(old) if old.content_ref == digest && old.mode == file.mode => {
+                    out_entries.push((*old).clone());
                 }
-                let stored = store.put(data).await?;
-                let entry = TreeEntry {
-                    path: path.clone(),
-                    content_ref: stored.as_str().to_string(),
-                    mode: file.mode,
-                };
-                changes.push(Change {
-                    path: path.clone(),
-                    op: if existing.is_some() {
-                        "modified"
-                    } else {
-                        "added"
-                    },
-                    content_ref: Some(entry.content_ref.clone()),
-                    base_ref: existing.map(|e| e.content_ref.clone()),
-                });
-                out_entries.push(entry);
+                existing => {
+                    let allowed = req
+                        .declared
+                        .as_ref()
+                        .is_none_or(|d| declared_covers(d, path));
+                    if !allowed {
+                        undeclared.insert(path.clone());
+                        if let Some(old) = existing {
+                            out_entries.push((*old).clone());
+                        }
+                        continue;
+                    }
+                    let stored = store.put(data).await?;
+                    let entry = TreeEntry {
+                        path: path.clone(),
+                        content_ref: stored.as_str().to_string(),
+                        mode: file.mode,
+                    };
+                    changes.push(Change {
+                        path: path.clone(),
+                        op: if existing.is_some() {
+                            "modified"
+                        } else {
+                            "added"
+                        },
+                        content_ref: Some(entry.content_ref.clone()),
+                        base_ref: existing.map(|e| e.content_ref.clone()),
+                    });
+                    out_entries.push(entry);
+                }
             }
         }
-    }
-    for (path, old) in &input {
-        if found.contains_key(*path) {
-            continue;
+        for (path, old) in &input {
+            if found.contains_key(*path) {
+                continue;
+            }
+            let allowed = req
+                .declared
+                .as_ref()
+                .is_none_or(|d| declared_covers(d, path));
+            if !allowed {
+                undeclared.insert(path.to_string());
+                out_entries.push((*old).clone());
+                continue;
+            }
+            changes.push(Change {
+                path: path.to_string(),
+                op: "deleted",
+                content_ref: None,
+                base_ref: Some(old.content_ref.clone()),
+            });
         }
-        let allowed = req
-            .declared
-            .as_ref()
-            .is_none_or(|d| declared_covers(d, path));
-        if !allowed {
-            undeclared.insert(path.to_string());
-            out_entries.push((*old).clone());
-            continue;
-        }
-        changes.push(Change {
-            path: path.to_string(),
-            op: "deleted",
-            content_ref: None,
-            base_ref: Some(old.content_ref.clone()),
-        });
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        receipt.changed = changes;
+        receipt.undeclared = undeclared.into_iter().collect();
+        receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
+        receipt.success =
+            !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+
+        Ok(())
     }
-    changes.sort_by(|a, b| a.path.cmp(&b.path));
-    receipt.changed = changes;
-    receipt.undeclared = undeclared.into_iter().collect();
-    receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
-    receipt.success =
-        !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+    .await;
+    if let Err(error) = captured {
+        receipt.success = false;
+        receipt.reason = Some(error.to_string());
+        receipt.tree_out = None;
+        receipt.changed.clear();
+        receipt.undeclared.clear();
+        // A partial capture is never retained as a purported output tree,
+        // including when successful runs would otherwise be kept.
+        cleanup(&run_dir, &profile_path, false);
+        return Ok(());
+    }
 
     cleanup(&run_dir, &profile_path, cfg.keep);
     Ok(())
@@ -1068,4 +1138,123 @@ fn read_limit_report(reader: libc::c_int) -> Value {
     let mut text = String::new();
     let _ = file.read_to_string(&mut text);
     serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn materialize_preserves_literal_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("run");
+        let targets: &[(&str, &[u8])] = &[
+            ("inside", b"sub/../file"),
+            ("escape", b"../../x"),
+            ("absolute", b"/absolute/missing"),
+            ("non_utf8", b"target-\xff"),
+        ];
+        let mut entries = vec![TreeEntry {
+            path: "file".into(),
+            content_ref: digest_hex(b"content"),
+            mode: 644,
+        }];
+        let mut blobs = BTreeMap::from([(digest_hex(b"content"), b"content".to_vec())]);
+        for (path, target) in targets {
+            let content_ref = digest_hex(target);
+            entries.push(TreeEntry {
+                path: (*path).into(),
+                content_ref: content_ref.clone(),
+                mode: 120000,
+            });
+            blobs.insert(content_ref, target.to_vec());
+        }
+        materialize(&root, &entries, &blobs).unwrap();
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"content");
+        for (path, expected) in targets {
+            let path = root.join(path);
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_link(path).unwrap().as_os_str().as_bytes(),
+                *expected
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_symlink_aliases_never_redirect_file_writes() {
+        for descendant in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let sentinel = outside.join("child");
+            std::fs::write(&sentinel, b"unchanged").unwrap();
+            let link_target = if descendant {
+                outside.clone()
+            } else {
+                sentinel.clone()
+            };
+            let target = link_target.as_os_str().as_bytes().to_vec();
+            let link_ref = digest_hex(&target);
+            let file_ref = digest_hex(b"replacement");
+            let entries = vec![
+                TreeEntry {
+                    path: "A".into(),
+                    content_ref: link_ref.clone(),
+                    mode: 120000,
+                },
+                TreeEntry {
+                    path: if descendant { "a/child" } else { "a" }.into(),
+                    content_ref: file_ref.clone(),
+                    mode: 644,
+                },
+            ];
+            let bytes = BTreeMap::from([(link_ref, target), (file_ref, b"replacement".to_vec())]);
+            let root = dir.path().join("run");
+            let result = materialize(&root, &entries, &bytes);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            match result {
+                Ok(()) => {
+                    // A case-sensitive filesystem can represent both paths safely.
+                    assert!(std::fs::symlink_metadata(root.join("A"))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                    assert_eq!(
+                        std::fs::read(root.join(if descendant { "a/child" } else { "a" })).unwrap(),
+                        b"replacement"
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                    assert!(!root.exists(), "the partial input tree must be removed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn materialize_refuses_an_existing_root_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("run");
+        std::fs::create_dir(&root).unwrap();
+        let existing = root.join("file");
+        std::fs::write(&existing, b"unchanged").unwrap();
+        let content_ref = digest_hex(b"replacement");
+        let entries = vec![TreeEntry {
+            path: "file".into(),
+            content_ref: content_ref.clone(),
+            mode: 644,
+        }];
+        let bytes = BTreeMap::from([(content_ref, b"replacement".to_vec())]);
+        assert_eq!(
+            materialize(&root, &entries, &bytes).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(existing).unwrap(), b"unchanged");
+    }
 }
