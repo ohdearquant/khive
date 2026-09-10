@@ -19,6 +19,27 @@ use crate::entity_type::EntityTypeDef;
 /// registry construction enforce one exact contract.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
 
+/// Tag marking a `tool` pack registry object.
+///
+/// The value is on-disk data on every row the tool registry has ever minted,
+/// so it is not free to change.
+pub const TOOL_REGISTRY_TAG: &str = "tool-registry";
+
+/// Tags whose presence makes an entity a pack's registry row.
+///
+/// Such a row is not ordinary metadata: its fields are policy inputs. The
+/// tool registry's `source` names the binary a granted tool name resolves to,
+/// and `side_effect` is read at run time and handed to the policy decision, so
+/// a caller who can patch the row can change what a granted name does without
+/// registering anything. The generic entity verbs therefore refuse to write a
+/// row carrying one of these tags, including a patch that would remove the tag
+/// itself, and the owning pack's verbs are the only writer.
+///
+/// This is a list rather than a field allow-list on purpose: a list of
+/// protected properties goes stale the first time a pack adds a
+/// capability-bearing property, which is exactly how `side_effect` was missed.
+pub const PACK_REGISTRY_TAGS: &[&str] = &[TOOL_REGISTRY_TAG];
+
 /// Visibility tier for a handler.
 ///
 /// `Verb` entries appear on the MCP wire and are invokable by agents.
