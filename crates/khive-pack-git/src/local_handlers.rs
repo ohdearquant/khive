@@ -108,12 +108,26 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
             "session_id",
         ],
         "git.reconcile" => &["receipt"],
+        "git.init" => &["repo", "branch", "session_id"],
         _ => return Err(Failure::refused("invalid_params")),
     };
     validate_keys(params, keys)?;
     optional(params, "session_id")?;
     if verb == "git.reconcile" {
         required(params, "receipt")?;
+        return Ok(());
+    }
+    // `git.init` is the one local verb whose target is deliberately NOT a repository yet, so the
+    // shared validate_repo_path check below, which requires a `.git` entry, would refuse every
+    // legitimate call. Its own preconditions are checked in local_git::init against the live path.
+    if verb == "git.init" {
+        let repo = Path::new(required(params, "repo")?);
+        if !repo.is_absolute() {
+            return Err(Failure::refused("invalid_params"));
+        }
+        if let Some(branch) = optional(params, "branch")? {
+            validate_ref_name("branch", branch).map_err(|_| Failure::refused("invalid_params"))?;
+        }
         return Ok(());
     }
     let repo = Path::new(required(params, "repo")?);
@@ -157,6 +171,7 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
         "git.branch" => &["name", "from", "expected"],
         "git.commit" => &["branch", "tree", "message", "expected_head"],
         "git.reconcile" => &["receipt"],
+        "git.init" => &["branch"],
         _ => &[],
     };
     let mut inputs = serde_json::Map::new();
@@ -397,6 +412,15 @@ impl GitPack {
         prior: Option<Receipt>,
     ) -> Result<Value, Failure> {
         match verb {
+            "git.init" => {
+                let branch = optional(params, "branch")?.unwrap_or("main");
+                let head = local_git::init(repo, branch).await?;
+                let result = json!({"repo":repo.display().to_string(), "branch":head,
+                    "receipt_id":receipt.id});
+                receipt.result = result.clone();
+                receipts::persist(self.runtime(), receipt).await?;
+                Ok(result)
+            }
             "git.checkout" => {
                 let result =
                     local_git::checkout(self.runtime(), repo, required(params, "ref")?).await?;
@@ -642,6 +666,102 @@ impl GitPack {
         )
         .await?;
         Ok(page.to_value())
+    }
+
+    /// The allowlist match, the gate decision and the read, in that order, for a verb that owns
+    /// no credential and writes no receipt. `git.gates` established this shape (ADR-182
+    /// Amendment 4 item 4): the match is repo-only, and `gate.id` is the lowest matching entry
+    /// index, so removing a duplicate row never changes which id a caller already saw.
+    async fn read_gate(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        verb: &'static str,
+        repo: &str,
+    ) -> Result<(PathBuf, usize), RuntimeError> {
+        let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
+        let (canonical, index) = allowlist
+            .match_entry(Path::new(repo), None)
+            .map_err(|error| RuntimeError::InvalidInput(gate_reason(&error).into()))?;
+        let decision = checked_policy(registry, token, verb).await?;
+        if decision["decision"] != "allow" {
+            return Err(RuntimeError::InvalidInput("policy_denied".into()));
+        }
+        Ok((canonical, index))
+    }
+
+    pub(crate) async fn handle_status(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let invalid = || RuntimeError::InvalidInput("invalid_params".into());
+        validate_keys(&params, &["repo", "untracked", "limit"]).map_err(|_| invalid())?;
+        let repo = required(&params, "repo").map_err(|_| invalid())?;
+        let untracked = optional(&params, "untracked")
+            .map_err(|_| invalid())?
+            .unwrap_or("normal");
+        let limit = match params.get("limit") {
+            None => 1000,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=5000).contains(n))
+                .ok_or_else(invalid)? as usize,
+        };
+        let (canonical, index) = self.read_gate(token, registry, "git.status", repo).await?;
+        let result = local_git::status(&canonical, untracked, limit)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.code().into()))?;
+        let entries = serde_json::to_value(&result.entries)
+            .map_err(|_| RuntimeError::Internal("status entries did not serialize".into()))?;
+        let branch = serde_json::to_value(&result.branch)
+            .map_err(|_| RuntimeError::Internal("status branch did not serialize".into()))?;
+        Ok(json!({
+            "repo": canonical.display().to_string(),
+            "gate": {"decision":"allow", "source":"git_write.allowed", "id": index},
+            "branch": branch,
+            "entries": entries,
+            "total": result.total,
+            "truncated": result.total > result.entries.len(),
+            "clean": result.total == 0,
+        }))
+    }
+
+    pub(crate) async fn handle_log(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let invalid = || RuntimeError::InvalidInput("invalid_params".into());
+        validate_keys(&params, &["repo", "ref", "limit", "path"]).map_err(|_| invalid())?;
+        let repo = required(&params, "repo").map_err(|_| invalid())?;
+        let reference = optional(&params, "ref")
+            .map_err(|_| invalid())?
+            .unwrap_or("HEAD");
+        let path = optional(&params, "path").map_err(|_| invalid())?;
+        let limit = match params.get("limit") {
+            None => 100,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=500).contains(n))
+                .ok_or_else(invalid)? as usize,
+        };
+        let (canonical, index) = self.read_gate(token, registry, "git.log", repo).await?;
+        let commits = local_git::log(&canonical, reference, limit, path)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.code().into()))?;
+        let truncated = commits.len() == limit;
+        let commits = serde_json::to_value(&commits)
+            .map_err(|_| RuntimeError::Internal("log entries did not serialize".into()))?;
+        Ok(json!({
+            "repo": canonical.display().to_string(),
+            "gate": {"decision":"allow", "source":"git_write.allowed", "id": index},
+            "ref": reference,
+            "commits": commits,
+            "truncated": truncated,
+        }))
     }
 
     pub(crate) async fn handle_gates(

@@ -164,11 +164,13 @@ impl PackRuntime for GitPack {
             "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
                 self.handle_remote(token, registry, verb, params).await
             }
-            "git.checkout" | "git.diff" | "git.reconcile" => {
+            "git.init" | "git.checkout" | "git.diff" | "git.reconcile" => {
                 self.handle_local(token, registry, verb, params).await
             }
             "git.receipts" => self.handle_receipts(token, registry, params).await,
             "git.gates" => self.handle_gates(token, registry, params).await,
+            "git.status" => self.handle_status(token, registry, params).await,
+            "git.log" => self.handle_log(token, registry, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "git pack does not handle verb {verb:?}"
             ))),
