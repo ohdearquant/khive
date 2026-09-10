@@ -362,13 +362,21 @@ returns more than this many results for a single query regardless of
 `--limit` — paging works around that ceiling by advancing an `updated:>=`
 floor between calls, not by requesting more than one page can hold.
 
+Each fetch requests the remaining fresh-record visit budget, capped at
+`PAGE_LIMIT`, rather than always requesting 1,000 rows. The limit additionally
+reserves room for exact acknowledged records at the queried inclusive floor and
+for undated acknowledgments, still under the same 1,000-row cap. Those records
+are replayed without spending the visit budget; omitting their allowance would
+strand a `max_items=1` resume behind an already acknowledged timestamp tie.
+An unbounded admin-ingest budget keeps the full page cap.
+
 `PageOutcome` is pure and unit-testable independent of `gh`, the database,
 or async machinery — the entire "was the remote window proven exhausted"
 decision lives here (ADR-088 Amendment 1): a single hard-coded `--limit
 1000` fetch could previously report `done: true` while a repo's remaining
 PRs/issues past position 1000 were never seen.
 
-- `WindowComplete`: the page held fewer than `PAGE_LIMIT` items — the
+- `WindowComplete`: the page held fewer than the actual requested limit — the
   remote window is proven exhausted regardless of local budget state.
 - `StopBudgetExhausted`: the page was full and the local budget is
   exhausted — stop paging, but the window is NOT proven exhausted.
@@ -381,7 +389,9 @@ PRs/issues past position 1000 were never seen.
 
 Only `WindowComplete` lets `done` stay `true` on the local-budget question
 alone; every other outcome means more remote records may exist past the
-last fetched page.
+last fetched page. In particular, a full reduced page does not prove exhaustion
+just because it holds fewer than 1,000 records. The remaining budget and replay
+allowance are recomputed before every subsequent fetch.
 
 ## `ingest_prs` / `ingest_issues` cursor semantics
 

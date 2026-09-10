@@ -32,6 +32,8 @@ use uuid::Uuid;
 
 #[path = "support/digest_commit_resume.rs"]
 mod digest_commit_resume;
+#[path = "support/digest_fetch_budget.rs"]
+mod digest_fetch_budget;
 #[path = "support/digest_resume.rs"]
 mod digest_resume;
 #[path = "support/digest_scale.rs"]
