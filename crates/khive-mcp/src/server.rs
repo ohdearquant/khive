@@ -71,6 +71,20 @@ const _: () = assert!(
     "the search diagnostic budget must retain at least one backend cause"
 );
 const MISSING_BACKEND_ERROR_MESSAGE: &str = "backend search failed without diagnostic detail";
+/// Server-named retry pace for ADR-130 Amendment 2. One failed backend uses
+/// the published 2s floor; a wider all-timeout outage adds 250ms per extra
+/// failed leg, capped at 10s. The full failure set (including omitted
+/// diagnostics) controls the value.
+const SEARCH_RETRY_AFTER_FLOOR_MS: u64 = 2_000;
+const SEARCH_RETRY_AFTER_PER_FAILED_BACKEND_MS: u64 = 250;
+const SEARCH_RETRY_AFTER_CEILING_MS: u64 = 10_000;
+
+fn search_retry_after_ms(failed_backend_count: usize) -> u64 {
+    let extra_backends = u64::try_from(failed_backend_count.saturating_sub(1)).unwrap_or(u64::MAX);
+    SEARCH_RETRY_AFTER_FLOOR_MS
+        .saturating_add(extra_backends.saturating_mul(SEARCH_RETRY_AFTER_PER_FAILED_BACKEND_MS))
+        .min(SEARCH_RETRY_AFTER_CEILING_MS)
+}
 
 /// Per-operation completeness discriminator for the `search` verb (ADR-130
 /// §1). `SearchDegradation::status == None` means "not a search op" — no
@@ -158,6 +172,7 @@ struct SearchDegradation {
     status: Option<SearchStatus>,
     retryable: bool,
     arm_participation: Option<SearchArmParticipation>,
+    retry_after_ms: Option<u64>,
     missing_backends: Vec<String>,
     backend_errors: BTreeMap<String, BackendErrorDiagnostic>,
     backend_errors_omitted: usize,
@@ -177,6 +192,7 @@ impl SearchDegradation {
             status: Some(SearchStatus::Complete),
             retryable: false,
             arm_participation: Some(arm_participation),
+            retry_after_ms: None,
             missing_backends: Vec::new(),
             backend_errors: BTreeMap::new(),
             backend_errors_omitted: 0,
@@ -246,6 +262,7 @@ impl SearchDegradation {
                 .iter()
                 .filter_map(|backend| backend.error.as_ref())
                 .all(|failure| failure.kind == BackendSearchFailureKind::Timeout);
+        let retry_after_ms = retryable.then(|| search_retry_after_ms(failed_backend_count));
         let mut candidates = BTreeMap::new();
         for (backend, failure) in result
             .per_backend
@@ -277,6 +294,7 @@ impl SearchDegradation {
                 status: Some(SearchStatus::Partial),
                 retryable,
                 arm_participation: Some(arm_participation),
+                retry_after_ms,
                 missing_backends: candidate.keys().cloned().collect(),
                 backend_errors_omitted: failed_backend_count.saturating_sub(candidate.len()),
                 backend_errors: candidate.clone(),
@@ -321,6 +339,7 @@ impl SearchDegradation {
             status: Some(status),
             retryable,
             arm_participation: Some(arm_participation),
+            retry_after_ms,
             missing_backends,
             backend_errors,
             backend_errors_omitted,
@@ -435,6 +454,11 @@ fn backend_errors_value(errors: &BTreeMap<String, BackendErrorDiagnostic>) -> Va
 }
 
 fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
+    debug_assert_eq!(
+        degradation.retryable,
+        degradation.retry_after_ms.is_some(),
+        "retryable search failures must always carry a server-named pace"
+    );
     let mut value = json!({
         "kind": "search_incomplete",
         "message": "no-match was not established because selected backends failed",
@@ -444,6 +468,8 @@ fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
     });
     if let Some(participation) = degradation.arm_participation {
         value["arm_participation"] = search_arm_participation_value(participation);
+    if let Some(retry_after_ms) = degradation.retry_after_ms {
+        value["retry_after_ms"] = json!(retry_after_ms);
     }
     if degradation.backend_errors_omitted > 0 {
         value["backend_errors_truncated"] = Value::Bool(true);
@@ -2915,6 +2941,7 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         status,
         retryable: _,
         arm_participation,
+        retry_after_ms: _,
         missing_backends,
         backend_errors,
         backend_errors_omitted,
@@ -3310,8 +3337,14 @@ filtering, the op instead fails outright with ok:false and
 error.kind="search_incomplete" while retaining the same diagnostics — that case
 must not be read as "no results found." Per-backend causes use kind="timeout"
 for typed deadline failures and kind="backend_error" otherwise. The incomplete
-error is retryable only when every failed backend leg timed out; callers still
-apply their own backoff and retry admission.
+error is retryable only when every failed backend leg timed out. Every such
+error names retry_after_ms: 2000ms plus 250ms per additional failed backend,
+capped at 10000ms and computed from the full pre-truncation failure set.
+Conforming clients use at most three total attempts per logical request,
+exponential backoff with nonnegative jitter (never shorter than the named
+pace), and a 30s circuit breaker after three consecutive all-timeout outcomes
+for the same backend set; the breaker suppresses first attempts too and admits
+one half-open probe after the open interval.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -7934,9 +7967,35 @@ mod tests {
         let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
 
         assert_eq!(diagnostic["retryable"], json!(true));
+        assert_eq!(diagnostic["retry_after_ms"], json!(2_000));
         assert_eq!(
             diagnostic["backend_errors"]["archive"]["kind"],
             json!("timeout")
+        );
+    }
+
+    #[test]
+    fn search_retry_pace_scales_with_the_full_failed_backend_set_and_is_capped() {
+        assert_eq!(search_retry_after_ms(1), 2_000);
+        assert_eq!(search_retry_after_ms(2), 2_250);
+        assert_eq!(search_retry_after_ms(9), 4_000);
+        assert_eq!(search_retry_after_ms(usize::MAX), 10_000);
+    }
+
+    #[test]
+    fn search_failure_classification_does_not_parse_timeout_from_backend_error_text() {
+        let result = degraded_search_result([(
+            "archive".to_string(),
+            BackendSearchFailure::backend("backend search timed out after 5000ms"),
+        )]);
+
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
+
+        assert_eq!(diagnostic["retryable"], json!(false));
+        assert!(diagnostic.get("retry_after_ms").is_none());
+        assert_eq!(
+            diagnostic["backend_errors"]["archive"]["kind"],
+            json!("backend_error")
         );
     }
 
@@ -7956,6 +8015,7 @@ mod tests {
         let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
 
         assert_eq!(diagnostic["retryable"], json!(false));
+        assert!(diagnostic.get("retry_after_ms").is_none());
         assert_eq!(
             diagnostic["backend_errors"]["archive"]["kind"],
             json!("timeout")
@@ -8007,6 +8067,7 @@ mod tests {
 
         assert!(degradation.backend_errors_omitted > 0);
         assert_eq!(diagnostic["retryable"], json!(true));
+        assert!(diagnostic["retry_after_ms"].as_u64().unwrap() > 2_000);
     }
 
     #[test]
@@ -9453,6 +9514,7 @@ mod tests {
                         candidate_count: 0,
                     },
                 }),
+                retry_after_ms: None,
                 missing_backends: vec!["archive".to_string()],
                 backend_errors: BTreeMap::from([(
                     "archive".to_string(),
