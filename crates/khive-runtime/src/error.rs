@@ -1026,10 +1026,12 @@ mod channel_ingest_failure_class_tests {
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
         let first = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: None,
             masked: "first-rendering".to_string(),
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
         });
 
