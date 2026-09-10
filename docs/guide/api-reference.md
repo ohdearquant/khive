@@ -27,7 +27,7 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 15    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
@@ -36,7 +36,8 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its fifteen verbs are `git.digest` (read/ingest), the three
+`kkernel git-ingest` CLI drive. Its sixteen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+stored ingest cursor and checkpoint for one project and source kind), the three
 write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
@@ -2261,7 +2262,7 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 15 verbs
+## `git` pack — 16 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
@@ -2369,6 +2370,13 @@ observed 300,000 ms bound is the MCP client's request default, so large
 `max_items` values can outlive a particular caller's wait while the daemon
 continues the pass. The durable receipt is the recovery contract; the item
 bound is not silently clamped to a transport-specific duration.
+
+### `git.ingest_cursor` — Assertive
+
+Reads the stored ingest cursor and checkpoint for a `project` and source kind in one
+snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of
+resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor
+writes (ADR-088 Amendment 1).
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
