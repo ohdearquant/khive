@@ -3011,9 +3011,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 // =============================================================================
 
 /// A purely-synchronous `SqlReader`/`SqlWriter` over a borrowed connection,
-/// used ONLY to drive an [`AtomicUnitOp`] on the queued file-backed path,
-/// where the closure body runs inside the writer task's `spawn_blocking`
-/// (synchronous
+/// used to drive an [`AtomicUnitOp`] on the queued or in-memory path, where the
+/// closure body runs inside a `spawn_blocking` (synchronous
 /// `FnOnce(&rusqlite::Connection) -> ...`) rather than a real async context.
 ///
 /// Every method here does plain, non-suspending rusqlite work — there is no
@@ -3039,7 +3038,7 @@ struct InlineWriter {
 // SAFETY: `InlineWriter` is never actually shared across a real thread
 // boundary — it is constructed, driven to completion synchronously via
 // `block_on_sync`, and dropped within a single call frame inside the
-// writer task's `spawn_blocking` closure (see `atomic_unit`). The `Send`
+// `spawn_blocking` closure (see `atomic_unit`). The `Send`
 // bound `async_trait` imposes on the futures below is a static
 // over-approximation for this restricted, single-threaded usage pattern.
 unsafe impl Send for InlineWriter {}
@@ -3197,8 +3196,7 @@ fn block_on_sync<F: std::future::Future>(fut: F) -> Result<F::Output, StorageErr
 
 /// Run `op` under a manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on `writer`
 /// — the pre-ADR-067 shape, used by [`SqlBridge::atomic_unit`] whenever no
-/// writer task applies: no runtime, a read-only pool, or an in-memory pool,
-/// which this branch preserves byte-for-byte.
+/// writer task applies to a file-backed pool.
 async fn run_manual_atomic_unit(
     writer: &mut dyn khive_storage::SqlWriter,
     op: AtomicUnitOp,
@@ -3383,8 +3381,7 @@ impl khive_storage::SqlAccess for SqlBridge {
     }
 
     /// Implements the trait's atomic-unit suspend-free invariant
-    /// (`SqlAccess::atomic_unit`'s doc comment): on the queued file-backed
-    /// branch below,
+    /// (`SqlAccess::atomic_unit`'s doc comment): on the queued and in-memory branches,
     /// `op` is driven through `block_on_sync` on an `InlineWriter` — a
     /// single-poll driver that returns `Err` the instant `op`'s future is
     /// `Pending` instead of ever actually suspending. `op` must therefore
@@ -3486,15 +3483,51 @@ impl khive_storage::SqlAccess for SqlBridge {
             };
             run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         } else {
-            // In-memory units share one SQLite connection. Keep the pool-wide
-            // unit slot across BEGIN, awaited statements, and COMMIT/ROLLBACK;
-            // PoolBackedWriter's per-statement writer guard is a separate lock.
-            let _unit_slot =
-                acquire_in_memory_write_unit(&self.pool, "sql_bridge.atomic_unit_handle").await?;
-            let mut writer = PoolBackedWriter {
-                pool: Arc::clone(&self.pool),
-            };
-            run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
+            // Every statement shares one connection. Keep its guard through
+            // commit/rollback so other units and ordinary writes cannot join it.
+            let pool = Arc::clone(&self.pool);
+            tokio::task::spawn_blocking(move || {
+                let guard = pool.try_writer().map_err(|error: SqliteError| {
+                    StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
+                })?;
+                let conn = guard.conn();
+                if !conn.is_autocommit() {
+                    pool.retire_pooled_writer(conn);
+                    return Err(StorageError::WriterTaskTerminated {
+                        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                    });
+                }
+                if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                    if !conn.is_autocommit() {
+                        pool.retire_pooled_writer(conn);
+                        return Err(StorageError::WriterTaskTerminated {
+                            request_state:
+                                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                        });
+                    }
+                    return Err(map_rusqlite_err(error, "atomic_unit.begin"));
+                }
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("atomic_unit".to_string()),
+                    pool.origin(),
+                );
+                let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
+                    conn,
+                    "atomic_unit.commit",
+                    |conn| {
+                        let mut inline = InlineWriter {
+                            conn: conn as *const rusqlite::Connection,
+                        };
+                        block_on_sync(op(&mut inline)).and_then(|result| result)
+                    },
+                );
+                if terminal_state.is_some() {
+                    pool.retire_pooled_writer(conn);
+                }
+                result
+            })
+            .await
+            .map_err(|error| StorageError::driver(StorageCapability::Sql, "atomic_unit", error))?
         }
     }
 }
@@ -3505,6 +3538,111 @@ mod tests {
     use crate::pool::PoolConfig;
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
+
+    #[tokio::test]
+    async fn in_memory_atomic_unit_pending_future_rolls_back_and_remains_usable() {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE atomic_pending (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let inserted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let op_inserted = Arc::clone(&inserted);
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO atomic_pending VALUES (1)".into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await?;
+                op_inserted.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<khive_storage::types::StorageResult<Box<dyn Any + Send>>>()
+                    .await
+            })
+        });
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), bridge.atomic_unit(op)).await;
+        assert!(inserted.load(std::sync::atomic::Ordering::SeqCst));
+        let error = result
+            .expect("in-memory atomic_unit must reject Pending promptly, not await it forever")
+            .expect_err("a suspending atomic unit must fail");
+        assert!(error.to_string().contains("future suspended"), "{error}");
+        {
+            let guard = pool.writer().unwrap();
+            assert!(guard.conn().is_autocommit());
+            let count: i64 = guard
+                .conn()
+                .query_row("SELECT COUNT(*) FROM atomic_pending", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "SQL before Pending must roll back");
+        }
+        let next: AtomicUnitOp = Box::new(|writer| {
+            Box::pin(async move {
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO atomic_pending VALUES (2)".into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            })
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), bridge.atomic_unit(next))
+            .await
+            .expect("unit admission must remain usable")
+            .unwrap();
+        let sum: i64 = pool
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row("SELECT SUM(id) FROM atomic_pending", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sum, 2);
+    }
+
+    // Pause SQLite itself during the first INSERT preparation so tests can
+    // arrange contention without putting an async wait in an AtomicUnitOp.
+    fn pause_first_insert(
+        pool: &ConnectionPool,
+        table: &'static str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let (entered, in_statement) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut entered = Some(entered);
+        pool.writer()
+            .unwrap()
+            .conn()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(ctx.action, AuthAction::Insert { table_name } if table_name == table) {
+                    if let Some(entered) = entered.take() {
+                        entered.send(()).unwrap();
+                        released
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("test must release the SQLite statement");
+                    }
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        (in_statement, release)
+    }
 
     #[tokio::test]
     async fn in_memory_atomic_units_serialize_across_bridges() {
@@ -3522,6 +3660,7 @@ mod tests {
             .execute_batch("CREATE TABLE atomic_in_memory (id INTEGER PRIMARY KEY)")
             .unwrap();
 
+        let (in_statement, release) = pause_first_insert(&pool, "atomic_in_memory");
         let ready = Arc::new(tokio::sync::Barrier::new(8));
         let mut jobs = Vec::new();
         for unit in 0..8_i64 {
@@ -3541,9 +3680,6 @@ mod tests {
                                     label: None,
                                 })
                                 .await?;
-                            if row == 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            }
                         }
                         Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
                     })
@@ -3551,6 +3687,16 @@ mod tests {
                 bridge.atomic_unit(op).await.map(|_| ())
             }));
         }
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(10), in_statement).await;
+        if !matches!(&entered, Ok(Ok(()))) {
+            drop(release);
+            for job in jobs {
+                let _ = job.await;
+            }
+            panic!("atomic unit did not reach its first INSERT: {entered:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        release.send(()).unwrap();
         let mut errors = Vec::new();
         for job in jobs {
             if let Err(error) = job.await.unwrap() {
@@ -3595,8 +3741,7 @@ mod tests {
                     .execute_batch("CREATE TABLE atomic_event_overlap (id INTEGER PRIMARY KEY)")
                     .unwrap();
             }
-            let (entered, in_unit) = tokio::sync::oneshot::channel();
-            let (release, released) = tokio::sync::oneshot::channel();
+            let (in_unit, release) = pause_first_insert(&pool, "atomic_event_overlap");
             let bridge = SqlBridge::new(Arc::clone(&pool), false);
             let unit = tokio::spawn(async move {
                 let op: AtomicUnitOp = Box::new(move |writer| {
@@ -3608,8 +3753,6 @@ mod tests {
                                 label: None,
                             })
                             .await?;
-                        entered.send(()).unwrap();
-                        released.await.unwrap();
                         writer
                             .execute(SqlStatement {
                                 sql: "INSERT INTO atomic_event_overlap VALUES (2)".into(),
@@ -3622,7 +3765,12 @@ mod tests {
                 });
                 bridge.atomic_unit(op).await.map(|_| ())
             });
-            in_unit.await.unwrap();
+            let entered = tokio::time::timeout(std::time::Duration::from_secs(10), in_unit).await;
+            if !matches!(&entered, Ok(Ok(()))) {
+                drop(release);
+                let result = unit.await;
+                panic!("atomic unit did not reach its first INSERT: {entered:?}; {result:?}");
+            }
             let store = Arc::new(crate::stores::event::SqlEventStore::new_scoped(
                 Arc::clone(&pool),
                 false,
@@ -8070,6 +8218,220 @@ mod tests {
              otherwise-successful INSERT — not just the failing statement; \
              got {count:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
+        use khive_storage::WriterTaskRequestState;
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        // Exercise operation, commit, and panic failures, including a clean
+        // panic rollback. Terminal connections must never reenter the pool.
+        for (mode, deny_rollback, expected) in [
+            ("error", true, WriterTaskRequestState::SideEffectsUnknown),
+            ("commit", true, WriterTaskRequestState::SideEffectsUnknown),
+            ("panic", true, WriterTaskRequestState::SideEffectsUnknown),
+            (
+                "panic",
+                false,
+                WriterTaskRequestState::TransactionRolledBack,
+            ),
+        ] {
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: None,
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            {
+                let guard = pool.writer().unwrap();
+                guard
+                    .execute_batch("CREATE TABLE atomic_terminal_probe (id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                guard
+                    .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                        AuthAction::Transaction {
+                            operation: TransactionOperation::Rollback,
+                        } if deny_rollback => Authorization::Deny,
+                        AuthAction::Transaction {
+                            operation: TransactionOperation::Unknown,
+                        } if mode == "commit" => Authorization::Deny,
+                        _ => Authorization::Allow,
+                    }))
+                    .unwrap();
+            }
+            let bridge = SqlBridge::new(Arc::clone(&pool), false);
+            let result = bridge
+                .atomic_unit(Box::new(move |writer| {
+                    Box::pin(async move {
+                        writer
+                            .execute(SqlStatement {
+                                sql: "INSERT INTO atomic_terminal_probe VALUES (1)".into(),
+                                params: vec![],
+                                label: None,
+                            })
+                            .await?;
+                        match mode {
+                            "error" => Err(StorageError::Internal("terminal probe".into())),
+                            "panic" => panic!("terminal probe"),
+                            _ => Ok(Box::new(()) as Box<dyn Any + Send>),
+                        }
+                    })
+                }))
+                .await;
+            assert!(
+                matches!(result, Err(StorageError::WriterTaskTerminated { request_state })
+                if request_state == expected),
+                "{mode}: {result:?}"
+            );
+            assert!(
+                pool.try_writer_nowait().is_err(),
+                "{mode}: writer was not retired"
+            );
+            let mut writer = bridge.writer().await.unwrap();
+            assert!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO atomic_terminal_probe VALUES (2)".into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await
+                    .is_err(),
+                "{mode}: ordinary write reused a terminal connection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_atomic_unit_holds_writer_guard_through_rollback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .execute_batch("CREATE TABLE atomic_guard_probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let excluded = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&excluded);
+        let probe_pool = Arc::clone(&pool);
+        let result = bridge
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "INSERT INTO atomic_guard_probe VALUES (1)".into(),
+                            params: vec![],
+                            label: None,
+                        })
+                        .await?;
+                    observed.store(probe_pool.try_writer_nowait().is_err(), Ordering::SeqCst);
+                    Err(StorageError::Internal("rollback guard probe".into()))
+                })
+            }))
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::WriterTaskRequestFailed {
+                request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                ref source,
+            }) if matches!(source.as_ref(), StorageError::Internal(message)
+                if message == "rollback guard probe")),
+            "{result:?}"
+        );
+        assert!(
+            excluded.load(Ordering::SeqCst),
+            "atomic unit released its writer guard"
+        );
+        let mut writer = bridge.writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO atomic_guard_probe VALUES (2)".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        let rows = writer
+            .query_all(SqlStatement {
+                sql: "SELECT id FROM atomic_guard_probe ORDER BY id".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(matches!(rows[0].columns[0].value, SqlValue::Integer(2)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_atomic_unit_pending_op_rolls_back_and_releases_guard() {
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .execute_batch("CREATE TABLE atomic_pending_probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            bridge.atomic_unit(Box::new(|writer| {
+                Box::pin(async move {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "INSERT INTO atomic_pending_probe VALUES (1)".into(),
+                            params: vec![],
+                            label: None,
+                        })
+                        .await?;
+                    std::future::pending::<
+                            khive_storage::types::StorageResult<Box<dyn Any + Send>>,
+                        >()
+                        .await
+                })
+            })),
+        )
+        .await
+        .expect("suspending atomic unit must return promptly");
+        assert!(
+            matches!(result, Err(StorageError::WriterTaskRequestFailed {
+                request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                ref source,
+            }) if matches!(source.as_ref(), StorageError::Internal(message)
+                if message.contains("future suspended"))),
+            "{result:?}"
+        );
+        let mut writer = bridge.writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO atomic_pending_probe VALUES (2)".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        let sum = writer
+            .query_scalar(SqlStatement {
+                sql: "SELECT SUM(id) FROM atomic_pending_probe".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(sum, Some(SqlValue::Integer(2))), "{sum:?}");
+        assert!(pool.try_writer_nowait().unwrap().is_autocommit());
     }
 
     /// ADR-067 Component A: before
