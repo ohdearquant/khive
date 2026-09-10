@@ -841,10 +841,17 @@ An `observed` entry may carry `id`, the note identity it read:
   the writer transaction, in one read, before the first write, exactly where the version half is
   checked today.
 - The identity half refuses with `reason: "identity_conflict"`: kind `conflict` (§2, ADR-172 §2),
-  `details` naming the key, the kind, the version asserted, the `id` asserted and the `current_id`
-  found, plus the `index` every observed refusal carries. Nothing is written. `current_id` is the
-  live holder's identity, which a caller holding the key and the kind can already read; it is named
-  so the caller can tell a replacement from a version move without a second round trip.
+  `details` naming the key, the kind, the version asserted, the `id` asserted and the `index` every
+  observed refusal carries. Nothing is written.
+- **`current_id` is disclosed only where the holder's identity is already disclosable.** It names the
+  live holder, so it is emitted under exactly the authorization that already governs `existing_id` on
+  `key_conflict`: a caller allowed to learn which note holds that `(kind, key)` gets `current_id` and
+  can tell a replacement from a version move without a second round trip; a caller not allowed to
+  learn it gets the same refusal without that field. This amendment first asserted the field was
+  always safe because the caller could already read it. That is false for exactly the caller the
+  existing filter exists for, one authorized to write a batch but not to read or list the key, and an
+  identity pin is composable from a key and a guessed identity, so an unfiltered `current_id` would
+  hand that caller the holder identity the write path already withholds.
 - The version half is unchanged, including its refusal shape. When both halves fail the identity
   half is reported, because a replacement explains the version difference and the version alone does
   not explain the replacement.
@@ -854,8 +861,10 @@ An `observed` entry may carry `id`, the note identity it read:
   a pinned version against an empty key. So a caller pinning `(key, version, id)` reads its two
   failure worlds apart without a new shape: the key is empty (`version_conflict`, no
   `current_version`), or a different note holds it (`identity_conflict`, `current_id` naming it).
-  `current_id` is therefore never absent and never the string `"null"` on an `identity_conflict`;
-  the reason that fires carries the distinction.
+  The distinction is carried by the reason that fires, not by `current_id`, which is why withholding
+  `current_id` from an unauthorized caller costs that caller nothing it is entitled to: it still
+  learns that the key is held by someone else rather than that its version was stale. When
+  `current_id` is present it is a live holder's identity and so is never the string `"null"`.
 - `id` requires a positive version: with `version: null` the entry asserts no live holder, which no
   identity can be pinned against, so `id` with a null version is `invalid_input` before any member
   writes.
@@ -942,6 +951,14 @@ acceptance 2.
 8. **Help.** `stream.batch(help=true)` names `id` under `observed`, its refusal, and states in one
    sentence what an entry without `id` asserts.
 9. **Cross-process.** Arm 1 through the socket, the recreation performed by a second OS process.
-10. **Mutation.** With the identity half skipped, arm 1 goes red. With the identity half reported as
+10. **Disclosure.** Arm 1 run twice against the same recreation: once as a caller allowed to learn
+    the key's holder, whose refusal carries `current_id`, and once as a caller allowed to write the
+    batch but not to read or list the key, whose refusal carries the same `reason`, `key`, `kind`,
+    version and `index` and no `current_id` at all. The unauthorized arm supplies a guessed `id`, so
+    it is the disclosure the filter exists to stop. The `key_conflict` case is the control: the same
+    unauthorized caller already receives `key_conflict` without `existing_id`, and this arm asserts
+    the two refusals now behave the same way.
+11. **Mutation.** With the identity half skipped, arm 1 goes red. With the identity half reported as
     `version_conflict`, arm 1's reason assertion goes red. With `id` accepted beside a null version,
-    arm 5 goes red. Each run quoted with its exit code.
+    arm 5 goes red. With `current_id` emitted unconditionally, arm 10's unauthorized half goes red.
+    Each run quoted with its exit code.
