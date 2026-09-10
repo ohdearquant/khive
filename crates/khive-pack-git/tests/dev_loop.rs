@@ -583,6 +583,44 @@ async fn arm14_ref_move_race_preserves_rival_with_atomic_compare() {
 
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
+async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.commit", "allow").await;
+    let index = std::fs::read(f.repo.join(".git/index")).expect("index before");
+    let worktree = std::fs::read(f.repo.join("a.txt")).expect("worktree before");
+    let target = b"../missing-\xff\n";
+    let manifest = f.tree(&[("link", target, 120000)]).await;
+    let result = f.call("git.commit", f.commit_params(&manifest)).await;
+    let sha = result["sha"].as_str().expect("commit SHA");
+    assert_eq!(f.git_text(&["rev-parse", &format!("{sha}^")]), f.base);
+    assert_eq!(
+        f.git_bytes(&["ls-tree", "-r", "--name-only", sha]),
+        b"link\n"
+    );
+    assert!(f
+        .git_text(&["ls-tree", "-r", sha, "link"])
+        .starts_with("120000 blob "));
+    assert_eq!(
+        f.git_bytes(&["cat-file", "blob", &format!("{sha}:link")]),
+        target
+    );
+    assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), sha);
+    assert_eq!(std::fs::read(f.repo.join(".git/index")).unwrap(), index);
+    assert_eq!(std::fs::read(f.repo.join("a.txt")).unwrap(), worktree);
+    assert!(std::fs::symlink_metadata(f.repo.join("link")).is_err());
+    f.success_receipt(&result).await;
+    let error = f
+        .err("git.checkout", json!({"repo":f.repo,"ref":sha}))
+        .await;
+    assert!(
+        error.contains("unsupported_entry") && error.contains("symlinks"),
+        "{error}"
+    );
+    f.refusal_receipt(&error).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn arm14_manifest_commit_preserves_index_and_worktree_residue() {
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;

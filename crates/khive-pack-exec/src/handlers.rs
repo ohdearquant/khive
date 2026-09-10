@@ -642,7 +642,9 @@ async fn preflight(
     tree::verify_blobs(rt, &entries)
         .await
         .map_err(|e| format!("tree: {e}"))?;
-    let cwd = tree::validate_cwd(&req.cwd).map_err(|e| e.to_string())?;
+    let cwd = tree::resolve_cwd(rt, &entries, &req.cwd)
+        .await
+        .map_err(|e| e.to_string())?;
     receipt.cwd = cwd;
     Ok(Ready {
         binary,
@@ -974,81 +976,99 @@ async fn execute(
     receipt.stdout_ref = Some(store.put(out_bytes).await?.as_str().to_string());
     receipt.stderr_ref = Some(store.put(err_bytes).await?.as_str().to_string());
 
-    // Capture the tree.
-    let (found, skipped) = walk(&run_dir).unwrap_or_default();
-    receipt.skipped = skipped;
-    let input: BTreeMap<&str, &TreeEntry> =
-        ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
-    let mut out_entries: Vec<TreeEntry> = Vec::new();
-    let mut changes: Vec<Change> = Vec::new();
-    let mut undeclared: BTreeSet<String> = BTreeSet::new();
-    for (path, file) in &found {
-        let data = file
-            .read_content()
-            .map_err(|e| RuntimeError::Unconfigured(format!("capture entry {path:?}: {e}")))?;
-        let digest = digest_hex(&data);
-        match input.get(path.as_str()) {
-            Some(old) if old.content_ref == digest && old.mode == file.mode => {
-                out_entries.push((*old).clone());
-            }
-            existing => {
-                let allowed = req
-                    .declared
-                    .as_ref()
-                    .is_none_or(|d| declared_covers(d, path));
-                if !allowed {
-                    undeclared.insert(path.clone());
-                    if let Some(old) = existing {
-                        out_entries.push((*old).clone());
-                    }
-                    continue;
+    // Capture errors describe a completed, unsuccessful run. Finalize its
+    // receipt rather than propagating past receipt insertion in `run`.
+    let captured: Result<(), RuntimeError> = async {
+        let (found, skipped) =
+            walk(&run_dir).map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+        receipt.skipped = skipped;
+        let input: BTreeMap<&str, &TreeEntry> =
+            ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+        let mut out_entries: Vec<TreeEntry> = Vec::new();
+        let mut changes: Vec<Change> = Vec::new();
+        let mut undeclared: BTreeSet<String> = BTreeSet::new();
+        for (path, file) in &found {
+            let data = file
+                .read_content()
+                .map_err(|e| RuntimeError::Unconfigured(format!("capture entry {path:?}: {e}")))?;
+            let digest = digest_hex(&data);
+            match input.get(path.as_str()) {
+                Some(old) if old.content_ref == digest && old.mode == file.mode => {
+                    out_entries.push((*old).clone());
                 }
-                let stored = store.put(data).await?;
-                let entry = TreeEntry {
-                    path: path.clone(),
-                    content_ref: stored.as_str().to_string(),
-                    mode: file.mode,
-                };
-                changes.push(Change {
-                    path: path.clone(),
-                    op: if existing.is_some() {
-                        "modified"
-                    } else {
-                        "added"
-                    },
-                    content_ref: Some(entry.content_ref.clone()),
-                    base_ref: existing.map(|e| e.content_ref.clone()),
-                });
-                out_entries.push(entry);
+                existing => {
+                    let allowed = req
+                        .declared
+                        .as_ref()
+                        .is_none_or(|d| declared_covers(d, path));
+                    if !allowed {
+                        undeclared.insert(path.clone());
+                        if let Some(old) = existing {
+                            out_entries.push((*old).clone());
+                        }
+                        continue;
+                    }
+                    let stored = store.put(data).await?;
+                    let entry = TreeEntry {
+                        path: path.clone(),
+                        content_ref: stored.as_str().to_string(),
+                        mode: file.mode,
+                    };
+                    changes.push(Change {
+                        path: path.clone(),
+                        op: if existing.is_some() {
+                            "modified"
+                        } else {
+                            "added"
+                        },
+                        content_ref: Some(entry.content_ref.clone()),
+                        base_ref: existing.map(|e| e.content_ref.clone()),
+                    });
+                    out_entries.push(entry);
+                }
             }
         }
-    }
-    for (path, old) in &input {
-        if found.contains_key(*path) {
-            continue;
+        for (path, old) in &input {
+            if found.contains_key(*path) {
+                continue;
+            }
+            let allowed = req
+                .declared
+                .as_ref()
+                .is_none_or(|d| declared_covers(d, path));
+            if !allowed {
+                undeclared.insert(path.to_string());
+                out_entries.push((*old).clone());
+                continue;
+            }
+            changes.push(Change {
+                path: path.to_string(),
+                op: "deleted",
+                content_ref: None,
+                base_ref: Some(old.content_ref.clone()),
+            });
         }
-        let allowed = req
-            .declared
-            .as_ref()
-            .is_none_or(|d| declared_covers(d, path));
-        if !allowed {
-            undeclared.insert(path.to_string());
-            out_entries.push((*old).clone());
-            continue;
-        }
-        changes.push(Change {
-            path: path.to_string(),
-            op: "deleted",
-            content_ref: None,
-            base_ref: Some(old.content_ref.clone()),
-        });
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        receipt.changed = changes;
+        receipt.undeclared = undeclared.into_iter().collect();
+        receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
+        receipt.success =
+            !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+
+        Ok(())
     }
-    changes.sort_by(|a, b| a.path.cmp(&b.path));
-    receipt.changed = changes;
-    receipt.undeclared = undeclared.into_iter().collect();
-    receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
-    receipt.success =
-        !receipt.timed_out && receipt.exit_code == Some(0) && receipt.undeclared.is_empty();
+    .await;
+    if let Err(error) = captured {
+        receipt.success = false;
+        receipt.reason = Some(error.to_string());
+        receipt.tree_out = None;
+        receipt.changed.clear();
+        receipt.undeclared.clear();
+        // A partial capture is never retained as a purported output tree,
+        // including when successful runs would otherwise be kept.
+        cleanup(&run_dir, &profile_path, false);
+        return Ok(());
+    }
 
     cleanup(&run_dir, &profile_path, cfg.keep);
     Ok(())

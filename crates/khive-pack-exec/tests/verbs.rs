@@ -732,6 +732,147 @@ async fn refusals_write_receipts_and_touch_no_disk() {
     assert!(root_is_empty(&f));
 }
 
+#[tokio::test]
+async fn run_refuses_symlink_cwd_escapes_and_cycles_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let cases = [
+        vec![("link", b"/usr".as_slice(), 120000)],
+        vec![("link", b"../outside".as_slice(), 120000)],
+        vec![
+            ("link", b"links/hop".as_slice(), 120000),
+            ("links/hop", b"../../outside".as_slice(), 120000),
+        ],
+        // Lexically cancelling redirect/.. before following redirect would
+        // incorrectly hide this absolute escape.
+        vec![
+            ("link", b"redirect/..".as_slice(), 120000),
+            ("redirect", b"/usr".as_slice(), 120000),
+        ],
+        vec![
+            ("link", b"next".as_slice(), 120000),
+            ("next", b"link".as_slice(), 120000),
+        ],
+    ];
+    for entries in cases {
+        let tree = f.tree(&entries).await;
+        let error = f
+            .call_err(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","args":["-c","true"],
+                    "actor":"local","cwd":"link"}),
+            )
+            .await;
+        assert!(
+            error.contains("cwd") && error.contains("symlink"),
+            "{error}"
+        );
+        let id = error
+            .split("receipt_id=")
+            .nth(1)
+            .expect("refusal names its receipt")
+            .trim_end_matches(')');
+        let receipt = f.call("exec.receipt", json!({"id":id})).await;
+        assert_eq!(receipt["denied"], true, "{receipt}");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert!(receipt["reason"].as_str().unwrap().contains("cwd"));
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["started_at"].is_null());
+        assert!(root_is_empty(&f), "preflight must not materialize anything");
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":id})).await["count"],
+            0
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_resolves_relative_symlink_cwd_chains_inside_the_manifest() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f
+        .tree(&[
+            ("dir/file", b"from directory", 644),
+            ("dir/inner/keep", b"nested", 644),
+            ("links/hop", b"../alias", 120000),
+            ("alias", b"dir/./inner/..", 120000),
+        ])
+        .await;
+    for cwd in ["dir", "links/hop"] {
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","args":["-c","cat file"],
+                    "actor":"local","cwd":cwd}),
+            )
+            .await;
+        assert_eq!(out["receipt"]["success"], true, "{out}");
+        assert_eq!(out["receipt"]["cwd"], "dir");
+        assert_eq!(
+            f.blob_text(&out["receipt"]["stdout_ref"]).await,
+            "from directory"
+        );
+        assert_eq!(out["receipt"]["tree_out"], tree);
+        assert!(root_is_empty(&f));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
+    // chmod 000 must make a real read fail; a root test runner is not a
+    // substitute for the daemon's unprivileged execution environment.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run this regression as a non-root user"
+    );
+    for keep in [false, true] {
+        let f = fixture_with_keep(keep);
+        f.register_sh("sh", "allow").await;
+        let tree = f.tree(&[]).await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local",
+                    "args":["-c","printf readable > a-readable && printf secret > z-unreadable && chmod 000 z-unreadable && printf created"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["exit_code"], 0, "the command completed: {receipt}");
+        assert_eq!(f.blob_text(&receipt["stdout_ref"]).await, "created");
+        assert_eq!(receipt["denied"], false);
+        assert_eq!(receipt["success"], false);
+        assert!(receipt["reason"]
+            .as_str()
+            .unwrap()
+            .contains("capture entry \"z-unreadable\""));
+        assert!(
+            receipt["tree_out"].is_null(),
+            "no partial tree may be claimed"
+        );
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(out["changed"], json!([]));
+        assert!(receipt["finished_at"].is_string());
+        let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
+        assert_eq!(&stored, receipt, "the failed receipt is durable");
+        let events = f.call("exec.events", json!({"run_id":receipt["id"]})).await;
+        let kinds: Vec<&str> = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["materialized", "launched", "exited"]);
+        assert!(
+            root_is_empty(&f),
+            "both the run directory and profile must be removed"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_captures_output_changes_and_receipt() {

@@ -4,7 +4,7 @@
 //! serialization is canonical (entries sorted by path, compact JSON) so two
 //! runs that leave identical content produce identical tree references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +64,104 @@ pub fn validate_cwd(cwd: &str) -> Result<String, RuntimeError> {
         return Ok(".".to_string());
     }
     validate_relative_path(cwd, "cwd")
+}
+
+/// Resolve cwd against the immutable manifest before materialization. Only
+/// directory prefixes in the manifest can be working directories. Expand each
+/// link before interpreting subsequent `..` components, as path lookup does.
+pub async fn resolve_cwd(
+    rt: &KhiveRuntime,
+    entries: &[TreeEntry],
+    cwd: &str,
+) -> Result<String, RuntimeError> {
+    let cwd = validate_cwd(cwd)?;
+    if cwd == "." {
+        return Ok(cwd);
+    }
+    let by_path: BTreeMap<&str, &TreeEntry> = entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let directories: BTreeSet<&str> = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .path
+                .match_indices('/')
+                .map(move |(i, _)| &entry.path[..i])
+        })
+        .collect();
+    let store = blob_store(rt)?;
+    let mut pending: VecDeque<String> = cwd.split('/').map(str::to_string).collect();
+    let mut resolved: Vec<String> = Vec::new();
+    let mut expansions = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "cwd {cwd:?} symlink target escapes the tree root"
+                    )));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let path = if resolved.is_empty() {
+            component.clone()
+        } else {
+            format!("{}/{component}", resolved.join("/"))
+        };
+        if let Some(entry) = by_path.get(path.as_str()) {
+            if entry.mode != 120000 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd {cwd:?} traverses non-directory entry {path:?}"
+                )));
+            }
+            expansions += 1;
+            if expansions > 40 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd {cwd:?} symlink chain exceeds 40 expansions (possible cycle)"
+                )));
+            }
+            let reference = ContentRef::from_hex(&entry.content_ref)
+                .map_err(|e| RuntimeError::InvalidInput(format!("cwd entry {path:?}: {e}")))?;
+            let bytes = store
+                .get_bounded_verified(&reference, khive_storage::MAX_BLOB_WHOLE_BYTES)
+                .await?;
+            let target = std::str::from_utf8(&bytes).map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "cwd entry {path:?} target cannot name a UTF-8 manifest directory"
+                ))
+            })?;
+            if target.starts_with('/') {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd {cwd:?} symlink target at {path:?} is absolute and escapes the tree root"
+                )));
+            }
+            if target.is_empty() || target.contains('\0') {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd entry {path:?} has an empty or NUL-containing symlink target"
+                )));
+            }
+            // A relative target starts in the link's parent, not at the link.
+            for part in target.split('/').rev() {
+                pending.push_front(part.to_string());
+            }
+        } else if directories.contains(path.as_str()) {
+            resolved.push(component);
+        } else {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cwd {cwd:?} directory {path:?} is absent from the manifest"
+            )));
+        }
+    }
+    Ok(if resolved.is_empty() {
+        ".".to_string()
+    } else {
+        resolved.join("/")
+    })
 }
 
 /// The one entry validator: paths, modes, duplicates, ref format, and the rule that an entry

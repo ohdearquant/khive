@@ -135,6 +135,9 @@ item 1 is amended again in item 3.
    `hash-object -w --no-filters`, `mktree`, `commit-tree` and `update-ref`; no checkout, index or
    working tree is touched; a path the manifest omits is a deletion; `100644` and `100755` are the
    only modes. This replaces the Decision's detached-worktree materialization.
+   **Amended 2026-09-10:** `git.commit` also accepts symlink mode `120000` through
+   the shared `write_manifest_tree` writer, preserving the literal target blob;
+   `git.checkout` retains its independent symlink refusal.
 3. **Actor-only credentials (amends Amendment 1 item 1).** `git.commit`, `git.push`, `git.pr_open`,
    `git.pr_review` and `git.pr_merge` resolve the caller's `[git_write.actors]` row at every call; an
    actor without a row refuses with reason `actor_unmapped`; these verbs have no daemon fallback and
