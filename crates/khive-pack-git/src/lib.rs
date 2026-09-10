@@ -2,11 +2,12 @@
 //! Amendments 1 and 2, plus ADR-108).
 //!
 //! Contributes three note kinds (`commit`, `issue`, `pull_request`) that make
-//! repository provenance queryable through the KG graph, one read/ingest
+//! repository provenance queryable through the KG graph, an ingest
 //! agent-facing verb, `git.digest(source, project?, max_items?, include?)`
 //! (`handlers`), that drives the batch, cursor-based ingester (`ingest`)
 //! against either a local path or a remote `https://` URL (cloned/fetched
-//! into a daemon-owned scratch cache, `cache`), local object operations, and
+//! into a daemon-owned scratch cache, `cache`), persisted position inspection
+//! (`ingest_cursor`), local object operations, and
 //! policy-gated remote writes (ADR-182). Git children use hardened,
 //! allowlisted argv construction; platform operations use actor credentials. See
 //! `docs/adr/ADR-088-git-lifecycle-pack.md`,
@@ -18,6 +19,7 @@
 //!
 //! | Verb | Args | What it does |
 //! | ---- | ---- | ------------ |
+//! | `git.ingest_cursor` | `project`, `source_kind` | Read the exact stored ingest cursor/checkpoint pair in one snapshot |
 //! | `git.digest` | `source`, `project?`, `max_items?`, `include?` | Ingest commit/issue/PR provenance from a local path or `https://` URL, bounded and cursor-resumable |
 //! | `git.commit` | `repo`, `message`, `paths?`, `author?` | Stage and commit against a local repo; returns the resulting SHA |
 //! | `git.branch` | `repo`, `name`, `from?` | Create a branch, optionally from a named ref/SHA |
@@ -36,6 +38,7 @@ mod credentials;
 pub mod handlers;
 pub mod hook;
 pub mod ingest;
+mod ingest_cursor;
 mod input_schema;
 mod local_git;
 mod local_handlers;

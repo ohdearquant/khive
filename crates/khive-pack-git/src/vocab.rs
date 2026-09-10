@@ -77,7 +77,7 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 15] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 16] = [
     crate::local_vocab::INIT,
     crate::local_vocab::CHECKOUT,
     crate::local_vocab::DIFF,
@@ -86,6 +86,28 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 15] = [
     crate::local_vocab::RECONCILE,
     crate::local_vocab::STATUS,
     crate::local_vocab::LOG,
+    HandlerDef {
+        name: "git.ingest_cursor",
+        description: "Read the stored ingest cursor and checkpoint for a project and source kind in one snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor writes.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "project",
+                param_type: "uuid",
+                required: true,
+                description: "Full UUID of the live project anchor. Canonical get authorization applies with the caller's identity; by-ID reads are namespace-agnostic.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
+            },
+            ParamDef {
+                name: "source_kind",
+                param_type: "string",
+                required: true,
+                description: "One of commits, issues, pull_requests. Commits use a SHA cursor; issues and pull_requests use timestamp cursors with page checkpoints.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     HandlerDef {
         name: "git.digest",
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
