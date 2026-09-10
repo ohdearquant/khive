@@ -34,6 +34,29 @@ pub const SYSTEM_READ_ROOTS: &[&str] = &[
 /// inside a sandbox, it runs through the git verbs.
 pub const FORBIDDEN_BASENAMES: &[&str] = &["git", "gh"];
 
+/// The sandbox launcher. Every run is a child of this binary, so its absence
+/// is the whole reason the pack runs on macOS only.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Refuse before any work is done when the host has no sandbox backend.
+///
+/// The check reads the backend's own dependency rather than a compile-time
+/// target, so a macOS host that is missing `sandbox-exec` refuses for the same
+/// stated reason a Linux host does, and the reason names the platform instead
+/// of arriving later as a failed spawn.
+pub fn check_backend(path: &str) -> Result<(), String> {
+    if Path::new(path).exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "no sandbox backend on this host: every run is executed under the macOS \
+         seatbelt sandbox, which needs {path}, and this host is {os}, where that \
+         binary does not exist. Runs are macOS-only until a backend for this \
+         platform ships.",
+        os = std::env::consts::OS
+    ))
+}
+
 fn quote(path: &Path) -> String {
     let s = path.to_string_lossy();
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -252,6 +275,23 @@ pub fn check_binary(registered: &str, never: &[PathBuf]) -> Result<PathBuf, Bina
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_backend_accepts_a_backend_that_is_present() {
+        // Positive control: a path that exists on every host running this suite,
+        // so the refusal arm below is about absence and not about the check.
+        check_backend("/bin/sh").expect("an existing path reads as a present backend");
+    }
+
+    #[test]
+    fn check_backend_refuses_and_names_the_platform_when_absent() {
+        let missing = "/usr/bin/sandbox-exec-that-is-not-installed";
+        assert!(!Path::new(missing).exists());
+        let error = check_backend(missing).unwrap_err();
+        assert!(error.contains(missing), "{error}");
+        assert!(error.contains(std::env::consts::OS), "{error}");
+        assert!(error.contains("seatbelt"), "{error}");
+    }
 
     #[test]
     fn profile_names_run_dir_and_roots_only() {

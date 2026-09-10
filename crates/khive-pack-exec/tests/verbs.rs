@@ -1018,7 +1018,49 @@ async fn run_resolves_relative_symlink_cwd_chains_inside_the_manifest() {
     }
 }
 
-#[cfg(unix)]
+// The other half of the arm below: on a host with no sandbox backend the run
+// refuses in preflight with the platform named, writes its receipt, and leaves
+// the exec root untouched.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test]
+async fn run_refuses_a_host_without_a_sandbox_backend_and_names_the_platform() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("a-file", b"input", 644)]).await;
+    let error = f
+        .call_err(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","args":["-c","printf launched > out"],
+                "actor":"local","cwd":"."}),
+        )
+        .await;
+    let id = error
+        .split("receipt_id=")
+        .nth(1)
+        .expect("refusal names its durable receipt")
+        .trim_end_matches(')');
+    let receipt = f.call("exec.receipt", json!({"id":id})).await;
+    assert_eq!(receipt["denied"], true, "{receipt}");
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert_eq!(receipt["decision"]["decision"], "allow", "{receipt}");
+    assert!(receipt["started_at"].is_null(), "{receipt}");
+    assert!(receipt["exit_code"].is_null(), "{receipt}");
+    assert!(receipt["tree_out"].is_null(), "{receipt}");
+    let reason = receipt["reason"]
+        .as_str()
+        .expect("preflight refusal reason");
+    assert!(reason.contains("no sandbox backend"), "{reason}");
+    assert!(reason.contains("/usr/bin/sandbox-exec"), "{reason}");
+    assert!(reason.contains(std::env::consts::OS), "{reason}");
+    assert!(
+        root_is_empty(&f),
+        "a run refused for the platform writes nothing to the exec root"
+    );
+}
+
+// Materialization is only reachable on a host that has a sandbox backend:
+// without one the run refuses in preflight, before any tree is written.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_materialize_symlink_failure_persists_receipt_and_cleans_up() {
     for keep in [false, true] {
