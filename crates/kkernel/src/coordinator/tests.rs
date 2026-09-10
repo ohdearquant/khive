@@ -3757,7 +3757,7 @@ async fn coordinator_service_preserves_timeout_failure_kind() {
     };
 
     let mut backend_reg = BackendRegistry::new();
-    backend_reg.register(BackendId::new("hung"), memory_runtime());
+    backend_reg.register(backend_id("hung"), memory_runtime());
     let service = SubstrateCoordinatorService::new(
         SubstrateCoordinator::new(backend_reg).with_hanging_backend("hung"),
     );
