@@ -7,7 +7,7 @@ use khive_runtime::{
     EdgePatch, EntityPatch, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
 };
 
-use khive_types::entity::Entity;
+use khive_storage::Entity;
 use khive_types::pack::PACK_REGISTRY_TAGS;
 
 use super::common::{
