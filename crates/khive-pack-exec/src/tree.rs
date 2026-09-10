@@ -4,7 +4,8 @@
 //! serialization is canonical (entries sorted by path, compact JSON) so two
 //! runs that leave identical content produce identical tree references.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use std::ops::Bound::{Included, Unbounded};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -144,15 +145,6 @@ pub async fn resolve_cwd(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
-    let directories: BTreeSet<&str> = entries
-        .iter()
-        .flat_map(|entry| {
-            entry
-                .path
-                .match_indices('/')
-                .map(move |(i, _)| &entry.path[..i])
-        })
-        .collect();
     let store = blob_store(rt)?;
     let mut pending = VecDeque::new();
     let mut pending_bytes = 0;
@@ -213,12 +205,19 @@ pub async fn resolve_cwd(
             }
             // A relative target starts in the link's parent, not at the link.
             prepend_cwd_components(&mut pending, &mut pending_bytes, target)?;
-        } else if directories.contains(path.as_str()) {
-            resolved.push(component);
         } else {
-            return Err(RuntimeError::InvalidInput(format!(
-                "cwd {cwd:?} directory {path:?} is absent from the manifest"
-            )));
+            // Seek the slash boundary so lexical siblings cannot mask descendants.
+            let prefix = format!("{path}/");
+            let is_directory = by_path
+                .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                .next()
+                .is_some_and(|(entry_path, _)| entry_path.starts_with(&prefix));
+            if !is_directory {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd {cwd:?} directory {path:?} is absent from the manifest"
+                )));
+            }
+            resolved.push(component);
         }
     }
     Ok(if resolved.is_empty() {

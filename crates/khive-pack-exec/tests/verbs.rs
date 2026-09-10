@@ -787,6 +787,77 @@ async fn run_refuses_symlink_cwd_escapes_and_cycles_before_materialization() {
     }
 }
 
+#[tokio::test]
+async fn run_deep_shared_prefix_manifest_refuses_missing_cwd_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let content_ref = f.put(b"x").await;
+    let mut tree = f
+        .tree(&[("a-sibling/file", b"x", 644), ("start", b"a", 120000)])
+        .await;
+    let prefix = "a/".repeat(250_000);
+    for leaf in 0..12 {
+        let params = json!({"tree":tree,"edits":[{
+            "path":format!("{prefix}leaf-{leaf}"),"ref":content_ref,"mode":644,
+        }]});
+        assert!(serde_json::to_vec(&params).unwrap().len() < 1024 * 1024);
+        let out = f.call("exec.tree_put", params).await;
+        assert_eq!(out["entries"], json!(leaf + 3));
+        tree = out["tree"].as_str().unwrap().to_string();
+    }
+    let stat = f.call("blob.stat", json!({"content_ref":tree})).await;
+    let manifest_bytes = stat["size"].as_u64().unwrap();
+    assert!(manifest_bytes >= 6_000_000, "{stat}");
+    assert!(manifest_bytes < 8 * 1024 * 1024, "{stat}");
+    assert!(!f.root.exists());
+
+    for (cwd, missing) in [
+        ("missing", "missing"),
+        ("a/missing", "a/missing"),
+        ("start/missing", "a/missing"),
+    ] {
+        let error = f
+            .call_err(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local","cwd":cwd,
+                    "args":["-c","printf launched > child-output"]}),
+            )
+            .await;
+        let id = error
+            .split("receipt_id=")
+            .nth(1)
+            .expect("missing-directory refusal names its durable receipt")
+            .trim_end_matches(')');
+        let receipt = f.call("exec.receipt", json!({"id":id})).await;
+        let reason = khive_runtime::RuntimeError::InvalidInput(format!(
+            "cwd {cwd:?} directory {missing:?} is absent from the manifest"
+        ))
+        .to_string();
+        assert_eq!(receipt["reason"], json!(reason));
+        assert!(error.contains(&reason), "{error}");
+        assert_eq!(receipt["denied"], true);
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert_eq!(receipt["cwd"], json!(cwd));
+        assert!(receipt["started_at"].is_null());
+        assert!(receipt["exit_code"].is_null());
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["profile_ref"].is_null());
+        assert!(receipt["sandbox"].is_null());
+        assert!(receipt["pids"].is_null());
+        assert!(receipt["stdout_ref"].is_null());
+        assert!(receipt["stderr_ref"].is_null());
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":id})).await["count"],
+            0
+        );
+        assert!(!f.root.join(id).exists());
+        assert!(!f.root.join(format!("{id}.sb")).exists());
+        assert!(!f.root.exists(), "preflight must not create the run root");
+    }
+}
+
 async fn cwd_preflight_refusal(f: &Fixture, tree: &str, cwd: &str) -> String {
     let error = f
         .call_err(
