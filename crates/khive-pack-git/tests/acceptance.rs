@@ -30,6 +30,9 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[path = "support/digest_scale.rs"]
+mod digest_scale;
+
 fn rt() -> KhiveRuntime {
     KhiveRuntime::memory().expect("memory runtime")
 }
