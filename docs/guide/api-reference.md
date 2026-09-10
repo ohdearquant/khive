@@ -1384,17 +1384,17 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit caller-attributed feedback for one recall result — the convenience verb to call
 right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required    | Notes                                                                  |
-| ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
-| `query`                | string | yes         | The recall query that produced the results.                            |
-| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
-| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
-| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
-| `served_by_profile_id` | string | no          | Profile that served the recall.                                        |
-| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.       |
-| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
-| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
-| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail. |
+| Param                  | Type   | Required    | Notes                                                                                                                                                                            |
+| ---------------------- | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`                | string | yes         | The recall query that produced the results.                                                                                                                                      |
+| `results`              | array  | yes         | Recall result objects retained as candidate context: objects with an `id` field (result UUID or compact id) and optionally `served_by_profile_id`; bare id strings are rejected. |
+| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.                                                                                                                  |
+| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.                                                                                                                        |
+| `served_by_profile_id` | string | no          | Profile that served the recall.                                                                                                                                                  |
+| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.                                                                                                                 |
+| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.                                                                                                            |
+| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.                                                                                                              |
+| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail.                                                                                                           |
 
 Top-level serve-attribution fields are one pair and take precedence over the selected
 result's pair. If neither top-level field is supplied, both fields are copied from the
