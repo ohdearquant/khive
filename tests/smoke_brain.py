@@ -16,10 +16,26 @@ import json
 import subprocess
 import sys
 import os
+import tempfile
 
 from kkernel_binary import resolve_binary_path
 
 BINARY = resolve_binary_path()
+
+# The child must not inherit this host's khive: a HOME that carries a
+# ~/.khive config points the binary at a configured daemon, and a KHIVE_*
+# setting in the parent shell (packs, embedding models, output format) changes
+# what the smoke exercises. Mirrors smoke_child_env in smoke_test.py: drop every
+# KHIVE_* variable, give the child an empty HOME, and forbid the daemon path so
+# the in-memory store under test is the one that answers.
+_SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-brain-smoke-home-")
+
+
+def smoke_child_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KHIVE_")}
+    env["HOME"] = _SMOKE_HOME.name
+    env["KHIVE_NO_DAEMON"] = "1"
+    return env
 
 request_id = 0
 
@@ -115,6 +131,7 @@ def spawn_brain_proc():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=smoke_child_env(),
     )
     send(proc, "initialize", {
         "protocolVersion": "2024-11-05",
