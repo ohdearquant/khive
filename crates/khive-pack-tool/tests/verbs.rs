@@ -471,7 +471,7 @@ async fn an_untagged_entity_still_updates_and_deletes() {
     let created = f
         .call(
             "create",
-            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary", "properties": {"source": "before"}}),
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary", "tags": ["ordinary-tag"], "properties": {"source": "before"}}),
         )
         .await;
     let id = created["id"].as_str().expect("created id").to_string();
@@ -486,6 +486,11 @@ async fn an_untagged_entity_still_updates_and_deletes() {
         updated["properties"]["source"],
         json!("after"),
         "an untagged entity is still writable by the generic verb: {updated}"
+    );
+    assert_eq!(
+        updated["tags"],
+        json!(["ordinary-tag"]),
+        "a patch that names no tags leaves the row's tags alone: {updated}"
     );
     let deleted = f.call("delete", json!({"id": id})).await;
     assert_eq!(deleted["deleted"], json!(true));
