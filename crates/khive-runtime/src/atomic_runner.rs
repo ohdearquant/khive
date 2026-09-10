@@ -1331,4 +1331,231 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         }
     }
+
+    mod acknowledgement {
+        use super::*;
+        use khive_storage::{SqlReader, WriterTaskRequestState};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            Request(WriterTaskRequestState),
+            Terminated(WriterTaskRequestState),
+        }
+
+        impl Fault {
+            fn error(self) -> StorageError {
+                match self {
+                    Self::Request(request_state) => StorageError::WriterTaskRequestFailed {
+                        request_state,
+                        source: Box::new(StorageError::Internal(
+                            "lost atomic acknowledgement".into(),
+                        )),
+                    },
+                    Self::Terminated(request_state) => {
+                        StorageError::WriterTaskTerminated { request_state }
+                    }
+                }
+            }
+
+            fn assert_preserved(self, error: StorageError) {
+                match (self, error) {
+                    (
+                        Self::Request(expected),
+                        StorageError::WriterTaskRequestFailed {
+                            request_state,
+                            source,
+                        },
+                    ) => {
+                        assert_eq!(request_state, expected);
+                        assert!(matches!(*source, StorageError::Internal(ref message)
+                            if message == "lost atomic acknowledgement"));
+                    }
+                    (
+                        Self::Terminated(expected),
+                        StorageError::WriterTaskTerminated { request_state },
+                    ) => assert_eq!(request_state, expected),
+                    (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
+                }
+            }
+        }
+
+        struct FaultAccess {
+            bridge: SqlBridge,
+            fault: Fault,
+            invoke: bool,
+            callback_result: StdArc<Mutex<Option<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SqlAccess for FaultAccess {
+            async fn reader(&self) -> StorageResultAlias<Box<dyn SqlReader>> {
+                self.bridge.reader().await
+            }
+
+            async fn writer(&self) -> StorageResultAlias<Box<dyn SqlWriter>> {
+                self.bridge.writer().await
+            }
+
+            async fn atomic_unit(
+                &self,
+                op: AtomicUnitOp,
+            ) -> StorageResultAlias<Box<dyn Any + Send>> {
+                if self.invoke {
+                    let callback_result = StdArc::clone(&self.callback_result);
+                    let result = self
+                        .bridge
+                        .atomic_unit(Box::new(move |writer| {
+                            Box::pin(async move {
+                                let result = op(writer).await;
+                                *callback_result.lock().expect("callback result") =
+                                    Some(result.is_ok());
+                                result
+                            })
+                        }))
+                        .await;
+                    assert_eq!(
+                        Some(result.is_ok()),
+                        *self.callback_result.lock().expect("callback result"),
+                        "the real transaction must finish before replacing its acknowledgement"
+                    );
+                }
+                Err(self.fault.error())
+            }
+        }
+
+        fn fault_access(pool: &TestPool, fault: Fault, invoke: bool) -> FaultAccess {
+            FaultAccess {
+                bridge: SqlBridge::new(StdArc::clone(pool), true),
+                fault,
+                invoke,
+                callback_result: StdArc::new(Mutex::new(None)),
+            }
+        }
+
+        fn effect_plan(id: Uuid) -> AtomicOpPlan {
+            let AtomicOpPlan::Update(mut plan) = rename_plan(id, "changed", "rename") else {
+                unreachable!()
+            };
+            plan.post_commit = PostCommitEffect::ReindexEntity { entity_id: id };
+            AtomicOpPlan::Update(plan)
+        }
+
+        #[tokio::test]
+        async fn recorded_failure_recovers_only_after_confirmed_rollback() {
+            let pool = scratch_pool("recorded_rollback");
+            seed_schema(&pool);
+            let id = Uuid::new_v4();
+            insert_entity(&pool, id, "original");
+            let before = entities_snapshot(&pool);
+            let access = fault_access(
+                &pool,
+                Fault::Request(WriterTaskRequestState::TransactionRolledBack),
+                true,
+            );
+            let result = run_atomic_unit(
+                &access,
+                vec![
+                    effect_plan(id),
+                    rename_plan(Uuid::new_v4(), "missing", "missing-target"),
+                ],
+            )
+            .await
+            .expect("confirmed rollback recovers the recorded refusal");
+            assert_eq!(
+                result,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed {
+                        statement_label: Some("missing-target".into()),
+                        expected: AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                },
+            );
+            assert_eq!(*access.callback_result.lock().unwrap(), Some(false));
+            assert_eq!(entities_snapshot(&pool), before);
+        }
+
+        #[tokio::test]
+        async fn recorded_failure_does_not_mask_unknown_or_terminal_outcomes() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::TransactionRolledBack),
+            ] {
+                let pool = scratch_pool("recorded_uncertain");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let before = entities_snapshot(&pool);
+                let access = fault_access(&pool, fault, true);
+                let error = run_atomic_unit(
+                    &access,
+                    vec![
+                        effect_plan(id),
+                        rename_plan(Uuid::new_v4(), "missing", "missing-target"),
+                    ],
+                )
+                .await
+                .expect_err("a recorded refusal cannot replace the outer outcome");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), Some(false));
+                assert_eq!(entities_snapshot(&pool), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn failure_before_callback_cannot_manufacture_recorded_refusal() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::NotStarted),
+                Fault::Request(WriterTaskRequestState::TransactionRolledBack),
+                Fault::Terminated(WriterTaskRequestState::NotStarted),
+            ] {
+                let pool = scratch_pool("empty_failure_slot");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let before = entities_snapshot(&pool);
+                let access = fault_access(&pool, fault, false);
+                let error = run_atomic_unit(&access, vec![effect_plan(id)])
+                    .await
+                    .expect_err("an empty slot must preserve the outer failure");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), None);
+                assert_eq!(entities_snapshot(&pool), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn successful_callback_with_lost_acknowledgement_returns_no_commit_token() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+            ] {
+                let pool = scratch_pool("committed_ack_lost");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let access = fault_access(&pool, fault, true);
+                let error = run_atomic_unit(&access, vec![effect_plan(id)])
+                    .await
+                    .expect_err("callback success is not a committed-effects token");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), Some(true));
+                let writer = pool.try_writer().expect("writer");
+                let name: String = writer
+                    .conn()
+                    .query_row(
+                        "SELECT name FROM entities WHERE id=?1",
+                        rusqlite::params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("persisted write");
+                assert_eq!(
+                    name, "changed",
+                    "the lost acknowledgement does not imply rollback"
+                );
+            }
+        }
+    }
 }

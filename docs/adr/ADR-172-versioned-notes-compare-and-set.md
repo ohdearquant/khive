@@ -465,6 +465,10 @@ indices. This whole class is an `invalid_input` error carried in the message tex
 client must not look for one here. Identical keys in different note kinds remain distinct. Omitting `fence` keeps today's
 unfenced behaviour. A list never changes the successful response or adds writes to a lease.
 
+Clarification (2026-09-10): the once-per-`(kind, key)` target rule applies independently to each ordered
+fence list and to the keyed-write members of [ADR-174 A1.1](ADR-174-ordered-streams-append.md); it does
+not expand the batch-wide `fence`, which deliberately remains object-only.
+
 The Python client accepts a dictionary or list of dictionaries and preserves entry order. Its generic
 `stream.append` builder preserves explicitly supplied null so the server can reject it.
 
