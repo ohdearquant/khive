@@ -1262,8 +1262,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         description: "Report the caller's identity as the runtime already resolved it for \
                       this request: actor_id, actor_kind, whether the actor is the \
                       unattributed/anonymous fallback, the write namespace, and the \
-                      read-visible namespace set. Never returns tokens or credentials — \
-                      only labels the runtime already computed before dispatch.",
+                      read-visible namespace set. Also returns build.version and \
+                      build.revision from the serving process's compile-time metadata, \
+                      without database diagnostics or a checkpoint probe. Never returns \
+                      tokens or credentials.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
