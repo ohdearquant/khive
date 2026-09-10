@@ -96,6 +96,7 @@ struct ObservedMember {
     key: String,
     kind: String,
     version: Option<i64>,
+    live_until: Option<String>,
 }
 
 fn batch_fence(value: Value, registry: &VerbRegistry) -> Result<NoteFence, RuntimeError> {
@@ -125,6 +126,11 @@ fn batch_observed(
                 )));
             }
             let entry: ObservedMember = deser(entry)?;
+            if entry.live_until.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch observed entry {index}: live_until requires a positive version"
+                )));
+            }
             NoteWriteOptions {
                 key: Some(entry.key.clone()),
                 expected_version: entry.version,
@@ -135,6 +141,7 @@ fn batch_observed(
                 key: entry.key,
                 kind: canonical_note_kind(&entry.kind, registry)?,
                 version: entry.version,
+                live_until: entry.live_until,
             })
         })
         .collect()

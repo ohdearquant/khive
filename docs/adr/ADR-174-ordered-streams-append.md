@@ -687,6 +687,8 @@ acceptance 2.
 
 **Status**: Proposed.
 
+**Implementation (2026-09-10):** `live_until` checks share one SQL clock reading inside the atomic writer transaction; write results return the stored `updated_at` before commit.
+
 ### The gap
 
 Amendment 4 lets a caller pin what it read: an `observed` entry with a version holds only while the
@@ -743,6 +745,28 @@ An `observed` entry may carry `live_until`:
 - Everything else about `observed` stands: atomic mode only, refused with `invalid_input` in
   per-member mode, every entry checked inside the writer transaction before the first write, the
   version half refusing exactly as Amendment 1 and Amendment 4 say.
+
+Correction (2026-09-10): an unreadable refusal does not carry the value. `live_until` is a
+caller-chosen path into a document the caller named but need not be able to read, so echoing
+whatever the path lands on turns one authorized `stream.batch` into a read of any field of that
+document. `live_until_unreadable` therefore carries `value_type` in place of `value`, one of
+`absent`, `null`, `boolean`, `number`, `string`, `array`, `object`, where `absent` is the path
+resolving to nothing and `null` is a JSON null found at it; the two are distinguished, which is
+what the earlier "the value found" left open for a field that is not there. `expired` keeps
+`value`: reaching it requires the field to have parsed as an RFC 3339 timestamp, so the value it
+names is the deadline the entry pinned, and the caller needs it beside `now` to see the window it
+lost. Acceptance arm 3 reads `value_type` and asserts `value` is absent.
+
+Traversal (2026-09-10, same correction): the path is split on `.` and each segment is read as an
+object key, left to right; anything else resolves to nothing and refuses `live_until_unreadable`
+with `value_type: "absent"`. So a segment applied to an array, a number or a string resolves to
+nothing (there is no positional indexing and a numeric segment is an object key, not an index); an
+empty segment, which a leading, trailing or doubled `.` produces, is read as the empty key and so
+resolves to nothing in any document that does not hold one; a document whose root is not an object
+resolves to nothing; and a key containing a literal `.` is unreachable, because the separator is not
+escapable. Every one of these is a refusal, never a pass, so an
+unresolvable path can only ever cost the caller a batch, and two implementations reading the same
+document and the same path agree.
 
 No predicate on the field's meaning is added. khive compares one timestamp with one clock; whether the
 field is a lease expiry, a handle deadline or anything else is the caller's convention, as the fence

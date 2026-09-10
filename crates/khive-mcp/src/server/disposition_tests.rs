@@ -1706,3 +1706,22 @@ fn ordered_fences_refusal_has_no_domain_commit() {
         assert_eq!(value["details"].get("index").and_then(Value::as_str), index);
     }
 }
+
+#[test]
+fn expiry_arm10_named_time_refusals_carry_rollback_proof() {
+    for reason in ["expired", "live_until_unreadable", "unrelated"] {
+        let error = khive_types::KhiveError::conflict("observation refused").with_details(
+            khive_types::Details::new_owned([("reason", reason.to_string())]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(
+            value["domain_disposition"],
+            if reason == "unrelated" {
+                "unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(value["details"]["reason"], reason);
+    }
+}
