@@ -659,6 +659,11 @@ No `key_conflict` case is added. A `write` member that creates a key another liv
 refuses with `key_conflict` and `existing_id` exactly as A1.1 says; an `observed` entry never creates
 anything, so it can only ever produce `version_conflict`.
 
+Correction (2026-09-10): the never-creates half stands, the reason set does not. An `observed` entry
+refuses with `version_conflict`, and since Amendment 5 also with `expired` and
+`live_until_unreadable`, and since Amendment 6 also with `identity_conflict`. It never refuses with
+`key_conflict`, which is what this paragraph is about and is what remains true of it.
+
 ### Acceptance
 
 Every arm names its command; the atomic-mode counts are read as domain events only, as in Amendment 1
@@ -826,3 +831,170 @@ acceptance 2.
     the request's arrival time instead of inside the transaction, arm 7's trace assertion goes red.
     With an unreadable field treated as live, arm 3 goes red. With `updated_at` omitted, arm 8 goes
     red. Each run quoted with its exit code.
+
+## Amendment 6 (2026-09-10): an `observed` entry may pin the note it read, so an observation does not survive that note's recreation
+
+**Status**: Proposed.
+
+### The gap
+
+Amendment 4's `observed` entry pins `(kind, key, version)` and nothing else. A note's version is a
+property of the note row: ADR-172 §3 starts every row at 1, and a soft-deleted note releases its
+key, so a note deleted and created again under the same `(kind, key)` is live at version 1 and
+satisfies an observation pinned at version 1. Two different notes, one predicate, and no component
+of the predicate distinguishes them. The caller reads a head, composes a batch on what it read, and
+the batch commits against a note that replaced the one it read.
+
+The version half is doing exactly what it says. The point of this amendment is that what it says was
+never enough on its own, because "the key is at version V" and "the note I read is still there" are
+different claims and only the first one is checked. Amendment 1's `version_conflict` shape, the
+Amendment 3 fence lists and Amendment 5's `live_until` all inherit the same predicate, and
+`live_until` inherits it twice: it reads a document field out of whatever note holds the key now.
+
+This is the same class as the recreated-key correction already recorded above for a positive-version
+`write` member, which refuses when its prepared target is deleted and recreated before commit. That
+correction settled the write path. The read-side predicate was left with the hole.
+
+### A6.1 `id`
+
+An `observed` entry may carry `id`, the note identity it read:
+
+```json
+{"key": K, "kind": <note kind>, "version": V, "id": <uuid>, "live_until": "<field path>"}
+```
+
+- With `id` present the entry holds only when the live note of that kind holding `K` in the caller's
+  primary namespace is that note **and** is at exactly version `V`. Both halves are checked inside
+  the writer transaction, in one read, before the first write, exactly where the version half is
+  checked today.
+- The identity half refuses with `reason: "identity_conflict"`: kind `conflict` (§2, ADR-172 §2),
+  `details` naming the key, the kind, the version asserted, the `id` asserted and the `index` every
+  observed refusal carries. Nothing is written.
+- **`current_id` is disclosed only where the holder's identity is already disclosable.** It names the
+  live holder, so it is emitted under exactly the authorization that already governs `existing_id` on
+  `key_conflict`: a caller allowed to learn which note holds that `(kind, key)` gets `current_id` and
+  can tell a replacement from a version move without a second round trip; a caller not allowed to
+  learn it gets the same refusal without that field. This amendment first asserted the field was
+  always safe because the caller could already read it. That is false for exactly the caller the
+  existing filter exists for, one authorized to write a batch but not to read or list the key, and an
+  identity pin is composable from a key and a guessed identity, so an unfiltered `current_id` would
+  hand that caller the holder identity the write path already withholds.
+- The version half is unchanged, including its refusal shape. When both halves fail the identity
+  half is reported, because a replacement explains the version difference and the version alone does
+  not explain the replacement.
+- **An absent holder is not an identity conflict.** `identity_conflict` says a different note holds
+  the key. When no live note holds it at all, the version half has already failed and describes the
+  world exactly: the refusal is `version_conflict` with `current_version` omitted, as it is today for
+  a pinned version against an empty key. So a caller pinning `(key, version, id)` reads its two
+  failure worlds apart without a new shape: the key is empty (`version_conflict`, no
+  `current_version`), or a different note holds it (`identity_conflict`, `current_id` naming it).
+  The distinction is carried by the reason that fires, not by `current_id`, which is why withholding
+  `current_id` from an unauthorized caller costs that caller nothing it is entitled to: it still
+  learns that the key is held by someone else rather than that its version was stale. When
+  `current_id` is present it is a live holder's identity and so is never the string `"null"`.
+- `id` requires a positive version: with `version: null` the entry asserts no live holder, which no
+  identity can be pinned against, so `id` with a null version is `invalid_input` before any member
+  writes.
+- Every `details` value is a string as ADR-172 §2 requires: `key` and `kind` as given, `version` and
+  `index` as their decimal strings, `id` and `current_id` as the identity string reads return.
+- `id` is optional and additive. Everything Amendment 4 says about an entry without it still holds,
+  and §A6.2 states what that entry means.
+
+### A6.2 What an entry without `id` asserts
+
+An `observed` entry without `id` asserts version-equality on the note that holds the key **at commit
+time**, not on the note the caller read. It is a liveness-and-freshness check on the key, not an
+identity check on a document. A caller that needs the note it read must pass `id`; a caller that only
+needs the key to be at a known version need not.
+
+Where the caller's own read already returns the identity, passing it costs nothing: a `write`
+member's result carries `id` (§A5.2 adds `updated_at` beside it), and every read of a keyed note
+carries `id`. The recommended shape for a read-then-pin caller is therefore to pin both halves.
+
+### A6.3 Why the two halves of a batch differ, and where they stop differing
+
+The write path already settled this principle. A positive-version `write` member whose prepared
+target is deleted and recreated under the same `(kind, key)` before commit refuses with
+`version_conflict`, recorded in the correction above and served from the revision that carries it.
+So the position was never that a recreated key is an open question; it is that one half of a batch
+was fixed and the other half was not, and from that revision onward a batch can refuse a write
+against a replacement in the same transaction in which an observation validates against one.
+
+With `id` the halves agree: both refuse when the note they named is gone, each in the writer
+transaction, each naming the member or the entry that failed.
+
+One difference remains and it is deliberate. A `write` member always has a specific note as its
+target, so it has no unpinned form to offer. An `observed` entry does: `version: null` asserts that
+nobody holds the key, and a positive version without `id` asserts the key is at a version, which are
+both useful claims about a key rather than about a document. The write path cannot express them and
+does not need to. That is the whole of the asymmetry after this amendment: not a gap, a difference
+in what the two things are for.
+
+### Alternatives considered
+
+**A generation that a create does not reset.** A per-key counter outliving the row would make the
+version half sufficient by itself. It needs a counter that survives a delete, so it is a schema
+addition plus a new invariant on the delete path, and it introduces a second number beside `version`
+whose difference from `version` every caller then has to learn. Identity is already carried by every
+write result and every read, so nothing new has to be stored or explained.
+
+**Refusing recreation outright**, as the write path does for a prepared target. The read path has no
+prepared target: an observation names a key, and a key with no live note is a legitimate observation
+(`version: null`). There is nothing to refuse against.
+
+**Leaving it to the caller** by documenting the current meaning and stopping there. That is A6.2, and
+it is necessary but not sufficient: the callers that need identity would have to check it outside the
+transaction, which is the race the whole `observed` mechanism exists to close.
+
+### Acceptance
+
+Every arm names its command; atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Recreation refused.** A keyed note at version 1, read for its `id`; the note deleted and created
+   again under the same `(kind, key)`, so a different note is live at version 1; a batch carrying
+   `{"key": K, "kind": <k>, "version": 1, "id": <the first note's id>}` is refused with
+   `identity_conflict`, `details` naming the asserted `id` and the `current_id`; the note count, the
+   ledger count and every named stream's head are unchanged. The control is the same batch against
+   the note that was never replaced, which commits every member.
+2. **The hole, stated as a control.** The same recreation with the same batch and `id` omitted
+   commits, and the ADR text of A6.2 is what that commit means. This arm exists so the difference
+   between the two predicates is a test and not a paragraph.
+3. **Identity holds across a version move.** The observed note updated once, so it is live at version
+   2 with the same `id`: the entry at version 1 refuses `version_conflict` (not
+   `identity_conflict`), and the entry at version 2 with the same `id` commits.
+4. **Both halves wrong.** A recreated note at a different version refuses with `identity_conflict`,
+   and the details still carry the version asserted.
+5. **Null version.** `id` with `version: null` is `invalid_input` before any member writes.
+   5b. **Absent holder.** The observed note deleted and not replaced: an entry carrying `id` and a
+   positive version refuses `version_conflict` with no `current_version` and no `current_id`, not
+   `identity_conflict`. The control is the same deletion followed by a recreation, which refuses
+   `identity_conflict`; the pair is what makes the two failure worlds distinguishable.
+6. **With `live_until`.** An entry carrying `id` and `live_until` together checks identity, version
+   and the deadline; recreation refuses `identity_conflict` before the deadline is read, so a
+   replacement is never reported as an expiry.
+7. **Mixed list.** A pinned entry and an unpinned entry in one list commit when both hold, and the
+   refusal names the offending key in both directions.
+8. **Help.** `stream.batch(help=true)` names `id` under `observed`, its refusal, and states in one
+   sentence what an entry without `id` asserts.
+9. **Cross-process.** Arm 1 through the socket, the recreation performed by a second OS process.
+10. **Disclosure.** Arm 1 run twice against the same recreation: once as a caller allowed to learn
+    the key's holder, whose refusal carries `current_id`, and once as a caller allowed to write the
+    batch but not to read or list the key, whose refusal carries the same `reason`, `key`, `kind`,
+    version and `index` and no `current_id` at all. The unauthorized arm supplies a guessed `id`, so
+    it is the disclosure the filter exists to stop. The `key_conflict` case is the control: the same
+    unauthorized caller already receives `key_conflict` without `existing_id`, and this arm asserts
+    the two refusals now behave the same way. The filter exists at two sites, the transactional error
+    rewrite and the per-member result strip, so the arm covers both batch modes: the unauthorized
+    half above runs in atomic mode, where the refusal is produced, and the same identity-pinned
+    observation submitted in per-member mode is asserted to refuse `invalid_input`, because
+    `observed` requires atomic mode. That second half is not a duplicate of the first. It is what
+    makes a single-site filter sound, by asserting that the per-member result path cannot carry an
+    `identity_conflict` at all; if a later amendment admits `observed` in per-member mode, this arm
+    goes red and names the second site as the one that then needs the filter.
+11. **Mutation.** With the identity half skipped, arm 1 goes red. With the identity half reported as
+    `version_conflict`, arm 1's reason assertion goes red. With `id` accepted beside a null version,
+    arm 5 goes red. With `current_id` emitted unconditionally, arm 10's unauthorized half goes red.
+    With `observed` admitted in per-member mode, arm 10's second half goes red, which is the arm that
+    proves the second filter site is unreachable rather than merely unused. Each run quoted with its
+    exit code.
