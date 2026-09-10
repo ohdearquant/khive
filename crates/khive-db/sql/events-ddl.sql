@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS event_observations (
 
 CREATE INDEX IF NOT EXISTS idx_events_namespace ON events(namespace);
 CREATE INDEX IF NOT EXISTS idx_events_verb ON events(verb);
+CREATE INDEX IF NOT EXISTS idx_events_ns_verb ON events(namespace, verb COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_events_substrate ON events(substrate);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);

@@ -70,5 +70,7 @@ path = "benches/db_hot_path.rs"
 required-features = ["vectors"]
 
 [features]
+# Exposes the task-scoped SQLite progress probe for dependent-crate tests.
+test-support = []
 default = []
 vectors = ["dep:sqlite-vec"]
