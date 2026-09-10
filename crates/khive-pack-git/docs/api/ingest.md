@@ -206,8 +206,17 @@ see `find_document_for_path_tests`).
 
 ## `write_cursor`
 
-Commits persist their exclusive SHA cursor after each contiguous successful or
-already-existing record. Issues and PRs persist a paired page checkpoint after each
+Commits atomically persist a SHA and frozen snapshot continuation after each
+contiguous successful or already-existing record (`write_commit_checkpoint`).
+The sidecar retains the original base, immutable tip, and completed position in a
+topologically ordered walk. This prevents max-one passes from cycling between
+siblings in a merge DAG. The acknowledged prefix consumes no visits on resume;
+both Git history passes and recovery retries use the pinned tip. A completed old
+snapshot with a changed `HEAD` requires another call even with spare budget. See
+[the frozen snapshot contract](../ingest.md#cursor-stall-guarantee) for validation,
+the 8 KiB metadata cap, reset semantics, and failure handling.
+
+Issues and PRs persist a paired page checkpoint after each
 fetched page is processed, including a partial page stopped by the visit budget,
 and before fetching the next page. A later fetch or database failure therefore
 preserves the earlier saved prefix. A failure within a page can replay that page.
@@ -271,7 +280,7 @@ with the metadata format has no clean, unambiguous delimiter.
 `CommitSnapshot` bundles both passes so a classified failure in either one
 can be retried as a single unit. `load_commit_snapshot` mirrors
 `ingest_commits`'s original inline sequencing: `touched_files` (a second,
-unscoped `git log --name-only` pass over the whole history) is skipped
+`git log --name-only` pass over the frozen tip's whole history) is skipped
 entirely when `walk_commits` found no new commits, since there is nothing
 new to annotate with touched paths.
 
@@ -282,7 +291,9 @@ one truthful success warning once the commit phase completes.
 used to repair a classified `GitLogError` — `recover_commit_snapshot`
 retries the snapshot load against that path (the same cache slot for both
 strategies in `cache.rs`, but callers are not required to keep it
-identical).
+identical). The tip is resolved once before recovery and remains fixed across
+retries, even when a replacement clone has a newer `HEAD`. A replacement that
+cannot provide the pinned objects fails without advancing the continuation.
 
 `recover_commit_snapshot` is bounded entirely by `recover`'s own return
 value: `Ok(Some(_))` retries the snapshot load against the recovered repo
@@ -506,13 +517,13 @@ token into two lines, so `grep -av` removes only the header line and the
 deleted commit's path token survives in the stream as the orphan.
 
 Before walking commits, the ingester loads the same-namespace live ADR-085
-module index once for the repository snapshot HEAD. That snapshot is never
-truncated: `walk_commits` issues one unbounded `git log {since}..HEAD`, and
-`max_items` bounds only the create loop (a budget check after the snapshot
-loads), never the walk — so the snapshot HEAD is always the true repository
-HEAD of this pass, and the index anchors to modules-as-of-HEAD regardless of
-how many commits the budget lets this pass create. A module is eligible only
-when both `properties.source_revision` equals that HEAD and
+module index once for the frozen repository snapshot tip. The snapshot is never
+truncated by the visit budget: `walk_commits` reconstructs the original base-to-tip
+range in reverse topological order, and `max_items` bounds the fresh-record loop
+after the acknowledged prefix. The index therefore remains anchored to the same
+immutable tip throughout continuation, even if the repository's current `HEAD`
+advances. A module is eligible only when both `properties.source_revision` equals
+that tip and
 `properties.source_path` exactly equals the changed path. Requiring the
 revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still

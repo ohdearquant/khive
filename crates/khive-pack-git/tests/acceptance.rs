@@ -30,6 +30,8 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[path = "support/digest_commit_resume.rs"]
+mod digest_commit_resume;
 #[path = "support/digest_resume.rs"]
 mod digest_resume;
 #[path = "support/digest_scale.rs"]
@@ -7347,7 +7349,7 @@ async fn ingest_truncates_over_cap_commit_embedding_and_reports_it() {
     let sql = rt.sql();
     let mut w = sql.writer().await.expect("sql writer");
     w.execute(SqlStatement {
-        sql: "DELETE FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits'".into(),
+        sql: "DELETE FROM git_mirror_cursor WHERE project_id=?1 AND kind IN ('commits','commits_checkpoint')".into(),
         params: vec![SqlValue::Text(project_id.to_string())],
         label: Some("test_reset_commits_cursor".into()),
     })

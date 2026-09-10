@@ -429,6 +429,17 @@ async fn digest_resume_commit_prefix_survives_later_cursor_write_failure() {
         read_git_cursor(&rt, project, "commits").await.as_deref(),
         Some(first_sha.as_str())
     );
+    let progress: Value = serde_json::from_str(
+        &read_git_cursor(&rt, project, "commits_checkpoint")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        progress["last_completed_sha"], first_sha,
+        "the failed main-row write rolls back its paired continuation"
+    );
+    assert_eq!(progress["snapshot_head"], second_sha);
     rt.sql()
         .writer()
         .await

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 const ISSUES: usize = 5_000;
 const UNRELATED: usize = 50_000;
 
-async fn file_fixture(path: &Path) -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
+pub(super) async fn file_fixture(path: &Path) -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: Some(path.to_path_buf()),
         ..RuntimeConfig::no_embeddings()

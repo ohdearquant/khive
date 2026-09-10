@@ -1247,57 +1247,101 @@ async fn load_code_modules_by_snapshot_path(
     Ok(modules)
 }
 
-/// Read the last-ingested cursor value for `(project_id, kind)`, if any.
-async fn read_cursor(
+/// A single SHA cannot describe a visited prefix of a branching DAG. Retain
+/// the immutable walk and a position inside its deterministic topological order.
+#[derive(Debug, Serialize, Deserialize)]
+struct CommitCheckpoint {
+    version: u8,
+    namespace: String,
+    base_cursor: Option<String>,
+    snapshot_head: String,
+    last_completed_sha: String,
+}
+
+const COMMIT_CHECKPOINT_MAX_BYTES: usize = 8 * 1024;
+
+fn is_commit_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read both rows at one SQL snapshot. A present invalid continuation cannot
+/// safely fall back to a SHA range: that would lose the already visited DAG prefix.
+async fn read_commit_checkpoint(
     runtime: &KhiveRuntime,
+    token: &NamespaceToken,
     project_id: Uuid,
-    kind: &str,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, Option<CommitCheckpoint>)> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
-            sql: "SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2"
+            sql: "SELECT \
+                  (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits') AS cursor, \
+                  (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits_checkpoint') AS progress"
                 .into(),
-            params: vec![
-                SqlValue::Text(project_id.to_string()),
-                SqlValue::Text(kind.to_string()),
-            ],
-            label: Some("git_ingest_read_cursor".into()),
+            params: vec![SqlValue::Text(project_id.to_string())],
+            label: Some("git_ingest_read_commit_checkpoint".into()),
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| match r.get("cursor_value") {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }))
+    let value = |name| {
+        row.as_ref().and_then(|r| match r.get(name) {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+    };
+    let cursor = value("cursor");
+    let Some(raw) = value("progress") else {
+        return Ok((cursor, None));
+    };
+    if raw.len() > COMMIT_CHECKPOINT_MAX_BYTES {
+        return Err(anyhow!("commits checkpoint exceeds the size limit; reset both commit cursor rows to replay history"));
+    }
+    let checkpoint: CommitCheckpoint = serde_json::from_str(&raw)
+        .context("invalid commits checkpoint; reset both commit cursor rows to replay history")?;
+    if checkpoint.version != 1
+        || checkpoint.namespace != token.namespace().as_str()
+        || !is_commit_oid(&checkpoint.snapshot_head)
+        || !is_commit_oid(&checkpoint.last_completed_sha)
+        || checkpoint
+            .base_cursor
+            .as_deref()
+            .is_some_and(|sha| !is_commit_oid(sha))
+        || cursor.as_deref() != Some(checkpoint.last_completed_sha.as_str())
+    {
+        return Err(anyhow!(
+            "inconsistent commits checkpoint; reset both commit cursor rows to replay history"
+        ));
+    }
+    Ok((cursor, Some(checkpoint)))
 }
 
-/// Advance the `(project_id, kind)` cursor. See
-/// crates/khive-pack-git/docs/api/ingest.md#write_cursor for the
-/// stall-then-retry cursor semantics.
-async fn write_cursor(
+/// Atomically publish the compatibility SHA and its frozen-walk continuation.
+async fn write_commit_checkpoint(
     runtime: &KhiveRuntime,
     project_id: Uuid,
-    kind: &str,
-    value: &str,
+    checkpoint: &CommitCheckpoint,
 ) -> Result<()> {
+    let progress = serde_json::to_string(checkpoint)?;
+    if progress.len() > COMMIT_CHECKPOINT_MAX_BYTES {
+        return Err(anyhow!("commits checkpoint exceeds the size limit"));
+    }
     let sql = runtime.sql();
     let mut w = sql.writer().await.map_err(anyhow::Error::new)?;
     w.execute(SqlStatement {
         sql: "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) \
-              VALUES(?1, ?2, ?3, ?4) \
+              VALUES(?1, 'commits_checkpoint', ?2, ?4), (?1, 'commits', ?3, ?4) \
               ON CONFLICT(project_id, kind) DO UPDATE SET \
                 cursor_value=excluded.cursor_value, \
                 updated_at=excluded.updated_at"
             .into(),
         params: vec![
             SqlValue::Text(project_id.to_string()),
-            SqlValue::Text(kind.to_string()),
-            SqlValue::Text(value.to_string()),
+            SqlValue::Text(progress),
+            SqlValue::Text(checkpoint.last_completed_sha.clone()),
             SqlValue::Integer(Utc::now().timestamp_micros()),
         ],
-        label: Some("git_ingest_write_cursor".into()),
+        label: Some("git_ingest_write_commit_checkpoint".into()),
     })
     .await
     .map_err(anyhow::Error::new)?;
@@ -1506,7 +1550,11 @@ impl GitLogError {
 
 /// Walk local git history via `git log` with a stable, machine-parseable
 /// format. See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
-fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> {
+fn walk_commits(
+    repo: &Path,
+    since_sha: Option<&str>,
+    snapshot_head: &str,
+) -> Result<Vec<RawCommit>> {
     // Raw control-byte separators embedded directly in the format string
     // (not git's `%xHH` escape syntax) — passed as a single argv element
     // (never through a shell), so the literal bytes survive intact and git's
@@ -1515,11 +1563,14 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
     let mut args = vec![
         "log".to_string(),
         "--reverse".to_string(),
+        "--topo-order".to_string(),
         format!("--pretty=format:{format}"),
     ];
-    if let Some(sha) = since_sha {
-        args.push(format!("{sha}..HEAD"));
-    }
+    args.push(match since_sha {
+        Some(sha) => format!("{sha}..{snapshot_head}"),
+        None => snapshot_head.to_string(),
+    });
+    args.push("--".into());
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -1571,7 +1622,7 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 /// `sha -> [touched paths]` for every commit in `repo`'s history, via a
 /// separate NUL-delimited `--name-only` pass. See
 /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
-fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
+fn touched_files(repo: &Path, snapshot_head: &str) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -1584,6 +1635,8 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
         // can start with `/`. This absolute-looking prefix is therefore an
         // unambiguous header sentinel in the NUL-delimited token stream.
         .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
+        .arg(snapshot_head)
+        .arg("--")
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
@@ -1773,22 +1826,48 @@ mod touched_file_parser_tests {
 struct CommitSnapshot {
     commits: Vec<RawCommit>,
     files_by_sha: HashMap<String, Vec<String>>,
+    head: String,
+    repo: PathBuf,
+}
+
+/// Resolve the ref without peeling objects so missing-promisor recovery still
+/// runs through the classified git-log boundary. Never retarget a retry to HEAD.
+fn resolve_commit_head(repo: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .context("resolving commit snapshot HEAD")?;
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || !is_commit_oid(&head) {
+        return Err(anyhow!("could not resolve commit snapshot HEAD"));
+    }
+    Ok(head)
 }
 
 /// Load one commit-history snapshot; skips `touched_files` entirely when
 /// `walk_commits` found no new commits.
-fn load_commit_snapshot(repo: &Path, since_sha: Option<&str>) -> Result<CommitSnapshot> {
-    let commits = walk_commits(repo, since_sha)?;
+fn load_commit_snapshot(
+    repo: &Path,
+    since_sha: Option<&str>,
+    snapshot_head: &str,
+) -> Result<CommitSnapshot> {
+    let commits = walk_commits(repo, since_sha, snapshot_head)?;
     if commits.is_empty() {
         return Ok(CommitSnapshot {
             commits,
             files_by_sha: HashMap::new(),
+            head: snapshot_head.to_string(),
+            repo: repo.to_path_buf(),
         });
     }
-    let files_by_sha = touched_files(repo)?;
+    let files_by_sha = touched_files(repo, snapshot_head)?;
     Ok(CommitSnapshot {
         commits,
         files_by_sha,
+        head: snapshot_head.to_string(),
+        repo: repo.to_path_buf(),
     })
 }
 
@@ -1825,12 +1904,17 @@ fn cache_repair_warning(strategy: CacheRepairStrategy) -> String {
 fn recover_commit_snapshot(
     repo: &Path,
     since_sha: Option<&str>,
+    snapshot_head: Option<&str>,
     mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>>,
 ) -> Result<(CommitSnapshot, Option<String>)> {
+    let snapshot_head = match snapshot_head {
+        Some(head) => head.to_string(),
+        None => resolve_commit_head(repo)?,
+    };
     let mut repo_path = repo.to_path_buf();
     let mut recovery_warning: Option<String> = None;
     loop {
-        match load_commit_snapshot(&repo_path, since_sha) {
+        match load_commit_snapshot(&repo_path, since_sha, &snapshot_head) {
             Ok(snapshot) => return Ok((snapshot, recovery_warning)),
             Err(e) => {
                 let classified = e
@@ -1947,18 +2031,47 @@ async fn ingest_commits(
     recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
     walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = read_cursor(runtime, project_id, "commits").await?;
-    let (snapshot, recovery_warning) = recover_commit_snapshot(repo, since.as_deref(), recover)?;
+    let (since, checkpoint) = read_commit_checkpoint(runtime, token, project_id).await?;
+    let pending = checkpoint
+        .as_ref()
+        .filter(|c| c.last_completed_sha != c.snapshot_head);
+    let base_cursor = match pending {
+        Some(c) => c.base_cursor.clone(),
+        None => since.clone(),
+    };
+    if base_cursor
+        .as_deref()
+        .is_some_and(|sha| !is_commit_oid(sha))
+    {
+        return Err(anyhow!(
+            "invalid commits cursor; reset both commit cursor rows to replay history"
+        ));
+    }
+    let (snapshot, recovery_warning) = recover_commit_snapshot(
+        repo,
+        base_cursor.as_deref(),
+        pending.map(|c| c.snapshot_head.as_str()),
+        recover,
+    )?;
     let CommitSnapshot {
-        commits,
+        mut commits,
         files_by_sha,
+        head: snapshot_head,
+        repo: snapshot_repo,
     } = snapshot;
+    if let Some(c) = pending {
+        let position = commits.iter().position(|record| record.sha == c.last_completed_sha)
+            .ok_or_else(|| anyhow!("commits checkpoint position is absent from its frozen snapshot; reset both commit cursor rows to replay history"))?;
+        // Reconstructing the snapshot does no natural-key lookups. Its
+        // acknowledged prefix consumes no fresh-record visit budget.
+        commits.drain(..=position);
+    }
     if commits.is_empty() {
         // An empty range is a genuine completion only when the cursor is an
         // ancestor of HEAD. See crates/khive-pack-git/docs/ingest.md
         // #commit-walk-ancestor-divergence-and-cursor-stall.
         let cursor_not_ancestor = last_sha_of(&since).is_some_and(|since_sha| {
-            let not_ancestor = !is_ancestor_of_head(repo, since_sha);
+            let not_ancestor = !is_ancestor_of_head(&snapshot_repo, since_sha);
             if not_ancestor {
                 report.warnings.push(format!(
                     "commits cursor {since_sha} is not an ancestor of this \
@@ -1981,6 +2094,11 @@ async fn ingest_commits(
                  lags or diverged from the history that advanced the cursor (issue #1644)"
                     .into(),
             ));
+        } else if resolve_commit_head(&snapshot_repo)? != snapshot_head {
+            report.done = false;
+            report.sources.commits = Some(IngestSourceState::StoppedEarly(
+                "source HEAD changed after the frozen commit snapshot; call again for the new history".into(),
+            ));
         } else {
             report.sources.commits = Some(IngestSourceState::Completed);
             *walk_complete = true;
@@ -1993,14 +2111,13 @@ async fn ingest_commits(
     report.sources.commits = Some(IngestSourceState::StoppedEarly(
         COMMIT_WALK_SEED_REASON.into(),
     ));
-    // The last record (walk is oldest-first) is the exact snapshot HEAD the
-    // module index binds against; the walk itself is never truncated by
-    // `max_items` — only the record-visit loop below is.
-    let snapshot_head = commits
-        .last()
-        .expect("non-empty commit snapshot checked above")
-        .sha
-        .clone();
+    let mut checkpoint = CommitCheckpoint {
+        version: 1,
+        namespace: token.namespace().as_str().to_string(),
+        base_cursor,
+        snapshot_head: snapshot_head.clone(),
+        last_completed_sha: String::new(),
+    };
     // Module annotation is best-effort enrichment: a failed index load
     // degrades to no module annotation with a warning carrying the load
     // error's text rather than aborting the pass that records the durable
@@ -2046,7 +2163,8 @@ async fn ingest_commits(
             local_sha_to_id.insert(c.sha.clone(), existing);
             report.commits_skipped_existing += 1;
             if !cursor_stalled {
-                write_cursor(runtime, project_id, "commits", &c.sha).await?;
+                checkpoint.last_completed_sha.clone_from(&c.sha);
+                write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
             }
             continue;
         }
@@ -2245,9 +2363,10 @@ async fn ingest_commits(
             }
         }
         if !cursor_stalled {
-            // Exclusive SHA resume: each contiguous success survives a later
-            // database, subprocess, or request-deadline failure.
-            write_cursor(runtime, project_id, "commits", &c.sha).await?;
+            // Each contiguous success survives later failures without treating
+            // the ancestor closure of one SHA as the visited DAG prefix.
+            checkpoint.last_completed_sha.clone_from(&c.sha);
+            write_commit_checkpoint(runtime, project_id, &checkpoint).await?;
         }
     }
 
@@ -2268,8 +2387,15 @@ async fn ingest_commits(
             // `None` from an instrumentation gap) is rewritten to
             // `Completed`. Any other reason was written by a real
             // early-stop arm and is preserved.
-            report.sources.commits = Some(IngestSourceState::Completed);
-            *walk_complete = true;
+            if resolve_commit_head(&snapshot_repo)? != snapshot_head {
+                report.done = false;
+                report.sources.commits = Some(IngestSourceState::StoppedEarly(
+                    "source HEAD changed after the frozen commit snapshot; call again for the new history".into(),
+                ));
+            } else {
+                report.sources.commits = Some(IngestSourceState::Completed);
+                *walk_complete = true;
+            }
         }
     }
     // One bounded line per run (never one per path): filenames are
@@ -3400,7 +3526,7 @@ mod recovery_classifier_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo_with_commit(dir.path());
         let mut recover_calls = 0;
-        let (snapshot, warning) = recover_commit_snapshot(dir.path(), None, |_repo, _err| {
+        let (snapshot, warning) = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
             recover_calls += 1;
             Ok(None)
         })
@@ -3419,7 +3545,7 @@ mod recovery_classifier_tests {
         // Not a git repo at all -- `git log` fails with a plain spawn/repo
         // error, not a classified promisor one.
         let mut recover_calls = 0;
-        let result = recover_commit_snapshot(dir.path(), None, |_repo, _err| {
+        let result = recover_commit_snapshot(dir.path(), None, None, |_repo, _err| {
             recover_calls += 1;
             Ok(Some(RecoveredRepo {
                 repo: dir.path().to_path_buf(),

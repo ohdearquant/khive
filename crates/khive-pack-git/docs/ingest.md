@@ -103,16 +103,35 @@ mid-walk database error is reported in-band as walked-then-failed rather
 than as a pre-walk hard error (cursor and snapshot failures earlier in the
 function remain pre-walk errors).
 
-The commit snapshot (`walk_commits`) is oldest-first and always includes
-`HEAD` whenever this phase has work, so the last record is the exact
-repository snapshot the ADR-085 module index binds against. The walk
-itself is never truncated — `walk_commits` issues one unbounded
-`git log {since}..HEAD`, and `max_items` bounds only the fresh-record visit loop that
-follows, never the snapshot — so `snapshot_head` is always the true
-repository `HEAD` of the pass regardless of how many commits the budget
-lets it create.
+Commit progress uses a **frozen snapshot continuation**, because the ancestor
+closure of one SHA does not describe a visited prefix across both sides of a
+merge. At the start of a new walk, resolve `HEAD` to an immutable OID. Reconstruct
+`git log --reverse --topo-order {base}..{snapshot_head}` on each resumed call
+(omit the base exclusion for a full-history walk). Metadata, touched paths,
+recovery retries, and the ADR-085 module index all bind to that same snapshot tip.
+The walk itself remains unbounded; `max_items` limits fresh record visits, not
+snapshot construction. Its acknowledged prefix is skipped before any natural-key
+lookup or budget charge.
 
-`cursor_stalled` freezes the persisted SHA at the last contiguous successfully
+After each contiguous success or existing-note visit, one atomic UPSERT stores the
+compatibility `commits` SHA and a versioned `commits_checkpoint` sidecar containing
+namespace, original base, frozen tip, and last completed SHA. The sidecar has
+constant fields and an 8 KiB serialized cap; no list of visited SHAs grows with
+history. Resume validates the paired rows and the position's membership in the
+frozen traversal. An absent sidecar preserves legacy SHA-only startup. Present
+malformed, oversized, unknown-version, or inconsistent metadata fails before
+record visits; it never silently falls back to an incomplete SHA-only prefix.
+An unavailable frozen tip also fails without advancing either row. Reset both
+rows to deliberately replay the history, including after local note deletion.
+
+The frozen tip is the last record in topological order. Once acknowledged, the
+next call may begin a new walk from that tip. If `HEAD` has changed when a frozen
+walk finishes, the response remains `done:false` and `history_exhausted:false`,
+even with unused budget, so callers request the subsequent history. A pass that
+exactly consumes its budget retains the existing `done:false` convention and
+proves completion on the next call. Issue/PR page checkpoints are unchanged.
+
+`cursor_stalled` freezes both commit cursor rows at the last contiguous successfully
 processed commit: once a record fails to create, later records in the same
 pass are still attempted (so a run surfaces every failure it can, not just
 the first), but the persisted cursor no longer advances past the failure.
