@@ -176,6 +176,28 @@ impl PolicyEnforcingNoteStore {
 
 #[async_trait]
 impl NoteStore for PolicyEnforcingNoteStore {
+    async fn get_live_notes_by_key(
+        &self,
+        namespace: &str,
+        key: &str,
+        kind: Option<&str>,
+    ) -> StorageResult<Vec<Note>> {
+        self.inner.get_live_notes_by_key(namespace, key, kind).await
+    }
+
+    async fn query_keyed_notes(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        prefix: &str,
+        after: Option<&khive_storage::note::NoteKeyCursor>,
+        page: PageRequest,
+    ) -> StorageResult<(Vec<Note>, Option<khive_storage::note::NoteKeyCursor>)> {
+        self.inner
+            .query_keyed_notes(namespace, filter, prefix, after, page)
+            .await
+    }
+
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
         reject_if_forged_message_note(&note, "upsert_note")?;
         self.inner.upsert_note(note).await

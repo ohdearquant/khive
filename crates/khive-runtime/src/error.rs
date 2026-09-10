@@ -435,6 +435,67 @@ impl std::error::Error for CircularPackDependency {}
 
 /// All errors produced by the khive-runtime layer.
 ///
+/// Where the `GateDenied` audit row of a refused dispatch ended up.
+///
+/// A refusal reaches the caller whatever happens to its audit row; this value
+/// says whether the row the caller could cite exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialAuditOutcome {
+    /// The row committed, or an identical row was already present, and
+    /// `audit_event_id` on the refusal names it.
+    Committed,
+    /// The row was built and submitted but did not commit; the audit
+    /// obligation wire code says why.
+    NotCommitted(&'static str),
+    /// No event store is configured, so no row was written.
+    NoStore,
+    /// The refusal comes from a path that writes no audit row (namespace
+    /// authorization, channel policy).
+    NotAudited,
+}
+
+impl DenialAuditOutcome {
+    /// Closed wire spelling: `committed`, `not_committed:<code>`, `no_store`,
+    /// `not_audited`.
+    pub fn wire_code(&self) -> String {
+        match self {
+            Self::Committed => "committed".to_string(),
+            Self::NotCommitted(code) => format!("not_committed:{code}"),
+            Self::NoStore => "no_store".to_string(),
+            Self::NotAudited => "not_audited".to_string(),
+        }
+    }
+}
+
+/// What a refused dispatch can cite: the `GateDenied` audit row's id when
+/// one committed, and where the row ended up otherwise. Boxed on the error
+/// so a refusal does not widen every `Result<_, RuntimeError>` in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialReceipt {
+    /// The audit row's event id when `audit_outcome` is `Committed`.
+    pub audit_event_id: Option<uuid::Uuid>,
+    /// Whether the row the caller could cite exists.
+    pub audit_outcome: DenialAuditOutcome,
+}
+
+impl DenialReceipt {
+    /// The refusal's path writes no audit row.
+    pub fn not_audited() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NotAudited,
+        }
+    }
+
+    /// No event store is configured, so no row was written.
+    pub fn no_store() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NoStore,
+        }
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
@@ -547,8 +608,16 @@ pub enum RuntimeError {
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
     /// `GateDecision::Deny`. The pack is never invoked. The `reason` field
     /// carries the deny message produced by the gate implementation.
+    ///
+    /// `receipt` carries the id of the `GateDenied` audit row when one
+    /// committed, so the caller can cite the refusal, and says whether such
+    /// a row exists.
     #[error("permission denied for verb {verb:?}: {reason}")]
-    PermissionDenied { verb: String, reason: String },
+    PermissionDenied {
+        verb: String,
+        reason: String,
+        receipt: Box<DenialReceipt>,
+    },
 
     /// The configured gate could not produce an authorization decision.
     ///
@@ -673,6 +742,15 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// A gate refusal from a path that writes no audit row.
+    pub fn permission_denied(verb: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::PermissionDenied {
+            verb: verb.into(),
+            reason: reason.into(),
+            receipt: Box::new(DenialReceipt::not_audited()),
+        }
+    }
+
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
@@ -948,10 +1026,12 @@ mod channel_ingest_failure_class_tests {
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
         let first = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: None,
             masked: "first-rendering".to_string(),
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
         });
 

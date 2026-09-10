@@ -15,6 +15,8 @@ fn file_backed_registry(
     db_path: std::path::PathBuf,
 ) -> (khive_runtime::VerbRegistry, KhiveRuntime) {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -30,6 +32,7 @@ fn file_backed_registry(
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        exec: Default::default(),
     })
     .expect("file-backed runtime");
     let mut builder = VerbRegistryBuilder::new();

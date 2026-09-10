@@ -1009,6 +1009,12 @@ impl ErrorConstructorCensus {
     }
 }
 
+const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[(
+    "khive-mcp/src/daemon.rs",
+    "executable",
+    "khive-mcp/src/daemon/executable.rs",
+)];
+
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         if !is_test_only(&item.attrs) {
@@ -1029,11 +1035,15 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
         if is_test_only(&item.attrs) {
             return;
         }
-        if item.content.is_none() {
-            // None of the current three production roots delegates its error
-            // builders to a separate file. A new such module must expand this
-            // census explicitly; silently visiting its empty AST would turn a
-            // source split into a coverage bypass.
+        if item.content.is_none()
+            && !(self.modules.is_empty()
+                && item.attrs.is_empty()
+                && EXTERNAL_ERROR_MODULES
+                    .iter()
+                    .any(|(source, module, _)| self.source == *source && item.ident == *module))
+        {
+            // External modules must join the scanned source set. Reject path
+            // overrides and nested declarations that would change that target.
             self.reject(&format!("unscanned production submodule {}; add its source to the census before delegating envelope construction", item.ident));
         }
         self.modules.push(item.ident.to_string());
@@ -1229,7 +1239,11 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
     ];
     let mut emitted = 0;
     let mut runtime_variants = std::collections::BTreeSet::new();
-    for source in sources {
+    for source in sources.into_iter().chain(
+        EXTERNAL_ERROR_MODULES
+            .iter()
+            .map(|(_, _, path)| manifest.parent().unwrap().join(path)),
+    ) {
         let census = census_source(&source);
         assert!(
             census.offenders.is_empty(),
@@ -1261,6 +1275,25 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
         })
         .expect("RuntimeError declaration must be present");
     assert_eq!(runtime_variants, variants, "every real runtime variant must have an explicit projection arm; adding a catch-all is not coverage");
+}
+
+#[test]
+fn a3_constructor_census_rejects_redirected_registered_modules() {
+    use syn::visit::Visit;
+    for source in [
+        r#"#[path = "other.rs"] mod executable;"#,
+        r#"mod nested { mod executable; }"#,
+    ] {
+        let mut census = ErrorConstructorCensus {
+            source: "khive-mcp/src/daemon.rs".into(),
+            ..Default::default()
+        };
+        census.visit_file(&syn::parse_file(source).unwrap());
+        assert!(
+            !census.offenders.is_empty(),
+            "module redirected outside the scanned population"
+        );
+    }
 }
 
 #[test]
@@ -1474,7 +1507,12 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
             *FORWARD.lock().unwrap() = None;
         }
     }
-    fn native_forward(frame: DaemonRequestFrame, _packs: Option<Vec<String>>) -> ForwardFuture {
+    fn native_forward(
+        frame: DaemonRequestFrame,
+        _packs: Option<Vec<String>>,
+        replay_read_only: bool,
+    ) -> ForwardFuture {
+        assert!(!replay_read_only, "comm.send must not be replayed");
         let dispatcher = FORWARD.lock().unwrap().take().expect("one native forward");
         Box::pin(async move {
             let capture = Arc::clone(&dispatcher.capture);
@@ -1610,5 +1648,105 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
         file.write_all(&serde_json::to_vec_pretty(&evidence).unwrap())
             .unwrap();
         file.write_all(b"\n").unwrap();
+    }
+}
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn a_gate_refusal_projects_its_audit_receipt_beside_the_denial_text() {
+    let id = uuid::Uuid::new_v4();
+    let error = runtime_error_value(
+        RuntimeError::PermissionDenied {
+            verb: "create".into(),
+            reason: "denied for test".into(),
+            receipt: Box::new(khive_runtime::DenialReceipt {
+                audit_event_id: Some(id),
+                audit_outcome: khive_runtime::DenialAuditOutcome::Committed,
+            }),
+        },
+        DomainDisposition::NotCommitted,
+    );
+    assert_eq!(error["kind"], "runtime_error");
+    assert_eq!(error["code"], "permission_denied");
+    assert_eq!(
+        error["message"],
+        "permission denied for verb \"create\": denied for test"
+    );
+    assert_eq!(error["verb"], "create");
+    assert_eq!(error["reason"], "denied for test");
+    assert_eq!(error["audit_event_id"], id.to_string());
+    assert_eq!(error["audit_outcome"], "committed");
+
+    let unaudited = runtime_error_value(
+        RuntimeError::permission_denied("authorize", "gate denied"),
+        DomainDisposition::NotCommitted,
+    );
+    assert_eq!(unaudited["audit_event_id"], Value::Null);
+    assert_eq!(unaudited["audit_outcome"], "not_audited");
+    assert!(unaudited["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("permission denied for verb"));
+}
+#[test]
+fn ordered_fences_refusal_has_no_domain_commit() {
+    for index in [None, Some("0"), Some("1")] {
+        let mut details = vec![
+            ("reason", "fence_conflict".to_owned()),
+            ("key", "lease".to_owned()),
+            ("expected_version", "1".to_owned()),
+        ];
+        if let Some(index) = index {
+            details.push(("index", index.to_owned()));
+        }
+        let error = khive_types::KhiveError::conflict("note fence precondition failed")
+            .with_details(khive_types::Details::new_owned(details));
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"].get("index").and_then(Value::as_str), index);
+    }
+}
+
+#[test]
+fn observed_id_arm1_named_identity_refusal_is_not_committed() {
+    let details = khive_types::Details::new_owned(vec![
+        ("reason", "identity_conflict".into()),
+        ("key", "lease".into()),
+        ("kind", "head".into()),
+        ("version", "1".into()),
+        ("id", uuid::Uuid::nil().to_string()),
+        ("current_id", uuid::Uuid::new_v4().to_string()),
+        ("index", "0".into()),
+    ]);
+    let error =
+        khive_types::KhiveError::conflict("stream observation identity precondition failed")
+            .with_details(details);
+    let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+    assert_eq!(value["domain_disposition"], "not_committed");
+    assert_eq!(value["details"]["reason"], "identity_conflict");
+    assert_eq!(value["details"]["version"], "1");
+    let unknown = runtime_error_value(
+        khive_types::KhiveError::conflict("unestablished outcome").into(),
+        DomainDisposition::Unknown,
+    );
+    assert_eq!(unknown["domain_disposition"], "unknown");
+}
+
+#[test]
+fn expiry_arm10_named_time_refusals_carry_rollback_proof() {
+    for reason in ["expired", "live_until_unreadable", "unrelated"] {
+        let error = khive_types::KhiveError::conflict("observation refused").with_details(
+            khive_types::Details::new_owned([("reason", reason.to_string())]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(
+            value["domain_disposition"],
+            if reason == "unrelated" {
+                "unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(value["details"]["reason"], reason);
     }
 }

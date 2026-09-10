@@ -1155,7 +1155,7 @@ async fn parallel_assign_batch_creates_n_tasks() -> anyhow::Result<()> {
     ]"#;
     let result = call(&client, "request", json!({"ops": ops})).await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
-    assert_eq!(body["summary"]["succeeded"], 3);
+    assert_eq!(body["summary"]["succeeded"], 3, "{body}");
     Ok(())
 }
 
@@ -3357,6 +3357,48 @@ async fn help_brain_feedback_params_non_empty_with_target_and_signal() -> anyhow
         has_signal,
         "brain.feedback params must include 'signal'; got: {params:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn help_brain_actor_reads_expose_caller_scope_and_fleet_gate() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    for verb in ["brain.event_counts", "brain.resolve", "brain.bindings"] {
+        let schema = help_schema(&client, verb).await?;
+        let description = schema["description"]
+            .as_str()
+            .expect("verb help description")
+            .to_ascii_lowercase();
+        assert!(description.contains("caller"), "{verb}: {description}");
+        let params = schema["params"].as_array().expect("help params");
+        let actor = params
+            .iter()
+            .find(|param| param["name"] == "actor")
+            .expect("actor read help includes actor");
+        assert_eq!(actor["type"], "string", "{verb}: {actor}");
+        assert_eq!(actor["required"], false, "{verb}: {actor}");
+        let actor_scope = actor["description"]
+            .as_str()
+            .expect("actor scope description")
+            .to_ascii_lowercase();
+        assert!(actor_scope.contains("caller"), "{verb}: {actor_scope}");
+        assert!(actor_scope.contains("visible"), "{verb}: {actor_scope}");
+
+        let all_actors = params.iter().find(|param| param["name"] == "all_actors");
+        if verb == "brain.event_counts" {
+            let all_actors = all_actors.expect("event counts advertises fleet reads");
+            assert_eq!(all_actors["type"], "boolean");
+            assert_eq!(all_actors["required"], false);
+            let fleet_scope = all_actors["description"]
+                .as_str()
+                .expect("fleet read scope description")
+                .to_ascii_lowercase();
+            assert!(fleet_scope.contains("fleet_readers"), "{fleet_scope}");
+            assert!(fleet_scope.contains("actor"), "{fleet_scope}");
+        } else {
+            assert!(all_actors.is_none(), "{verb} has no fleet read parameter");
+        }
+    }
     Ok(())
 }
 
@@ -6073,6 +6115,7 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
                 branches: vec!["release/*".to_string()],
             },
         ],
+        ..Default::default()
     };
     let configured = RuntimeConfig {
         git_write: policy.clone(),
@@ -6088,12 +6131,14 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["fix/*".to_string()],
             }],
+            ..Default::default()
         },
         ..base.clone()
     };
     let reordered = RuntimeConfig {
         git_write: GitWriteSectionConfig {
             allowed: policy.allowed.into_iter().rev().collect(),
+            ..Default::default()
         },
         ..base
     };
@@ -6748,3 +6793,6 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         "AlwaysVerbose get: properties.priority must survive redundancy-drop; rendered: {rendered}"
     );
 }
+
+#[path = "streams/contract.rs"]
+mod stream_contract;

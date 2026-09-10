@@ -26,6 +26,16 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// Immutable caller-chosen identity, unique among live notes of the same namespace and kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Persisted revision, assigned by storage and advanced on every matched update.
+    #[serde(default = "initial_note_version")]
+    pub version: i64,
+}
+
+const fn initial_note_version() -> i64 {
+    1
 }
 
 impl Note {
@@ -50,6 +60,8 @@ impl Note {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            key: None,
+            version: 1,
         }
     }
 
@@ -120,6 +132,21 @@ mod tests {
 
     fn base_note() -> Note {
         Note::new("ns:test", "memory", "hello world")
+    }
+
+    #[test]
+    fn note_key_is_optional_and_unkeyed_wire_shape_is_unchanged() {
+        let note = base_note();
+        assert_eq!(note.key, None);
+        let legacy = serde_json::to_value(&note).unwrap();
+        assert!(legacy.get("key").is_none());
+        assert_eq!(serde_json::from_value::<Note>(legacy).unwrap(), note);
+
+        let mut keyed = note;
+        keyed.key = Some("operation-1".to_string());
+        let encoded = serde_json::to_value(&keyed).unwrap();
+        assert_eq!(encoded["key"], "operation-1");
+        assert_eq!(serde_json::from_value::<Note>(encoded).unwrap(), keyed);
     }
 
     // -- with_salience --
@@ -534,6 +561,32 @@ pub struct NoteSeekAfter {
     pub id: Uuid,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteTagMode {
+    #[default]
+    Any,
+    All,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NoteKeyCursor {
+    pub updated_at: i64,
+    pub key: String,
+    pub id: Uuid,
+}
+
+impl From<&Note> for NoteKeyCursor {
+    fn from(note: &Note) -> Self {
+        Self {
+            updated_at: note.updated_at,
+            key: note.key.clone().expect("keyed row"),
+            id: note.id,
+        }
+    }
+}
+
 /// Filter + sort options for [`NoteStore::query_notes_filtered`].
 ///
 /// Designed for general property-based filtering on any JSON field, not
@@ -554,6 +607,12 @@ pub struct NoteFilter {
     /// Restrict to notes where `created_at >= min_created_at` (microseconds epoch).
     /// `None` applies no lower-bound constraint.
     pub min_created_at: Option<i64>,
+    #[serde(default)]
+    pub min_updated_at: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tag_mode: NoteTagMode,
     /// Restrict results to rows strictly after this boundary in the default
     /// `created_at DESC, id ASC` order, for keyset (seek) pagination that
     /// avoids re-walking earlier pages the way `PageRequest.offset` does.
@@ -572,7 +631,35 @@ pub struct NoteFilter {
 /// Temporal-referential note CRUD over the notes substrate table.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
-    /// Insert or update a single note.
+    async fn get_live_notes_by_key(
+        &self,
+        _namespace: &str,
+        _key: &str,
+        _kind: Option<&str>,
+    ) -> StorageResult<Vec<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "get_live_notes_by_key".into(),
+            message: "backend has no keyed note lookup".into(),
+        })
+    }
+
+    async fn query_keyed_notes(
+        &self,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _prefix: &str,
+        _after: Option<&NoteKeyCursor>,
+        _page: PageRequest,
+    ) -> StorageResult<(Vec<Note>, Option<NoteKeyCursor>)> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_keyed_notes".into(),
+            message: "backend has no keyed note pagination".into(),
+        })
+    }
+
+    /// Insert or update a single note. Updates preserve the stored immutable key.
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
     /// Replace a note only when the persisted row still matches the caller's
     /// read snapshot.
@@ -624,7 +711,7 @@ pub trait NoteStore: Send + Sync + 'static {
             message: "this backend does not implement guarded note insertion".into(),
         })
     }
-    /// Insert or update a batch of notes.
+    /// Insert or update a batch of notes. Updates preserve each stored immutable key.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;

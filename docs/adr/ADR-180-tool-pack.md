@@ -1,10 +1,10 @@
 # ADR-180: Tool Pack: Capability Registry, Ontological Discovery and Use Policy
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the tool pack)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-002](ADR-002-edge-ontology.md) (edge ontology; the registry reuses `project`,
   `concept` and the `implements` edge),
-  [ADR-023](ADR-023-declarative-pack-format.md) (declarative pack format; the handlers below
+  [ADR-023](ADR-023-declarative-pack-format.md) (pack verb surface, visibility and composition, the file keeping its original name; the handlers below
   are declared there and are wire surfaces)
 - **Relates to**: [ADR-007](ADR-007-namespace.md) (registry, policy and grants are namespace scoped),
   [ADR-096](ADR-096-warm-daemon-per-request-identity.md) (per-request identity: the actor a
@@ -36,7 +36,7 @@ or `verb`, tagged `tool-registry` and its kind, with properties `schema` (the ca
 capability is a `concept` entity of `entity_type` `capability`, tagged `tool-capability`, and a
 registered object points at each capability it implements with an `implements` edge. Names are
 unique per namespace; re-registering an existing name returns the existing object and links any
-new capabilities without changing its properties.
+new capabilities without changing its properties. `tool.register(name, kind, description, schema, source, side_effect, trust, capabilities, tags)` creates the object; `kind` defaults to `tool`, `side_effect` to `write` and `trust` to `external`.
 
 **Discovery.** `tool.suggest(query, limit, kind, actor)` runs two arms and merges them: hybrid
 search over the registry, and hybrid search over capability concepts expanded through their
@@ -61,7 +61,7 @@ and, when `notify` names an actor and the comm pack is loaded, mails that actor 
 `comm.send`. `tool.grant(id, expires_in_s, note)` moves `requested` or `denied` to `granted`,
 `tool.deny(id, note)` moves `requested` or `granted` to `denied`, `tool.revoke(id, note)` moves
 `granted` to `revoked`; any other transition is refused with the current status in the message.
-The decider is the calling actor. `tool.requests(status, actor, tool, limit)` and
+The decider is the calling actor and must differ from the actor that requested the row: a requester granting its own request is refused with the status and the requester named. `tool.requests(status, actor, tool, limit)` and
 `tool.policies(actor, limit)` list. Requests and policies live in two pack-owned tables,
 `tool_grants` and `tool_policy`, created by the pack's schema plan; when the general grants
 primitive lands, the request rows migrate onto it and this record is amended to say so.
@@ -84,6 +84,8 @@ primitive lands, the request rows migrate onto it and this record is amended to 
 7. `tool.deny` on a `revoked` row is refused with the current status in the message.
 8. `tool.ingest(source="khive")` registers every loaded verb of visibility `verb` under
    `khive:<pack>` with one capability per pack, and a second run reports them all as `existing`.
+9. `tool.grant` by the actor that requested the row is refused and the row stays `requested`; the same
+   row requested by another actor is granted.
 
 ## Known rough edges
 

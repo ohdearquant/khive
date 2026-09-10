@@ -55,6 +55,10 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage operator-configured tool sources.
+    #[command(subcommand)]
+    Mount(crate::mount::MountCommand),
+
     /// Build a working SQLite DB from .khive/kg/*.ndjson sources (issue #174).
     Sync(SyncArgs),
 
@@ -290,6 +294,7 @@ pub async fn cli_main() -> Result<()> {
     let command = resolve_command(args.exec, args.command);
 
     match command {
+        Command::Mount(command) => crate::mount::run(command).await,
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
@@ -335,6 +340,10 @@ pub async fn cli_main() -> Result<()> {
             anyhow::bail!("the events daemon requires a Unix platform (Unix-socket transport)")
         }
         Command::Mcp(a) => {
+            #[cfg(unix)]
+            if !a.daemon && a.transport.as_deref().unwrap_or("stdio") == "stdio" {
+                khive_mcp::daemon::capture_bridge_executable();
+            }
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
@@ -438,6 +447,9 @@ pub async fn cli_main() -> Result<()> {
                 // failing to acquire the lock here must abort before that
                 // unguarded construction runs, rather than silently
                 // proceeding with `boot_guard = None`.
+                if a.daemon {
+                    khive_runtime::daemon::mark_warm_index_host();
+                }
                 #[cfg(unix)]
                 let boot_guard = if a.daemon {
                     Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)

@@ -25,7 +25,7 @@ instrumentation gap that would have to exist for the slot to still be
 
 `run_ingest` distinguishes a **never-walked** source (its first page/first
 fetch failed) from a **walked-then-failed** source (a continuation-page
-fetch, a per-record existence lookup, or the final cursor write failed
+fetch, a per-record existence lookup, or the page or per-commit checkpoint write failed
 after the walk was already underway) by reading the source's own state
 slot: `None` means the walker never got as far as recording anything, so
 the source was never walked; `Some` means the walker had already recorded a
@@ -35,8 +35,8 @@ occurred, so the walk did happen.
 For pull requests and issues this is checked directly (`report.sources.pull_requests.is_none()` /
 `report.sources.issues.is_none()`). For commits, `ingest_commits` records
 its source slot at every walker exit, so a `Some` slot beside an `Err` means
-the walk ran (possibly to completion) and the pass failed *after* it — the
-final cursor write is the canonical case for that. A `None` slot for
+the walk ran (possibly to completion) and the pass failed _after_ it — the
+page or per-commit checkpoint write is the canonical case for that. A `None` slot for
 commits is a pre-walk failure (snapshot recovery, cursor read) and stays a
 hard error, since the recovery contract depends on those surfacing.
 
@@ -44,7 +44,7 @@ When the source did walk before failing:
 
 - A completed walk whose pass then fails is downgraded from `Completed` to
   `StoppedEarly`, so `completed` never outlives a pass whose durability
-  turned out to be unproven (e.g. the final cursor write never landed).
+  turned out to be unproven (e.g. the page or per-commit checkpoint write never landed).
 - The resume loop must not treat the source as finished: `report.done` is
   forced to `false`.
 
@@ -68,7 +68,7 @@ as a real stop reason.
 
 **Fabrication risk**, named here for the next maintainer touching a walker:
 in release builds the `debug_assert!` guarding these arms is a no-op, so a
-future walker that sets its completion flag *without* also recording a
+future walker that sets its completion flag _without_ also recording a
 source state would silently produce a fabricated `Completed` /
 `StoppedEarly` here with no real reason behind it. The invariant every
 walker must uphold is that it records its own exit state; these fallback
@@ -80,7 +80,7 @@ reason instead of leaving the slot silently empty.
 ### Ancestor-divergence check
 
 An empty `{cursor}..HEAD` commit range is a genuine completion only when
-the cursor is an ancestor of the tip being walked. A cursor that is *not*
+the cursor is an ancestor of the tip being walked. A cursor that is _not_
 an ancestor means this source's history lags or diverged from whatever
 advanced the cursor — measured directly: a scratch clone whose `HEAD`
 trailed the cursor by weeks walked nothing and reported a clean pass
@@ -103,16 +103,35 @@ mid-walk database error is reported in-band as walked-then-failed rather
 than as a pre-walk hard error (cursor and snapshot failures earlier in the
 function remain pre-walk errors).
 
-The commit snapshot (`walk_commits`) is oldest-first and always includes
-`HEAD` whenever this phase has work, so the last record is the exact
-repository snapshot the ADR-085 module index binds against. The walk
-itself is never truncated — `walk_commits` issues one unbounded
-`git log {since}..HEAD`, and `max_items` bounds only the create loop that
-follows, never the snapshot — so `snapshot_head` is always the true
-repository `HEAD` of the pass regardless of how many commits the budget
-lets it create.
+Commit progress uses a **frozen snapshot continuation**, because the ancestor
+closure of one SHA does not describe a visited prefix across both sides of a
+merge. At the start of a new walk, resolve `HEAD` to an immutable OID. Reconstruct
+`git log --reverse --topo-order {base}..{snapshot_head}` on each resumed call
+(omit the base exclusion for a full-history walk). Metadata, touched paths,
+recovery retries, and the ADR-085 module index all bind to that same snapshot tip.
+The walk itself remains unbounded; `max_items` limits fresh record visits, not
+snapshot construction. Its acknowledged prefix is skipped before any natural-key
+lookup or budget charge.
 
-`cursor_stalled` freezes `last_sha` at the last contiguous successfully
+After each contiguous success or existing-note visit, one atomic UPSERT stores the
+compatibility `commits` SHA and a versioned `commits_checkpoint` sidecar containing
+namespace, original base, frozen tip, and last completed SHA. The sidecar has
+constant fields and an 8 KiB serialized cap; no list of visited SHAs grows with
+history. Resume validates the paired rows and the position's membership in the
+frozen traversal. An absent sidecar preserves legacy SHA-only startup. Present
+malformed, oversized, unknown-version, or inconsistent metadata fails before
+record visits; it never silently falls back to an incomplete SHA-only prefix.
+An unavailable frozen tip also fails without advancing either row. Reset both
+rows to deliberately replay the history, including after local note deletion.
+
+The frozen tip is the last record in topological order. Once acknowledged, the
+next call may begin a new walk from that tip. If `HEAD` has changed when a frozen
+walk finishes, the response remains `done:false` and `history_exhausted:false`,
+even with unused budget, so callers request the subsequent history. A pass that
+exactly consumes its budget retains the existing `done:false` convention and
+proves completion on the next call. Issue/PR page checkpoints are unchanged.
+
+`cursor_stalled` freezes both commit cursor rows at the last contiguous successfully
 processed commit: once a record fails to create, later records in the same
 pass are still attempted (so a run surfaces every failure it can, not just
 the first), but the persisted cursor no longer advances past the failure.
@@ -125,9 +144,9 @@ natural key, so a retried pass never double-creates them.
 `local_sha_to_id` maps parent SHA to note id for commits created earlier in
 the same pass. Combined with `find_commit_by_sha`'s database lookup, it
 resolves `precedes` parent edges regardless of which pass the parent
-landed in. The stall guard applies to every `last_sha` advance in the loop:
+landed in. The stall guard applies to every cursor write in the loop:
 once a commit create fails, advancing the cursor past a later
-refused/failed record — including past a later *existing* record, whose
+refused/failed record — including past a later _existing_ record, whose
 natural-key lookup proves only its own landing, not the failed record's —
 would strand the failed commit behind the floor and skip it forever instead
 of retrying it on the next pass.

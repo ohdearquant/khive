@@ -50,9 +50,9 @@ EdgeEndpointRule {
 `khive-pack-formal` sits in the pack tier on `khive-types` (`EdgeEndpointRule`,
 `EndpointKind`) and `khive-runtime` (`Pack`, `PackRuntime`, inventory
 registration); it `REQUIRES` [`khive-pack-kg`](https://crates.io/crates/khive-pack-kg)
-for the underlying `concept` entity substrate. Unlike the twelve packs force-linked into the `khive-mcp` binary, `khive-pack-formal`
-is only force-linked into `kkernel` (the admin/reindex binary) — it is not part of
-the agent-facing MCP server's pack registry at all today. A deployment that
+for the underlying `concept` entity substrate. Unlike the fourteen packs `khive-mcp` loads by default, `khive-pack-formal`
+is force-linked into `kkernel` (the admin/reindex binary) and is selectable by name,
+but it is not in the default pack set. A deployment that
 ingests formal-math corpora (Lean/mathlib-style theorem/definition/proof graphs)
 through `kkernel` opts in via `KHIVE_PACKS` or `--pack formal` on that binary; wiring
 it into `khive-mcp` would require adding the force-link `pub use` in

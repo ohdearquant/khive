@@ -1146,6 +1146,142 @@ fn v27_adds_hot_property_indexes_to_a_pre_v27_database() {
 }
 
 #[test]
+fn v28_adds_nullable_note_keys_and_preserves_populated_v27_rows() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 27);
+    assert!(!column_exists(&conn, "notes", "key"));
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+         VALUES (?1, 'local', 'memory', 'old content', 100, 200, ?2)",
+        rusqlite::params!["legacy-live", Option::<i64>::None],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+         VALUES (?1, 'other', 'reference', 'old deleted content', 101, 201, ?2)",
+        rusqlite::params!["legacy-deleted", Some(300_i64)],
+    )
+    .unwrap();
+    let before: Vec<String> = conn.prepare(
+        "SELECT json_object('id', id, 'namespace', namespace, 'kind', kind, 'content', content, \
+         'created_at', created_at, 'updated_at', updated_at, 'deleted_at', deleted_at) \
+         FROM notes ORDER BY id",
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert!(column_exists(&conn, "notes", "key"));
+    assert!(index_exists(&conn, "idx_notes_namespace_kind_key"));
+    let after: Vec<(String, Option<String>)> = conn.prepare(
+        "SELECT json_object('id', id, 'namespace', namespace, 'kind', kind, 'content', content, \
+         'created_at', created_at, 'updated_at', updated_at, 'deleted_at', deleted_at), key \
+         FROM notes ORDER BY id",
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(after.len(), before.len());
+    for ((row, key), original) in after.into_iter().zip(before) {
+        assert_eq!(row, original);
+        assert_eq!(key, None);
+    }
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    let v28_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _schema_migrations WHERE version = 28 AND name = 'notes_key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v28_rows, 1);
+}
+
+#[test]
+fn note_version_migration_preserves_populated_rows_and_bumps_every_update() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 29);
+    assert!(!column_exists(&conn, "notes", "version"));
+    for (id, deleted) in [("live", None), ("deleted", Some(300_i64))] {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at, deleted_at) \
+             VALUES (?1, 'local', 'memory', 'before', 100, 200, ?2)",
+            rusqlite::params![id, deleted],
+        )
+        .unwrap();
+    }
+    run_migrations(&mut conn).unwrap();
+    let rows: Vec<(String, String, i64, i64, Option<i64>, i64)> = conn.prepare(
+        "SELECT id, content, created_at, updated_at, deleted_at, version FROM notes ORDER BY id",
+    ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("deleted".into(), "before".into(), 100, 200, Some(300), 1),
+            ("live".into(), "before".into(), 100, 200, None, 1),
+        ]
+    );
+    for (index, sql) in [
+        "UPDATE notes SET content = 'after' WHERE id = 'live'",
+        "UPDATE notes SET content = content WHERE id = 'live'",
+        "UPDATE notes SET properties = '{\"status\":\"done\"}' WHERE id = 'live'",
+        "UPDATE notes SET key = 'key' WHERE id = 'live'",
+        "UPDATE notes SET deleted_at = 400 WHERE id = 'live'",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(conn.execute(sql, []).unwrap(), 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM notes WHERE id = 'live'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, index as i64 + 2, "{sql}");
+    }
+    assert_eq!(
+        conn.execute("UPDATE notes SET content = '' WHERE id = 'missing'", [])
+            .unwrap(),
+        0
+    );
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
+fn v28_fresh_schema_has_the_exact_partial_note_key_index() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    let column: (String, i64, Option<String>) = conn.query_row(
+        "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('notes') WHERE name = 'key'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(column, ("TEXT".to_string(), 0, None));
+    let index: (i64, i64) = conn
+        .query_row(
+            "SELECT \"unique\", partial FROM pragma_index_list('notes') \
+         WHERE name = 'idx_notes_namespace_kind_key'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(index, (1, 1));
+    let columns: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_index_info('idx_notes_namespace_kind_key') ORDER BY seqno",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(columns, ["namespace", "kind", "key"]);
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_notes_namespace_kind_key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("WHERE key IS NOT NULL AND deleted_at IS NULL"));
+}
+
+#[test]
 fn latest_schema_version_matches_the_newest_migrations_entry() {
     assert_eq!(
         MIGRATIONS.last().map(|m| m.version),
@@ -3962,4 +4098,134 @@ fn v21_finalize_revalidates_model_coverage_and_attachment_claim_fences() {
         )
         .expect_err("an attachment cannot acquire a claimed digest");
     assert!(insert_error.to_string().contains("active blob sweep"));
+}
+
+#[test]
+fn stream_migration_empty_and_populated_previous_version() {
+    let stream_version = MIGRATIONS
+        .iter()
+        .find(|m| m.name == "note_streams")
+        .expect("streams migration")
+        .version;
+    let previous = MIGRATIONS
+        .iter()
+        .rfind(|m| m.version < stream_version)
+        .expect("previous migration")
+        .version;
+    for populated in [false, true] {
+        let mut conn = open_memory();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate_through(&mut conn, previous);
+        if populated {
+            insert_dependency_test_note(&conn, "existing", "observation", "{}", None);
+        }
+        run_migrations(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM note_streams", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(populated)
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'refuse_stream_%'", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        insert_dependency_test_note(&conn, "entry", "observation", "{}", None);
+        insert_dependency_test_note(&conn, "second", "observation", "{}", None);
+        conn.execute(
+            "INSERT INTO note_streams VALUES ('local','s',1,'entry')",
+            [],
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE notes SET content='changed' WHERE id='entry'",
+            "DELETE FROM notes WHERE id='entry'",
+            "UPDATE notes SET deleted_at=1 WHERE id='entry'",
+            "UPDATE notes SET namespace='other' WHERE id='entry'",
+            "UPDATE notes SET kind='insight' WHERE id='entry'",
+            "UPDATE notes SET id='replacement' WHERE id='entry'",
+            "UPDATE note_streams SET seq=8",
+            "DELETE FROM note_streams",
+            "INSERT OR REPLACE INTO note_streams VALUES ('local','s',2,'entry')",
+            "INSERT INTO note_streams VALUES ('local','s',3,'second')",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{sql}");
+        }
+        conn.execute("UPDATE notes SET salience=0.8 WHERE id='entry'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO note_streams VALUES ('local','s',2,'second')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*),MAX(seq) FROM note_streams", [], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?
+            )))
+            .unwrap(),
+            (2, 2)
+        );
+        run_migrations(&mut conn).unwrap();
+    }
+}
+
+#[test]
+fn v31_reopen_installs_knowledge_count_covering_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("count-index-upgrade.db");
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_through(&mut conn, 31);
+        conn.execute("INSERT INTO events (id, namespace, verb, substrate, actor, outcome, created_at) VALUES ('event-a', 'local', 'Knowledge.learn', 'entity', 'test', 'ok', 0)", []).unwrap();
+    }
+    let mut conn = Connection::open(&path).unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    for (table, index) in [
+        ("events", "idx_events_ns_verb"),
+        ("knowledge_atoms", "idx_knowledge_atoms_ns_live_counts"),
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list(?1) WHERE name = ?2)",
+                rusqlite::params![table, index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing {index} after reopening V31");
+    }
+    let event_sql = "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'";
+    let count: i64 = conn
+        .query_row(event_sql, ["local"], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "index must preserve ASCII-insensitive LIKE");
+    for (sql, expected) in [
+        (event_sql, "idx_events_ns_verb"),
+        ("SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'", "idx_knowledge_atoms_ns_live_counts"),
+        ("SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%' AND status = 'reviewed'", "idx_knowledge_atoms_ns_live_counts"),
+        ("SELECT COUNT(*), SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'", "idx_knowledge_atoms_ns_live_counts"),
+    ] {
+        let detail: String = conn.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["local"], |row| row.get(3)).unwrap();
+        assert!(detail.contains(&format!("COVERING INDEX {expected}")), "{detail}");
+        if expected == "idx_events_ns_verb" {
+            assert!(detail.contains("verb>?") && detail.contains("verb<?"), "{detail}");
+        }
+    }
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
+fn event_store_ddl_upgrades_existing_event_indexes_idempotently() {
+    let conn = open_memory();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    conn.execute_batch("DROP INDEX idx_events_ns_verb").unwrap();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_index_list('events') WHERE name = 'idx_events_ns_verb')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(exists);
 }

@@ -24,7 +24,17 @@ mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod keyed_memory;
+#[cfg(test)]
+mod keyed_memory_tests;
+pub mod keyed_message;
+mod note_create;
+mod note_index;
+mod note_read;
 mod note_store_guard;
+pub mod note_write;
+#[cfg(test)]
+mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
@@ -40,6 +50,11 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod streams;
+pub use streams::{
+    refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal, StreamObservation,
+    StreamWriteSpec,
+};
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
@@ -80,16 +95,16 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
-    GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig,
-    StorageSectionConfig,
+    config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+    PackConfig, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
-    ChannelIngestFailureClass, DispatchError, DomainDisposition, GuardedWriteFailure, RuntimeError,
-    RuntimeResult, WriterPoolCheckoutTimeoutContext, WriterTaskFailureContext,
-    WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
-    WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
+    ChannelIngestFailureClass, DenialAuditOutcome, DenialReceipt, DispatchError, DomainDisposition,
+    GuardedWriteFailure, RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext,
+    WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
@@ -100,7 +115,7 @@ pub use khive_db::{
 };
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
-    GateDecision, GateError, GateRef, GateRequest, Obligation,
+    GateDecision, GateError, GateRef, GateRequest, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
@@ -152,3 +167,10 @@ pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,
 };
+
+#[cfg(test)]
+mod mount_config_tests;
+
+pub mod mount_config;
+
+pub mod mounted_verb;

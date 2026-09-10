@@ -14,10 +14,12 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
+use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
-    validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
+    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
@@ -187,6 +189,19 @@ fn inbox_note_matches(
     content_needle: Option<&str>,
 ) -> bool {
     let props = note.properties.as_ref();
+    if params.kind.as_deref().is_some_and(|kind| note.kind != kind) {
+        return false;
+    }
+    if params.tags.as_ref().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            !props
+                .and_then(|properties| properties.get("tags"))
+                .and_then(Value::as_array)
+                .is_some_and(|stored| stored.iter().any(|value| value.as_str() == Some(tag)))
+        })
+    }) {
+        return false;
+    }
     let sender = props
         .and_then(|properties| properties.get("from_actor"))
         .and_then(Value::as_str);
@@ -278,15 +293,8 @@ fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
 ///
-/// Known gap (external desk review, 2026-07-21): there is no idempotency
-/// guard here, so a retrying caller that repeats an identical `send` (same
-/// `to`/`content`) produces a fresh duplicate outbound+inbound pair every
-/// call. `comm.ingest`'s `external_id` dedup key is a different mechanism
-/// (transport-level dedup for channel-delivered inbound mail) and does not
-/// apply to caller-composed sends. Fixing this needs a caller-supplied
-/// idempotency key param on `SendParams` (additive) — a content-hash dedup
-/// invented here would risk collapsing legitimate repeated messages, so this
-/// is left as a design decision rather than implemented speculatively.
+/// Caller-keyed sends reconcile through the atomic outbound claim and its
+/// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
@@ -349,7 +357,18 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (outbound_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "send", "to": to_actor, "content": p.content,
+            "subject": p.subject, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+        })
+    })?;
+    let MessageWrite {
+        outbound: outbound_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -364,9 +383,12 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // `thread_id` is a strict full-UUID input on a later send. Surface the
     // canonical value persisted by `dual_write_message` so this response can
@@ -385,6 +407,9 @@ pub(crate) async fn handle_send(
         "subject": p.subject,
         "sent_at": sent_at,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &outbound_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -466,6 +491,11 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
+    let thread_id = p
+        .thread_id
+        .as_deref()
+        .map(|raw| canonicalize_thread_id("inbox", raw))
+        .transpose()?;
     validate_message_projection_fields("inbox", p.fields.as_deref())?;
     let wait_ms = p.wait_ms.unwrap_or(0);
     if wait_ms > MAX_INBOX_WAIT_MS {
@@ -648,6 +678,14 @@ pub(crate) async fn handle_inbox(
         }
     }
 
+    if let Some(thread_id) = thread_id {
+        property_filters.push(PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(thread_id),
+        });
+    }
+
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
@@ -749,7 +787,9 @@ async fn query_inbox_response(
     offset: u64,
     limit: usize,
 ) -> Result<Value, RuntimeError> {
-    let has_post_filter = params.from_prefix.is_some()
+    let has_post_filter = params.kind.is_some()
+        || params.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+        || params.from_prefix.is_some()
         || params.exclude_from_actor.is_some()
         || before_micros.is_some()
         || subject_needle.is_some()
@@ -1559,7 +1599,18 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (reply_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+            "subject": reply_subject_opt, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+        })
+    })?;
+    let MessageWrite {
+        outbound: reply_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -1574,9 +1625,12 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // Replying is the strongest possible read signal, and callers universally
     // chained `reply | read` to say so — fold it in. Skips only an explicitly
@@ -1600,7 +1654,7 @@ pub(crate) async fn handle_reply(
     let caller_is_addressee = original_to_actor
         .as_deref()
         .is_none_or(|addressee| addressee == from_actor_label);
-    let marked_read = if original_direction == "outbound" || !caller_is_addressee {
+    let marked_read = if replayed || original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
         let updated_at = Utc::now().timestamp_micros();
@@ -1626,6 +1680,9 @@ pub(crate) async fn handle_reply(
         "sent_at": sent_at,
         "marked_read": marked_read,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &reply_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -2528,6 +2585,8 @@ pub(crate) async fn handle_heartbeat(
     };
 
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: ns.to_string(),
         kind: "channel_health".to_string(),
@@ -3542,6 +3601,8 @@ mod tests {
 
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3557,6 +3618,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4642,6 +4704,8 @@ mod tests {
 
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -4657,6 +4721,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4668,6 +4733,8 @@ mod tests {
         let created_at = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),
@@ -4760,6 +4827,8 @@ mod tests {
         ] {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: khive_runtime::config::resolve_default_display_timezone(),
                 events_split: None,
@@ -4775,6 +4844,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             })
             .expect("in-memory runtime");
             let token = runtime
@@ -4785,6 +4855,8 @@ mod tests {
             let id = Uuid::new_v4();
             let created_at = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),

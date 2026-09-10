@@ -66,6 +66,25 @@ ordinary request. Plan frames omit caller identity and rendering options; the
 required namespace field is sent empty. `session.request(...)` retains its
 ordinary dispatch behavior and returns per-operation results.
 
+## Typed recall outcome
+
+`Session.recall(query, ...)` runs one `memory.recall` and returns a `RecallOutcome`
+instead of a raw row list, so the response class the daemon distinguishes survives
+the client boundary:
+
+```python
+outcome = session.recall("what did we decide about retries", limit=5)
+for hit in outcome.hits:          # RecallHit rows: id, score, content, ...
+    print(hit.id, hit.score, hit.is_degraded, hit.is_truncated)
+print(outcome.degraded, outcome.truncated, outcome.degraded_reason, outcome.envelope_class)
+```
+
+A non-empty recall is a bare row array with per-row `degraded` and `truncated`
+stamps; an empty recall that needs a reason arrives as an object envelope
+(`degraded`, `truncated`, or both). `RecallOutcome.from_result` reads either shape,
+`enveloped` records which one arrived, and a clean empty recall has both flags false.
+A failed op raises `OperationError` with the daemon's error object unchanged.
+
 ## Scratch database
 
 Experiments should run against a scratch daemon, not a production store:

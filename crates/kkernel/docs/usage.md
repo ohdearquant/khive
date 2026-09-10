@@ -42,7 +42,7 @@ This is the production entrypoint. The deno/npm distribution invokes it:
 # stdio MCP server (default transport) — what MCP clients spawn
 kkernel mcp --db ~/.khive/khive.db
 
-# pick packs explicitly (default loads all 12 production packs)
+# pick packs explicitly (default loads all 14 production packs)
 kkernel mcp --pack kg --pack gtd --pack knowledge
 
 # warm Unix-socket daemon (owns ANN indexes; stdio clients auto-spawn + forward to it)
@@ -496,3 +496,10 @@ make ci             # full gate (fmt, clippy -D warnings, tests, contract + smok
 ```
 
 After `make local`, run `/mcp` in Claude Code to reconnect to the rebuilt server.
+
+### Tool-source catalog management
+
+`kkernel mount repin <name> [--config <path>] [--db <path>]` refreshes an
+operator-configured stdio source and atomically replaces its pinned catalog with one
+audit record. Calls use ordinary `kkernel exec '<mount>.<tool>(...)'` dispatch.
+See [mounted tool sources](../../../docs/packs/mounts.md) for configuration and lifecycle.

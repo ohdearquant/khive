@@ -108,6 +108,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "Task body. Stored as properties.description and mirrored into the task's content; read back on the task record and by gtd.tasks/gtd.next.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "status",
                 param_type: "string",
                 required: false,

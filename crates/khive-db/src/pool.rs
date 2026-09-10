@@ -1962,6 +1962,7 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        register_writer_clock(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
             .configure_wal_autocheckpoint(&conn)?;
@@ -2464,10 +2465,23 @@ fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
+fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
+    // Evaluated by SQLite at statement execution, never deterministic: stream
+    // observation deadlines use the same UTC microsecond source as note stamps.
+    conn.create_scalar_function(
+        "khive_now_micros",
+        0,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |_| Ok(chrono::Utc::now().timestamp_micros()),
+    )?;
+    Ok(())
+}
+
 fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    register_writer_clock(conn)?;
     if config.read_only {
         // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
         // wal_autocheckpoint, journal_size_limit all require write access to

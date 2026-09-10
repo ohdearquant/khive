@@ -29,12 +29,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
-use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
-#[cfg(unix)]
-use khive_types::Namespace;
-
-#[cfg(unix)]
 use crate::pack::RequestIdentity;
+#[cfg(unix)]
+use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -47,7 +44,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -437,9 +434,9 @@ pub struct DaemonRequestFrame {
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked
-    /// `visible_namespaces` (ADR-096). At ingress, a valid non-`local`
-    /// `actor_id` is included if absent, matching config loading; an empty
-    /// list therefore still includes that actor in default reads. Explicit
+    /// `visible_namespaces` (ADR-096). A non-`local` `actor_id` joins default
+    /// reads where the registry mints the token (ADR-007 Rev 4 Rule 3b), so
+    /// an empty list still includes that actor in default reads. Explicit
     /// `namespace=` operations remain scoped to exactly that namespace.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
@@ -957,6 +954,29 @@ fn checkpoint_task_specs(
 // presence that `drain()` waits on, exactly like the `active` counter does
 // for in-flight connections: the caller still only pays for the spawn +
 // counter increment, never the task's own work.
+/// Set once by the boot path that takes the daemon role, and never cleared: a
+/// process that is not the warm daemon has no path to becoming one except exec.
+static WARM_INDEX_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare this process the warm index host. Called by the serve path as soon as
+/// the daemon role is decided, before any runtime is built, so nothing warms
+/// under the wrong answer.
+pub fn mark_warm_index_host() {
+    WARM_INDEX_HOST.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether this process is the warm index host.
+///
+/// Building an ANN index from the full corpus is minutes of CPU and hundreds of
+/// megabytes of segment rewrite, and it pays for itself only across a process
+/// that outlives the request. A short-lived client that does it pays the whole
+/// cost, discards the result at exit, and publishes a checkpoint that every
+/// other reader on the root must then re-read. Consumers use this to decide
+/// whether to build or to serve degraded and let the daemon build.
+pub fn is_warm_index_host() -> bool {
+    WARM_INDEX_HOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
     std::sync::OnceLock::new();
 
@@ -1299,7 +1319,21 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id,
-            version_mismatch: true,
+            // A client below this protocol is a bridge that predates the binary this
+            // daemon was spawned from. Through protocol 5 the bridge treats an
+            // explicit `version_mismatch` from a higher-numbered daemon as a terminal
+            // error it repeats on every request, and re-execs itself onto the on-disk
+            // binary only for the implicit shape: an unequal `daemon_protocol_version`
+            // with the flag clear. Answering older clients in that shape, still
+            // refused and still carrying the code in `error_detail`, lets every
+            // pre-swap bridge replace itself on its first request instead of staying
+            // refused until a person reconnects the session. A client above this
+            // protocol keeps the explicit flag. Remove once no live bridge predates
+            // the two-direction re-exec in khive-mcp (an inode census of `kkernel mcp`
+            // processes before the swap): bridges built with it no longer read the
+            // flag, but a bump while older bridges still run must keep this shape so
+            // they replace themselves too.
+            version_mismatch: frame.protocol_version > PROTOCOL_VERSION,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
             request_id: frame.request_id,
@@ -1392,18 +1426,13 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
         // `actor_id`/`visible_namespaces` the client resolved (defaulting to
         // `None`/`vec![]` for an older, field-absent payload, which is
         // exactly the prior anonymous/no-extra-visibility behavior).
-        let mut visible_namespaces = frame.visible_namespaces.clone();
-        if let Some(actor_id) = frame.actor_id.as_deref().filter(|actor_id| {
-            *actor_id != Namespace::LOCAL
-                && Namespace::parse(actor_id).is_ok()
-                && !visible_namespaces.iter().any(|ns| ns == *actor_id)
-        }) {
-            visible_namespaces.push(actor_id.to_string());
-        }
+        // The caller's actor namespace joins default reads where the registry
+        // mints the token (ADR-007 Rev 4 Rule 3b), the one seam every identity
+        // path shares; the frame's list is forwarded as sent.
         let identity = RequestIdentity {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
-            visible_namespaces,
+            visible_namespaces: frame.visible_namespaces.clone(),
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
@@ -1580,10 +1609,10 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 /// Run a real daemon server for an in-process multi-launch test.
 ///
 /// Separate production daemon candidates have distinct PIDs, so the boot fence
-/// recognizes a responsive incumbent and makes later candidates exit. Parallel
+/// recognizes a live incumbent and makes later candidates exit. Parallel
 /// test launchers share one OS process and therefore one PID; this explicit
 /// fault-injection entry point preserves the production fence semantics by
-/// allowing a responsive same-PID incumbent to win. Ordinary daemon startup
+/// allowing a live same-PID incumbent to win. Ordinary daemon startup
 /// continues to treat a same-PID rendezvous as stale, protecting PID-reuse
 /// cleanup behavior.
 ///
@@ -1887,7 +1916,7 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
     let _startup_lock = boot_guard;
 
     if !cleanup_stale_daemon(&sock, &pid_file, allow_same_process_incumbent).await {
-        tracing::info!("a responsive khived is already running; exiting");
+        tracing::info!("a live process already owns the daemon PID file; exiting");
         return Ok(());
     }
 
@@ -2071,6 +2100,10 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
         _ = shutdown => {}
     }
 
+    // A listening backlog is not admitted work. Close it before draining so
+    // new clients cannot finish writing to a socket nobody will accept.
+    drop(listener);
+
     // Signal the checkpoint task to exit before draining, so `drain()`
     // actually waits on it via `track_background_task` rather than the
     // task outliving the drain window (or the process) unsignalled.
@@ -2225,9 +2258,9 @@ async fn cleanup_stale_daemon(
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
                 && is_process_running(pid)
-                && sock.exists()
-                && UnixStream::connect(sock).await.is_ok()
             {
+                // A draining incumbent closes its listener before releasing writers.
+                // Ambiguous live PIDs are left for client recovery to classify.
                 return false;
             }
         }
@@ -2699,7 +2732,7 @@ mod tests {
         );
         assert!(
             pid_can_name_incumbent(current, current, true),
-            "the in-process harness must let a responsive same-PID owner win"
+            "the in-process harness must let a live same-PID owner win"
         );
         // Keep the probe two away from `current` so the fixture preserves the
         // off-by-one regression check for adjacent PIDs; wrapping_add avoids
@@ -2728,6 +2761,47 @@ mod tests {
             is_process_running(1),
             "PID 1 always exists; EPERM must not read as dead"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_preserves_live_incumbent_without_reachable_socket() {
+        for socket_exists in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sock = dir.path().join("khived.sock");
+            let pid_file = dir.path().join("khived.pid");
+            if socket_exists {
+                let listener = std::os::unix::net::UnixListener::bind(&sock)
+                    .expect("bind socket before closing listener");
+                drop(listener);
+            }
+            let identity = socket_identity(&sock);
+            assert_eq!(identity.is_some(), socket_exists);
+            let error = UnixStream::connect(&sock)
+                .await
+                .expect_err("incumbent must have no reachable listener");
+            assert_eq!(
+                error.kind(),
+                if socket_exists {
+                    std::io::ErrorKind::ConnectionRefused
+                } else {
+                    std::io::ErrorKind::NotFound
+                }
+            );
+            let live_pid = std::process::id().to_string();
+            std::fs::write(&pid_file, &live_pid).expect("write live incumbent PID");
+
+            // Harness eligibility makes our own stable PID an incumbent;
+            // ordinary same-PID rejection is covered separately above.
+            assert!(
+                !cleanup_stale_daemon(&sock, &pid_file, true).await,
+                "live incumbent must retain ownership with socket_exists={socket_exists}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pid_file).expect("live incumbent PID must survive"),
+                live_pid
+            );
+            assert!(socket_identity(&sock) == identity);
+        }
     }
 
     #[test]
@@ -2846,6 +2920,153 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), drain(&active))
             .await
             .expect("empty drain should return immediately");
+    }
+
+    #[test]
+    fn stopped_listener_is_closed_before_drain() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::Builder::new()
+            .prefix("kh-drain-")
+            .tempdir_in("/tmp")
+            .expect("short isolated socket directory");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "daemon::tests::stopped_listener_is_closed_before_drain_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .envs(
+                std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
+            )
+            .env("HOME", dir.path())
+            .env("KHIVE_DRAIN_TEST_CHILD", "1")
+            .env("KHIVE_SOCKET", dir.path().join("s"))
+            .env("KHIVE_PID", dir.path().join("p"))
+            .env("KHIVE_LOCK", dir.path().join("l"))
+            .env("KHIVE_DRAIN_TIMEOUT_SECS", "10")
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated daemon test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let completed = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    break false;
+                }
+            }
+        };
+        let output = child.wait_with_output().expect("reap daemon test child");
+        assert!(completed, "daemon test child did not finish: {output:?}");
+        assert!(output.status.success(), "daemon test failed: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("STOPPED_LISTENER_DRAIN_VERIFIED"),
+            "child must run the listener witness: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper, invoked by stopped_listener_is_closed_before_drain"]
+    async fn stopped_listener_is_closed_before_drain_child() {
+        assert_eq!(
+            std::env::var("KHIVE_DRAIN_TEST_CHILD").expect("isolated child environment"),
+            "1"
+        );
+        let _sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install child SIGTERM handler");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let background = spawn_tracked_task(async move {
+            release_rx.await.expect("release held drain task");
+        });
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "drain-test".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let daemon = tokio::spawn(run_daemon(dispatcher));
+        let sock = socket_path();
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = UnixStream::connect(&sock).await {
+                    break stream;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("daemon must bind");
+        let payload = serde_json::to_vec(&base_request_frame("drain-test"))
+            .expect("encode readiness request");
+        write_frame(&mut stream, &payload)
+            .await
+            .expect("write readiness request");
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut stream))
+                .await
+                .expect("daemon must serve readiness request")
+                .expect("read readiness response");
+        let response: DaemonResponseFrame =
+            serde_json::from_slice(&response).expect("decode readiness response");
+        assert!(response.ok, "daemon readiness failed: {response:?}");
+        drop(stream);
+
+        // SAFETY: the isolated child signals only itself, after installing its handler.
+        let rc = unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+        assert_eq!(rc, 0, "signal isolated daemon child");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            daemon_shutdown_token().cancelled(),
+        )
+        .await
+        .expect("daemon must begin shutdown");
+        assert!(
+            !daemon.is_finished(),
+            "held background task must retain drain"
+        );
+        assert!(
+            sock.exists(),
+            "cleanup must not have removed the socket yet"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pid_path()).expect("draining daemon PID"),
+            std::process::id().to_string()
+        );
+
+        // Cancellation is published after listener close but before drain.
+        let late_connect = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            UnixStream::connect(&sock),
+        )
+        .await
+        .expect("late connect must finish promptly");
+        release_tx.send(()).expect("release daemon drain");
+        background.await.expect("held background task must finish");
+        tokio::time::timeout(std::time::Duration::from_secs(2), daemon)
+            .await
+            .expect("released daemon must finish shutdown")
+            .expect("daemon task must not panic")
+            .expect("daemon shutdown must succeed");
+        let error = late_connect.expect_err("stopped listener must not queue new connections");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(!sock.exists(), "owned socket must be removed after drain");
+        assert!(
+            !pid_path().exists(),
+            "owned PID must be removed after drain"
+        );
+        println!("STOPPED_LISTENER_DRAIN_VERIFIED");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3127,6 +3348,7 @@ mod tests {
     struct CancellationAwareDispatch {
         started: Arc<tokio::sync::Notify>,
         cancellation_observed: Arc<std::sync::atomic::AtomicBool>,
+        count_sql: Option<Arc<dyn khive_storage::SqlAccess>>,
     }
 
     #[async_trait]
@@ -3146,6 +3368,24 @@ mod tests {
             _identity: Option<RequestIdentity>,
         ) -> Result<String, String> {
             self.started.notify_one();
+            if let Some(sql) = &self.count_sql {
+                let mut reader = sql.reader().await.map_err(|error| error.to_string())?;
+                let result = reader.query_scalar(khive_storage::SqlStatement {
+                    sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'".into(),
+                    params: vec![khive_storage::SqlValue::Text("local".into())],
+                    label: Some("knowledge.stats.event_count".into()),
+                }).await;
+                self.cancellation_observed.store(
+                    matches!(
+                        result,
+                        Err(khive_storage::error::StorageError::Timeout { .. })
+                    ),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                return result
+                    .map(|value| format!("{value:?}"))
+                    .map_err(|error| error.to_string());
+            }
             khive_storage::wait_for_request_read_cancellation().await;
             self.cancellation_observed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3340,7 +3580,7 @@ mod tests {
         let legacy: LegacyV4Response = serde_json::from_slice(&encoded).expect("legacy v4 decode");
         assert!(!legacy.ok);
         assert_eq!(legacy.error.as_deref(), Some("audit failed"));
-        assert_eq!(legacy.daemon_protocol_version, 4);
+        assert_eq!(legacy.daemon_protocol_version, PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -3451,6 +3691,7 @@ mod tests {
         let dispatcher = CancellationAwareDispatch {
             started: Arc::clone(&started),
             cancellation_observed: Arc::clone(&cancellation_observed),
+            count_sql: None,
         };
         let (mut client, server) = UnixStream::pair().expect("unix stream pair");
         let request = base_request_frame("disconnect-test");
@@ -3470,6 +3711,91 @@ mod tests {
             cancellation_observed.load(std::sync::atomic::Ordering::SeqCst),
             "peer loss did not reach the request-scoped read cancellation signal"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_disconnect_interrupts_pooled_stats_count() {
+        use khive_storage::{SqlAccess, SqlStatement, SqlValue};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(dir.path().join("disconnect-count.db")),
+                max_readers: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
+             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) \
+             INSERT INTO count_fixture SELECT x FROM n; \
+             CREATE VIEW events AS SELECT 'local' AS namespace, 'knowledge.learn' AS verb \
+             FROM count_fixture a CROSS JOIN count_fixture b CROSS JOIN count_fixture c;",
+            )
+            .unwrap();
+        let sql = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+        let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = CancellationAwareDispatch {
+            started: Arc::new(tokio::sync::Notify::new()),
+            cancellation_observed: Arc::clone(&cancellation_observed),
+            count_sql: Some(sql.clone()),
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = base_request_frame("disconnect-test");
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = tokio::spawn(khive_db::scope_test_read_progress(
+            Arc::clone(&progress),
+            async move { handle_conn(server, dispatcher).await },
+        ));
+        write_frame(&mut client, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while progress.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    !handler.is_finished(),
+                    "COUNT returned before its first SQLite progress callback"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !handler.is_finished(),
+            "COUNT must be outstanding at disconnect"
+        );
+        let started = std::time::Instant::now();
+        let grace = khive_db::sqlite_interrupt_grace_from_env();
+        drop(client);
+        tokio::time::timeout(grace, handler)
+            .await
+            .expect("disconnected COUNT did not settle within interrupt grace")
+            .unwrap();
+        assert!(cancellation_observed.load(std::sync::atomic::Ordering::SeqCst));
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.active_pooled_checkouts, 0);
+        assert_eq!(snapshot.available_reader_admission_slots, 1);
+        eprintln!(
+            "daemon_stats_count_disconnect_ms={} grace_ms={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            grace.as_millis()
+        );
+        let count = sql
+            .reader()
+            .await
+            .unwrap()
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM count_fixture".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(count, Some(SqlValue::Integer(1000))));
     }
 
     /// Protocol v4 makes `process_ref` part of dispatch semantics. A still-warm
@@ -3498,7 +3824,14 @@ mod tests {
 
         let response = round_trip(dispatcher, &request).await;
         assert!(!response.ok);
-        assert!(response.version_mismatch);
+        assert!(
+            !response.version_mismatch,
+            "a client below this protocol is answered in the implicit shape its bridge re-execs on"
+        );
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
         assert_eq!(
             response.error_detail.as_ref().unwrap()["domain_disposition"],
             "unknown"
@@ -3513,6 +3846,42 @@ mod tests {
         assert!(
             error.contains("client=3") && error.contains(&format!("daemon={PROTOCOL_VERSION}")),
             "mismatch must identify the exact rollout boundary; got {error:?}"
+        );
+    }
+
+    /// A client above this protocol is answered with the explicit flag: that
+    /// direction is the warm-old-daemon case, where the newer client's own
+    /// handling replaces the daemon, and the implicit shape reserved for older
+    /// bridges must not reach it. A matching client is served (the round-trip
+    /// tests above).
+    #[tokio::test]
+    async fn newer_client_frame_is_refused_with_the_explicit_flag() {
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-v4".to_string(),
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut request = base_request_frame("cfg-v4");
+        request.protocol_version = PROTOCOL_VERSION + 1;
+
+        let response = round_trip(dispatcher, &request).await;
+        assert!(!response.ok);
+        assert!(
+            response.version_mismatch,
+            "a client above this protocol keeps the explicit flag"
+        );
+        assert_eq!(response.daemon_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            response.error_detail.as_ref().unwrap()["code"],
+            "version_mismatch"
+        );
+        assert_eq!(
+            dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a newer client's frame must not dispatch"
         );
     }
 
@@ -4191,6 +4560,46 @@ mod tests {
             pid_file.exists(),
             "replacement daemon's pid file must survive"
         );
+    }
+
+    #[test]
+    fn shutdown_cleanup_preserves_atomically_renamed_successor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let staged_sock = dir.path().join("next.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let _original_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind original socket");
+        let successor =
+            std::os::unix::net::UnixListener::bind(&staged_sock).expect("bind staged successor");
+        let original_identity = socket_identity(&sock).expect("original socket identity");
+        let successor_identity = socket_identity(&staged_sock).expect("successor socket identity");
+        assert!(original_identity != successor_identity);
+        let original_pid = std::process::id().to_string();
+        std::fs::write(&pid_file, &original_pid).expect("write original PID");
+
+        std::fs::rename(&staged_sock, &sock).expect("publish successor over original socket");
+        assert!(!staged_sock.exists());
+        assert!(socket_identity(&sock) == Some(successor_identity));
+        // A matching PID must not authorize deleting a different socket inode.
+        assert!(!shutdown_cleanup_if_owned(
+            &sock,
+            &pid_file,
+            Some(original_identity)
+        ));
+        assert!(socket_identity(&sock) == Some(successor_identity));
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).expect("PID must survive stale cleanup"),
+            original_pid
+        );
+        successor
+            .set_nonblocking(true)
+            .expect("bound successor must support nonblocking accept");
+        let _client = std::os::unix::net::UnixStream::connect(&sock)
+            .expect("published successor must remain reachable");
+        let _accepted = successor
+            .accept()
+            .expect("successor must receive connection");
     }
 
     // ── the recovery lock actually serializes two boot sequences ─────────────

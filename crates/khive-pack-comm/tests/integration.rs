@@ -1065,6 +1065,8 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id: uuid_a,
             namespace: ns.clone(),
             kind: "message".into(),
@@ -1084,6 +1086,8 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id: uuid_b,
             namespace: ns.clone(),
             kind: "message".into(),
@@ -1546,6 +1550,8 @@ async fn test_reply_marks_directionless_legacy_original() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
             kind: "message".into(),
@@ -1605,6 +1611,8 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
             kind: "message".into(),
@@ -3537,6 +3545,8 @@ fn build_crossns_registry(
     allowed_outbound: Vec<Namespace>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -3552,6 +3562,7 @@ fn build_crossns_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: allowed_outbound,
         actor_id: None,
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4479,6 +4490,8 @@ fn build_actor_registry(
     actor_id: &str,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4494,6 +4507,7 @@ fn build_actor_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor_id.to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4775,6 +4789,8 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
 
     let backend = shared_backend();
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4790,6 +4806,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some("lambda:tenant-x".to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4892,6 +4909,8 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 
     // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
     let config_anon = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4907,6 +4926,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None, // anonymous
+        exec: Default::default(),
     };
     let rt_anon = KhiveRuntime::from_backend(backend, config_anon);
     let mut builder_anon = VerbRegistryBuilder::new();
@@ -5898,6 +5918,8 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         let now = chrono::Utc::now().timestamp_micros();
         let thread_uuid = uuid::Uuid::new_v4();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -5961,6 +5983,8 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6082,6 +6106,8 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6154,6 +6180,8 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = khive_storage::note::Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6267,6 +6295,8 @@ async fn plant_message_note(
     let now = chrono::Utc::now().timestamp_micros();
     let id = uuid::Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: "local".into(),
         kind: "message".into(),
@@ -7090,6 +7120,8 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: outbound_id,
             namespace: "local".into(),
             kind: "message".into(),
@@ -7182,6 +7214,8 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: root_id,
                 namespace: "local".into(),
                 kind: "message".into(),
@@ -7209,6 +7243,8 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
             .expect("seed legacy outbound root");
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: legacy_child_id,
                 namespace: "local".into(),
                 kind: "message".into(),
@@ -7406,6 +7442,8 @@ async fn thread_includes_root_message_without_thread_id_property() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let root_note = Note {
+            version: 1,
+            key: None,
             id: root_id,
             namespace: "local".into(),
             kind: "message".into(),
@@ -7428,6 +7466,8 @@ async fn thread_includes_root_message_without_thread_id_property() {
         store.upsert_note(root_note).await.expect("upsert root");
 
         let child_note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -7891,6 +7931,8 @@ async fn plant_healthy_channel_rows(rt: &KhiveRuntime, count: usize) {
         .map(|index| {
             let slug = format!("heartbeat-{index:03}");
             Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
                 kind: "channel_health".to_string(),
@@ -8136,6 +8178,8 @@ async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
                 kind: "channel_health".to_string(),
@@ -8447,6 +8491,8 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
             let store = rt.notes(&token).expect("notes store");
             let now = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: ns.to_string(),
                 kind: "channel_health".to_string(),
@@ -8971,6 +9017,8 @@ async fn insert_thread_message(
     let store = rt.notes(&token).expect("notes store");
     store
         .upsert_note(khive_storage::note::Note {
+            version: 1,
+            key: None,
             id,
             namespace: ns.to_string(),
             kind: "message".into(),
@@ -10515,6 +10563,8 @@ async fn insert_i1422_message(
     }
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: "local".to_string(),
             kind: "message".to_string(),

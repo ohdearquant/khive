@@ -10,7 +10,7 @@ use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags,
+    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
     recall_candidate_count, search_source_label, to_json, validate_memory_type,
     RecallCandidateParams, RecallParams, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
     RECALL_DIAGNOSTIC_SNIPPET_CHARS,
@@ -265,6 +265,11 @@ impl MemoryPack {
                 }
                 if let Some(filter_tags) = p.tags.as_ref().filter(|tags| !tags.is_empty()) {
                     if !note_matches_tags(note.properties.as_ref(), filter_tags, p.tag_mode) {
+                        return None;
+                    }
+                }
+                if let Some(excluded) = p.exclude_tags.as_ref().filter(|tags| !tags.is_empty()) {
+                    if note_has_any_tag(note.properties.as_ref(), excluded) {
                         return None;
                     }
                 }

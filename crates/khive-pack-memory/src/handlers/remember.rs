@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::keyed_memory::{create_keyed_memory, validate_memory_key, KeyedMemorySpec};
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
@@ -22,6 +23,9 @@ impl MemoryPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: RememberParams = deser(params)?;
+        if let Some(key) = p.key.as_deref() {
+            validate_memory_key(key)?;
+        }
         if p.content.trim().is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "content must not be empty".into(),
@@ -113,20 +117,38 @@ impl MemoryPack {
 
         let annotates_target = annotates.first().copied();
 
-        let note = self
-            .runtime
-            .create_note_with_decay_for_embedding_model(
+        let (note, keyed_edge_id) = if let Some(key) = p.key.as_deref() {
+            create_keyed_memory(
+                &self.runtime,
                 write_token,
-                "memory",
-                None,
-                &p.content,
-                Some(salience),
-                decay_factor,
-                Some(props),
-                annotates,
-                p.embedding_model.as_deref(),
+                KeyedMemorySpec {
+                    content: &p.content,
+                    key,
+                    salience,
+                    decay_factor,
+                    properties: props,
+                    source_id: annotates_target,
+                    embedding_model: p.embedding_model.as_deref(),
+                },
             )
-            .await?;
+            .await?
+        } else {
+            let note = self
+                .runtime
+                .create_note_with_decay_for_embedding_model(
+                    write_token,
+                    "memory",
+                    None,
+                    &p.content,
+                    Some(salience),
+                    decay_factor,
+                    Some(props),
+                    annotates,
+                    p.embedding_model.as_deref(),
+                )
+                .await?;
+            (note, None)
+        };
 
         {
             // Preserve the stale graph as a fast fallback; generation is the invalidation signal.
@@ -142,7 +164,9 @@ impl MemoryPack {
             }
         }
 
-        let edge_id = if let Some(target_id) = annotates_target {
+        let edge_id = if p.key.is_some() {
+            keyed_edge_id.map(|id| id.to_string())
+        } else if let Some(target_id) = annotates_target {
             self.runtime
                 .neighbors_with_query(
                     token,

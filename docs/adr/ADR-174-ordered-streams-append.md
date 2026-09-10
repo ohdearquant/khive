@@ -116,6 +116,8 @@ Three verbs, registered by the kg pack because the entries are its notes:
     checked only when supplied. Whether an unfenced append to a stream that belongs to a leased run
     should be refused is policy above khive: the layer that knows which streams belong to which run
     decides it, and passes the fence when it applies.
+    Clarification (2026-09-09): ADR-172 Amendment 3 adds a non-empty ordered list of fence objects;
+    list refusals include a zero-based string `details.index`, including for a one-element list.
 - `stream.read(stream, after=0, limit=1000, namespace=None)` returns
   `{"entries": [{"seq", "id", "record", "created_at"}...], "head_seq": H, "next_after": N | null}`:
   the entries with `seq > after` in ascending `seq`, at most `limit` of them, straight off the primary
@@ -321,16 +323,29 @@ Both forms are load-bearing, so the verb carries both and names which one it is 
 
 ### A1.1 `stream.batch`
 
+**Implementation (2026-09-09):** Object fences and version observations execute in the atomic writer transaction; keyed `write` members execute in either batch mode.
+
 `stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
 operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
-`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "expected_version": V | null}` (the
-keyed document write of ADR-172 §2 and §3). Common to both modes:
+`{"op": "write", "key": K, "kind": <note kind>, "doc": D, "tags": [...] | null, "embed": bool | null,
+"expected_version": V | null}` (the keyed document write of ADR-172 §2 and §3; `tags` and `embed` as
+its Amendment 2 defines them, `embed` defaulting by the note kind). Common to both modes:
 
 - Members are validated for shape before anything is written: a member that is not an object, a
   member without an `op` string, or a record over the note content limit refuses the whole batch
   with `KhiveError::invalid_input` and writes nothing. An op string that names no member operation
   is not a shape error: it is that member's refusal, `unknown_op`, and the mode below decides
   whether it stops the batch or returns as the member's value.
+- Decision (2026-09-10): a batch names each `(kind, key)` write target at most once, in either
+  mode. A repeated target is a shape error (`invalid_input`, naming the member index), not a
+  per-member `key_conflict`: version observations are taken once before the first member runs, so
+  a second write to the same key inside one request would either observe a stale version or
+  conflict with its own sibling, and neither outcome is useful to a caller. Create-then-update is
+  two requests, the second carrying the version the first returned.
+  Clarification (2026-09-10): this once-per-`(kind, key)` target rule is shared with ordered fence lists in
+  [ADR-172 Amendment 3](ADR-172-versioned-notes-compare-and-set.md): it applies independently to each
+  fence list and to a batch's keyed-write members. The batch-wide `fence` deliberately remains
+  object-only.
 - A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
   `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
   as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
@@ -341,7 +356,7 @@ keyed document write of ADR-172 §2 and §3). Common to both modes:
   the mode: an atomic batch's appends to one stream take consecutive numbers, because they are one
   transaction; a per-member batch's appends may have another process's append between them, and
   only the union is dense (§3).
-- Reads (`get`, `stream.read`, `stream.head`) are not members: a batch is a write primitive. The
+- Reads (`get`, `stream.read`, `stream.stat`) are not members: a batch is a write primitive. The
   consumer's case reads an unknown object inside its batch; on khive that read is issued beside
   the batch by the adapter, and the assertion on its value is unchanged.
 - The result is `{"results": [<member result>...], "committed": true}` in list order; a member
@@ -362,6 +377,16 @@ is written, and the error carries that member's refusal plus `member` (the list 
 disposition is the `domain_disposition: not_committed` every member refusal already carries, and
 no parallel boolean rides beside it. The caller may ignore the result list on success, because
 success means every member committed.
+
+Correction (2026-09-10): if a positive-version `write` member's prepared target is deleted and
+recreated under the same `(kind, key)` before commit, the member refuses with `version_conflict`.
+The atomic batch returns `member` and `domain_disposition: not_committed`, with no member writes
+committed; the replacement does not turn this confirmed refusal into an unknown storage outcome.
+
+Allocation (2026-09-10): a successful atomic batch reads each appended stream's initial head once
+inside its writer transaction, then allocates that stream's sequences from a transaction-local
+cache in member order. The cache is never reused across transactions; per-member mode retains
+its independently admitted transactions and permits intervening writers.
 
 **Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, so
 one stream's numbers increase with list position but need not be adjacent. A member's own refusal (`unknown_op`, `seq_conflict`,
@@ -455,3 +480,523 @@ read.
 3. **Count and head are read from one snapshot.** `stream.stat` reads `COUNT(*)` and `MAX(seq)` in
 one statement over the same rows, so the equality acceptance 7 asserts compares two readings of
 one snapshot, and a divergence between them is a ledger defect, never a race between two reads.
+
+## Amendment 3 (2026-09-08): entries are not embedded by default, prefix truncation, two acceptance corrections
+
+**Status**: Proposed.
+
+### The gap
+
+§1 makes an entry a note, and the note path embeds every note it inserts with every registered
+embedding model unless one model is named. That default is right for a note a caller wants back by
+similarity and wrong for a record stream: `stream.read` walks by sequence and never by similarity, and
+the consumer this ADR serves appends one record per run event. On the reference deployment the vector
+index segments of the busiest namespace were measured being rewritten every two to three minutes, about
+440 MiB a cycle, under ordinary write load (#2446); a recorder stream would multiply that without a
+single reader ever asking for a stream entry by vector. §3 and §6 leave retention to a later ADR; the
+consumer's state layer now names its recorder as the largest caller, so the retention shape has to exist
+before that recorder moves.
+
+Two acceptance items are corrected here on findings from the first implementation of Amendment 1.
+
+### A3.1 `embed` on `stream.append` and on batch append members
+
+**Implementation (2026-09-10):** Single appends and batch append members default to no embedding,
+accept explicit embedding and model selection, and refuse a model without `embed=true` before writes.
+
+`stream.append(..., embed=false, embedding_model=None)`. `embed` defaults to `false`. An entry appended
+with `embed=false` gets no embedding rows and no vector-index work, and is never a candidate for
+similarity `search` or `recall`; lexical indexing and `list` are unchanged, so it stays findable by text
+and by walk. With `embed=true` the entry is embedded exactly as `create(kind="note")` embeds: every
+registered model, or the one `embedding_model` names. `embedding_model` without `embed=true` is refused
+as `invalid_input` and nothing is written. A `stream.batch` append member carries the same two fields
+with the same defaults, and the keyed `write` member carries `tags` and `embed` as ADR-172 Amendment 2
+defines them (A1.1's member shape lists both), `embed` defaulting to `false` for the `head` kind and
+`true` for every other kind.
+
+Preparation (2026-09-10): eligible embedded append and keyed-create members are prepared together
+before the member write transactions: one embedding request per selected model within its supported
+batch size, bounded chunks above that size, and one shared vector-schema writer acquisition across
+those models. This adds no aggregate admission limit. Positive-version keyed updates retain their
+separate preparation; embedding defaults and model selection are unchanged.
+With no eligible embeddings, this preparation invokes no embedding provider or vector-schema writer.
+
+The note's content limit, the audit event and the ledger row are unchanged; an unembedded entry is a
+whole entry in every respect this ADR defines.
+
+### A3.2 `stream.truncate`
+
+`stream.truncate(stream, before_seq, namespace=None)` removes every entry of the stream whose `seq` is
+below `before_seq`, ledger row and note together, as a hard delete inside one writer transaction, and
+returns `{"removed": N, "floor_seq": F, "head_seq": H}`. Numbering continues from `head_seq`; density
+holds from `floor_seq`; `expected_seq` is unaffected because the head does not move. The call is
+idempotent and never fails for a range: `before_seq` at or below the floor removes nothing, `before_seq`
+above `head_seq + 1` is clipped to it, and an unknown stream returns `removed: 0, floor_seq: 1,
+head_seq: 0`. Write authority on the namespace is required, as for `append`. One audit event records the
+call with `stream`, `before_seq` and `removed`, not one per entry.
+
+The floor is persisted, not derived: one row per truncated stream in
+`note_stream_floors(namespace, stream, floor_seq)`, written in the truncate transaction, so a stream
+emptied by truncation still knows where its numbering stands, which `MIN(seq)` cannot say. `stream.read`
+and `stream.stat` gain `floor_seq` (`1` when never truncated). A reader whose `after + 1` is below the
+floor receives entries from the floor and learns from `floor_seq` that a prefix it never saw is gone.
+That is the only truncation signal and it is enough: a reader that must not miss entries reads before
+the writer truncates, and arranging that is the retention policy's job, not khive's. `count` becomes
+`head_seq - floor_seq + 1`, still read from the one snapshot Amendment 2 item 3 requires; §2's
+`count == head_seq` holds exactly for a stream never truncated.
+
+§3's triggers refuse every delete of a member note and Amendment 2's ledger guards refuse every ledger
+delete; truncation is the one authorized path, and its authorization is a row, not a bypass. The
+truncate transaction first inserts `(namespace, stream, before_seq)` into `note_stream_truncations`; the
+ledger delete trigger's `WHEN` exempts a row whose `(namespace, stream)` has an open truncation with
+`seq < before_seq`; the transaction deletes the ledger rows, then the notes (whose member trigger no
+longer fires, the ledger rows being gone), then the truncation row, and commits. A direct `DELETE`
+outside a truncate transaction sees no truncation row and is refused as today; a truncation row cannot
+outlive its transaction. Embedding and lexical rows of the removed notes go the way any hard delete takes
+them.
+
+Retention policy stays outside: which streams to truncate, at what age or count, is decided by the
+layer that named the streams (a scheduled job or the consumer itself); khive does not decide what to
+keep. Drop of a whole stream remains out of scope: truncating to `head_seq + 1` leaves an empty stream
+with its floor, which is exactly what a later reader needs to see.
+
+### A3.3 Amendment 1 acceptance 9, corrected
+
+Acceptance 9 says that with `observed` checked after the first write, arm 3's unchanged-count assertion
+goes red. It does not: the transaction still rolls back on the conflict and the counts stay unchanged
+whichever order the statements ran in. What reddens is arm 3's statement-trace assertion, that every
+observation check precedes the first insert. Acceptance 9 reads accordingly: the trace assertion is the
+order control and the unchanged-count assertion is the rollback control, two controls, not one.
+
+### A3.4 The check is inside the transaction, proven by mutation
+
+The property the consumer's state layer depends on is that a stale generation writes nothing, and that
+property lives in the transaction boundary, not in the fence's shape. For `stream.append` with a
+`fence` and for an atomic `stream.batch` with a `fence` or `observed`, the check is evaluated inside the
+writer transaction before the first insert. Mutation arm: move the check outside the transaction (read
+the version, then begin, then insert) and the stale-fence and stale-observed arms must go red, meaning
+something was written or a count moved; restore, and they go green. Both runs are quoted with exit
+codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fence` on documents.
+
+### Acceptance
+
+1. **No embedding by default.** After a default `stream.append`, the entry's note has no embedding row
+   for any registered model and the vector-index queue is empty; the `embed=true` control yields one
+   row per registered model, the count named.
+2. **Not a similarity candidate.** The unembedded entry's own content as a `search` query returns no
+   hit for it; the `embed=true` control returns it.
+3. **Still listed and found by text.** The default entry is returned by `list` and by lexical search.
+4. **Truncate keeps numbering.** Five appends, `truncate(before_seq=3)`: `removed 2, floor_seq 3,
+   head_seq 5`; `stat` count 3; `read(after=0)` returns 3, 4, 5 with `floor_seq 3`; the next append
+   is 6.
+5. **Whole prefix.** `truncate(before_seq=6)` on the same stream: `removed 3, floor_seq 6, head_seq 5`,
+   count 0, the next append is 6.
+6. **Idempotent and clipped.** Repeating arm 5 removes 0; `before_seq=100` on a five-entry stream
+   removes 5 and reports `floor_seq 6`; an unknown stream removes 0 with `floor_seq 1, head_seq 0`.
+7. **Guards unchanged.** Outside a truncate, a direct delete of a member note or ledger row is refused
+   as in §3 and Amendment 2, count and head unchanged.
+8. **Atomic.** A failure injected between the ledger delete and the note delete leaves count, floor and
+   head unchanged.
+9. **Mutation.** With `embed` ignored, arm 1's two counts read the same (red). With the floor derived
+   from `MIN(seq)` instead of persisted, arm 5's `floor_seq` reads 1 (red). With the truncation row
+   left in place after commit, a later direct ledger delete succeeds (red), which is what proves the
+   row is the authorization.
+
+## Amendment 4 (2026-09-09): an `observed` entry may assert that a key is unheld
+
+**Status**: Proposed.
+
+**Implementation (2026-09-09):** `observed` entries with a version or `null` are checked inside the atomic writer transaction before member writes.
+
+### The gap
+
+Amendment 1 A1.1 gives an atomic batch an `observed` list of `{"key": K, "version": V}` entries, each
+checked inside the transaction before the first write. An exact version says "this key is held, at this
+version". It cannot say "this key is not held", and the consumer's state layer needs exactly that.
+
+Its publication fence has three forms beside the lease generation. Two of them are versions of a live
+row and map onto `observed` as written: a claim that a `(run, holder, generation)` is a live lease
+becomes one entry per claim, and a release claim is the same entry on the release key. The third does
+not. A handle opened while a run had no lease publishes under the predicate _the lease is still absent,
+or it is still held by the holder this handle captured_. Its suite asserts that a foreign lease
+appearing after the handle opened refuses the publication and writes nothing. An exact-version entry
+cannot express the absent half, and the caller cannot decompose the disjunction by sending two batches:
+the point of the fence is that the predicate and the writes share one transaction.
+
+### A4.1 `version: null`
+
+An `observed` entry is `{"key": K, "kind": <note kind>, "version": V | null}`.
+
+`kind` completes A1.1's two-field spelling rather than leaving it to the implementation. A key is
+unique among live notes of one kind in one namespace (ADR-172 §3), so a key alone does not name a row:
+without `kind` an entry either resolves ambiguously, or it reads across kinds and lets a note some other
+pack keyed the same way refuse a batch it has nothing to do with. `fence` (ADR-172 §2b) already carries
+the kind for the same reason, and the batch's own `write` member names one, so this is the shape the
+rest of the surface already uses.
+
+- `version: V` is unchanged: the entry holds when a live note of that kind holds `K` in the caller's
+  primary namespace at exactly version `V`. A missing row or a different version refuses the batch with
+  `version_conflict` naming the key, as A1.1 says.
+- `version: null` holds when **no** live note of that kind holds `K` in that namespace. A live holder at
+  any version refuses the batch with `version_conflict`, `details` naming the key and the holder's
+  `current_version`; nothing is written. A soft-deleted note has released its key (ADR-172 §3), so it
+  does not hold it here either.
+
+Everything else about `observed` stands: it is atomic mode only, refused with `invalid_input` in
+per-member mode, and every entry is checked inside the writer transaction before the first write.
+
+### A4.2 The disjunction decomposes on the caller's side
+
+The caller reads the lease before composing the batch, so by the time it composes it has observed one of
+two concrete states, and it sends the entry for the state it saw: its own generation, or null. What the
+batch has to guarantee is not the disjunction but that the state it observed still holds at the write.
+A holder that appears between the read and the batch refuses the null entry; a holder that renews
+between them refuses the version entry; a lease released between them refuses the version entry, and the
+caller re-reads and re-composes. That is the same contract every other `observed` entry has, so `null`
+adds a value, not a rule.
+
+No `key_conflict` case is added. A `write` member that creates a key another live note holds still
+refuses with `key_conflict` and `existing_id` exactly as A1.1 says; an `observed` entry never creates
+anything, so it can only ever produce `version_conflict`.
+
+Correction (2026-09-10): the never-creates half stands, the reason set does not. An `observed` entry
+refuses with `version_conflict`, and since Amendment 5 also with `expired` and
+`live_until_unreadable`, and since Amendment 6 also with `identity_conflict`. It never refuses with
+`key_conflict`, which is what this paragraph is about and is what remains true of it.
+
+### Acceptance
+
+Every arm names its command; the atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Unheld and observed unheld.** A batch carrying `{"key": K, "kind": <k>, "version": null}` for a key
+   no live note holds commits every member; the stream heads move by exactly the members' appends.
+2. **Held and observed unheld.** With a live note holding `K` at version 1, the same batch is refused
+   with `version_conflict` naming `K` and `current_version` 1; the note count, the ledger count and
+   every named stream's head are unchanged. Repeated with the holder at version 5, to show the refusal
+   does not depend on the version being the initial one.
+3. **Kind is part of the key.** A live note of kind `A` holding `K` does not refuse an entry naming
+   kind `B` and the same `K`; the batch commits. The control is arm 2 with the kinds equal.
+4. **Released key.** A soft-deleted note that held `K` does not refuse a null entry; a hard-deleted one
+   does not either. The control is arm 2 with the note live.
+5. **Mixed list.** One batch carrying a null entry and a version entry commits when both hold, and is
+   refused naming the offending key when either does not, in both directions, with nothing written.
+6. **Cross-process.** Arms 1 and 2 through the socket, with the holder created by a second OS process
+   between the caller's read and its batch, so the refusal is a real race and not a self-inflicted one.
+7. **Mutation.** With a null entry treated as no check at all, arm 2 goes red. With a null entry
+   compiled as `version = 0`, arm 1 goes red. With the null check moved after the first insert, arm 2's
+   statement-trace assertion goes red (Amendment 3 A3.3: the trace is the order control, the unchanged
+   counts are the rollback control). Both runs quoted with exit codes.
+
+## Amendment 5 (2026-09-10): an `observed` entry may assert that a document's time field is still in the future, and write members return their write time
+
+**Status**: Proposed.
+
+**Implementation (2026-09-10):** `live_until` checks share one SQL clock reading inside the atomic writer transaction; write results return the stored `updated_at` before commit.
+
+### The gap
+
+Amendment 4 lets a caller pin what it read: an `observed` entry with a version holds only while the
+document it checked is still the document there, because a keyed note's version moves on every write
+to it. That closes every race in which the competing writer changes the document. It does not close
+the one in which nobody writes. A lease that merely runs out changes no document, so it bumps no
+version, so every observation still holds, and a batch composed under a lease that expired between the
+caller's read and the commit is written as if the lease were live. The consumer's own store evaluated
+the lease's expiry against the clock of the transaction doing the writing; the khive route evaluates
+it against the clock of the read that preceded the request, and the window is the request itself. Its
+suite has the arm: a lease written to expire in one second, the batch dispatched after that second
+with no writer touching the head, and the contract's stale-generation refusal expected. Today the
+batch commits.
+
+The caller cannot close this by reading again, because the read and the write would still be two
+transactions. The check has to run on the writer's clock inside the transaction that writes, which is
+where the other `observed` checks already run. The document's shape is the caller's, so the caller
+names the field.
+
+### A5.1 `live_until`
+
+An `observed` entry may carry `live_until`:
+
+```json
+{"key": K, "kind": <note kind>, "version": V, "live_until": "<field path>"}
+```
+
+- `live_until` names a field in the observed note's document (the keyed `doc` of ADR-172 §3, as
+  written) by a dotted path, `"expires_at"` or `"lease.expires_at"`. The entry holds when the live
+  note of that kind holding `K` in the caller's primary namespace is at exactly version `V` **and**
+  the named field holds an RFC 3339 timestamp strictly later than the transaction's clock.
+- The transaction's clock is one reading, taken by one statement inside the writer transaction after
+  it opens and before the first `observed` check, and shared by every entry in the list. It is the
+  same source that stamps the row's `updated_at` (A5.2), so the reading appears in the statement trace
+  of Amendment 3 A3.3 and the `now` an `expired` refusal carries is on the clock khive itself writes.
+  It is never the caller's clock, never the request's arrival time and never a process clock read
+  outside the transaction.
+- A field that is absent, or whose value is not an RFC 3339 timestamp, refuses the batch with
+  `live_until_unreadable`: kind `conflict` (§2, ADR-172 §2), `reason: "live_until_unreadable"`,
+  `details` naming the key, the kind, the version, the field and the value found; nothing is written.
+  A value without an offset is not RFC 3339 and is unreadable. A liveness the entry cannot read is not
+  a liveness it may assume.
+- A timestamp at or before the transaction's clock refuses the batch with `expired`: kind `conflict`,
+  `reason: "expired"`, `details` naming the key, the kind, the version, the field, the value found and
+  the clock reading (`now`) it was compared with, so the caller can see the window it lost; nothing is
+  written. The comparison is between instants, the value's offset honoured.
+- Both refusals are transaction-time precondition outcomes on store state, so they take the kind
+  Amendment 1's `version_conflict` takes, and every `details` value is a string as ADR-172 §2
+  requires: `key`, `kind` and `field` as given, `version` as its decimal string, `value` as the field's
+  JSON text (a found value may be a number, an object or `null`, and is rendered as JSON), `now` in
+  the form `updated_at` takes.
+- `live_until` requires a version. With `version: null` the entry is `invalid_input` before any
+  member writes: an absent document has no field to read.
+- Everything else about `observed` stands: atomic mode only, refused with `invalid_input` in
+  per-member mode, every entry checked inside the writer transaction before the first write, the
+  version half refusing exactly as Amendment 1 and Amendment 4 say.
+
+Correction (2026-09-10): an unreadable refusal does not carry the value. `live_until` is a
+caller-chosen path into a document the caller named but need not be able to read, so echoing
+whatever the path lands on turns one authorized `stream.batch` into a read of any field of that
+document. `live_until_unreadable` therefore carries `value_type` in place of `value`, one of
+`absent`, `null`, `boolean`, `number`, `string`, `array`, `object`, where `absent` is the path
+resolving to nothing and `null` is a JSON null found at it; the two are distinguished, which is
+what the earlier "the value found" left open for a field that is not there. `expired` keeps
+`value`: reaching it requires the field to have parsed as an RFC 3339 timestamp, so the value it
+names is the deadline the entry pinned, and the caller needs it beside `now` to see the window it
+lost. Acceptance arm 3 reads `value_type` and asserts `value` is absent.
+
+Traversal (2026-09-10, same correction): the path is split on `.` and each segment is read as an
+object key, left to right; anything else resolves to nothing and refuses `live_until_unreadable`
+with `value_type: "absent"`. So a segment applied to an array, a number or a string resolves to
+nothing (there is no positional indexing and a numeric segment is an object key, not an index); an
+empty segment, which a leading, trailing or doubled `.` produces, is read as the empty key and so
+resolves to nothing in any document that does not hold one; a document whose root is not an object
+resolves to nothing; and a key containing a literal `.` is unreachable, because the separator is not
+escapable. Every one of these is a refusal, never a pass, so an
+unresolvable path can only ever cost the caller a batch, and two implementations reading the same
+document and the same path agree.
+
+No predicate on the field's meaning is added. khive compares one timestamp with one clock; whether the
+field is a lease expiry, a handle deadline or anything else is the caller's convention, as the fence
+key's convention is (§2 alternatives, "the layer that owns the convention passes the fence").
+
+### A5.2 `updated_at` on write member results
+
+A `write` member's result is `{"id": <id>, "version": <v>, "updated_at": <timestamp>}`, for a create
+and for an update alike, where `updated_at` is the write's own time as the note row records it in that
+transaction (ISO 8601 with microseconds, the form `created_at` already takes on append results). The
+consumer's head record carries the write's own timestamp, and without this field the caller has to
+read the head back and may only trust the time while the version it finds is still the one it wrote.
+A result field is a value; a later writer moving the version does not change it.
+
+### A5.3 The `observed` help names its mode
+
+The `observed` parameter's own help states that it requires atomic mode and that supplying `observed`
+alone does not select it: `atomic` defaults to whether `fence` is present, and an `observed` list
+without `fence` and without `atomic=true` is refused with `invalid_input` naming the mode. The
+`atomic` help line says the same from its side. The behaviour is unchanged; the sentence was missing
+where the caller reads.
+
+### Acceptance
+
+Every arm names its command; atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Expired.** A keyed note holding `K` at version 1 whose document has `expires_at` one second in
+   the future; a batch carrying `{"key": K, "kind": <k>, "version": 1, "live_until": "expires_at"}`
+   dispatched after that second, with no writer touching the note, is refused with `expired`,
+   `details` naming `K`, `expires_at`, the value and `now` later than it; the note count, the ledger
+   count and every named stream's head are unchanged. The control is the same batch dispatched
+   before the second elapses, which commits every member.
+2. **Live and pinned.** With the field an hour in the future, the entry holds at version 1 and is
+   refused with `version_conflict` at version 2 after one intervening write; the version half is
+   unchanged by the presence of `live_until`.
+3. **Unreadable.** The same batch against a document with no `expires_at`, then against one whose
+   `expires_at` is the string `"soon"`, is refused with `live_until_unreadable` naming the field and
+   the value found, nothing written. The control is arm 2's live document.
+4. **Dotted path.** `live_until: "lease.expires_at"` reads a nested field; the control is the flat
+   path on the same document.
+5. **Null version.** `live_until` with `version: null` is `invalid_input` before any member writes.
+6. **Mixed list.** A version-only entry and a `live_until` entry in one list commit when both hold
+   and refuse naming the offending key when either does not, in both directions, nothing written.
+7. **The writer's clock.** Arm 1's refusal carries `now`; the statement trace (Amendment 3 A3.3)
+   shows the clock read inside the writer transaction, after the transaction opens and before the
+   first `observed` check, and the same reading serves every entry in the list.
+8. **`updated_at`.** A `write` member's result carries `updated_at`; a read of the note immediately
+   after shows the same value; a second writer moving the version does not change the first result.
+   Both create and update.
+9. **Help.** `stream.batch(help=true)` names the atomic-mode requirement under `observed` and the
+   `live_until` shape; `observed` without `fence` and without `atomic=true` is refused naming the
+   mode.
+10. **Cross-process.** Arms 1 and 2 through the socket, the expiry elapsing while a second OS
+    process holds the note, so the refusal is a real window and not a self-inflicted one.
+11. **Mutation.** With `live_until` treated as no check, arm 1 goes red. With the clock taken from
+    the request's arrival time instead of inside the transaction, arm 7's trace assertion goes red.
+    With an unreadable field treated as live, arm 3 goes red. With `updated_at` omitted, arm 8 goes
+    red. Each run quoted with its exit code.
+
+## Amendment 6 (2026-09-10): an `observed` entry may pin the note it read, so an observation does not survive that note's recreation
+
+**Status**: Proposed.
+
+**Implementation (2026-09-10):** Observed entries may pin the live note UUID beside its version in one transactional read. Replacements refuse before version and deadline checks; absent holders retain version refusals. The replacement UUID follows the existing holder-disclosure policy, while identity pins remain usable by batch-only callers.
+
+### The gap
+
+Amendment 4's `observed` entry pins `(kind, key, version)` and nothing else. A note's version is a
+property of the note row: ADR-172 §3 starts every row at 1, and a soft-deleted note releases its
+key, so a note deleted and created again under the same `(kind, key)` is live at version 1 and
+satisfies an observation pinned at version 1. Two different notes, one predicate, and no component
+of the predicate distinguishes them. The caller reads a head, composes a batch on what it read, and
+the batch commits against a note that replaced the one it read.
+
+The version half is doing exactly what it says. The point of this amendment is that what it says was
+never enough on its own, because "the key is at version V" and "the note I read is still there" are
+different claims and only the first one is checked. Amendment 1's `version_conflict` shape, the
+Amendment 3 fence lists and Amendment 5's `live_until` all inherit the same predicate, and
+`live_until` inherits it twice: it reads a document field out of whatever note holds the key now.
+
+This is the same class as the recreated-key correction already recorded above for a positive-version
+`write` member, which refuses when its prepared target is deleted and recreated before commit. That
+correction settled the write path. The read-side predicate was left with the hole.
+
+### A6.1 `id`
+
+An `observed` entry may carry `id`, the note identity it read:
+
+```json
+{"key": K, "kind": <note kind>, "version": V, "id": <uuid>, "live_until": "<field path>"}
+```
+
+- With `id` present the entry holds only when the live note of that kind holding `K` in the caller's
+  primary namespace is that note **and** is at exactly version `V`. Both halves are checked inside
+  the writer transaction, in one read, before the first write, exactly where the version half is
+  checked today.
+- The identity half refuses with `reason: "identity_conflict"`: kind `conflict` (§2, ADR-172 §2),
+  `details` naming the key, the kind, the version asserted, the `id` asserted and the `index` every
+  observed refusal carries. Nothing is written.
+- **`current_id` is disclosed only where the holder's identity is already disclosable.** It names the
+  live holder, so it is emitted under exactly the authorization that already governs `existing_id` on
+  `key_conflict`: a caller allowed to learn which note holds that `(kind, key)` gets `current_id` and
+  can tell a replacement from a version move without a second round trip; a caller not allowed to
+  learn it gets the same refusal without that field. This amendment first asserted the field was
+  always safe because the caller could already read it. That is false for exactly the caller the
+  existing filter exists for, one authorized to write a batch but not to read or list the key, and an
+  identity pin is composable from a key and a guessed identity, so an unfiltered `current_id` would
+  hand that caller the holder identity the write path already withholds.
+- The version half is unchanged, including its refusal shape. When both halves fail the identity
+  half is reported, because a replacement explains the version difference and the version alone does
+  not explain the replacement.
+- **An absent holder is not an identity conflict.** `identity_conflict` says a different note holds
+  the key. When no live note holds it at all, the version half has already failed and describes the
+  world exactly: the refusal is `version_conflict` with `current_version` omitted, as it is today for
+  a pinned version against an empty key. So a caller pinning `(key, version, id)` reads its two
+  failure worlds apart without a new shape: the key is empty (`version_conflict`, no
+  `current_version`), or a different note holds it (`identity_conflict`, `current_id` naming it).
+  The distinction is carried by the reason that fires, not by `current_id`, which is why withholding
+  `current_id` from an unauthorized caller costs that caller nothing it is entitled to: it still
+  learns that the key is held by someone else rather than that its version was stale. When
+  `current_id` is present it is a live holder's identity and so is never the string `"null"`.
+- `id` requires a positive version: with `version: null` the entry asserts no live holder, which no
+  identity can be pinned against, so `id` with a null version is `invalid_input` before any member
+  writes.
+- Every `details` value is a string as ADR-172 §2 requires: `key` and `kind` as given, `version` and
+  `index` as their decimal strings, `id` and `current_id` as the identity string reads return.
+- `id` is optional and additive. Everything Amendment 4 says about an entry without it still holds,
+  and §A6.2 states what that entry means.
+
+### A6.2 What an entry without `id` asserts
+
+An `observed` entry without `id` asserts version-equality on the note that holds the key **at commit
+time**, not on the note the caller read. It is a liveness-and-freshness check on the key, not an
+identity check on a document. A caller that needs the note it read must pass `id`; a caller that only
+needs the key to be at a known version need not.
+
+Where the caller's own read already returns the identity, passing it costs nothing: a `write`
+member's result carries `id` (§A5.2 adds `updated_at` beside it), and every read of a keyed note
+carries `id`. The recommended shape for a read-then-pin caller is therefore to pin both halves.
+
+### A6.3 Why the two halves of a batch differ, and where they stop differing
+
+The write path already settled this principle. A positive-version `write` member whose prepared
+target is deleted and recreated under the same `(kind, key)` before commit refuses with
+`version_conflict`, recorded in the correction above and served from the revision that carries it.
+So the position was never that a recreated key is an open question; it is that one half of a batch
+was fixed and the other half was not, and from that revision onward a batch can refuse a write
+against a replacement in the same transaction in which an observation validates against one.
+
+With `id` the halves agree: both refuse when the note they named is gone, each in the writer
+transaction, each naming the member or the entry that failed.
+
+One difference remains and it is deliberate. A `write` member always has a specific note as its
+target, so it has no unpinned form to offer. An `observed` entry does: `version: null` asserts that
+nobody holds the key, and a positive version without `id` asserts the key is at a version, which are
+both useful claims about a key rather than about a document. The write path cannot express them and
+does not need to. That is the whole of the asymmetry after this amendment: not a gap, a difference
+in what the two things are for.
+
+### Alternatives considered
+
+**A generation that a create does not reset.** A per-key counter outliving the row would make the
+version half sufficient by itself. It needs a counter that survives a delete, so it is a schema
+addition plus a new invariant on the delete path, and it introduces a second number beside `version`
+whose difference from `version` every caller then has to learn. Identity is already carried by every
+write result and every read, so nothing new has to be stored or explained.
+
+**Refusing recreation outright**, as the write path does for a prepared target. The read path has no
+prepared target: an observation names a key, and a key with no live note is a legitimate observation
+(`version: null`). There is nothing to refuse against.
+
+**Leaving it to the caller** by documenting the current meaning and stopping there. That is A6.2, and
+it is necessary but not sufficient: the callers that need identity would have to check it outside the
+transaction, which is the race the whole `observed` mechanism exists to close.
+
+### Acceptance
+
+Every arm names its command; atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Recreation refused.** A keyed note at version 1, read for its `id`; the note deleted and created
+   again under the same `(kind, key)`, so a different note is live at version 1; a batch carrying
+   `{"key": K, "kind": <k>, "version": 1, "id": <the first note's id>}` is refused with
+   `identity_conflict`, `details` naming the asserted `id` and the `current_id`; the note count, the
+   ledger count and every named stream's head are unchanged. The control is the same batch against
+   the note that was never replaced, which commits every member.
+2. **The hole, stated as a control.** The same recreation with the same batch and `id` omitted
+   commits, and the ADR text of A6.2 is what that commit means. This arm exists so the difference
+   between the two predicates is a test and not a paragraph.
+3. **Identity holds across a version move.** The observed note updated once, so it is live at version
+   2 with the same `id`: the entry at version 1 refuses `version_conflict` (not
+   `identity_conflict`), and the entry at version 2 with the same `id` commits.
+4. **Both halves wrong.** A recreated note at a different version refuses with `identity_conflict`,
+   and the details still carry the version asserted.
+5. **Null version.** `id` with `version: null` is `invalid_input` before any member writes.
+   5b. **Absent holder.** The observed note deleted and not replaced: an entry carrying `id` and a
+   positive version refuses `version_conflict` with no `current_version` and no `current_id`, not
+   `identity_conflict`. The control is the same deletion followed by a recreation, which refuses
+   `identity_conflict`; the pair is what makes the two failure worlds distinguishable.
+6. **With `live_until`.** An entry carrying `id` and `live_until` together checks identity, version
+   and the deadline; recreation refuses `identity_conflict` before the deadline is read, so a
+   replacement is never reported as an expiry.
+7. **Mixed list.** A pinned entry and an unpinned entry in one list commit when both hold, and the
+   refusal names the offending key in both directions.
+8. **Help.** `stream.batch(help=true)` names `id` under `observed`, its refusal, and states in one
+   sentence what an entry without `id` asserts.
+9. **Cross-process.** Arm 1 through the socket, the recreation performed by a second OS process.
+10. **Disclosure.** Arm 1 run twice against the same recreation: once as a caller allowed to learn
+    the key's holder, whose refusal carries `current_id`, and once as a caller allowed to write the
+    batch but not to read or list the key, whose refusal carries the same `reason`, `key`, `kind`,
+    version and `index` and no `current_id` at all. The unauthorized arm supplies a guessed `id`, so
+    it is the disclosure the filter exists to stop. The `key_conflict` case is the control: the same
+    unauthorized caller already receives `key_conflict` without `existing_id`, and this arm asserts
+    the two refusals now behave the same way. The filter exists at two sites, the transactional error
+    rewrite and the per-member result strip, so the arm covers both batch modes: the unauthorized
+    half above runs in atomic mode, where the refusal is produced, and the same identity-pinned
+    observation submitted in per-member mode is asserted to refuse `invalid_input`, because
+    `observed` requires atomic mode. That second half is not a duplicate of the first. It is what
+    makes a single-site filter sound, by asserting that the per-member result path cannot carry an
+    `identity_conflict` at all; if a later amendment admits `observed` in per-member mode, this arm
+    goes red and names the second site as the one that then needs the filter.
+11. **Mutation.** With the identity half skipped, arm 1 goes red. With the identity half reported as
+    `version_conflict`, arm 1's reason assertion goes red. With `id` accepted beside a null version,
+    arm 5 goes red. With `current_id` emitted unconditionally, arm 10's unauthorized half goes red.
+    With `observed` admitted in per-member mode, arm 10's second half goes red, which is the arm that
+    proves the second filter site is unreachable rather than merely unused. Each run quoted with its
+    exit code.

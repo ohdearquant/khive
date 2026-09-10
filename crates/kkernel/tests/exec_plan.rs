@@ -111,7 +111,7 @@ mod daemon {
             "config_mismatch": false,
             "served_config_id": frame["config_id"],
             "version_mismatch": false,
-            "daemon_protocol_version": 5
+            "daemon_protocol_version": 6
         })
     }
 
@@ -169,7 +169,7 @@ mod daemon {
             assert_eq!(frame["plan"], true);
             assert_eq!(frame["ops"], ops);
             assert_eq!(frame["namespace"], "");
-            assert_eq!(frame["protocol_version"], 5);
+            assert_eq!(frame["protocol_version"], 6);
             assert!(frame["config_id"].as_str().is_some_and(|id| !id.is_empty()));
             assert_eq!(frame.as_object().unwrap().len(), 5);
         }

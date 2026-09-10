@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 20    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 24    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -27,16 +27,22 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
-write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction. A remote `git.digest` source whose initial
+`kkernel git-ingest` CLI drive. Its sixteen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+stored ingest cursor and checkpoint for one project and source kind), the three
+write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
+with hardened, allowlisted argv construction, the three read verbs `git.status` /
+`git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
+`git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
+`git.pr_merge` (ADR-182). A remote `git.digest` source whose initial
 clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
 to in-process callers; the MCP `request` envelope renders it as a plain error message
 rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
@@ -68,9 +74,14 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
+`tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
+`tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
+keeps a namespace-scoped registry of tools, skills, plugins and verbs as kg entities, joins them to
+capability concepts with `implements` edges, and answers what a caller may call (ADR-180).
+
 Pack selection resolves as `--pack` > `KHIVE_PACKS` > discovered `[runtime].packs` > the
 built-in production set. With no non-empty selection at any of the first three layers, the
-default binary loads all 12 packs. Use `verbs()` for the current aggregate rather than carrying
+default binary loads all 14 packs. Use `verbs()` for the current aggregate rather than carrying
 a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
@@ -195,7 +206,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 20 verbs
+## `kg` pack — 24 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -231,7 +242,7 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 ### `get` — Assertive
 
-Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
+Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
 | Param             | Type | Required | Notes                                                                  |
 | ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
@@ -575,7 +586,7 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors.
+Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
@@ -826,9 +837,16 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 
 ### `whoami` — Assertive
 
-Report the caller identity and namespace scope the runtime already resolved for this request.
-It takes no parameters and returns only identity labels, never tokens or credentials:
-`{actor_id, actor_kind, unattributed, namespace, visible_namespaces}`.
+Report the caller identity and namespace scope the runtime already resolved for this request,
+plus the serving process's build identity. It takes no parameters and never returns tokens or
+credentials: `{actor_id, actor_kind, unattributed, namespace, visible_namespaces, build: {version, revision}}`.
+
+`build.version` is the package version; `build.revision` is the source revision shown by that
+process's `kkernel --version`, including any `-dirty` suffix or the explicit `unstamped` fallback.
+These compile-time values share the source used by `db_diagnostics().build`; diagnostics calls
+the optional revision field `build_hash` and reports it as null for an unstamped build.
+Use `whoami()` for a lightweight build-identity probe: its handler reads existing token state
+and immutable build metadata without invoking database diagnostics or a checkpoint probe.
 
 ```
 request(ops="whoami()")
@@ -897,7 +915,8 @@ neither is ever `null`.
 `audit_batch_flush_failures`, `audit_degraded_rows`, and `audit_degraded` are additive fields
 supplied by the runtime's audit-batch control once one is registered: accepted batch generations
 that reached a terminal non-commit outcome after retry, pure-observability rows released without a
-commit, and a monotonic process-lifetime degradation flag, respectively. Each carries a matching
+commit, and a monotonic process-lifetime degradation flag that either of the first two sets,
+respectively. Each carries a matching
 `_unavailable_reason` field and reports `null` — never a fabricated `0`/`false` — for a direct
 `khive-db` caller or a runtime with no audit-batch control registered.
 
@@ -1208,16 +1227,48 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 `truncated` is `true`, these sums are computed over the fetched page only, same as the other
 `counts_by_*` fields.
 
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
+| Param        | Type   | Required | Notes                                                                                                                                                                                                                                                                                                                                      |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `since`      | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                                                                                                                                                                                                       |
+| `until`      | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                                                                                                                                                                                                        |
+| `actor`      | string | no       | Defaults to the authorized caller. A filter prefixed with `actor:`, `anonymous:`, or `agent:` matches a stored label exactly. Self access compares kind and id; foreign access checks the raw id for `actor:` and the full label for other reserved kinds against the caller's visible set. Other filters match bare and canonical labels. |
+| `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                                                                                                            |
+| `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                                                                                                     |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
 ```
+
+For an actor of kind `actor`, the canonical stored label is `actor:` followed by
+the unmodified raw principal id, prepending the prefix exactly once. The default
+scope also matches a historical bare alias only when the raw id does not begin
+with any prefix reserved by `RUNTIME_STAMPED_ACTOR_KINDS`: `actor:`, `anonymous:`,
+or `agent:`. Such prefixed ids match only their canonical stored label. The default
+`counts_by_actor` combines the permitted spellings under one caller-label key, or
+has no keys when no events match. Other actor kinds match their exact caller label.
+Explicit `actor` and `all_actors=true` reads preserve stored actor keys. The caller
+label is the actor id for kind `actor`, otherwise `kind:id`; an anonymous caller
+therefore defaults to `anonymous:local`. A visible foreign actor is readable only
+when explicitly requested. An allowlisted aggregate reader also defaults to its
+own events unless it supplies `all_actors=true`. Client-local configuration cannot
+grant aggregate access on a serving daemon.
+
+For example, principal id `actor:caller-a` writes `actor:actor:caller-a` and uses
+`actor="actor:actor:caller-a"` for an explicit self read. The filter
+`actor="actor:caller-a"` instead selects the canonical label for principal
+`caller-a`, requiring visibility of that identity even when the filter equals
+the caller's raw id. Likewise, a named principal with id `anonymous:local` uses
+`actor="actor:anonymous:local"` for an explicit self read; the exact filter
+`actor="anonymous:local"` selects the anonymous principal and requires visibility
+of that full label. Prefix parsing happens once, and self access compares the
+token's kind and id rather than its collapsed caller label.
+
+The reserved-kind list is shared with the gate's `ActorRef` definition, not a
+closed kind enum. Custom kinds outside that list are not covered by the
+historical-alias separation guarantee. A new runtime-stamped kind must be added
+to the shared list and covered by per-kind event-count tests. See
+[configuration](../configuration.md#brain-read-scope) and
+[ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
 
 ### `brain.profiles` — Assertive
 
@@ -1247,15 +1298,20 @@ request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 
 Show which profile would serve a caller context.
 
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
+| Param           | Type   | Required | Notes                                                                                                       |
+| --------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`).                                                |
+| `actor`         | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       | Default `*` (wildcard match).                                                                               |
 
 ```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
+request(ops="brain.resolve(consumer_kind=\"recall\")")
 ```
+
+Resolution retains wildcard binding fallback. For anonymous callers, an omitted
+actor remains wildcard-only and does not match explicit `local` or
+`anonymous:local` bindings. An explicit caller label is permitted; other actor ids
+require visibility. There is no `all_actors` resolution mode.
 
 ### `brain.activate` — Commissive
 
@@ -1329,17 +1385,17 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit caller-attributed feedback for one recall result — the convenience verb to call
 right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required    | Notes                                                                  |
-| ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
-| `query`                | string | yes         | The recall query that produced the results.                            |
-| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
-| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
-| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
-| `served_by_profile_id` | string | no          | Profile that served the recall.                                        |
-| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.       |
-| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
-| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
-| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail. |
+| Param                  | Type   | Required    | Notes                                                                                                                                                                            |
+| ---------------------- | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`                | string | yes         | The recall query that produced the results.                                                                                                                                      |
+| `results`              | array  | yes         | Recall result objects retained as candidate context: objects with an `id` field (result UUID or compact id) and optionally `served_by_profile_id`; bare id strings are rejected. |
+| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.                                                                                                                  |
+| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.                                                                                                                        |
+| `served_by_profile_id` | string | no          | Profile that served the recall.                                                                                                                                                  |
+| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.                                                                                                                 |
+| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.                                                                                                            |
+| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.                                                                                                              |
+| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail.                                                                                                           |
 
 Top-level serve-attribution fields are one pair and take precedence over the selected
 result's pair. If neither top-level field is supplied, both fields are copied from the
@@ -1406,18 +1462,23 @@ the same count for compatibility.
 
 ### `brain.bindings` — Assertive
 
-List rows in the profile resolution table, optionally filtered.
+List the authorized caller's rows in the profile resolution table, optionally
+narrowed by profile, namespace, and consumer kind. The actor filter matches exact
+binding rows; wildcard fallback belongs to profile resolution, not this listing.
 
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
+| Param           | Type   | Required | Notes                                                                                                                                              |
+| --------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `profile_id`    | string | no       |                                                                                                                                                    |
+| `actor`         | string | no       | Defaults to the caller label (`anonymous:local` for an anonymous caller). An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       |                                                                                                                                                    |
+| `consumer_kind` | string | no       |                                                                                                                                                    |
 
 ```
 request(ops="brain.bindings(consumer_kind=\"recall\")")
 ```
+
+The caller's own label is always permitted as an explicit actor filter. There is
+no `all_actors` binding-list mode.
 
 ### `brain.create_profile` — Declaration
 
@@ -1720,11 +1781,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                 |
-| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `content` | string | yes      | Non-empty reminder message.                                                                           |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
+| Param     | Type   | Required | Notes                                                                                                |
+| --------- | ------ | -------- | ---------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                          |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, `every:<N><s\|m\|h\|d>` (e.g. `every:15m`), or five-field cron in UTC. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -2159,7 +2220,54 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ---
 
-## `git` pack — 4 verbs
+## `exec` tree manifests
+
+The exec pack uses immutable `khive-tree/v1` manifests, also consumed by Git tree
+operations. See [ADR-181](../adr/ADR-181-exec-verb-sandboxed-run.md) for run and
+sandbox semantics.
+
+### `exec.tree`, `exec.tree_get`, `exec.tree_put`, `exec.tree_diff`
+
+| Verb             | Parameters                                                      | Result                           |
+| ---------------- | --------------------------------------------------------------- | -------------------------------- |
+| `exec.tree`      | `entries: [{path, ref, mode}]`                                  | `{tree}`                         |
+| `exec.tree_get`  | `tree`                                                          | `{tree, entries}`                |
+| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?}]` | `{tree, base, entries, changed}` |
+| `exec.tree_diff` | `base`, `head`                                                  | `{base, head, changed}`          |
+
+Entry modes are decimal `644` (file), `755` (executable file) or `120000`
+(symlink). A symlink's blob holds its literal target bytes, without an added
+newline or normalization. Entry paths must be relative and normalized, with no
+duplicates or entries below a file or symlink path. Empty `entries` is an empty
+tree. The schema string remains `khive-tree/v1`; existing file-only manifests
+remain valid.
+
+A put edit supplies exactly one of `ref`, `content` (UTF-8 text), or
+`delete: true`. Use `ref` for arbitrary target bytes. Its optional mode preserves
+an existing mode or defaults to `644` for a new path; deletes cannot carry a mode.
+Retargeting a link or switching between a symlink and a file is `modified`.
+Unsupported modes, duplicate edit paths and deletion of a missing path refuse
+the call without publishing a new tree.
+
+`exec.run` materializes real symlinks, including absolute or escaping targets.
+Seatbelt constrains access to resolved targets; `declared_write_paths` names
+tree-relative paths and does not expand sandbox access. Capture records link
+targets without following them, never descends through directory symlinks, and
+reports link additions, retargeting, removal and mode changes in `changed`.
+Sockets, FIFOs and devices remain skipped.
+
+`git.diff(input_kind="trees")` preserves symlink mode `120000` and target blobs,
+so its patches use Git's native symlink and file-conversion representation.
+This does not change the separate `git.checkout` symlink-refusal contract.
+
+---
+
+## `git` pack — 16 verbs
+
+The entries below cover the ingest and write surface; the dev-loop verbs
+(`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`) are specified in
+ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
 [ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
@@ -2262,6 +2370,13 @@ observed 300,000 ms bound is the MCP client's request default, so large
 `max_items` values can outlive a particular caller's wait while the daemon
 continues the pass. The durable receipt is the recovery contract; the item
 bound is not silently clamped to a transport-specific duration.
+
+### `git.ingest_cursor` — Assertive
+
+Reads the stored ingest cursor and checkpoint for a `project` and source kind in one
+snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of
+resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor
+writes (ADR-088 Amendment 1).
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
@@ -2427,3 +2542,57 @@ request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+
+## `tool` pack — 13 verbs
+
+Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
+`tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges
+(ADR-180). Every decision answer carries `decision` (`allow`, `deny`, `ask`), `source` (`grant`,
+`policy`, `default`) and the row id it came from.
+
+### `tool.register` — Commissive
+
+`tool.register(name, kind="tool", description, schema, source, side_effect="write", trust="external", capabilities=[], tags=[])`.
+Creates the object or returns the existing one by name (`created: false`); capabilities are created when
+absent and linked.
+
+### `tool.ingest` — Commissive
+
+`tool.ingest(source="khive")` registers every loaded verb under `khive:<pack>` with one capability per
+pack; `tool.ingest(source="mcp", server, tools=[...])` registers an MCP `tools/list` payload under
+`mcp:<server>`. Returns `registered` and `existing` counts.
+
+### `tool.suggest` — Assertive
+
+`tool.suggest(query, limit=10, kind, actor)`: hybrid search over the registry merged with capability
+concepts expanded through `implements`; each hit carries `score`, `via` (capability names) and the
+caller's `decision`.
+
+### `tool.describe` / `tool.list` — Assertive
+
+`tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
+`tool.list(kind, limit=100, offset=0)` pages the registry.
+
+### `tool.check` — Assertive
+
+`tool.check(tool, actor)`: active grant, then the most specific matching policy (`deny` over `ask` over
+`allow` on ties), then the default (`allow` for `read` side effects, `ask` otherwise and for unregistered
+names).
+
+### `tool.request` — Directive
+
+`tool.request(tool, actor, scope, reason, notify)`: returns the decision with `request_id: null` when
+already allowed; otherwise inserts a `requested` row and, when `notify` names an actor and the comm pack
+is loaded, mails it.
+
+### `tool.grant` / `tool.deny` / `tool.revoke` — Declaration
+
+`tool.grant(id, expires_in_s, note)` from `requested` or `denied`; `tool.deny(id, note)` from
+`requested` or `granted`; `tool.revoke(id, note)` from `granted`. Any other transition is refused with the
+current status. A requester cannot grant its own request.
+
+### `tool.requests` / `tool.policy` / `tool.policies`
+
+`tool.requests(status, actor, tool, limit=50)` lists grant rows; `tool.policy(actor, tool, decision, note)`
+stores a rule where `actor` and `tool` are exact labels, trailing-`*` prefixes or `*`;
+`tool.policies(actor, limit=100)` lists rules.

@@ -1,6 +1,6 @@
 # ADR-182: Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the git pack dev-loop verbs)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-108](ADR-108-git-write-surface.md) and its Amendment 1 (write verbs over an
   allow-listed repo set, force-push denied, hooks disabled; all of it stands),
@@ -135,6 +135,9 @@ item 1 is amended again in item 3.
    `hash-object -w --no-filters`, `mktree`, `commit-tree` and `update-ref`; no checkout, index or
    working tree is touched; a path the manifest omits is a deletion; `100644` and `100755` are the
    only modes. This replaces the Decision's detached-worktree materialization.
+   **Amended 2026-09-10:** `git.commit` also accepts symlink mode `120000` through
+   the shared `write_manifest_tree` writer, preserving the literal target blob;
+   `git.checkout` retains its independent symlink refusal.
 3. **Actor-only credentials (amends Amendment 1 item 1).** `git.commit`, `git.push`, `git.pr_open`,
    `git.pr_review` and `git.pr_merge` resolve the caller's `[git_write.actors]` row at every call; an
    actor without a row refuses with reason `actor_unmapped`; these verbs have no daemon fallback and
@@ -287,3 +290,257 @@ still points elsewhere leaves that receipt `unknown` under `git.reconcile`, and 
 the ref advanced past the sha settles to `committed`; 32 with the git and tool packs on different
 backends and a stale allow row planted in the git backend beside a deny row in the tool backend, the
 verb refuses with the tool pack's decision and id.
+
+## Amendment 6 (2026-09-08): the remote marker after acknowledgement, `reflog write`, match-head merge, recorded scope, repository configuration, published schema
+
+Adopted from the second implementation slice (push with exact compares, pull-request verbs, fork
+rows, the pack schema table). Nothing above is withdrawn; items 1 and 2 tighten Amendment 4 item 2
+and Amendment 5 item 1 for the remote case, items 3 to 6 record decisions the slice needed and the
+Decision left open.
+
+1. **The remote marker is written after acknowledgement and exact readback.** For `git.push` the
+   local marker is appended only after the remote has acknowledged the push and a readback of the
+   remote ref returns exactly the pushed sha. A reply lost before the acknowledgement leaves the
+   receipt `unknown` with no marker, and `git.reconcile`'s remote arm settles an `unknown` push to
+   `committed` only when both hold: the remote ref reads back at the pushed sha, and the marker is
+   present; either alone leaves `unknown`. The preflight compares are exact (Amendment 2): the local
+   branch head must equal `expected_local`, the remote ref must equal `expected_remote`, and the
+   remote must not already equal the candidate, which refuses as `already_at_target` with a receipt
+   and no remote effect, so a push that would move nothing is a refusal, never a silent success.
+2. **The marker mechanism is `reflog write`, not a ref update.** `update-ref` with identical old and
+   new shas appends no reflog entry (measured on the host Git during the slice), and after a push the
+   local ref does not move, so the marker is written with
+   `git reflog write refs/heads/<branch> <sha> <sha> khive-receipt:<receipt-id>`, which changes no ref,
+   index or worktree. A capability probe runs before the resolver and before any network use: a Git
+   that does not advertise `reflog write` refuses the push before any remote effect, with a receipt
+   naming the Git version and the missing capability, in the toolchain-identity refusal shape the pack
+   already uses. No compatibility with older Git is claimed from source; the receipt is the claim.
+3. **Merge by match-head compare-and-set, no administrator bypass.** `git.pr_merge` merges through
+   the platform's REST endpoint `PUT /repos/{slug}/pulls/{number}/merge` with `sha` set to
+   `expected_head`, so a head that moves between the verb's own check and the platform call is
+   refused by the platform; the refusal is receipted with disposition `not_committed` and nothing is
+   retried. The administrator bypass is not requested by this slice even where a `git.pr_merge.admin`
+   row allows it; a later slice that needs the bypass re-states the arm. Self-approval is refused
+   before the platform call both for the actor that opened the pull request and for a different actor
+   whose credential row resolves to the same platform login, read from the platform. The same pre-check,
+   on `git.pr_review(approve)` and on `git.pr_merge`'s required-review read, also refuses when the
+   reviewer's platform login equals the login that last pushed `expected_head`, because the platform's
+   last-push rule disqualifies exactly that approval and a merge that relies on it strands. That login
+   is read from the pack's own ledger, never inferred: it is the platform login on the newest `git.push`
+   receipt whose acknowledged head equals `expected_head`; a commit's author or committer, a workflow's
+   triggering actor and the platform's events feed do not name the pusher of a ref. With no such receipt
+   the pre-check refuses nothing and the receipt records `last_pusher` as unknown with reason
+   `no_push_receipt`. Independently, `git.pr_merge`'s required-review read takes the platform's own
+   review decision: the pull request's `reviewDecision` must read `APPROVED`, never a count of approving
+   reviews, so an approval the platform has disqualified under its last-push rule (an approving review
+   under `REVIEW_REQUIRED`) is refused before the merge call even when the push happened outside the
+   pack.
+4. **Grant scope is recorded, not evaluated.** The tool policy decision matches actor, tool pattern and
+   expiry; a grant's `scope` is free text that stays on the grant row, and the receipt cites that row by
+   its grant id beside the policy decision and its source, without copying the scope. A grant whose
+   tool pattern does not match the verb refuses in the same receipt shape as no grant; no
+   repository-scoped authorization is derived from the scope text.
+5. **Repository configuration.** The expectation a pull-request verb asserts before any platform
+   write comes from `[git_write.repositories."<absolute repository path>"]` with `remote`, `slug` and
+   `visibility`; at call time the key must match an ADR-108 allow-list row or the call refuses. A
+   repository without a row is refused by the pull-request verbs, never guessed from the remote.
+6. **The schema table is published through a runtime hook.** The pack publishes an input schema for
+   every git verb through a defaulted runtime hook, `input_schema(verb)` returning the table when the
+   pack has one; `help` and the MCP tool list read it, and a pack without a table keeps the parameter
+   rendering it has today. No handler definition shape changes.
+
+Acceptance arms added: 33 a push whose remote already equals the candidate refuses `already_at_target`
+with a receipt, no marker and no remote effect; 34 a transport cut after the send and before the
+acknowledgement leaves the receipt `unknown` with no marker, and `git.reconcile` settles it only when
+both the remote readback and the marker hold; 35 `update-ref` with identical shas appends no reflog
+entry while `reflog write` does, the control behind item 2; 36 a simulated Git without `reflog write`
+refuses before the resolver and the network with the version and the capability in the receipt; 37 a
+second actor whose credential resolves to the author's platform login is refused approval before the
+platform call; 38 a merge whose head moved between the check and the platform call is refused by the
+platform as `not_committed` and not retried; 39 a repository key absent from the allow-list refuses at
+call time; 40 `help` on every git verb returns the schema table and a pack without one keeps its
+parameter rendering; 41 an approval by the login on the newest `git.push` receipt for `expected_head` is refused before
+the platform call citing that receipt; a head with no push receipt takes the approval and records
+`last_pusher` unknown; a merge whose `reviewDecision` reads other than `APPROVED` is refused before the
+merge call; an approval by a third login under `reviewDecision` `APPROVED` proceeds (control). Mutation controls stated before they ran and both failed at their effects:
+removing the preflight together with the remote comparison overwrote a rival bare ref with the
+candidate; removing only the platform-login check let an alias actor submit an approval as the author
+account.
+
+Corrected the same day, after the slice read the record against its implementation: item 3 names the
+source of the last pusher (the pack's push receipts, and the platform's own review decision at merge)
+where the first text named a workflow's triggering actor, which is not the pusher; item 4 places the
+scope on the grant row the receipt cites, where the first text said the receipt carried it; arm 41
+follows item 3.
+
+## Amendment 7 (2026-09-09): merge dispatch refusals per repository
+
+Adopted from a caller's reading of the `git.pr_merge` help against the rule its operators hold for
+merges: the account that opened a pull request and the account that last pushed its head do not
+perform the merge. Amendment 6 item 5 stands; this adds one optional field to the repository row.
+
+1. **`merge_refusals` on the repository row.** `[git_write.repositories."<path>"]` may list
+   `merge_refusals = ["opener", "last_pusher"]`, each entry at most once; any other entry or a
+   repeated one fails configuration validation. The list is empty by default, and an empty list
+   changes nothing.
+2. **`opener`.** `git.pr_merge` is refused with reason `merge_by_opener` when the dispatching actor's
+   platform login equals the pull request author's login (evidence `platform_login`), or when this
+   namespace holds a committed `git.pr_open` receipt for that number by the dispatching actor or by
+   its credential reference (evidence `pr_open_receipt`): the same two readings that refuse a
+   self-approval on `git.pr_review`.
+3. **`last_pusher`.** `git.pr_merge` is refused with reason `merge_by_last_pusher` when the
+   dispatching actor's platform login equals the login on the newest `git.push` receipt whose
+   acknowledged head equals `expected_head` (Amendment 6 item 3); with no such receipt the entry
+   refuses nothing and `last_pusher` stays unknown on the receipt.
+4. **Order and receipt.** Both refusals run after the fork policy and the last-pusher read and before
+   the review-decision read and the merge call, so a refused merge writes nothing to the platform.
+   The receipt carries `result.merge_refusal: {name, source: "git_write.repositories.merge_refusals",
+   evidence}` beside `last_pusher`; a permitted merge carries no `merge_refusal`.
+
+Acceptance arm added: 42 with both entries listed, a merge dispatched by the opening actor, by a
+second actor on the opener's platform account, and by the last pusher of `expected_head` each refuse
+before any platform write with the named reason and evidence on the receipt, and a merge dispatched by
+the approving login that is neither the opener nor the last pusher proceeds (control). Mutation
+controls, stated before they ran: removing either entry's check alone lets its refusal arm merge.
+
+## Amendment 8 (2026-09-09): reading a repository, and creating one the operator already listed
+
+Adopted from a reading of a real caller rather than from the ADR alone. A client with no filesystem
+hands can commit, branch, push and open a pull request through this pack, but it still shells out to
+git for the four things it needs before any of that: what changed, what happened, where the head is,
+and, once, making the repository at all. Those four are the whole remaining shell dependency, so
+they enter here. Nothing above is withdrawn.
+
+1. **`git.status(repo, untracked?, limit?)`.** Porcelain v2, NUL-separated, renames off. Returns
+   `branch`, a bounded `entries` page, `total`, `truncated` and `clean`. `untracked` is `no`,
+   `normal` (default) or `all`; `limit` is 1 through 5000, default 1000. `total` counts every entry
+   git reported and is never capped, so `clean` is a claim about the whole repository even when the
+   page was truncated; a capped page that reported `clean` would be a fabricated negative, which is
+   the reason the two fields are separate. The record separator is NUL because a path may hold a
+   space, a newline or a non-ASCII character, and whitespace splitting silently produces a wrong
+   answer rather than an error. Renames are disabled, and a `2` record refuses rather than
+   attributing the following record's path to it, so re-enabling detection later cannot fail quietly.
+2. **The head read is a field, not a verb.** Porcelain v2's `--branch` headers already carry the
+   commit and the branch, so `git.status` answers the head read and no `git.head` is minted. The two
+   sentinels are normalized: `branch.head` is `null` on a detached head and `branch.oid` is `null` on
+   an unborn branch, rather than the literal `(detached)` and `(initial)`. A caller therefore reads
+   an absent branch as absent instead of having to know the sentinel, and a detached head is not an
+   error, because the underlying `symbolic-ref` fails there by design.
+3. **`git.log(repo, ref?, limit?, path?)`.** A bounded page from one resolved ref, newest first;
+   `ref` defaults to `HEAD`, `limit` is 1 through 500 default 100. Per commit: `sha`, `author_name`,
+   `author_email`, `authored_at`, `committed_at`, `subject`. Fields are newline-separated inside a
+   NUL-separated record, which is unambiguous because none of them can contain a newline. `path` is
+   passed under `--literal-pathspecs`, so a caller-supplied path is never read as a glob or as a
+   magic pathspec; a file actually named `*.txt` filters to itself.
+4. **Both reads are gated, and neither writes a receipt.** They take the repo-only allowlist match
+   and `tool.check` in that order, with `gate.id` the lowest matching entry index, exactly as
+   `git.gates` does under Amendment 4 item 4. They take no credential and no actor row. The
+   allowlist is consulted first, so a call against a repository outside it refuses without any
+   policy row existing. `git.status` inherits `GIT_OPTIONAL_LOCKS=0` from the hardened environment,
+   so it refreshes nothing and takes no index lock: the index is byte-identical across the call, and
+   Amendment 1's arm 12 stays usable as a control.
+5. **`git.init(repo, branch?)` initializes; it never creates the path.** The target must exist, must
+   be a directory, and must not already hold a repository. It is subject to the same allowlist as
+   every write, which is what decides where a repository may appear: the operator creates the
+   directory and lists it, and this verb turns it into a repository. It is not given a
+   non-canonicalizing matcher, so it cannot reach a path the allowlist could not already name.
+   `--template=` is passed, so a repository this pack creates inherits no sample hooks and item 4 of
+   Amendment 2 is true of it from birth. A target that already holds a repository refuses
+   `already_initialized` rather than reinitializing, because git would rewrite configuration in
+   place and the caller would read success. `branch` defaults to `main` and is validated as a ref
+   name. Being a write, it takes a receipt; the two reads do not.
+
+Acceptance arms added: 43 `git.status` entries equal the native porcelain v2 records for the same
+repository, and the index file is byte-identical before and after; 44 with the page capped below the
+number of changes, `entries` is the cap, `total` is the full count, `truncated` is true and `clean`
+is false; 45 a path holding a space, a newline and a non-ASCII character round-trips as one entry
+with its exact name; 46 a detached head reports `branch.head` null beside a real `branch.oid`, and
+an attached head reports its name (control); 47 `git.log` shas equal `git rev-list -n <limit>` for
+the same ref, a `limit` of 0, 501, a string or null refuses `invalid_params`, and a `path` of
+`*.txt` returns only the commit touching the file literally so named; 48 both reads refuse
+`repo_not_allowlisted` off the allowlist with no policy row present and `policy_denied` under a deny
+decision, the receipt count is unchanged across all four refusals, and the same calls succeed under
+an allow decision (control); 49 `git.init` on an allowlisted empty directory creates the repository
+with the named initial branch, leaves no sample hooks, and writes exactly one receipt, while the
+same call against a live repository refuses `already_initialized` with HEAD and `.git/config`
+byte-identical afterwards, and against an unlisted directory refuses `repo_not_allowlisted` with no
+repository created.
+
+Recorded with the arms: the pack's schema census test enumerated its verbs from a list typed in the
+test, under a name promising it covered all of them, so it would have passed while two verbs behind.
+It now derives the population from the handler table and asserts that table is non-empty, which is
+the shape any census here should take.
+
+Two additions, from gating this amendment rather than from writing it.
+
+6. **A verb's input schema is part of registering it.** `input_schema.json` is what the request
+   surface validates against, and a verb absent from it dispatches with no boundary check and no
+   `additionalProperties: false`. The schema census therefore derives its verb list from
+   `GIT_HANDLERS` rather than from a list typed in the test: the hand-kept list of twelve passed
+   while three verbs shipped with no schema at all, which is exactly the failure the census's name
+   promises to catch. Arm 50: every name in `GIT_HANDLERS` has a schema whose type is `object` and
+   whose `additionalProperties` is false, with the table asserted non-empty in the same pass.
+
+7. **A policy control runs before the deny, never after.** Tool policies are append-only rows and a
+   deny is not reversible by a later allow, so a refusal arm whose positive control follows its deny
+   arm cannot pass on a healthy pack. Arm 49's control now runs first: the same repo and the same
+   call shape succeed while the decision is allow, then the deny arm refuses, then the receipt count
+   is compared across both.
+
+8. **A new public Assertive verb is unclassified until someone reviews its side effects.** The
+   runtime keeps a cross-pack census that scans every pack's live vocabulary for public Assertive
+   handlers and requires each one to appear exactly once either on the admission-degrade-safe
+   allowlist or on the known-incidental-writer denylist, so a verb added without that review fails
+   the census rather than inheriting a default. `git.status` and `git.log` take the same shape
+   `git.gates` established: allowlist match, policy decision, read, no credential and no receipt.
+   Both are therefore admission-degrade-safe and are listed under the `git` pack beside
+   `git.receipts` and `git.gates`. `git.init` is Commissive and writes a receipt, so the census
+   does not reach it.
+
+## Amendment 9 (2026-09-10): explicitly local push targets
+
+Amends Amendment 2 items 3–4 for push targets only, implementing issue #2508.
+A repository mapping with `slug = ""` explicitly opts into a local remote: `remote`
+is an absolute POSIX path or an authority-free `file:///absolute/path` URL, and
+`visibility` remains one of `public`, `private`, `internal`. Relative paths,
+file URLs with a host, double-leading-slash paths, control characters and other
+schemes (including `ssh://`) refuse `remote_scheme`. File-URL paths are percent-decoded
+before these checks; malformed escapes or decoded non-UTF-8 paths also refuse.
+Encoded spaces remain supported, and ordinary absolute paths keep literal percent signs.
+A local path with a nonempty
+slug also refuses; HTTPS retains its owner/name slug and existing validation.
+
+```toml
+[git_write.repositories."/abs/checkout"]
+remote = "file:///abs/remote.git"
+slug = ""
+visibility = "private"
+```
+
+`git.push` on this mapping takes the same allowlist, tool policy, exact local and
+remote comparisons, fast-forward proof, server-side lease, readback and acknowledged
+push marker as HTTPS. It resolves neither an actor row nor a credential, including
+when an actor row exists, and its receipt records `credential: {"source":"none"}`.
+Its Git transport enables file access only for the explicit local path, disables
+HTTPS for that operation and injects no authorization header. HTTPS credential
+resolution is unchanged. `git.reconcile` reads a local push target without a
+credential and still needs both the receipt marker and the exact remote SHA.
+
+`git.pr_open`, `git.pr_review`, and `git.pr_merge` on a local mapping refuse
+`remote_scheme` before resolving credentials or reading platform/review state.
+Reconciliation of a platform merge against a local mapping also refuses
+`remote_scheme`. No local platform behavior is synthesized.
+
+`git.gates` preserves its existing allowlist rows and adds `target` with `kind`
+(`local` or `platform`), `remote`, `slug`, and `visibility`. An absent mapping
+returns `target: null`; an invalid or ambiguous mapping returns
+`target: {kind: "unavailable", reason}` without echoing the invalid remote.
+
+Acceptance arms: a production-transport push to a temporary bare `file:///` target
+succeeds with credential source `none` and an independently read remote SHA;
+absolute-path and unmapped-actor controls also succeed; stale expected-remote and
+divergent-head pushes refuse without moving refs; local PR verbs refuse before a
+credential read; gates distinguish local and HTTPS mappings in one configuration;
+unknown schemes and local targets lacking the empty slug refuse; reconciliation
+requires the marker and exact remote SHA. Mutation expectation: restoring the
+HTTPS-only scheme check makes the successful local-file push arm fail.

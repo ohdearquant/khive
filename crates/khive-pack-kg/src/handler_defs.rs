@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (20 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,59 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
+    HandlerDef {
+        name: "stream.append",
+        description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "record", param_type: "JSON value", required: true, description: "Required JSON value, including scalar or null; stored as note content.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "expected_seq", param_type: "integer", required: false, description: "Append only if this entry would receive this sequence; conflict details include next_seq.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Registered note kind; defaults to observation.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "boolean", required: false, description: "Defaults false: no embedding rows or vector-index work, while lexical indexing and stream reads remain available. True embeds under every registered model unless embedding_model selects one.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embedding_model", param_type: "string", required: false, description: "Select one registered embedding model. Requires embed=true; otherwise invalid_input before any write.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tags", param_type: "array of string", required: false, description: "Immutable entry tags stored in properties.tags.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.read",
+        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after", param_type: "integer", required: false, description: "Exclusive nonnegative sequence; defaults to 0.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "limit", param_type: "integer", required: false, description: "Positive page size; defaults to 1000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.stat",
+        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.batch",
+        description: "Run append and keyed write members in one request. Atomic mode (the default whenever fence is present) runs the list in one writer transaction: appends to one stream take consecutive numbers, each expected_seq is checked immediately before its own append inside that transaction, and any member refusal refuses the whole batch with details.member set and nothing written. Per-member mode runs each member in its own transaction in list order: a refusal is returned as that member's value with domain_disposition not_committed and its siblings stand; numbers on one stream increase with list position but another writer's append may fall between them. Reads are not members. Result {results: [...], committed: true} in list order.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "ops", param_type: "array of object", required: true, description: "Members in order. {op: \"append\", stream, record, expected_seq?, fence?, embed?, embedding_model?}: record is any JSON value, including null. Append embed defaults false; true embeds under all registered models or the one embedding_model selects. embedding_model requires embed=true or the entire list is invalid_input before any write; atomic errors name details.member. Each append fence is an object or non-empty ordered list of {key, kind, expected_version}; all append-member fences are checked in order before any member writes in their transaction. A stale or missing list entry reports a string index; atomic refusal also names the string member position. Null, empty lists and duplicate (kind,key) entries are invalid before any member writes. {op: \"write\", key, kind, doc, tags?, embed?, expected_version?}: doc is any JSON value; omitted/null expected_version creates only if absent, while a positive version updates only an existing key at that version. Duplicate write (kind, key) pairs refuse the whole batch. An unknown op is that member's unknown_op refusal, placed by the mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "{key, kind, expected_version}: a keyed note whose positive version must match, checked once inside the atomic transaction before the first write. A missing or stale note refuses the whole batch with fence_conflict. Selects atomic mode; atomic=false beside a fence is refused. List-valued fences are not supported.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "observed", param_type: "array of object", required: false, description: "Requires atomic mode; supplying observed alone does not select it. Set atomic=true or supply fence. [{key, kind, version, id?, live_until?}], checked inside the transaction before the first write. A positive version asserts the live key's exact version; explicit null asserts no live holder. A mismatch refuses the batch with version_conflict naming the key and the entry index. The version field is required. Optional live_until is a dotted document path (for example lease.expires_at), requires a positive version, and must hold an RFC 3339 timestamp strictly later than one writer-transaction clock reading. Expired or unreadable fields refuse with expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID and requires a positive version; a replacement refuses with identity_conflict before the version check. The refusal includes current_id only when the caller may learn the holder, under the same disclosure rule as key_conflict. Without id, the entry asserts version equality on the note holding the key at commit time. Refused with invalid_input in per-member mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "atomic", param_type: "boolean", required: false, description: "true: one transaction, all or nothing. false: one transaction per member, refusals as member values. Defaults to whether fence is present. observed alone does not select atomic mode; observed without fence requires atomic=true, otherwise invalid_input.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -22,6 +74,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -52,7 +107,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Registered note kind when kind=\"note\", including head for nameless JSON documents. Head document kinds use properties.tags entries kind:<value> (at most 64 UTF-8 bytes without U+0000).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -136,17 +191,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves and presents a record
     HandlerDef {
         name: "get",
-        description: "Fetch any record by UUID",
+        description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
+                      the granular kind (concept, task, observation, ...), `entity_type` is the \
+                      governed subtype when one is set, and an entity's vocabulary type lives \
+                      at `properties.type`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Live note key in the caller's primary namespace; excludes id and include_deleted=true. With no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "kind", param_type: "string", required: false, description: "Optional note substrate or registered note-kind hint for key lookup only.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Optional registered note kind for key lookup, disambiguating the same key across note kinds.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
-                required: true,
+                required: false,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
                               note, edge, event, or proposal to fetch. Entity-name fallback \
-                              uses the primary namespace.",
+                              uses the primary namespace. Required when key is absent; id and key are mutually exclusive.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
@@ -175,6 +236,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key_prefix", param_type: "string", required: false, description: "Notes only, primary namespace: literal prefix over non-null keys; empty selects all keyed notes. Order is updated_at DESC, key DESC, id ASC. Cursor pages return notes and an opaque next_after; explicit offset retains the items envelope.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after_key", param_type: "string", required: false, description: "Keyed notes only: resume after this live key's current position even when its row fails other filters. Excludes after and offset. Missing fails with after_key_missing; ambiguous kind fails with key_ambiguous.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -205,7 +271,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "after",
                 param_type: "string",
                 required: false,
-                description: "Insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
+                description: "With key_prefix, round-trip the opaque keyed-note next_after cursor (updated_at, key, id), or use an empty string to begin. Otherwise insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
                               the prior page's next_after, or \"\" to start cursor mode. A new id is \
                               assigned a durable database sequence, so later inserts cannot fall behind \
                               an issued boundary even when timestamps tie. This is a live walk, not an \
@@ -236,15 +302,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference | head).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Case-insensitive OR-filter over entity tags or note \
-                              properties.tags (kind=\"entity\" or kind=\"note\").",
+                description: "Case-insensitive OR-filter over entity tags or note properties.tags. For notes, tag_mode=all requires every requested tag.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -396,6 +461,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
+            ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
@@ -784,7 +852,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
+        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
+                      {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
+                      queried node, edge_id, relation, weight, and the neighbor's id, kind and \
+                      name; include_entity_type=true adds entity_type when the neighbor has one.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -1193,8 +1264,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         description: "Report the caller's identity as the runtime already resolved it for \
                       this request: actor_id, actor_kind, whether the actor is the \
                       unattributed/anonymous fallback, the write namespace, and the \
-                      read-visible namespace set. Never returns tokens or credentials — \
-                      only labels the runtime already computed before dispatch.",
+                      read-visible namespace set. Also returns build.version and \
+                      build.revision from the serving process's compile-time metadata, \
+                      without database diagnostics or a checkpoint probe. Never returns \
+                      tokens or credentials.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
@@ -1286,7 +1359,10 @@ fn compact_signature(handler: &HandlerDef) -> String {
 }
 
 /// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
-pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
+pub(crate) async fn handle_verbs(
+    params: Value,
+    registry: &VerbRegistry,
+) -> Result<Value, RuntimeError> {
     #[derive(serde::Deserialize, Default)]
     struct VerbsParams {
         category: Option<String>,
@@ -1294,49 +1370,36 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     }
     let p: VerbsParams =
         serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-    let all_verbs = registry.all_verbs_with_names();
+    let mut verbs: Vec<Value> = registry.all_verbs_with_names().into_iter().map(|(pack, handler)| serde_json::json!({
+        "verb": handler.name, "pack": pack, "description": handler.description,
+        "category": format!("{:?}", handler.category), "signature": compact_signature(handler),
+    })).collect();
+    verbs.extend(registry.mounted_verb_catalog().await?);
     let pack_counts: serde_json::Map<String, Value> = registry
         .pack_names()
         .into_iter()
-        .map(|pack_name| {
-            let count = all_verbs
-                .iter()
-                .filter(|(owner, _)| *owner == pack_name)
-                .count();
-            (pack_name.to_string(), serde_json::json!(count))
+        .map(|pack| {
+            (
+                pack.to_string(),
+                serde_json::json!(verbs
+                    .iter()
+                    .filter(|verb| verb["pack"].as_str() == Some(pack))
+                    .count()),
+            )
         })
         .collect();
-    let verbs: Vec<Value> = all_verbs
-        .into_iter()
-        .filter(|(pack_name, handler)| {
-            let cat_ok = p
-                .category
-                .as_deref()
-                .is_none_or(|c| format!("{:?}", handler.category).eq_ignore_ascii_case(c));
-            let pack_ok = p
-                .pack
-                .as_deref()
-                .is_none_or(|pk| pack_name.eq_ignore_ascii_case(pk));
-            cat_ok && pack_ok
+    verbs.retain(|verb| {
+        p.category.as_deref().is_none_or(|filter| {
+            verb["category"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
+        }) && p.pack.as_deref().is_none_or(|filter| {
+            verb["pack"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
         })
-        .map(|(pack_name, handler)| {
-            serde_json::json!({
-                "verb": handler.name,
-                "pack": pack_name,
-                "description": handler.description,
-                "category": format!("{:?}", handler.category),
-                "signature": compact_signature(handler),
-            })
-        })
-        .collect();
-
-    let total = verbs.len();
-    Ok(serde_json::json!({
-        "verbs": verbs,
-        "total": total,
-        "pack_counts": pack_counts,
-    }))
+    });
+    Ok(serde_json::json!({"total": verbs.len(), "verbs": verbs, "pack_counts": pack_counts}))
 }
 
 #[cfg(test)]

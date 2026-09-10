@@ -182,6 +182,8 @@ impl EmbedderProvider for ControlledRankingProvider {
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -197,6 +199,7 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
@@ -265,6 +268,8 @@ impl EmbedderProvider for CountingProvider {
 fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -280,6 +285,7 @@ fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(CountingProvider {
@@ -290,6 +296,8 @@ fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
 
 fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -305,6 +313,7 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
@@ -317,6 +326,8 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
 /// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
 fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -332,6 +343,7 @@ fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("file-backed runtime");
     rt.register_embedder(FakeDimProvider);

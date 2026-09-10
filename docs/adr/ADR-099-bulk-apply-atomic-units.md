@@ -891,3 +891,17 @@ separately in public issue #2231.
 No open design question remains within this atomic-unit amendment. The affected-row guard remains
 an effect check, the revision predicate becomes the stale-plan check, and a zero-row guarded apply
 is a unit failure with rollback.
+
+## Amendment: Mutation-free read assertions (2026-09-09)
+
+Prepared atomic plans admit one additional statement kind: the typed, same-status GTD
+transition plan (`idempotent_noop=true`) executes a `SELECT` assertion on the same writer
+connection, inside its operation SAVEPOINT and the enclosing atomic transaction. Its exact
+prepare-snapshot predicate includes the task id, note version, update timestamp, deletion
+marker, and semantic status; its guard requires exactly one result row. A mismatch fails the
+operation and rolls back the whole unit, including earlier operations. The assertion never
+executes an equal-value `UPDATE`, advances a note version, or appends a lifecycle audit or
+transition note. This extends the DML-only statement contract, not the admissible user-verb
+set: other plan statements retain affected-row guards and no external work may suspend inside
+the writer transaction. ADR-172's unconditional version trigger still advances the version
+for every matched `UPDATE`, including equal-value assignments.

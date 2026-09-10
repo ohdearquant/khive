@@ -186,7 +186,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
     /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
-    /// `comm.delivered`, `git.digest`.
+    /// `comm.delivered`, `git.digest`, `git.ingest_cursor`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -205,6 +205,8 @@ pub enum VerbPresentationPolicy {
     /// `git.digest` is included because its successful response is also the
     /// durable receipt payload. Presentation must not shorten `receipt_id` or
     /// otherwise make the returned result differ from the stored result.
+    /// `git.ingest_cursor` preserves raw checkpoint strings, full project UUIDs,
+    /// and stored microsecond timestamps for persisted-position inspection.
     AlwaysVerbose,
 }
 
@@ -228,7 +230,8 @@ impl HandlerDef {
             | "brain.auto_feedback"
             | "memory.feedback"
             | "comm.delivered"
-            | "git.digest" => VerbPresentationPolicy::AlwaysVerbose,
+            | "git.digest"
+            | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -641,6 +644,7 @@ mod tests {
             "memory.feedback",
             "comm.delivered",
             "git.digest",
+            "git.ingest_cursor",
         ];
         for name in always_verbose {
             let h = HandlerDef {

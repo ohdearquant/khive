@@ -452,13 +452,40 @@ impl KhiveRuntime {
         model_name: &str,
         texts: &[String],
     ) -> RuntimeResult<Vec<DocumentEmbeddingOutcome>> {
+        self.embed_document_batch_with_model_outcomes_inner(None, model_name, texts)
+            .await
+    }
+
+    pub(crate) async fn embed_document_batch_with_model_outcomes_for_token(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<DocumentEmbeddingOutcome>> {
+        self.embed_document_batch_with_model_outcomes_inner(Some(token), model_name, texts)
+            .await
+    }
+
+    async fn embed_document_batch_with_model_outcomes_inner(
+        &self,
+        token: Option<&NamespaceToken>,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<DocumentEmbeddingOutcome>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
         let model = parse_embedding_model_alias(model_name);
-        let service = self.embedder(model_name).await?;
+        let service = match token {
+            Some(token) => self.embedder_with_token(token, model_name).await?,
+            None => self.embedder(model_name).await?,
+        };
         let emb_model = model.unwrap_or_default();
         let budget = document_embedding_budget(model_name);
+        if token.is_some() {
+            // Atomic preparation records issued work even if its task is cancelled.
+            crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        }
         let out = if texts.iter().all(|text| text.len() <= budget) {
             service.embed_passage(texts, emb_model).await
         } else {
@@ -468,7 +495,9 @@ impl KhiveRuntime {
                 .collect();
             service.embed_passage(&bounded_texts, emb_model).await
         };
-        crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        if token.is_none() {
+            crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
+        }
         let vectors = out?;
         if vectors.len() != texts.len() {
             return Err(RuntimeError::Internal(format!(

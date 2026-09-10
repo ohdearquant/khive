@@ -220,7 +220,15 @@ class _Notes:
     def __init__(self, db: Khive) -> None:
         self._db = db
 
-    def create(self, note: Note | None = None, /, **fields: Any) -> Note:
+    def create(
+        self,
+        note: Note | None = None,
+        /,
+        *,
+        fence: dict[str, Any] | list[dict[str, Any]] | None = None,
+        embed: bool | None = None,
+        **fields: Any,
+    ) -> Note:
         n = note or Note(**fields)
         # subject rides in properties until the daemon grows the column.
         props = {**n.properties, "subject": n.subject} if n.subject else (n.properties or None)
@@ -232,6 +240,9 @@ class _Notes:
                             "create",
                             kind=n.kind,
                             content=n.content,
+                            key=n.key,
+                            fence=fence,
+                            embed=embed,
                             properties=props or None,
                             tags=n.tags or None,
                         )

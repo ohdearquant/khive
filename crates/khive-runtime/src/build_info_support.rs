@@ -34,6 +34,7 @@ fn git_command(cwd: &Path) -> Command {
     command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(cwd);
     command

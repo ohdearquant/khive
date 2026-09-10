@@ -75,14 +75,23 @@ async fn plan_daemon_refuses_each_present_companion_including_null() {
 
 #[tokio::test]
 async fn plan_daemon_protocol_rejects_previous_version_without_dispatch() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let (response, calls) = plan_raw_round_trip(serde_json::json!({
         "ops":"missing_verb()", "namespace":"", "plan":true,
         "config_id":"plan-config", "protocol_version":4
     }))
     .await;
     assert!(!response.ok);
-    assert!(response.version_mismatch);
+    assert!(
+        !response.version_mismatch,
+        "a client below this daemon's protocol is refused with the flag clear: it is \
+         reserved for a client that is ahead, and deployed bridges recover on this shape"
+    );
+    assert_eq!(
+        response.error_detail.as_ref().unwrap()["code"],
+        "version_mismatch",
+        "the refusal stays typed even though the flag is clear"
+    );
     assert_eq!(calls, 0);
 }
 

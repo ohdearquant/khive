@@ -1,6 +1,6 @@
 # ADR-178: Plan-Only Request — Grammar Check Without Dispatch
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the plan-only request path)
 - **Date**: 2026-09-07
 - **Extends**: [ADR-016](ADR-016-request-dsl.md) (Request DSL: the one `request` tool, three
   syntactic forms, the parser this record reuses)

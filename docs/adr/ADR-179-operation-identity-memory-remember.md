@@ -1,6 +1,6 @@
 # ADR-179: Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by keyed memory.remember)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-021](ADR-021-memory-pack.md) (memory pack: `memory.remember` creates one note
   of kind `memory`)
@@ -168,3 +168,63 @@ outcome so no one mistakes it for a defect of the index.
   `try_insert_note` shape (insert, then on zero rows resolve the existing id by
   `(namespace, kind, key)` and return the conflict with it).
 - `python/khive`: `Session.remember(..., key=None)`; the conflict object is surfaced unchanged.
+
+## Amendment 1: Message-pair identity (Accepted, 2026-09-09)
+
+This amendment extends D2–D3 and the exclusion of other note kinds only for `comm.send` and
+`comm.reply`. The accepted memory contract remains unchanged. Both verbs accept an optional
+`idempotency_key`. Unkeyed calls retain their existing behavior. Python `Session.send` and
+`Session.reply` pass the argument through and return the raw per-operation outcome without an
+automatic operation retry.
+
+Identity is the tuple `(write namespace, sending actor, client key)`. The logical key uses D1's
+exact validation: at most 512 UTF-8 bytes and no U+0000; empty strings and other control characters
+are allowed. Its physical encoding is `comm-v1:` followed by the compact JSON array
+`[namespace, actor, key]`, preserving tuple boundaries even when components contain colons.
+The 512-byte bound applies to the logical key and is validated at the verb boundary before
+encoding; the stored physical key is longer by the prefix, namespace, actor and JSON quoting, and
+the `notes.key` column (migration 028, `TEXT`) carries no store-level length bound.
+Recovery must pin the same namespace and actor.
+
+Public sends and replies store both notes in the caller namespace. Only the outbound note holds
+`notes.key`; both notes carry the logical `idempotency_key` property. The inbound note retains
+`outbound_ref`, and the outbound note carries the pre-generated recipient UUID as `inbound_ref`.
+Both notes and the final outbound key claim commit in one transaction under migration 028's
+existing unique index. A concurrent loser rolls back its entire pair before resolving the live
+holder. It never attaches a key after commit. An absent holder after a lost claim is an ambiguous
+outcome, never permission for an internal fresh insertion.
+
+The outbound note stores a versioned normalized request: operation kind, trimmed recipient, exact
+content, optional subject, canonical optional caller-supplied thread UUID, tags, and the resolved
+original note UUID for replies. Absent tags equal an empty list; order and duplicates otherwise
+remain significant. Prefix and full spellings of the same reply-parent UUID are equivalent.
+Different parent note UUIDs or operation kinds remain distinct. Generated timestamps, process IDs
+and the generated root UUID of a send without `thread_id` are not request identity.
+
+A matching replay returns the original `full_id`, `recipient_id`, `sent_at`, `thread_id`, logical
+key and `replayed: true`; a newly created keyed pair returns `replayed: false`. Replay also requires
+the live recipient sibling in the same namespace, expected directions and reciprocal references,
+matching actor routing, logical key, content, subject, tags and stored thread. Read and delivery
+state may evolve. A different normalized request or missing/inconsistent sibling yields
+`key_conflict` with the outbound `existing_id`, logical `key` and
+`domain_disposition: "not_committed"`. It creates no replacement and makes no repair. A successful
+replay makes no domain writes, including no repeat parent mark-read, and publishes no inbox signal.
+Existing authorization and parent/thread validation still apply.
+
+Inbox, sent-box and thread views expose the logical key on both copies, including explicit field
+projection. `comm.read` exposes it on its permitted inbound response; its outbound refusal remains.
+Read-back and replay do not promise transport delivery. Soft or hard deletion of the outbound
+claim releases the key; a later call may create another pair even if the old inbound survives.
+This is live-record reconciliation, not permanent exactly-once delivery. No migration is added;
+older binaries leave these keys and properties inert and refuse a keyed call as bad params (unknown
+field `idempotency_key`), so a client is never silently unkeyed.
+
+Acceptance must demonstrate same-payload replay, different-payload refusal, concurrent send and
+reply, lost acknowledgement, tuple-boundary collisions, namespace/actor separation, approved
+self-send, unchanged unkeyed duplication, key validation, thread/parent normalization, mutation-free
+reply replay and both-copy read-back. A keyed call against a handler without the field must be
+refused as bad params, never accepted unkeyed (mixed-version control). Missing or altered recipient siblings must refuse without
+repair; ordinary read/delivery changes must allow replay. Deleting the outbound must demonstrate
+the stated release limit. Removing the final physical key claim must make the duplicate-population
+test fail; restore it and rerun. The amendment requires independent review and acceptance before
+dependent implementation merges.

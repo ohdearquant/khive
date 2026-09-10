@@ -524,7 +524,10 @@ mod tests {
         let db_path = dir.path().join("fold-gate-concurrency.db");
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
+            exec: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
             db_path: Some(db_path),
@@ -633,7 +636,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
+            exec: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
             db_path: Some(db_path),

@@ -984,7 +984,26 @@ mod tests {
         "code",
         "workspace",
         "blob",
+        "tool",
+        "exec",
     ];
+
+    /// The fixture above is a copy of the shipping declaration, and a copy is
+    /// how the set goes stale: when it sat two packs behind, every gate-path
+    /// test in this module ran against a registry smaller than the one that
+    /// ships, and nothing said so. This fails the day they diverge again.
+    #[test]
+    fn all_packs_fixture_matches_the_shipping_declaration() {
+        let mut fixture: Vec<String> = ALL_PACKS.iter().map(|p| p.to_string()).collect();
+        let mut declared = khive_runtime::RuntimeConfig::built_in_packs();
+        fixture.sort();
+        declared.sort();
+        assert_eq!(
+            fixture, declared,
+            "ALL_PACKS must equal RuntimeConfig::built_in_packs(); add the pack to the \
+             declaration and this fixture together, or derive the fixture from it"
+        );
+    }
 
     #[derive(Debug, Default)]
     struct DenyFindingsIngestGate {

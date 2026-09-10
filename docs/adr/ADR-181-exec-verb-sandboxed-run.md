@@ -1,6 +1,6 @@
 # ADR-181: Exec Verb: One Declared Command in a Sandbox over a Materialized Tree
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-09-09, implemented by the exec pack)
 - **Date**: 2026-09-08
 - **Extends**: [ADR-111](ADR-111-blob-store.md) (content-addressed objects; this record adds a tree
   manifest over them), [ADR-180](ADR-180-tool-pack.md) (the policy vocabulary every run is checked
@@ -178,3 +178,144 @@ started concurrently in one session receive `seq` 1 and 2, `exec.runs` for the s
 and `exec.receipt` reports the same number as the run reply; 22 a shell run that invokes
 `git --version` and one that invokes a `never` path both end with a non-zero status and the kernel's
 refusal in stderr, while the same shell invoking `/bin/echo` exits zero (control).
+
+## Amendment 4 (2026-09-09): `exec.tree_put`, a batch edit that mints one tree or none
+
+A tree is an immutable manifest blob, so every edit mints a new manifest. Callers today build the
+whole entry list themselves and call `exec.tree`, which means an agent editing a checkout has to
+read the old tree, splice its own changes into the entry array, and re-declare every path it did
+not touch. `exec.tree_put(tree, edits)` does that splice, and it takes a list rather than a single
+path because a caller that edits several files per step would otherwise mint one throwaway tree per
+file, each of which nothing ever reads.
+
+1. **The shape.** `exec.tree_put(tree, edits)` returns `{tree, base, entries, changed}`, where
+   `changed` is the `exec.tree_diff` of the base against the result. Each edit is an object with a
+   `path` and exactly one of `ref` (an existing blob reference), `content` (bytes to store), or
+   `delete: true`. An edit that names none of the three, or more than one, is refused and the
+   refusal says how many it named. `mode` is optional on a put and forbidden on a delete: an edit
+   that omits it keeps the mode the path already had, and a new path takes 644. The modes a
+   manifest stores are the decimal 644 and 755, never octal literals.
+
+2. **One new tree or none.** The atomicity is a property of the result, not of the loop that
+   produces it: a call yields exactly one new tree reference or none, and a refusal on any edit
+   leaves the blob store with no new object from the call, including objects for the edits that
+   were fine. That is why `content` bytes are hashed rather than written while the call is being
+   validated. `digest_hex` is the same BLAKE3 the blob store keys on, so a content edit's reference
+   is known before its byte is stored, and only a call that will succeed writes anything.
+   The guarantee is scoped to refusals: it covers every refusal the verb raises, all of which are
+   raised during validation, and it does not cover a blob store that fails partway through
+   publication. Once validation passes, the content blobs are published one at a time and the
+   manifest last, so a backend failure during publication leaves the objects already published and
+   mints no tree. Those objects are referenced by no manifest, which is the same state an
+   interrupted `blob.put` leaves and is what the store's own reclamation is for; a caller reading
+   the refusal still knows no new tree exists, which is the property the atomicity claim is about.
+
+3. **The candidate manifest goes through the pack's own validator.** After the edits are applied,
+   the complete entry list is validated by `parse_entries`, the same function `exec.tree` uses. This
+   is not tidiness. `parse_entries` enforces that a file cannot also be a directory prefix of
+   another entry, and a verb that builds `TreeEntry` values directly and stores them would happily
+   mint a manifest containing both `a` and `a/b` that `exec.tree_get` would then refuse to load.
+   Deleting `a` and adding `a/b` in one call is legitimate and passes, because the candidate the
+   validator sees no longer holds `a` as a file.
+
+4. **Refusals that a quiet success would hide.** Duplicate paths in one list are refused and the
+   refusal names both indices, rather than last-one-wins: these lists are produced by generated code
+   and by models, both of which produce duplicates, and last-one-wins makes the caller's second
+   intent vanish where nothing downstream can observe that it happened. A delete of a path the tree
+   does not hold is refused, because a silent no-op is how a caller comes to believe it removed
+   something. An empty `edits` list is refused rather than returning the input tree, because an
+   empty edit is almost always a caller bug and echoing the input makes a no-op look like work.
+
+5. **Degrade safety.** `exec.tree_put` is a Declaration and a writer, so it is not on the admission
+   degrade-safe list beside `exec.tree_get` and `exec.tree_diff`.
+
+Acceptance arms added: 23 a call that rewrites one path by content, replaces another by ref, and
+adds two new paths returns a new tree whose entries carry the expected modes (kept, given, and the
+644 default), leaves the base tree readable at its pre-edit content, and stores the new bytes so
+they read back; 24 a delete removes only the named path, a delete of an absent path is refused
+naming it, and a delete carrying a mode is refused; 25 duplicate paths are refused with both
+indices and the path in the message; 26 an empty edits list is refused; 27 an edit naming zero or
+two of ref/content/delete is refused counting them, an out-of-range mode is refused, an octal
+literal mode is refused as the 420 it is, and an escaping path is refused; 28 adding `a/b` where
+`a` is a file is refused, while deleting `a` and adding `a/b` in one call succeeds; 29 a list whose
+last edit fails normalization leaves the blob store object count unchanged, with the same list
+minus that edit as a positive control that moves the count; 30 a `ref` naming no stored object is
+refused with the count unchanged, so the good edit's blob was not written first.
+
+## Amendment 5 (2026-09-10): symlink entries
+
+1. **Manifest modes.** `khive-tree/v1` accepts the decimal modes `644`, `755` and
+   `120000`. The third mode represents a symlink: its blob contains the literal
+   target path bytes, exactly as a Git `120000` blob does, with no added newline,
+   encoding conversion or normalization. This is an additive entry mode, not a
+   new manifest shape, so the schema string remains `khive-tree/v1` and existing
+   manifests remain valid. Entry paths retain their existing validation; no entry
+   may be below a file or symlink entry, and duplicate paths are refused.
+
+2. **Tree editing and comparison.** `exec.tree` and `exec.tree_put` accept
+   `120000`; `exec.tree_get` returns it. For a symlink put, `content` supplies the
+   target's UTF-8 bytes or `ref` names a blob holding arbitrary target bytes.
+   Omitted mode preserves the existing entry mode, and deletion is unchanged.
+   Changing the target or switching between a file and a symlink is `modified`.
+   `git.diff(input_kind="trees")` maps this mode to Git's `120000` blob entry,
+   retaining native symlink add, retarget, remove and file-conversion patches.
+
+3. **Materialization and containment.** Materialization creates a real symlink
+   with its literal target, whether relative, absolute, dangling or outside the
+   tree. The target is not constrained to the tree root. A fresh run directory
+   receives all directories and exclusively created files before any symlinks,
+   so filesystem name aliases cannot redirect materialization writes. The seatbelt profile
+   remains the read/write boundary: writing through a symlink does not grant
+   write access to its resolved target outside the run directory. A denied write
+   is visible through the command's exit status and captured stderr.
+   `declared_write_paths` still names tree-relative paths, not resolved targets;
+   it filters captured changes and grants no additional filesystem access.
+
+4. **Capture.** The capture walk records symlinks with mode `120000` and reads
+   their target bytes without following them. Directory symlinks are entries,
+   never traversal roots. Created, retargeted, removed and mode-flipped links
+   appear in `changed` under the same declaration rules as files. Sockets,
+   FIFOs and devices remain skipped.
+
+Acceptance arms added: 31 valid symlink entries pass while unsupported modes and
+entries beneath symlinks fail; 32 tree edits preserve target bytes and classify
+all link transitions; 33 materialization preserves literal relative, escaping,
+absolute and non-UTF-8 targets; 34 an escaping-link write leaves its outside
+target unchanged and reports a sandbox denial, while an inside-tree write
+succeeds; 35 capture records links without descending through directory links;
+36 tracked file, directory and dangling symlinks round-trip through the manifest
+to a Git tree with an empty `git diff-tree`, and a link-to-file conversion emits
+the native `120000` to `100644` change.
+
+## Amendment 6 (2026-09-10): observed limiting resource on receipts
+
+Every newly written run receipt, including a refusal receipt, carries the explicit
+`limiting_resource` key. Its closed vocabulary is `cpu_seconds | address_space |
+file_size | nproc | null`; `null` is serialized rather than omitted. `exec.run`,
+`exec.receipt` and `exec.runs` return the same stored value. Historical receipts are
+not rewritten or assigned an inferred cause.
+
+The wait site records `cpu_seconds` only for a delivered `SIGXCPU` when that run
+configured `cpu_seconds`, and `file_size` only for a delivered `SIGXFSZ` when it
+configured `file_size`. Normal exits, nonzero exit codes, unrelated signals
+(including generic `SIGKILL`), wait errors and the run-timeout path leave `null`.
+The field is not derived afterwards from the exit code or merely from a requested
+limit. Existing signal termination keeps `exit_code: null` and the delivered
+signal in `exit_signal`; enforcement and timeout behavior are unchanged.
+
+The observation is limited to the directly waited child's signal. A descendant
+whose parent converts a signal into an ordinary exit code supplies no such
+observation. Likewise, `ENOMEM` from an address-space limit and `EAGAIN` from a
+process limit occur inside the child, so this wrapper records `null` for
+`address_space` and `nproc` even on Linux. An ignored `SIGXFSZ` followed by an
+`EFBIG` write error is not inferred as `file_size`. The macOS startup refusal for
+unsupported `address_space` and `nproc` remains unchanged and produces no receipt.
+
+Acceptance arms added: 37 a spinning child under a one-second CPU limit records
+`cpu_seconds`; 38 a child writing past a file-size limit records `file_size`; 39
+exit zero, nonzero exit, `SIGTERM`, generic `SIGKILL` and timeout each retain a
+present JSON null; 40 the same spin without a CPU limit reaches its wall timeout
+and retains null; 41 each resource signal without its matching configured limit
+retains null. The arms read back the durable receipt and its listing as well as
+the run reply. Replacing observation with a nonzero-exit heuristic must fail the
+unrelated-signal arm; omitting null must fail the exit-zero arm.

@@ -605,6 +605,8 @@ async fn sch_aud_002_malformed_five_field_cron_rejected() {
 async fn sch_aud_002_out_of_range_cron_minute_rejected() {
     let (registry, _rt) = build_registry();
 
+    // Minute field 99 is out of range (0-59): the parser the executor uses refuses it,
+    // so creation refuses it too.
     let err = registry
         .dispatch(
             "schedule.remind",
@@ -618,50 +620,38 @@ async fn sch_aud_002_out_of_range_cron_minute_rejected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("cron") && msg.contains("not executable"),
-        "SCH-AUD-002: every unsupported cron form must be rejected; got: {msg}"
+        msg.contains("invalid repeat expression") && msg.contains("cron"),
+        "SCH-AUD-002: every cron form the executor cannot advance must be rejected; got: {msg}"
     );
 }
 
 #[tokio::test]
-async fn sch_aud_002_wildcard_cron_rejected_as_unexecutable() {
-    let (registry, _rt) = build_registry();
-
-    let error = registry
-        .dispatch(
-            "schedule.remind",
-            serde_json::json!({
-                "content": "wildcard cron",
-                "at": "2099-06-01T09:00:00Z",
-                "repeat": "* * * * *"
-            }),
-        )
-        .await
-        .expect_err("SCH-AUD-002: an unadvanceable wildcard cron must be rejected");
-    assert!(error.to_string().contains("not executable"));
-}
-
-#[tokio::test]
-async fn sch_aud_002_numeric_cron_rejected_as_unexecutable() {
-    let (registry, _rt) = build_registry();
-
-    let error = registry
-        .dispatch(
-            "schedule.remind",
-            serde_json::json!({
-                "content": "monday morning",
-                "at": "2099-06-01T09:00:00Z",
-                "repeat": "0 9 * * 1"
-            }),
-        )
-        .await
-        .expect_err("SCH-AUD-002: an unadvanceable numeric cron must be rejected");
-    assert!(error.to_string().contains("not executable"));
+async fn sch_aud_002_cron_the_executor_advances_is_accepted() {
+    // SCH-AUD-002 once required these forms to be refused because the executor could
+    // not advance them. Creation and the executor now share one parser, so a cron
+    // expression the executor advances is accepted, and only unadvanceable forms remain
+    // refused (see the out-of-range and malformed arms above).
+    for repeat in ["0 9 * * 1", "* * * * *"] {
+        let (registry, _rt) = build_registry();
+        let result = registry
+            .dispatch(
+                "schedule.remind",
+                serde_json::json!({
+                    "content": "monday morning",
+                    "at": "2099-06-01T09:00:00Z",
+                    "repeat": repeat
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("SCH-AUD-002: cron {repeat:?} must be accepted; got: {e}"));
+        assert_eq!(result["status"], "pending");
+    }
 }
 
 // ── Repeat contract matrix ─────────────────────────────────────────────────
-// The executor advances exactly the three named aliases. Every cron form is
-// rejected at creation rather than silently consumed as a one-shot.
+// Creation and the executor share one parser: the three calendar aliases,
+// `every:<N><s|m|h|d>` intervals, and five-field cron in UTC. Everything
+// else is rejected at creation rather than silently consumed as a one-shot.
 
 async fn assert_repeat_accepted(repeat: &str) {
     let (registry, _rt) = build_registry();
@@ -707,33 +697,45 @@ async fn repeat_contract_matrix_aliases_accepted() {
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_wildcard_rejected() {
-    assert_repeat_rejected("* * * * *").await;
+async fn repeat_contract_matrix_intervals_accepted() {
+    assert_repeat_accepted("every:30s").await;
+    assert_repeat_accepted("every:15m").await;
+    assert_repeat_accepted("every:2h").await;
+    assert_repeat_accepted("every:1d").await;
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_single_numeric_field_rejected() {
-    assert_repeat_rejected("0 9 * * 1").await;
+async fn repeat_contract_matrix_five_field_cron_accepted() {
+    assert_repeat_accepted("* * * * *").await;
+    assert_repeat_accepted("0 9 * * 1").await;
+    assert_repeat_accepted("*/15 * * * *").await;
+    assert_repeat_accepted("0 9-17 * * 1-5").await;
+    assert_repeat_accepted("0,30 9 * * 1").await;
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_step_operator_rejected() {
-    assert_repeat_rejected("*/15 * * * *").await;
+async fn repeat_contract_matrix_malformed_intervals_rejected() {
+    assert_repeat_rejected("every:0s").await;
+    assert_repeat_rejected("every:15").await;
+    assert_repeat_rejected("every:x").await;
+    assert_repeat_rejected("every:1w").await;
 }
 
 #[tokio::test]
-async fn repeat_contract_matrix_range_operator_rejected() {
-    assert_repeat_rejected("0 9-17 * * 1-5").await;
-}
-
-#[tokio::test]
-async fn repeat_contract_matrix_list_operator_rejected() {
-    assert_repeat_rejected("0,30 9 * * 1").await;
-}
-
-#[tokio::test]
-async fn repeat_contract_matrix_out_of_range_rejected() {
+async fn repeat_contract_matrix_out_of_range_cron_rejected() {
     assert_repeat_rejected("99 * * * *").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_wrong_field_count_rejected() {
+    assert_repeat_rejected("* * * *").await;
+    assert_repeat_rejected("0 9 * * 1 2027").await;
+}
+
+#[tokio::test]
+async fn repeat_contract_matrix_nicknames_rejected() {
+    assert_repeat_rejected("@daily").await;
+    assert_repeat_rejected("hourly").await;
 }
 
 #[tokio::test]

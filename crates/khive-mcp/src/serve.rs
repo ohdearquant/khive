@@ -140,17 +140,24 @@ pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json:
 /// the same database file at the same time — see
 /// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
+        crate::daemon::capture_bridge_executable();
+    }
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     // #667: in daemon mode, failing to acquire the boot guard must abort
     // before `build_server` runs migrations/FTS DDL unguarded — see
     // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
     // lock (dropped right after construction below).
+    if args.daemon {
+        khive_runtime::daemon::mark_warm_index_host();
+    }
     #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
@@ -2087,7 +2094,7 @@ pub async fn serve_server(
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
@@ -3135,6 +3142,8 @@ async fn build_registry_for_multi_backend_inner(
     )
     .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
 
+    khive_mounts::register_mounts(&default_runtime, &mut builder).await?;
+
     let registry = builder
         .build()
         .map_err(|e| anyhow::anyhow!("registry build: {e}"))?;
@@ -3428,7 +3437,8 @@ pub async fn build_server_with_explicit_namespace(
                 .then(|| runtime.clone()),
         );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        let server = KhiveMcpServer::new(runtime)
+        let server = KhiveMcpServer::new_with_mounts(runtime)
+            .await
             .map(|s| s.with_default_output_format(fmt))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok((server, schedule_rt));

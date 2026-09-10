@@ -1,0 +1,139 @@
+name: Serving artifact
+
+# Builds the kkernel binary a deployment serves, per platform, and publishes it
+# beside its sha256 so a consumer pins the binary by digest instead of by
+# version string (a version string does not identify a build; a digest does).
+# Nothing here touches npm or crates.io; release.yml owns publishing.
+#
+# Two ways in:
+#   - workflow_dispatch with `ref`: build that ref. The release is named
+#     serving-<short sha> of the commit the ref resolved to, so a moving branch
+#     name still yields an exact, pinned artifact.
+#   - push of a tag matching serving-*: build the tagged commit and publish the
+#     release under that tag name.
+#
+# Every matrix leg checks out the same resolved commit, so the two binaries in
+# one release always come from one tree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or commit sha)"
+        required: true
+        type: string
+        default: main
+  push:
+    tags: ["serving-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+      release: ${{ steps.rev.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - id: rev
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          if [ "$EVENT_NAME" = "push" ]; then
+            release="$REF_NAME"
+          else
+            release="serving-${sha:0:9}"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "building $sha as $release"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: resolve
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - name: Build kkernel
+        working-directory: crates
+        run: cargo build --release --locked --target ${{ matrix.target }} -p kkernel --features pack-formal
+      - name: Stage binary and digest
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          cp "crates/target/${TARGET}/release/kkernel" "dist/kkernel-${TARGET}"
+          chmod +x "dist/kkernel-${TARGET}"
+          cd dist
+          # sha256sum format on both platforms so `sha256sum -c` verifies the download.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "kkernel-${TARGET}" > "kkernel-${TARGET}.sha256"
+          else
+            shasum -a 256 "kkernel-${TARGET}" > "kkernel-${TARGET}.sha256"
+          fi
+          cat "kkernel-${TARGET}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kkernel-${{ matrix.target }}
+          path: dist/kkernel-${{ matrix.target }}*
+          if-no-files-found: error
+          retention-days: 30
+
+  prerelease:
+    name: Attach to prerelease
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kkernel-*
+          path: dist
+          merge-multiple: true
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ needs.resolve.outputs.release }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          ls -l dist
+          test -f "dist/kkernel-x86_64-unknown-linux-gnu.sha256"
+          test -f "dist/kkernel-aarch64-apple-darwin.sha256"
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SHA" \
+              --prerelease \
+              --title "$RELEASE" \
+              --notes "kkernel serving build of ${SHA} (features: pack-formal). Verify a download with: sha256sum -c kkernel-<target>.sha256"
+          fi

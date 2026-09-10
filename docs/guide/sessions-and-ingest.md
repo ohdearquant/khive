@@ -204,5 +204,5 @@ discovery.
 - [Communication and Email](communication.md): the other daemon-only
   background loop (email channel polling), and the same warm-hook /
   daemon-role pattern.
-- [Specialized Packs](specialized-packs.md): packs beyond the twelve loaded
+- [Specialized Packs](specialized-packs.md): packs beyond the fourteen loaded
   by default.
