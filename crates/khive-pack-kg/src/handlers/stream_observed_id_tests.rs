@@ -355,6 +355,46 @@ impl khive_gate::Gate for ObservedDisclosurePolicy {
 }
 
 #[tokio::test]
+async fn observed_id_arm10b_per_member_mode_refuses_observed_before_any_holder_read() {
+    use std::sync::{Arc, Mutex};
+
+    // Arm 10's second half. The disclosure filter has two sites, the transactional error rewrite
+    // and the per-member result strip, and only the first can ever carry an identity_conflict:
+    // `observed` is refused outside atomic mode before any check runs, so the per-member path
+    // cannot produce the reason at all. Filtering at one site is sound because of that, not
+    // because the other site happens to be untested, and this arm is what says so. If a later
+    // amendment admits `observed` in per-member mode, this goes red and names the site that then
+    // needs the filter.
+    let (rt, setup) = surface();
+    lease(&setup, "target").await;
+    let (original, _holder) = recreate(&setup, "private/key").await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(Arc::new(ObservedDisclosurePolicy {
+        allow_holder: false,
+        seen: seen.clone(),
+    }));
+    builder.register(crate::KgPack::new(rt.clone()));
+    let reg = builder.build().unwrap();
+    let mut args = publication(json!([observation(
+        "private/key",
+        json!(1),
+        Some(&original["id"])
+    )]));
+    args["atomic"] = json!(false);
+    let before = snapshot(&rt, &setup).await;
+    seen.lock().unwrap().clear();
+    let error = reg.dispatch("stream.batch", args.clone()).await.unwrap_err();
+    assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error:?}");
+    // The refusal is the mode guard, so nothing read the key's holder on the way to it.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("stream.batch".to_owned(), args)]
+    );
+    assert_eq!(snapshot(&rt, &setup).await, before);
+}
+
+#[tokio::test]
 async fn observed_id_arm10_disclosure_uses_observation_key_and_existing_policy() {
     use std::sync::{Arc, Mutex};
 
