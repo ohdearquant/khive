@@ -18,6 +18,8 @@ struct AppendParams {
     stream: String,
     record: Value,
     expected_seq: Option<i64>,
+    embed: Option<bool>,
+    embedding_model: Option<String>,
     note_kind: Option<String>,
     tags: Option<Vec<String>>,
     #[serde(
@@ -66,6 +68,8 @@ struct AppendMember {
     stream: String,
     record: Value,
     expected_seq: Option<i64>,
+    embed: Option<bool>,
+    embedding_model: Option<String>,
     #[serde(
         default,
         deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
@@ -206,6 +210,8 @@ impl KgPack {
                 &kind,
                 p.tags,
                 p.fence,
+                p.embed,
+                p.embedding_model,
             )
             .await
     }
@@ -302,6 +308,8 @@ impl KgPack {
                         note_kind: note_kind.clone(),
                         tags: None,
                         fence: m.fence,
+                        embed: m.embed,
+                        embedding_model: m.embedding_model,
                     })
                 }
                 "write" => {
