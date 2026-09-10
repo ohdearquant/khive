@@ -786,8 +786,16 @@ impl GitPack {
             std::fs::canonicalize(&row.repo).ok().filter(|path| *path == canonical)
                 .map(|_| json!({"id":id, "repo":canonical.display().to_string(), "branches":row.branches}))
         }).collect();
+        let target = match self.remote_repository(&canonical) {
+            Ok(target) => json!({
+                "kind": if target.slug.is_empty() { "local" } else { "platform" },
+                "remote": target.remote, "slug": target.slug, "visibility": target.visibility,
+            }),
+            Err(error) if error.reason == "repository_unmapped" => Value::Null,
+            Err(error) => json!({"kind":"unavailable", "reason":error.reason}),
+        };
         Ok(
-            json!({"repo":canonical.display().to_string(), "gate":{"decision":"allow","source":"git_write.allowed","id":index},"gates":rows}),
+            json!({"repo":canonical.display().to_string(), "gate":{"decision":"allow","source":"git_write.allowed","id":index},"gates":rows,"target":target}),
         )
     }
 }

@@ -32,7 +32,7 @@ const SESSION: ParamDef = crate::local_vocab::SESSION;
 
 pub(crate) const PUSH: HandlerDef = HandlerDef {
     name: "git.push",
-    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. All caller force/remote/refspec overrides refuse. Actor-only credentials, durable receipt, no retries.",
+    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. All caller force/remote/refspec overrides refuse. HTTPS uses actor-only credentials. An absolute path or file:/// remote configured with slug=\"\" uses no credential or actor row and records credential.source=none. Durable receipt, no retries.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -46,7 +46,7 @@ pub(crate) const PUSH: HandlerDef = HandlerDef {
 
 pub(crate) const PR_OPEN: HandlerDef = HandlerDef {
     name: "git.pr_open",
-    description: "Open a pull request after checking configured slug, visibility and exact platform head. Uses the dispatching actor credential: [git_write] actors.<actor>.credential_ref is resolved through credential_resolver (by default the login keychain item with that service name), never stored, and an unmapped actor or a failed resolver refuses actor_unmapped before any network call. The resolved token must belong to the actor configured platform_identity or the act refuses platform_identity_mismatch. Returns number, url, head_sha and receipt_id.",
+    description: "Open a pull request after checking configured slug, visibility and exact platform head. Local mappings refuse remote_scheme before resolving credentials; PR verbs require HTTPS. Uses the dispatching actor credential: [git_write] actors.<actor>.credential_ref is resolved through credential_resolver (by default the login keychain item with that service name), never stored, and an unmapped actor or a failed resolver refuses actor_unmapped before any network call. The resolved token must belong to the actor configured platform_identity or the act refuses platform_identity_mismatch. Returns number, url, head_sha and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -62,7 +62,7 @@ pub(crate) const PR_OPEN: HandlerDef = HandlerDef {
 
 pub(crate) const PR_REVIEW: HandlerDef = HandlerDef {
     name: "git.pr_review",
-    description: "Submit a review bound to expected_head. Approval requires a different opening actor, credential reference and platform account; fork approvals additionally require git.pr_review.fork. Returns review_id, head_sha, state and receipt_id.",
+    description: "Submit a review bound to expected_head. Local mappings refuse remote_scheme before any credential or platform read; PR verbs require HTTPS. Approval requires a different opening actor, credential reference and platform account; fork approvals additionally require git.pr_review.fork. Returns review_id, head_sha, state and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -77,7 +77,7 @@ pub(crate) const PR_REVIEW: HandlerDef = HandlerDef {
 
 pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
     name: "git.pr_merge",
-    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. The merge presents as the dispatching actor credential, resolved the same way as git.pr_open. The approval precondition is an approving review at expected_head from a platform account other than the LAST PUSHER of that head, not other than the author. A repository row may list merge_refusals: opener refuses a merge dispatched by the account or actor that opened the pull request (merge_by_opener) and last_pusher refuses one dispatched by the login on the newest push receipt for expected_head (merge_by_last_pusher), both before any platform write and named on the receipt; with no list a merge dispatched by the opener is not refused. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
+    description: "Merge with a platform head comparison after caller policy and current-head approval by another account. Local mappings refuse remote_scheme before any credential or review read; PR verbs require HTTPS. The merge presents as the dispatching actor credential, resolved the same way as git.pr_open. The approval precondition is an approving review at expected_head from a platform account other than the LAST PUSHER of that head, not other than the author. A repository row may list merge_refusals: opener refuses a merge dispatched by the account or actor that opened the pull request (merge_by_opener) and last_pusher refuses one dispatched by the login on the newest push receipt for expected_head (merge_by_last_pusher), both before any platform write and named on the receipt; with no list a merge dispatched by the opener is not refused. Forks require git.pr_merge.fork; no administrator bypass is requested. Returns merged_head_sha, merged_sha and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[

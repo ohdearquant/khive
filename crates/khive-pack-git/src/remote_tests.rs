@@ -126,18 +126,18 @@ impl RemoteTransport for Recording {
     }
     async fn remote_ref(
         &self,
-        token: &str,
+        token: Option<&str>,
         _remote: &str,
         _branch: &str,
     ) -> Result<Option<String>, RemoteError> {
         let mut s = self.state.lock().unwrap();
-        s.calls.push(json!({"op":"remote_ref","token_hash":blake3::hash(token.as_bytes()).to_hex().to_string()}));
+        s.calls.push(json!({"op":"remote_ref","token_hash":blake3::hash(token.expect("platform credential").as_bytes()).to_hex().to_string()}));
         if s.api_failure {
             return Err(RemoteError::Unavailable);
         }
         Ok(remote_head(&self.bare))
     }
-    async fn push(&self, token: &str, mut request: PushRequest) -> Result<(), RemoteError> {
+    async fn push(&self, token: Option<&str>, mut request: PushRequest) -> Result<(), RemoteError> {
         let (race, lost) = {
             let mut s = self.state.lock().unwrap();
             s.push_calls += 1;

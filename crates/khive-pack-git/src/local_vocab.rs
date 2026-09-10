@@ -56,14 +56,14 @@ pub(crate) const RECEIPTS: HandlerDef = HandlerDef {
 };
 pub(crate) const GATES: HandlerDef = HandlerDef {
     name: "git.gates",
-    description: "Read effective repository allowlist rows, preserving their configured entry indices and branch patterns.",
+    description: "Read effective repository allowlist rows, preserving their configured entry indices and branch patterns. target names the configured remote, slug, visibility and kind (local or platform); absent mappings return null and invalid mappings return kind=unavailable with a reason.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO],
 };
 pub(crate) const RECONCILE: HandlerDef = HandlerDef {
     name: "git.reconcile",
-    description: "Settle a caller-owned unknown receipt using observed evidence. Local receipts require the receipt marker and SHA in the ref reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; merge receipts read platform merged state and SHA. Missing evidence leaves unknown. Never repeats a write.",
+    description: "Settle a caller-owned unknown receipt using observed evidence. Local receipts require the receipt marker and SHA in the ref reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; explicitly local remote mappings read that SHA without resolving credentials; merge receipts read platform merged state and SHA. Missing evidence leaves unknown. Never repeats a write.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[param("receipt", true, "Caller-owned receipt UUID of a branch, tree commit, push or PR merge operation.")],
