@@ -403,9 +403,18 @@ async fn local_mapping_rejects_unknown_scheme_and_missing_opt_in() {
 async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentials() {
     let f = Fixture::file().await;
     f.call(&f.actor, "git.push", f.push()).await.unwrap();
-    let mut receipt = f.last(&f.actor).await;
+    let committed = f.last(&f.actor).await;
+    assert_eq!(committed.disposition, Disposition::Committed);
+    // Seed an unfinished observation of the completed native effect. Terminal
+    // receipts cannot be downgraded; this fixture needs its own row and marker.
+    let mut receipt = committed.clone();
+    receipt.id = uuid::Uuid::new_v4().to_string();
     receipt.disposition = Disposition::Unknown;
-    receipts::persist(&f.rt, &receipt).await.unwrap();
+    receipt.finished_at = None;
+    receipts::insert(&f.rt, &receipt).await.unwrap();
+    crate::local_git::record_push_marker(&f.repo, "work", &f.head, &receipt.id)
+        .await
+        .unwrap();
     git(&f.bare, &["update-ref", "refs/heads/work", &f.rival]);
     f.call(&f.actor, "git.reconcile", json!({"receipt":receipt.id}))
         .await
@@ -428,6 +437,15 @@ async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentia
             .disposition,
         Disposition::Committed
     );
+    assert_eq!(
+        receipts::load_owned(&f.rt, "local", &f.actor, &committed.id)
+            .await
+            .unwrap()
+            .disposition,
+        Disposition::Committed,
+        "the original terminal receipt is unchanged"
+    );
+    // This still-unfinished in-memory copy gets a new ID with no matching marker.
     receipt.id = uuid::Uuid::new_v4().to_string();
     receipts::insert(&f.rt, &receipt).await.unwrap();
     f.call(&f.actor, "git.reconcile", json!({"receipt":receipt.id}))
