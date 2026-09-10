@@ -68,3 +68,39 @@ pub(crate) const RECONCILE: HandlerDef = HandlerDef {
     category: VerbCategory::Assertive,
     params: &[param("receipt", true, "Caller-owned receipt UUID of a branch, tree commit, push or PR merge operation.")],
 };
+
+pub(crate) const STATUS: HandlerDef = HandlerDef {
+    name: "git.status",
+    description: "Read the working tree and index state as porcelain v2 without refreshing the index, taking a lock, or changing any file. Renames are not detected. Returns branch headers, a bounded entries page, and total, where total counts every entry git reported so total zero is a whole-repository claim. Takes no credential and writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[
+        REPO,
+        param("untracked", false, "Untracked file reporting: no, normal (default) or all."),
+        ParamDef { name: "limit", param_type: "integer", required: false, description: "Entries returned, 1 through 5000; default 1000. total is never capped.", resolution_mode: IdResolutionMode::NotApplicable },
+    ],
+};
+pub(crate) const LOG: HandlerDef = HandlerDef {
+    name: "git.log",
+    description: "Read a bounded page of commit history from one resolved ref, newest first, with decoration and color disabled and pathspecs taken literally. Returns sha, author name and email, authored_at, committed_at and subject per commit. Takes no credential and writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[
+        REPO,
+        param("ref", false, "Commit SHA or ref resolved exactly once; default HEAD."),
+        ParamDef { name: "limit", param_type: "integer", required: false, description: "Commits returned, 1 through 500; default 100.", resolution_mode: IdResolutionMode::NotApplicable },
+        param("path", false, "Optional literal path filter; never interpreted as a glob or magic pathspec."),
+    ],
+};
+
+pub(crate) const INIT: HandlerDef = HandlerDef {
+    name: "git.init",
+    description: "Initialize an allowlisted directory that exists and holds no repository yet, with no template so it inherits no sample hooks. A target that already holds a repository is refused rather than reinitialized. The operator creates and allowlists the path; this verb never creates one. Returns repo, the resolved initial branch, and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        param("branch", false, "Initial branch name; default main."),
+        SESSION,
+    ],
+};
