@@ -437,6 +437,12 @@ async fn registry_rows_are_opaque_to_the_generic_entity_verbs() {
     // pre-write tags, so it is refused by the same rule.
     let err = f.call_err("update", json!({"id": id, "tags": []})).await;
     assert!(err.contains("tool-registry"), "{err}");
+    let after_strip = f.call("tool.describe", json!({"tool": "fetch_url"})).await;
+    let tags = after_strip["tool"]["tags"].as_array().expect("tags");
+    assert!(
+        tags.contains(&json!("tool-registry")),
+        "the refusal is read before the write, so the tag is still there: {after_strip}"
+    );
 
     let err = f.call_err("delete", json!({"id": id})).await;
     assert!(err.contains("tool-registry"), "{err}");
