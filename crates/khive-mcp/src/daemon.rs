@@ -242,6 +242,7 @@ struct ConfigIdFields<'a> {
     outbound: &'a str,
     gate: &'a str,
     git_write: &'a str,
+    brain: &'a str,
     display_timezone: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
@@ -261,6 +262,9 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (packs, rest) = base.split_once("];db=")?;
     let (rest, display_timezone) = rest
         .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, brain) = rest
+        .rsplit_once(";brain=")
         .unwrap_or((rest, "<legacy-absent>"));
     let (rest, git_write) = rest.rsplit_once(";git_write=")?;
     let (rest, gate) = rest
@@ -291,6 +295,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         outbound,
         gate,
         git_write,
+        brain,
         display_timezone,
         backends,
         pack_backends,
@@ -325,6 +330,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "gate"
     } else if client.git_write != daemon.git_write {
         "git_write"
+    } else if client.brain != daemon.brain {
+        "brain"
     } else if client.display_timezone != daemon.display_timezone {
         "display_tz"
     } else if client.backends != daemon.backends {
@@ -3139,6 +3146,19 @@ mod tests {
         let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&revoked, None, true);
 
         assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "gate");
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_brain_read_policy() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.brain.fleet_readers = vec!["lambda:reader".to_string()];
+        let client =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let daemon =
+            crate::server::compute_config_id_with_runtime_policies(&changed, None, true, false);
+
+        assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "brain");
     }
 
     #[test]

@@ -363,6 +363,8 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Resolved `[brain]` policy from the serving process's configuration.
+    pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
@@ -469,6 +471,7 @@ impl Default for RuntimeConfig {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
             mounts: Vec::new(),
@@ -819,6 +822,7 @@ pub fn runtime_config_from_khive_config(
         })
         .unwrap_or_else(|| base.gate.clone());
 
+    let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();
     let exec = khive_cfg.exec.clone();
     let blob_hydration_bytes = khive_cfg
@@ -845,6 +849,7 @@ pub fn runtime_config_from_khive_config(
             allowed_outbound_namespaces,
             actor_id,
             gate,
+            brain,
             git_write,
             exec,
             mounts,
@@ -885,6 +890,7 @@ pub fn runtime_config_from_khive_config(
         allowed_outbound_namespaces,
         actor_id,
         gate,
+        brain,
         git_write,
         exec,
         mounts,

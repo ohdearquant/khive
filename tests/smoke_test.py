@@ -1158,10 +1158,22 @@ def brain_smoke():
 
         # brain.bind / brain.bindings / brain.unbind: use the always-present
         # balanced-recall-v1 profile (Active by default) for binding coverage
+        identity = call_verb(proc, "whoami", {})
+        binding_actor = identity["actor_id"] if identity["actor_kind"] == "actor" else (
+            f"{identity['actor_kind']}:{identity['actor_id']}"
+        )
+        foreign_actor = "smoke-foreign-actor"
+        assert foreign_actor != binding_actor
+        foreign_bound = call_verb(proc, "brain.bind", {
+            "profile_id": "balanced-recall-v1",
+            "consumer_kind": "recall",
+            "actor": foreign_actor,
+        })
+        assert foreign_bound.get("bound") is True, foreign_bound
         bound = call_verb(proc, "brain.bind", {
             "profile_id": "balanced-recall-v1",
             "consumer_kind": "recall",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         assert bound.get("bound") is True, (
             f"brain.bind must return bound=true: {bound}"
@@ -1170,14 +1182,25 @@ def brain_smoke():
 
         bindings = call_verb(proc, "brain.bindings", {"profile_id": "balanced-recall-v1"})
         binding_actors = [b.get("actor") for b in bindings.get("bindings", [])]
-        assert "smoke-actor" in binding_actors, (
-            f"smoke-actor must appear in bindings after brain.bind: {binding_actors}"
+        assert binding_actor in binding_actors, (
+            f"caller {binding_actor} must appear in bindings after brain.bind: {binding_actors}"
         )
+        assert foreign_actor not in binding_actors, (
+            f"writing a foreign binding must not grant readback: {binding_actors}"
+        )
+        foreign_read = _call_request_raw(proc, json.dumps([{
+            "tool": "brain.bindings", "args": {"actor": foreign_actor},
+        }]))["results"][0]
+        assert foreign_read.get("ok") is False, foreign_read
+        foreign_error = foreign_read.get("error", "")
+        if isinstance(foreign_error, dict):
+            foreign_error = foreign_error.get("message", "")
+        assert foreign_actor in foreign_error and "not visible" in foreign_error, foreign_read
         print(f"  [brain] brain.bindings -- {bindings['count']} binding(s)")
 
         unbound = call_verb(proc, "brain.unbind", {
             "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         assert unbound.get("unbound", 0) >= 1, (
             f"brain.unbind must remove at least one binding: {unbound}"
@@ -1187,13 +1210,18 @@ def brain_smoke():
         # Confirm the binding is gone
         after = call_verb(proc, "brain.bindings", {
             "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         remaining_actors = [b.get("actor") for b in after.get("bindings", [])]
-        assert "smoke-actor" not in remaining_actors, (
-            f"smoke-actor must be absent after unbind: {remaining_actors}"
+        assert binding_actor not in remaining_actors, (
+            f"caller {binding_actor} must be absent after unbind: {remaining_actors}"
         )
-        print(f"  [brain] brain.bindings post-unbind -- smoke-actor removed")
+        foreign_unbound = call_verb(proc, "brain.unbind", {
+            "profile_id": "balanced-recall-v1",
+            "actor": foreign_actor,
+        })
+        assert foreign_unbound.get("unbound", 0) == 1, foreign_unbound
+        print(f"  [brain] brain.bindings post-unbind -- caller binding removed")
 
         print(f"\n  BRAIN PACK SMOKE TESTS PASSED")
     finally:

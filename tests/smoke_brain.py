@@ -312,21 +312,25 @@ def brain_smoke():
 
         # ── 11. bind + bindings ────────────────────────────────────────────────
         try:
+            identity = call_verb(proc, "whoami", {})
+            binding_actor = identity["actor_id"] if identity["actor_kind"] == "actor" else (
+                f"{identity['actor_kind']}:{identity['actor_id']}"
+            )
             bind_result = call_verb(proc, "brain.bind", {
                 "profile_id": "balanced-recall-v1",
-                "actor": "test-actor",
+                "actor": binding_actor,
                 "consumer_kind": "recall",
             })
             assert bind_result.get("bound") is True, f"bind must return bound=true: {bind_result}"
-            assert bind_result.get("actor") == "test-actor", f"actor mismatch: {bind_result}"
+            assert bind_result.get("actor") == binding_actor, f"actor mismatch: {bind_result}"
 
             bindings = call_verb(proc, "brain.bindings", {})
             rows = bindings.get("bindings", [])
             found = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
+                r.get("actor") == binding_actor and r.get("consumer_kind") == "recall"
                 for r in rows
             )
-            assert found, f"test-actor/recall binding must appear in bindings: {rows}"
+            assert found, f"{binding_actor}/recall binding must appear in bindings: {rows}"
             ok(f"bind + bindings — binding appears in listing")
         except Exception as e:
             fail("bind + bindings", e)
@@ -334,7 +338,7 @@ def brain_smoke():
         # ── 12. unbind ────────────────────────────────────────────────────────
         try:
             unbind_result = call_verb(proc, "brain.unbind", {
-                "actor": "test-actor",
+                "actor": binding_actor,
                 "consumer_kind": "recall",
             })
             removed = unbind_result.get("unbound", 0)
@@ -343,7 +347,7 @@ def brain_smoke():
             bindings_after = call_verb(proc, "brain.bindings", {})
             rows_after = bindings_after.get("bindings", [])
             still_there = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
+                r.get("actor") == binding_actor and r.get("consumer_kind") == "recall"
                 for r in rows_after
             )
             assert not still_there, (

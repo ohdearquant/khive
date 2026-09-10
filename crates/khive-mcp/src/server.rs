@@ -824,6 +824,16 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     );
     let git_write = format!("{:x}", git_write_hasher.finalize());
 
+    let mut fleet_readers = config.brain.fleet_readers.clone();
+    fleet_readers.sort();
+    fleet_readers.dedup();
+    let mut brain_hasher = Sha256::new();
+    brain_hasher.update(b"khive.brain-read-policy.v1");
+    brain_hasher.update(
+        serde_json::to_vec(&fleet_readers).expect("brain read policy is JSON serializable"),
+    );
+    let brain = format!("{:x}", brain_hasher.finalize());
+
     let backend = if storage_read_only {
         format!("{:?}:read_only", config.backend_id)
     } else {
@@ -858,7 +868,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -869,6 +879,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         outbound.join(","),
         gate,
         git_write,
+        brain,
         config.display_timezone.name(),
     );
 
@@ -6013,6 +6024,35 @@ mod tests {
         }
         assert!(!original.contains("example-reference"));
         assert_eq!(original, fingerprint(&base.clone()));
+    }
+
+    #[test]
+    fn config_id_separates_brain_read_policy_and_normalizes_reader_sets() {
+        let base = RuntimeConfig::no_embeddings();
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let mut configured = base.clone();
+        configured.brain.fleet_readers =
+            vec!["lambda:reader".to_string(), "lambda:auditor".to_string()];
+        let configured_id = fingerprint(&configured);
+        assert_ne!(configured_id, fingerprint(&base));
+        assert!(!configured_id.contains("lambda:reader"));
+        assert!(!configured_id.contains("lambda:auditor"));
+
+        let mut reordered = configured.clone();
+        reordered.brain.fleet_readers.reverse();
+        reordered
+            .brain
+            .fleet_readers
+            .push("lambda:reader".to_string());
+        assert_eq!(configured_id, fingerprint(&reordered));
+
+        let mut revoked = configured;
+        revoked.brain.fleet_readers.pop();
+        assert_ne!(configured_id, fingerprint(&revoked));
+        revoked.brain.fleet_readers.clear();
+        assert_eq!(fingerprint(&revoked), fingerprint(&base));
     }
 
     #[test]

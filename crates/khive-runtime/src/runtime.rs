@@ -2110,6 +2110,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2145,6 +2146,7 @@ mod tests {
         let sidecar_path = dir.path().join("main.db.events.db");
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: Some(crate::events_split::EventsSplitConfig {
@@ -2205,6 +2207,7 @@ mod tests {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2232,6 +2235,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2263,6 +2267,7 @@ mod tests {
         let path = dir.path().join("read_only_runtime.db");
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2325,6 +2330,7 @@ mod tests {
         let path = dir.path().join("explicit_read_only_runtime.db");
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2474,6 +2480,7 @@ mod tests {
         let path = dir.path().join("read_only_blob_seam.db");
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
@@ -2710,6 +2717,7 @@ mod tests {
 
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
                 mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
@@ -2760,6 +2768,7 @@ mod tests {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3016,6 +3025,7 @@ mod tests {
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3046,6 +3056,7 @@ mod tests {
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3084,6 +3095,7 @@ mod tests {
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3114,6 +3126,7 @@ mod tests {
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3162,6 +3175,7 @@ mod tests {
     fn runtime_config_from_khive_config_display_timezone_overrides_base() {
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3197,6 +3211,7 @@ mod tests {
     fn runtime_config_from_khive_config_absent_display_timezone_keeps_base() {
         let base = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
             events_split: None,
@@ -3346,6 +3361,7 @@ mod tests {
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             exec: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
@@ -3428,6 +3444,7 @@ mod tests {
 
         let main_config = RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3570,6 +3587,7 @@ mod tests {
             backend,
             RuntimeConfig {
                 mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,

@@ -19,6 +19,7 @@ fn actor_registry(
         RuntimeConfig {
             mounts: Vec::new(),
             exec: Default::default(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,

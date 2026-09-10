@@ -21,6 +21,7 @@ fn actor_registry(
         backend,
         RuntimeConfig {
             mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             exec: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),

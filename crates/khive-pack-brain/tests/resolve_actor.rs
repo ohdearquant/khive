@@ -13,6 +13,7 @@ use serde_json::json;
 fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         exec: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
@@ -102,12 +103,27 @@ async fn resolve_defaults_actor_from_dispatch_identity() {
 /// evaluation tooling can query other identities.
 #[tokio::test]
 async fn explicit_actor_param_overrides_dispatch_identity() {
-    let rt = runtime_with_actor(Some("lambda:other-seat"));
+    let mut config = khive_runtime::KhiveConfig::default();
+    config.actor.id = Some("lambda:other-seat".to_string());
+    config.actor.visible_namespaces = Some(vec!["lambda:test-seat".to_string()]);
+    let rt = KhiveRuntime::new(khive_runtime::runtime_config_from_khive_config(
+        &config,
+        RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            ..RuntimeConfig::no_embeddings()
+        },
+    ))
+    .expect("runtime with actor visibility");
     let brain = Arc::new(BrainPack::new(rt.clone()));
     bind_seat_profile(&brain, &rt, "lambda:test-seat").await;
 
     let registry = VerbRegistryBuilder::new().build().expect("registry");
-    let token = rt.authorize(Namespace::local()).expect("token");
+    let token = rt
+        .authorize_with_visibility(Namespace::local(), rt.visible_namespaces().to_vec())
+        .expect("token");
     let out = brain
         .dispatch(
             "brain.resolve",
