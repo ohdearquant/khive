@@ -541,9 +541,7 @@ async fn stream_batch_recreated_key_between_prepare_and_commit_is_version_confli
         .await
         .unwrap();
         if replacement.is_some() {
-            let refusal = outcome
-                .err()
-                .expect("a recreated holder refuses the stale plan");
+            let refusal = outcome.expect_err("a recreated holder refuses the stale plan");
             assert_eq!(refusal.member, 2);
             let error = serde_json::to_value(refusal.error).unwrap();
             assert_eq!(error["kind"], "conflict");
@@ -565,7 +563,7 @@ async fn stream_batch_recreated_key_between_prepare_and_commit_is_version_confli
             );
             assert!(fired.lock().unwrap().is_empty());
         } else {
-            let (values, effects) = outcome.ok().expect("an unchanged holder commits");
+            let (values, effects) = outcome.expect("an unchanged holder commits");
             assert_eq!(values[2]["id"], first["id"]);
             assert_eq!(values[2]["version"], 2);
             assert_eq!(values[1]["seq"], 1);
@@ -675,15 +673,14 @@ async fn stream_batch_recovers_failure_slot_only_after_confirmed_rollback() {
         if invoke && !terminate && state == TransactionRolledBack {
             let refusal = outcome
                 .unwrap()
-                .err()
-                .expect("recover the recorded member failure");
+                .expect_err("recover the recorded member failure");
             assert_eq!(refusal.member, 1);
             let error = serde_json::to_value(refusal.error).unwrap();
             assert_eq!(error["details"]["reason"], "seq_conflict");
             assert_eq!(error["details"]["member"], "1");
             assert_eq!(error["details"]["next_seq"], "1");
         } else {
-            match outcome.err().expect("preserve the outer storage failure") {
+            match outcome.expect_err("preserve the outer storage failure") {
                 RuntimeError::Storage(StorageError::WriterTaskTerminated { request_state }) => {
                     assert!(terminate);
                     assert_eq!(request_state, state);
