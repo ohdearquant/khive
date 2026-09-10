@@ -18,6 +18,59 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
 const MODEL: &str = "note-version-test";
 
+#[tokio::test]
+async fn ordered_fences_observe_prior_write_in_same_transaction() {
+    let (runtime, token, _) = fixture();
+    let lease_a = create(&runtime, &token, "lease/a", None).await;
+    let lease_b = create(&runtime, &token, "lease/b", None).await;
+    let target = create(&runtime, &token, "target", None).await;
+    let lease_update = crate::atomic_prepare::prepare_update(
+        &runtime,
+        &token,
+        &json!({"id":lease_b.id,"content":"{\"renewed\":true}","expected_version":1}),
+        None,
+    )
+    .await
+    .unwrap();
+    let target_update = crate::atomic_prepare::prepare_update(
+        &runtime,
+        &token,
+        &json!({"id":target.id,"content":"{\"bad\":true}","fence":[
+            {"kind":"head","key":"lease/a","expected_version":1},
+            {"kind":"head","key":"lease/b","expected_version":1}]}),
+        None,
+    )
+    .await
+    .unwrap();
+    let outcome = run_atomic_unit(runtime.sql().as_ref(), vec![lease_update, target_update])
+        .await
+        .unwrap();
+    let AtomicRunOutcome::RolledBack {
+        failed_op_index,
+        failure: crate::atomic_runner::AtomicOpFailure::NoteConflict(conflict),
+        ..
+    } = outcome
+    else {
+        panic!("fence must see the earlier update and roll back: {outcome:?}");
+    };
+    assert_eq!(failed_op_index, 1);
+    let detail = serde_json::to_value(conflict.into_error().details().unwrap()).unwrap();
+    assert_eq!(detail["index"], "1");
+    assert_eq!(detail["current_version"], "2");
+    for note in [lease_a, lease_b, target] {
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            note
+        );
+    }
+}
+
 #[derive(Default)]
 struct Service {
     started: Notify,
@@ -368,11 +421,14 @@ async fn version_fence_and_prior_operation_roll_back_together() {
         ("version/missing", 1, None),
     ] {
         let mut update = patch("{\"changed\":true}", 1, None);
-        update.write_options.fence = Some(NoteFence {
-            key: key.into(),
-            kind: "head".into(),
-            expected_version: expected,
-        });
+        update.write_options.fence = Some(
+            NoteFence {
+                key: key.into(),
+                kind: "head".into(),
+                expected_version: expected,
+            }
+            .into(),
+        );
         let error = details(
             runtime
                 .update_note(&token, target.id, update)
@@ -402,11 +458,14 @@ async fn version_fence_and_prior_operation_roll_back_together() {
         .await
         .unwrap();
     let mut update = patch("{\"changed\":true}", 1, None);
-    update.write_options.fence = Some(NoteFence {
-        key: fence.key.clone().unwrap(),
-        kind: "head".into(),
-        expected_version: 1,
-    });
+    update.write_options.fence = Some(
+        NoteFence {
+            key: fence.key.clone().unwrap(),
+            kind: "head".into(),
+            expected_version: 1,
+        }
+        .into(),
+    );
     let (_, target_plan) = runtime
         .prepare_versioned_note_update(&token, target.clone(), update.clone())
         .await
@@ -1080,3 +1139,6 @@ async fn assert_legacy_creation_revision_guard(multimodel: bool, fail: bool) {
         "newer lexical document must survive"
     );
 }
+
+#[path = "note_fence_race_tests.rs"]
+mod fence_races;

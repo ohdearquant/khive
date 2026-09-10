@@ -2719,13 +2719,15 @@ fn coordinator_search_visibility(
 
 /// Every runtime variant is explicitly covered. Dispatch provenance, not the
 /// variant, determines whether the domain handler ran successfully, except for
-/// the named keyed-memory outcomes, which carry their own domain proof.
+/// the named write outcomes, which carry their own domain proof.
 fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
     let named_disposition = match &error {
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
-            (khive_types::ErrorKind::Conflict, Some("key_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
+                Some("not_committed")
+            }
             (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
             // ADR-174 A1.1: a stream member refusal carries
             // `domain_disposition: not_committed` wherever it surfaces. In

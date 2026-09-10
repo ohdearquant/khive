@@ -139,6 +139,29 @@ def test_typed_note_create_preserves_fence_and_embedding_options(embed):
     assert args["embed"] is embed
 
 
+@pytest.mark.parametrize("count", [1, 2])
+def test_typed_note_create_preserves_ordered_fence_list(count):
+    payload = {"id": NOTE_ID, "kind": "head", "content": "{}", "version": 1}
+    transport = ResponseTransport([{"ok": True, "tool": "create", "result": payload}])
+    db = Khive(transport=transport, actor_id="test-client")
+    fences = [{"key": f"lease/{i}", "kind": "head", "expected_version": i + 1}
+              for i in range(count)]
+    db.notes.create(kind="head", subject="", content="{}", fence=fences)
+    args = json.loads(transport.dispatches[0]["ops"])[0]["args"]
+    assert args["fence"] == fences
+    assert op("stream.append", stream="s", record=None, fence=fences)["args"]["fence"] == fences
+
+
+def test_indexed_fence_conflict_preserves_string_details():
+    details = {"reason": "fence_conflict", "key": "lease/second", "expected_version": "1",
+               "current_version": "2", "index": "1"}
+    db = client_for([{"ok": False, "tool": "stream.append", "error": {
+        "kind": "conflict", "message": "note fence precondition failed",
+        "domain_disposition": "not_committed", "details": details}}])
+    result = db.raw([op("stream.append", stream="s", record=None)])[0]
+    assert result.error.details == details
+
+
 @pytest.mark.parametrize(
     "details",
     [

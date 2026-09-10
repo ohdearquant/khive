@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
 use crate::atomic_plan::PlanStatement;
 use crate::atomic_runner::AtomicOpPlan;
+use crate::note_write::{NoteFences, NoteWriteConflict, NoteWriteGuard};
 use crate::{
     micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
 };
@@ -68,6 +69,7 @@ pub struct StreamAppendSpec {
     pub expected_seq: Option<i64>,
     pub note_kind: String,
     pub tags: Option<Vec<String>>,
+    pub fence: Option<NoteFences>,
 }
 
 /// A batch member as the verb layer resolved it: an append to run, or the
@@ -113,6 +115,7 @@ struct PreparedAppend {
     expected_seq: Option<i64>,
     note: Note,
     statements: Vec<PlanStatement>,
+    guard: NoteWriteGuard,
 }
 
 fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
@@ -121,7 +124,14 @@ fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
 
 enum BatchOutcome {
     Appended(Vec<i64>),
-    Conflict { member: usize, next: i64 },
+    Conflict {
+        member: usize,
+        next: i64,
+    },
+    FenceConflict {
+        member: usize,
+        conflict: NoteWriteConflict,
+    },
 }
 
 impl KhiveRuntime {
@@ -136,6 +146,12 @@ impl KhiveRuntime {
         let mut contents = Vec::with_capacity(specs.len());
         for spec in specs {
             validate_stream(&spec.stream)?;
+            if let Some(fences) = &spec.fence {
+                fences.validate()?;
+                for fence in fences.entries() {
+                    self.validate_note_kind(&fence.kind)?;
+                }
+            }
             contents.push(
                 serde_json::to_string(&spec.record)
                     .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
@@ -162,11 +178,16 @@ impl KhiveRuntime {
                     "stream preparation did not produce a note".into(),
                 ));
             };
+            let mut guard = plan.note_guard.ok_or_else(|| {
+                RuntimeError::Internal("stream preparation did not produce a note guard".into())
+            })?;
+            guard.fence = spec.fence.clone();
             out.push(PreparedAppend {
                 stream: spec.stream.clone(),
                 expected_seq: spec.expected_seq,
                 note,
                 statements: plan.statements,
+                guard,
             });
         }
         Ok(out)
@@ -182,7 +203,7 @@ impl KhiveRuntime {
         appends: &[PreparedAppend],
     ) -> RuntimeResult<BatchOutcome> {
         let ns = token.namespace().as_str().to_string();
-        let entries: Vec<(String, Option<i64>, String, Vec<PlanStatement>)> = appends
+        let entries: Vec<_> = appends
             .iter()
             .map(|a| {
                 (
@@ -190,13 +211,14 @@ impl KhiveRuntime {
                     a.expected_seq,
                     a.note.id.to_string(),
                     a.statements.clone(),
+                    a.guard.clone(),
                 )
             })
             .collect();
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
                 let mut heads: Vec<(String, i64)> = Vec::new();
-                for (stream, _, _, _) in &entries {
+                for (stream, _, _, _, _) in &entries {
                     if heads.iter().any(|(known, _)| known == stream) {
                         continue;
                     }
@@ -212,7 +234,11 @@ impl KhiveRuntime {
                     heads.push((stream.clone(), head));
                 }
                 let mut assigned = Vec::with_capacity(entries.len());
-                for (member, (stream, expected_seq, _, _)) in entries.iter().enumerate() {
+                for (member, (stream, expected_seq, _, _, guard)) in entries.iter().enumerate() {
+                    if let Some(conflict) = guard.check_fence(writer).await? {
+                        return Ok(Box::new(BatchOutcome::FenceConflict { member, conflict })
+                            as Box<dyn Any + Send>);
+                    }
                     let head = heads
                         .iter_mut()
                         .find(|(known, _)| known == stream)
@@ -228,7 +254,7 @@ impl KhiveRuntime {
                     *head = next;
                     assigned.push(next);
                 }
-                for ((stream, _, note_id, statements), seq) in
+                for ((stream, _, note_id, statements, _), seq) in
                     entries.into_iter().zip(assigned.iter().copied())
                 {
                     for planned in statements {
@@ -266,6 +292,7 @@ impl KhiveRuntime {
 
     /// Append a JSON value as an immutable note. The sequence precondition and
     /// every note/index/ledger statement share the same writer transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_append(
         &self,
         token: &NamespaceToken,
@@ -274,6 +301,7 @@ impl KhiveRuntime {
         expected_seq: Option<i64>,
         note_kind: &str,
         tags: Option<Vec<String>>,
+        fence: Option<NoteFences>,
     ) -> RuntimeResult<Value> {
         let spec = StreamAppendSpec {
             stream: stream.to_string(),
@@ -281,10 +309,12 @@ impl KhiveRuntime {
             expected_seq,
             note_kind: note_kind.to_string(),
             tags,
+            fence,
         };
         let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
         match self.run_stream_appends(token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
+            BatchOutcome::FenceConflict { conflict, .. } => Err(conflict.into_error().into()),
             BatchOutcome::Conflict { next, .. } => Err(seq_conflict(
                 stream,
                 expected_seq.expect("only conditional appends conflict"),
@@ -330,6 +360,10 @@ impl KhiveRuntime {
                 .zip(seqs)
                 .map(|(append, seq)| append_result(append, seq))
                 .collect())),
+            BatchOutcome::FenceConflict { member, conflict } => Ok(Err(StreamBatchRefusal {
+                member,
+                error: conflict.into_error_at_member(Some(member)),
+            })),
             BatchOutcome::Conflict { member, next } => Ok(Err(StreamBatchRefusal {
                 member,
                 error: seq_conflict(
@@ -378,6 +412,9 @@ impl KhiveRuntime {
                     {
                         BatchOutcome::Appended(seqs) => {
                             results.push(append_result(&append, seqs[0]))
+                        }
+                        BatchOutcome::FenceConflict { conflict, .. } => {
+                            results.push(refusal_value(&conflict.into_error())?)
                         }
                         BatchOutcome::Conflict { next, .. } => {
                             results.push(refusal_value(&seq_conflict(
@@ -494,7 +531,15 @@ mod tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let appended = rt
-            .stream_append(&token, "cas", &json!({"n": 1}), None, "observation", None)
+            .stream_append(
+                &token,
+                "cas",
+                &json!({"n": 1}),
+                None,
+                "observation",
+                None,
+                None,
+            )
             .await
             .unwrap();
         let id = uuid::Uuid::parse_str(appended["id"].as_str().unwrap()).unwrap();
@@ -564,6 +609,7 @@ mod tests {
                     &json!(token.namespace().as_str()),
                     Some(1),
                     "observation",
+                    None,
                     None
                 )
                 .await

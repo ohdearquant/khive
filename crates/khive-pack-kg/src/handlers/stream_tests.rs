@@ -46,6 +46,189 @@ fn reason(error: RuntimeError, expected: &str) -> Value {
     value
 }
 
+async fn lease(registry: &VerbRegistry, key: &str) -> Value {
+    registry
+        .dispatch("create", json!({"kind":"head", "key":key, "content":"{}"}))
+        .await
+        .unwrap()
+}
+
+fn fence(key: &str, version: i64) -> Value {
+    json!({"key":key, "kind":"head", "expected_version":version})
+}
+
+#[tokio::test]
+async fn ordered_fences_commit_objects_and_lists_on_notes_and_streams() {
+    let (_, registry) = surface();
+    let a = lease(&registry, "lease/a").await;
+    let b = lease(&registry, "lease/b").await;
+    for (index, fences) in [
+        fence("lease/a", 1),
+        json!([fence("lease/a", 1)]),
+        json!([fence("lease/a", 1), fence("lease/b", 1)]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = registry
+            .dispatch(
+                "create",
+                json!({"kind":"head", "content":"{}", "fence":fences}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(target["version"], 1);
+        registry.dispatch("update", json!({"id":target["id"], "content":"{\"written\":true}", "expected_version":1, "fence":fences})).await.unwrap();
+        let after = registry
+            .dispatch("get", json!({"id":target["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(after["version"], 2);
+        assert_eq!(after["content"], "{\"written\":true}");
+        let appended = registry
+            .dispatch(
+                "stream.append",
+                json!({"stream":"fenced", "record":index, "fence":fences}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended["seq"], index + 1);
+    }
+    for original in [a, b] {
+        let after = registry
+            .dispatch("get", json!({"id":original["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(after["version"], original["version"]);
+        assert_eq!(after["content"], original["content"]);
+    }
+}
+
+#[tokio::test]
+async fn ordered_fences_refuse_first_stale_index_without_mutation() {
+    let (rt, registry) = surface();
+    let a = lease(&registry, "lease/a").await;
+    lease(&registry, "lease/b").await;
+    let target = lease(&registry, "target").await;
+    for (fences, key, current, index) in [
+        (fence("lease/a", 2), "lease/a", Some("1"), None),
+        (
+            json!([fence("lease/a", 2)]),
+            "lease/a",
+            Some("1"),
+            Some("0"),
+        ),
+        (
+            json!([fence("lease/a", 1), fence("lease/b", 2)]),
+            "lease/b",
+            Some("1"),
+            Some("1"),
+        ),
+        (
+            json!([fence("lease/a", 1), fence("missing", 2)]),
+            "missing",
+            None,
+            Some("1"),
+        ),
+        (
+            json!([fence("lease/a", 2), fence("lease/b", 2)]),
+            "lease/a",
+            Some("1"),
+            Some("0"),
+        ),
+    ] {
+        for (verb, args) in [
+            (
+                "create",
+                json!({"kind":"head", "content":"{}", "fence":fences}),
+            ),
+            (
+                "update",
+                json!({"id":target["id"], "content":"{\"bad\":true}", "fence":fences}),
+            ),
+            (
+                "stream.append",
+                json!({"stream":"refused", "record":null, "fence":fences}),
+            ),
+        ] {
+            let before = population(&rt).await;
+            let error = reason(
+                registry.dispatch(verb, args).await.unwrap_err(),
+                "fence_conflict",
+            );
+            let mut expected = json!({"reason":"fence_conflict","key":key,"expected_version":"2"});
+            if let Some(current) = current {
+                expected["current_version"] = json!(current);
+            }
+            if let Some(index) = index {
+                expected["index"] = json!(index);
+            }
+            assert_eq!(error["details"], expected);
+            assert_eq!(population(&rt).await, before);
+            assert_eq!(
+                registry
+                    .dispatch("stream.stat", json!({"stream":"refused"}))
+                    .await
+                    .unwrap()["head_seq"],
+                0
+            );
+            for original in [&a, &target] {
+                let after = registry
+                    .dispatch("get", json!({"id":original["id"]}))
+                    .await
+                    .unwrap();
+                assert_eq!(after["version"], original["version"]);
+                assert_eq!(after["content"], original["content"]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordered_fences_reject_malformed_input_without_domain_writes() {
+    let (rt, registry) = surface();
+    let target = lease(&registry, "target").await;
+    for fences in [
+        Value::Null,
+        json!([]),
+        json!([fence("x", 1), fence("x", 2)]),
+        json!([fence("x", 0)]),
+        json!([{"kind":"head","key":"x","expected_version":1,"extra":true}]),
+        json!([null]),
+        json!([{"kind":"","key":"x","expected_version":1}]),
+        json!([fence("x\0y", 1)]),
+    ] {
+        for (verb, args) in [
+            (
+                "create",
+                json!({"kind":"head","content":"{}","fence":fences}),
+            ),
+            (
+                "update",
+                json!({"id":target["id"],"content":"{}","fence":fences}),
+            ),
+            (
+                "stream.append",
+                json!({"stream":"invalid","record":null,"fence":fences}),
+            ),
+        ] {
+            let before = population(&rt).await;
+            let error = registry.dispatch(verb, args).await.unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(_)),
+                "{verb}: {error:?}"
+            );
+            if fences.as_array().is_some_and(|items| items.len() == 2) {
+                assert!(
+                    error.to_string().contains("0") && error.to_string().contains("1"),
+                    "{error}"
+                );
+            }
+            assert_eq!(population(&rt).await, before);
+        }
+    }
+}
+
 #[tokio::test]
 async fn stream_dense_per_stream_and_json_values() {
     let (_, registry) = surface();
@@ -270,7 +453,7 @@ async fn stream_arguments_validate_presence_and_utf8_bytes() {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("later slice"), "{error}");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
     }
     for args in [
         json!({"stream": "s"}),
@@ -768,3 +951,6 @@ async fn stream_batch_atomic_refuses_before_it_prepares_a_good_member() {
     assert_eq!(schema(&rt).await, before_schema);
     assert_eq!(heads(&registry, &["guard"]).await, vec![0]);
 }
+
+#[path = "stream_fence_batch_tests.rs"]
+mod fence_batches;

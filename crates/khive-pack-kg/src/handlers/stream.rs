@@ -17,6 +17,11 @@ struct AppendParams {
     expected_seq: Option<i64>,
     note_kind: Option<String>,
     tags: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    fence: Option<khive_runtime::note_write::NoteFences>,
     #[serde(rename = "namespace")]
     _namespace: Option<String>,
 }
@@ -58,6 +63,11 @@ struct AppendMember {
     stream: String,
     record: Value,
     expected_seq: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    fence: Option<khive_runtime::note_write::NoteFences>,
 }
 
 /// The keyed-note surface a fence, an observation set and the write member
@@ -85,13 +95,7 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // Presence matters: explicit null is a supplied fence, and a JSON null
-        // record is valid while a missing record is not.
-        if params.get("fence").is_some() {
-            return Err(RuntimeError::InvalidInput(
-                "stream.append fence is reserved for a later slice with versioned leases".into(),
-            ));
-        }
+        // A null record is valid JSON, but an absent record is malformed input.
         if params.get("record").is_none() {
             return Err(RuntimeError::InvalidInput(
                 "stream.append requires record (any JSON value, including null)".into(),
@@ -100,7 +104,15 @@ impl KgPack {
         let p: AppendParams = deser(params)?;
         let kind = canonical_note_kind(p.note_kind.as_deref().unwrap_or("observation"), registry)?;
         self.runtime
-            .stream_append(token, &p.stream, &p.record, p.expected_seq, &kind, p.tags)
+            .stream_append(
+                token,
+                &p.stream,
+                &p.record,
+                p.expected_seq,
+                &kind,
+                p.tags,
+                p.fence,
+            )
             .await
     }
 
@@ -195,6 +207,7 @@ impl KgPack {
                         expected_seq: m.expected_seq,
                         note_kind: note_kind.clone(),
                         tags: None,
+                        fence: m.fence,
                     })
                 }
                 "write" => member_refusal(

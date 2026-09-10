@@ -19,7 +19,7 @@ from typing import Any
 
 def op(tool: str, **args: Any) -> dict[str, Any]:
     # A stream record may be JSON null. A supplied fence (even null) must
-    # reach the server so its deferred-feature refusal cannot be bypassed.
+    # reach the server so input validation cannot be bypassed.
     preserve_null = {"record", "fence"} if tool == "stream.append" else set()
     return {
         "tool": tool,
