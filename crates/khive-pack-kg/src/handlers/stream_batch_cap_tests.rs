@@ -140,7 +140,12 @@ async fn cap_arm6_help_names_both_caps() {
         .await
         .unwrap();
     let text = help["description"].as_str().unwrap();
-    for required in ["1000 members", "100 observed", "invalid_input", "both modes"] {
+    for required in [
+        "1000 members",
+        "100 observed",
+        "invalid_input",
+        "both modes",
+    ] {
         assert!(text.contains(required), "missing {required}: {help}");
     }
 }
