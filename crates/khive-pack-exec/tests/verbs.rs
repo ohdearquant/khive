@@ -943,6 +943,61 @@ async fn run_resolves_relative_symlink_cwd_chains_inside_the_manifest() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn run_materialize_symlink_failure_persists_receipt_and_cleans_up() {
+    for keep in [false, true] {
+        let f = fixture_with_keep(keep);
+        f.register_sh("sh", "allow").await;
+        let tree = f
+            .tree(&[
+                ("a-file", b"materialized before failure", 644),
+                ("b-link", b"a-file", 120000),
+                ("c-invalid-link", b"a-file\0suffix", 120000),
+            ])
+            .await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree":tree,"tool":"sh","actor":"local","cwd":".",
+                    "args":["-c","printf launched > child-output"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["denied"], false, "{receipt}");
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["decision"]["decision"], "allow");
+        assert!(receipt["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("materialize "));
+        assert!(receipt["finished_at"].is_string());
+        assert!(receipt["started_at"].is_null());
+        assert!(receipt["exit_code"].is_null());
+        assert!(receipt["tree_out"].is_null());
+        assert!(receipt["profile_ref"].is_null());
+        assert!(receipt["sandbox"].is_null());
+        assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(out["changed"], json!([]));
+        let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
+        assert_eq!(&stored, receipt, "the materialization failure is durable");
+        assert_eq!(
+            f.call("exec.events", json!({"run_id":receipt["id"]})).await["count"],
+            0,
+            "a partial materialization is not a materialized or launched run"
+        );
+
+        let id = receipt["id"].as_str().unwrap();
+        let run_dir = f.root.join(id);
+        assert!(!f.root.join(format!("{id}.sb")).exists());
+        assert!(!run_dir.exists());
+        assert!(
+            root_is_empty(&f),
+            "partial trees must be removed even when keep={keep}"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {

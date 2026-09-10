@@ -658,9 +658,23 @@ fn materialize(
     entries: &[TreeEntry],
     bytes: &BTreeMap<String, Vec<u8>>,
 ) -> std::io::Result<()> {
+    std::fs::create_dir(run_dir)?;
+    let result = materialize_entries(run_dir, entries, bytes);
+    if result.is_err() {
+        // Remove only the fresh root we own, never a pre-existing root whose
+        // create_dir failed. A partial input tree is not a keepable run.
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+    result
+}
+
+fn materialize_entries(
+    run_dir: &Path,
+    entries: &[TreeEntry],
+    bytes: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
     use std::io::Write;
 
-    std::fs::create_dir(run_dir)?;
     // Populate directories and files before creating any links. Filesystem aliases
     // (including case-insensitive names) must not redirect a later materialization write.
     for entry in entries {
@@ -770,9 +784,13 @@ async fn execute(
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
     let run_dir = root.join(&receipt.id);
-    materialize(&run_dir, &ready.entries, &bytes).map_err(|e| {
-        RuntimeError::Unconfigured(format!("materialize {}: {e}", run_dir.display()))
-    })?;
+    if let Err(error) = materialize(&run_dir, &ready.entries, &bytes) {
+        receipt.success = false;
+        receipt.reason = Some(format!("materialize {}: {error}", run_dir.display()));
+        receipt.finished_at = Some(receipts::now_micros());
+        // No profile or child exists yet. Return through run's receipt insertion.
+        return Ok(());
+    }
     receipts::event(
         rt,
         ns,
@@ -1199,22 +1217,23 @@ mod tests {
             let root = dir.path().join("run");
             let result = materialize(&root, &entries, &bytes);
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
-            let aliases = std::fs::symlink_metadata(root.join("A"))
-                .unwrap()
-                .file_type();
-            if aliases.is_symlink() {
-                // A case-sensitive filesystem can represent both distinct paths safely.
-                result.unwrap();
-            } else {
-                assert_eq!(
-                    result.unwrap_err().kind(),
-                    std::io::ErrorKind::AlreadyExists
-                );
+            match result {
+                Ok(()) => {
+                    // A case-sensitive filesystem can represent both paths safely.
+                    assert!(std::fs::symlink_metadata(root.join("A"))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                    assert_eq!(
+                        std::fs::read(root.join(if descendant { "a/child" } else { "a" })).unwrap(),
+                        b"replacement"
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                    assert!(!root.exists(), "the partial input tree must be removed");
+                }
             }
-            assert_eq!(
-                std::fs::read(root.join(if descendant { "a/child" } else { "a" })).unwrap(),
-                b"replacement"
-            );
         }
     }
 
