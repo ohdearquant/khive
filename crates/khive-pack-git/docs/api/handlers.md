@@ -2,6 +2,9 @@
 
 Extracted from `crates/khive-pack-git/src/handlers.rs` doc-comments.
 
+For the separate read of persisted ingest progress, see
+[`git.ingest_cursor`](ingest_cursor.md). It does not run this digest handler.
+
 ## `RemoteRecoveryStage` / `RemoteCommitRecovery`
 
 Issue #765 remote-only repair policy: at most one `git fetch --refetch`,

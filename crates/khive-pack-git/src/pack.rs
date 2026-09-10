@@ -17,8 +17,8 @@ use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS}
 
 /// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendments 1 and 2, plus
 /// ADR-108) — registers `commit` / `issue` / `pull_request` note kinds populated by
-/// the batch ingester in `src/ingest.rs`, one read/ingest agent-facing verb,
-/// `git.digest` (`src/handlers.rs`), and three write verbs, `git.commit` /
+/// the batch ingester in `src/ingest.rs`, the agent-facing verb
+/// `git.digest` (`src/handlers.rs`), the read `git.ingest_cursor`, and write verbs `git.commit` /
 /// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108). Extends the
 /// base edge contract with `precedes` commit→commit (parent→child lineage,
 /// ADR-088 Amendment 1 ingest enrichment) — the only new endpoint rule this
@@ -156,6 +156,7 @@ impl PackRuntime for GitPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "git.digest" => self.handle_digest(token, registry, params).await,
+            "git.ingest_cursor" => self.handle_ingest_cursor(token, registry, params).await,
             "git.commit" if params.get("tree").is_some() => {
                 self.handle_local(token, registry, verb, params).await
             }

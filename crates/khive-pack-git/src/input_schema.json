@@ -466,5 +466,27 @@
       "repo"
     ],
     "additionalProperties": false
+  },
+  "git.ingest_cursor": {
+    "type": "object",
+    "properties": {
+      "project": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "source_kind": {
+        "type": "string",
+        "enum": [
+          "commits",
+          "issues",
+          "pull_requests"
+        ]
+      }
+    },
+    "required": [
+      "project",
+      "source_kind"
+    ],
+    "additionalProperties": false
   }
 }
