@@ -286,3 +286,36 @@ succeeds; 35 capture records links without descending through directory links;
 36 tracked file, directory and dangling symlinks round-trip through the manifest
 to a Git tree with an empty `git diff-tree`, and a link-to-file conversion emits
 the native `120000` to `100644` change.
+
+## Amendment 6 (2026-09-10): observed limiting resource on receipts
+
+Every newly written run receipt, including a refusal receipt, carries the explicit
+`limiting_resource` key. Its closed vocabulary is `cpu_seconds | address_space |
+file_size | nproc | null`; `null` is serialized rather than omitted. `exec.run`,
+`exec.receipt` and `exec.runs` return the same stored value. Historical receipts are
+not rewritten or assigned an inferred cause.
+
+The wait site records `cpu_seconds` only for a delivered `SIGXCPU` when that run
+configured `cpu_seconds`, and `file_size` only for a delivered `SIGXFSZ` when it
+configured `file_size`. Normal exits, nonzero exit codes, unrelated signals
+(including generic `SIGKILL`), wait errors and the run-timeout path leave `null`.
+The field is not derived afterwards from the exit code or merely from a requested
+limit. Existing signal termination keeps `exit_code: null` and the delivered
+signal in `exit_signal`; enforcement and timeout behavior are unchanged.
+
+The observation is limited to the directly waited child's signal. A descendant
+whose parent converts a signal into an ordinary exit code supplies no such
+observation. Likewise, `ENOMEM` from an address-space limit and `EAGAIN` from a
+process limit occur inside the child, so this wrapper records `null` for
+`address_space` and `nproc` even on Linux. An ignored `SIGXFSZ` followed by an
+`EFBIG` write error is not inferred as `file_size`. The macOS startup refusal for
+unsupported `address_space` and `nproc` remains unchanged and produces no receipt.
+
+Acceptance arms added: 37 a spinning child under a one-second CPU limit records
+`cpu_seconds`; 38 a child writing past a file-size limit records `file_size`; 39
+exit zero, nonzero exit, `SIGTERM`, generic `SIGKILL` and timeout each retain a
+present JSON null; 40 the same spin without a CPU limit reaches its wall timeout
+and retains null; 41 each resource signal without its matching configured limit
+retains null. The arms read back the durable receipt and its listing as well as
+the run reply. Replacing observation with a nonzero-exit heuristic must fail the
+unrelated-signal arm; omitting null must fail the exit-zero arm.
