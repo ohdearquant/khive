@@ -467,7 +467,9 @@ pub struct GitWriteSectionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitWriteRepositoryConfig {
+    /// HTTPS platform remote, or an absolute path / file:/// URL with an empty slug.
     pub remote: String,
+    /// owner/name for HTTPS; empty explicitly opts into credential-free local pushes.
     pub slug: String,
     pub visibility: String,
     /// Merge dispatch refusals for this repository (ADR-182 Amendment 7):

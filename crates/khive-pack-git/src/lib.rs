@@ -39,6 +39,8 @@ pub mod ingest;
 mod input_schema;
 mod local_git;
 mod local_handlers;
+#[cfg(all(test, unix))]
+mod local_remote_tests;
 mod local_vocab;
 mod pack;
 #[cfg(test)]

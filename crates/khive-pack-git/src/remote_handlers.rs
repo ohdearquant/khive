@@ -193,8 +193,32 @@ fn after_effect(error: Failure) -> Failure {
     Failure::unknown(error.reason)
 }
 
+fn decode_file_path(path: &str) -> Result<String, Failure> {
+    if !path.starts_with('/') {
+        return Err(Failure::refused("remote_scheme"));
+    }
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let low = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                _ => return Err(Failure::refused("remote_scheme")),
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| Failure::refused("remote_scheme"))
+}
+
 impl GitPack {
-    fn remote_repository(&self, repo: &Path) -> Result<GitWriteRepositoryConfig, Failure> {
+    pub(crate) fn remote_repository(
+        &self,
+        repo: &Path,
+    ) -> Result<GitWriteRepositoryConfig, Failure> {
         let configured = &self.runtime().config().git_write.repositories;
         let mut matches = configured
             .iter()
@@ -205,6 +229,21 @@ impl GitPack {
             .ok_or_else(|| Failure::refused("repository_unmapped"))?;
         if matches.next().is_some() {
             return Err(Failure::refused("repository_ambiguous"));
+        }
+        // Git decodes file URL paths before opening them; plain paths keep literal '%'.
+        let path = match row.remote.strip_prefix("file://") {
+            Some(path) => decode_file_path(path)?,
+            None => row.remote.clone(),
+        };
+        if row.slug.is_empty()
+            && path.starts_with('/')
+            && !path.starts_with("//")
+            && !path.chars().any(char::is_control)
+        {
+            if !matches!(row.visibility.as_str(), "public" | "private" | "internal") {
+                return Err(Failure::refused("repository_identity"));
+            }
+            return Ok(row);
         }
         let rest = row
             .remote
@@ -368,6 +407,12 @@ impl GitPack {
     ) -> Result<Value, Failure> {
         let repo = std::path::PathBuf::from(&receipt.repo);
         let target = self.remote_repository(&repo)?;
+        if target.slug.is_empty() {
+            receipt.credential = json!({"source":"none"});
+            if verb != "git.push" {
+                return Err(Failure::refused("remote_scheme"));
+            }
+        }
         if verb == "git.push" {
             let (version, supported) = local_git::push_marker_support(&repo).await?;
             if !supported {
@@ -379,6 +424,9 @@ impl GitPack {
                 return Err(Failure::refused("expected_local_mismatch"));
             }
         }
+        if target.slug.is_empty() {
+            return self.push_exact(None, &target, params, receipt).await;
+        }
         let (identity, secret) =
             credentials::resolve_remote(&self.runtime().config().git_write, &receipt.actor)
                 .await
@@ -387,7 +435,9 @@ impl GitPack {
         receipts::persist(self.runtime(), receipt).await?;
         let secret = secret.value();
         if verb == "git.push" {
-            return self.push_exact(secret, &target, params, receipt).await;
+            return self
+                .push_exact(Some(secret), &target, params, receipt)
+                .await;
         }
         // gh's GitHub endpoint must name the same repository as configured Git.
         if target.remote.trim_end_matches(".git") != format!("https://github.com/{}", target.slug) {
@@ -571,7 +621,7 @@ impl GitPack {
 
     async fn push_exact(
         &self,
-        secret: &str,
+        secret: Option<&str>,
         target: &GitWriteRepositoryConfig,
         params: &Value,
         receipt: &mut Receipt,
@@ -833,10 +883,19 @@ impl GitPack {
             return Ok(());
         }
         let target = self.remote_repository(repo)?;
-        let (_, secret) =
-            credentials::resolve_remote(&self.runtime().config().git_write, &prior.actor)
-                .await
-                .map_err(|_| Failure::refused("actor_unmapped"))?;
+        let secret = if target.slug.is_empty() {
+            if prior.verb != "git.push" {
+                return Err(Failure::refused("remote_scheme"));
+            }
+            None
+        } else {
+            Some(
+                credentials::resolve_remote(&self.runtime().config().git_write, &prior.actor)
+                    .await
+                    .map_err(|_| Failure::refused("actor_unmapped"))?
+                    .1,
+            )
+        };
         let committed = match prior.verb.as_str() {
             "git.push" => {
                 let branch = required(&prior.inputs, "branch")?;
@@ -849,7 +908,11 @@ impl GitPack {
                     .unwrap_or(false)
                     && self
                         .remote_transport()
-                        .remote_ref(secret.value(), &target.remote, branch)
+                        .remote_ref(
+                            secret.as_ref().map(|secret| secret.value()),
+                            &target.remote,
+                            branch,
+                        )
                         .await
                         .ok()
                         .flatten()
@@ -865,7 +928,10 @@ impl GitPack {
                 let n = number(&prior.inputs)?;
                 let pr = self
                     .api(
-                        secret.value(),
+                        secret
+                            .as_ref()
+                            .ok_or_else(|| Failure::refused("remote_scheme"))?
+                            .value(),
                         "GET",
                         endpoint(&target.slug, &format!("pulls/{n}")),
                         None,

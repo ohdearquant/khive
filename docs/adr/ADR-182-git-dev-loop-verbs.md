@@ -496,3 +496,51 @@ Two additions, from gating this amendment rather than from writing it.
    Both are therefore admission-degrade-safe and are listed under the `git` pack beside
    `git.receipts` and `git.gates`. `git.init` is Commissive and writes a receipt, so the census
    does not reach it.
+
+## Amendment 9 (2026-09-10): explicitly local push targets
+
+Amends Amendment 2 items 3–4 for push targets only, implementing issue #2508.
+A repository mapping with `slug = ""` explicitly opts into a local remote: `remote`
+is an absolute POSIX path or an authority-free `file:///absolute/path` URL, and
+`visibility` remains one of `public`, `private`, `internal`. Relative paths,
+file URLs with a host, double-leading-slash paths, control characters and other
+schemes (including `ssh://`) refuse `remote_scheme`. File-URL paths are percent-decoded
+before these checks; malformed escapes or decoded non-UTF-8 paths also refuse.
+Encoded spaces remain supported, and ordinary absolute paths keep literal percent signs.
+A local path with a nonempty
+slug also refuses; HTTPS retains its owner/name slug and existing validation.
+
+```toml
+[git_write.repositories."/abs/checkout"]
+remote = "file:///abs/remote.git"
+slug = ""
+visibility = "private"
+```
+
+`git.push` on this mapping takes the same allowlist, tool policy, exact local and
+remote comparisons, fast-forward proof, server-side lease, readback and acknowledged
+push marker as HTTPS. It resolves neither an actor row nor a credential, including
+when an actor row exists, and its receipt records `credential: {"source":"none"}`.
+Its Git transport enables file access only for the explicit local path, disables
+HTTPS for that operation and injects no authorization header. HTTPS credential
+resolution is unchanged. `git.reconcile` reads a local push target without a
+credential and still needs both the receipt marker and the exact remote SHA.
+
+`git.pr_open`, `git.pr_review`, and `git.pr_merge` on a local mapping refuse
+`remote_scheme` before resolving credentials or reading platform/review state.
+Reconciliation of a platform merge against a local mapping also refuses
+`remote_scheme`. No local platform behavior is synthesized.
+
+`git.gates` preserves its existing allowlist rows and adds `target` with `kind`
+(`local` or `platform`), `remote`, `slug`, and `visibility`. An absent mapping
+returns `target: null`; an invalid or ambiguous mapping returns
+`target: {kind: "unavailable", reason}` without echoing the invalid remote.
+
+Acceptance arms: a production-transport push to a temporary bare `file:///` target
+succeeds with credential source `none` and an independently read remote SHA;
+absolute-path and unmapped-actor controls also succeed; stale expected-remote and
+divergent-head pushes refuse without moving refs; local PR verbs refuse before a
+credential read; gates distinguish local and HTTPS mappings in one configuration;
+unknown schemes and local targets lacking the empty slug refuse; reconciliation
+requires the marker and exact remote SHA. Mutation expectation: restoring the
+HTTPS-only scheme check makes the successful local-file push arm fail.

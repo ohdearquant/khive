@@ -45,13 +45,14 @@ pub trait RemoteTransport: Send + Sync {
         slug: &str,
         number: u64,
     ) -> Result<Value, RemoteError>;
+    /// None is the explicitly local, credential-free Git transport; HTTPS uses Some.
     async fn remote_ref(
         &self,
-        token: &str,
+        token: Option<&str>,
         remote: &str,
         branch: &str,
     ) -> Result<Option<String>, RemoteError>;
-    async fn push(&self, token: &str, request: PushRequest) -> Result<(), RemoteError>;
+    async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError>;
 }
 
 pub struct GhTransport;
@@ -244,15 +245,24 @@ impl RemoteTransport for GhTransport {
             .ok_or(RemoteError::InvalidResponse)
     }
 
+    /// None is the explicitly local, credential-free Git transport; HTTPS uses Some.
     async fn remote_ref(
         &self,
-        token: &str,
+        token: Option<&str>,
         remote: &str,
         branch: &str,
     ) -> Result<Option<String>, RemoteError> {
         let scratch = bare().await?;
         let reference = format!("refs/heads/{branch}");
-        let mut command = git_command(scratch.path(), Some(token));
+        let mut command = git_command(scratch.path(), token);
+        if token.is_none() {
+            command.args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "protocol.https.allow=never",
+            ]);
+        }
         command.args(["ls-remote", "--refs", "--", remote, &reference]);
         let (success, bytes) = run(command, None, false).await?;
         if !success {
@@ -273,13 +283,13 @@ impl RemoteTransport for GhTransport {
         Ok(Some(sha.to_ascii_lowercase()))
     }
 
-    async fn push(&self, token: &str, request: PushRequest) -> Result<(), RemoteError> {
-        push_native(token, request, false).await
+    async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError> {
+        push_native(token, request, token.is_none()).await
     }
 }
 
 pub(crate) async fn push_native(
-    token: &str,
+    token: Option<&str>,
     request: PushRequest,
     allow_file: bool,
 ) -> Result<(), RemoteError> {
@@ -293,9 +303,14 @@ pub(crate) async fn push_native(
         "--force-with-lease={reference}:{}",
         request.expected_remote.as_deref().unwrap_or("")
     );
-    let mut command = git_command(scratch.path(), Some(token));
+    let mut command = git_command(scratch.path(), token);
     if allow_file {
-        command.args(["-c", "protocol.file.allow=always"]);
+        command.args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "protocol.https.allow=never",
+        ]);
     }
     let alternate = serde_json::to_string(&objects.display().to_string())
         .map_err(|_| RemoteError::Unavailable)?;
