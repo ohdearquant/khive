@@ -1,8 +1,9 @@
 use super::*;
 use async_trait::async_trait;
-use khive_storage::{SqlReader, StorageResult};
+use khive_storage::{SqlReader, StorageError, StorageResult, WriterTaskRequestState};
 use khive_types::{HandlerDef, Namespace, Pack};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+use std::sync::{Arc, Mutex};
 
 use crate::embedder_registry::EmbedderProvider;
 use crate::pack::{KindHook, PackRuntime, VerbRegistryBuilder};
@@ -40,6 +41,41 @@ impl EmbedderProvider for Provider {
     }
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         Ok(Arc::new(Service))
+    }
+}
+
+struct CountingService(Arc<Mutex<Vec<Vec<String>>>>);
+
+#[async_trait]
+impl EmbeddingService for CountingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.lock().unwrap().push(texts.to_vec());
+        Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+    }
+    fn supports_model(&self, _: EmbeddingModel) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        MODEL
+    }
+}
+
+struct CountingProvider(Arc<Mutex<Vec<Vec<String>>>>);
+
+#[async_trait]
+impl EmbedderProvider for CountingProvider {
+    fn name(&self) -> &str {
+        MODEL
+    }
+    fn dimensions(&self) -> usize {
+        4
+    }
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(CountingService(self.0.clone())))
     }
 }
 
@@ -112,6 +148,85 @@ async fn vectors(runtime: &KhiveRuntime, token: &NamespaceToken) -> u64 {
         .count()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn stream_batch_embeds_distinct_appends_and_eligible_creates_in_one_call() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["head".into(), "observation".into()]);
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    runtime.register_embedder(CountingProvider(calls.clone()));
+    runtime.embedder_with_token(&token, MODEL).await.unwrap();
+    let registry = VerbRegistryBuilder::new().build().unwrap();
+    let mut members = vec![append("embedding", None)];
+    for (key, kind, embed) in [
+        ("first", "observation", None),
+        ("second", "observation", None),
+        ("explicit-on", "head", Some(true)),
+        ("default-off", "head", None),
+        ("explicit-off", "observation", Some(false)),
+    ] {
+        let mut spec = write(key, None);
+        spec.kind = kind.into();
+        spec.doc = json!({"marker": key});
+        spec.embed = embed;
+        members.push(StreamBatchMember::Write(spec));
+    }
+    let prepared = runtime
+        .prepare_stream_batch(&token, members, &registry)
+        .await
+        .unwrap();
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one provider request for the complete eligible create set"
+        );
+        assert_eq!(calls[0].len(), 4);
+        assert_eq!(calls[0].iter().collect::<HashSet<_>>().len(), 4);
+        for doc in [
+            json!({"event": "batch"}),
+            json!({"marker": "first"}),
+            json!({"marker": "second"}),
+            json!({"marker": "explicit-on"}),
+        ] {
+            let text = serde_json::to_string(&doc).unwrap();
+            assert!(
+                calls[0].iter().any(|input| input.contains(&text)),
+                "missing document {text:?}"
+            );
+        }
+        assert!(calls[0]
+            .iter()
+            .all(|input| !input.contains("default-off") && !input.contains("explicit-off")));
+    }
+    assert_eq!(
+        vectors(&runtime, &token).await,
+        0,
+        "preparation must not insert vectors"
+    );
+    let (values, effects) = run_prepared_stream_batch(
+        runtime.sql().as_ref(),
+        token.namespace().as_str().into(),
+        prepared,
+        None,
+        vec![],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(values.len(), 6);
+    assert_eq!(values[0]["seq"], 1);
+    for value in &values[1..] {
+        assert_eq!(value["version"], 1);
+    }
+    crate::atomic_prepare::apply_post_commit_effects_with_report(&runtime, &token, effects)
+        .await
+        .unwrap();
+    assert_eq!(vectors(&runtime, &token).await, 4);
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -349,6 +464,304 @@ fn file_fixture() -> (
     )
 }
 
+async fn stream_store_snapshot(runtime: &KhiveRuntime) -> Value {
+    let mut reader = runtime.sql().reader().await.unwrap();
+    let mut snapshot = serde_json::Map::new();
+    for (table, order) in [
+        ("notes", "id"),
+        ("notes_seq", "seq"),
+        ("note_streams", "namespace, stream, seq"),
+        ("events", "id"),
+        ("fts_notes", "rowid"),
+        ("fts_notes_rowids", "rowid"),
+        ("fts_notes_rowids_state", "key"),
+        ("ann_write_log", "rowid"),
+        ("sqlite_sequence", "name"),
+    ] {
+        let rows = reader
+            .query_all(statement(
+                &format!("SELECT * FROM {table} ORDER BY {order}"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        snapshot.insert(table.into(), serde_json::to_value(rows).unwrap());
+    }
+    Value::Object(snapshot)
+}
+
+#[tokio::test]
+async fn stream_batch_recreated_key_between_prepare_and_commit_is_version_conflict() {
+    for replacement in [None, Some(false), Some(true)] {
+        let (_dir, runtime, peer, token, registry) = file_fixture();
+        let peer_token = peer.authorize(Namespace::local()).unwrap();
+        let first = batch_write(&runtime, &token, &registry, write("target", None)).await;
+        let first_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let hook_fired = fired.clone();
+        runtime.install_note_mutation_hook(Arc::new(move |kind: String, id: Uuid| {
+            let fired = hook_fired.clone();
+            Box::pin(async move { fired.lock().unwrap().push((kind, id)) })
+        }));
+        let prepared = runtime
+            .prepare_stream_batch(
+                &token,
+                vec![
+                    StreamBatchMember::Write(write("candidate", None)),
+                    append("recreated", None),
+                    StreamBatchMember::Write(write("target", Some(1))),
+                    append("recreated", None),
+                ],
+                &registry,
+            )
+            .await
+            .unwrap();
+        if let Some(hard) = replacement {
+            // The old identity disappears after preparation; its replacement has
+            // the same version, so comparing only versions cannot detect this race.
+            assert!(peer.delete_note(&peer_token, first_id, hard).await.unwrap());
+            let mut recreated = write("target", None);
+            recreated.doc = json!({"replacement": true});
+            let holder = batch_write(&peer, &peer_token, &registry, recreated).await;
+            assert_ne!(holder["id"], first["id"]);
+            assert_eq!(holder["version"], 1);
+        }
+        let holder_before = runtime
+            .get_note_by_key(&token, "target", Some("head"), false)
+            .await
+            .unwrap();
+        let baseline = stream_store_snapshot(&runtime).await;
+        let outcome = run_prepared_stream_batch(
+            runtime.sql().as_ref(),
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        if replacement.is_some() {
+            let refusal = outcome.expect_err("a recreated holder refuses the stale plan");
+            assert_eq!(refusal.member, 2);
+            let error = serde_json::to_value(refusal.error).unwrap();
+            assert_eq!(error["kind"], "conflict");
+            assert_eq!(error["details"]["reason"], "version_conflict");
+            assert_eq!(error["details"]["member"], "2");
+            assert_eq!(error["details"]["expected_version"], "1");
+            assert_eq!(error["details"]["current_version"], "1");
+            assert_eq!(stream_store_snapshot(&runtime).await, baseline);
+            assert_eq!(
+                runtime
+                    .get_note_by_key(&token, "target", Some("head"), false)
+                    .await
+                    .unwrap(),
+                holder_before,
+            );
+            assert_eq!(
+                runtime.stream_stat(&token, "recreated").await.unwrap()["count"],
+                0
+            );
+            assert!(fired.lock().unwrap().is_empty());
+        } else {
+            let (values, effects) = outcome.expect("an unchanged holder commits");
+            assert_eq!(values[2]["id"], first["id"]);
+            assert_eq!(values[2]["version"], 2);
+            assert_eq!(values[1]["seq"], 1);
+            assert_eq!(values[3]["seq"], 2);
+            assert!(!effects.as_slice().is_empty());
+            assert!(fired.lock().unwrap().is_empty());
+            crate::atomic_prepare::apply_post_commit_effects_with_report(&runtime, &token, effects)
+                .await
+                .unwrap();
+            assert!(fired.lock().unwrap().iter().any(|(_, id)| *id == first_id));
+            assert_eq!(
+                runtime.stream_stat(&token, "recreated").await.unwrap()["count"],
+                2
+            );
+        }
+    }
+}
+
+struct OutcomeAccess {
+    inner: Arc<dyn SqlAccess>,
+    invoke: bool,
+    expect_success: bool,
+    terminate: bool,
+    state: WriterTaskRequestState,
+    callback: Arc<Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl SqlAccess for OutcomeAccess {
+    async fn reader(&self) -> StorageResult<Box<dyn SqlReader>> {
+        self.inner.reader().await
+    }
+    async fn writer(&self) -> StorageResult<Box<dyn SqlWriter>> {
+        self.inner.writer().await
+    }
+    async fn atomic_unit(&self, op: AtomicUnitOp) -> StorageResult<Box<dyn Any + Send>> {
+        if self.invoke {
+            let callback = self.callback.clone();
+            let traced: AtomicUnitOp = Box::new(move |writer| {
+                Box::pin(async move {
+                    let outcome = op(writer).await;
+                    *callback.lock().unwrap() = Some(outcome.is_ok());
+                    outcome
+                })
+            });
+            let outcome = self.inner.atomic_unit(traced).await;
+            assert_eq!(outcome.is_ok(), self.expect_success);
+        }
+        if self.terminate {
+            Err(StorageError::WriterTaskTerminated {
+                request_state: self.state,
+            })
+        } else {
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: self.state,
+                source: Box::new(StorageError::Pool {
+                    operation: "stream_test_ack".into(),
+                    message: "injected acknowledgment failure".into(),
+                }),
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_recovers_failure_slot_only_after_confirmed_rollback() {
+    use WriterTaskRequestState::{NotStarted, SideEffectsUnknown, TransactionRolledBack};
+    for (invoke, terminate, state) in [
+        (true, false, TransactionRolledBack),
+        (true, false, SideEffectsUnknown),
+        (true, true, SideEffectsUnknown),
+        (true, true, TransactionRolledBack),
+        (false, false, NotStarted),
+        (false, false, TransactionRolledBack),
+    ] {
+        let (_dir, runtime, _peer, token, registry) = file_fixture();
+        let prepared = runtime
+            .prepare_stream_batch(
+                &token,
+                vec![
+                    StreamBatchMember::Write(write("candidate", None)),
+                    append("refused", Some(9)),
+                ],
+                &registry,
+            )
+            .await
+            .unwrap();
+        let baseline = stream_store_snapshot(&runtime).await;
+        let callback = Arc::new(Mutex::new(None));
+        let access = OutcomeAccess {
+            inner: runtime.sql(),
+            invoke,
+            expect_success: false,
+            terminate,
+            state,
+            callback: callback.clone(),
+        };
+        let outcome = run_prepared_stream_batch(
+            &access,
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![],
+        )
+        .await;
+        assert_eq!(*callback.lock().unwrap(), invoke.then_some(false));
+        if invoke && !terminate && state == TransactionRolledBack {
+            let refusal = outcome
+                .unwrap()
+                .expect_err("recover the recorded member failure");
+            assert_eq!(refusal.member, 1);
+            let error = serde_json::to_value(refusal.error).unwrap();
+            assert_eq!(error["details"]["reason"], "seq_conflict");
+            assert_eq!(error["details"]["member"], "1");
+            assert_eq!(error["details"]["next_seq"], "1");
+        } else {
+            match outcome.expect_err("preserve the outer storage failure") {
+                RuntimeError::Storage(StorageError::WriterTaskTerminated { request_state }) => {
+                    assert!(terminate);
+                    assert_eq!(request_state, state);
+                }
+                RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
+                    request_state,
+                    source,
+                }) => {
+                    assert!(!terminate);
+                    assert_eq!(request_state, state);
+                    assert!(
+                        matches!(*source, StorageError::Pool { operation, .. } if operation == "stream_test_ack")
+                    );
+                }
+                error => panic!("unexpected storage outcome: {error:?}"),
+            }
+        }
+        assert_eq!(stream_store_snapshot(&runtime).await, baseline);
+    }
+}
+
+#[tokio::test]
+async fn stream_batch_commit_ack_failure_returns_no_executable_effects() {
+    let (_dir, runtime, _peer, token, registry) = file_fixture();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let hook_fired = fired.clone();
+    runtime.install_note_mutation_hook(Arc::new(move |kind: String, id: Uuid| {
+        let fired = hook_fired.clone();
+        Box::pin(async move { fired.lock().unwrap().push((kind, id)) })
+    }));
+    let prepared = runtime
+        .prepare_stream_batch(
+            &token,
+            vec![
+                StreamBatchMember::Write(write("acknowledgment", None)),
+                append("acknowledgment", None),
+            ],
+            &registry,
+        )
+        .await
+        .unwrap();
+    let callback = Arc::new(Mutex::new(None));
+    let access = OutcomeAccess {
+        inner: runtime.sql(),
+        invoke: true,
+        expect_success: true,
+        terminate: true,
+        state: WriterTaskRequestState::SideEffectsUnknown,
+        callback: callback.clone(),
+    };
+    let outcome = run_prepared_stream_batch(
+        &access,
+        token.namespace().as_str().into(),
+        prepared,
+        None,
+        vec![],
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        }))
+    ));
+    assert_eq!(*callback.lock().unwrap(), Some(true));
+    assert!(fired.lock().unwrap().is_empty());
+    // The injected error loses the acknowledgment, not the committed writes.
+    assert_eq!(
+        runtime.stream_stat(&token, "acknowledgment").await.unwrap()["count"],
+        1
+    );
+    assert_eq!(
+        runtime
+            .get_note_by_key(&token, "acknowledgment", Some("head"), false)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+}
+
 #[tokio::test]
 async fn stream_batch_fence_rechecks_after_writer_admission() {
     let (_dir, runtime, peer, token, registry) = file_fixture();
@@ -567,6 +980,120 @@ impl SqlAccess for TraceAccess {
         ));
         result
     }
+}
+
+fn interleaved_appends() -> Vec<StreamBatchMember> {
+    ["a", "b", "a", "a", "b"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, stream)| {
+            let StreamBatchMember::Append(mut spec) = append(stream, None) else {
+                unreachable!()
+            };
+            spec.record = json!({"position": index});
+            StreamBatchMember::Append(spec)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_batch_reads_each_stream_head_once_and_allocates_in_order() {
+    let (runtime, token, registry) = fixture();
+    let prepared = runtime
+        .prepare_stream_batch(&token, interleaved_appends(), &registry)
+        .await
+        .unwrap();
+    let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
+    let (values, _) = run_prepared_stream_batch(
+        &trace,
+        token.namespace().as_str().into(),
+        prepared,
+        None,
+        vec![],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(values.len(), 5);
+    let trace = trace.0.lock().unwrap();
+    let heads: Vec<_> = trace
+        .iter()
+        .filter(|statement| statement.sql.contains("MAX(seq)"))
+        .collect();
+    assert_eq!(heads.len(), 2, "one head query per distinct stream");
+    for (head, stream) in heads.iter().zip(["a", "b"]) {
+        assert!(matches!(&head.params[0], SqlValue::Text(ns) if ns == token.namespace().as_str()));
+        assert!(matches!(&head.params[1], SqlValue::Text(name) if name == stream));
+    }
+    let inserts: Vec<_> = trace
+        .iter()
+        .filter(|statement| statement.sql.starts_with("INSERT INTO note_streams"))
+        .collect();
+    assert_eq!(inserts.len(), 5);
+    for ((insert, value), (stream, seq)) in
+        inserts
+            .iter()
+            .zip(&values)
+            .zip([("a", 1), ("b", 1), ("a", 2), ("a", 3), ("b", 2)])
+    {
+        assert!(matches!(&insert.params[1], SqlValue::Text(name) if name == stream));
+        assert!(matches!(&insert.params[2], SqlValue::Integer(actual) if *actual == seq));
+        assert!(
+            matches!(&insert.params[3], SqlValue::Text(id) if Some(id.as_str()) == value["id"].as_str())
+        );
+        assert_eq!(value["seq"], seq);
+    }
+    assert_eq!(trace.first().unwrap().sql, "BEGIN");
+    assert_eq!(trace.last().unwrap().sql, "COMMIT");
+}
+
+#[tokio::test]
+async fn stream_batch_head_allocation_persists_order_and_refreshes_next_transaction() {
+    let (_dir, runtime, _peer, token, registry) = file_fixture();
+    for expected in [[1, 1, 2, 3, 2], [4, 3, 5, 6, 4]] {
+        let values = runtime
+            .stream_batch_atomic(&token, interleaved_appends(), None, vec![], &registry)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(values.len(), 5);
+        for (value, seq) in values.iter().zip(expected) {
+            assert_eq!(value["seq"], seq);
+        }
+    }
+    for (stream, positions) in [("a", vec![0, 2, 3, 0, 2, 3]), ("b", vec![1, 4, 1, 4])] {
+        let page = runtime.stream_read(&token, stream, 0, 100).await.unwrap();
+        assert_eq!(page["head_seq"], positions.len());
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), positions.len());
+        for (index, (entry, position)) in entries.iter().zip(positions).enumerate() {
+            assert_eq!(entry["seq"], index + 1);
+            assert_eq!(entry["record"]["position"], position);
+        }
+    }
+    let baseline = stream_store_snapshot(&runtime).await;
+    let refusal = runtime
+        .stream_batch_atomic(
+            &token,
+            vec![
+                append("a", Some(7)),
+                append("b", Some(5)),
+                append("a", Some(7)),
+            ],
+            None,
+            vec![],
+            &registry,
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refusal.member, 2);
+    let error = serde_json::to_value(refusal.error).unwrap();
+    assert_eq!(error["details"]["reason"], "seq_conflict");
+    assert_eq!(error["details"]["member"], "2");
+    assert_eq!(error["details"]["expected_seq"], "7");
+    assert_eq!(error["details"]["next_seq"], "8");
+    assert_eq!(stream_store_snapshot(&runtime).await, baseline);
 }
 
 #[tokio::test]

@@ -342,6 +342,10 @@ its Amendment 2 defines them, `embed` defaulting by the note kind). Common to bo
   a second write to the same key inside one request would either observe a stale version or
   conflict with its own sibling, and neither outcome is useful to a caller. Create-then-update is
   two requests, the second carrying the version the first returned.
+  Clarification (2026-09-10): this once-per-`(kind, key)` target rule is shared with ordered fence lists in
+  [ADR-172 Amendment 3](ADR-172-versioned-notes-compare-and-set.md): it applies independently to each
+  fence list and to a batch's keyed-write members. The batch-wide `fence` deliberately remains
+  object-only.
 - A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
   `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
   as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
@@ -373,6 +377,16 @@ is written, and the error carries that member's refusal plus `member` (the list 
 disposition is the `domain_disposition: not_committed` every member refusal already carries, and
 no parallel boolean rides beside it. The caller may ignore the result list on success, because
 success means every member committed.
+
+Correction (2026-09-10): if a positive-version `write` member's prepared target is deleted and
+recreated under the same `(kind, key)` before commit, the member refuses with `version_conflict`.
+The atomic batch returns `member` and `domain_disposition: not_committed`, with no member writes
+committed; the replacement does not turn this confirmed refusal into an unknown storage outcome.
+
+Allocation (2026-09-10): a successful atomic batch reads each appended stream's initial head once
+inside its writer transaction, then allocates that stream's sequences from a transaction-local
+cache in member order. The cache is never reused across transactions; per-member mode retains
+its independently admitted transactions and permits intervening writers.
 
 **Per-member (unfenced) mode.** Each member runs in its own writer transaction, in list order, so
 one stream's numbers increase with list position but need not be adjacent. A member's own refusal (`unknown_op`, `seq_conflict`,
@@ -496,6 +510,13 @@ as `invalid_input` and nothing is written. A `stream.batch` append member carrie
 with the same defaults, and the keyed `write` member carries `tags` and `embed` as ADR-172 Amendment 2
 defines them (A1.1's member shape lists both), `embed` defaulting to `false` for the `head` kind and
 `true` for every other kind.
+
+Preparation (2026-09-10): eligible embedded append and keyed-create members are prepared together
+before the member write transactions: one embedding request per selected model within its supported
+batch size, bounded chunks above that size, and one shared vector-schema writer acquisition across
+those models. This adds no aggregate admission limit. Positive-version keyed updates retain their
+separate preparation; embedding defaults and model selection are unchanged.
+With no eligible embeddings, this preparation invokes no embedding provider or vector-schema writer.
 
 The note's content limit, the audit event and the ledger row are unchanged; an unembedded entry is a
 whole entry in every respect this ADR defines.

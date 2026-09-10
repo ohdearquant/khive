@@ -37,7 +37,7 @@
 //! version of `dual_write_message` used to document is closed by
 //! construction.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -73,7 +73,7 @@ pub struct AtomicNoteSpec<'a> {
     pub properties: Option<Value>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct AtomicNoteOptions<'a> {
     pub salience: Option<f64>,
     pub decay_factor: Option<f64>,
@@ -82,6 +82,11 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub embed: Option<bool>,
     pub key: Option<&'a str>,
     pub fence: Option<&'a crate::note_write::NoteFences>,
+}
+
+pub(crate) struct AtomicNoteRequest<'a> {
+    pub spec: AtomicNoteSpec<'a>,
+    pub options: AtomicNoteOptions<'a>,
 }
 
 pub(crate) struct PreparedAtomicNotes {
@@ -320,6 +325,23 @@ pub(crate) async fn prepare_atomic_notes(
     specs: Vec<AtomicNoteSpec<'_>>,
     options: AtomicNoteOptions<'_>,
 ) -> RuntimeResult<PreparedAtomicNotes> {
+    validate_atomic_note_options(&options)?;
+    if options.embed != Some(false) {
+        if let Some(model) = options.embedding_model {
+            runtime.resolve_embedding_model(Some(model))?;
+        }
+    }
+    prepare_atomic_note_requests(
+        runtime,
+        specs
+            .into_iter()
+            .map(|spec| AtomicNoteRequest { spec, options })
+            .collect(),
+    )
+    .await
+}
+
+fn validate_atomic_note_options(options: &AtomicNoteOptions<'_>) -> RuntimeResult<()> {
     if let Some(value) = options.salience {
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err(RuntimeError::InvalidInput(
@@ -334,18 +356,45 @@ pub(crate) async fn prepare_atomic_notes(
             ));
         }
     }
-    let embed_model_names = if options.embed == Some(false) {
-        Vec::new()
-    } else if let Some(model) = options.embedding_model {
-        runtime.resolve_embedding_model(Some(model))?;
-        vec![model.to_owned()]
-    } else {
-        runtime.registered_embedding_model_names()
-    };
+    Ok(())
+}
+
+pub(crate) async fn prepare_atomic_note_requests(
+    runtime: &KhiveRuntime,
+    requests: Vec<AtomicNoteRequest<'_>>,
+) -> RuntimeResult<PreparedAtomicNotes> {
+    let mut embed_model_names = Vec::new();
+    let mut note_models = Vec::with_capacity(requests.len());
+    for request in &requests {
+        let options = &request.options;
+        validate_atomic_note_options(options)?;
+        let models = if options.embed == Some(false) {
+            Vec::new()
+        } else if let Some(model) = options.embedding_model {
+            runtime.resolve_embedding_model(Some(model))?;
+            vec![model.to_owned()]
+        } else {
+            runtime.registered_embedding_model_names()
+        };
+        let mut indices = Vec::with_capacity(models.len());
+        for model in models {
+            let index = match embed_model_names.iter().position(|name| name == &model) {
+                Some(index) => index,
+                None => {
+                    embed_model_names.push(model);
+                    embed_model_names.len() - 1
+                }
+            };
+            indices.push(index);
+        }
+        note_models.push(indices);
+    }
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
-    let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
-    for spec in &specs {
+    let mut notes: Vec<Note> = Vec::with_capacity(requests.len());
+    for request in &requests {
+        let spec = &request.spec;
+        let options = &request.options;
         runtime.validate_note_kind(spec.kind)?;
         // Same owned-identity derivation every other note-write site runs
         // (`operations.rs`'s create funnel, `atomic_prepare::prepare_add_note`):
@@ -384,14 +433,15 @@ pub(crate) async fn prepare_atomic_notes(
         notes.push(note);
     }
 
-    // ---- 2. Embed every distinct (content, model) pair in parallel, BEFORE
+    // ---- 2. Batch distinct content per model in parallel, BEFORE
     // opening any transaction. Any failure aborts here — no write has been
     // attempted. Identical note siblings reuse the same computed vector. ----
     let mut content_group_by_text: HashMap<&str, usize> = HashMap::new();
     let mut content_groups: Vec<Vec<usize>> = Vec::new();
     let mut note_content_groups: Vec<usize> = Vec::with_capacity(notes.len());
     for (note_idx, note) in notes.iter().enumerate() {
-        let text = options
+        let text = requests[note_idx]
+            .options
             .embedding_content
             .unwrap_or_else(|| crate::curation::note_embedding_text_ref(note));
         let content_group_idx = match content_group_by_text.get(text) {
@@ -417,56 +467,84 @@ pub(crate) async fn prepare_atomic_notes(
             .collect();
     let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
 
-    // `specs` is empty when a caller prepares a note set every member of
+    // `requests` is empty when a caller prepares a note set every member of
     // which was refused before preparation: there is nothing to embed, no
     // token to read, and the lazy vector-table create belongs to a write
     // that is not going to happen.
-    if !embed_model_names.is_empty() && !specs.is_empty() {
+    if !embed_model_names.is_empty() {
         // Ensure every model's vector table exists before the commit pass —
-        // the same lazy-create side effect `vectors_for_model` performs on
-        // the non-atomic path, done once per model rather than per note.
-        for model_name in &embed_model_names {
-            runtime.vectors_for_model(specs[0].token, model_name)?;
-        }
+        // the same lazy-create side effect as vector-store construction, with
+        // all model tables sharing one schema-writer acquisition.
+        let models = embed_model_names
+            .iter()
+            .map(|name| {
+                runtime
+                    .vector_model_metadata(name)
+                    .map(|(name, dimensions)| (crate::config::sanitize_key(&name), dimensions))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let model_specs: Vec<_> = models
+            .iter()
+            .map(|(key, dimensions)| (key.as_str(), *dimensions))
+            .collect();
+        runtime.backend().ensure_vector_tables(&model_specs)?;
 
         let usage_ctx = crate::usage::current();
         let mut join_set = tokio::task::JoinSet::new();
-        for (content_group_idx, note_indices) in content_groups.iter().enumerate() {
-            let note_idx = note_indices[0];
-            let spec = &specs[note_idx];
-            let note = &notes[note_idx];
-            // Spawned tasks need owned text; share one content allocation across
-            // every model instead of cloning the note body per task.
-            let text: Arc<str> = Arc::from(
-                options
-                    .embedding_content
-                    .unwrap_or_else(|| crate::curation::note_embedding_text_ref(note)),
-            );
-            for (model_idx, model_name) in embed_model_names.iter().enumerate() {
-                let rt = runtime.clone();
-                let token = spec.token.clone();
-                let name = model_name.clone();
-                let text = Arc::clone(&text);
-                let ctx = usage_ctx.clone();
-                join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_outcome_for_token(
-                        &token,
-                        &name,
-                        text.as_ref(),
-                    );
-                    let result = match ctx {
-                        Some(ctx) => crate::usage::scope(ctx, fut).await,
-                        None => fut.await,
-                    };
-                    (content_group_idx, model_idx, result)
-                });
+        for (model_idx, model_name) in embed_model_names.iter().enumerate() {
+            let mut groups = Vec::new();
+            let mut texts = Vec::new();
+            let mut token = None;
+            for (group_idx, note_indices) in content_groups.iter().enumerate() {
+                let Some(&note_idx) = note_indices
+                    .iter()
+                    .find(|&&index| note_models[index].contains(&model_idx))
+                else {
+                    continue;
+                };
+                token.get_or_insert_with(|| requests[note_idx].spec.token.clone());
+                groups.push(group_idx);
+                texts.push(
+                    requests[note_idx]
+                        .options
+                        .embedding_content
+                        .unwrap_or_else(|| {
+                            crate::curation::note_embedding_text_ref(&notes[note_idx])
+                        })
+                        .to_owned(),
+                );
             }
+            let rt = runtime.clone();
+            let token = token.expect("a selected model has at least one note");
+            let name = model_name.clone();
+            let ctx = usage_ctx.clone();
+            join_set.spawn(async move {
+                let fut = async {
+                    let mut outcomes = Vec::with_capacity(texts.len());
+                    for chunk in texts.chunks(lattice_embed::DEFAULT_MAX_BATCH_SIZE) {
+                        outcomes.extend(
+                            rt.embed_document_batch_with_model_outcomes_for_token(
+                                &token, &name, chunk,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok::<_, RuntimeError>(outcomes)
+                };
+                let result = match ctx {
+                    Some(ctx) => crate::usage::scope(ctx, fut).await,
+                    None => fut.await,
+                };
+                (groups, model_idx, result)
+            });
         }
 
         while let Some(joined) = join_set.join_next().await {
             match joined {
-                Ok((content_group_idx, model_idx, Ok(outcome))) => {
-                    embedding_outcomes[content_group_idx][model_idx] = Some(outcome);
+                Ok((groups, model_idx, Ok(outcomes))) => {
+                    for (group_idx, outcome) in groups.into_iter().zip(outcomes) {
+                        embedding_outcomes[group_idx][model_idx] = Some(outcome);
+                    }
                 }
                 Ok((_, _, Err(e))) => {
                     join_set.abort_all();
@@ -484,8 +562,11 @@ pub(crate) async fn prepare_atomic_notes(
 
     // Preserve the report's logical note/model accounting even when identical
     // siblings share one provider invocation.
-    for &content_group_idx in &note_content_groups {
-        for outcome in embedding_outcomes[content_group_idx].iter().flatten() {
+    for (note_idx, &content_group_idx) in note_content_groups.iter().enumerate() {
+        for &model_idx in &note_models[note_idx] {
+            let outcome = embedding_outcomes[content_group_idx][model_idx]
+                .as_ref()
+                .expect("every requested embedding was observed");
             embedding_truncation.observe(outcome);
             if outcome.truncated {
                 tracing::warn!(
@@ -564,8 +645,9 @@ pub(crate) async fn prepare_atomic_notes(
         if let Some(fault) = maybe_inject_vector_failure(&note.namespace, "fault-injected-vector") {
             statements.push(fault);
         } else {
-            for (model_name, outcome) in embed_model_names.iter().zip(outcomes_for_note) {
-                let outcome = outcome
+            for &model_idx in &note_models[note_idx] {
+                let model_name = &embed_model_names[model_idx];
+                let outcome = outcomes_for_note[model_idx]
                     .as_ref()
                     .expect("every model index observed exactly once");
                 let table = format!("vec_{}", crate::config::sanitize_key(model_name));
@@ -583,10 +665,10 @@ pub(crate) async fn prepare_atomic_notes(
 
         plans.push(AtomicOpPlan::AddNote(AddNotePlan {
             note_guard: Some(crate::note_write::NoteWriteGuard {
-                namespace: specs[note_idx].token.namespace().as_str().into(),
+                namespace: requests[note_idx].spec.token.namespace().as_str().into(),
                 target_id: note.id,
                 expected_version: None,
-                fence: options.fence.cloned(),
+                fence: requests[note_idx].options.fence.cloned(),
                 create_key: note
                     .key
                     .as_ref()
@@ -610,6 +692,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
+    use std::sync::{Arc, Mutex};
 
     use khive_types::Namespace;
 
@@ -726,6 +809,168 @@ mod tests {
         async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
             Ok(std::sync::Arc::new(DedupService { name: self.name }))
         }
+    }
+
+    struct BatchCountingService {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for BatchCountingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![0.25; DEDUP_DIMS]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    struct BatchCountingProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for BatchCountingProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            DEDUP_DIMS
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(BatchCountingService {
+                name: self.name,
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_notes_batch_models_with_one_schema_writer() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = runtime
+            .authorize(Namespace::parse("batch-notes").unwrap())
+            .unwrap();
+        let names = ["batch-notes-a", "batch-notes-b"];
+        let mut counters = Vec::new();
+        for name in names {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            runtime.register_embedder(BatchCountingProvider {
+                name,
+                calls: Arc::clone(&calls),
+            });
+            runtime.embedder_with_token(&token, name).await.unwrap();
+            counters.push(calls);
+        }
+        let inputs = [
+            ("first", "shared text", true, 0.2),
+            ("second", "shared text", true, 0.4),
+            ("third", "different text", true, 0.6),
+            ("disabled", "shared text", false, 0.8),
+        ];
+        let requests = inputs
+            .iter()
+            .map(|&(key, content, embed, salience)| AtomicNoteRequest {
+                spec: AtomicNoteSpec {
+                    token: &token,
+                    id: None,
+                    kind: "observation",
+                    name: None,
+                    content,
+                    properties: Some(serde_json::json!({"key": key})),
+                },
+                options: AtomicNoteOptions {
+                    key: Some(key),
+                    salience: Some(salience),
+                    embed: Some(embed),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let before = runtime.backend().pool().writer_acquisition_snapshot();
+        let prepared = prepare_atomic_note_requests(&runtime, requests)
+            .await
+            .unwrap();
+        let after = runtime.backend().pool().writer_acquisition_snapshot();
+        assert_eq!(after.acquisitions - before.acquisitions, 1);
+        for calls in &counters {
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![vec!["shared text".to_owned(), "different text".to_owned()]],
+            );
+        }
+        for (note, &(key, content, _, salience)) in prepared.notes.iter().zip(&inputs) {
+            assert_eq!(note.key.as_deref(), Some(key));
+            assert_eq!(note.content, content);
+            assert_eq!(note.salience, Some(salience));
+            assert_eq!(note.properties.as_ref().unwrap()["key"], key);
+        }
+        assert!(matches!(
+            crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), prepared.plans)
+                .await
+                .unwrap(),
+            AtomicRunOutcome::Committed { .. }
+        ));
+        for name in names {
+            assert_eq!(
+                runtime
+                    .vectors_for_model(&token, name)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                3,
+                "disabled notes must not inherit a sibling's shared vector",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_note_batch_chunks_only_above_provider_limit() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        runtime.register_embedder(BatchCountingProvider {
+            name: "batch-notes-large",
+            calls: Arc::clone(&calls),
+        });
+        let contents: Vec<_> = (0..=lattice_embed::DEFAULT_MAX_BATCH_SIZE)
+            .map(|index| format!("distinct document {index}"))
+            .collect();
+        let specs = contents
+            .iter()
+            .map(|content| AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content,
+                properties: None,
+            })
+            .collect();
+        let prepared = prepare_atomic_notes(&runtime, specs, AtomicNoteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(prepared.notes.len(), contents.len());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), lattice_embed::DEFAULT_MAX_BATCH_SIZE);
+        assert_eq!(calls[1].len(), 1);
+        assert_eq!(calls.concat(), contents);
     }
 
     /// A minimal note-write validator standing in for a pack's real one (e.g.

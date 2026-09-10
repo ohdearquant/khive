@@ -12,14 +12,14 @@
 //!
 //! # Safety: suspend-free invariant
 //!
-//! [`run_atomic_unit`] is the one place in this crate that builds an
-//! [`AtomicUnitOp`] closure for [`SqlAccess::atomic_unit`], whose contract
+//! `run_prepared_atomic_unit` owns the failure and commit protocol shared by
+//! the atomic-plan and stream-batch paths. It builds an [`AtomicUnitOp`]
+//! closure for [`SqlAccess::atomic_unit`], whose contract
 //! requires the closure's future to resolve on its first poll — synchronous
 //! DML against the provided `&mut dyn SqlWriter` only, never a suspending
-//! `.await`. Every statement driven here comes from
-//! `AtomicOpPlan::plan_statements`, which can only ever produce
-//! [`PlanStatement`]s (plain parameterized SQL), so no code path in this
-//! module can hand `atomic_unit` a suspending future. The paired
+//! `.await`. Prepared callbacks drive only parameterized statements, guards
+//! and stream-ledger reads through the provided writer. They must not perform
+//! asynchronous preparation or other I/O. The paired
 //! suspend-trap tests at the bottom of this file check both the happy-path
 //! (real commit pass resolves on first poll) and the misuse-is-caught case
 //! (a hand-built suspending closure fails loudly through the same seam). See
@@ -28,7 +28,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use khive_storage::{AtomicUnitOp, SqlAccess, SqlStatement, SqlWriter, StorageError};
+use khive_storage::{AtomicUnitOp, BoxFuture, SqlAccess, SqlStatement, SqlWriter, StorageError};
 
 use crate::atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernancePlan, GtdCompletePlan,
@@ -152,7 +152,7 @@ pub enum AtomicOpFailure {
 
 /// Deferred effects whose owning atomic unit has committed successfully.
 ///
-/// Only this crate's atomic and stream-batch commit owners construct this token.
+/// Only the shared prepared-unit commit owner constructs this token.
 /// Consumers may inspect
 /// its effects through [`CommittedPostCommitEffects::as_slice`], while the
 /// phase-3 executor takes the token by value; no public API exposes the owned
@@ -177,7 +177,7 @@ pub struct CommittedPostCommitEffects {
 }
 
 impl CommittedPostCommitEffects {
-    pub(crate) fn new(effects: Vec<PostCommitEffect>) -> Self {
+    fn new(effects: Vec<PostCommitEffect>) -> Self {
         Self { effects }
     }
 
@@ -441,10 +441,7 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
     plans: Vec<AtomicOpPlan>,
     capture_note_versions: bool,
 ) -> Result<(AtomicRunOutcome, Vec<i64>), AtomicRunnerError> {
-    let failure_slot: Arc<Mutex<Option<(usize, AtomicOpFailure)>>> = Arc::new(Mutex::new(None));
-    let failure_slot_for_closure = Arc::clone(&failure_slot);
-
-    let op: AtomicUnitOp = Box::new(move |writer| {
+    let op: PreparedAtomicOp<Vec<i64>, (usize, AtomicOpFailure)> = Box::new(move |writer| {
         Box::pin(async move {
             let mut post_commit = Vec::new();
             let mut note_versions = Vec::new();
@@ -471,50 +468,105 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
                         // guarantee, only a diagnostic nicety.
                         let _ = rollback_to_savepoint(writer, &savepoint).await;
                         let _ = release_savepoint(writer, &savepoint).await;
-                        *failure_slot_for_closure
-                            .lock()
-                            .expect("atomic runner failure slot poisoned") =
-                            Some((op_index, failure));
-                        return Err(StorageError::Internal(format!(
-                            "ADR-099 atomic unit aborted at op {op_index}"
-                        )));
+                        return Err(PreparedAtomicError::Refused {
+                            failure: (op_index, failure),
+                            message: format!("ADR-099 atomic unit aborted at op {op_index}"),
+                        });
                     }
                 }
             }
-            Ok(Box::new((post_commit, note_versions)) as Box<dyn Any + Send>)
+            Ok((note_versions, post_commit))
         })
     });
 
+    match run_prepared_atomic_unit(access, op)
+        .await
+        .map_err(AtomicRunnerError)?
+    {
+        PreparedAtomicOutcome::Committed { value, post_commit } => {
+            Ok((AtomicRunOutcome::Committed { post_commit }, value))
+        }
+        PreparedAtomicOutcome::RolledBack((failed_op_index, failure)) => Ok((
+            AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            },
+            Vec::new(),
+        )),
+    }
+}
+
+pub(crate) enum PreparedAtomicError<E> {
+    Refused { failure: E, message: String },
+    Storage(StorageError),
+}
+
+impl<E> From<StorageError> for PreparedAtomicError<E> {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+pub(crate) enum PreparedAtomicOutcome<T, E> {
+    Committed {
+        value: T,
+        post_commit: CommittedPostCommitEffects,
+    },
+    RolledBack(E),
+}
+
+pub(crate) type PreparedAtomicOp<T, E> = Box<
+    dyn for<'w> FnOnce(
+            &'w mut dyn SqlWriter,
+        )
+            -> BoxFuture<'w, Result<(T, Vec<PostCommitEffect>), PreparedAtomicError<E>>>
+        + Send,
+>;
+
+/// Recover a recorded refusal only after the storage owner proves rollback;
+/// effects become executable only after that same owner confirms commit.
+pub(crate) async fn run_prepared_atomic_unit<T: Send + 'static, E: Send + 'static>(
+    access: &dyn SqlAccess,
+    prepared: PreparedAtomicOp<T, E>,
+) -> Result<PreparedAtomicOutcome<T, E>, StorageError> {
+    let failure_slot = Arc::new(Mutex::new(None));
+    let recorded = Arc::clone(&failure_slot);
+    let op: AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            match prepared(writer).await {
+                Ok(value) => Ok(Box::new(value) as Box<dyn Any + Send>),
+                Err(PreparedAtomicError::Storage(error)) => Err(error),
+                Err(PreparedAtomicError::Refused { failure, message }) => {
+                    *recorded
+                        .lock()
+                        .expect("atomic runner failure slot poisoned") = Some(failure);
+                    Err(StorageError::Internal(message))
+                }
+            }
+        })
+    });
     match access.atomic_unit(op).await {
         Ok(boxed) => {
-            let (post_commit, note_versions) = *boxed
-                .downcast::<(Vec<PostCommitEffect>, Vec<i64>)>()
-                .expect("atomic runner closure returns committed effects and note versions");
-            Ok((
-                AtomicRunOutcome::Committed {
-                    post_commit: CommittedPostCommitEffects::new(post_commit),
-                },
-                note_versions,
-            ))
+            let (value, effects) = *boxed
+                .downcast::<(T, Vec<PostCommitEffect>)>()
+                .map_err(|_| StorageError::Internal("invalid prepared atomic outcome".into()))?;
+            Ok(PreparedAtomicOutcome::Committed {
+                value,
+                post_commit: CommittedPostCommitEffects::new(effects),
+            })
         }
         Err(storage_err) => {
             // A recorded op failure does not prove the outer transaction rolled back.
             if !atomic_unit_error_allows_recorded_refusal(&storage_err) {
-                return Err(AtomicRunnerError(storage_err));
+                return Err(storage_err);
             }
             let recorded = failure_slot
                 .lock()
                 .expect("atomic runner failure slot poisoned")
                 .take();
             match recorded {
-                Some((failed_op_index, failure)) => Ok((
-                    AtomicRunOutcome::RolledBack {
-                        failed_op_index,
-                        failure,
-                    },
-                    Vec::new(),
-                )),
-                None => Err(AtomicRunnerError(storage_err)),
+                Some(failure) => Ok(PreparedAtomicOutcome::RolledBack(failure)),
+                None => Err(storage_err),
             }
         }
     }
@@ -1277,6 +1329,233 @@ mod tests {
                 );
             }
             other => panic!("expected Committed, got {other:?}"),
+        }
+    }
+
+    mod acknowledgement {
+        use super::*;
+        use khive_storage::{SqlReader, WriterTaskRequestState};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            Request(WriterTaskRequestState),
+            Terminated(WriterTaskRequestState),
+        }
+
+        impl Fault {
+            fn error(self) -> StorageError {
+                match self {
+                    Self::Request(request_state) => StorageError::WriterTaskRequestFailed {
+                        request_state,
+                        source: Box::new(StorageError::Internal(
+                            "lost atomic acknowledgement".into(),
+                        )),
+                    },
+                    Self::Terminated(request_state) => {
+                        StorageError::WriterTaskTerminated { request_state }
+                    }
+                }
+            }
+
+            fn assert_preserved(self, error: StorageError) {
+                match (self, error) {
+                    (
+                        Self::Request(expected),
+                        StorageError::WriterTaskRequestFailed {
+                            request_state,
+                            source,
+                        },
+                    ) => {
+                        assert_eq!(request_state, expected);
+                        assert!(matches!(*source, StorageError::Internal(ref message)
+                            if message == "lost atomic acknowledgement"));
+                    }
+                    (
+                        Self::Terminated(expected),
+                        StorageError::WriterTaskTerminated { request_state },
+                    ) => assert_eq!(request_state, expected),
+                    (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
+                }
+            }
+        }
+
+        struct FaultAccess {
+            bridge: SqlBridge,
+            fault: Fault,
+            invoke: bool,
+            callback_result: StdArc<Mutex<Option<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SqlAccess for FaultAccess {
+            async fn reader(&self) -> StorageResultAlias<Box<dyn SqlReader>> {
+                self.bridge.reader().await
+            }
+
+            async fn writer(&self) -> StorageResultAlias<Box<dyn SqlWriter>> {
+                self.bridge.writer().await
+            }
+
+            async fn atomic_unit(
+                &self,
+                op: AtomicUnitOp,
+            ) -> StorageResultAlias<Box<dyn Any + Send>> {
+                if self.invoke {
+                    let callback_result = StdArc::clone(&self.callback_result);
+                    let result = self
+                        .bridge
+                        .atomic_unit(Box::new(move |writer| {
+                            Box::pin(async move {
+                                let result = op(writer).await;
+                                *callback_result.lock().expect("callback result") =
+                                    Some(result.is_ok());
+                                result
+                            })
+                        }))
+                        .await;
+                    assert_eq!(
+                        Some(result.is_ok()),
+                        *self.callback_result.lock().expect("callback result"),
+                        "the real transaction must finish before replacing its acknowledgement"
+                    );
+                }
+                Err(self.fault.error())
+            }
+        }
+
+        fn fault_access(pool: &TestPool, fault: Fault, invoke: bool) -> FaultAccess {
+            FaultAccess {
+                bridge: SqlBridge::new(StdArc::clone(pool), true),
+                fault,
+                invoke,
+                callback_result: StdArc::new(Mutex::new(None)),
+            }
+        }
+
+        fn effect_plan(id: Uuid) -> AtomicOpPlan {
+            let AtomicOpPlan::Update(mut plan) = rename_plan(id, "changed", "rename") else {
+                unreachable!()
+            };
+            plan.post_commit = PostCommitEffect::ReindexEntity { entity_id: id };
+            AtomicOpPlan::Update(plan)
+        }
+
+        #[tokio::test]
+        async fn recorded_failure_recovers_only_after_confirmed_rollback() {
+            let pool = scratch_pool("recorded_rollback");
+            seed_schema(&pool);
+            let id = Uuid::new_v4();
+            insert_entity(&pool, id, "original");
+            let before = entities_snapshot(&pool);
+            let access = fault_access(
+                &pool,
+                Fault::Request(WriterTaskRequestState::TransactionRolledBack),
+                true,
+            );
+            let result = run_atomic_unit(
+                &access,
+                vec![
+                    effect_plan(id),
+                    rename_plan(Uuid::new_v4(), "missing", "missing-target"),
+                ],
+            )
+            .await
+            .expect("confirmed rollback recovers the recorded refusal");
+            assert_eq!(
+                result,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed {
+                        statement_label: Some("missing-target".into()),
+                        expected: AffectedRowGuard::exactly(1),
+                        observed: 0,
+                    },
+                },
+            );
+            assert_eq!(*access.callback_result.lock().unwrap(), Some(false));
+            assert_eq!(entities_snapshot(&pool), before);
+        }
+
+        #[tokio::test]
+        async fn recorded_failure_does_not_mask_unknown_or_terminal_outcomes() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::TransactionRolledBack),
+            ] {
+                let pool = scratch_pool("recorded_uncertain");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let before = entities_snapshot(&pool);
+                let access = fault_access(&pool, fault, true);
+                let error = run_atomic_unit(
+                    &access,
+                    vec![
+                        effect_plan(id),
+                        rename_plan(Uuid::new_v4(), "missing", "missing-target"),
+                    ],
+                )
+                .await
+                .expect_err("a recorded refusal cannot replace the outer outcome");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), Some(false));
+                assert_eq!(entities_snapshot(&pool), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn failure_before_callback_cannot_manufacture_recorded_refusal() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::NotStarted),
+                Fault::Request(WriterTaskRequestState::TransactionRolledBack),
+                Fault::Terminated(WriterTaskRequestState::NotStarted),
+            ] {
+                let pool = scratch_pool("empty_failure_slot");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let before = entities_snapshot(&pool);
+                let access = fault_access(&pool, fault, false);
+                let error = run_atomic_unit(&access, vec![effect_plan(id)])
+                    .await
+                    .expect_err("an empty slot must preserve the outer failure");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), None);
+                assert_eq!(entities_snapshot(&pool), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn successful_callback_with_lost_acknowledgement_returns_no_commit_token() {
+            for fault in [
+                Fault::Request(WriterTaskRequestState::SideEffectsUnknown),
+                Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
+            ] {
+                let pool = scratch_pool("committed_ack_lost");
+                seed_schema(&pool);
+                let id = Uuid::new_v4();
+                insert_entity(&pool, id, "original");
+                let access = fault_access(&pool, fault, true);
+                let error = run_atomic_unit(&access, vec![effect_plan(id)])
+                    .await
+                    .expect_err("callback success is not a committed-effects token");
+                fault.assert_preserved(error.0);
+                assert_eq!(*access.callback_result.lock().unwrap(), Some(true));
+                let writer = pool.try_writer().expect("writer");
+                let name: String = writer
+                    .conn()
+                    .query_row(
+                        "SELECT name FROM entities WHERE id=?1",
+                        rusqlite::params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("persisted write");
+                assert_eq!(
+                    name, "changed",
+                    "the lost acknowledgement does not imply rollback"
+                );
+            }
         }
     }
 }
