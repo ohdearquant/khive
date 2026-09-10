@@ -37,6 +37,12 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
 
+fn file_url(path: &Path) -> String {
+    format!("file://{}", path.display())
+        .replace('%', "%25")
+        .replace(' ', "%20")
+}
+
 struct Fixture {
     _env_guard: tokio::sync::MutexGuard<'static, ()>,
     dir: tempfile::TempDir,
@@ -69,7 +75,7 @@ impl Fixture {
         let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
         let rival = git(&repo, &["commit-tree", &tree, "-p", &base, "-m", "rival"]);
         git(&repo, &["update-ref", "refs/heads/rival", &rival]);
-        let bare = dir.path().join("remote.git");
+        let bare = dir.path().join("remote % space.git");
         git(
             &repo,
             &[
@@ -181,7 +187,7 @@ impl Fixture {
         }
     }
     async fn file() -> Self {
-        Self::new(|bare| format!("file://{}", bare.display()), "").await
+        Self::new(file_url, "").await
     }
     async fn call(
         &self,
@@ -353,7 +359,7 @@ async fn local_gates_distinguish_https_platform_in_same_config() {
         .unwrap();
     assert_eq!(
         local["target"],
-        json!({"kind":"local","remote":format!("file://{}",f.bare.display()),"slug":"","visibility":"private"})
+        json!({"kind":"local","remote":file_url(&f.bare),"slug":"","visibility":"private"})
     );
     assert_eq!(
         platform["target"],
@@ -435,4 +441,23 @@ async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentia
         Disposition::Unknown
     );
     f.no_credential_read();
+}
+
+#[tokio::test]
+async fn local_file_url_rejects_decoded_controls_slashes_and_invalid_encoding() {
+    for remote in [
+        "file:///tmp/line%0Abreak.git",
+        "file:///tmp/line%0dbreak.git",
+        "file:///tmp/nul%00.git",
+        "file:///%2Fprivate/tmp/remote.git",
+        "file:///%2fprivate/tmp/remote.git",
+        "file://%2Fprivate/tmp/remote.git",
+        "file:///tmp/bad%",
+        "file:///tmp/bad%2",
+        "file:///tmp/bad%ZZ",
+        "file:///tmp/bad%FF",
+    ] {
+        let f = Fixture::new(|_| remote.into(), "").await;
+        f.refusal("git.push", f.push(), "remote_scheme").await;
+    }
 }

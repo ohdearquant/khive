@@ -193,6 +193,27 @@ fn after_effect(error: Failure) -> Failure {
     Failure::unknown(error.reason)
 }
 
+fn decode_file_path(path: &str) -> Result<String, Failure> {
+    if !path.starts_with('/') {
+        return Err(Failure::refused("remote_scheme"));
+    }
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let low = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                _ => return Err(Failure::refused("remote_scheme")),
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| Failure::refused("remote_scheme"))
+}
+
 impl GitPack {
     pub(crate) fn remote_repository(
         &self,
@@ -209,11 +230,15 @@ impl GitPack {
         if matches.next().is_some() {
             return Err(Failure::refused("repository_ambiguous"));
         }
-        let path = row.remote.strip_prefix("file://").unwrap_or(&row.remote);
+        // Git decodes file URL paths before opening them; plain paths keep literal '%'.
+        let path = match row.remote.strip_prefix("file://") {
+            Some(path) => decode_file_path(path)?,
+            None => row.remote.clone(),
+        };
         if row.slug.is_empty()
             && path.starts_with('/')
             && !path.starts_with("//")
-            && !row.remote.chars().any(char::is_control)
+            && !path.chars().any(char::is_control)
         {
             if !matches!(row.visibility.as_str(), "public" | "private" | "internal") {
                 return Err(Failure::refused("repository_identity"));

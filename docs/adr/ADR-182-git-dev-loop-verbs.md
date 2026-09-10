@@ -504,7 +504,10 @@ A repository mapping with `slug = ""` explicitly opts into a local remote: `remo
 is an absolute POSIX path or an authority-free `file:///absolute/path` URL, and
 `visibility` remains one of `public`, `private`, `internal`. Relative paths,
 file URLs with a host, double-leading-slash paths, control characters and other
-schemes (including `ssh://`) refuse `remote_scheme`. A local path with a nonempty
+schemes (including `ssh://`) refuse `remote_scheme`. File-URL paths are percent-decoded
+before these checks; malformed escapes or decoded non-UTF-8 paths also refuse.
+Encoded spaces remain supported, and ordinary absolute paths keep literal percent signs.
+A local path with a nonempty
 slug also refuses; HTTPS retains its owner/name slug and existing validation.
 
 ```toml
