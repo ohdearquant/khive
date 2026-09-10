@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{SqlStatement, SqlValue};
@@ -69,6 +70,7 @@ async fn benchmark_count_indexes() {
     })
     .unwrap();
     let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
     builder.register(KnowledgePack::new(runtime.clone()));
     let registry = builder.build().unwrap();
     execute(&runtime,
