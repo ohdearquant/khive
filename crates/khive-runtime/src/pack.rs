@@ -1839,6 +1839,18 @@ impl VerbRegistry {
         self.degrade_safe_verbs.contains(verb)
     }
 
+    /// Narrow transport replay opt-in. These trusted built-in handlers have no
+    /// domain mutations for any arguments. A repeated dispatch may append a new
+    /// ordinary audit row; its request id remains correlation, not deduplication.
+    /// Unknown and custom handlers cannot inherit safety from a name/category.
+    pub fn is_read_replay_safe(&self, verb: &str) -> bool {
+        self.degrade_safe_verbs.contains(verb)
+            && matches!(
+                verb,
+                "stats" | "comm.thread" | "comm.inbox" | "comm.unread" | "comm.delivered"
+            )
+    }
+
     /// White-box accessor for [`Self::admission_degrade_safe`], needed
     /// because the admission-pressure regression tests in
     /// `tests/read_verb_admission_exhaustion.rs` compile as a separate
@@ -5173,6 +5185,96 @@ pub(crate) mod tests {
             after_build,
             "a miss must not re-scan any pack's handlers() either"
         );
+    }
+
+    #[test]
+    fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
+        static HANDLERS: [HandlerDef; 5] = [
+            HandlerDef {
+                name: "stats",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.thread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.inbox",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.unread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.delivered",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+
+        for (owner, handlers) in [("kg", &HANDLERS[..1]), ("comm", &HANDLERS[1..])] {
+            for (name, trusted, expected) in [
+                (owner, true, true),
+                (owner, false, false),
+                ("custom-impostor", true, false),
+            ] {
+                let mut builder = VerbRegistryBuilder::new();
+                let pack = CountingHandlersPack {
+                    name,
+                    handlers,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                };
+                if trusted {
+                    builder.register_trusted(pack);
+                } else {
+                    builder.register(pack);
+                }
+                let registry = builder.build().expect("replay fixture registry");
+                for handler in handlers {
+                    assert_eq!(
+                        registry.is_read_replay_safe(handler.name),
+                        expected,
+                        "verb={}, owner={name}, trusted={trusted}",
+                        handler.name,
+                    );
+                }
+                assert!(!registry.is_read_replay_safe("unknown.read"));
+            }
+        }
+    }
+
+    #[test]
+    fn read_replay_rejects_a_trusted_opted_in_name_with_mutating_category() {
+        static HANDLERS: [HandlerDef; 1] = [HandlerDef {
+            name: "stats",
+            description: "same name with a state-changing contract",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CountingHandlersPack {
+            name: "kg",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = builder.build().expect("mutating fixture registry");
+        assert!(!registry.is_read_replay_safe("stats"));
     }
 
     /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's

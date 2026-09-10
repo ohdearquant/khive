@@ -551,9 +551,10 @@ enum ForwardOutcome {
         kind: std::io::ErrorKind,
         os_error_code: Option<i32>,
     },
-    /// Connected but the response could not be decoded — most likely a stale
-    /// daemon speaking a different wire format.
+    /// Invalid response framing/JSON or a response timeout after a full write.
     ParseFailure,
+    /// EOF/reset after a full write; distinct from malformed frames/timeouts.
+    ResponseLost,
     /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
     /// does not match [`PROTOCOL_VERSION`], in either direction. Below: the
     /// new-client + old-daemon scenario, implicit (a pre-versioning daemon ignores
@@ -583,6 +584,13 @@ fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
 }
 
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
+    try_forward_before(frame, None).await
+}
+
+async fn try_forward_before(
+    frame: &DaemonRequestFrame,
+    retry_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
     let sock = socket_path();
     #[cfg(test)]
     {
@@ -613,6 +621,7 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
         .unwrap_or_else(|| {
             tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
         });
+    let deadline = retry_deadline.map_or(deadline, |retry| retry.min(deadline));
 
     let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&sock)).await {
         Ok(Ok(s)) => s,
@@ -668,16 +677,24 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             // The request was sent but the daemon closed the connection before
-            // sending a response frame — likely a daemon crash or panic during
-            // dispatch. Treat as ParseFailure (not NoSocket): the request may
-            // already have committed, so the caller must return a terminal
-            // ambiguity error without lifecycle actions or local dispatch.
+            // sending a response frame. This does not establish why it closed
+            // or whether dispatch completed. Only classified reads can replay;
+            // mutations remain ambiguous, with no recovery or local fallback.
             tracing::warn!(
                 error = %e,
-                "daemon closed connection without sending a response \
-                 (crash during dispatch?) — returning terminal ambiguity"
+                "daemon response unavailable after full request write"
             );
-            return ForwardOutcome::ParseFailure;
+            return if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                ForwardOutcome::ResponseLost
+            } else {
+                ForwardOutcome::ParseFailure
+            };
         }
         Err(_elapsed) => {
             // The daemon never answered within the deadline. The write
@@ -736,6 +753,84 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             ForwardOutcome::ParseFailure
         }
     }
+}
+
+const HANDOVER_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const HANDOVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn bounded_retry_deadline() -> tokio::time::Instant {
+    let deadline = tokio::time::Instant::now() + HANDOVER_RETRY_WINDOW;
+    khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at)
+        .map_or(deadline, |caller| caller.min(deadline))
+}
+
+fn recorded_daemon_is_alive() -> bool {
+    std::fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .is_some_and(process_is_alive)
+}
+
+async fn sleep_until_retry(deadline: tokio::time::Instant) {
+    tokio::time::sleep_until((tokio::time::Instant::now() + HANDOVER_RETRY_INTERVAL).min(deadline))
+        .await;
+}
+
+struct ReadReplayBudget {
+    remaining: usize,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ReadReplayBudget {
+    fn new(enabled: bool) -> Self {
+        Self {
+            remaining: if enabled { 2 } else { 0 },
+            deadline: None,
+        }
+    }
+}
+
+async fn try_forward_with_read_replay(
+    frame: &DaemonRequestFrame,
+    replay: &mut ReadReplayBudget,
+    attempt_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
+    let outcome = try_forward_before(frame, attempt_deadline).await;
+    if !matches!(outcome, ForwardOutcome::ResponseLost) || replay.remaining == 0 {
+        return outcome;
+    }
+    let deadline = *replay.deadline.get_or_insert_with(|| {
+        let deadline = bounded_retry_deadline();
+        attempt_deadline.map_or(deadline, |attempt| attempt.min(deadline))
+    });
+    while replay.remaining > 0
+        && tokio::time::Instant::now() < deadline
+        && !khive_storage::request_read_is_cancelled()
+    {
+        sleep_until_retry(deadline).await;
+        if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled() {
+            break;
+        }
+        match try_forward_before(frame, Some(deadline)).await {
+            ForwardOutcome::NoSocket => {}
+            ForwardOutcome::ResponseLost => replay.remaining -= 1,
+            ForwardOutcome::Response(response)
+                if response.config_mismatch
+                    || response.namespace_mismatch
+                    || response.served_config_id.as_deref() != Some(frame.config_id.as_str()) =>
+            {
+                // A later identity rejection cannot erase the first dispatch
+                // or permit map_response to select local fallback.
+                return ForwardOutcome::ResponseLost;
+            }
+            other => return other,
+        }
+    }
+    // A read may have executed before losing its response. Even if its retry
+    // only saw missing sockets, never convert this to recovery/local fallback.
+    ForwardOutcome::ResponseLost
 }
 
 fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
@@ -1164,21 +1259,45 @@ async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Signal the daemon named by the PID file and remove its rendezvous files
-/// only after its PID is positively confirmed dead (caller holds the recovery
-/// lock). The PID is captured before SIGTERM and ownership is re-checked by
-/// [`remove_daemon_paths_if_still_stale`] immediately before unlinking.
-async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<(), RecoveryError> {
+#[derive(Debug, PartialEq, Eq)]
+enum PidFileSnapshot {
+    Missing,
+    Present(Vec<u8>),
+    Unreadable,
+}
+
+impl PidFileSnapshot {
+    fn read(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::Present(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Present(bytes) => std::str::from_utf8(bytes).ok()?.trim().parse().ok(),
+            Self::Missing | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Signal under the boot lock, but release it before waiting: the incumbent
+/// needs that same lock to finish its own shutdown cleanup.
+async fn kill_stale_daemon_inner(
+    exit_timeout: std::time::Duration,
+    boot_guard: Option<std::fs::File>,
+) -> Result<PidFileSnapshot, RecoveryError> {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let pid_file = pid_path();
-    let expected_pid = std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+    let expected_snapshot = PidFileSnapshot::read(&pid_file);
+    let expected_pid = expected_snapshot.pid();
 
-    if let Some(pid) = expected_pid {
-        let wait_for_exit = match classify_pid_identity(pid) {
+    let wait_for_exit = if let Some(pid) = expected_pid {
+        match classify_pid_identity(pid) {
             PidIdentity::KhiveDaemon => {
                 if let Ok(signed) = i32::try_from(pid) {
                     if signed > 0 {
@@ -1205,34 +1324,45 @@ async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<()
                 );
                 true
             }
-        };
+        }
+    } else {
+        false
+    };
+    drop(boot_guard);
+    if let Some(pid) = expected_pid {
         if wait_for_exit && !wait_for_process_exit(pid, exit_timeout).await {
             return Err(RecoveryError::IncumbentStillAlive { pid });
         }
     }
 
-    remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
-    Ok(())
+    Ok(expected_snapshot)
 }
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
-/// `expected_pid` was observed: the PID file must still name `expected_pid`,
+/// `expected_snapshot` was observed: the PID file must be unchanged or absent,
 /// and the socket path must not already have a live listener answering it.
 /// Either signal changing means a replacement daemon claimed the rendezvous
 /// between the observation and this call, and unlinking would delete its live
 /// paths instead of the truly-stale ones (#645).
-fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: Option<u32>) {
-    let current_pid = std::fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    if current_pid != expected_pid {
+fn remove_daemon_paths_if_still_stale(
+    pid_file: &std::path::Path,
+    expected_snapshot: &PidFileSnapshot,
+) -> bool {
+    let current_snapshot = PidFileSnapshot::read(pid_file);
+    if matches!(expected_snapshot, PidFileSnapshot::Unreadable)
+        || matches!(current_snapshot, PidFileSnapshot::Unreadable)
+    {
+        return false;
+    }
+    // Graceful incumbent cleanup may already have removed its own PID file.
+    if current_snapshot != PidFileSnapshot::Missing && &current_snapshot != expected_snapshot {
         tracing::warn!(
-            expected_pid = ?expected_pid,
-            current_pid = ?current_pid,
+            expected_pid = ?expected_snapshot.pid(),
+            current_pid = ?current_snapshot.pid(),
             "pid file changed during stale-daemon cleanup — a replacement daemon \
              already claimed it; skipping unlink to avoid deleting its live paths"
         );
-        return;
+        return false;
     }
 
     let sock = socket_path();
@@ -1241,17 +1371,27 @@ fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: 
     // that bound after our probe found the old one dead. Combined with the
     // PID-file recheck above, this closes the window even when the recovery
     // lock alone did not exclude the replacement's boot.
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        tracing::warn!(
-            socket = ?sock,
-            "a live listener now answers the daemon socket — skipping unlink to \
-             avoid deleting a replacement daemon's rendezvous"
-        );
-        return;
+    match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(_) => {
+            tracing::warn!(socket = ?sock, "live listener claimed rendezvous; skipping cleanup and launch");
+            return false;
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(_) => return false,
     }
 
-    let _ = std::fs::remove_file(pid_file);
-    let _ = std::fs::remove_file(&sock);
+    for path in [pid_file, sock.as_path()] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Outcome of the under-lock identity probe.
@@ -1358,6 +1498,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         Ok(
             ForwardOutcome::NoSocket
             | ForwardOutcome::ParseFailure
+            | ForwardOutcome::ResponseLost
             | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::Unreachable {
@@ -1667,18 +1808,30 @@ where
             Ok(RecoveryOutcome::Uncertain)
         }
         ProbeOutcome::Dead => {
-            // Also take the shared boot/recovery lock for the kill+spawn step
-            // itself, matching `acquire_recovery_lock`'s existing role of
-            // serializing this against the daemon server's own
-            // cleanup→bind→pid-write critical section. No deadlock risk: this
-            // is a distinct lock file from `recoverer_guard` above, acquired
-            // and dropped entirely within this arm.
+            let boot_lock = acquire_recovery_lock();
+            match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
+                ProbeOutcome::Alive | ProbeOutcome::Timeout => return Ok(RecoveryOutcome::Skipped),
+                ProbeOutcome::LockContended => return Ok(RecoveryOutcome::Uncertain),
+                ProbeOutcome::Dead => {}
+            }
+            let expected_snapshot = kill_stale_daemon_inner(exit_timeout, boot_lock).await?;
+            // Keep the recoverer-only lock throughout, but let graceful exit
+            // take the boot lock. An independently started successor can win
+            // while we wait, so recheck under the boot lock before unlink/spawn.
             let _boot_lock = acquire_recovery_lock();
-            kill_stale_daemon_inner(exit_timeout).await?;
-            launcher
-                .launch()
-                .map(RecoveryOutcome::Spawned)
-                .map_err(RecoveryError::Spawn)
+            match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
+                ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
+                ProbeOutcome::LockContended => Ok(RecoveryOutcome::Uncertain),
+                ProbeOutcome::Dead => {
+                    if !remove_daemon_paths_if_still_stale(&pid_path(), &expected_snapshot) {
+                        return Ok(RecoveryOutcome::Uncertain);
+                    }
+                    launcher
+                        .launch()
+                        .map(RecoveryOutcome::Spawned)
+                        .map_err(RecoveryError::Spawn)
+                }
+            }
         }
     };
     drop(recoverer_guard);
@@ -2304,6 +2457,16 @@ pub async fn forward_or_spawn_with_config_and_packs(
     db: Option<&str>,
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
+    forward_or_spawn_with_replay_policy(frame, config, db, packs, false).await
+}
+
+pub(crate) async fn forward_or_spawn_with_replay_policy(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+    replay_read_only: bool,
+) -> Option<Result<String, McpError>> {
     #[cfg(any(test, feature = "test-forward-seam"))]
     if let Some(intercepted) = test_forward_seam::intercept(frame, packs) {
         return intercepted;
@@ -2312,7 +2475,7 @@ pub async fn forward_or_spawn_with_config_and_packs(
         let exe = std::env::current_exe()?;
         spawn_daemon_with_exe_and_config(&exe, config, db, packs)
     };
-    forward_or_spawn_with(frame, &spawn).await
+    forward_or_spawn_with_policy(frame, &spawn, replay_read_only).await
 }
 
 /// Forward a request, spawning the daemon if needed, without an explicit
@@ -2419,11 +2582,49 @@ async fn forward_or_spawn_with<F>(
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
+    forward_or_spawn_with_policy(frame, spawn, false).await
+}
+
+async fn forward_or_spawn_with_policy<F>(
+    frame: &DaemonRequestFrame,
+    spawn: &F,
+    replay_read_only: bool,
+) -> Option<Result<String, McpError>>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
     }
 
-    match try_forward_inner(frame).await {
+    let mut replay = ReadReplayBudget::new(replay_read_only);
+    let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
+    if matches!(first, ForwardOutcome::NoSocket) && recorded_daemon_is_alive() {
+        let deadline = bounded_retry_deadline();
+        while matches!(first, ForwardOutcome::NoSocket)
+            && tokio::time::Instant::now() < deadline
+            && !khive_storage::request_read_is_cancelled()
+        {
+            sleep_until_retry(deadline).await;
+            if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled()
+            {
+                break;
+            }
+            first = try_forward_with_read_replay(frame, &mut replay, Some(deadline)).await;
+        }
+    }
+    if matches!(first, ForwardOutcome::NoSocket)
+        && (khive_storage::request_read_is_cancelled()
+            || khive_storage::capture_request_read_context()
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at()))
+    {
+        return Some(Err(daemon_mcp_error(
+            "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+            Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+        )));
+    }
+    match first {
         ForwardOutcome::Response(resp) => {
             return map_response(*resp, &frame.config_id, &frame.namespace)
         }
@@ -2435,7 +2636,7 @@ where
             kind,
             os_error_code,
         } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
-        ForwardOutcome::ParseFailure => {
+        ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
                 config_id = %config_id,
@@ -2514,11 +2715,12 @@ where
         }
     }
 
-    // Send the real frame exactly once now that a daemon is confirmed ready
+    // Send the real frame now that a daemon is confirmed ready
     // (or believed ready via Skipped). The connect attempt inside
     // `try_forward_inner` doubles as the readiness check — a `NoSocket`
     // outcome here just means "not listening yet" (nothing written), so keep
-    // retrying; any other outcome is terminal and returned immediately.
+    // retrying. Only the explicit read policy may replay a lost response;
+    // every other post-write outcome is terminal and returned immediately.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -2556,11 +2758,11 @@ where
                 BootFenceOutcome::HardError(err) => return Some(Err(err)),
             }
         }
-        match try_forward_inner(frame).await {
+        match try_forward_with_read_replay(frame, &mut replay, None).await {
             ForwardOutcome::Response(resp) => {
                 return map_response(*resp, &frame.config_id, &frame.namespace)
             }
-            ForwardOutcome::ParseFailure => {
+            ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
                     config_id = %config_id,
@@ -2687,6 +2889,368 @@ mod tests {
 
     const CFG: &str = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
     const NS: &str = "test";
+
+    mod handover {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        fn request(ops: &str) -> DaemonRequestFrame {
+            DaemonRequestFrame {
+                plan: false,
+                ops: ops.to_owned(),
+                presentation: None,
+                presentation_per_op: None,
+                namespace: NS.to_owned(),
+                actor_id: None,
+                process_ref: None,
+                visible_namespaces: Vec::new(),
+                config_id: CFG.to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                probe_only: false,
+                metrics_only: false,
+                format: None,
+                format_per_op: None,
+                from_wire: true,
+                request_id: Some(17),
+            }
+        }
+
+        fn isolate(dir: &std::path::Path) {
+            clear_daemon_env();
+            reset_counters();
+            std::env::set_var("KHIVE_SOCKET", dir.join("s"));
+            std::env::set_var("KHIVE_PID", dir.join("p"));
+            std::env::set_var("KHIVE_LOCK", dir.join("l"));
+            std::env::set_var("KHIVE_RECOVERER_LOCK", dir.join("r"));
+        }
+
+        fn never_spawn() -> std::io::Result<std::process::Child> {
+            panic!("socket handover must not spawn or invoke local fallback")
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn reconnect_waits_for_live_owner_socket_gap_without_recovery() {
+            let _cleanup = RecoveryTestGuard::new();
+            for refused in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let sock = socket_path();
+                std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+                if refused {
+                    drop(tokio::net::UnixListener::bind(&sock).unwrap());
+                }
+                let peer = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if refused {
+                        std::fs::remove_file(&sock).unwrap();
+                    }
+                    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let frame: DaemonRequestFrame =
+                        serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                    assert!(!frame.probe_only, "grace must not enter lifecycle probing");
+                    write_frame(
+                        &mut stream,
+                        &serde_json::to_vec(&frame_ok("gap-ok")).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    forward_or_spawn_with(&request("stats()"), &never_spawn),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.unwrap().unwrap(), "gap-ok");
+                peer.await.unwrap();
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn read_response_loss_replays_only_with_explicit_policy_and_keeps_identity() {
+            let _cleanup = RecoveryTestGuard::new();
+            for enabled in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let expected = request("comm.thread(id=\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\")");
+                let expected_json = serde_json::to_value(&expected).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let peer_calls = calls.clone();
+                let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+                let peer = tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = tokio::select! {
+                            _ = &mut done_rx => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        let bytes = read_frame(&mut stream).await.unwrap();
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                            expected_json
+                        );
+                        let attempt = peer_calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt > 0 {
+                            write_frame(
+                                &mut stream,
+                                &serde_json::to_vec(&frame_ok("replayed")).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    forward_or_spawn_with_policy(&expected, &never_spawn, enabled),
+                )
+                .await
+                .unwrap();
+                let _ = done_tx.send(());
+                if enabled {
+                    assert_eq!(result.unwrap().unwrap(), "replayed");
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+                peer.await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), if enabled { 2 } else { 1 });
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn read_replay_attempt_cap_and_identity_drift_stay_terminal() {
+            let _cleanup = RecoveryTestGuard::new();
+            for drift in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let peer_calls = calls.clone();
+                let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+                let peer = tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = tokio::select! {
+                            _ = &mut done_rx => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        read_frame(&mut stream).await.unwrap();
+                        let attempt = peer_calls.fetch_add(1, Ordering::SeqCst);
+                        if drift && attempt > 0 {
+                            let mut response = frame_ok("must-not-use");
+                            response.config_mismatch = true;
+                            response.served_config_id = Some("replacement-config".to_owned());
+                            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    forward_or_spawn_with_policy(&request("stats()"), &never_spawn, true),
+                )
+                .await
+                .unwrap();
+                let _ = done_tx.send(());
+                assert!(result.unwrap().is_err());
+                peer.await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), if drift { 2 } else { 3 });
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn replay_deadline_never_converts_lost_response_to_no_socket() {
+            let _cleanup = RecoveryTestGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            isolate(dir.path());
+            let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+            let peer = tokio::spawn(serve_crash_on_dispatch(listener));
+            let mut budget = ReadReplayBudget::new(true);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let outcome =
+                try_forward_with_read_replay(&request("stats()"), &mut budget, Some(deadline))
+                    .await;
+            assert!(matches!(outcome, ForwardOutcome::ResponseLost));
+            assert!(tokio::time::Instant::now() < deadline + Duration::from_millis(300));
+            peer.await.unwrap();
+            assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn reconnect_deadline_and_cancellation_prevent_fresh_recovery() {
+            let _cleanup = RecoveryTestGuard::new();
+            for cancel in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let canceller = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if cancel {
+                        tx.send(true).unwrap();
+                    }
+                    tx
+                });
+                let result = khive_storage::scope_request_read_cancellation(
+                    rx,
+                    khive_storage::scope_request_read_deadline(
+                        Duration::from_millis(60),
+                        forward_or_spawn_with(&request("stats()"), &never_spawn),
+                    ),
+                )
+                .await;
+                let error = result.unwrap().unwrap_err();
+                assert_eq!(error.data.unwrap()["reason"], "daemon_reconnect_expired");
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+                canceller.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn classified_reads_do_not_replay_malformed_timeout_or_protocol_failures() {
+            let _cleanup = RecoveryTestGuard::new();
+            for kind in ["malformed", "timeout", "protocol"] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let peer = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_frame(&mut stream).await.unwrap();
+                    match kind {
+                        "malformed" => write_frame(&mut stream, b"not-json").await.unwrap(),
+                        "protocol" => {
+                            let mut response = frame_ok("wrong-version");
+                            response.daemon_protocol_version = PROTOCOL_VERSION + 1;
+                            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                                .await
+                                .unwrap();
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(750)).await,
+                    }
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                });
+                let mut budget = ReadReplayBudget::new(true);
+                let deadline = tokio::time::Instant::now()
+                    + if kind == "timeout" {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(2)
+                    };
+                let outcome =
+                    try_forward_with_read_replay(&request("stats()"), &mut budget, Some(deadline))
+                        .await;
+                match kind {
+                    "protocol" => {
+                        assert!(matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }))
+                    }
+                    _ => assert!(matches!(outcome, ForwardOutcome::ParseFailure)),
+                }
+                assert_eq!(budget.remaining, 2);
+                peer.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "isolated subprocess fixture"]
+        async fn graceful_incumbent_child() {
+            assert_eq!(
+                std::env::var("KHIVE_HANDOVER_TEST_CHILD").as_deref(),
+                Ok("1")
+            );
+            let _signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            run_daemon(HarnessDispatch::new(NS, "old-config"))
+                .await
+                .unwrap();
+            if let Ok(successor) = std::env::var("KHIVE_HANDOVER_SUCCESSOR_PID") {
+                std::fs::write(pid_path(), successor).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn recovery_releases_boot_lock_for_graceful_exit_and_rechecks_owner() {
+            for successor_wins in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut cleanup = RecoveryTestGuard::new();
+                isolate(dir.path());
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "daemon::tests::handover::graceful_incumbent_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("HOME", dir.path())
+                    .current_dir(dir.path())
+                    .env("KHIVE_HANDOVER_TEST_CHILD", "1")
+                    .env_remove("KHIVE_HANDOVER_SUCCESSOR_PID")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if successor_wins {
+                    command.env(
+                        "KHIVE_HANDOVER_SUCCESSOR_PID",
+                        std::process::id().to_string(),
+                    );
+                }
+                let incumbent_pid = cleanup.track_child(command.spawn().unwrap());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !matches!(
+                    probe_daemon_identity("old-config", NS, 100).await,
+                    ProbeOutcome::Alive
+                ) {
+                    assert!(tokio::time::Instant::now() < deadline, "child readiness");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                FORCE_PID_IS_DAEMON.store(true, Ordering::SeqCst);
+                let launches = AtomicUsize::new(0);
+                let spawn = || {
+                    assert!(!process_is_alive(incumbent_pid));
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 0"])
+                        .spawn()
+                };
+                let result =
+                    kill_and_respawn_with_exit_timeout(CFG, NS, &spawn, Duration::from_secs(2))
+                        .await;
+                match (successor_wins, result) {
+                    (false, Ok(RecoveryOutcome::Spawned(mut child))) => {
+                        assert!(child.wait().unwrap().success());
+                    }
+                    (true, Ok(RecoveryOutcome::Uncertain)) => {}
+                    (_, other) => panic!("unexpected recovery outcome: {other:?}"),
+                }
+                assert!(cleanup.child_mut().wait().unwrap().success());
+                assert_eq!(
+                    launches.load(Ordering::SeqCst),
+                    usize::from(!successor_wins)
+                );
+                if successor_wins {
+                    assert_eq!(
+                        std::fs::read_to_string(pid_path()).unwrap(),
+                        std::process::id().to_string()
+                    );
+                }
+            }
+        }
+    }
 
     fn frame_ok(result: &str) -> DaemonResponseFrame {
         DaemonResponseFrame {
@@ -5524,7 +6088,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     #[serial_test::serial(config_ledger)]
-    async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
+    async fn try_forward_inner_returns_response_lost_when_daemon_closes_without_response() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -5570,9 +6134,9 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::ParseFailure),
+            matches!(outcome, ForwardOutcome::ResponseLost),
             "daemon crash (connection closed without response) must yield \
-             ParseFailure, not NoSocket — got a different variant"
+             ResponseLost, not NoSocket — got a different variant"
         );
 
         clear_daemon_env();
@@ -8155,7 +8719,10 @@ mod tests {
         std::fs::write(&pid_file, "4242").expect("write pid file");
         std::fs::write(&sock, "stale socket placeholder").expect("write stale sock placeholder");
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
 
         assert!(!pid_file.exists(), "unchanged pid file must be removed");
         assert!(!sock.exists(), "stale socket must be removed");
@@ -8174,7 +8741,10 @@ mod tests {
         std::fs::write(&pid_file, "5555").expect("write replacement pid file");
         std::fs::write(&sock, "replacement socket placeholder").expect("write sock placeholder");
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::Present(b"4242".to_vec()),
+        ));
 
         assert!(
             pid_file.exists(),
@@ -8202,7 +8772,10 @@ mod tests {
         // just before its own pid-write).
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind live socket");
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
 
         assert!(
             sock.exists(),
@@ -8213,6 +8786,52 @@ mod tests {
             "pid file must be left alone alongside the live socket"
         );
         clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_compares_malformed_pid_bytes() {
+        let _cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+
+        for contents in [
+            b"".as_slice(),
+            b"partial-pid".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            for changed in [false, true] {
+                std::fs::write(&pid_file, contents).expect("write incomplete pid file");
+                let expected_snapshot = PidFileSnapshot::read(&pid_file);
+                assert_eq!(expected_snapshot.pid(), None);
+                drop(std::os::unix::net::UnixListener::bind(&sock).expect("bind stale socket"));
+                let mut current_contents = contents.to_vec();
+                if changed {
+                    current_contents.push(b'\n');
+                    std::fs::write(&pid_file, &current_contents).expect("change pid file bytes");
+                }
+
+                assert_eq!(
+                    remove_daemon_paths_if_still_stale(&pid_file, &expected_snapshot),
+                    !changed,
+                );
+                if changed {
+                    assert_eq!(std::fs::read(&pid_file).unwrap(), current_contents);
+                    assert!(sock.exists(), "changed owner's socket must survive");
+                    std::fs::remove_file(&pid_file).unwrap();
+                    std::fs::remove_file(&sock).unwrap();
+                } else {
+                    assert!(
+                        !pid_file.exists(),
+                        "unchanged incomplete pid must be removed"
+                    );
+                    assert!(!sock.exists(), "unchanged stale socket must be removed");
+                }
+            }
+        }
     }
 
     // ── bridge self-heal on ProtocolMismatch (#714) ───────────────────────────

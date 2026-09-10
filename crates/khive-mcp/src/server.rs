@@ -3328,9 +3328,10 @@ type ForwardFuture = std::pin::Pin<
 /// the real function would receive. `config`/`db` are always `None` at this
 /// call site.
 #[cfg(unix)]
-type ForwardFnPtr = fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture;
+type ForwardFnPtr =
+    fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>, bool) -> ForwardFuture;
 
-/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
+/// Adapts the real `forward_or_spawn_with_replay_policy` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
 /// happened at the call site — so this boundary carries no logic a test
 /// spy could fail to observe.
@@ -3338,10 +3339,17 @@ type ForwardFnPtr = fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -
 fn forward_or_spawn_boxed(
     frame: khive_runtime::DaemonRequestFrame,
     packs: Option<Vec<String>>,
+    replay_read_only: bool,
 ) -> ForwardFuture {
     Box::pin(async move {
-        crate::daemon::forward_or_spawn_with_config_and_packs(&frame, None, None, packs.as_deref())
-            .await
+        crate::daemon::forward_or_spawn_with_replay_policy(
+            &frame,
+            None,
+            None,
+            packs.as_deref(),
+            replay_read_only,
+        )
+        .await
     })
 }
 
@@ -3418,9 +3426,15 @@ impl KhiveMcpServer {
         // side-effect-free preflight keeps the local and warm-daemon surfaces on
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
-        if let Err(error) = parse_request(&p.ops) {
-            return Err(dsl_err_to_mcp(error));
-        }
+        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        #[cfg(unix)]
+        let replay_read_only = !parsed.ops.is_empty()
+            && parsed
+                .ops
+                .iter()
+                .all(|op| self.registry.is_read_replay_safe(&op.tool));
+        #[cfg(not(unix))]
+        let _ = parsed;
 
         // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. An ordinary no-socket condition, a namespace
@@ -3481,7 +3495,7 @@ impl KhiveMcpServer {
                 .map(khive_storage::RequestReadDeadline::async_at);
             let mut forward_task =
                 tokio::spawn(khive_storage::inherit_request_read_context(async move {
-                    let outcome = forward_fn(frame, Some(resolved_packs)).await;
+                    let outcome = forward_fn(frame, Some(resolved_packs), replay_read_only).await;
                     tracing::debug!(
                         request_id,
                         daemon_outcome_present = outcome.is_some(),
@@ -5169,6 +5183,7 @@ mod tests {
         fn spy_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
             Box::pin(async {
@@ -5218,6 +5233,308 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    mod read_replay_tests {
+        use super::*;
+
+        thread_local! {
+            static CAPTURED_FORWARD: std::cell::RefCell<Option<(String, bool)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn capture_forward_policy(
+            frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            replay_read_only: bool,
+        ) -> ForwardFuture {
+            CAPTURED_FORWARD.with(|capture| {
+                *capture.borrow_mut() = Some((frame.ops, replay_read_only));
+            });
+            Box::pin(async { Some(Ok("forwarded-policy-fixture".to_string())) })
+        }
+
+        fn live_server() -> KhiveMcpServer {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string(), "comm".to_string(), "memory".to_string()],
+                ..RuntimeConfig::default()
+            })
+            .expect("in-memory replay registry");
+            KhiveMcpServer::new(runtime).expect("live kg, comm and memory handlers")
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn request_forward_policy_requires_every_operation_to_be_an_opted_in_read() {
+            let server = live_server();
+            let cases = [
+                ("stats()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("comm.inbox(wait_ms=30000, box=\"sent\", limit=1)", true),
+                ("comm.unread()", true),
+                (
+                    "comm.delivered(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("[stats(), comm.unread(), comm.inbox(limit=1)]", true),
+                ("stats() | comm.unread()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\") | \
+                     comm.thread(id=$prev.thread_id) | comm.thread(id=$prev.thread_id)",
+                    true,
+                ),
+                (
+                    r#"[{"tool":"stats"},{"tool":"comm.unread","args":{}}]"#,
+                    true,
+                ),
+                ("stats(help=true)", true),
+                ("comm.send(to=\"bob\", content=\"policy-fixture\")", false),
+                (
+                    "[comm.unread(), comm.send(to=\"bob\", content=\"policy-fixture\")]",
+                    false,
+                ),
+                (
+                    "comm.send(to=\"bob\", content=\"policy-fixture\") | comm.thread(id=$prev.id)",
+                    false,
+                ),
+                ("[stats(), unknown.read()]", false),
+                ("unknown.read()", false),
+                ("unknown.read(help=true)", false),
+                ("comm.send(help=true)", false),
+                ("stats() | comm.send(help=$prev.help)", false),
+                ("memory.prune(dry_run=true)", false),
+                ("merge(dry_run=true)", false),
+                (
+                    "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
+                    false,
+                ),
+                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
+                ("memory.recall(query=\"policy-fixture\")", false),
+                ("get(id=\"00000000-0000-0000-0000-000000000001\")", false),
+            ];
+
+            for (ops, expected) in cases {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let response = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("forward preflight rejected {ops}: {error}"));
+                assert_eq!(response, "forwarded-policy-fixture");
+                assert_eq!(
+                    CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                    Some((ops.to_string(), expected)),
+                    "forwarded replay policy for {ops}",
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn malformed_and_atomic_wrapper_requests_never_reach_forwarding() {
+            let server = live_server();
+            for ops in [
+                "",
+                "stats(",
+                "[stats(), comm.unread()",
+                r#"{"atomic":true,"ops":[{"tool":"stats"}]}"#,
+            ] {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let error = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .expect_err("invalid DSL must fail before forwarding");
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data["reason"].as_str()),
+                    Some("parse-error"),
+                );
+                assert!(CAPTURED_FORWARD.with(|capture| capture.borrow().is_none()));
+            }
+        }
+
+        struct ImpostorCommPack;
+
+        impl khive_types::Pack for ImpostorCommPack {
+            const NAME: &'static str = "comm";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+                name: "comm.thread",
+                description: "untrusted same-name replay fixture",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            }];
+        }
+
+        #[async_trait::async_trait]
+        impl khive_runtime::PackRuntime for ImpostorCommPack {
+            fn name(&self) -> &str {
+                <Self as khive_types::Pack>::NAME
+            }
+
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+                <Self as khive_types::Pack>::HANDLERS
+            }
+
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &khive_runtime::NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                panic!("the forwarding policy fixture must not dispatch locally")
+            }
+        }
+
+        #[tokio::test]
+        async fn custom_same_name_pack_cannot_enable_replay_at_request_boundary() {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(ImpostorCommPack);
+            let registry = builder.build().expect("custom comm fixture registry");
+            assert_eq!(
+                registry.verb_category("comm.thread"),
+                Some(khive_runtime::VerbCategory::Assertive),
+            );
+            let server = KhiveMcpServer::from_registry(registry);
+            let ops = "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")";
+            CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    capture_forward_policy,
+                )
+                .await
+                .expect("custom call reaches forwarding without replay permission");
+            assert_eq!(
+                CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                Some((ops.to_string(), false)),
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[serial_test::serial(config_ledger)]
+        async fn mixed_comm_batch_commits_once_when_its_daemon_response_is_lost() {
+            clear_daemon_env();
+            let dir = tempfile::tempdir().expect("mixed batch socket directory");
+            let socket = dir.path().join("khived.sock");
+            std::env::set_var("KHIVE_SOCKET", &socket);
+            std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+            let client = live_server();
+            let daemon = live_server();
+            let baseline = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client baseline");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon");
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let observed_mutations = Arc::clone(&mutations);
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon_task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        incoming = listener.accept() => incoming.expect("accept mixed batch"),
+                    };
+                    let payload = khive_runtime::daemon::read_frame(&mut stream)
+                        .await
+                        .expect("receive full mixed batch");
+                    let frame: khive_runtime::DaemonRequestFrame =
+                        serde_json::from_slice(&payload).expect("decode mixed batch frame");
+                    assert!(
+                        !frame.probe_only,
+                        "mixed response loss must not trigger recovery"
+                    );
+                    let response = daemon
+                        .dispatch_request_local(RequestParams {
+                            ops: frame.ops,
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("execute mixed batch before losing the response");
+                    let envelope: Value = serde_json::from_str(&response).expect("batch response");
+                    assert_eq!(envelope["summary"]["succeeded"], 2, "{envelope}");
+                    let committed = envelope["results"]
+                        .as_array()
+                        .expect("batch entries")
+                        .iter()
+                        .filter(|entry| entry["tool"] == "comm.send" && entry["ok"] == true)
+                        .count();
+                    observed_mutations.fetch_add(committed, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+
+            let result = client
+                .request(
+                    Parameters(RequestParams {
+                        ops: "[comm.unread(), comm.send(to=\"bob\", content=\"mixed-replay-fixture\")]"
+                            .to_string(),
+                        ..Default::default()
+                    }),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let _ = stop_tx.send(());
+            let stopped = daemon_task.await;
+            clear_daemon_env();
+            stopped.expect("fake daemon exits cleanly");
+
+            let error = result.expect_err("the mixed batch must preserve its ambiguous outcome");
+            assert!(error.message.contains("not retrying"), "{error}");
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                1,
+                "comm.send committed more than once"
+            );
+            let after = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client state after remote response loss");
+            assert_eq!(
+                stats_without_request_local_usage(&after),
+                stats_without_request_local_usage(&baseline),
+                "a lost mixed response must not dispatch comm.send locally",
+            );
+        }
+    }
+
     /// A cancellation notification after daemon admission must not replace the
     /// daemon's actual per-op outcome with a bare RPC-level error. The daemon
     /// response is the only source that can say which independent operations
@@ -5240,6 +5557,7 @@ mod tests {
         fn delayed_partial_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5323,6 +5641,7 @@ mod tests {
         fn unreachable_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             panic!("save_to must bypass daemon forwarding regardless of cancellation");
         }
@@ -5397,6 +5716,7 @@ mod tests {
         fn cancel_then_none_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             Box::pin(async move {
                 CANCEL_TX.with(|c| {
@@ -5488,6 +5808,7 @@ mod tests {
         fn slow_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5577,6 +5898,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5661,6 +5983,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5757,6 +6080,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
