@@ -38,7 +38,8 @@ An always-machine-readable copy of this page is at
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive. Its fifteen verbs are `git.digest` (read/ingest), the three
 write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
-with hardened, allowlisted argv construction, and the dev-loop verbs `git.checkout` /
+with hardened, allowlisted argv construction, the three read verbs `git.status` /
+`git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
 `git.pr_merge` (ADR-182). A remote `git.digest` source whose initial
 clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
