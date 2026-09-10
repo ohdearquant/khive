@@ -54,6 +54,10 @@ impl EmbedderProvider for CountingProvider {
 async fn embedding_surface() -> (KhiveRuntime, VerbRegistry, Arc<AtomicUsize>) {
     let model = EmbeddingModel::AllMiniLmL6V2;
     let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
         embedding_model: Some(model),
         ..RuntimeConfig::no_embeddings()
     })
