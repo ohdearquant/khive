@@ -8,8 +8,10 @@ use khive_types::{
 pub const PACK_NAME: &str = "tool";
 
 /// Tag carried by every registry object so listing and search can select
-/// the registry without a schema change.
-pub const REGISTRY_TAG: &str = "tool-registry";
+/// the registry without a schema change. Defined in the shared type crate
+/// because the generic entity verbs refuse to write a row that carries it,
+/// and one definition is what keeps the two sides from drifting apart.
+pub const REGISTRY_TAG: &str = khive_types::pack::TOOL_REGISTRY_TAG;
 
 /// Tag carried by every capability concept.
 pub const CAPABILITY_TAG: &str = "tool-capability";

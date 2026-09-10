@@ -396,3 +396,91 @@ async fn self_grant_is_refused() {
     let granted = f.call("tool.grant", json!({"id": id2})).await;
     assert_eq!(granted["grant"]["status"], json!("granted"));
 }
+
+// Arm 10: a registry row is opaque to the generic entity verbs. `update` and
+// `delete` refuse a row whose current tags carry the registry tag, and the
+// refusal reads those tags before the write, so stripping the tag is itself
+// refused. The pack's own verbs are unaffected.
+#[tokio::test]
+async fn registry_rows_are_opaque_to_the_generic_entity_verbs() {
+    let f = fixture();
+    let registered = f
+        .call(
+            "tool.register",
+            json!({
+                "name": "fetch_url",
+                "side_effect": "read",
+                "trust": "first_party",
+                "source": "mcp:web@1",
+            }),
+        )
+        .await;
+    let id = s(&registered["tool"], "full_id");
+
+    // The measured hole: moving `properties.source` under a registered name.
+    let err = f
+        .call_err(
+            "update",
+            json!({"id": id, "properties": {"source": "mcp:evil@1"}}),
+        )
+        .await;
+    assert!(
+        err.contains("tool-registry"),
+        "the refusal names the tag it read: {err}"
+    );
+    assert!(
+        err.contains("registering a new name"),
+        "the refusal says what to do instead: {err}"
+    );
+
+    // Strip-then-edit: the strip is the same write, read against the same
+    // pre-write tags, so it is refused by the same rule.
+    let err = f.call_err("update", json!({"id": id, "tags": []})).await;
+    assert!(err.contains("tool-registry"), "{err}");
+
+    let err = f.call_err("delete", json!({"id": id})).await;
+    assert!(err.contains("tool-registry"), "{err}");
+    assert!(err.contains("delete refuses"), "{err}");
+
+    // Nothing moved: the row still answers with its registered source, and the
+    // pack's own verb still writes it.
+    let described = f.call("tool.describe", json!({"tool": "fetch_url"})).await;
+    assert_eq!(described["tool"]["source"], json!("mcp:web@1"));
+    let again = f
+        .call(
+            "tool.register",
+            json!({"name": "fetch_url", "capabilities": ["http"]}),
+        )
+        .await;
+    assert_eq!(again["created"], json!(false));
+    assert_eq!(again["tool"]["full_id"], json!(id));
+}
+
+// Arm 11 (control): the rule keys on the registry tag, not on the entity kind
+// or the pack that is loaded. An untagged entity of the same kind still
+// updates and still deletes.
+#[tokio::test]
+async fn an_untagged_entity_still_updates_and_deletes() {
+    let f = fixture();
+    let created = f
+        .call(
+            "create",
+            json!({"kind": "entity", "entity_kind": "project", "name": "ordinary", "properties": {"source": "before"}}),
+        )
+        .await;
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let updated = f
+        .call(
+            "update",
+            json!({"id": id, "properties": {"source": "after"}}),
+        )
+        .await;
+    assert_eq!(
+        updated["properties"]["source"],
+        json!("after"),
+        "an untagged entity is still writable by the generic verb: {updated}"
+    );
+    let deleted = f.call("delete", json!({"id": id})).await;
+    assert_eq!(deleted["deleted"], json!(true));
+}
