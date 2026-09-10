@@ -336,6 +336,12 @@ its Amendment 2 defines them, `embed` defaulting by the note kind). Common to bo
   with `KhiveError::invalid_input` and writes nothing. An op string that names no member operation
   is not a shape error: it is that member's refusal, `unknown_op`, and the mode below decides
   whether it stops the batch or returns as the member's value.
+- Decision (2026-09-10): a batch names each `(kind, key)` write target at most once, in either
+  mode. A repeated target is a shape error (`invalid_input`, naming the member index), not a
+  per-member `key_conflict`: version observations are taken once before the first member runs, so
+  a second write to the same key inside one request would either observe a stale version or
+  conflict with its own sibling, and neither outcome is useful to a caller. Create-then-update is
+  two requests, the second carrying the version the first returned.
 - A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
   `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
   as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
