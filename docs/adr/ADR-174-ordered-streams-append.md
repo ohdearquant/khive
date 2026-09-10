@@ -656,6 +656,11 @@ No `key_conflict` case is added. A `write` member that creates a key another liv
 refuses with `key_conflict` and `existing_id` exactly as A1.1 says; an `observed` entry never creates
 anything, so it can only ever produce `version_conflict`.
 
+Correction (2026-09-10): the never-creates half stands, the reason set does not. An `observed` entry
+refuses with `version_conflict`, and since Amendment 5 also with `expired` and
+`live_until_unreadable`, and since Amendment 6 also with `identity_conflict`. It never refuses with
+`key_conflict`, which is what this paragraph is about and is what remains true of it.
+
 ### Acceptance
 
 Every arm names its command; the atomic-mode counts are read as domain events only, as in Amendment 1
@@ -854,6 +859,8 @@ An `observed` entry may carry `id`, the note identity it read:
 - `id` requires a positive version: with `version: null` the entry asserts no live holder, which no
   identity can be pinned against, so `id` with a null version is `invalid_input` before any member
   writes.
+- Every `details` value is a string as ADR-172 §2 requires: `key` and `kind` as given, `version` and
+  `index` as their decimal strings, `id` and `current_id` as the identity string reads return.
 - `id` is optional and additive. Everything Amendment 4 says about an entry without it still holds,
   and §A6.2 states what that entry means.
 
