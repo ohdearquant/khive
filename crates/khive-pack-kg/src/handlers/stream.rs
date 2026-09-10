@@ -13,6 +13,16 @@ use uuid::Uuid;
 use super::common::{canonical_note_kind, deser};
 use crate::KgPack;
 
+/// The most members one `stream.batch` call admits (ADR-174 Amendment 7). In
+/// atomic mode the whole list runs inside one writer transaction, so this is
+/// the bound on how long one caller may hold the single writer.
+pub(crate) const MAX_BATCH_MEMBERS: usize = 1000;
+
+/// The most `observed` entries one `stream.batch` call admits (ADR-174
+/// Amendment 7). Each entry is a read the batch performs while holding the
+/// writer only to decide whether to proceed.
+pub(crate) const MAX_BATCH_OBSERVED: usize = 100;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppendParams {
@@ -297,6 +307,22 @@ impl KgPack {
                 "stream.batch observed requires atomic mode: an observation set is a precondition for one transaction"
                     .into(),
             ));
+        }
+        // Admission bounds, before any member is parsed into an action, any
+        // note plan is prepared, or a writer is requested (ADR-174 A7.3).
+        if p.ops.len() > MAX_BATCH_MEMBERS {
+            return Err(RuntimeError::InvalidInput(format!(
+                "stream.batch admits at most {MAX_BATCH_MEMBERS} members; this call sent {}: the whole list runs inside one writer transaction",
+                p.ops.len()
+            )));
+        }
+        if let Some(entries) = observed.as_ref().and_then(Value::as_array) {
+            if entries.len() > MAX_BATCH_OBSERVED {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch admits at most {MAX_BATCH_OBSERVED} observed entries; this call sent {}: an observation is a read taken while holding the writer",
+                    entries.len()
+                )));
+            }
         }
         let fence = fence
             .map(|value| batch_fence(value, registry))
