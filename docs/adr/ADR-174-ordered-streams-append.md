@@ -743,6 +743,17 @@ An `observed` entry may carry `live_until`:
   per-member mode, every entry checked inside the writer transaction before the first write, the
   version half refusing exactly as Amendment 1 and Amendment 4 say.
 
+Correction (2026-09-10): an unreadable refusal does not carry the value. `live_until` is a
+caller-chosen path into a document the caller named but need not be able to read, so echoing
+whatever the path lands on turns one authorized `stream.batch` into a read of any field of that
+document. `live_until_unreadable` therefore carries `value_type` in place of `value`, one of
+`absent`, `null`, `boolean`, `number`, `string`, `array`, `object`, where `absent` is the path
+resolving to nothing and `null` is a JSON null found at it; the two are distinguished, which is
+what the earlier "the value found" left open for a field that is not there. `expired` keeps
+`value`: reaching it requires the field to have parsed as an RFC 3339 timestamp, so the value it
+names is the deadline the entry pinned, and the caller needs it beside `now` to see the window it
+lost. Acceptance arm 3 reads `value_type` and asserts `value` is absent.
+
 No predicate on the field's meaning is added. khive compares one timestamp with one clock; whether the
 field is a lease expiry, a handle deadline or anything else is the caller's convention, as the fence
 key's convention is (§2 alternatives, "the layer that owns the convention passes the fence").

@@ -110,13 +110,13 @@ async fn expiry_arm2_live_and_pinned_version() {
 
 #[tokio::test]
 async fn expiry_arm3_unreadable_fields_fail_closed() {
-    for found in [
-        None,
-        Some(json!("soon")),
-        Some(json!("2030-01-01T00:00:00")),
-        Some(json!(42)),
-        Some(json!({})),
-        Some(Value::Null),
+    for (found, value_type) in [
+        (None, "absent"),
+        (Some(json!("soon")), "string"),
+        (Some(json!("2030-01-01T00:00:00")), "string"),
+        (Some(json!(42)), "number"),
+        (Some(json!({})), "object"),
+        (Some(Value::Null), "null"),
     ] {
         let (rt, registry) = expiry_surface();
         let mut doc = json!({});
@@ -132,10 +132,10 @@ async fn expiry_arm3_unreadable_fields_fail_closed() {
             "lease",
         )
         .await;
-        assert_eq!(
-            error["details"]["value"],
-            found.unwrap_or(Value::Null).to_string()
-        );
+        // The value itself is never echoed here: the path is the caller's, so the
+        // refusal names the type it found and nothing of the document's contents.
+        assert_eq!(error["details"]["value_type"], value_type);
+        assert!(error["details"].get("value").is_none());
         assert_eq!(error["details"]["field"], "expires_at");
         assert_eq!(error["details"]["kind"], "head");
         assert_eq!(error["details"]["version"], "1");

@@ -301,10 +301,10 @@ async fn check_observed(
                 }
                 _ => Value::Null,
             };
-            let value = field
+            let found = field
                 .split('.')
-                .try_fold(&doc, |value, part| value.get(part))
-                .unwrap_or(&Value::Null);
+                .try_fold(&doc, |value, part| value.get(part));
+            let value = found.unwrap_or(&Value::Null);
             let deadline = value
                 .as_str()
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
@@ -324,11 +324,16 @@ async fn check_observed(
                     ("kind", entry.kind.clone()),
                     ("version", entry.version.unwrap().to_string()),
                     ("field", field.clone()),
-                    ("value", value.to_string()),
                     ("index", index.to_string()),
                 ];
                 if reason == "expired" {
+                    // Only a value that parsed as RFC 3339 is echoed, because that value is
+                    // the deadline the caller pinned. The path is caller-chosen, so echoing
+                    // whatever it lands on would read any field of the document back out.
+                    details.push(("value", value.to_string()));
                     details.push(("now", micros_to_iso(now)));
+                } else {
+                    details.push(("value_type", found.map_or("absent", json_type_name).into()));
                 }
                 return Ok(Some(
                     KhiveError::conflict("stream observation time precondition failed")
@@ -338,6 +343,19 @@ async fn check_observed(
         }
     }
     Ok(None)
+}
+
+/// The JSON type of a `live_until` field, which an unreadable refusal reports in
+/// place of the value itself.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 async fn observation_clock(writer: &mut dyn SqlWriter) -> Result<i64, StorageError> {

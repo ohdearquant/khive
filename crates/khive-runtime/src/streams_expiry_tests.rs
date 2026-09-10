@@ -54,9 +54,8 @@ async fn expiry_arm7_writer_clock_statement_trace_is_once_before_observations() 
             "the clock is evaluated by SQL, not passed from arrival time"
         );
         if expired {
-            let RuntimeError::Khive(error) = result.err().expect("equal deadline must refuse")
-            else {
-                panic!("structured refusal")
+            let Err(RuntimeError::Khive(error)) = result else {
+                panic!("an equal deadline must refuse with a structured error")
             };
             assert_eq!(error.details().unwrap().get("reason"), Some("expired"));
             assert_eq!(error.details().unwrap().get("key"), Some("expired"));
