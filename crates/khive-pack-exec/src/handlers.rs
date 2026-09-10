@@ -649,6 +649,10 @@ async fn preflight(
         .await
         .map_err(|e| e.to_string())?;
     receipt.cwd = cwd;
+    // Sandbox backend, last: every more specific refusal above still wins, and
+    // a host with no backend refuses here, naming the platform, instead of
+    // materializing a tree that could only ever fail at spawn.
+    sandbox::check_backend(sandbox::SANDBOX_EXEC)?;
     Ok(Ready {
         binary,
         registered,
@@ -834,7 +838,7 @@ async fn execute(
     } else {
         run_dir.join(&receipt.cwd)
     };
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    let mut command = Command::new(sandbox::SANDBOX_EXEC);
     command
         .arg("-f")
         .arg(&profile_path)
