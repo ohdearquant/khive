@@ -70,7 +70,7 @@ impl GitPack {
         let checkpoint_kind = format!("{kind}_checkpoint");
         // One SELECT snapshot cannot tear the atomically written pair. Limit
         // materialized value bytes even when a damaged row exceeds writer bounds.
-        let rows = self.runtime().sql().reader().await?.query(SqlStatement {
+        let rows = self.runtime().sql().reader().await?.query_all(SqlStatement {
             sql: "SELECT kind, updated_at, typeof(cursor_value) AS value_type, \
                   length(CAST(cursor_value AS BLOB)) AS value_bytes, \
                   CASE WHEN length(CAST(cursor_value AS BLOB)) <= ?4 THEN CAST(cursor_value AS BLOB) END AS value \
@@ -83,8 +83,8 @@ impl GitPack {
         let mut checkpoint = Value::Null;
         for row in rows {
             match row.get("kind") {
-                Some(SqlValue::Text(name)) if name == kind => cursor = render_row(&row)?,
-                Some(SqlValue::Text(name)) if name == &checkpoint_kind => {
+                Some(SqlValue::Text(name)) if name.as_str() == kind => cursor = render_row(&row)?,
+                Some(SqlValue::Text(name)) if name.as_str() == checkpoint_kind.as_str() => {
                     checkpoint = render_row(&row)?
                 }
                 _ => return Err(invalid_row()),
