@@ -1501,3 +1501,6 @@ mod mixed_fences;
 
 #[path = "stream_embedding_tests.rs"]
 mod embedding_tests;
+
+#[path = "stream_observed_id_tests.rs"]
+mod observed_id_tests;

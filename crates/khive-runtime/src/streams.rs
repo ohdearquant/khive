@@ -119,12 +119,14 @@ pub struct StreamWriteSpec {
     pub expected_version: Option<i64>,
 }
 
-/// An exact live-key observation; `None` asserts that the key is unheld.
+/// An exact live-key observation; a null version asserts that the key is unheld.
+/// An optional identity pins which live note must hold the key at that version.
 #[derive(Clone, Debug)]
 pub struct StreamObservation {
     pub key: String,
     pub kind: String,
     pub version: Option<i64>,
+    pub id: Option<Uuid>,
 }
 
 /// A batch member or its already established refusal. The mode places it.
@@ -278,20 +280,56 @@ async fn check_observed(
     observed: &[StreamObservation],
 ) -> Result<Option<KhiveError>, StorageError> {
     for (index, entry) in observed.iter().enumerate() {
-        let current = writer.query_scalar(SqlStatement {
-            sql: "SELECT version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
+        let current = writer.query_row(SqlStatement {
+            sql: "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
             params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
             label: Some("stream-batch-observed".into()),
         }).await?;
-        let current = match current {
-            None => None,
-            Some(SqlValue::Integer(version)) => Some(version),
-            Some(_) => {
-                return Err(StorageError::Internal(
-                    "invalid observed note version".into(),
-                ))
+        let current = current
+            .map(|row| {
+                let id = match row.get("id") {
+                    Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|_| {
+                        StorageError::Internal("invalid observed note identity".into())
+                    })?,
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "invalid observed note identity".into(),
+                        ))
+                    }
+                };
+                let version = match row.get("version") {
+                    Some(SqlValue::Integer(version)) => *version,
+                    _ => {
+                        return Err(StorageError::Internal(
+                            "invalid observed note version".into(),
+                        ))
+                    }
+                };
+                Ok::<_, StorageError>((id, version))
+            })
+            .transpose()?;
+        // No live holder is the existing version conflict. Identity conflict
+        // specifically names a replacement, so current_id is always present.
+        if let (Some(asserted), Some((current_id, _))) = (entry.id, current) {
+            if asserted != current_id {
+                let version = entry.version.ok_or_else(|| {
+                    StorageError::Internal("identity observation missing version".into())
+                })?;
+                return Ok(Some(
+                    KhiveError::conflict("stream observation identity precondition failed")
+                        .with_details(Details::new_owned(vec![
+                            ("reason", "identity_conflict".into()),
+                            ("key", entry.key.clone()),
+                            ("kind", entry.kind.clone()),
+                            ("version", version.to_string()),
+                            ("id", asserted.to_string()),
+                            ("current_id", current_id.to_string()),
+                            ("index", index.to_string()),
+                        ])),
+                ));
             }
-        };
+        }
+        let current = current.map(|(_, version)| version);
         if current != entry.version {
             let mut details = vec![
                 ("reason", "version_conflict".into()),
@@ -1032,6 +1070,11 @@ impl KhiveRuntime {
             self.validate_note_kind(&fence.kind)?;
         }
         for entry in &observed {
+            if entry.id.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "observed id requires a positive version".into(),
+                ));
+            }
             crate::keyed_memory::validate_memory_key(&entry.key)?;
             self.validate_note_kind(&entry.kind)?;
             if entry.version.is_some_and(|version| version < 1) {

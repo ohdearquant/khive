@@ -8,6 +8,7 @@ use khive_types::{Details, KhiveError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 use super::common::{canonical_note_kind, deser};
 use crate::KgPack;
@@ -96,6 +97,7 @@ struct ObservedMember {
     key: String,
     kind: String,
     version: Option<i64>,
+    id: Option<Uuid>,
 }
 
 fn batch_fence(value: Value, registry: &VerbRegistry) -> Result<NoteFence, RuntimeError> {
@@ -125,6 +127,11 @@ fn batch_observed(
                 )));
             }
             let entry: ObservedMember = deser(entry)?;
+            if entry.id.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "observed id requires a positive version".into(),
+                ));
+            }
             NoteWriteOptions {
                 key: Some(entry.key.clone()),
                 expected_version: entry.version,
@@ -135,6 +142,7 @@ fn batch_observed(
                 key: entry.key,
                 kind: canonical_note_kind(&entry.kind, registry)?,
                 version: entry.version,
+                id: entry.id,
             })
         })
         .collect()

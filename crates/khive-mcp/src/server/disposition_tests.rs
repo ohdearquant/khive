@@ -1706,3 +1706,28 @@ fn ordered_fences_refusal_has_no_domain_commit() {
         assert_eq!(value["details"].get("index").and_then(Value::as_str), index);
     }
 }
+
+#[test]
+fn observed_id_arm1_named_identity_refusal_is_not_committed() {
+    let details = khive_types::Details::new_owned(vec![
+        ("reason", "identity_conflict".into()),
+        ("key", "lease".into()),
+        ("kind", "head".into()),
+        ("version", "1".into()),
+        ("id", uuid::Uuid::nil().to_string()),
+        ("current_id", uuid::Uuid::new_v4().to_string()),
+        ("index", "0".into()),
+    ]);
+    let error =
+        khive_types::KhiveError::conflict("stream observation identity precondition failed")
+            .with_details(details);
+    let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+    assert_eq!(value["domain_disposition"], "not_committed");
+    assert_eq!(value["details"]["reason"], "identity_conflict");
+    assert_eq!(value["details"]["version"], "1");
+    let unknown = runtime_error_value(
+        khive_types::KhiveError::conflict("unestablished outcome").into(),
+        DomainDisposition::Unknown,
+    );
+    assert_eq!(unknown["domain_disposition"], "unknown");
+}
