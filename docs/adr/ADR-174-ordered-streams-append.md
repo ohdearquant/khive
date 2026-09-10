@@ -501,6 +501,9 @@ Two acceptance items are corrected here on findings from the first implementatio
 
 ### A3.1 `embed` on `stream.append` and on batch append members
 
+**Implementation (2026-09-10):** Single appends and batch append members default to no embedding,
+accept explicit embedding and model selection, and refuse a model without `embed=true` before writes.
+
 `stream.append(..., embed=false, embedding_model=None)`. `embed` defaults to `false`. An entry appended
 with `embed=false` gets no embedding rows and no vector-index work, and is never a candidate for
 similarity `search` or `recall`; lexical indexing and `list` are unchanged, so it stays findable by text

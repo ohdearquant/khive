@@ -107,6 +107,8 @@ fn append(stream: &str, expected_seq: Option<i64>) -> StreamBatchMember {
         stream: stream.into(),
         record: json!({"event": "batch"}),
         expected_seq,
+        embed: Some(true),
+        embedding_model: None,
         note_kind: "observation".into(),
         tags: None,
         fence: None,
