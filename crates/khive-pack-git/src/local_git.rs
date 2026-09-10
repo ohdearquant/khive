@@ -613,10 +613,16 @@ pub(crate) async fn write_manifest_tree(
             .or_default()
             .push(GitEntry {
                 name: name.to_string(),
-                mode: if entry.mode == 755 {
-                    "100755"
-                } else {
-                    "100644"
+                mode: match entry.mode {
+                    644 => "100644",
+                    755 => "100755",
+                    120000 => "120000",
+                    _ => {
+                        return Err(LocalGitError::new(
+                            "invalid_params",
+                            "tree entry mode must be 644, 755, or 120000",
+                        ))
+                    }
                 },
                 kind: "blob",
                 oid,
@@ -1395,6 +1401,113 @@ pub(crate) async fn log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_roundtrip_preserves_git_symlink_modes_and_target_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo directory");
+        run_async(&repo, &["init", "-q", "--template="], None)
+            .await
+            .expect("initialize fixture");
+        std::fs::write(repo.join("file.txt"), b"file contents\n").expect("file");
+        std::fs::create_dir(repo.join("dir")).expect("directory");
+        std::fs::write(repo.join("dir/nested.txt"), b"nested contents\n").expect("nested file");
+        for (path, target) in [
+            ("file-link", b"./file.txt".as_slice()),
+            ("directory-link", b"./dir".as_slice()),
+            ("dangling-link", b"../missing-\xff".as_slice()),
+        ] {
+            symlink(OsStr::from_bytes(target), repo.join(path)).expect("symlink");
+        }
+        run_async(&repo, &["add", "--all"], None)
+            .await
+            .expect("index fixture");
+        let original = oid_output(
+            &run_async(&repo, &["write-tree"], None)
+                .await
+                .expect("original tree"),
+        )
+        .expect("tree object id");
+
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(dir.path().join("runtime.db")),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        let blobs = khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0)
+            .expect("fixture blob store");
+        rt.install_blob_store(std::sync::Arc::new(blobs))
+            .expect("install blob store");
+        let store = tree::blob_store(&rt).expect("blob store");
+        let listing = run_async(&repo, &["ls-files", "-s", "-z"], None)
+            .await
+            .expect("index listing");
+        let mut entries = Vec::new();
+        let mut symlinks = 0;
+        for record in listing
+            .split(|byte| *byte == 0)
+            .filter(|row| !row.is_empty())
+        {
+            let tab = record.iter().position(|byte| *byte == b'\t').unwrap();
+            let metadata = std::str::from_utf8(&record[..tab]).unwrap();
+            let fields: Vec<_> = metadata.split_whitespace().collect();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[2], "0", "fixture must have no unmerged entries");
+            let mode = match fields[0] {
+                "100644" => 644,
+                "100755" => 755,
+                "120000" => {
+                    symlinks += 1;
+                    120000
+                }
+                mode => panic!("unexpected index mode {mode}"),
+            };
+            let path = std::str::from_utf8(&record[tab + 1..]).unwrap();
+            let bytes = run_async(&repo, &["cat-file", "blob", fields[1]], None)
+                .await
+                .expect("index blob");
+            if mode == 120000 {
+                assert_eq!(
+                    bytes,
+                    std::fs::read_link(repo.join(path))
+                        .expect("literal target")
+                        .as_os_str()
+                        .as_bytes()
+                );
+            }
+            let content = store.put(bytes).await.expect("store index blob");
+            entries.push(serde_json::json!({"path":path,"ref":content.as_str(),"mode":mode}));
+        }
+        assert_eq!(symlinks, 3, "all three symlinks must be indexed as links");
+        let manifest = tree::store_from_value(&rt, &serde_json::json!(entries))
+            .await
+            .expect("store manifest");
+        let roundtrip = write_manifest_tree(&rt, &repo, &manifest)
+            .await
+            .expect("write manifest tree");
+        assert_eq!(roundtrip, original);
+        let diff = run_async(
+            &repo,
+            &[
+                "diff-tree",
+                "-r",
+                "-p",
+                "--no-ext-diff",
+                &original,
+                &roundtrip,
+            ],
+            None,
+        )
+        .await
+        .expect("roundtrip diff");
+        assert!(diff.is_empty(), "roundtrip must have no git differences");
+    }
 
     #[test]
     fn listing_preserves_delimiters_and_refuses_unsupported_modes() {

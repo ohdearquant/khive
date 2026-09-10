@@ -48,6 +48,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+khive-db = { version = "0.8.0", path = "../khive-db" }
 khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }

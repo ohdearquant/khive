@@ -2170,6 +2170,48 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ---
 
+## `exec` tree manifests
+
+The exec pack uses immutable `khive-tree/v1` manifests, also consumed by Git tree
+operations. See [ADR-181](../adr/ADR-181-exec-verb-sandboxed-run.md) for run and
+sandbox semantics.
+
+### `exec.tree`, `exec.tree_get`, `exec.tree_put`, `exec.tree_diff`
+
+| Verb             | Parameters                                                      | Result                           |
+| ---------------- | --------------------------------------------------------------- | -------------------------------- |
+| `exec.tree`      | `entries: [{path, ref, mode}]`                                  | `{tree}`                         |
+| `exec.tree_get`  | `tree`                                                          | `{tree, entries}`                |
+| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?}]` | `{tree, base, entries, changed}` |
+| `exec.tree_diff` | `base`, `head`                                                  | `{base, head, changed}`          |
+
+Entry modes are decimal `644` (file), `755` (executable file) or `120000`
+(symlink). A symlink's blob holds its literal target bytes, without an added
+newline or normalization. Entry paths must be relative and normalized, with no
+duplicates or entries below a file or symlink path. Empty `entries` is an empty
+tree. The schema string remains `khive-tree/v1`; existing file-only manifests
+remain valid.
+
+A put edit supplies exactly one of `ref`, `content` (UTF-8 text), or
+`delete: true`. Use `ref` for arbitrary target bytes. Its optional mode preserves
+an existing mode or defaults to `644` for a new path; deletes cannot carry a mode.
+Retargeting a link or switching between a symlink and a file is `modified`.
+Unsupported modes, duplicate edit paths and deletion of a missing path refuse
+the call without publishing a new tree.
+
+`exec.run` materializes real symlinks, including absolute or escaping targets.
+Seatbelt constrains access to resolved targets; `declared_write_paths` names
+tree-relative paths and does not expand sandbox access. Capture records link
+targets without following them, never descends through directory symlinks, and
+reports link additions, retargeting, removal and mode changes in `changed`.
+Sockets, FIFOs and devices remain skipped.
+
+`git.diff(input_kind="trees")` preserves symlink mode `120000` and target blobs,
+so its patches use Git's native symlink and file-conversion representation.
+This does not change the separate `git.checkout` symlink-refusal contract.
+
+---
+
 ## `git` pack — 15 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs

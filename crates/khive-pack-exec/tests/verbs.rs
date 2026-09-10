@@ -19,6 +19,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_keep(false)
+}
+
+fn fixture_with_keep(keep: bool) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
@@ -32,7 +36,7 @@ fn fixture() -> Fixture {
             max_output_bytes: Some(128),
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
-            keep: false,
+            keep,
             limits: Default::default(),
         },
         // No embedding model: tool.register would otherwise build the default
@@ -262,6 +266,141 @@ async fn tree_put_applies_edits_and_leaves_the_base_tree_alone() {
 }
 
 #[tokio::test]
+async fn tree_put_preserves_symlink_targets_and_classifies_mode_flips() {
+    let f = fixture();
+    let base = f
+        .tree(&[("plain", b"target", 644), ("executable", b"target", 755)])
+        .await;
+    let target_ref = f.put(b"target").await;
+    let created = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": base, "edits": [
+                { "path": "link", "content": "./target", "mode": 120000 },
+                { "path": "plain", "ref": target_ref, "mode": 120000 },
+                { "path": "executable", "ref": target_ref, "mode": 120000 },
+            ]}),
+        )
+        .await;
+    let linked = created["tree"].as_str().unwrap();
+    let entries = entries_of(&f, linked).await;
+    assert!(entries.iter().all(|(_, _, mode)| *mode == 120000));
+    assert_eq!(entries[1].1, f.put(b"./target").await);
+    let changes: Vec<(&str, &str)> = created["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["op"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("executable", "modified"),
+            ("link", "added"),
+            ("plain", "modified"),
+        ]
+    );
+    assert_eq!(
+        created["changed"],
+        f.call("exec.tree_diff", json!({ "base": base, "head": linked }))
+            .await["changed"]
+    );
+
+    let retargeted = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": linked, "edits": [
+                { "path": "link", "content": "../other" },
+                { "path": "plain", "content": "target", "mode": 644 },
+                { "path": "executable", "ref": target_ref, "mode": 755 },
+            ]}),
+        )
+        .await;
+    let head = retargeted["tree"].as_str().unwrap();
+    assert_eq!(
+        entries_of(&f, head).await,
+        vec![
+            ("executable".into(), target_ref.clone(), 755),
+            ("link".into(), f.put(b"../other").await, 120000),
+            ("plain".into(), target_ref.clone(), 644),
+        ]
+    );
+    assert_eq!(retargeted["changed"].as_array().unwrap().len(), 3);
+    assert!(retargeted["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|change| change["op"] == "modified"));
+    assert_eq!(
+        retargeted["changed"],
+        f.call("exec.tree_diff", json!({ "base": linked, "head": head }))
+            .await["changed"]
+    );
+
+    let deleted = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": head, "edits": [{ "path": "link", "delete": true }] }),
+        )
+        .await;
+    assert_eq!(deleted["changed"].as_array().unwrap().len(), 1);
+    assert_eq!(deleted["changed"][0]["path"], "link");
+    assert_eq!(deleted["changed"][0]["op"], "deleted");
+    assert_eq!(
+        deleted["tree"], base,
+        "all original file modes are restored"
+    );
+    assert_eq!(entries_of(&f, linked).await, entries, "trees are immutable");
+}
+
+#[tokio::test]
+async fn tree_symlink_mode_does_not_allow_invalid_modes_or_descendant_entries() {
+    let f = fixture();
+    let target_ref = f.put(b"../outside").await;
+    let tree = f.tree(&[("link", b"../outside", 120000)]).await;
+    assert_eq!(
+        entries_of(&f, &tree).await,
+        vec![("link".into(), target_ref.clone(), 120000)]
+    );
+    for mode in [777, 0o120777, 0o120000, 100644] {
+        let err = f
+            .call_err(
+                "exec.tree",
+                json!({ "entries": [{ "path": "link", "ref": target_ref, "mode": mode }] }),
+            )
+            .await;
+        assert!(err.contains("mode"), "{err}");
+        let err = f
+            .call_err(
+                "exec.tree_put",
+                json!({ "tree": tree, "edits": [{ "path": "link", "ref": target_ref, "mode": mode }] }),
+            )
+            .await;
+        assert!(err.contains("mode"), "{err}");
+    }
+    let err = f
+        .call_err(
+            "exec.tree",
+            json!({ "entries": [
+                { "path": "link", "ref": target_ref, "mode": 120000 },
+                { "path": "link/child", "ref": target_ref, "mode": 644 },
+            ]}),
+        )
+        .await;
+    assert!(err.contains("link"), "{err}");
+    let before = blob_object_count(&f);
+    let err = f
+        .call_err(
+            "exec.tree_put",
+            json!({ "tree": tree, "edits": [{ "path": "link/child", "content": "child" }] }),
+        )
+        .await;
+    assert!(err.contains("link"), "{err}");
+    assert_eq!(blob_object_count(&f), before);
+    assert_eq!(entries_of(&f, &tree).await.len(), 1);
+}
+
+#[tokio::test]
 async fn tree_put_deletes_only_paths_the_tree_holds() {
     let f = fixture();
     let base = f.tree(&[("a", b"1", 644), ("b", b"2", 644)]).await;
@@ -346,12 +485,12 @@ async fn tree_put_refuses_edits_that_do_not_name_exactly_one_action() {
         ),
         (
             json!([{ "path": "a", "content": "x", "mode": 777 }]),
-            "644 or 755",
+            "644, 755 or 120000",
         ),
         (json!([{ "path": "../escape", "content": "x" }]), "escape"),
         (
             json!([{ "path": "a", "content": "x", "mode": 0o644 }]),
-            "644 or 755",
+            "644, 755 or 120000",
         ),
     ] {
         let err = f
@@ -673,6 +812,263 @@ async fn run_captures_output_changes_and_receipt() {
         .collect();
     assert_eq!(kinds, vec!["materialized", "launched", "exited"]);
     assert!(root_is_empty(&f));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_captures_symlink_creation_retargeting_removal_and_mode_flips() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f
+        .tree(&[
+            ("target", b"body", 644),
+            ("dir/file", b"nested", 644),
+            ("retarget", b"target", 120000),
+            ("remove", b"target", 120000),
+            ("to-file", b"target", 120000),
+            ("to-link", b"target", 644),
+        ])
+        .await;
+    let script = "set -e; ln -s './dir/../target' created; \
+        rm retarget; ln -s dir/file retarget; rm remove; ln -s dir dir-link; \
+        rm to-file; printf target > to-file; rm to-link; ln -s target to-link";
+    let out = f
+        .call(
+            "exec.run",
+            json!({ "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local" }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["skipped"], json!([]));
+    let changed: Vec<(&str, &str)> = out["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["op"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        changed,
+        vec![
+            ("created", "added"),
+            ("dir-link", "added"),
+            ("remove", "deleted"),
+            ("retarget", "modified"),
+            ("to-file", "modified"),
+            ("to-link", "modified"),
+        ]
+    );
+    let head = receipt["tree_out"].as_str().unwrap();
+    assert_eq!(
+        entries_of(&f, head).await,
+        vec![
+            ("created".into(), f.put(b"./dir/../target").await, 120000),
+            ("dir-link".into(), f.put(b"dir").await, 120000),
+            ("dir/file".into(), f.put(b"nested").await, 644),
+            ("retarget".into(), f.put(b"dir/file").await, 120000),
+            ("target".into(), f.put(b"body").await, 644),
+            ("to-file".into(), f.put(b"target").await, 644),
+            ("to-link".into(), f.put(b"target").await, 120000),
+        ],
+        "directory links are entries, and their descendants are never captured"
+    );
+    assert_eq!(
+        out["changed"],
+        f.call("exec.tree_diff", json!({ "base": tree, "head": head }))
+            .await["changed"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_denies_writes_through_escaping_symlinks_and_allows_inside_targets() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let outside = f._dir.path().join("outside.txt");
+    std::fs::write(&outside, b"unchanged").expect("outside control file");
+    for target in [
+        b"../../outside.txt".as_slice(),
+        outside.as_os_str().as_bytes(),
+    ] {
+        let tree = f
+            .tree(&[
+                ("inside", b"before", 644),
+                ("inside-link", b"inside", 120000),
+                ("escape", target, 120000),
+            ])
+            .await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({
+                    "tree": tree, "tool": "sh", "actor": "local",
+                    "args": ["-c", "set -e; printf changed > inside-link; printf escaped > escape"],
+                    "declared_write_paths": ["inside", "inside-link", "escape"],
+                }),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_ne!(receipt["exit_code"], 0, "{receipt}");
+        assert_eq!(receipt["success"], false, "{receipt}");
+        assert_eq!(receipt["denied"], false, "the tool was launched: {receipt}");
+        let stderr = f.blob_text(&receipt["stderr_ref"]).await;
+        assert!(
+            stderr.contains("ermitted") || stderr.contains("ermission"),
+            "the kernel refusal must be reported in stderr: {stderr:?}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+        assert_eq!(receipt["undeclared_changes"], json!([]));
+        assert_eq!(
+            entries_of(&f, receipt["tree_out"].as_str().unwrap()).await,
+            vec![
+                ("escape".into(), f.put(target).await, 120000),
+                ("inside".into(), f.put(b"changed").await, 644),
+                ("inside-link".into(), f.put(b"inside").await, 120000),
+            ],
+            "the inside write control succeeds while the outside target stays unchanged"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_materialized_symlinks_round_trip_losslessly_through_git() {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::process::Command;
+
+    let f = fixture_with_keep(true);
+    f.register_sh("sh", "allow").await;
+    let repo = tempfile::tempdir().expect("git fixture");
+    let git_dir = repo.path().join(".git");
+    let git = |worktree: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("--work-tree")
+            .arg(worktree)
+            .args(["-c", "core.symlinks=true", "-c", "core.filemode=true"])
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .expect("launch fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(repo.path(), &["init", "--quiet"]);
+    std::fs::write(repo.path().join("target.txt"), b"payload\n").unwrap();
+    std::fs::create_dir(repo.path().join("dir")).unwrap();
+    std::fs::write(repo.path().join("dir/child.txt"), b"nested\n").unwrap();
+    for (name, target) in [
+        ("file-link", "target.txt"),
+        ("dir-link", "dir"),
+        ("dangling-link", "missing"),
+    ] {
+        symlink(target, repo.path().join(name)).expect("tracked fixture symlink");
+    }
+    git(repo.path(), &["add", "--force", "--all", "."]);
+    let original = String::from_utf8(git(repo.path(), &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let index = String::from_utf8(git(repo.path(), &["ls-files", "-s", "-z"]))
+        .expect("fixture index paths are UTF-8");
+    let mut manifest = Vec::new();
+    let mut symlinks = 0;
+    for entry in index.split('\0').filter(|entry| !entry.is_empty()) {
+        let (header, path) = entry.split_once('\t').expect("git index entry");
+        let mut fields = header.split_whitespace();
+        let mode = match fields.next().expect("git mode") {
+            "100644" => 644,
+            "100755" => 755,
+            "120000" => {
+                symlinks += 1;
+                120000
+            }
+            mode => panic!("unexpected fixture mode: {mode}"),
+        };
+        let object = fields.next().expect("git blob id");
+        assert_eq!(fields.next(), Some("0"));
+        let bytes = git(repo.path(), &["cat-file", "blob", object]);
+        manifest.push(json!({ "path": path, "ref": f.put(&bytes).await, "mode": mode }));
+    }
+    assert_eq!(symlinks, 3, "the source index must contain actual symlinks");
+    let input = f.call("exec.tree", json!({ "entries": manifest })).await;
+    let tree = input["tree"].as_str().unwrap();
+    let out = f
+        .call(
+            "exec.run",
+            json!({ "tree": tree, "tool": "sh", "args": ["-c", ":"], "actor": "local" }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["success"], true, "{receipt}");
+    let materialized = f.root.join(receipt["id"].as_str().unwrap());
+
+    // Git reads the actual materialization, so matching target blobs cannot conceal a mode loss.
+    git(&materialized, &["add", "--force", "--all", "."]);
+    let rebuilt = String::from_utf8(git(&materialized, &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let diff = git(
+        &materialized,
+        &["diff-tree", "--no-commit-id", "-r", &original, &rebuilt],
+    );
+    assert!(
+        diff.is_empty(),
+        "materializing the manifest must preserve Git's tree: {}",
+        String::from_utf8_lossy(&diff)
+    );
+    assert_eq!(receipt["tree_out"], tree);
+    assert_eq!(receipt["skipped"], json!([]));
+    for (name, target) in [
+        ("file-link", "target.txt"),
+        ("dir-link", "dir"),
+        ("dangling-link", "missing"),
+    ] {
+        assert!(std::fs::symlink_metadata(materialized.join(name))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(materialized.join(name)).unwrap(),
+            Path::new(target)
+        );
+    }
+
+    std::fs::remove_file(materialized.join("file-link")).unwrap();
+    std::fs::write(materialized.join("file-link"), b"target.txt").unwrap();
+    git(&materialized, &["add", "--all", "."]);
+    let changed = String::from_utf8(git(&materialized, &["write-tree"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let patch = String::from_utf8(git(
+        &materialized,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "-p",
+            &original,
+            &changed,
+        ],
+    ))
+    .unwrap();
+    assert!(patch.contains("deleted file mode 120000"), "{patch}");
+    assert!(patch.contains("new file mode 100644"), "{patch}");
 }
 
 #[cfg(target_os = "macos")]

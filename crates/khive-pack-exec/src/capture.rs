@@ -67,16 +67,27 @@ pub async fn drain<R: AsyncRead + Unpin>(mut reader: R, cap: u64) -> Tail {
     tail
 }
 
-/// A regular file found in the run directory after the run.
+/// A regular file or symlink found in the run directory after the run.
 #[derive(Debug, Clone)]
 pub struct Found {
     pub abs: PathBuf,
     pub mode: u32,
 }
 
-/// Walk `root` without following symlinks. Symlinks are reported by relative
-/// path in `skipped` and never opened; directories are descended; anything
-/// else (sockets, fifos, devices) is skipped as well.
+impl Found {
+    pub fn read_content(&self) -> std::io::Result<Vec<u8>> {
+        if self.mode == 120000 {
+            Ok(std::fs::read_link(&self.abs)?
+                .into_os_string()
+                .into_encoded_bytes())
+        } else {
+            std::fs::read(&self.abs)
+        }
+    }
+}
+
+/// Walk `root` without following symlinks. Files and symlinks become entries;
+/// directories are descended; sockets, fifos and devices are reported in `skipped`.
 pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String>)> {
     let mut files = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -100,7 +111,7 @@ pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String
             };
             let ft = meta.file_type();
             if ft.is_symlink() {
-                skipped.push(child_rel);
+                files.insert(child_rel, Found { abs, mode: 120000 });
                 continue;
             }
             if ft.is_dir() {
@@ -150,17 +161,75 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn walk_skips_symlinks() {
+    fn walk_captures_file_directory_and_dangling_symlinks_without_following() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"1").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b"), b"2").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("escape")).unwrap();
+        for (name, target) in [
+            ("file-link", "a"),
+            ("dir-link", "sub"),
+            ("dangling-link", "missing"),
+            ("escape-link", "/etc/passwd"),
+        ] {
+            std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
+        }
         let (files, skipped) = walk(dir.path()).unwrap();
         assert_eq!(
             files.keys().cloned().collect::<Vec<_>>(),
-            vec!["a", "sub/b"]
+            vec![
+                "a",
+                "dangling-link",
+                "dir-link",
+                "escape-link",
+                "file-link",
+                "sub/b"
+            ]
         );
-        assert_eq!(skipped, vec!["escape"]);
+        assert!(skipped.is_empty());
+        assert_eq!(files["a"].read_content().unwrap(), b"1");
+        assert_eq!(files["sub/b"].read_content().unwrap(), b"2");
+        for (name, target) in [
+            ("file-link", "a"),
+            ("dir-link", "sub"),
+            ("dangling-link", "missing"),
+            ("escape-link", "/etc/passwd"),
+        ] {
+            assert_eq!(files[name].mode, 120000);
+            assert_eq!(files[name].read_content().unwrap(), target.as_bytes());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_preserves_non_utf8_and_unnormalized_symlink_target_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = b"../missing//\xff/./target\n";
+        std::os::unix::fs::symlink(
+            std::ffi::OsString::from_vec(target.to_vec()),
+            dir.path().join("link"),
+        )
+        .unwrap();
+        let (files, skipped) = walk(dir.path()).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(files["link"].mode, 120000);
+        assert_eq!(files["link"].read_content().unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_still_skips_sockets_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("socket")).unwrap();
+        let fifo = std::ffi::CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (files, mut skipped) = walk(dir.path()).unwrap();
+        assert!(files.is_empty());
+        skipped.sort();
+        assert_eq!(skipped, vec!["fifo", "socket"]);
     }
 }

@@ -241,3 +241,48 @@ literal mode is refused as the 420 it is, and an escaping path is refused; 28 ad
 last edit fails normalization leaves the blob store object count unchanged, with the same list
 minus that edit as a positive control that moves the count; 30 a `ref` naming no stored object is
 refused with the count unchanged, so the good edit's blob was not written first.
+
+## Amendment 5 (2026-09-10): symlink entries
+
+1. **Manifest modes.** `khive-tree/v1` accepts the decimal modes `644`, `755` and
+   `120000`. The third mode represents a symlink: its blob contains the literal
+   target path bytes, exactly as a Git `120000` blob does, with no added newline,
+   encoding conversion or normalization. This is an additive entry mode, not a
+   new manifest shape, so the schema string remains `khive-tree/v1` and existing
+   manifests remain valid. Entry paths retain their existing validation; no entry
+   may be below a file or symlink entry, and duplicate paths are refused.
+
+2. **Tree editing and comparison.** `exec.tree` and `exec.tree_put` accept
+   `120000`; `exec.tree_get` returns it. For a symlink put, `content` supplies the
+   target's UTF-8 bytes or `ref` names a blob holding arbitrary target bytes.
+   Omitted mode preserves the existing entry mode, and deletion is unchanged.
+   Changing the target or switching between a file and a symlink is `modified`.
+   `git.diff(input_kind="trees")` maps this mode to Git's `120000` blob entry,
+   retaining native symlink add, retarget, remove and file-conversion patches.
+
+3. **Materialization and containment.** Materialization creates a real symlink
+   with its literal target, whether relative, absolute, dangling or outside the
+   tree. The target is not constrained to the tree root. A fresh run directory
+   receives all directories and exclusively created files before any symlinks,
+   so filesystem name aliases cannot redirect materialization writes. The seatbelt profile
+   remains the read/write boundary: writing through a symlink does not grant
+   write access to its resolved target outside the run directory. A denied write
+   is visible through the command's exit status and captured stderr.
+   `declared_write_paths` still names tree-relative paths, not resolved targets;
+   it filters captured changes and grants no additional filesystem access.
+
+4. **Capture.** The capture walk records symlinks with mode `120000` and reads
+   their target bytes without following them. Directory symlinks are entries,
+   never traversal roots. Created, retargeted, removed and mode-flipped links
+   appear in `changed` under the same declaration rules as files. Sockets,
+   FIFOs and devices remain skipped.
+
+Acceptance arms added: 31 valid symlink entries pass while unsupported modes and
+entries beneath symlinks fail; 32 tree edits preserve target bytes and classify
+all link transitions; 33 materialization preserves literal relative, escaping,
+absolute and non-UTF-8 targets; 34 an escaping-link write leaves its outside
+target unchanged and reports a sandbox denial, while an inside-tree write
+succeeds; 35 capture records links without descending through directory links;
+36 tracked file, directory and dangling symlinks round-trip through the manifest
+to a Git tree with an empty `git diff-tree`, and a link-to-file conversion emits
+the native `120000` to `100644` change.

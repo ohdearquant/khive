@@ -36,7 +36,7 @@ pub(crate) const CHECKOUT: HandlerDef = HandlerDef {
 };
 pub(crate) const DIFF: HandlerDef = HandlerDef {
     name: "git.diff",
-    description: "Compare commits or khive tree manifests through diff-tree with external diff, text conversion, color and rename detection disabled. Returns the diff blob, input pair, summary and receipt_id.",
+    description: "Compare commits or khive tree manifests through diff-tree with external diff, text conversion, color and rename detection disabled. Tree entries support regular files (644/755) and symlinks (120000), whose blobs contain literal target bytes. Returns the diff blob, input pair, summary and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO, param("input_kind", true, "Either commits or trees."), param("base", true, "Base commit/ref or tree manifest, according to input_kind."), param("head", true, "Head commit/ref or tree manifest, according to input_kind."), SESSION],

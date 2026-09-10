@@ -66,7 +66,7 @@ pub fn validate_cwd(cwd: &str) -> Result<String, RuntimeError> {
     validate_relative_path(cwd, "cwd")
 }
 
-/// The one entry validator: paths, modes, duplicates, ref format, and the rule that a file
+/// The one entry validator: paths, modes, duplicates, ref format, and the rule that an entry
 /// cannot also be a directory prefix of another entry. Exposed so `exec.tree_put` validates
 /// a whole candidate manifest through this function rather than reimplementing its rules.
 pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeError> {
@@ -86,16 +86,15 @@ pub(crate) fn parse_entries(value: &Value) -> Result<Vec<TreeEntry>, RuntimeErro
             .ok_or_else(|| RuntimeError::InvalidInput("entry.ref must be a string".into()))?;
         ContentRef::from_hex(content_ref)
             .map_err(|e| RuntimeError::InvalidInput(format!("entry {path:?} ref: {e}")))?;
-        let mode = item
-            .get("mode")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| RuntimeError::InvalidInput("entry.mode must be 644 or 755".into()))?;
-        if mode != 644 && mode != 755 {
+        let mode = item.get("mode").and_then(Value::as_u64).ok_or_else(|| {
+            RuntimeError::InvalidInput("entry.mode must be 644, 755 or 120000".into())
+        })?;
+        if !matches!(mode, 644 | 755 | 120000) {
             return Err(RuntimeError::InvalidInput(format!(
-                "entry {path:?} mode must be 644 or 755; got {mode} (symlinks and other modes are refused)"
+                "entry {path:?} mode must be 644, 755 or 120000; got {mode}"
             )));
         }
-        // A file cannot also be a directory prefix of another entry.
+        // Neither a file nor a symlink can be a directory prefix of another entry.
         for existing in seen.keys() {
             if existing.starts_with(&format!("{path}/"))
                 || path.starts_with(&format!("{existing}/"))
@@ -285,18 +284,45 @@ mod tests {
     }
 
     #[test]
+    fn accepts_regular_executable_and_symlink_modes() {
+        let r = digest_hex(b"target");
+        let entries = parse_entries(&json!([
+            {"path": "a", "ref": r, "mode": 644},
+            {"path": "b", "ref": r, "mode": 755},
+            {"path": "c", "ref": r, "mode": 120000}
+        ]))
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.mode).collect::<Vec<_>>(),
+            vec![644, 755, 120000]
+        );
+    }
+
+    #[test]
     fn rejects_duplicates_and_modes() {
         let r = digest_hex(b"x");
         let dup =
             json!([{"path": "a", "ref": r, "mode": 644}, {"path": "a", "ref": r, "mode": 644}]);
         assert!(parse_entries(&dup).is_err());
-        let mode = json!([{"path": "a", "ref": r, "mode": 777}]);
-        assert!(parse_entries(&mode).is_err());
-        let link = json!([{"path": "a", "ref": r, "mode": 0o120777}]);
-        assert!(parse_entries(&link).is_err());
-        let nested =
-            json!([{"path": "a", "ref": r, "mode": 644}, {"path": "a/b", "ref": r, "mode": 644}]);
-        assert!(parse_entries(&nested).is_err());
+        for mode in [0, 777, 0o120777, 0o120000, 100644, 100755, 120001, u64::MAX] {
+            let entries = json!([{"path": "a", "ref": r, "mode": mode}]);
+            assert!(parse_entries(&entries).is_err(), "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn rejects_entries_beneath_files_and_symlinks_in_either_order() {
+        let r = digest_hex(b"target");
+        for mode in [644, 755, 120000] {
+            let mut entries = vec![
+                json!({"path": "a", "ref": r, "mode": mode}),
+                json!({"path": "a/b", "ref": r, "mode": 644}),
+            ];
+            for _ in 0..2 {
+                assert!(parse_entries(&json!(entries)).is_err(), "mode {mode}");
+                entries.reverse();
+            }
+        }
     }
 
     #[test]

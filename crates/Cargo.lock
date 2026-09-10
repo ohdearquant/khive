@@ -2287,6 +2287,7 @@ dependencies = [
  "chrono",
  "clap",
  "inventory",
+ "khive-db",
  "khive-pack-blob",
  "khive-pack-exec",
  "khive-pack-kg",
