@@ -384,7 +384,10 @@ async fn observed_id_arm10b_per_member_mode_refuses_observed_before_any_holder_r
     args["atomic"] = json!(false);
     let before = snapshot(&rt, &setup).await;
     seen.lock().unwrap().clear();
-    let error = reg.dispatch("stream.batch", args.clone()).await.unwrap_err();
+    let error = reg
+        .dispatch("stream.batch", args.clone())
+        .await
+        .unwrap_err();
     assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error:?}");
     // The refusal is the mode guard, so nothing read the key's holder on the way to it.
     assert_eq!(

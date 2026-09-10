@@ -1519,6 +1519,7 @@ async fn observed_id_arm5_runtime_null_version_refused_before_preparation() {
                     kind: "head".into(),
                     version,
                     id: Some(Uuid::new_v4()),
+                    live_until: None,
                 }],
                 &registry,
             )
@@ -1554,6 +1555,7 @@ async fn observed_id_arm1_trace_one_row_read_inside_transaction_before_members()
                 } else {
                     Uuid::nil()
                 }),
+                live_until: None,
             }],
         )
         .await;
