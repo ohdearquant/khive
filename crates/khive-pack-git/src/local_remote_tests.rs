@@ -280,6 +280,39 @@ async fn local_file_push_moves_native_ref_without_credentials() {
 }
 
 #[tokio::test]
+async fn local_push_leaves_destination_hooks_unrun() {
+    let f = Fixture::file().await;
+    let marker = f.dir.path().join("hook-ran");
+    let quoted = format!("'{}'", marker.display().to_string().replace('\'', "'\\''"));
+    let hook = f.bare.join("hooks").join("update");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\nprintf ran > {quoted}\nexit 0\n")).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    f.call(&f.actor, "git.push", f.push()).await.unwrap();
+    assert_eq!(f.remote_head(), f.head);
+    assert!(
+        !marker.exists(),
+        "the destination update hook ran during the daemon's push"
+    );
+    // Control: a plain push with the same client-side hooks path runs the destination hook,
+    // so its silence above is the transport's doing and not the hook's.
+    git(
+        &f.repo,
+        &[
+            "push",
+            "-q",
+            f.bare.to_str().unwrap(),
+            &format!("{}:refs/heads/control", f.head),
+        ],
+    );
+    assert!(
+        marker.exists(),
+        "control: a plain push must run the destination update hook"
+    );
+    f.no_credential_read();
+}
+
+#[tokio::test]
 async fn local_path_push_allows_unmapped_actor_and_absent_remote_branch() {
     let f = Fixture::new(|bare| bare.display().to_string(), "").await;
     let actor = format!("{}:unmapped", f.actor);
