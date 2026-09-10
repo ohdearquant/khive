@@ -24,7 +24,10 @@ work that is not yet implemented.
 ### D1 — BackendRegistry (shipped)
 
 `BackendRegistry` stores backends in a `BTreeMap<String, BackendEntry>` for deterministic
-iteration order. The first registered backend is the primary.
+iteration order. The first registered backend is the primary. Each entry may
+carry a closed, nonempty `served_kinds` declaration. Omitted metadata preserves
+conservative eligibility for every substrate; an explicit empty declaration is
+rejected at registration.
 
 ### D2 — LocatorCache (shipped)
 
@@ -37,8 +40,10 @@ populates the cache on first hit.
 
 ### D3 — Fan-out search (shipped)
 
-`fan_out_search(&ValidatedSearchRequest, namespace)` broadcasts entity or note search to all
-registered backends in parallel. The request is constructed by the KG pack's canonical validator
+`fan_out_search(&ValidatedSearchRequest, namespace)` broadcasts entity or note search to eligible
+registered backends in parallel. Eligibility is declaration-based: a backend is skipped only when
+its explicit `served_kinds` metadata excludes the request substrate, and filtering occurs before
+any backend task is spawned. A backend with no declaration remains eligible. The request is constructed by the KG pack's canonical validator
 and carries the resolved substrate plus `entity_kind`/`entity_type`,
 `note_kind`/`include_superseded`, `properties`, `tags`, `limit`, and `min_score`. Applicable storage
 filters reach every backend; compatibility kind spellings are reconciled before this boundary, so
@@ -80,6 +85,8 @@ via `khive.toml` (ADR-028).
 
 - `BackendRegistry` is append-only after boot; no backend is removed at runtime.
 - The primary backend is always the first registered.
+- An explicit served-kind declaration is nonempty and uses the closed substrate vocabulary;
+  omission is conservative and includes the backend.
 - `LocatorCache` entries are immutable once inserted (backend affinity is stable per entity).
 - `fan_out_search` never silently drops a backend error; ordinary errors and task-join failures are
   captured in the result and become bounded response diagnostics plus warning records.
@@ -104,6 +111,8 @@ through the same `khive_mcp::serve::build_registry_for_multi_backend` choke poin
 plain (coordinator-less) `build_server_multi_backend` path uses, so the db-anchor
 consistency guard, the ADR-078 output-format resolution, and the ADR-091 checkpoint
 pool are each implemented exactly once and apply identically to both boot paths. It
+copies each declared backend's `served_kinds` metadata into the registry before
+constructing the coordinator. It
 also returns the resolved `"schedule"`-pack runtime (ADR-106) read out of the same
 `multi.per_pack_runtimes` map used to build the `BackendRegistry`, so the daemon's
 dynamic ADR-119 `schedule-tick` component drains the exact backend this boot resolved

@@ -65,6 +65,7 @@ fn policy(repo: &Path, branches: &[&str]) -> GitWriteSectionConfig {
             repo: repo.display().to_string(),
             branches: branches.iter().map(|b| b.to_string()).collect(),
         }],
+        ..GitWriteSectionConfig::default()
     }
 }
 
@@ -83,6 +84,24 @@ async fn pack_and_token_with_policy(git_write: GitWriteSectionConfig) -> (GitPac
     };
     let rt = KhiveRuntime::new(config).expect("in-memory runtime");
     let token = rt.authorize(Namespace::local()).expect("authorize");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(khive_pack_tool::ToolPack::new(rt.clone()));
+    builder.register(GitPack::new(rt.clone()));
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("legacy fixture audit store");
+    let registry = builder.build().expect("legacy fixture registry");
+    registry.apply_schema_plans(rt.backend());
+    registry
+        .dispatch(
+            "tool.policy",
+            json!({
+                "actor": "*", "tool": "git.branch", "decision": "allow"
+            }),
+        )
+        .await
+        .expect("legacy branch policy");
     (GitPack::new(rt), token)
 }
 
@@ -662,161 +681,6 @@ async fn branch_denied_when_no_policy_configured() {
     );
 }
 
-// -- git.push -----------------------------------------------------------
-
-#[tokio::test]
-async fn push_sends_branch_to_remote() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
-
-    run(repo.path(), &["checkout", "-q", "-b", "feat/pushme"]);
-    std::fs::write(repo.path().join("c.txt"), b"c").unwrap();
-    run(repo.path(), &["add", "c.txt"]);
-    run(repo.path(), &["commit", "-q", "-m", "add c"]);
-
-    let result = pack
-        .handle_push(
-            &token,
-            json!({ "repo": repo.path().to_str().unwrap(), "branch": "feat/pushme" }),
-        )
-        .await
-        .expect("push succeeds");
-    assert_eq!(
-        result.get("remote").and_then(|v| v.as_str()),
-        Some("origin")
-    );
-
-    let branches = git_command(remote.path())
-        .args(["branch", "--list", "feat/pushme"])
-        .output()
-        .expect("git branch --list on remote");
-    assert!(String::from_utf8_lossy(&branches.stdout).contains("feat/pushme"));
-}
-
-#[tokio::test]
-async fn push_rejects_explicit_force_true() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "main",
-                "force": true,
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("force-push"), "{err}");
-
-    let audit = audit_event(&pack, &token, "git.push").await;
-    assert_eq!(audit.outcome, EventOutcome::Denied);
-    assert_eq!(audit.payload["decision"], "deny");
-    assert_eq!(audit.payload["branch"], "main");
-}
-
-#[tokio::test]
-async fn push_allows_force_false() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
-
-    let result = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "main",
-                "force": false,
-            }),
-        )
-        .await;
-    assert!(result.is_ok(), "{result:?}");
-}
-
-#[tokio::test]
-async fn push_rejects_non_boolean_force() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "main",
-                "force": "true",
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("boolean"), "{err}");
-}
-
-#[tokio::test]
-async fn push_rejects_injection_shaped_remote() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "main",
-                "remote": "--upload-pack=evil",
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("start with"), "{err}");
-}
-
-#[tokio::test]
-async fn push_rejects_non_string_remote_without_pushing() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
-    run(
-        repo.path(),
-        &["checkout", "-q", "-b", "feat/malformed-remote"],
-    );
-    std::fs::write(repo.path().join("new.txt"), b"new").unwrap();
-    run(repo.path(), &["add", "new.txt"]);
-    run(repo.path(), &["commit", "-q", "-m", "new commit"]);
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "feat/malformed-remote",
-                "remote": 42,
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("remote must be a string"), "{err}");
-
-    let branches = git_command(remote.path())
-        .args(["branch", "--list", "feat/malformed-remote"])
-        .output()
-        .expect("git branch --list on remote");
-    assert!(
-        branches.stdout.is_empty(),
-        "malformed remote must not push to origin"
-    );
-    let audit = audit_event(&pack, &token, "git.push").await;
-    assert_eq!(audit.outcome, EventOutcome::Denied);
-}
-
-#[cfg(unix)]
 #[tokio::test]
 async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
     use std::os::unix::fs::PermissionsExt;
@@ -834,7 +698,7 @@ async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
         .expect("make fake git executable");
     let _path = EnvVarGuard::set("PATH", fake_bin.path());
 
-    let cases: [(&str, Value, &str); 6] = [
+    let cases: [(&str, Value, &str); 4] = [
         ("git.commit", json!({ "message": "msg" }), "required"),
         (
             "git.commit",
@@ -847,12 +711,6 @@ async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
             json!({ "repo": 42, "name": "feat/x" }),
             "string",
         ),
-        ("git.push", json!({ "branch": "main" }), "required"),
-        (
-            "git.push",
-            json!({ "repo": 42, "branch": "main" }),
-            "string",
-        ),
     ];
 
     for (verb, params, expected_error) in cases {
@@ -860,7 +718,6 @@ async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
         let result = match verb {
             "git.commit" => pack.handle_commit(&token, params).await,
             "git.branch" => pack.handle_branch(&token, params).await,
-            "git.push" => pack.handle_push(&token, params).await,
             _ => unreachable!("fixed test case verb"),
         };
         let err = result.unwrap_err();
@@ -871,60 +728,6 @@ async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
         assert_eq!(audit.payload["repo"], "<invalid-repo>", "{verb}");
         assert!(!sentinel.exists(), "{verb} must not invoke git");
     }
-}
-
-#[tokio::test]
-async fn push_rejects_nonexistent_branch() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["*"])).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({
-                "repo": repo.path().to_str().unwrap(),
-                "branch": "does-not-exist",
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("git"), "{err}");
-}
-
-#[tokio::test]
-async fn push_denied_when_no_policy_configured() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({ "repo": repo.path().to_str().unwrap(), "branch": "main" }),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("git-write policy is configured"),
-        "{err}"
-    );
-}
-
-#[tokio::test]
-async fn push_denied_for_branch_outside_patterns() {
-    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
-    let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["release-*"])).await;
-
-    let err = pack
-        .handle_push(
-            &token,
-            json!({ "repo": repo.path().to_str().unwrap(), "branch": "main" }),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("branch"), "{err}");
 }
 
 // -- symlink TOCTOU (ADR-108 review r2 High finding) -----------------------

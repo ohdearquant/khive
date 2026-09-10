@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::GateValidationError;
 
+/// Kind prefixes reserved by runtime event attribution and its identity fixtures.
+///
+/// Add newly stamped kinds here and extend the per-kind event scope regressions.
+/// This is not a closed taxonomy: [`ActorRef::try_new`] accepts any non-empty kind.
+pub const RUNTIME_STAMPED_ACTOR_KINDS: &[&str] = &["actor", "anonymous", "agent"];
+
 /// Caller identity with non-empty `kind` and `id`, validated on construction and deserialization.
 ///
 /// See `crates/khive-gate/docs/api/policy-types.md`.

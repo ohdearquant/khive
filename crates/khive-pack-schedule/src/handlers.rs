@@ -83,18 +83,14 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validates the recurrence aliases the executor can advance. Accepting a
-/// recurrence that the drain cannot compute would silently consume it as a
-/// one-shot, so unsupported cron text is rejected at this write boundary.
+/// Validates the recurrence against the one parser the executor advances
+/// with (`crate::repeat`). Accepting a recurrence that the drain cannot
+/// compute would silently consume it as a one-shot, so anything the parser
+/// refuses is rejected at this write boundary.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
-    match repeat {
-        "daily" | "weekly" | "monthly" => Ok(()),
-        _ => Err(RuntimeError::InvalidInput(format!(
-            "invalid repeat expression {repeat:?}: supported values are \"daily\", \
-             \"weekly\", and \"monthly\"; five-field cron is not executable and is \
-             rejected instead of degrading to a one-shot"
-        ))),
-    }
+    crate::repeat::parse_repeat(repeat)
+        .map(|_| ())
+        .map_err(RuntimeError::InvalidInput)
 }
 
 /// Validates `action` parses as DSL via `khive_request::parse_request`,
@@ -911,7 +907,7 @@ pub(crate) async fn handle_agenda(
 
     loop {
         let page = store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 namespace,
                 &filter,
                 PageRequest {

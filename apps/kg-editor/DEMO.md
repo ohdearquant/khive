@@ -20,9 +20,10 @@ npm run dev
 ```
 
 Place the report at `$KHIVE_SHOWCASE_ANALYSIS_ROOT/khive/khive.repo.v1.json`.
-The protected route requires the bearer token on every request and fails closed
-to 404 without it, which silently selects the static fallback. Unlock the UI in
-the browser console before opening the repository:
+The protected route requires the bearer token on every request and fails closed to 404
+without it. Without a token the UI skips that request for an entry that has a curated
+asset and loads the static fallback directly. Unlock the UI in the browser console
+before opening the repository:
 
 ```js
 sessionStorage.setItem("khive.showcase.accessToken", "a-long-random-operator-secret");

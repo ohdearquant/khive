@@ -91,6 +91,42 @@ pub(crate) fn validate_entity_type(
     Ok(resolved.entity_type)
 }
 
+/// Collapse case and separator-style differences (space/hyphen/underscore,
+/// including repeated and leading/trailing separators) so cosmetic
+/// formatting doesn't get flagged as an alias substitution below.
+///
+/// Delegates to the registry's own `to_snake_case` — the exact normalisation
+/// `validate_entity_type`'s `resolve()` call applies before alias lookup —
+/// instead of a hand-rolled copy that can drift from it (e.g. a naive
+/// space/hyphen substitution that doesn't collapse `--algorithm__` down to
+/// `algorithm`, which then misreports a purely cosmetic normalisation as an
+/// alias substitution).
+fn normalize_for_comparison(s: &str) -> String {
+    khive_types::to_snake_case(s.trim())
+}
+
+/// Describe an `entity_type` alias resolution when the resolved value is a
+/// genuinely different word than what the caller wrote (e.g. the built-in
+/// `method` -> `function` alias), as opposed to a mere case/separator
+/// normalization of the same word (e.g. `Blog-Post` -> `blog_post`).
+///
+/// `validate_entity_type`'s alias table is deliberate (ADR-085 code
+/// subtypes, model/model_family, etc.) — the defect this guards against is
+/// not that a substitution happens, but that it happened invisibly: a
+/// caller who wrote `method` and never saw `function` come back has no way
+/// to know their data was rewritten. Callers embed this in the `create`
+/// response so the applied substitution is always visible.
+pub(crate) fn describe_entity_type_normalization(
+    raw: Option<&str>,
+    resolved: Option<&str>,
+) -> Option<Value> {
+    let (raw, resolved) = (raw?, resolved?);
+    if normalize_for_comparison(raw) == resolved {
+        return None;
+    }
+    Some(json!({"requested": raw, "stored": resolved}))
+}
+
 // ---- Granular `kind` discriminator ----
 
 /// Resolved shape of a `kind` discriminator string: which substrate (entity, note,
@@ -479,15 +515,26 @@ pub(crate) async fn enrich_allowlist_error(
         &tgt_kind,
         tgt_entity_type.as_deref(),
     );
+    // The typed subtype participates in rule matching (EntityOfType pack
+    // rules), so the label must carry it: two base-identical endpoints can
+    // have different legal sets.
+    let src_label = match src_entity_type.as_deref() {
+        Some(t) => format!("{src_kind}/{t}"),
+        None => src_kind.clone(),
+    };
+    let tgt_label = match tgt_entity_type.as_deref() {
+        Some(t) => format!("{tgt_kind}/{t}"),
+        None => tgt_kind.clone(),
+    };
     let mut msg = if valid.is_empty() {
         format!(
-            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
-             No valid relations exist for {src_kind}\u{2192}{tgt_kind} in the current edge rules.",
+            "Invalid relation {:?} for {src_label}\u{2192}{tgt_label}. \
+             No valid relations exist for {src_label}\u{2192}{tgt_label} in the current edge rules.",
             relation.as_str()
         )
     } else {
         format!(
-            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
+            "Invalid relation {:?} for {src_label}\u{2192}{tgt_label}. \
              Valid relations: {}",
             relation.as_str(),
             valid.join(", ")
@@ -503,7 +550,60 @@ pub(crate) async fn enrich_allowlist_error(
             relation.as_str()
         ));
     }
+    let source_short: String = source_id.to_string().chars().take(8).collect();
+    let target_short: String = target_id.to_string().chars().take(8).collect();
+    msg.push_str(&format!(
+        " Endpoint resolution: source {source_short} resolved as {src_label}; \
+         target {target_short} resolved as {tgt_label}."
+    ));
     msg
+}
+
+/// Attribute an atomic bulk `link` allowlist rejection to the offending entry.
+///
+/// `link_many` validates per-spec but its error does not say which entry
+/// failed. Re-derive it: the acceptance set from
+/// [`valid_relations_for_entity_pair`] equals the validator's acceptance set
+/// for a typed pair (proven by the generative cross-check test in
+/// `handlers/tests.rs`), so the first spec whose relation falls outside its
+/// pair's set is the entry the validator rejected. Falls back to the original
+/// message if no spec re-identifies (e.g. a concurrent endpoint mutation).
+pub(crate) async fn enrich_bulk_atomic_allowlist_error(
+    original: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    specs: &[khive_runtime::operations::LinkSpec],
+    entry_indices: &[usize],
+) -> String {
+    for (pos, spec) in specs.iter().enumerate() {
+        let idx = entry_indices.get(pos).copied().unwrap_or(pos);
+        let Ok(src) = runtime.get_entity(token, spec.source_id).await else {
+            continue;
+        };
+        let Ok(tgt) = runtime.get_entity(token, spec.target_id).await else {
+            continue;
+        };
+        let valid = valid_relations_for_entity_pair(
+            runtime,
+            &src.kind,
+            src.entity_type.as_deref(),
+            &tgt.kind,
+            tgt.entity_type.as_deref(),
+        );
+        if !valid.contains(&spec.relation.as_str()) {
+            let enriched = enrich_allowlist_error(
+                original,
+                runtime,
+                token,
+                spec.source_id,
+                spec.target_id,
+                spec.relation,
+            )
+            .await;
+            return format!("entry {idx}: {enriched}");
+        }
+    }
+    original.to_string()
 }
 
 pub(crate) const IMMUTABLE_EVENT_MSG: &str =

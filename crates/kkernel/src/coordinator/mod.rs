@@ -9,7 +9,7 @@ pub use dispatch::{
     BackendSearchFailure, BackendSearchFailureKind, BackendSearchResult, SubstrateCoordinator,
 };
 pub use locator::LocatorCache;
-pub use registry::{BackendEntry, BackendRegistry};
+pub use registry::{BackendEntry, BackendRegistrationError, BackendRegistry};
 pub use service::SubstrateCoordinatorService;
 
 #[cfg(test)]

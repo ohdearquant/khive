@@ -42,12 +42,22 @@ pub(crate) struct CreateParams {
     /// present, `content` is still stored/FTS-indexed in full; only the text
     /// sent to the embedder is replaced with this value.
     pub(crate) embedding_content: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) embed: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFences>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
-    pub(crate) id: String,
+    pub(crate) id: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) note_kind: Option<String>,
     pub(crate) include_deleted: Option<bool>,
 }
 
@@ -70,6 +80,11 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    pub(crate) key_prefix: Option<String>,
+    pub(crate) after_key: Option<String>,
+    pub(crate) created_after: Option<String>,
+    pub(crate) updated_after: Option<String>,
+    pub(crate) tag_mode: Option<khive_storage::note::NoteTagMode>,
     pub(crate) thread_id: Option<String>,
     pub(crate) direction: Option<String>,
     pub(crate) from: Option<String>,
@@ -120,9 +135,21 @@ pub struct UpdateParams {
     pub(crate) decay_factor: Option<Option<f64>>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
+    /// ADR-014 tri-state: absent = unchanged, JSON `null` = explicit clear,
+    /// string = set (validated against the kind's registered vocabulary).
+    /// Same `Option<Option<T>>` shape as `salience`/`decay_factor` above.
+    #[serde(default, deserialize_with = "tri_string")]
+    pub(crate) entity_type: Option<Option<String>>,
     pub(crate) relation: Option<String>,
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
+    pub(crate) expected_version: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
+    )]
+    pub(crate) fence: Option<khive_runtime::note_write::NoteFences>,
+    pub(crate) embed: Option<bool>,
 }
 
 /// ADR-099 B3: `pub` for the same reason as `UpdateParams` above — reused
@@ -167,6 +194,7 @@ pub(crate) struct SearchParams {
     pub(crate) include_superseded: Option<bool>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
+    pub(crate) source: Option<String>,
     pub(crate) min_score: Option<f64>,
 }
 
@@ -302,5 +330,15 @@ pub(crate) struct ResolveParams {
 }
 
 pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Ok(Some(Option::deserialize(d)?))
+}
+
+/// String analog of [`tri_f64`] (ADR-014 patch-style updates): with the
+/// struct-level `#[serde(default)]`, an absent key deserializes to `None`
+/// (leave unchanged) while a present key keeps its `null`/value distinction
+/// as `Some(None)` (explicit clear) / `Some(Some(s))` (set).
+pub(crate) fn tri_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }

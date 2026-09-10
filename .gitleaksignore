@@ -10,3 +10,7 @@ f245f9600e47ee5cb6740189b265b9ef71f7cb0f:crates/khive-pack-git/src/cache.rs:gene
 f245f9600e47ee5cb6740189b265b9ef71f7cb0f:crates/khive-pack-git/src/cache.rs:generic-api-key:1408
 4ce001460f67750796f533b1269c74c90c67eb5c:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:135
 39fb7052c29916e50f20083f5f6281861bb7ebd9:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:155
+# Synthetic 40-hex test constant in issue_1988_latex_exemption_does_not_hide_credential_runs
+# (secret_gate regression test on the open branch for #2056); flagged by the nightly
+# all-ref scan since 2026-08-30, confirmed non-credential.
+f1c8e732e61b9ec2516b794dbb37afd5152cee59:crates/khive-runtime/src/secret_gate.rs:generic-api-key:3338

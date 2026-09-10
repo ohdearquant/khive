@@ -25,7 +25,11 @@ describe("khive.review.v1", () => {
     expect(bundle.snapshot_identity.head_hash).toMatch(/^sha256:/);
     expect(bundle.pull_request.number).toBe(184);
     expect(bundle.change_set.envelope.batch_id).toBe("demo-enrich-2026-08-07-184");
-    expect(bundle.change_set.envelope.producer).toBe("actor:casey");
+    expect(bundle.pull_request.author).toBe("actor:demo-author");
+    expect(bundle.change_set.envelope.producer).toBe("actor:demo-author");
+    expect(JSON.stringify(bundle)).not.toMatch(
+      /actor:casey|actor:robin|family:demo-frontier|curator persona/i,
+    );
     expect(bundle.live_proposal).toBeNull();
   });
 
@@ -48,7 +52,7 @@ describe("khive.review.v1", () => {
     });
 
     expect(stale.pull_request.head_sha).not.toBe(stale.repository.head_sha);
-    expect(canApproveReview(stale, "family:independent-reasoner")).toEqual({
+    expect(canApproveReview(stale, "family:demo-reviewer")).toEqual({
       allowed: false,
       reason: "The pull-request head changed; regenerate the semantic review bundle.",
     });
@@ -115,7 +119,7 @@ describe("khive.review.v1", () => {
       change_set: {
         envelope: {
           schema_version: 1,
-          producer: "actor:casey",
+          producer: "actor:demo-author",
           producer_model_family: "family:demo",
           staged_at: 2_000_000,
           batch_id: "demo-batch-7",
@@ -182,12 +186,12 @@ describe("review gate", () => {
       ),
     ).toEqual({
       allowed: false,
-      reason: "ADR-102 requires a reviewer outside family:demo-frontier.",
+      reason: "ADR-102 requires a reviewer outside family:demo-author.",
     });
   });
 
   it("allows an independent reviewer when no required check failed", () => {
-    expect(canApproveReview(demoReviewFixture, "family:independent-reasoner").allowed).toBe(
+    expect(canApproveReview(demoReviewFixture, "family:demo-reviewer").allowed).toBe(
       true,
     );
   });
@@ -203,14 +207,14 @@ describe("review gate", () => {
       },
     };
 
-    expect(canApproveReview(bundle, "family:independent-reasoner")).toEqual({
+    expect(canApproveReview(bundle, "family:demo-reviewer")).toEqual({
       allowed: false,
       reason: "1 required check failed.",
     });
   });
 
   it("blocks non-reviewer pending checks but resolves the fixture's reviewer check locally", () => {
-    expect(canApproveReview(demoReviewFixture, "family:independent-reasoner").allowed).toBe(
+    expect(canApproveReview(demoReviewFixture, "family:demo-reviewer").allowed).toBe(
       true,
     );
 
@@ -231,7 +235,7 @@ describe("review gate", () => {
       },
     };
 
-    expect(canApproveReview(pending, "family:independent-reasoner")).toEqual({
+    expect(canApproveReview(pending, "family:demo-reviewer")).toEqual({
       allowed: false,
       reason: "1 required check is still pending.",
     });
@@ -249,7 +253,7 @@ describe("review gate", () => {
       },
     };
 
-    expect(canApproveReview(blocked, "family:independent-reasoner")).toEqual({
+    expect(canApproveReview(blocked, "family:demo-reviewer")).toEqual({
       allowed: false,
       reason: "Repository policy has not admitted this semantic review.",
     });
@@ -260,7 +264,7 @@ describe("review gate", () => {
       ...demoReviewFixture,
       pull_request: { ...demoReviewFixture.pull_request, head_sha: "0".repeat(40) },
     });
-    expect(canApproveReview(stale, "family:independent-reasoner").reason).toMatch(
+    expect(canApproveReview(stale, "family:demo-reviewer").reason).toMatch(
       /head changed/i,
     );
 
@@ -280,7 +284,7 @@ describe("review gate", () => {
         },
       ],
     };
-    expect(canApproveReview(invalid, "family:independent-reasoner").reason).toMatch(
+    expect(canApproveReview(invalid, "family:demo-reviewer").reason).toMatch(
       /semantic finding/i,
     );
   });

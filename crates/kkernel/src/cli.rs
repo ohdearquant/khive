@@ -55,6 +55,10 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage operator-configured tool sources.
+    #[command(subcommand)]
+    Mount(crate::mount::MountCommand),
+
     /// Build a working SQLite DB from .khive/kg/*.ndjson sources (issue #174).
     Sync(SyncArgs),
 
@@ -93,6 +97,13 @@ enum Command {
     /// warm Unix-socket server; `--transport` selects a registered transport).
     Mcp(khive_mcp::args::Args),
 
+    /// Serve the dedicated events daemon (ADR-170): the resident writer of
+    /// the events database, receiving observational events over its own Unix
+    /// socket so telemetry never queues on the domain store's writer lane.
+    /// Normally spawned and supervised by `kkernel mcp --daemon`, not run by
+    /// hand.
+    EventsDaemon(EventsDaemonArgs),
+
     /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
@@ -108,6 +119,21 @@ enum Command {
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
+}
+
+/// Arguments for the dedicated events daemon (ADR-170).
+#[derive(clap::Parser, Debug)]
+struct EventsDaemonArgs {
+    /// Events database file. Defaults to `<main-file-name>.events.db` beside the
+    /// resolved main database (`--db`/`KHIVE_DB` resolution applies to the
+    /// MAIN database; this flag names the events file itself).
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    /// Unix socket path to bind. Defaults to the events database path with a
+    /// `.sock` extension, beside that database.
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 /// Database schema lifecycle subcommands.
@@ -268,6 +294,7 @@ pub async fn cli_main() -> Result<()> {
     let command = resolve_command(args.exec, args.command);
 
     match command {
+        Command::Mount(command) => crate::mount::run(command).await,
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
@@ -289,7 +316,34 @@ pub async fn cli_main() -> Result<()> {
             }
             result
         }
+        #[cfg(unix)]
+        Command::EventsDaemon(a) => {
+            let db = match a.db {
+                Some(db) => db,
+                None => {
+                    let main_db = khive_runtime::resolve_db_anchor(None).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "events-daemon: no main database resolvable to anchor the events \
+                             database; pass --db explicitly"
+                        )
+                    })?;
+                    khive_runtime::events_split::events_db_path_beside(&main_db)
+                }
+            };
+            let socket = a
+                .socket
+                .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
+            khive_runtime::events_split::run_events_daemon(&db, &socket).await
+        }
+        #[cfg(not(unix))]
+        Command::EventsDaemon(_) => {
+            anyhow::bail!("the events daemon requires a Unix platform (Unix-socket transport)")
+        }
         Command::Mcp(a) => {
+            #[cfg(unix)]
+            if !a.daemon && a.transport.as_deref().unwrap_or("stdio") == "stdio" {
+                khive_mcp::daemon::capture_bridge_executable();
+            }
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
@@ -372,6 +426,17 @@ pub async fn cli_main() -> Result<()> {
                             brain_profile: a.brain_profile.clone(),
                         },
                     )?;
+                // ADR-170: this arm is a resident daemon host when `--daemon`
+                // is set — it supervises an events daemon at the derived
+                // socket (`start_daemon_components_if_daemon`), so upgrade
+                // the resolved event plane from direct mode to forwarding.
+                let base_cfg = {
+                    let mut base_cfg = base_cfg;
+                    if a.daemon {
+                        khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
+                    }
+                    base_cfg
+                };
 
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and
@@ -382,6 +447,9 @@ pub async fn cli_main() -> Result<()> {
                 // failing to acquire the lock here must abort before that
                 // unguarded construction runs, rather than silently
                 // proceeding with `boot_guard = None`.
+                if a.daemon {
+                    khive_runtime::daemon::mark_warm_index_host();
+                }
                 #[cfg(unix)]
                 let boot_guard = if a.daemon {
                     Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
@@ -512,20 +580,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         .get("schedule")
         .map(|rt| (**rt).clone());
 
-    // Build BackendRegistry: one entry per unique backend (deduplicated
-    // by backend_name so packs sharing a backend share one runtime).
-    let mut backend_reg = BackendRegistry::new();
-    for (pack_name, rt) in &multi.per_pack_runtimes {
-        let backend_name = khive_cfg
-            .packs
-            .get(pack_name.as_str())
-            .map(|pc| pc.backend.as_str())
-            .unwrap_or(BackendId::MAIN);
-        let backend_id = BackendId::new(backend_name);
-        // `BackendRegistry::register` is idempotent by backend_id —
-        // the second registration for the same id is a no-op.
-        backend_reg.register(backend_id, Arc::clone(rt));
-    }
+    let backend_reg = coordinator_backend_registry(&multi.per_pack_runtimes, khive_cfg)?;
 
     let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
@@ -535,6 +590,31 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
     );
     Ok((server, schedule_rt))
+}
+
+/// Build one coordinator registration per unique configured backend.
+fn coordinator_backend_registry(
+    per_pack_runtimes: &std::collections::HashMap<String, Arc<KhiveRuntime>>,
+    khive_cfg: &KhiveConfig,
+) -> Result<BackendRegistry> {
+    let mut backend_reg = BackendRegistry::new();
+    for (pack_name, rt) in per_pack_runtimes {
+        let backend_name = khive_cfg
+            .packs
+            .get(pack_name.as_str())
+            .map(|pc| pc.backend.as_str())
+            .unwrap_or(BackendId::MAIN);
+        let backend_id = BackendId::parse(backend_name)?;
+        let served_kinds = khive_cfg
+            .backends
+            .iter()
+            .find(|backend| backend.name == backend_name)
+            .and_then(|backend| backend.served_kinds.clone());
+        // `BackendRegistry::register` is idempotent by backend_id —
+        // the second registration for the same id is a no-op.
+        backend_reg.register_with_served_kinds(backend_id, Arc::clone(rt), served_kinds)?;
+    }
+    Ok(backend_reg)
 }
 
 async fn cmd_db(cmd: DbCommand) -> Result<()> {
@@ -949,7 +1029,7 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
             Ok(())
         }
         BackendCommand::Info { name, human } => {
-            let id = BackendId::new(&name);
+            let id = BackendId::parse(&name)?;
             let entry = registry
                 .get(&id)
                 .with_context(|| format!("backend {name:?} is not registered"))?;
@@ -1216,19 +1296,7 @@ mod tests {
         // inspection below accepts only the frozen snapshot form.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
+            khive_storage::test_support::freeze_snapshot_sidecars(&path);
         }
         let before = std::fs::read(&path).expect("read db before check");
         // strict passes only when the db is already current — proves the read sees V1.
@@ -1416,7 +1484,7 @@ mod tests {
         let migrated = StorageBackend::sqlite(&path).expect("reopen migrated database");
         assert_eq!(
             migrated.prepare_core_schema().unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            khive_db::migrations::latest_schema_version()
         );
         let attachment = migrated
             .attachments()
@@ -1430,10 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_preflights_soft_deleted_secondary_before_advancing_main() {
-        use khive_db::migrations::{
-            attachment_cutover_status, read_schema_version, AttachmentCutoverStatus,
-            ATTACHMENT_CUTOVER_VERSION,
-        };
+        use khive_db::migrations::{AttachmentCutoverStatus, ATTACHMENT_CUTOVER_VERSION};
 
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("main.db");
@@ -1458,17 +1523,15 @@ mod tests {
 
         let main_backend =
             khive_db::StorageBackend::sqlite(&main).expect("inspect blocked main backend");
-        let main_conn = main_backend.pool().reader().expect("inspect blocked main");
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1,
             "main must remain V20 when secondary inventory fails"
         );
         assert_eq!(
-            attachment_cutover_status(main_conn.conn()).unwrap(),
+            main_backend.attachment_cutover_status().unwrap(),
             AttachmentCutoverStatus::Pending
         );
-        drop(main_conn);
         drop(main_backend);
 
         let secondary_backend =
@@ -1495,13 +1558,12 @@ mod tests {
         for path in [&secondary, &main] {
             let backend =
                 khive_db::StorageBackend::sqlite(path).expect("inspect completed topology backend");
-            let conn = backend.pool().reader().expect("inspect completed topology");
             assert_eq!(
-                read_schema_version(conn.conn()).unwrap(),
-                ATTACHMENT_CUTOVER_VERSION
+                backend.schema_version().unwrap(),
+                khive_db::migrations::latest_schema_version()
             );
             assert_eq!(
-                attachment_cutover_status(conn.conn()).unwrap(),
+                backend.attachment_cutover_status().unwrap(),
                 AttachmentCutoverStatus::Complete
             );
         }
@@ -1509,7 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_named_secondary_does_not_advance_main() {
-        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
+        use khive_db::migrations::ATTACHMENT_CUTOVER_VERSION;
 
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("main.db");
@@ -1532,15 +1594,13 @@ mod tests {
 
         let main_backend = khive_db::StorageBackend::sqlite(&main).unwrap();
         let secondary_backend = khive_db::StorageBackend::sqlite(&secondary).unwrap();
-        let main_conn = main_backend.pool().reader().unwrap();
-        let secondary_conn = secondary_backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(main_conn.conn()).unwrap(),
+            main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
         );
         assert_eq!(
-            read_schema_version(secondary_conn.conn()).unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            secondary_backend.schema_version().unwrap(),
+            khive_db::migrations::latest_schema_version()
         );
     }
 
@@ -1570,8 +1630,6 @@ mod tests {
 
     #[tokio::test]
     async fn db_migrate_one_declared_main_uses_its_configured_path() {
-        use khive_db::migrations::{read_schema_version, ATTACHMENT_CUTOVER_VERSION};
-
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("declared-main.db");
         create_v20_fixture(&main, None);
@@ -1588,10 +1646,9 @@ mod tests {
         .await
         .expect("one declared main must use topology path");
         let backend = khive_db::StorageBackend::sqlite(&main).unwrap();
-        let conn = backend.pool().reader().unwrap();
         assert_eq!(
-            read_schema_version(conn.conn()).unwrap(),
-            ATTACHMENT_CUTOVER_VERSION
+            backend.schema_version().unwrap(),
+            khive_db::migrations::latest_schema_version()
         );
     }
 
@@ -1754,10 +1811,31 @@ mod tests {
                 path,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
         }
+    }
+
+    #[test]
+    fn coordinator_registry_copies_backend_served_kind_declarations() {
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.backends[0].served_kinds = Some(std::collections::BTreeSet::from([
+            khive_types::SubstrateKind::Note,
+        ]));
+        let runtimes = std::collections::HashMap::from([(
+            "kg".to_string(),
+            Arc::new(KhiveRuntime::memory().expect("memory runtime")),
+        )]);
+
+        let registry = coordinator_backend_registry(&runtimes, &khive_cfg)
+            .expect("valid coordinator registry");
+        let main = registry
+            .get(&BackendId::main())
+            .expect("main backend registered");
+        assert!(main.serves(khive_types::SubstrateKind::Note));
+        assert!(!main.serves(khive_types::SubstrateKind::Entity));
     }
 
     /// File-backed main: both boot paths must agree on every `WiringSurface`
@@ -1996,6 +2074,7 @@ mod tests {
             path: None,
             cache_mb: None,
             journal_mode: None,
+            served_kinds: None,
             read_only: false,
         });
 
@@ -2034,6 +2113,7 @@ mod tests {
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 khive_runtime::BackendConfig {
@@ -2042,6 +2122,7 @@ mod tests {
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -2051,6 +2132,7 @@ mod tests {
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -2077,6 +2159,7 @@ mod tests {
                 // route around the coordinator's full-UUID-only interception.
                 let resp = server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: Some("verbose".to_string()),
                         presentation_per_op: None,

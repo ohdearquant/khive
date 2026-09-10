@@ -51,8 +51,17 @@ operation is successful but its operation envelope also carries:
 
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
-presentation transforms only `result`, and daemon frame-budget omission keeps
-the bounded diagnostics even if the result itself must be omitted. If no hit
+presentation transforms only `result`. Daemon frame-budget handling keeps the
+bounded diagnostics if an oversized result becomes a typed
+`response_frame_budget_exceeded` error, decided after the whole request has
+already run: it moves `status`/`partial`/`missing_backends`/`backend_errors*`
+under `error.search` (they are defined only on a successful entry, and this
+one just flipped to `ok: false`). The error's `retryable` is always `false` —
+reissuing an identical search overflows the identical budget identically, and
+`search` also schedules a best-effort `SearchExecuted` telemetry event on
+every dispatch with no dedup key, so a lost response must not be advertised
+as safe to reissue either way; the entry carries `executed: true` and
+`recoverable: "read_outcome"` instead. If no hit
 survives filtering, `missing_backends` and `backend_errors` instead live inside
 the `search_incomplete` error. Complete searches omit both fields. At most 16
 causes and one per-operation wire budget are retained; truncation is explicit

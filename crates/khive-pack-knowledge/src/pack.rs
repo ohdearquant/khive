@@ -57,10 +57,18 @@ impl Pack for KnowledgePack {
 impl KnowledgePack {
     /// Create a new pack bound to the given runtime, initializing a shared ANN index.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the atom
+    /// index from the full corpus. See `MemoryPack::new_with_index_role` for the
+    /// reasoning; the two packs share one index root per model family and the
+    /// same cost.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
-            ann: vamana::new_shared(),
+            ann: vamana::new_shared_for_role(builds_corpus_indexes),
             section_posteriors: Mutex::new(HashMap::new()),
             brain_profile,
         }
@@ -79,7 +87,10 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(KnowledgePack::new(runtime))
+        Box::new(KnowledgePack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 
     fn create_resolver(
@@ -131,6 +142,7 @@ impl PackRuntime for KnowledgePack {
         // below; it must not enter a writer-bearing ANN lifecycle.
         if !self.runtime.is_read_only() {
             crate::knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+            crate::knowledge::vamana::start_rotation_watcher(&self.runtime, &self.ann);
         }
         if !self.runtime.default_embedder_name().is_empty() {
             let runtime = self.runtime.clone();
@@ -654,20 +666,8 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let db_path = config.db_path.as_ref().expect("db path");
-            for suffix in ["-wal", "-shm"] {
-                let mut name = db_path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = db_path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
+            khive_storage::test_support::freeze_snapshot_sidecars(db_path);
         }
 
         let read_only = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
@@ -691,6 +691,75 @@ mod tests {
             read_only.backend().pool().writer_acquisition_snapshot(),
             before,
             "read-only ANN admission must not acquire a writer"
+        );
+    }
+
+    /// Pack-level lifecycle coverage for `start_rotation_watcher`'s
+    /// production wiring (issue #2340): the rotation tests elsewhere in this
+    /// crate call the private `refresh_rotated_segments_once` test helper
+    /// directly, so nothing previously asserted that a writable `warm()`
+    /// actually starts the tracked watcher, that a repeated `warm()` is
+    /// idempotent, or that the watcher exits once its `AnnState` is dropped.
+    /// Time is paused so the watcher's 5-second tick can be crossed
+    /// deterministically instead of by a real sleep.
+    #[tokio::test(start_paused = true)]
+    async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("writable runtime");
+        let pack = KnowledgePack::new(rt);
+
+        let before = khive_runtime::background_task_count();
+        pack.warm().await;
+        assert!(
+            crate::knowledge::vamana::rotation_watch_started_for_test(&pack.ann),
+            "a writable warm must start the rotation watcher"
+        );
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "warm must track exactly one rotation watcher task"
+        );
+
+        // A repeated warm must not start a second tracked watcher.
+        pack.warm().await;
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "a repeated warm must be idempotent and not start a second watcher"
+        );
+
+        // The watcher retains only a Weak<AnnState>; dropping every strong
+        // reference lets its next tick observe the failed upgrade and exit.
+        let ann_weak = std::sync::Arc::downgrade(&pack.ann);
+        drop(pack);
+        assert!(
+            ann_weak.upgrade().is_none(),
+            "dropping the pack must drop its last strong ANN reference"
+        );
+
+        // The watcher builds its interval on its first poll, which can land
+        // after this advance; under paused time `sleep` auto-advances the
+        // clock once every task is idle, so the tick is reached by virtual
+        // time rather than by a fixed yield budget.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while khive_runtime::background_task_count() != before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watcher must exit once its ANN state is dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before,
+            "the watcher must exit once its ANN state is dropped"
         );
     }
 }

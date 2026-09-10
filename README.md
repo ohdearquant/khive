@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **91 verbs, 12 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob: all load by default                                              |
+| **129 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -63,24 +63,26 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 12 packs load by default, giving **91 verbs** out of the box (updated from the
-current handler declarations, 2026-08-06; verify again with `request(ops="verbs()")`
+All 14 packs load by default, giving **129 verbs** out of the box (updated from the
+current handler declarations, 2026-09-09; verify again with `request(ops="verbs()")`
 before editing this table):
 
-| Pack          | Prefix       | Verbs | What it does                                                                                   |
-| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 20    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics  |
-| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **brain**     | `brain.`     | 16    | Bayesian user profiles + feedback loop                                                         |
-| **comm**      | `comm.`      | 10    | Threaded messaging with sender-side internal delivery confirmation                             |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
-| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                     |
-| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |
-| **git**       | `git.`       | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
-| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)              |
-| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)   |
-| **blob**      | `blob.`      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                 |
+| Pack          | Prefix       | Verbs | What it does                                                                                                                                                          |
+| ------------- | ------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_     | 24    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                         |
+| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                                                                                         |
+| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                      |
+| **brain**     | `brain.`     | 16    | Bayesian user profiles + feedback loop                                                                                                                                |
+| **comm**      | `comm.`      | 10    | Threaded messaging with sender-side internal delivery confirmation                                                                                                    |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                                                                                                |
+| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                                                                                            |
+| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                                                                                                 |
+| **tool**      | `tool.`      | 13    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                           |
+| **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                                          |
+| **git**       | `git.`       | 16    | Provenance ingest, branch/commit/push writes (ADR-108), dev-loop verbs: checkout, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge (ADR-182) |
+| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)                                                                                     |
+| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                                          |
+| **blob**      | `blob.`      | 3     | Content-addressed object put/get/stat over the `BlobStore` CAS trait (ADR-111)                                                                                        |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -137,7 +139,7 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 20 verb handlers       │
+│  khive-pack-kg:        KG vocabulary + 24 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (5 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
 │  khive-pack-brain:     Bayesian profiles (16 verbs)           │
@@ -145,13 +147,17 @@ records what's connected, in which direction, and why.
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-knowledge: atom KB + embedding rerank (19 verbs)  │
 │  khive-pack-session:   session record persistence (4 verbs)   │
-│  khive-pack-git:       provenance ingest + writes (4 verbs)   │
+│  khive-pack-git:       provenance ingest + writes (16 verbs)  │
 │  khive-pack-code:      source ingest (L1 manifest + L1.5      │
 │                        import-scan; 1 verb)                   │
 │  khive-pack-workspace: workspace entity + contains endpoint   │
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
 │                        (3 verbs)                              │
+│  khive-pack-tool:      tool/skill/plugin registry, capability │
+│                        discovery, use policy (13 verbs)       │
+│  khive-pack-exec:      sandboxed run over a materialized tree │
+│                        (9 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -227,6 +233,8 @@ must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchm
 | `khive-pack-git`       | Git pack: provenance ingest and git write verbs                                                          |
 | `khive-pack-code`      | Code pack: L1 manifest + L1.5 import-scan source ingestion                                               |
 | `khive-pack-workspace` | Workspace pack: workspace entity kind + contains endpoint rules                                          |
+| `khive-pack-tool`      | Tool pack: capability registry, discovery, use policy (ADR-180)                                          |
+| `khive-pack-exec`      | Exec pack: sandboxed run of a registered tool over a materialized tree (ADR-181)                         |
 | `khive-pack-blob`      | Blob pack: content-addressed object storage                                                              |
 | `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
 | `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
@@ -263,8 +271,8 @@ global):
 kkernel --version   # confirms the binary and version you just installed
 ```
 
-All 12 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 91-verb catalog.
+All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
+MCP client discovers the `request` tool with the full 129-verb catalog.
 
 ### Alternative: npm
 
@@ -313,23 +321,28 @@ Add the same server entry to `claude_desktop_config.json`:
 See [docs/guide/getting-started.md](docs/guide/getting-started.md) for the config file location
 on each platform.
 
-### Claude Code plugin (skills + agent)
+### Claude Code plugin (skills + agents)
 
-For guided research workflows, install the marketplace plugin:
+For guided workflows, install the marketplace plugin:
 
 ```
 /plugin marketplace add ohdearquant/khive
-/plugin install kg
+/plugin install khive
 ```
 
-This adds 4 workflow skills and a researcher agent:
+This adds one pattern skill per pack (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`,
+`knowledge`), four kg workflow skills, and six kg stewardship agents:
 
-| Skill         | What it does                                                   |
-| ------------- | -------------------------------------------------------------- |
-| `/kg:digest`  | Ingest material into the graph: extract entities, link, verify |
-| `/kg:explore` | Discover what the graph knows: traverse, narrate, surface gaps |
-| `/kg:connect` | Wire a new concept into existing knowledge: find relations     |
-| `/kg:polish`  | Audit and fix: orphans, low-degree nodes, duplicates           |
+| Skill           | What it does                                                   |
+| --------------- | -------------------------------------------------------------- |
+| `/khive:digest` | Ingest material into the graph: extract entities, link, verify |
+| `/khive:gap`    | Survey the graph's structural gaps: read-only frontier ranking |
+| `/khive:expand` | Grow the graph to close one strategic gap, with create caps    |
+| `/khive:polish` | Audit and fix: orphans, low-degree nodes, duplicates           |
+
+The agents (`khive:digester`, `khive:gap-analyst`, `khive:expander`, `khive:polisher`,
+`khive:librarian`, `khive:researcher`) and the pattern skills are described in
+[marketplace/khive/README.md](marketplace/khive/README.md).
 
 ### Configuration
 
@@ -391,7 +404,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 91 verbs across 12 packs, 9 entity kinds, 17 edge relations, daemon warm startup
+**Main after v0.7.0.** 129 verbs across 14 packs, 9 entity kinds, 17 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

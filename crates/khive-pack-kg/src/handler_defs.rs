@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (20 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -12,9 +12,61 @@
 use serde_json::Value;
 
 use khive_runtime::{RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
+    HandlerDef {
+        name: "stream.append",
+        description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "record", param_type: "JSON value", required: true, description: "Required JSON value, including scalar or null; stored as note content.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "expected_seq", param_type: "integer", required: false, description: "Append only if this entry would receive this sequence; conflict details include next_seq.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Registered note kind; defaults to observation.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "boolean", required: false, description: "Defaults false: no embedding rows or vector-index work, while lexical indexing and stream reads remain available. True embeds under every registered model unless embedding_model selects one.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embedding_model", param_type: "string", required: false, description: "Select one registered embedding model. Requires embed=true; otherwise invalid_input before any write.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tags", param_type: "array of string", required: false, description: "Immutable entry tags stored in properties.tags.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.read",
+        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after", param_type: "integer", required: false, description: "Exclusive nonnegative sequence; defaults to 0.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "limit", param_type: "integer", required: false, description: "Positive page size; defaults to 1000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.stat",
+        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.batch",
+        description: "Run append and keyed write members in one request. Atomic mode (the default whenever fence is present) runs the list in one writer transaction: appends to one stream take consecutive numbers, each expected_seq is checked immediately before its own append inside that transaction, and any member refusal refuses the whole batch with details.member set and nothing written. Per-member mode runs each member in its own transaction in list order: a refusal is returned as that member's value with domain_disposition not_committed and its siblings stand; numbers on one stream increase with list position but another writer's append may fall between them. Reads are not members. Result {results: [...], committed: true} in list order.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "ops", param_type: "array of object", required: true, description: "Members in order. {op: \"append\", stream, record, expected_seq?, fence?, embed?, embedding_model?}: record is any JSON value, including null. Append embed defaults false; true embeds under all registered models or the one embedding_model selects. embedding_model requires embed=true or the entire list is invalid_input before any write; atomic errors name details.member. Each append fence is an object or non-empty ordered list of {key, kind, expected_version}; all append-member fences are checked in order before any member writes in their transaction. A stale or missing list entry reports a string index; atomic refusal also names the string member position. Null, empty lists and duplicate (kind,key) entries are invalid before any member writes. {op: \"write\", key, kind, doc, tags?, embed?, expected_version?}: doc is any JSON value; omitted/null expected_version creates only if absent, while a positive version updates only an existing key at that version. Duplicate write (kind, key) pairs refuse the whole batch. An unknown op is that member's unknown_op refusal, placed by the mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "{key, kind, expected_version}: a keyed note whose positive version must match, checked once inside the atomic transaction before the first write. A missing or stale note refuses the whole batch with fence_conflict. Selects atomic mode; atomic=false beside a fence is refused. List-valued fences are not supported.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "observed", param_type: "array of object", required: false, description: "Requires atomic mode; supplying observed alone does not select it. Set atomic=true or supply fence. [{key, kind, version, id?, live_until?}], checked inside the transaction before the first write. A positive version asserts the live key's exact version; explicit null asserts no live holder. A mismatch refuses the batch with version_conflict naming the key and the entry index. The version field is required. Optional live_until is a dotted document path (for example lease.expires_at), requires a positive version, and must hold an RFC 3339 timestamp strictly later than one writer-transaction clock reading. Expired or unreadable fields refuse with expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID and requires a positive version; a replacement refuses with identity_conflict before the version check. The refusal includes current_id only when the caller may learn the holder, under the same disclosure rule as key_conflict. Without id, the entry asserts version equality on the note holding the key at commit time. Refused with invalid_input in per-member mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "atomic", param_type: "boolean", required: false, description: "true: one transaction, all or nothing. false: one transaction per member, refusals as member values. Defaults to whether fence is present. observed alone does not select atomic mode; observed without fence requires atomic=true, otherwise invalid_input.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -22,6 +74,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -32,36 +87,42 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Substrate or granular kind for the singleton path: \
                               \"entity\" | \"note\" | \"concept\" | \"document\" | \
                               \"observation\" | … Required when `items` is absent.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "name",
                 param_type: "string",
                 required: false,
                 description: "Human-readable name (entities, singleton path).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
                 description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Registered note kind when kind=\"note\", including head for nameless JSON documents. Head document kinds use properties.tags entries kind:<value> (at most 64 UTF-8 bytes without U+0000).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "content",
                 param_type: "string",
                 required: false,
                 description: "Body text (notes, singleton path).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
                 description: "Free-text description (entities).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "embedding_content",
@@ -72,24 +133,28 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               full text — use when `content` exceeds an embedder's \
                               input cap. Stored and FTS-indexed content are always the \
                               full `content`; this only replaces the vector input.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
                 description: "Tag list.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_type",
                 param_type: "string",
                 required: false,
                 description: "First-class entity type tag (e.g. \"paper\", \"algorithm\", \"tool\"). Stored in the entity's type field; also available in properties.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "properties",
                 param_type: "object",
                 required: false,
                 description: "Arbitrary JSON properties.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "items",
@@ -102,6 +167,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               Capped at 1000 entries per request. Bulk-created entities \
                               skip vector embedding and are not vector-searchable until \
                               a subsequent `reindex` call.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "atomic",
@@ -110,6 +176,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Bulk path only. When true (default), all items succeed or \
                               none are written. When false, items are attempted individually \
                               and per-item errors are collected in the response.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "verbose",
@@ -117,24 +184,31 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Bulk path only. When true, the response includes the full \
                               entity objects in an `entities` array.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     // Assertive: retrieves and presents a record
     HandlerDef {
         name: "get",
-        description: "Fetch any record by UUID",
+        description: "Fetch any record by UUID. Returns the bare record, no envelope: `kind` is \
+                      the granular kind (concept, task, observation, ...), `entity_type` is the \
+                      governed subtype when one is set, and an entity's vocabulary type lives \
+                      at `properties.type`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key", param_type: "string", required: false, description: "Live note key in the caller's primary namespace; excludes id and include_deleted=true. With no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "kind", param_type: "string", required: false, description: "Optional note substrate or registered note-kind hint for key lookup only.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_kind", param_type: "string", required: false, description: "Optional registered note kind for key lookup, disambiguating the same key across note kinds.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
-                required: true,
+                required: false,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
-                              note, edge, event, or proposal to fetch. UUID and prefix lookup \
-                              are namespace-unfiltered under ADR-007; other input falls back \
-                              to primary-namespace entity-name lookup.",
+                              note, edge, event, or proposal to fetch. Entity-name fallback \
+                              uses the primary namespace. Required when key is absent; id and key are mutually exclusive.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "include_deleted",
@@ -144,6 +218,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                     "If true, return soft-deleted entities (with deleted_at populated). Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
                      to soft-deleted entities when no live record matches.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -161,11 +236,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "key_prefix", param_type: "string", required: false, description: "Notes only, primary namespace: literal prefix over non-null keys; empty selects all keyed notes. Order is updated_at DESC, key DESC, id ASC. Cursor pages return notes and an opaque next_after; explicit offset retains the items envelope.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after_key", param_type: "string", required: false, description: "Keyed notes only: resume after this live key's current position even when its row fails other filters. Excludes after and offset. Missing fails with after_key_missing; ambiguous kind fails with key_ambiguous.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: true,
                 description: "Substrate or granular kind to list: \"entity\" | \"note\" | \"edge\" | \"event\" | \"proposal\" | granular kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
@@ -174,6 +255,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Maximum records to return (default varies by kind). Values above \
                               the kind's server-side cap are clamped and return explicit \
                               requested_limit, effective_limit, and limit_clamped metadata.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "offset",
@@ -183,12 +265,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               walks prefer \"after\", whose indexed seek cost does not grow with \
                               depth and whose boundaries are not shifted by concurrent inserts. \
                               Explicit offset and after values are mutually exclusive.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "after",
                 param_type: "string",
                 required: false,
-                description: "Insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
+                description: "With key_prefix, round-trip the opaque keyed-note next_after cursor (updated_at, key, id), or use an empty string to begin. Otherwise insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
                               the prior page's next_after, or \"\" to start cursor mode. A new id is \
                               assigned a durable database sequence, so later inserts cannot fall behind \
                               an issued boundary even when timestamps tie. This is a live walk, not an \
@@ -199,31 +282,35 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               cursor fails explicitly. Short prefixes are rejected because they can miss \
                               or be ambiguous while keyset pagination needs the exact stable insertion \
                               boundary. Mutually exclusive with offset.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
                 description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_type",
                 param_type: "string",
                 required: false,
                 description: "Filter by entity type field when kind=\"entity\" (e.g. \"paper\", \"algorithm\", \"tool\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "note_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference).",
+                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference | head).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Case-insensitive OR-filter over entity tags or note \
-                              properties.tags (kind=\"entity\" or kind=\"note\").",
+                description: "Case-insensitive OR-filter over entity tags or note properties.tags. For notes, tag_mode=all requires every requested tag.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "source_id",
@@ -232,6 +319,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter edges by source node complete UUID, unique 8+ hex prefix, \
                               or entity name (kind=\"edge\" only). Prefix and name resolution \
                               search the caller's primary namespace.",
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "target_id",
@@ -240,54 +328,63 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter edges by target node complete UUID, unique 8+ hex prefix, \
                               or entity name (kind=\"edge\" only). Prefix and name resolution \
                               search the caller's primary namespace.",
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "relations",
                 param_type: "array of string",
                 required: false,
                 description: "Filter edges to these relation types (kind=\"edge\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_weight",
                 param_type: "number",
                 required: false,
                 description: "Minimum edge weight inclusive (kind=\"edge\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "max_weight",
                 param_type: "number",
                 required: false,
                 description: "Maximum edge weight inclusive (kind=\"edge\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "event_kind",
                 param_type: "string",
                 required: false,
                 description: "Filter events to a single EventKind (kind=\"event\" only). E.g. \"ProposalCreated\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "event_kinds",
                 param_type: "array of string",
                 required: false,
                 description: "Filter events to multiple EventKinds (kind=\"event\" only). Additive with event_kind.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "session_id",
                 param_type: "uuid",
                 required: false,
                 description: "Filter events by an exact full session UUID (kind=\"event\" only). A short-prefix resolution can miss or be ambiguous, so it is rejected for this stable record filter.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "observed",
                 param_type: "array of uuid",
                 required: false,
                 description: "Filter events that observed every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "selected",
                 param_type: "array of uuid",
                 required: false,
                 description: "Filter events that selected every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "thread_id",
@@ -304,43 +401,51 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               byte-equal to the input takes precedence over any UUID-prefix \
                               match; a label differing only in ASCII case is a fallback, \
                               consulted only when no UUID-prefix candidate resolves.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "direction",
                 param_type: "string",
                 required: false,
                 description: "Filter messages by direction (kind=\"message\" only): \"inbound\" | \"outbound\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "from",
                 param_type: "string",
                 required: false,
                 description: "Filter messages by sender identifier (kind=\"message\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "to",
                 param_type: "string",
                 required: false,
                 description: "Filter messages by recipient identifier (kind=\"message\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "read",
                 param_type: "bool",
                 required: false,
                 description: "Filter messages by read status (kind=\"message\" only): true = read, false = unread.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "delivered",
                 param_type: "bool",
                 required: false,
                 description: "Filter messages by delivery status (kind=\"message\" only): true = delivered, false = undelivered (missing or null delivered_at).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes), plus an \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+                      live rows across caller-visible namespaces; count_scope repeats this scope \
+                      in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
                       know the true per-relation population before sampling.",
         visibility: Visibility::Verb,
@@ -351,78 +456,98 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
-                       entities accept name/description/properties/tags; notes accept \
+                       entities accept name/description/properties/tags/entity_type; notes accept \
                        name/content/salience/decay_factor/properties; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
+            ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of distinct (kind, key) objects, checked in order in the same writer transaction. Missing or stale returns fence_conflict; list refusals also carry string index (zero-based). Explicit null is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "bool", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, note, \
-                              or edge to patch. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              or edge to patch. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
                 description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "name",
                 param_type: "string",
                 required: false,
                 description: "New name (entities and notes).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
                 description: "New description (entities only; notes use 'content' for body text).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "content",
                 param_type: "string",
                 required: false,
                 description: "New body text (notes only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "salience",
                 param_type: "number",
                 required: false,
                 description: "Importance score 0.0–1.0 (notes only; affects recall ranking).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "decay_factor",
                 param_type: "number",
                 required: false,
                 description: "Decay rate >= 0 (notes only; higher = faster decay).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "relation",
                 param_type: "string",
                 required: false,
                 description: "New edge relation (edges only; any of the 17 canonical relations).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "weight",
                 param_type: "number",
                 required: false,
                 description: "New edge weight 0.0–1.0 (edges only; 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "properties",
                 param_type: "object",
                 required: false,
                 description: "Properties to merge in (shallow merge).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
                 description: "Replace tag list.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "Registered entity type to set (entities only). The value is validated against the entity kind's closed vocabulary and reindexed.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -438,20 +563,22 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the record to \
-                              delete. UUID and prefix lookup are namespace-unfiltered under \
-                              ADR-007; entity-name fallback uses the primary namespace.",
+                              delete. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
                 description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "hard",
                 param_type: "bool",
                 required: false,
                 description: "If true, permanently remove with edge cascade (default false = soft delete).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -468,52 +595,58 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
-                              note that survives. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              note that survives. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "from_id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
-                              note to merge from. UUID and prefix lookup are namespace-unfiltered \
-                              under ADR-007; entity-name fallback uses the primary namespace.",
+                              note to merge from. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
                 description: "Optional substrate or granular kind hint. Omit to resolve the substrate from into_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "strategy",
                 param_type: "string",
                 required: false,
                 description: "Field merge policy: prefer_into (default) | prefer_from | union.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "content_strategy",
                 param_type: "string",
                 required: false,
                 description: "Description/content policy: append (default) | prefer_into | prefer_from.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "dry_run",
                 param_type: "bool",
                 required: false,
                 description: "If true, return the planned summary without mutating records or emitting an event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "force",
                 param_type: "bool",
                 required: false,
                 description: "If true, bypass entity merge safety guards; the caller accepts responsibility for the merge.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "reason",
                 param_type: "string",
                 required: false,
                 description: "Optional caller-supplied reason preserved verbatim in the merge audit event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -529,91 +662,116 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: true,
                 description: "Substrate or granular kind to search.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "query",
                 param_type: "string",
                 required: true,
                 description: "Free-text search query.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
                 description: "Maximum results to return (default 10).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
                 description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_type",
                 param_type: "string",
                 required: false,
                 description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "note_kind",
                 param_type: "string",
                 required: false,
                 description: "Filter search results to a specific note kind (kind=\"note\" only).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "include_superseded",
                 param_type: "bool",
                 required: false,
                 description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "properties",
                 param_type: "object",
                 required: false,
                 description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array",
                 required: false,
                 description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: false,
+                description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
                 description: "Optional caller-supplied score floor (0.0–1.0). Results below this threshold are discarded. No server default is applied; RRF rank-1 scores are typically 0.013–0.033 on small corpora. Pass e.g. 0.02 to suppress near-zero noise hits.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     // Commissive: commits a typed edge to the graph
     HandlerDef {
         name: "link",
-        description: "Create a typed directed edge",
+        description: "Create one typed directed edge or a bounded bulk of edges. Supply the \
+                      singleton source_id/target_id/relation fields or links; unknown top-level \
+                      fields and unknown fields inside links entries are rejected.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
                 name: "source_id",
                 param_type: "uuid",
-                required: true,
-                description: "Source node complete UUID or globally unique 8+ hex prefix. UUID \
+                required: false,
+                description: "Required in singleton mode. Source node complete UUID or globally \
+                              unique 8+ hex prefix. UUID \
                               and prefix lookup are namespace-unfiltered under ADR-007; \
-                              entity-name fallback uses the primary namespace.",
+                              entity-name fallback uses the primary namespace. Ignored when \
+                              links is supplied.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "target_id",
                 param_type: "uuid",
-                required: true,
-                description: "Target node complete UUID or globally unique 8+ hex prefix. UUID \
+                required: false,
+                description: "Required in singleton mode. Target node complete UUID or globally \
+                              unique 8+ hex prefix. UUID \
                               and prefix lookup are namespace-unfiltered under ADR-007; \
-                              entity-name fallback uses the primary namespace.",
+                              entity-name fallback uses the primary namespace. Ignored when \
+                              links is supplied.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
                 name: "relation",
                 param_type: "string",
-                required: true,
-                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                required: false,
+                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base ADR-002 entity->entity allowlist (issue #964 — this table is a hand-maintained mirror of `base_entity_endpoint_rules()` (khive-runtime) and is guarded by a regression test on key rows; enforcement consults the shared rule data via `base_entity_rule_allows()`, not this text — `base_entity_endpoint_rules()` is just an exposed view of the same constant): \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
@@ -633,19 +791,71 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                     annotates: note -> {entity, note, edge, event} — the only relation permitting a note source paired with ANY target substrate (supersedes/supports/refutes also permit a note source, but only same-substrate: a note source there requires a note target too). \
                     The `kg` pack additionally allows (pack-extensible, additive-only per ADR-017): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
                     Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `KG_EDGE_RULES` in `khive-pack-kg/src/pack.rs` (ADR-017).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "weight",
                 param_type: "number",
                 required: false,
-                description: "Edge weight 0.0–1.0 (default 1.0). 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.",
+                description: "Singleton edge weight 0.0–1.0 (default 1.0). 1.0=definitional, \
+                              0.7-0.9=strong, 0.4-0.6=plausible. Ignored when links is supplied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "metadata",
+                param_type: "object",
+                required: false,
+                description: "Singleton edge metadata. Metadata is returned by get(id=<edge UUID>); \
+                              neighbors does not currently project edge metadata. Ignored when \
+                              links is supplied; use each bulk entry's metadata instead.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "dependency_kind",
+                param_type: "string",
+                required: false,
+                description: "Singleton convenience field for metadata.dependency_kind on \
+                              depends_on edges: build | runtime | data | artifact | tooling | \
+                              normative. An existing metadata.dependency_kind wins. Ignored when \
+                              links is supplied; each bulk entry accepts the same field.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "verbose",
+                param_type: "bool",
+                required: false,
+                description: "Bulk mode only. When true, include successfully created edges in \
+                              an edges array; default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "links",
+                param_type: "array of object",
+                required: false,
+                description: "Bulk edge creation, capped at 1000 entries. Each entry requires \
+                              source_id, target_id, and relation, and accepts optional weight, \
+                              metadata, and dependency_kind. Unknown entry fields are rejected. \
+                              When supplied, singleton edge fields are ignored.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "atomic",
+                param_type: "bool",
+                required: false,
+                description: "Bulk mode only. When true (default), all entries succeed or none \
+                              are written. When false, entries are attempted individually and \
+                              per-entry errors are collected in the response.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
+        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
+                      {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
+                      queried node, edge_id, relation, weight, and the neighbor's id, kind and \
+                      name; include_entity_type=true adds entity_type when the neighbor has one.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -656,24 +866,28 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
                               whose neighbors to return. Prefix and name resolution search the \
                               caller's primary namespace.",
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "direction",
                 param_type: "string",
                 required: false,
                 description: "Edge direction: \"outgoing\" | \"incoming\" | \"both\" (default \"both\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "relations",
                 param_type: "array of string",
                 required: false,
                 description: "Filter to these relation types only.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_weight",
                 param_type: "number",
                 required: false,
                 description: "Minimum edge weight for returned neighbors (0.0–1.0). Edges below this threshold are excluded.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -697,48 +911,56 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               names (maximum 100; aliases resolving to the same UUID are \
                               de-duplicated). Prefix and name resolution search the caller's \
                               primary namespace.",
+                resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
                 name: "max_depth",
                 param_type: "integer",
                 required: false,
                 description: "Maximum traversal depth (default 3, maximum 10).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "relations",
                 param_type: "array of string",
                 required: false,
                 description: "Restrict traversal to these relation types.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "direction",
                 param_type: "string",
                 required: false,
                 description: "out|outgoing|in|incoming|both (default both).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_weight",
                 param_type: "number",
                 required: false,
                 description: "Minimum edge weight (finite, 0.0–1.0).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
                 description: "Maximum non-root first-visit nodes per root (default 100, maximum 1000).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "include_roots",
                 param_type: "boolean",
                 required: false,
                 description: "Include each root as a depth-0 path node (default true; roots do not consume limit).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "include_properties",
                 param_type: "boolean",
                 required: false,
                 description: "Include entity properties on enriched path nodes (default false).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -761,6 +983,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Semantic anchor selection via hybrid search over entities; also \
                               contributes anchors alongside entity_ids (duplicates collapse). \
                               At least one of query/entity_ids is required.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "entity_ids",
@@ -769,6 +992,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Explicit anchor UUIDs, short prefixes, or slugs (ADR-046 \
                               resolution). Honored in full — never clamped by `limit`. At \
                               least one of query/entity_ids is required.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "hops",
@@ -776,6 +1000,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Expansion depth, clamped 0..=2 (default 1). 0 = anchors only, \
                               no neighbor expansion.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "budget",
@@ -784,12 +1009,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Output budget in Unicode scalar values of compact JSON per \
                               record, clamped 256..=65536 (default 4096). Governs response \
                               size, not expansion work.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "relations",
                 param_type: "array of string",
                 required: false,
                 description: "Edge-relation filter applied during expansion (default: all).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "direction",
@@ -798,6 +1025,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Edge direction during expansion: \"outgoing\" | \"incoming\" | \
                               \"both\" (default \"both\" — diverges from `neighbors`' \
                               \"outgoing\" default; see ADR-089).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
@@ -805,6 +1033,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Max anchors taken from the `query` search leg, clamped 1..=20 \
                               (default 5). Does not clamp explicit entity_ids.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "fanout",
@@ -812,6 +1041,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Max neighbors returned per expanded node per hop, clamped \
                               1..=50 (default 10). Work bound: anchors × (fanout + fanout²).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -827,6 +1057,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: true,
                 description: "GQL or SPARQL pattern query string (read-only). GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "page_size",
@@ -835,6 +1066,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Maximum rows in this result page (minimum 1, default 500, \
                               clamped to the hard cap 10 000). Mutually exclusive with \
                               deprecated `limit`. Query-text LIMIT composes as the smaller bound.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
@@ -842,6 +1074,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 required: false,
                 description: "Deprecated alias for `page_size`; mutually exclusive with \
                               `page_size`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -862,12 +1095,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: true,
                 description: "Short title for the proposal (must be non-empty).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: true,
                 description: "Full description explaining the proposed change (must be non-empty).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "changeset",
@@ -883,24 +1118,28 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
                     compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "reviewers",
                 param_type: "array<string>",
                 required: false,
                 description: "Actor IDs requested as reviewers. Default: empty list.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "expiry",
                 param_type: "integer",
                 required: false,
                 description: "Expiry timestamp in microseconds since epoch. Omit for no expiry.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "parent_id",
                 param_type: "uuid",
                 required: false,
                 description: "Full UUID of a parent proposal this supersedes or extends. A short prefix would require proposal-namespace resolution and is rejected because ancestry is an explicit stable reference.",
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
             },
         ],
     },
@@ -918,18 +1157,21 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID or unique 8+ hex prefix of the proposal to review. \
                               Prefix resolution searches open proposals in the caller's primary \
                               namespace.",
+                resolution_mode: IdResolutionMode::FullAndPrefixScopedToPrimary,
             },
             ParamDef {
                 name: "decision",
                 param_type: "string",
                 required: true,
                 description: "Review outcome: \"approve\" | \"reject\" | \"comment\" | \"request_changes\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "comment",
                 param_type: "string",
                 required: false,
                 description: "Optional reviewer comment attached to the review event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -947,12 +1189,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Complete UUID or unique 8+ hex prefix of the open proposal to \
                               withdraw. Prefix resolution searches open proposals in the caller's \
                               primary namespace.",
+                resolution_mode: IdResolutionMode::FullAndPrefixScopedToPrimary,
             },
             ParamDef {
                 name: "rationale",
                 param_type: "string",
                 required: false,
                 description: "Optional reason for withdrawing the proposal.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -989,6 +1233,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Natural-language references to resolve (e.g. \
                               \"the old record\", a UUID, a short hex prefix, \
                               or an exact entity name).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "kind",
@@ -998,6 +1243,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               hybrid-search (stage 4) stages to an entity kind \
                               (e.g. \"concept\", \"project\"). Has no effect on \
                               the id-string or ring stages.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "limit",
@@ -1008,6 +1254,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               to surface deeper-ranked matches. An exact-name \
                               match resolves to a single id and ignores this \
                               bound. Default 5, max 20.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -1017,27 +1264,40 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         description: "Report the caller's identity as the runtime already resolved it for \
                       this request: actor_id, actor_kind, whether the actor is the \
                       unattributed/anonymous fallback, the write namespace, and the \
-                      read-visible namespace set. Never returns tokens or credentials — \
-                      only labels the runtime already computed before dispatch.",
+                      read-visible namespace set. Also returns build.version and \
+                      build.revision from the serving process's compile-time metadata, \
+                      without database diagnostics or a checkpoint probe. Never returns \
+                      tokens or credentials.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
     },
-    // Assertive: writer-contention, edge-integrity, and WAL diagnostics (ADR-091/ADR-135)
+    // Assertive: reader/writer contention, edge-integrity, and WAL diagnostics.
     HandlerDef {
         name: "db_diagnostics",
-        description: "Report writer-contention, graph-edge integrity, and WAL/checkpoint \
+        description: "Report reader- and writer-contention, graph-edge integrity, and WAL/checkpoint \
                       diagnostics for the main \
-                      database: aggregate and class-specific pooled/standalone/writer-task \
-                      acquisitions, finite-wait pool timeouts, writer-task request failures and \
+                      database: reader admission capacity/availability, pooled reader checkouts, \
+                      separately attributed request/infrastructure standalone reader opens, \
+                      reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
+                      completed hold time; aggregate and class-specific pooled/standalone/writer-task \
+                      writer acquisitions, finite-wait pool timeouts, writer-task request failures and \
                       their unknown-side-effects subset, swallowed best-effort audit \
                       append failures, additive audit-batch flush-failure/degraded-row/degraded \
                       counters (present once a runtime audit-batch control is wired; \
                       unavailable with a reason otherwise), build identity, duplicate edge-ID \
                       and list-ledger counts, \
+                      graph_edges_rows across all namespaces including soft-deleted rows, and \
+                      graph_edges_seq_rows across the insertion ledger, whose rows survive hard deletion. \
+                      graph_edges_seq_minus_graph_edges and graph_edges_seq_relationship make the \
+                      expected non-negative ledger delta explicit; a negative delta is unexpected \
+                      unless the report also flags the pre-V14 duplicate-edge state, which is \
+                      classified as ledger_behind_pre_v14_duplicate_edge_state. \
+                      A bounded dbstat size composition reports per-table/per-index pages and \
+                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
                       ADR-091 checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
-                      WAL-pin holder census. The \
+                      WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
@@ -1062,12 +1322,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "string",
                 required: false,
                 description: "Filter by illocutionary category: Assertive | Commissive | Declaration | Directive.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "pack",
                 param_type: "string",
                 required: false,
                 description: "Filter by pack name (e.g. \"kg\", \"gtd\", \"memory\", \"brain\", \"comm\", \"schedule\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -1097,7 +1359,10 @@ fn compact_signature(handler: &HandlerDef) -> String {
 }
 
 /// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
-pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
+pub(crate) async fn handle_verbs(
+    params: Value,
+    registry: &VerbRegistry,
+) -> Result<Value, RuntimeError> {
     #[derive(serde::Deserialize, Default)]
     struct VerbsParams {
         category: Option<String>,
@@ -1105,49 +1370,36 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     }
     let p: VerbsParams =
         serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-    let all_verbs = registry.all_verbs_with_names();
+    let mut verbs: Vec<Value> = registry.all_verbs_with_names().into_iter().map(|(pack, handler)| serde_json::json!({
+        "verb": handler.name, "pack": pack, "description": handler.description,
+        "category": format!("{:?}", handler.category), "signature": compact_signature(handler),
+    })).collect();
+    verbs.extend(registry.mounted_verb_catalog().await?);
     let pack_counts: serde_json::Map<String, Value> = registry
         .pack_names()
         .into_iter()
-        .map(|pack_name| {
-            let count = all_verbs
-                .iter()
-                .filter(|(owner, _)| *owner == pack_name)
-                .count();
-            (pack_name.to_string(), serde_json::json!(count))
+        .map(|pack| {
+            (
+                pack.to_string(),
+                serde_json::json!(verbs
+                    .iter()
+                    .filter(|verb| verb["pack"].as_str() == Some(pack))
+                    .count()),
+            )
         })
         .collect();
-    let verbs: Vec<Value> = all_verbs
-        .into_iter()
-        .filter(|(pack_name, handler)| {
-            let cat_ok = p
-                .category
-                .as_deref()
-                .is_none_or(|c| format!("{:?}", handler.category).eq_ignore_ascii_case(c));
-            let pack_ok = p
-                .pack
-                .as_deref()
-                .is_none_or(|pk| pack_name.eq_ignore_ascii_case(pk));
-            cat_ok && pack_ok
+    verbs.retain(|verb| {
+        p.category.as_deref().is_none_or(|filter| {
+            verb["category"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
+        }) && p.pack.as_deref().is_none_or(|filter| {
+            verb["pack"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
         })
-        .map(|(pack_name, handler)| {
-            serde_json::json!({
-                "verb": handler.name,
-                "pack": pack_name,
-                "description": handler.description,
-                "category": format!("{:?}", handler.category),
-                "signature": compact_signature(handler),
-            })
-        })
-        .collect();
-
-    let total = verbs.len();
-    Ok(serde_json::json!({
-        "verbs": verbs,
-        "total": total,
-        "pack_counts": pack_counts,
-    }))
+    });
+    Ok(serde_json::json!({"total": verbs.len(), "verbs": verbs, "pack_counts": pack_counts}))
 }
 
 #[cfg(test)]
@@ -1159,6 +1411,31 @@ mod tests {
             .iter()
             .find(|h| h.name == name)
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
+    }
+
+    #[test]
+    fn count_verb_help_explains_edge_count_scopes_and_ledger_delta() {
+        let stats = find_handler("stats");
+        assert!(
+            stats.description.contains("caller-visible namespaces")
+                && stats.description.contains("live rows"),
+            "stats help must disclose its namespace and deletion scope"
+        );
+
+        let diagnostics = find_handler("db_diagnostics");
+        for required in [
+            "reader admission capacity",
+            "maximum completed hold time",
+            "all namespaces",
+            "soft-deleted rows",
+            "hard deletion",
+            "graph_edges_seq_minus_graph_edges",
+        ] {
+            assert!(
+                diagnostics.description.contains(required),
+                "db_diagnostics help must explain {required:?}"
+            );
+        }
     }
 
     /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list
@@ -1200,6 +1477,71 @@ mod tests {
             h.params.iter().any(|p| p.name == "changeset" && p.required),
             "propose must have required changeset param"
         );
+    }
+
+    #[test]
+    fn link_help_schema_matches_strict_singleton_and_bulk_params() {
+        let handler = find_handler("link");
+        let advertised = handler
+            .params
+            .iter()
+            .map(|param| param.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            advertised,
+            [
+                "source_id",
+                "target_id",
+                "relation",
+                "weight",
+                "metadata",
+                "dependency_kind",
+                "verbose",
+                "links",
+                "atomic",
+            ],
+            "link help must enumerate the complete LinkParams surface in wire order"
+        );
+        assert!(
+            handler.params.iter().all(|param| !param.required),
+            "link has a singleton-or-bulk contract, so no one field is unconditionally required"
+        );
+
+        let accepted = serde_json::from_value::<crate::handlers::LinkParams>(serde_json::json!({
+            "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "relation": "depends_on",
+            "weight": 0.7,
+            "metadata": {"optional": true},
+            "dependency_kind": "build",
+            "verbose": true,
+            "links": [],
+            "atomic": false,
+        }));
+        if let Err(error) = accepted {
+            panic!("every link help parameter must be accepted by LinkParams: {error}");
+        }
+
+        for payload in [
+            serde_json::json!({"properties": {"x": 1}}),
+            serde_json::json!({
+                "links": [{
+                    "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "relation": "extends",
+                    "properties": {"x": 1},
+                }],
+            }),
+        ] {
+            let error = match serde_json::from_value::<crate::handlers::LinkParams>(payload) {
+                Ok(_) => panic!("unknown link fields must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("unknown field") && error.contains("properties"),
+                "link must reject unknown fields explicitly, got: {error}"
+            );
+        }
     }
 
     #[test]

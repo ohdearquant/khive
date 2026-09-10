@@ -5,10 +5,28 @@
 //! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
-    parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, TypedJsonOp, MAX_OPS,
-    MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
+    parse_request as parse_request_unplanned, parse_typed_json_batch, plan_request, ArgValue,
+    DslError, ExecutionMode, TypedJsonOp, MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT,
+    RESERVED_ENVELOPE_ARGS,
 };
 use serde_json::json;
+
+/// Standalone default; including this corpus as a module lets a transport test
+/// supply its own crate-root callback over the same inputs.
+pub fn plan_for_parser_corpus(input: &str) -> serde_json::Value {
+    plan_request(input, &std::collections::BTreeMap::new())
+}
+
+fn parse_request(input: &str) -> Result<khive_request::ParsedRequest, DslError> {
+    let parsed = parse_request_unplanned(input);
+    if let Err(error) = &parsed {
+        let plan = crate::plan_for_parser_corpus(input);
+        assert_eq!(plan["parsed"], false);
+        assert_eq!(plan["error"], error.to_string());
+        assert!(plan.get("stages").is_none());
+    }
+    parsed
+}
 
 fn req(s: &str) -> khive_request::ParsedRequest {
     parse_request(s).unwrap_or_else(|e| panic!("parse({s:?}) failed: {e}"))
@@ -61,6 +79,29 @@ fn single_op_with_multiple_typed_args() {
     assert_eq!(val(&v[0].args["kind"]), &json!("entity"));
     assert_eq!(val(&v[0].args["weight"]), &json!(0.9));
     assert_eq!(val(&v[0].args["active"]), &json!(true));
+}
+
+#[test]
+fn function_form_integer_boundaries_match_serde_json_value_representation() {
+    // Mirrors `crates/khive-wire-protocol/src/codec.rs`'s boundary test for
+    // `decode_payload`'s `serde_json::from_slice` seam, but exercises the
+    // request parser's own scalar decode instead (`parser_impl.rs::parse_value`'s
+    // `serde_json::from_str(trimmed)` call) — a literal within
+    // `[i64::MIN, u64::MAX]` decodes as an exact integer there too; past
+    // either endpoint it silently becomes `f64`, changing the JSON type.
+    let min_i64 = ops("v(a=-9223372036854775808)");
+    assert!(val(&min_i64[0].args["a"]).is_i64());
+
+    let max_u64 = ops("v(a=18446744073709551615)");
+    assert!(val(&max_u64[0].args["a"]).is_u64());
+
+    let below_min = ops("v(a=-9223372036854775809)");
+    assert!(val(&below_min[0].args["a"]).is_f64());
+    assert!(!val(&below_min[0].args["a"]).is_i64());
+
+    let above_max = ops("v(a=18446744073709551616)");
+    assert!(val(&above_max[0].args["a"]).is_f64());
+    assert!(!val(&above_max[0].args["a"]).is_u64());
 }
 
 // ── Batch ─────────────────────────────────────────────────────────────────────
@@ -144,7 +185,7 @@ fn unterminated_multiline_string_rejected() {
     // closing quote is still required somewhere in the input.
     let src = "gtd.assign(title=\"line one\nline two)";
     let err = parse_request(src).unwrap_err();
-    assert!(matches!(err, DslError::UnclosedString));
+    assert!(matches!(err, DslError::UnclosedString { .. }));
 }
 
 #[test]
@@ -343,18 +384,18 @@ fn bareword_value_in_array_element_has_no_reconstruction_to_guess() {
 }
 
 #[test]
-fn invalid_value_position_and_message_no_longer_disagree() {
+fn invalid_value_byte_and_message_no_longer_disagree() {
     // Before this fix, a non-bareword invalid value (e.g. `1.2.3`) leaked
     // serde_json's own "at line 1 column N" — always relative to that
     // single value's isolated slice, so it disagreed with the DSL-absolute
-    // "at position N" this crate reports for the same failure. The
+    // "at byte N" this crate reports for the same failure. The
     // descriptive part of the message stays; the contradicting position
     // clause must be gone.
     let err = parse_request("get(id=1.2.3)").unwrap_err();
     assert!(matches!(err, DslError::InvalidValue { .. }));
     let msg = err.to_string();
     assert!(
-        msg.starts_with("at position 7:"),
+        msg.starts_with("at byte 7:"),
         "expected the DSL-absolute position, got: {msg}"
     );
     assert!(
@@ -649,13 +690,122 @@ fn unknown_token_after_op_rejected() {
 fn unclosed_paren_rejected() {
     let err = parse_request(r#"gtd.assign(title="a""#).unwrap_err();
     // The string is closed; the args list isn't.
-    assert!(matches!(err, DslError::UnexpectedEof { .. }));
+    assert!(matches!(err, DslError::UnclosedCall { .. }));
+}
+
+#[test]
+fn object_key_position_distinguishes_end_of_input_from_a_present_byte() {
+    // Only true end-of-input right after `{` reaches the object-key `None` arm.
+    let err = parse_request("v(a={").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DslError::UnexpectedEof {
+                expected: "object key"
+            }
+        ),
+        "{err:?}"
+    );
+    // Any present byte, `)` or `,` alike, takes the `Some(c)` arm instead.
+    for input in ["v(a={)", "v(a={, b=1)"] {
+        let err = parse_request(input).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DslError::UnexpectedChar {
+                    expected: "quoted string key",
+                    ..
+                }
+            ),
+            "{input}: {err:?}"
+        );
+    }
+    // The empty object closes only when `}` is the very next byte.
+    let parsed = ops("v(a={})");
+    assert_eq!(val(&parsed[0].args["a"]), &json!({}));
+}
+
+#[test]
+fn a_closing_brace_inside_an_open_local_bracket_is_rejected_at_once() {
+    // `[` is still open when `}` arrives, so the value scan rejects immediately.
+    let err = parse_request("v(a=1[})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnclosedBracket { kind: '{' }),
+        "{err:?}"
+    );
+    // With no local container open, `}` ends the value and the arg list rejects it.
+    let err = parse_request("v(a=1})").unwrap_err();
+    assert!(
+        matches!(err, DslError::UnexpectedChar { found: '}', .. }),
+        "{err:?}"
+    );
+    // Inside a quoted span the `}` is string content; the malformed scalar fails as a value.
+    let err = parse_request(r#"v(a=1["x}"])"#).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }), "{err:?}");
+}
+
+#[test]
+fn unclosed_call_reports_its_opening_byte_after_long_input() {
+    let padding = "x".repeat(1_024);
+    let src = format!(r#"comm.send(to="x", content="{padding}""#);
+    let opening = src.find('(').expect("call opening delimiter");
+
+    let message = parse_request(&src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unclosed call starting at byte {opening}; expected ')'"),
+    );
+}
+
+#[test]
+fn unclosed_call_reports_the_delimiter_not_preceding_whitespace() {
+    // Whitespace is permitted between the verb and its opening delimiter. The reported
+    // offset must be the delimiter's own byte, not the first byte skipped to reach it.
+    let src = "comm.send  \n (to=\"x\", content=\"ok\"";
+    let opening = src.find('(').expect("call opening delimiter");
+    assert!(opening > src.find("send").expect("verb") + "send".len());
+
+    let message = parse_request(src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unclosed call starting at byte {opening}; expected ')'"),
+    );
 }
 
 #[test]
 fn unterminated_string_rejected() {
     let err = parse_request(r#"gtd.assign(title="oops)"#).unwrap_err();
-    assert!(matches!(err, DslError::UnclosedString));
+    assert!(matches!(err, DslError::UnclosedString { .. }));
+}
+
+#[test]
+fn unterminated_string_reports_its_opening_byte_after_long_input() {
+    let padding = "x".repeat(1_024);
+    let src = format!(r#"comm.send(to="x", content="{padding}"#);
+    let opening = src.rfind('"').expect("string opening delimiter");
+
+    let message = parse_request(&src).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        format!("unterminated string literal starting at byte {opening}"),
+    );
+}
+
+#[test]
+fn positioned_error_labels_utf8_byte_offset() {
+    let src = r#"comm.send(to="x", content="→→→") garbage"#;
+    let garbage_byte = src.find("garbage").expect("trailing token");
+    assert_ne!(
+        garbage_byte,
+        src[..garbage_byte].chars().count(),
+        "multibyte precondition"
+    );
+
+    let message = parse_request(src).unwrap_err().to_string();
+    assert!(
+        message.starts_with(&format!("at byte {garbage_byte}:")),
+        "position basis must be explicit: {message}"
+    );
 }
 
 #[test]

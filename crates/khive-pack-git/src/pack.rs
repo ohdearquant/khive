@@ -17,14 +17,15 @@ use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS}
 
 /// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendments 1 and 2, plus
 /// ADR-108) — registers `commit` / `issue` / `pull_request` note kinds populated by
-/// the batch ingester in `src/ingest.rs`, one read/ingest agent-facing verb,
-/// `git.digest` (`src/handlers.rs`), and three write verbs, `git.commit` /
+/// the batch ingester in `src/ingest.rs`, the agent-facing verb
+/// `git.digest` (`src/handlers.rs`), the read `git.ingest_cursor`, and write verbs `git.commit` /
 /// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108). Extends the
 /// base edge contract with `precedes` commit→commit (parent→child lineage,
 /// ADR-088 Amendment 1 ingest enrichment) — the only new endpoint rule this
 /// pack contributes; everything else uses the base `annotates` contract.
 pub struct GitPack {
     runtime: KhiveRuntime,
+    remote: Arc<dyn crate::remote_transport::RemoteTransport>,
 }
 
 impl Pack for GitPack {
@@ -45,7 +46,21 @@ impl Pack for GitPack {
 impl GitPack {
     /// Create a new `GitPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            remote: Arc::new(crate::remote_transport::GhTransport),
+        }
+    }
+
+    pub fn with_remote_transport(
+        runtime: KhiveRuntime,
+        remote: Arc<dyn crate::remote_transport::RemoteTransport>,
+    ) -> Self {
+        Self { runtime, remote }
+    }
+
+    pub(crate) fn remote_transport(&self) -> &dyn crate::remote_transport::RemoteTransport {
+        self.remote.as_ref()
     }
 
     /// Accessor for `src/handlers.rs`, which lives in a sibling module and
@@ -94,6 +109,10 @@ impl PackRuntime for GitPack {
         <GitPack as Pack>::HANDLERS
     }
 
+    fn input_schema(&self, verb: &str) -> Option<Value> {
+        crate::input_schema::for_verb(verb)
+    }
+
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
         <GitPack as Pack>::EDGE_RULES
     }
@@ -137,9 +156,22 @@ impl PackRuntime for GitPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "git.digest" => self.handle_digest(token, registry, params).await,
+            "git.ingest_cursor" => self.handle_ingest_cursor(token, registry, params).await,
+            "git.commit" if params.get("tree").is_some() => {
+                self.handle_local(token, registry, verb, params).await
+            }
             "git.commit" => self.handle_commit(token, params).await,
-            "git.branch" => self.handle_branch(token, params).await,
-            "git.push" => self.handle_push(token, params).await,
+            "git.branch" => self.handle_local(token, registry, verb, params).await,
+            "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
+                self.handle_remote(token, registry, verb, params).await
+            }
+            "git.init" | "git.checkout" | "git.diff" | "git.reconcile" => {
+                self.handle_local(token, registry, verb, params).await
+            }
+            "git.receipts" => self.handle_receipts(token, registry, params).await,
+            "git.gates" => self.handle_gates(token, registry, params).await,
+            "git.status" => self.handle_status(token, registry, params).await,
+            "git.log" => self.handle_log(token, registry, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "git pack does not handle verb {verb:?}"
             ))),

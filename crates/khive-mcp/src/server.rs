@@ -36,9 +36,10 @@ use khive_request::{
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::{
-    present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
-    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    prepare_format_value, present, render_format, DispatchError, DomainDisposition,
+    InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -46,6 +47,10 @@ use khive_storage::{EdgeRelation, StorageCapability};
 
 use crate::coordinator::{BackendSearchFailureKind, CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
+
+const _: () = assert!(
+    khive_runtime::daemon::ERROR_DETAIL_NESTING_DEPTH_LIMIT == khive_request::NESTING_DEPTH_LIMIT
+);
 
 const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
 const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
@@ -85,6 +90,60 @@ impl SearchStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchArmStatus {
+    Ran,
+    Skipped,
+    Error,
+}
+
+impl SearchArmStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchArmEvidence {
+    status: SearchArmStatus,
+    candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchArmParticipation {
+    text: SearchArmEvidence,
+    vector: SearchArmEvidence,
+}
+
+impl SearchArmParticipation {
+    fn complete(vector_selected: bool) -> Self {
+        Self {
+            text: SearchArmEvidence {
+                status: SearchArmStatus::Ran,
+                candidate_count: 0,
+            },
+            vector: SearchArmEvidence {
+                status: if vector_selected {
+                    SearchArmStatus::Ran
+                } else {
+                    SearchArmStatus::Skipped
+                },
+                candidate_count: 0,
+            },
+        }
+    }
+
+    fn observe_result(&mut self, result: &Value) {
+        let (text, vector) = search_arm_candidate_counts(result);
+        self.text.candidate_count = text;
+        self.vector.candidate_count = vector;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendErrorDiagnostic {
     kind: BackendSearchFailureKind,
@@ -98,6 +157,7 @@ struct BackendErrorDiagnostic {
 struct SearchDegradation {
     status: Option<SearchStatus>,
     retryable: bool,
+    arm_participation: Option<SearchArmParticipation>,
     missing_backends: Vec<String>,
     backend_errors: BTreeMap<String, BackendErrorDiagnostic>,
     backend_errors_omitted: usize,
@@ -108,17 +168,73 @@ impl SearchDegradation {
     /// registry dispatch, or (in principle) a coordinator fan-out where
     /// every selected backend succeeded — `from_result` is used for the
     /// latter instead, since it also has to compute `missing_backends`.
-    fn complete() -> Self {
+    fn complete(result: &Value, vector_selected: bool) -> Self {
+        let (_, vector_candidates) = search_arm_candidate_counts(result);
+        let mut arm_participation =
+            SearchArmParticipation::complete(vector_selected || vector_candidates > 0);
+        arm_participation.observe_result(result);
         Self {
             status: Some(SearchStatus::Complete),
             retryable: false,
+            arm_participation: Some(arm_participation),
             missing_backends: Vec::new(),
             backend_errors: BTreeMap::new(),
             backend_errors_omitted: 0,
         }
     }
 
-    fn from_result(result: &CoordSearchResult) -> Self {
+    fn from_result(result: &CoordSearchResult, final_result: &Value) -> Self {
+        let vector_selected = result
+            .per_backend
+            .iter()
+            .any(|backend| backend.vector_selected || backend.vector_error.is_some())
+            || result.entity_hits.iter().any(|hit| {
+                matches!(
+                    hit.source,
+                    khive_runtime::SearchSource::Vector | khive_runtime::SearchSource::Both
+                )
+            })
+            || result.note_hits.iter().any(|hit| {
+                matches!(
+                    hit.source,
+                    khive_runtime::SearchSource::Vector | khive_runtime::SearchSource::Both
+                )
+            });
+        // A whole-backend `error` means that backend's dispatch task failed
+        // before either arm could be attributed (auth, timeout, join failure,
+        // or a failed text leg — the text leg fails loud inside
+        // `hybrid_search_outcome`, so a text-arm failure always surfaces
+        // here). `vector_error` is populated only when the text leg
+        // completed and the vector leg alone failed, so it never doubles as
+        // a text-arm signal.
+        let text_failed = result
+            .per_backend
+            .iter()
+            .any(|backend| backend.error.is_some());
+        let vector_failed = result.per_backend.iter().any(|backend| {
+            backend.vector_error.is_some() || (backend.vector_selected && backend.error.is_some())
+        });
+        let mut arm_participation = SearchArmParticipation {
+            text: SearchArmEvidence {
+                status: if text_failed {
+                    SearchArmStatus::Error
+                } else {
+                    SearchArmStatus::Ran
+                },
+                candidate_count: 0,
+            },
+            vector: SearchArmEvidence {
+                status: if !vector_selected {
+                    SearchArmStatus::Skipped
+                } else if vector_failed {
+                    SearchArmStatus::Error
+                } else {
+                    SearchArmStatus::Ran
+                },
+                candidate_count: 0,
+            },
+        };
+        arm_participation.observe_result(final_result);
         let failed_backend_count = result
             .per_backend
             .iter()
@@ -160,6 +276,7 @@ impl SearchDegradation {
             let candidate_degradation = Self {
                 status: Some(SearchStatus::Partial),
                 retryable,
+                arm_participation: Some(arm_participation),
                 missing_backends: candidate.keys().cloned().collect(),
                 backend_errors_omitted: failed_backend_count.saturating_sub(candidate.len()),
                 backend_errors: candidate.clone(),
@@ -203,6 +320,7 @@ impl SearchDegradation {
         Self {
             status: Some(status),
             retryable,
+            arm_participation: Some(arm_participation),
             missing_backends,
             backend_errors,
             backend_errors_omitted,
@@ -212,6 +330,37 @@ impl SearchDegradation {
     fn is_partial(&self) -> bool {
         self.status == Some(SearchStatus::Partial)
     }
+}
+
+fn search_arm_candidate_counts(result: &Value) -> (usize, usize) {
+    result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .fold((0, 0), |(text, vector), hit| {
+            let source = hit.get("source").and_then(Value::as_str);
+            match source {
+                Some(s) if s == khive_runtime::SearchSource::Text.as_str() => (text + 1, vector),
+                Some(s) if s == khive_runtime::SearchSource::Vector.as_str() => (text, vector + 1),
+                Some(s) if s == khive_runtime::SearchSource::Both.as_str() => {
+                    (text + 1, vector + 1)
+                }
+                _ => (text, vector),
+            }
+        })
+}
+
+fn search_arm_participation_value(participation: SearchArmParticipation) -> Value {
+    json!({
+        "text": {
+            "status": participation.text.status.as_str(),
+            "candidate_count": participation.text.candidate_count,
+        },
+        "vector": {
+            "status": participation.vector.status.as_str(),
+            "candidate_count": participation.vector.candidate_count,
+        },
+    })
 }
 
 fn bounded_backend_error_message(message: &str) -> String {
@@ -293,6 +442,9 @@ fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
         "missing_backends": degradation.missing_backends,
         "backend_errors": backend_errors_value(&degradation.backend_errors),
     });
+    if let Some(participation) = degradation.arm_participation {
+        value["arm_participation"] = search_arm_participation_value(participation);
+    }
     if degradation.backend_errors_omitted > 0 {
         value["backend_errors_truncated"] = Value::Bool(true);
         value["backend_errors_omitted"] = json!(degradation.backend_errors_omitted);
@@ -325,11 +477,16 @@ impl OpSuccess {
 /// (excluding `help=true`, which returns a schema rather than a result
 /// array) carries `status="complete"` (ADR-130 §1); every other verb keeps
 /// the untagged `OpSuccess::complete` — no `status` field on its envelope.
-fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> OpSuccess {
+fn op_success_from_registry_result(
+    tool: &str,
+    is_help: bool,
+    result: Value,
+    vector_selected: bool,
+) -> OpSuccess {
     if tool == "search" && !is_help {
         OpSuccess {
+            degradation: SearchDegradation::complete(&result, vector_selected),
             result,
-            degradation: SearchDegradation::complete(),
         }
     } else {
         OpSuccess::complete(result)
@@ -408,32 +565,43 @@ struct DispatchFailure {
 }
 
 impl DispatchFailure {
-    fn unclassified(tool: impl Into<String>, error: Value) -> Self {
+    fn before_dispatch(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::NotCommitted)
+    }
+
+    fn committed(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::Committed)
+    }
+
+    fn with_disposition(
+        tool: impl Into<String>,
+        error: Value,
+        disposition: DomainDisposition,
+    ) -> Self {
         Self {
             tool: tool.into(),
-            error,
+            error: error_with_disposition(error, disposition),
             reason: None,
         }
     }
 
-    fn from_runtime(tool: &str, error: RuntimeError) -> Self {
+    fn from_dispatch(tool: &str, error: DispatchError) -> Self {
+        let (error, disposition) = error.into_parts();
         let reason = match &error {
-            // `gate-refusal` is deliberately limited to the write-time secret
-            // gate. Authorization denials and gate infrastructure errors keep
-            // their established, unclassified shapes.
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             _ => None,
         };
         Self {
-            tool: tool.to_string(),
-            error: runtime_error_value(error),
+            tool: tool.into(),
+            error: runtime_error_value(error, disposition),
             reason,
         }
     }
 
     fn into_entry(self) -> Value {
-        let mut entry = json!({ "ok": false, "tool": self.tool, "error": self.error });
+        let disposition = error_disposition(&self.error);
+        let mut entry = failure_entry(self.tool, self.error, disposition);
         if let Some(reason) = self.reason {
             entry["reason"] = json!(reason.as_str());
         }
@@ -441,13 +609,81 @@ impl DispatchFailure {
     }
 }
 
+/// One constructor for per-op failures. Moving values avoids recursively
+/// serializing a canonical result before its depth has been checked.
+fn failure_entry(tool: impl Into<String>, error: Value, disposition: DomainDisposition) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("error".into(), error_with_disposition(error, disposition));
+    Value::Object(entry)
+}
+
+fn aborted_entry(tool: impl Into<String>, message: Option<String>) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("aborted".into(), Value::Bool(true));
+    entry.insert(
+        "domain_disposition".into(),
+        json!(DomainDisposition::NotCommitted.as_str()),
+    );
+    if let Some(message) = message {
+        entry.insert("message".into(), Value::String(message));
+    }
+    Value::Object(entry)
+}
+
+/// Missing/foreign disposition is uncertainty, never permission to replay.
+fn error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value {
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_value_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    if let Some(result) = error.remove("domain_result") {
+        if disposition != DomainDisposition::Committed {
+            // A nested operation's result is not proof of the outer result.
+            drop_value_iteratively(result);
+        } else if !result_within_depth_limit(&result) {
+            drop_value_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    Value::Object(error)
+}
+
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
 /// Two servers produce the same id iff they can safely share one warm engine:
 /// same pack set (order-independent), same storage target and effective access
 /// mode, same embedders, same backend topology/routing, and same
-/// construction-baked fresh-tail, blob-hydration, outbound, and git-write
-/// policies.
+/// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
+/// and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects
@@ -456,9 +692,10 @@ impl DispatchFailure {
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list, explicit read-only
-/// modes, and pack→backend assignments) is folded into the fingerprint so that
-/// two configs differing only in routing or access mode produce different ids
-/// (ADR-049 / B-SHOULD-FIX-4). Delimiter-free topologies retain their legacy
+/// modes, served-substrate declarations, and pack→backend assignments) is
+/// folded into the fingerprint so that two configs differing only in routing
+/// or access mode produce different ids (ADR-049 / B-SHOULD-FIX-4).
+/// Delimiter-free topologies retain their legacy
 /// spelling; a topology containing reserved delimiter text uses an injective,
 /// escaped v2 encoding so path data can never impersonate access mode.
 ///
@@ -583,19 +820,31 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .collect();
     outbound.sort();
     outbound.dedup();
+    let gate = config
+        .gate
+        .configuration_fingerprint()
+        .map(|fingerprint| format!(";gate={fingerprint}"))
+        .unwrap_or_default();
     let mut git_write_hasher = Sha256::new();
-    git_write_hasher.update(b"khive.git-write-policy.v1");
-    git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
-    for entry in &config.git_write.allowed {
-        git_write_hasher.update((entry.repo.len() as u64).to_be_bytes());
-        git_write_hasher.update(entry.repo.as_bytes());
-        git_write_hasher.update((entry.branches.len() as u64).to_be_bytes());
-        for branch in &entry.branches {
-            git_write_hasher.update((branch.len() as u64).to_be_bytes());
-            git_write_hasher.update(branch.as_bytes());
-        }
-    }
+    git_write_hasher.update(b"khive.git-write-policy.v2");
+    git_write_hasher.update(
+        serde_json::to_vec(&config.mounts).expect("mount configuration is JSON serializable"),
+    );
+    git_write_hasher.update(
+        serde_json::to_vec(&config.git_write)
+            .expect("git-write configuration is JSON serializable"),
+    );
     let git_write = format!("{:x}", git_write_hasher.finalize());
+
+    let mut fleet_readers = config.brain.fleet_readers.clone();
+    fleet_readers.sort();
+    fleet_readers.dedup();
+    let mut brain_hasher = Sha256::new();
+    brain_hasher.update(b"khive.brain-read-policy.v1");
+    brain_hasher.update(
+        serde_json::to_vec(&fleet_readers).expect("brain read policy is JSON serializable"),
+    );
+    let brain = format!("{:x}", brain_hasher.finalize());
 
     let backend = if storage_read_only {
         format!("{:?}:read_only", config.backend_id)
@@ -631,7 +880,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}];git_write={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -640,7 +889,9 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         config.blob_hydration_bytes,
         backend,
         outbound.join(","),
+        gate,
         git_write,
+        brain,
         config.display_timezone.name(),
     );
 
@@ -686,9 +937,19 @@ fn escape_topology_component(value: &str) -> String {
     escaped
 }
 
+/// Format a backend's served-kinds fingerprint component (`""` when the
+/// backend serves everything, `:serves=<kind>+<kind>` otherwise), shared by
+/// both the legacy and escaped topology encodings below so they always agree
+/// on the same served-kinds suffix for the same input.
+fn format_served_kinds_suffix(served_kinds: Option<&str>) -> String {
+    served_kinds
+        .map(|kinds| format!(":serves={kinds}"))
+        .unwrap_or_default()
+}
+
 fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let mut legacy_safe = true;
-    let mut backend_rows: Vec<(String, String, String, bool)> = cfg
+    let mut backend_rows: Vec<(String, String, String, bool, Option<String>)> = cfg
         .backends
         .iter()
         .map(|backend| {
@@ -704,18 +965,35 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
                     .path
                     .as_ref()
                     .is_none_or(|_| legacy_topology_component_is_safe(&path));
-            (backend.name.clone(), kind, path, backend.read_only)
+            let served_kinds = backend.served_kinds.as_ref().map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            });
+            (
+                backend.name.clone(),
+                kind,
+                path,
+                backend.read_only,
+                served_kinds,
+            )
         })
         .collect();
     backend_rows.sort();
 
-    let mut pack_rows: Vec<(String, String)> = cfg
+    let mut pack_rows: Vec<(String, String, bool)> = cfg
         .packs
         .iter()
         .map(|(pack, pack_config)| {
             legacy_safe &= legacy_topology_component_is_safe(pack)
                 && legacy_topology_component_is_safe(&pack_config.backend);
-            (pack.clone(), pack_config.backend.clone())
+            (
+                pack.clone(),
+                pack_config.backend.clone(),
+                pack_config.no_embed,
+            )
         })
         .collect();
     pack_rows.sort();
@@ -723,25 +1001,33 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let (backends, pack_backends) = if legacy_safe {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, is_read_only)| {
+            .map(|(name, kind, path, is_read_only, served_kinds)| {
                 let read_only = if *is_read_only { ":read_only" } else { "" };
-                format!("{name}:{kind}:{path}{read_only}")
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
+                format!("{name}:{kind}:{path}{read_only}{served_kinds}")
             })
             .collect::<Vec<_>>()
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| format!("{pack}={backend}"))
+            .map(|(pack, backend, no_embed)| {
+                // `no_embed` changes runtime behavior (that pack's runtime
+                // carries zero embedders), so it must move the fingerprint;
+                // emitted only when set so pre-existing configs keep their id.
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
+                format!("{pack}={backend}{no_embed}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         (backends, pack_backends)
     } else {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, read_only)| {
+            .map(|(name, kind, path, read_only, served_kinds)| {
                 let mode = if *read_only { "r" } else { "w" };
+                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
                 format!(
-                    "{}:{}:{}:{mode}",
+                    "{}:{}:{}:{mode}{served_kinds}",
                     escape_topology_component(name),
                     escape_topology_component(kind),
                     escape_topology_component(path),
@@ -751,9 +1037,10 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
             .join(",");
         let pack_backends = pack_rows
             .iter()
-            .map(|(pack, backend)| {
+            .map(|(pack, backend, no_embed)| {
+                let no_embed = if *no_embed { ":no_embed" } else { "" };
                 format!(
-                    "{}={}",
+                    "{}={}{no_embed}",
                     escape_topology_component(pack),
                     escape_topology_component(backend),
                 )
@@ -832,11 +1119,13 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// Runtime-mode admission for transport background work.
 ///
 /// The inbound tasks dispatch only `comm.*` verbs (`comm.ingest`, heartbeat,
-/// and cursor operations), so their write authority is the comm pack's actual
-/// assigned runtime. The outbound tasks scan and mutate notes through the kg
-/// pack's generic `list`/`update` verbs, so they must not perform an external
-/// send unless that runtime can durably record the claim and `delivered_at`.
-/// Keeping the two decisions separate preserves mixed-backend topologies.
+/// and cursor operations), and the outbound tasks scan, claim, and mark
+/// outbound `message` notes through the runtime's non-wire owner-side APIs —
+/// both against the comm pack's actual assigned runtime, since under a
+/// `[packs.comm]` backend assignment that is the backend holding comm's
+/// rows. Neither loop may run unless that runtime can durably record its
+/// writes. The two decisions stay separate so a future topology can admit
+/// one direction without the other.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
@@ -848,21 +1137,18 @@ pub(crate) struct ChannelLoopAdmission {
 impl ChannelLoopAdmission {
     fn for_single_runtime(runtime: &KhiveRuntime, packs: &[String]) -> Self {
         let comm_loaded = packs.iter().any(|pack| pack == "comm");
-        let kg_loaded = packs.iter().any(|pack| pack == "kg");
         let writable = !runtime.is_read_only();
         Self {
             inbound_poll: comm_loaded && writable,
-            outbound_delivery: comm_loaded && kg_loaded && writable,
+            outbound_delivery: comm_loaded && writable,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(
-        kg: Option<&KhiveRuntime>,
-        comm: Option<&KhiveRuntime>,
-    ) -> Self {
+    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+        let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
         Self {
-            inbound_poll: comm.is_some_and(|runtime| !runtime.is_read_only()),
-            outbound_delivery: comm.is_some() && kg.is_some_and(|runtime| !runtime.is_read_only()),
+            inbound_poll: admitted,
+            outbound_delivery: admitted,
         }
     }
 }
@@ -871,6 +1157,8 @@ impl ChannelLoopAdmission {
 #[derive(Clone)]
 pub struct KhiveMcpServer {
     registry: VerbRegistry,
+    #[cfg(unix)]
+    bridge_executable: Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
@@ -890,11 +1178,13 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     runtime: Option<KhiveRuntime>,
-    /// Runtime that owns KG-routed outbox notes. The email loop's
-    /// `external_id` claim is deliberately non-wire, so it cannot rely on the
-    /// registry to route that one mutation. In a multi-backend topology this
-    /// may differ from `runtime` (the default backend); retaining the exact KG
-    /// runtime keeps list, owner claim, and delivered-at update on one store.
+    /// Runtime that owns the outbound `message` notes the delivery loops
+    /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
+    /// those touches is deliberately non-wire (the generic verbs run on the
+    /// kg/main runtime, which under a `[packs.comm]` backend assignment does
+    /// not hold comm's rows). In a multi-backend topology this may differ
+    /// from `runtime` (the default backend); retaining the exact comm
+    /// runtime keeps scan, owner claim, and delivered-at update on one store.
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     channel_outbox_runtime: Option<KhiveRuntime>,
     /// Pool arc for the WAL checkpoint background task. `None` for in-memory
@@ -927,6 +1217,7 @@ pub struct KhiveMcpServer {
 pub enum PackRegFailure {
     UnknownPack(String),
     MissingDependency { pack: String, dep: String },
+    NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
 }
 
@@ -945,6 +1236,7 @@ impl std::fmt::Debug for PackRegError {
             PackRegFailure::MissingDependency { pack, dep } => {
                 dbg.field("pack", pack).field("missing_dep", dep)
             }
+            PackRegFailure::NoPublicVerbs { pack } => dbg.field("pack", pack),
             PackRegFailure::Registry(source) => dbg.field("source", source),
         }
         .finish_non_exhaustive()
@@ -964,6 +1256,11 @@ impl std::fmt::Display for PackRegError {
                 f,
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
+            ),
+            PackRegFailure::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs and is not marked as \
+                 intentionally vocabulary- or ontology-only"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
         }
@@ -1007,6 +1304,146 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     }
 }
 
+/// Optional idle timeout for a stdio bridge session: when configured, no
+/// request for this long and the session closes (see
+/// [`crate::transport::CancelOnEofTransport`]), releasing its reader-pool
+/// admission and DB connection — a client that comes back simply respawns the
+/// bridge, seamlessly from its perspective.
+/// This closes only a genuinely idle session: an admitted request with a
+/// response still being written — running long, or delivered slowly to a
+/// backpressured reader — defers the close rather than being cancelled out
+/// from under it, up to the separate response-delivery bound documented on
+/// [`stdio_bridge_response_deadline_from_env`].
+///
+/// **Off unless configured, and that is a deliberate reading of existing
+/// repository law rather than caution.** ADR-091 enumerates "kill long-lived
+/// reader sessions" among its rejected alternatives, on the ground that
+/// long-lived stdio sessions are live Claude Code instances and closing them
+/// by age is a worse user experience than bounding what they hold underneath
+/// them. Closing a session after an hour of quiet is that rejected policy
+/// whatever the mechanism, because this transport has no signal that
+/// separates an abandoned pipe from a live client that simply has not been
+/// asked anything. Defaulting it on would reverse an accepted decision from
+/// inside an unrelated change, so the default is off and turning it on is an
+/// operator's explicit act — a supervised deployment, a CI harness, or any
+/// context where session churn is cheap and a pinned WAL connection is not.
+/// Making it the default requires amending ADR-091, not a different number
+/// here.
+///
+/// Set `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS` to a positive number of seconds to
+/// enable it. `0`, absent, and unparsable all leave it disabled; unparsable
+/// falls back rather than panicking, matching this codebase's other
+/// `_from_env` helpers, and it falls back to *disabled* because a typo must
+/// never silently start closing live sessions. 3600 is the suggested value
+/// where it is wanted: long enough that ordinary gaps in a live session never
+/// trip it.
+fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
+    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// How long an admitted request whose response has not been written keeps
+/// deferring the idle close.
+///
+/// The idle check must not treat a session with work outstanding as idle, or
+/// it cancels a running handler out from under itself. But rmcp spawns each
+/// request handler and drops the join handle, so a handler that panics never
+/// reaches the response construction that would clear its obligation. Deferring
+/// on an outstanding obligation with no bound therefore hands any panicking
+/// handler the power to disable idle reaping for the life of the session — the
+/// exact unbounded lifetime the idle timeout exists to close, reintroduced
+/// through the guard that protects it.
+///
+/// This bound is separate from the idle window on purpose. Reusing the idle
+/// window would mean a handler that runs longer than one quiet window stops
+/// protecting its own session, which is the guarantee the obligation exists to
+/// provide. It is set far above any real handler and answers a different
+/// question: not "has this session been quiet" but "has this request been
+/// outstanding so long that its handler must be gone".
+///
+/// Overridable via `KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS`; `0` disables the
+/// bound, restoring the unbounded defer. An unparsable value falls back to the
+/// default. Default: 3600s.
+fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 3600;
+    let secs = std::env::var("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Maximum number of requests a stdio bridge admits to rmcp while their
+/// responses are still outstanding. A full session is closed before another
+/// handler is spawned, bounding the per-session handler and obligation state.
+///
+/// Overridable via `KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS`. Values must be
+/// positive; `0`, an unparsable value, or a value too large for this platform
+/// falls back to the default. Default: 1024, enough for ordinary concurrent
+/// MCP traffic while keeping a peer that stops reading from growing the
+/// session without limit.
+fn stdio_bridge_max_outstanding_requests_from_env() -> usize {
+    std::env::var("KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(crate::transport::DEFAULT_MAX_OUTSTANDING_REQUESTS)
+}
+
+/// Response-delivery deadline for a stdio bridge session: the longest a
+/// single response write may stay pending before it is abandoned (see
+/// [`crate::transport::CancelOnEofTransport::send`]) and this session is
+/// closed. Independent of the idle timeout above — it bounds an admitted
+/// request's response write directly, rather than the gap between
+/// requests. Without this bound, a peer that admits a request and then
+/// stops reading its response — while leaving the pipe itself open — keeps
+/// that write pending forever, so the idle timeout would defer indefinitely
+/// (an in-flight response always defers idle-close) and the session would
+/// never be reaped.
+///
+/// Overridable via `KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS`, accepted range
+/// 1..=u64::MAX seconds. Unlike `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS`, this bound
+/// cannot be disabled: `0` is a startup error naming the variable, the
+/// rejected value, and the accepted range, rather than a silent opt-out — a
+/// configuration that restores an unbounded pending write restores the
+/// defect this deadline exists to close (see the type doc above). An
+/// unparsable value falls back to the default rather than erroring, matching
+/// this codebase's other `_from_env` helpers. Default: 300s (5 minutes) —
+/// long enough that legitimately slow verbs and ordinary reader backpressure
+/// never trip it, short enough that a peer that has genuinely stopped
+/// reading does not pin the session's reader-pool admission / DB connection
+/// indefinitely.
+fn stdio_bridge_response_deadline_from_env() -> anyhow::Result<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = match std::env::var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => DEFAULT_SECS,
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    if secs == 0 {
+        anyhow::bail!(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 is not accepted: the response-delivery \
+             deadline cannot be disabled (a disabled deadline lets a peer that stops reading \
+             pin the bridge's response write forever). Set it to a positive number of seconds \
+             (accepted range: 1..=u64::MAX, default {DEFAULT_SECS})."
+        );
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     ///
@@ -1032,6 +1469,31 @@ impl KhiveMcpServer {
     // deref for no real benefit.
     #[allow(clippy::result_large_err)]
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
+        if !runtime.config().mounts.is_empty() {
+            return Err(PackRegError {
+                failure: PackRegFailure::Registry(RuntimeError::InvalidInput(
+                    "configured mounts require the async server constructor".into(),
+                )),
+                runtime,
+            });
+        }
+        Self::with_mounted_packs(runtime, packs, Vec::new())
+    }
+
+    /// Build a prepared runtime's native registry and start its configured sources.
+    #[allow(clippy::result_large_err)]
+    pub async fn new_with_mounts(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
+        let packs = runtime.config().packs.clone();
+        let mounted = khive_mounts::start_mounts(&runtime).await;
+        Self::with_mounted_packs(runtime, &packs, mounted)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn with_mounted_packs(
+        runtime: KhiveRuntime,
+        packs: &[String],
+        mounted: Vec<khive_mounts::MountedPack>,
+    ) -> Result<Self, PackRegError> {
         #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
         let channel_loop_admission = ChannelLoopAdmission::for_single_runtime(&runtime, packs);
         let gate = runtime.config().gate.clone();
@@ -1053,10 +1515,8 @@ impl KhiveMcpServer {
         // registry exposes an advisory beside each successful result instead.
         if runtime.is_read_only() {
             builder.with_read_only_audit_store();
-        } else if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
-            if let Ok(event_store) = runtime.events(&tok) {
-                builder.with_event_store(event_store);
-            }
+        } else if let Err(error) = builder.with_runtime_event_store(&runtime) {
+            tracing::warn!(%error, "registry audit event store is unavailable");
         }
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {
@@ -1064,8 +1524,17 @@ impl KhiveMcpServer {
                 PackLoadError::MissingDependency { pack, dep } => {
                     PackRegFailure::MissingDependency { pack, dep }
                 }
+                PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
+        }
+        for mount in mounted {
+            builder
+                .register_mounted(Box::new(mount))
+                .map_err(|source| PackRegError {
+                    failure: PackRegFailure::Registry(source),
+                    runtime: runtime.clone(),
+                })?;
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
@@ -1119,6 +1588,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
@@ -1146,6 +1617,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1172,6 +1645,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1193,7 +1668,7 @@ impl KhiveMcpServer {
         self
     }
 
-    /// Attach the exact KG-routed runtime that owns outbox note properties.
+    /// Attach the exact comm-routed runtime that owns outbox note properties.
     /// Multi-backend boot overrides the default-runtime fallback installed by
     /// [`Self::with_runtime`]; single-backend construction already points both
     /// handles at the same runtime.
@@ -1312,6 +1787,26 @@ impl KhiveMcpServer {
     }
 
     /// Fingerprint of the runtime config this server's registry was built for.
+    /// The resolved events-split config of the default-backend runtime, if
+    /// any (ADR-170). Daemon supervision derives the events daemon's
+    /// db/socket from this exact value so the supervised daemon and the
+    /// forwarding clients cannot anchor at diverging paths.
+    pub(crate) fn events_split_config(
+        &self,
+    ) -> Option<&khive_runtime::events_split::EventsSplitConfig> {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.config().events_split.as_ref())
+    }
+
+    /// Whether the default-backend runtime is read-only. Daemon supervision
+    /// asks this before spawning an events daemon: the supervised daemon
+    /// opens the events sidecar writable, which a read-only deployment must
+    /// never cause (ADR-170).
+    pub(crate) fn default_runtime_is_read_only(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
@@ -1397,17 +1892,26 @@ impl KhiveMcpServer {
     /// shares rmcp's root cancellation token so disconnect cancels every
     /// per-request child before rmcp starts its graceful drain.
     #[cfg(unix)]
-    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+    pub async fn serve_stdio(mut self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
+        self.bridge_executable = crate::daemon::executable::BridgeExecutable::current()
+            .map(|executable| Arc::new(std::sync::Mutex::new(executable)));
         let root = tokio_util::sync::CancellationToken::new();
+        let idle_timeout = stdio_bridge_idle_timeout_from_env();
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let max_outstanding_requests = stdio_bridge_max_outstanding_requests_from_env();
         let build_transport = |root: tokio_util::sync::CancellationToken| {
             let (read, write) = stdio();
-            crate::transport::CancelOnEofTransport::new(
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
                 crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(
                     read, write,
                 )),
                 root,
+                idle_timeout,
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
+                max_outstanding_requests,
             )
         };
 
@@ -1446,10 +1950,16 @@ impl KhiveMcpServer {
 
         let root = tokio_util::sync::CancellationToken::new();
         let (read, write) = stdio();
-        let transport = crate::transport::CancelOnEofTransport::new(
-            AsyncRwTransport::new_server(read, write),
-            root.clone(),
-        );
+        let response_deadline = stdio_bridge_response_deadline_from_env()?;
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(read, write),
+                root.clone(),
+                stdio_bridge_idle_timeout_from_env(),
+                Some(response_deadline),
+                stdio_bridge_request_obligation_ttl_from_env(),
+                stdio_bridge_max_outstanding_requests_from_env(),
+            );
         let service = self.serve_with_ct(transport, root).await?;
         service.waiting().await?;
         Ok(())
@@ -1465,7 +1975,18 @@ impl KhiveMcpServer {
             .all_verbs_with_names()
             .into_iter()
             .map(|(pack, v)| (pack.to_owned(), v.name.to_owned(), v.description.to_owned()));
-        build_verb_catalog(verbs)
+        let mounted = self
+            .registry
+            .mounted_verb_snapshot()
+            .into_iter()
+            .map(|verb| {
+                (
+                    verb["pack"].as_str().unwrap_or_default().to_owned(),
+                    verb["verb"].as_str().unwrap_or_default().to_owned(),
+                    verb["description"].as_str().unwrap_or_default().to_owned(),
+                )
+            });
+        build_verb_catalog(verbs.chain(mounted))
     }
 
     /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
@@ -1493,7 +2014,7 @@ impl KhiveMcpServer {
                 // exactly when this is the chain's first op, so there is no
                 // preceding result to substitute from at all.
                 let prev = prev_result.ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
@@ -1510,7 +2031,7 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         substitution_error_payload(&name, &arg_val, prev),
                     )
@@ -1522,7 +2043,7 @@ impl KhiveMcpServer {
                     match &resolved_val {
                         Value::Object(map) => {
                             let fields: Vec<&str> = map.keys().map(String::as_str).collect();
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1537,7 +2058,7 @@ impl KhiveMcpServer {
                             ));
                         }
                         Value::Array(_) => {
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1574,7 +2095,7 @@ impl KhiveMcpServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if from_wire && !is_help && self.registry.is_subhandler_verb(&tool) {
-            return Err(DispatchFailure::unclassified(
+            return Err(DispatchFailure::before_dispatch(
                 tool.clone(),
                 json!(format!(
                     "permission denied for verb {tool:?}: verb '{tool}' is an internal \
@@ -1594,7 +2115,7 @@ impl KhiveMcpServer {
 
         match self
             .registry
-            .dispatch_with_identity(&tool, args_value, identity.cloned())
+            .dispatch_with_disposition(&tool, args_value, identity.cloned())
             .await
         {
             Ok(result) => {
@@ -1604,10 +2125,15 @@ impl KhiveMcpServer {
                     result,
                     self.schedule_ticker_last_tick_micros.as_ref(),
                 );
-                let success = op_success_from_registry_result(&tool, is_help, result);
+                let vector_selected = self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
+                let success =
+                    op_success_from_registry_result(&tool, is_help, result, vector_selected);
                 chain_ok_envelope_or_depth_error(tool, success)
             }
-            Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
+            Err(error) => Err(DispatchFailure::from_dispatch(&tool, error)),
         }
     }
 
@@ -1713,6 +2239,10 @@ impl KhiveMcpServer {
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
                 let schedule_ticker_last_tick_micros =
                     self.schedule_ticker_last_tick_micros.clone();
+                let vector_selected = self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.vector_arm_selected());
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -1734,6 +2264,7 @@ impl KhiveMcpServer {
                     let schedule_ticker_last_tick_micros =
                         schedule_ticker_last_tick_micros.clone();
                     let op_identity = identity_owned.clone();
+                    let op_vector_selected = vector_selected;
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
                     BatchTask {
@@ -1748,7 +2279,7 @@ impl KhiveMcpServer {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
-                            return json!({ "ok": false, "tool": tool, "error": msg });
+                            return failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
                         }
                         // AlwaysVerbose verbs override the caller's presentation mode.
                         let effective_mode =
@@ -1770,13 +2301,9 @@ impl KhiveMcpServer {
                                     resolved.insert(name.clone(), v.clone());
                                 }
                             } else {
-                                prev_error = Some(json!({
-                                    "ok": false,
-                                    "tool": tool,
-                                    "error": format!(
-                                        "argument {name:?}: $prev reference is only valid in chain (|) mode"
-                                    )
-                                }));
+                                prev_error = Some(failure_entry(&tool, json!(format!(
+                                    "argument {name:?}: $prev reference is only valid in chain (|) mode"
+                                )), DomainDisposition::NotCommitted));
                                 break;
                             }
                         }
@@ -1795,15 +2322,10 @@ impl KhiveMcpServer {
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
                         if from_wire && !is_help && registry.is_subhandler_verb(&tool) {
-                            return json!({
-                                "ok": false,
-                                "tool": tool,
-                                "error": format!(
-                                    "permission denied for verb {tool:?}: verb '{tool}' is an \
-                                     internal subhandler and cannot be invoked via the MCP \
-                                     request surface"
-                                )
-                            });
+                            return failure_entry(tool.clone(), json!(format!(
+                                "permission denied for verb {tool:?}: verb '{tool}' is an \
+                                 internal subhandler and cannot be invoked via the MCP request surface"
+                            )), DomainDisposition::NotCommitted);
                         }
 
                         // Multi-backend interception: route link/search through the coordinator
@@ -1834,7 +2356,7 @@ impl KhiveMcpServer {
                         }
 
                         match registry
-                            .dispatch_with_identity(&tool, args_value, op_identity)
+                            .dispatch_with_disposition(&tool, args_value, op_identity)
                             .await
                         {
                             Ok(result) => {
@@ -1845,7 +2367,12 @@ impl KhiveMcpServer {
                                     schedule_ticker_last_tick_micros.as_ref(),
                                 );
                                 let success =
-                                    op_success_from_registry_result(&tool, is_help, result);
+                                    op_success_from_registry_result(
+                                        &tool,
+                                        is_help,
+                                        result,
+                                        op_vector_selected,
+                                    );
                                 present_ok_envelope_or_depth_error(
                                     tool,
                                     success,
@@ -1854,7 +2381,7 @@ impl KhiveMcpServer {
                                 )
                             }
                             Err(error) => {
-                                DispatchFailure::from_runtime(&tool, error).into_entry()
+                                DispatchFailure::from_dispatch(&tool, error).into_entry()
                             }
                         }
                         })
@@ -1890,17 +2417,11 @@ impl KhiveMcpServer {
                             .and_then(|r| r.get("tool"))
                             .and_then(Value::as_str)
                             .unwrap_or("<unknown>");
-                        results.push(json!({
-                            "ok": false,
-                            "tool": op.tool,
-                            "aborted": true,
-                            "message": format!(
-                                "not executed: op #{failed_index} ({failed_tool:?}) failed \
-                                 earlier in this chain, so the chain aborted before reaching \
-                                 this op. Fix op #{failed_index} — this op's own arguments, \
-                                 including any $prev reference, were never evaluated."
-                            ),
-                        }));
+                        results.push(aborted_entry(op.tool, Some(format!(
+                            "not executed: op #{failed_index} ({failed_tool:?}) failed earlier in this chain, \
+                             so the chain aborted before reaching this op. Fix op #{failed_index} — this \
+                             op's own arguments, including any $prev reference, were never evaluated."
+                        ))));
                         continue;
                     }
                     let op_mode = mode_for_op(i);
@@ -2020,7 +2541,7 @@ async fn dispatch_via_coordinator_inner(
             let metadata = args_value.get("metadata").cloned();
 
             let result = registry
-                .dispatch_intercepted_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2037,14 +2558,14 @@ async fn dispatch_via_coordinator_inner(
                                 obj.insert("target_id".to_string(), json!(target_id.to_string()));
                             }
                         }
-                        Ok(raw)
+                        Ok(InterceptedDispatchResult::new(raw, ()))
                     },
                 )
                 .await;
             Some(
                 result
-                    .map(OpSuccess::complete)
-                    .map_err(|error| DispatchFailure::from_runtime(tool, error)),
+                    .map(|outcome| OpSuccess::complete(outcome.result))
+                    .map_err(|error| DispatchFailure::from_dispatch(tool, error)),
             )
         }
         "search" => {
@@ -2059,7 +2580,7 @@ async fn dispatch_via_coordinator_inner(
             // normal registry dispatch path — see `coordinator_search_visibility`.
             let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
-                .dispatch_intercepted_with_metadata_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2072,8 +2593,6 @@ async fn dispatch_via_coordinator_inner(
                             .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
                         khive_storage::ensure_request_read_active("search")?;
-                        let degradation = SearchDegradation::from_result(&coord_result);
-
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
@@ -2085,7 +2604,8 @@ async fn dispatch_via_coordinator_inner(
                                 .note_hits
                                 .iter()
                                 .filter(|h| h.score.to_f64() >= request.min_score())
-                                .map(|h| {
+                                .filter_map(|h| {
+                                    let version = coord_result.note_versions.get(&h.note_id)?;
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
                                     let name =
                                         coord_result.note_names.get(&h.note_id).cloned().flatten();
@@ -2093,7 +2613,7 @@ async fn dispatch_via_coordinator_inner(
                                         .note_created_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
-                                    json!({
+                                    Some(json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
                                         "note_kind": note_kind,
@@ -2103,7 +2623,8 @@ async fn dispatch_via_coordinator_inner(
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
-                                    })
+                                        "version": version,
+                                    }))
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -2133,6 +2654,8 @@ async fn dispatch_via_coordinator_inner(
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         };
+                        let degradation =
+                            SearchDegradation::from_result(&coord_result, &result_val);
 
                         Ok(InterceptedDispatchResult::new(result_val, degradation))
                     },
@@ -2151,10 +2674,12 @@ async fn dispatch_via_coordinator_inner(
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
                     if outcome.metadata.is_partial() && is_empty {
-                        Err(DispatchFailure::unclassified(
-                            tool,
-                            search_incomplete_error(outcome.metadata),
-                        ))
+                        let mut error = search_incomplete_error(outcome.metadata);
+                        error
+                            .as_object_mut()
+                            .expect("structured search error")
+                            .insert("domain_result".into(), outcome.result);
+                        Err(DispatchFailure::committed(tool, error))
                     } else {
                         Ok(OpSuccess {
                             result: outcome.result,
@@ -2162,7 +2687,7 @@ async fn dispatch_via_coordinator_inner(
                         })
                     }
                 }
-                Err(error) => Err(DispatchFailure::from_runtime(tool, error)),
+                Err(error) => Err(DispatchFailure::from_dispatch(tool, error)),
             })
         }
         _ => None,
@@ -2215,35 +2740,128 @@ fn coordinator_search_visibility(
     extra_visible
 }
 
-/// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying every typed safe-retry write failure structurally through
-/// every MCP execution mode. Pool checkout and queue saturation happen before
-/// admission; writer-task BEGIN contention happens after queue acceptance but
-/// before the operation closure runs. None can leave a partial side effect.
-fn runtime_error_value(error: RuntimeError) -> Value {
-    match error {
+/// Every runtime variant is explicitly covered. Dispatch provenance, not the
+/// variant, determines whether the domain handler ran successfully, except for
+/// the named write outcomes, which carry their own domain proof.
+fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    // These named outcomes carry their own domain proof. Do not infer general
+    // write disposition from a conflict or unavailable variant.
+    let named_disposition = match &error {
+        RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
+            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
+            // ADR-174 A1.1: a stream member refusal carries
+            // `domain_disposition: not_committed` wherever it surfaces. In
+            // per-member mode it is the member's own value and the runtime
+            // writes the field itself; in atomic mode the refusal is raised
+            // as the call's error, where without these rows the boundary's
+            // `unknown` would stand and the caller could not tell a batch
+            // that wrote nothing from one whose outcome is unestablished.
+            (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
+                Some("not_committed")
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // The refusal text is the same Display string every consumer already
+    // matches on; the receipt fields ride beside it.
+    let denial_message =
+        matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
+    let payload = match error {
+        RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } => json!({
+            "kind": "runtime_error",
+            "code": "permission_denied",
+            "message": denial_message.unwrap_or_default(),
+            "verb": verb,
+            "reason": reason,
+            "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
+            "audit_outcome": receipt.audit_outcome.wire_code(),
+        }),
+        RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } => {
+            let mut error = serde_json::Map::from_iter([
+                ("kind".into(), json!("obligation")),
+                ("code".into(), json!(failure.wire_code())),
+                ("message".into(), json!(failure.to_string())),
+            ]);
+            error.insert("domain_result".into(), domain_result);
+            Value::Object(error)
+        }
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
-        other => {
-            let Some(context) = other.retryable_failure_context() else {
-                return json!(other.to_string());
-            };
-            let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-            let capability = context.capability.map(storage_capability_wire_name);
-            json!({
-                "kind": "unavailable",
-                "code": context.stage,
-                "stage": context.stage,
-                "message": other.to_string(),
-                "retryable": true,
-                "timeout_ms": timeout_ms,
-                "capability": capability,
-                "operation": context.operation,
-                "scope": context.scope,
-                "retry_after_ms": context.retry_after_ms,
-            })
+        other @ (RuntimeError::Storage(_)
+        | RuntimeError::Sqlite(_)
+        | RuntimeError::Query(_)
+        | RuntimeError::NotFound(_)
+        | RuntimeError::InvalidInput(_)
+        | RuntimeError::UnknownVerb(_)
+        | RuntimeError::Unconfigured(_)
+        | RuntimeError::UnknownModel(_)
+        | RuntimeError::Embedding(_)
+        | RuntimeError::Ambiguous(_)
+        | RuntimeError::Fusion(_)
+        | RuntimeError::UnknownFusionStrategy(_)
+        | RuntimeError::Internal(_)
+        | RuntimeError::IncompatibleEventStore(_)
+        | RuntimeError::GuardedWriteFailed(_)
+        | RuntimeError::MissingPackDependency(_)
+        | RuntimeError::MissingPackDependencies(_)
+        | RuntimeError::CircularPackDependency(_)
+        | RuntimeError::PackRedeclared { .. }
+        | RuntimeError::VerbCollision { .. }
+        | RuntimeError::ReservedEnvelopeParam { .. }
+        | RuntimeError::GateUnavailable { .. }
+        | RuntimeError::NamespaceMismatch { .. }
+        | RuntimeError::AmbiguousPrefix { .. }
+        | RuntimeError::CrossBackendMergeUnsupported { .. }
+        | RuntimeError::UnknownRemote { .. }
+        | RuntimeError::RemoteCacheMissing { .. }
+        | RuntimeError::AmbiguousId { .. }
+        | RuntimeError::CrossNamespaceWrite { .. }
+        | RuntimeError::RemoteFetchError { .. }
+        | RuntimeError::WriteBudgetExceeded { .. }
+        | RuntimeError::SecretDetected(_)
+        | RuntimeError::DeadlineExceeded { .. }) => {
+            if let Some(context) = other.writer_task_failure_context() {
+                json!({"kind":"storage", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":context.retryable,
+                    "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
+            } else if let Some(context) = other.retryable_failure_context() {
+                let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
+                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
+                    "capability":context.capability.map(storage_capability_wire_name),
+                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
+            } else {
+                json!({"kind":"runtime_error", "message":other.to_string()})
+            }
         }
+    };
+    let mut value = error_with_disposition(payload, disposition);
+    if let Some(named) = named_disposition {
+        value["domain_disposition"] = json!(named);
     }
+    value
 }
 
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
@@ -2276,6 +2894,7 @@ fn result_within_depth_limit(result: &Value) -> bool {
 fn depth_error_payload(context: &str) -> Value {
     json!({
         "kind": "result_too_deep",
+        "code": "result_too_deep",
         "message": format!(
             "op result nesting depth exceeds max {}{context}",
             khive_request::NESTING_DEPTH_LIMIT
@@ -2295,12 +2914,14 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
     let SearchDegradation {
         status,
         retryable: _,
+        arm_participation,
         missing_backends,
         backend_errors,
         backend_errors_omitted,
     } = degradation;
     let is_partial = status == Some(SearchStatus::Partial);
     let extra_fields = usize::from(status.is_some())
+        + usize::from(arm_participation.is_some())
         + if is_partial {
             3 + usize::from(backend_errors_omitted > 0) * 2
         } else {
@@ -2316,6 +2937,12 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         map.insert(
             "status".to_string(),
             Value::String(status.as_str().to_string()),
+        );
+    }
+    if let Some(participation) = arm_participation {
+        map.insert(
+            "arm_participation".to_string(),
+            search_arm_participation_value(participation),
         );
     }
     // Legacy `partial`/`missing_backends` alias, compatibility-release only
@@ -2446,7 +3073,7 @@ fn chain_ok_envelope_or_depth_error(
 ) -> Result<Value, DispatchFailure> {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return Err(DispatchFailure::unclassified(
+        return Err(DispatchFailure::committed(
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
@@ -2468,7 +3095,7 @@ fn present_ok_envelope_or_depth_error(
 ) -> Value {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
+        return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
     success.result = present(success.result, mode, now_unix);
     ok_envelope(tool, success)
@@ -2502,18 +3129,11 @@ fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let error_entry = json!({
-            "ok": false,
-            "tool": tool_name,
-            "error": {
-                "kind": "result_too_deep",
-                "message": format!(
-                    "op result nesting depth exceeds max {}; \
-                     cannot be used as $prev chain context",
-                    khive_request::NESTING_DEPTH_LIMIT
-                ),
-            },
-        });
+        let error_entry = failure_entry(
+            tool_name,
+            depth_error_payload("; cannot be used as $prev chain context"),
+            DomainDisposition::Committed,
+        );
         drop_value_iteratively(result_obj);
         return Err(error_entry);
     }
@@ -2569,6 +3189,30 @@ fn request_read_timeout() -> std::time::Duration {
     })
 }
 
+/// Ensure every MCP request attempt has a daemon/audit correlation id.
+///
+/// A caller-supplied id is an explicit retry/correlation key and therefore
+/// wins unchanged. Otherwise the bridge mints an opaque nonzero 64-bit id from
+/// UUID entropy before daemon forwarding or local fallback. The same value is
+/// then echoed by the daemon frame and stamped into every operation's audit
+/// resource, making a handler that disappears after admission observable.
+fn ensure_bridge_request_id(params: &mut RequestParams) -> u64 {
+    if let Some(request_id) = params.request_id {
+        return request_id;
+    }
+
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let high = u64::from_be_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("UUID high half is eight bytes"),
+    );
+    let low = u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half is eight bytes"));
+    let request_id = (high ^ low).max(1);
+    params.request_id = Some(request_id);
+    request_id
+}
+
 async fn scope_mcp_request_read_cancellation<F>(
     cancellation: tokio_util::sync::CancellationToken,
     future: F,
@@ -2601,6 +3245,12 @@ where
 #[tool_router]
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
+
+Set plan=true with ops alone to check syntax without execution. The result has
+parsed, mode, stage_count, stages (verb, pack, known, args, prev_refs), and parser
+limits. A syntax error returns parsed=false and error, with no stages. Planning
+does not check permission or resolve references. presentation, presentation_per_op,
+format, format_per_op, save_to, and request_id cannot accompany plan=true.
 
 ops syntax:
 
@@ -2643,6 +3293,13 @@ or `"writer_task_begin_busy"`)
 never rolls back a sibling that already committed. Inspect each result
 entry's own `ok` field rather than assuming batch-level atomicity.
 
+`comm.read` and `comm.mark_read` mutate delivery state. In a parallel batch,
+either acknowledgement does not wait for or depend on comm.send/comm.reply, so
+a read mark can commit even when the sibling send fails. When the mark must
+depend on a send, use a chain so a failed send aborts the mark. For the common
+reply-and-read flow, prefer `comm.reply`: comm.reply delivers first, then attempts
+the original message's best-effort read mark.
+
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
 degraded-but-answered search stays ok:true with status="partial" plus a
@@ -2672,10 +3329,14 @@ result (e.g. create then link with the new entity's id)."#)]
     }
 }
 
-/// Boxed future returned by the daemon-forwarding seam.
+/// Owned boxed future returned by the daemon-forwarding seam.
+///
+/// Ownership is deliberate: once daemon forwarding is admitted the exchange
+/// runs in its own task, so dropping the outer MCP handler cannot drop the
+/// socket future after the daemon may already have committed work.
 #[cfg(unix)]
-type ForwardFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Option<Result<String, McpError>>> + Send + 'a>,
+type ForwardFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<Result<String, McpError>>> + Send + 'static>,
 >;
 
 /// Function pointer type for the daemon-forwarding seam, parameterized so
@@ -2689,25 +3350,77 @@ type ForwardFuture<'a> = std::pin::Pin<
 /// call site.
 #[cfg(unix)]
 type ForwardFnPtr =
-    for<'a> fn(&'a khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture<'a>;
+    fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>, bool) -> ForwardFuture;
 
-/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
+/// Adapts the real `forward_or_spawn_with_replay_policy` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
 /// happened at the call site — so this boundary carries no logic a test
 /// spy could fail to observe.
 #[cfg(unix)]
 fn forward_or_spawn_boxed(
-    frame: &khive_runtime::DaemonRequestFrame,
+    frame: khive_runtime::DaemonRequestFrame,
     packs: Option<Vec<String>>,
-) -> ForwardFuture<'_> {
+    replay_read_only: bool,
+) -> ForwardFuture {
     Box::pin(async move {
-        crate::daemon::forward_or_spawn_with_config_and_packs(frame, None, None, packs.as_deref())
-            .await
+        crate::daemon::forward_or_spawn_with_replay_policy(
+            &frame,
+            None,
+            None,
+            packs.as_deref(),
+            replay_read_only,
+        )
+        .await
     })
 }
 
 impl KhiveMcpServer {
+    pub(crate) fn plan_ops(&self, ops: &str) -> String {
+        let catalog = self
+            .registry
+            .all_verbs_with_names()
+            .into_iter()
+            .map(|(pack, handler)| (handler.name.to_string(), pack.to_string()))
+            .chain(
+                self.registry
+                    .mounted_verb_snapshot()
+                    .into_iter()
+                    .map(|verb| {
+                        (
+                            verb["verb"].as_str().unwrap_or_default().to_owned(),
+                            verb["pack"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    }),
+            )
+            .collect();
+        khive_request::plan_request(ops, &catalog).to_string()
+    }
+
+    fn plan_response(&self, p: &RequestParams) -> Result<Option<String>, McpError> {
+        if p.plan != Some(true) {
+            return Ok(None);
+        }
+        p.validate_plan_envelope()?;
+        Ok(Some(self.plan_ops(&p.ops)))
+    }
+
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        #[cfg(unix)]
+        if let Some(executable) = &self.bridge_executable {
+            executable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .check()?;
+        }
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
+        let mut p = p;
+        let request_id = ensure_bridge_request_id(&mut p);
+        tracing::debug!(
+            request_id,
+            "MCP request admitted with bridge correlation id"
+        );
         #[cfg(unix)]
         return self.request_with_forward(p, forward_or_spawn_boxed).await;
         #[cfg(not(unix))]
@@ -2724,6 +3437,9 @@ impl KhiveMcpServer {
         p: RequestParams,
         #[cfg(unix)] forward_fn: ForwardFnPtr,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -2731,9 +3447,15 @@ impl KhiveMcpServer {
         // side-effect-free preflight keeps the local and warm-daemon surfaces on
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
-        if let Err(error) = parse_request(&p.ops) {
-            return Err(dsl_err_to_mcp(error));
-        }
+        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        #[cfg(unix)]
+        let replay_read_only = !parsed.ops.is_empty()
+            && parsed
+                .ops
+                .iter()
+                .all(|op| self.registry.is_read_replay_safe(&op.tool));
+        #[cfg(not(unix))]
+        let _ = parsed;
 
         // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. An ordinary no-socket condition, a namespace
@@ -2748,9 +3470,27 @@ impl KhiveMcpServer {
         // inline result instead. Bypass daemon forwarding whenever `save_to`
         // is set so the local path's manifest/file behavior always applies,
         // matching the existing `kkernel exec --save-file` precedent.
+        // A request cancelled before daemon admission must not start new
+        // work — this must hold regardless of whether the request would go
+        // through daemon forwarding or straight to local dispatch via the
+        // `save_to` bypass below, so the check runs before either branch is
+        // chosen. After admission, however, cancellation cannot safely drop
+        // the forward: the daemon may already have committed one or more
+        // operations, so the bridge must preserve its real response.
+        #[cfg(unix)]
+        if khive_storage::request_read_is_cancelled() {
+            return Err(McpError::internal_error(
+                "request cancelled before daemon dispatch",
+                Some(error_with_disposition(
+                    json!({"kind":"cancelled", "message":"request cancelled before daemon dispatch"}),
+                    DomainDisposition::NotCommitted,
+                )),
+            ));
+        }
         #[cfg(unix)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
+            let request_id = frame.request_id;
             // Forward this server's own resolved pack list so a daemon this
             // call spawns serves the SAME packs this process registered —
             // `pack_names()` reflects the actual loaded registry regardless
@@ -2763,14 +3503,99 @@ impl KhiveMcpServer {
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            let forwarded = forward_fn(&frame, Some(resolved_packs));
-            tokio::pin!(forwarded);
+            // Captured at the moment the forward is admitted so the
+            // post-cancellation wait below can bound itself by the time
+            // actually left on the REQUEST's own deadline, not by a fresh
+            // full ceiling starting from whenever cancellation happens to
+            // arrive. Also propagated into the spawned task itself
+            // (`inherit_request_read_context`) so `try_forward_inner`'s
+            // socket-exchange deadline is this exact same instant, instead
+            // of a second, independently-ticking relative timer.
+            let post_cancellation_deadline = khive_storage::capture_request_read_context()
+                .deadline()
+                .map(khive_storage::RequestReadDeadline::async_at);
+            let mut forward_task =
+                tokio::spawn(khive_storage::inherit_request_read_context(async move {
+                    let outcome = forward_fn(frame, Some(resolved_packs), replay_read_only).await;
+                    tracing::debug!(
+                        request_id,
+                        daemon_outcome_present = outcome.is_some(),
+                        "admitted daemon forward reached a terminal outcome"
+                    );
+                    outcome
+                }));
+            let mut cancelled_during_forward = false;
             let forwarded = tokio::select! {
-                result = &mut forwarded => result,
+                result = &mut forward_task => result,
                 _ = khive_storage::wait_for_request_read_cancellation() => {
-                    return Err(McpError::internal_error("request cancelled", None));
+                    cancelled_during_forward = true;
+                    tracing::warn!(
+                        request_id,
+                        "request cancellation arrived after daemon admission; shielding the \
+                         forward until its per-operation outcome is known"
+                    );
+                    // Shielding the forward must still be bounded: a stalled
+                    // daemon or a silent same-UID socket peer must not keep
+                    // this handler (and the task awaiting it) alive forever.
+                    // Wait only for whatever time remains on the request's
+                    // own absolute deadline (captured above, before this
+                    // select ever ran) rather than starting a fresh
+                    // `request_read_timeout()` ceiling from the moment
+                    // cancellation happens to arrive — a request cancelled a
+                    // moment before its own deadline must not then hold this
+                    // handler for almost another full ceiling. When no
+                    // deadline was installed (a direct `request_with_forward`
+                    // call outside `scope_mcp_request_read_cancellation`, as
+                    // some tests do), fall back to `request_read_timeout()`.
+                    // If the deadline had already passed by the time
+                    // cancellation arrived, `timeout_at` elapses on its very
+                    // next poll — an immediate unknown-outcome return, which
+                    // is the only consistent reading: there is no time left
+                    // to shield the forward with.
+                    let wait_result = match post_cancellation_deadline {
+                        Some(deadline) => {
+                            tokio::time::timeout_at(deadline, &mut forward_task).await
+                        }
+                        None => {
+                            tokio::time::timeout(request_read_timeout(), &mut forward_task).await
+                        }
+                    };
+                    match wait_result
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            // Never abort the task: the daemon may already
+                            // have committed. Just stop waiting on it here —
+                            // dropping the `JoinHandle` detaches without
+                            // cancelling, so the forward keeps running to
+                            // completion on its own.
+                            tracing::warn!(
+                                request_id,
+                                "admitted daemon forward did not resolve within the \
+                                 post-cancellation wait bound; reporting an unknown \
+                                 outcome and leaving the forward to finish on its own"
+                            );
+                            return Err(cancelled_forward_error(request_id));
+                        }
+                    }
                 }
             };
+            let forwarded = forwarded.map_err(|error| {
+                McpError::internal_error(
+                    format!(
+                        "daemon forwarding task failed after admission ({error}); outcome is \
+                         unknown and the request must not be retried blindly"
+                    ),
+                    Some(json!({
+                        "outcome": "unknown",
+                        "kind": "transport",
+                        "message": format!("daemon forwarding task failed after admission ({error}); outcome is unknown and the request must not be retried blindly"),
+                                    "domain_disposition": "unknown",
+                        "retryable": false,
+                        "request_id": request_id,
+                    })),
+                )
+            })?;
             if let Some(res) = forwarded {
                 return match res {
                     Ok(s) => Ok(s),
@@ -2787,6 +3612,26 @@ impl KhiveMcpServer {
                         None => Err(e),
                     },
                 };
+            }
+            // The forward produced no daemon-side outcome (e.g. no socket,
+            // `KHIVE_NO_DAEMON`). `tokio::select!` is unbiased, so the
+            // task-result arm can win with `None` in the same instant
+            // cancellation becomes visible — `cancelled_during_forward` alone
+            // would miss that race. Re-check the flag directly so local
+            // dispatch never runs after an admitted cancellation regardless
+            // of which arm happened to win.
+            if cancelled_during_forward || khive_storage::request_read_is_cancelled() {
+                return Err(McpError::internal_error(
+                    "request cancelled before local fallback dispatch",
+                    Some(json!({
+                        "outcome": "not_dispatched",
+                        "kind": "cancelled",
+                        "message": "request cancelled before local fallback dispatch",
+                        "domain_disposition": "not_committed",
+                        "retryable": true,
+                        "request_id": request_id,
+                    })),
+                ));
             }
         }
         self.dispatch_request_wire(p).await
@@ -2836,13 +3681,12 @@ fn attach_strict_refusal_reasons(result: &mut Value) {
 }
 
 fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
-    json!({
-        "ok": false,
-        "tool": tool,
-        "error": format!(
-            "batch response budget of {response_budget} serialized bytes exceeded"
-        ),
-    })
+    failure_entry(
+        tool,
+        json!({"kind":"response_budget_exceeded", "code":"response_budget_exceeded",
+        "message":format!("batch response budget of {response_budget} serialized bytes exceeded")}),
+        DomainDisposition::NotCommitted,
+    )
 }
 
 async fn execute_bounded_batch<I, F>(
@@ -2961,16 +3805,26 @@ fn strict_fallback_envelope_response(
             .enumerate()
             .map(|(i, op)| {
                 if i == 0 {
-                    json!({ "ok": false, "tool": op.tool, "error": error_msg })
+                    failure_entry(
+                        op.tool.clone(),
+                        json!(error_msg),
+                        DomainDisposition::NotCommitted,
+                    )
                 } else {
-                    json!({ "ok": false, "tool": op.tool, "aborted": true })
+                    aborted_entry(op.tool.clone(), None)
                 }
             })
             .collect(),
         ExecutionMode::Single | ExecutionMode::Parallel => parsed
             .ops
             .iter()
-            .map(|op| json!({ "ok": false, "tool": op.tool, "error": error_msg }))
+            .map(|op| {
+                failure_entry(
+                    op.tool.clone(),
+                    json!(error_msg),
+                    DomainDisposition::NotCommitted,
+                )
+            })
             .collect(),
     };
 
@@ -2999,6 +3853,7 @@ impl KhiveMcpServer {
     #[cfg(unix)]
     pub(crate) fn wire_daemon_frame(&self, p: &RequestParams) -> khive_runtime::DaemonRequestFrame {
         khive_runtime::DaemonRequestFrame {
+            plan: false,
             ops: p.ops.clone(),
             presentation: p.presentation.clone(),
             presentation_per_op: p.presentation_per_op.clone(),
@@ -3121,6 +3976,7 @@ impl KhiveMcpServer {
         debug_assert!(policy.max_batch_concurrency > 0);
         let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
         let p = RequestParams {
+            plan: None,
             ops: String::new(),
             presentation,
             presentation_per_op: None,
@@ -3217,6 +4073,9 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // `dispatch_request_inner_scoped` is the complete parse/dispatch/render
         // pipeline. Keep that large generator behind one pointer before handing
         // it to the generic task-local scope: otherwise the scope embeds the
@@ -3283,18 +4142,17 @@ impl KhiveMcpServer {
         });
 
         // Parse presentation strings → PresentationMode.
-        let presentation = parse_presentation_mode(p.presentation.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        let presentation =
+            parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
             if let Some(per_op_strs) = p.presentation_per_op {
                 let mut modes = Vec::with_capacity(per_op_strs.len());
                 for s in per_op_strs {
                     let mode = match s.as_deref() {
                         None => None,
-                        Some(v) => Some(
-                            parse_presentation_mode(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?,
-                        ),
+                        Some(v) => {
+                            Some(parse_presentation_mode(Some(v)).map_err(invalid_request_error)?)
+                        }
                     };
                     modes.push(mode);
                 }
@@ -3307,7 +4165,7 @@ impl KhiveMcpServer {
         // per-request `format` field → server default (already resolved from
         // env + toml + builtin by `serve.rs`).
         let batch_format = parse_output_format(p.format.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?
+            .map_err(invalid_request_error)?
             .unwrap_or(self.default_output_format);
 
         // Per-op format overrides (ADR-078 §8.4).
@@ -3319,7 +4177,7 @@ impl KhiveMcpServer {
                         None => None,
                         Some(v) => Some(
                             parse_output_format(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?
+                                .map_err(invalid_request_error)?
                                 .unwrap_or(batch_format),
                         ),
                     };
@@ -3359,10 +4217,10 @@ impl KhiveMcpServer {
             // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
             // matching its documented "write anywhere" behavior.
             let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
-                .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
+                .map_err(|e| request_internal_error(format!("save_to: {e}")))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
-                .map_err(|e| McpError::internal_error(format!("serialize manifest: {e}"), None));
+                .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
         }
 
         // Apply per-op format rendering (ADR-078 §8.4 and §9).
@@ -3434,10 +4292,56 @@ fn attach_audit_persistence_advisories(response: &mut Value, registry: &VerbRegi
     }
 }
 
+fn invalid_request_error(message: String) -> McpError {
+    McpError::invalid_params(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"invalid_input", "message":message,
+            }),
+            DomainDisposition::NotCommitted,
+        )),
+    )
+}
+
+#[cfg(unix)]
+fn cancelled_forward_error(request_id: Option<u64>) -> McpError {
+    McpError::internal_error(
+        "daemon forward outcome unknown after cancellation",
+        Some(error_with_disposition(
+            json!({
+                "outcome": "unknown",
+                "kind": "transport",
+                "message": "daemon forward outcome unknown after cancellation",
+                "retryable": false,
+                "request_id": request_id,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
+fn request_internal_error(message: String) -> McpError {
+    // Rendering/saving can follow a mixture of per-op outcomes.
+    McpError::internal_error(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"internal", "message":message,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
 fn dsl_err_to_mcp(e: DslError) -> McpError {
     McpError::invalid_params(
         e.to_string(),
-        Some(json!({ "reason": RefusalReason::ParseError.as_str() })),
+        Some(error_with_disposition(
+            json!({ "reason": RefusalReason::ParseError.as_str(),
+            "kind":"parse_error", "message":e.to_string() }),
+            DomainDisposition::NotCommitted,
+        )),
     )
 }
 
@@ -3476,19 +4380,26 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 /// - If `ok=false` (error entry): always compact JSON, never reformatted (§8.2).
 /// - If `ok=true`: resolve per-op format (per_op_formats[i] → batch_format) and
 ///   per-op presentation (presentation_per_op[i] → batch presentation, then the
-///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
-///   `result` payload with the effective presentation so that both
-///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (including
-///   strict feedback, delivery-correlation acknowledgements, and durable receipt
-///   responses) correctly skip the redundancy-drop
-///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///   verb's AlwaysVerbose policy forces Verbose), apply the effective presentation
+///   to the `result` payload so that both `presentation_per_op=["verbose"]` and
+///   AlwaysVerbose verbs (including strict feedback, delivery-correlation
+///   acknowledgements, and durable receipt responses) correctly skip the
+///   redundancy-drop pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`). JSON
+///   output stays a JSON value — `prepare_format_value` applies the pre-pass
+///   in place — so a compounded response never round-trips `result` through a
+///   string; every other format calls `render_format` and stores the rendered
+///   string instead (ADR-078 Amendment 3).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// Daemon-served responses are rendered before fitting. If the rendered envelope
 /// exceeds the frame allowance, entries fall back to compact JSON before payload
 /// details are omitted. Local dispatch has no daemon-frame allowance and returns
-/// the requested representation without fitting. Every daemon fit decision
-/// serializes the actual response-frame shape so JSON string escaping is included.
+/// the requested representation without fitting. Every daemon fit decision is
+/// computed from per-entry serialized lengths (`fit_rendered_batch_envelope`),
+/// not by re-serializing the response-frame shape on each candidate; the
+/// arithmetic accounts for JSON string escaping exactly (see
+/// `json_escaped_len`), so the fit decision matches what serializing the
+/// actual frame would have measured.
 fn render_result(
     value: serde_json::Value,
     batch_format: OutputFormat,
@@ -3518,7 +4429,7 @@ fn render_result(
                 .collect();
             let out_map = match daemon_frame_config_id {
                 Some(config_id) => {
-                    fit_rendered_batch_envelope(map, results, out_results, config_id)
+                    fit_rendered_batch_envelope(map, results, out_results, config_id, registry)
                 }
                 None => {
                     let mut out_map = map.clone();
@@ -3541,10 +4452,14 @@ fn render_result(
     if rendered_response_fits_daemon_frame(&compact, config_id) {
         return compact;
     }
-    serde_json::to_string(&json!({
-        "ok": false,
-        "error": "response payload omitted because it exceeds the daemon frame budget",
-    }))
+    serde_json::to_string(&failure_entry(
+        "request",
+        frame_budget_error(
+            "response payload omitted because it exceeds the daemon frame budget",
+            DomainDisposition::Unknown,
+        ),
+        DomainDisposition::Unknown,
+    ))
     .expect("static frame-budget error is serializable")
 }
 
@@ -3563,7 +4478,7 @@ fn render_batch_entry(
         .and_then(|format| *format)
         .unwrap_or(batch_format);
     let is_ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !is_ok || per_op_format == OutputFormat::Json {
+    if !is_ok {
         return entry.clone();
     }
 
@@ -3580,46 +4495,69 @@ fn render_batch_entry(
         }
         _ => base_presentation,
     };
-    let Some(result) = entry.get("result") else {
+    if entry.get("result").is_none() {
         return entry.clone();
-    };
-    let mut rendered_entry = entry.clone();
-    if let Value::Object(ref mut fields) = rendered_entry {
-        fields.insert(
-            "result".to_string(),
-            Value::String(render_format(
-                result.clone(),
-                per_op_format,
-                effective_presentation,
-            )),
-        );
     }
+    let mut rendered_entry = entry.clone();
+    let Value::Object(ref mut fields) = rendered_entry else {
+        return rendered_entry;
+    };
+    // `result` was already duplicated by `entry.clone()` above; take it back
+    // out of the clone instead of cloning it a second time off `entry`. Both
+    // `prepare_format_value` and `render_format` take the value by ownership,
+    // so a no-op reduction (Verbose/Human JSON) no longer pays for a clone it
+    // throws away.
+    let Some(result) = fields.remove("result") else {
+        return rendered_entry;
+    };
+    let formatted = if per_op_format == OutputFormat::Json {
+        prepare_format_value(result, per_op_format, effective_presentation)
+    } else {
+        Value::String(render_format(result, per_op_format, effective_presentation))
+    };
+    fields.insert("result".to_string(), formatted);
     rendered_entry
 }
 
+/// Fit a rendered batch envelope inside the daemon frame budget.
+///
+/// The envelope's compact-JSON length is additive: for a fixed set of
+/// non-`results` keys, `serialize({..metadata, results: X})` only ever
+/// changes in the byte range spanned by `results`'s own array literal, so
+/// its length is exactly `envelope_metadata_escaped_len(metadata) +
+/// sum(entry_escaped_len) + separators` (`envelope_escaped_len` below), and
+/// the daemon-frame length is that same number plus the frame's own fixed
+/// overhead (`empty_rendered_daemon_frame_len`). That turns "does this
+/// candidate fit" from a full-batch clone-and-reserialize into arithmetic
+/// over lengths computed once per entry, so fitting no longer costs
+/// O(entries × batch bytes).
 fn fit_rendered_batch_envelope(
     map: &serde_json::Map<String, Value>,
     compact_results: &[Value],
-    mut out_results: Vec<Value>,
+    out_results: Vec<Value>,
     served_config_id: &str,
+    registry: &VerbRegistry,
 ) -> serde_json::Map<String, Value> {
-    let mut out_map = map.clone();
-    out_map.insert(
-        "results".to_string(),
-        serde_json::Value::Array(out_results.clone()),
-    );
-    if response_value_fits_daemon_frame(
-        &serde_json::Value::Object(out_map.clone()),
-        served_config_id,
-    ) {
-        return out_map;
+    let frame_base = empty_rendered_daemon_frame_len(served_config_id);
+    let mut metadata = envelope_metadata(map);
+    let mut metadata_len = envelope_metadata_escaped_len(&metadata);
+    let mut out_results = out_results;
+    let mut entry_lens: Vec<usize> = out_results.iter().map(entry_escaped_len).collect();
+    let fits = |entry_lens: &[usize], metadata_len: usize| {
+        frame_base + envelope_escaped_len(entry_lens, metadata_len)
+            <= khive_runtime::daemon::MAX_FRAME_BYTES
+    };
+
+    if fits(&entry_lens, metadata_len) {
+        metadata.insert("results".to_string(), Value::Array(out_results));
+        return metadata;
     }
 
-    let rendered_frame_bytes = response_value_daemon_frame_len(
-        &serde_json::Value::Object(out_map.clone()),
-        served_config_id,
-    );
-    let mut compact_fallbacks: Vec<(usize, usize)> = compact_results
+    // Pass 1: canonical (compact) fallback wherever it actually saves bytes,
+    // largest saving first. Agent JSON reduction can make a canonical form
+    // LARGER than its rendered form (redundant fields already dropped), so a
+    // fallback there would move the envelope the wrong way and is skipped.
+    let mut compact_fallbacks: Vec<(usize, usize, usize)> = compact_results
         .iter()
         .zip(&out_results)
         .enumerate()
@@ -3627,25 +4565,26 @@ fn fit_rendered_batch_envelope(
             if compact == rendered {
                 return None;
             }
-            let mut candidate_results = out_results.clone();
-            candidate_results[index] = compact.clone();
-            let mut candidate_map = out_map.clone();
-            candidate_map.insert("results".to_string(), Value::Array(candidate_results));
-            let compact_frame_bytes =
-                response_value_daemon_frame_len(&Value::Object(candidate_map), served_config_id);
-            (compact_frame_bytes < rendered_frame_bytes)
-                .then_some((index, rendered_frame_bytes - compact_frame_bytes))
+            let compact_len = entry_escaped_len(compact);
+            // `then_some` evaluates its argument eagerly regardless of the
+            // guard, so an inline `rendered_len - compact_len` here would
+            // underflow-panic exactly when compact is larger (the case this
+            // guard exists to exclude) — `then` defers it to a closure.
+            (compact_len < entry_lens[index])
+                .then(|| (index, entry_lens[index] - compact_len, compact_len))
         })
         .collect();
-    compact_fallbacks.sort_unstable_by_key(|&(_, saved_bytes)| std::cmp::Reverse(saved_bytes));
-    for (index, _) in compact_fallbacks {
+    compact_fallbacks.sort_unstable_by_key(|&(_, saved_bytes, _)| std::cmp::Reverse(saved_bytes));
+    for (index, _, compact_len) in compact_fallbacks {
         out_results[index] = compact_results[index].clone();
-        out_map.insert("results".to_string(), Value::Array(out_results.clone()));
-        if response_value_fits_daemon_frame(&Value::Object(out_map.clone()), served_config_id) {
-            return out_map;
+        entry_lens[index] = compact_len;
+        if fits(&entry_lens, metadata_len) {
+            metadata.insert("results".to_string(), Value::Array(out_results));
+            return metadata;
         }
     }
 
+    // Pass 2: omission, largest current entry first.
     let mut by_size: Vec<(usize, usize)> = out_results
         .iter()
         .enumerate()
@@ -3653,49 +4592,200 @@ fn fit_rendered_batch_envelope(
         .collect();
     by_size.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     for (index, _) in by_size {
-        out_results[index] = frame_budget_omission(&compact_results[index]);
-        out_map.insert(
-            "results".to_string(),
-            serde_json::Value::Array(out_results.clone()),
-        );
-        if response_value_fits_daemon_frame(
-            &serde_json::Value::Object(out_map.clone()),
-            served_config_id,
-        ) {
+        let omitted = frame_budget_omission(&compact_results[index], registry);
+        entry_lens[index] = entry_escaped_len(&omitted);
+        out_results[index] = omitted;
+        refresh_frame_budget_outcome(&mut metadata, &out_results);
+        metadata_len = envelope_metadata_escaped_len(&metadata);
+        if fits(&entry_lens, metadata_len) {
             break;
         }
     }
-    out_map
+    metadata.insert("results".to_string(), Value::Array(out_results));
+    metadata
 }
 
-fn frame_budget_omission(entry: &Value) -> Value {
+/// All envelope fields except `results`, copied without ever touching the
+/// (potentially large) `results` array — `map.clone()` would deep-clone it
+/// just to have `results` overwritten a moment later.
+fn envelope_metadata(map: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    map.iter()
+        .filter(|(key, _)| key.as_str() != "results")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The escaped byte length of `{..metadata, "results": []}`. Since
+/// `metadata` excludes `results`, this costs nothing proportional to batch
+/// size — it changes only when `refresh_frame_budget_outcome` rewrites
+/// `summary`/`status`, both tiny fixed-shape objects.
+fn envelope_metadata_escaped_len(metadata: &serde_json::Map<String, Value>) -> usize {
+    let mut probe = metadata.clone();
+    probe.insert("results".to_string(), Value::Array(Vec::new()));
+    json_escaped_len(&serde_json::to_vec(&Value::Object(probe)).expect("value is serializable"))
+}
+
+/// The escaped byte length `entry` contributes once embedded in the
+/// envelope's `results` array (i.e. as it will be re-escaped a second time
+/// when the whole envelope is wrapped in a daemon response frame).
+fn entry_escaped_len(entry: &Value) -> usize {
+    json_escaped_len(&serde_json::to_vec(entry).expect("value is serializable"))
+}
+
+/// `envelope_metadata_escaped_len(metadata)` plus the array literal built
+/// from `entry_escaped_lens` — the incremental form of
+/// `envelope_metadata_escaped_len` with `results` populated instead of
+/// empty. `metadata_escaped_len` already counts the two bracket bytes of
+/// `results`'s empty `[]`, and those brackets stay in place either way, so
+/// only the entries and the commas between them are additional.
+fn envelope_escaped_len(entry_escaped_lens: &[usize], metadata_escaped_len: usize) -> usize {
+    let separators = entry_escaped_lens.len().saturating_sub(1);
+    metadata_escaped_len + entry_escaped_lens.iter().sum::<usize>() + separators
+}
+
+/// The number of bytes `bytes` would occupy once JSON-string-escaped
+/// (excluding the surrounding quotes), matching serde_json's default
+/// formatter (`ESCAPE` table in `serde_json::ser`) byte for byte. Escaping
+/// has no cross-byte state, so this is additive over concatenation — the
+/// property `fit_rendered_batch_envelope` relies on to compute the frame
+/// length from per-entry lengths instead of re-serializing the envelope.
+fn json_escaped_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            b'"' | b'\\' => 2,
+            0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 2,
+            0x00..=0x1F => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The daemon-frame byte length for an empty rendered payload — the fixed
+/// overhead every non-empty payload's escaped length is added on top of.
+fn empty_rendered_daemon_frame_len(served_config_id: &str) -> usize {
+    rendered_response_daemon_frame_len("", served_config_id)
+}
+
+fn frame_budget_error(message: &str, disposition: DomainDisposition) -> Value {
+    error_with_disposition(
+        json!({"kind":"response_frame_budget_exceeded", "code":"response_frame_budget_exceeded",
+        "message":message, "retryable":false,
+        "max_frame_bytes":khive_runtime::daemon::MAX_FRAME_BYTES}),
+        disposition,
+    )
+}
+
+fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let mut omitted = serde_json::Map::new();
+    if entry.get("aborted").and_then(Value::as_bool) == Some(true) {
+        let mut aborted = aborted_entry(
+            entry
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None,
+        );
+        for key in ["usage", "reason", "advisories"] {
+            if let Some(value) = entry.get(key) {
+                aborted[key] = value.clone();
+            }
+        }
+        return aborted;
+    }
+    let disposition = if ok {
+        DomainDisposition::Committed
+    } else {
+        error_disposition(&entry["error"])
+    };
+    let mut omitted = failure_entry(entry.get("tool").and_then(Value::as_str).unwrap_or_default(),
+        frame_budget_error("operation failed; error details omitted because the response frame budget was exceeded", disposition),
+        disposition).as_object().expect("error envelope").clone();
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
-    for key in [
-        "ok",
-        "tool",
-        "usage",
-        "aborted",
-        "reason",
-        "status",
-        "partial",
-        "missing_backends",
-        "backend_errors",
-        "backend_errors_truncated",
-        "backend_errors_omitted",
-        "advisories",
-    ] {
+    for key in ["ok", "tool", "usage", "aborted", "reason", "advisories"] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
     }
     if ok {
+        // Once the result is discarded, the operation is not a usable
+        // success. In particular, a pager must not interpret the missing
+        // payload as an empty terminal page. Surface a small, typed error
+        // and tell the caller what to actually do about it: reissue with a
+        // narrower request, or read the already-committed outcome back.
+        //
+        // This decision runs after `run_parsed` has already dispatched the
+        // operation (and, in a chain, every operation after it) — the frame
+        // budget is checked at render time, once the full envelope is known.
+        // A frame-budget overflow is never a transient, pace-and-retry
+        // condition: reissuing the identical request exceeds the identical
+        // budget identically. `retryable` therefore always stays `false`
+        // here — ADR-130 §2/§4 tie a `true` value to a published
+        // `retry_after_ms`/backoff/breaker contract this failure class does
+        // not have — and `recoverable` carries the actual guidance instead.
+        // A `Directive`/`Commissive`/`Declaration` verb (or an unregistered/
+        // unknown tool name, which cannot be proven side-effect-free)
+        // already committed its effect before the transport discovered the
+        // response was too large, so it fails closed to `read_outcome`; an
+        // `Assertive` verb with nothing to duplicate is told
+        // `reduce_result_size` instead. `is_retry_safe_after_frame_omission`
+        // (`khive-runtime`) additionally excludes a short, audited list of
+        // `Assertive` verbs that schedule a persisted write on every
+        // dispatch (`memory.recall`'s serve ledger, `search`'s
+        // `SearchExecuted` telemetry) — see its doc comment and
+        // `VerbCategory`'s doc comment in `khive-types`.
+        omitted.insert("ok".to_string(), Value::Bool(false));
+        let tool = entry.get("tool").and_then(Value::as_str);
+        let retry_safe = tool.is_some_and(|verb| registry.is_retry_safe_after_frame_omission(verb));
+        let (message, recoverable) = if retry_safe {
+            (
+                "operation result exceeded the daemon response frame budget; reduce limit \
+                 or result size and reissue the request",
+                "reduce_result_size",
+            )
+        } else {
+            omitted.insert("executed".to_string(), Value::Bool(true));
+            (
+                "operation completed but its result exceeded the daemon response frame \
+                 budget; read the outcome back instead of reissuing the operation",
+                "read_outcome",
+            )
+        };
+        let mut error = serde_json::Map::from_iter([
+            ("kind".to_string(), json!("response_frame_budget_exceeded")),
+            ("code".to_string(), json!("response_frame_budget_exceeded")),
+            ("message".to_string(), json!(message)),
+            ("retryable".to_string(), json!(false)),
+            ("recoverable".to_string(), json!(recoverable)),
+            (
+                "max_frame_bytes".to_string(),
+                json!(khive_runtime::daemon::MAX_FRAME_BYTES),
+            ),
+        ]);
+        // ADR-130 defines `status`/`arm_participation`/`partial`/`missing_backends`/
+        // `backend_errors*` only on a successful search entry. Once `ok` flips to
+        // false here they no longer belong at the top level; fold any that were
+        // present into `error.search` instead of dropping the diagnostic outright.
+        let search_fields: serde_json::Map<String, Value> = [
+            "status",
+            "arm_participation",
+            "partial",
+            "missing_backends",
+            "backend_errors",
+            "backend_errors_truncated",
+            "backend_errors_omitted",
+        ]
+        .into_iter()
+        .filter_map(|key| entry.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect();
+        if !search_fields.is_empty() {
+            error.insert("search".to_string(), Value::Object(search_fields));
+        }
         omitted.insert(
-            "result_omitted".to_string(),
-            json!("operation succeeded; result omitted because the response frame budget was exceeded"),
+            "error".to_string(),
+            error_with_disposition(Value::Object(error), disposition),
         );
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
@@ -3711,14 +4801,37 @@ fn frame_budget_omission(entry: &Value) -> Value {
             if let Some(error) = entry.get("error") {
                 omitted.insert("error".to_string(), error.clone());
             }
-        } else {
-            omitted.insert(
-                "error".to_string(),
-                json!("operation failed; error details omitted because the response frame budget was exceeded"),
-            );
         }
     }
     Value::Object(omitted)
+}
+
+/// Rebuild aggregate outcome fields after the transport layer turns one or
+/// more oversized successes into explicit failures.
+fn refresh_frame_budget_outcome(map: &mut serde_json::Map<String, Value>, results: &[Value]) {
+    let total = results.len();
+    let succeeded = results
+        .iter()
+        .filter(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true))
+        .count();
+    let aborted = results
+        .iter()
+        .filter(|entry| {
+            entry.get("ok").and_then(Value::as_bool) == Some(false)
+                && entry.get("aborted").and_then(Value::as_bool) == Some(true)
+        })
+        .count();
+    let failed = total.saturating_sub(succeeded + aborted);
+    map.insert(
+        "summary".to_string(),
+        json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    );
+    map.insert("status".to_string(), json!(batch_status(failed, aborted)));
 }
 
 fn serialized_response_len(value: &Value) -> usize {
@@ -3731,15 +4844,6 @@ fn serialize_response_value(value: &Value) -> String {
     serde_json::to_string(value).expect("serde_json::Value is always serializable")
 }
 
-fn response_value_fits_daemon_frame(value: &Value, served_config_id: &str) -> bool {
-    response_value_daemon_frame_len(value, served_config_id)
-        <= khive_runtime::daemon::MAX_FRAME_BYTES
-}
-
-fn response_value_daemon_frame_len(value: &Value, served_config_id: &str) -> usize {
-    rendered_response_daemon_frame_len(&serialize_response_value(value), served_config_id)
-}
-
 fn rendered_response_fits_daemon_frame(rendered: &str, served_config_id: &str) -> bool {
     rendered_response_daemon_frame_len(rendered, served_config_id)
         <= khive_runtime::daemon::MAX_FRAME_BYTES
@@ -3750,6 +4854,7 @@ fn rendered_response_daemon_frame_len(rendered: &str, served_config_id: &str) ->
         ok: true,
         result: Some(rendered.to_string()),
         error: None,
+        error_detail: None,
         namespace_mismatch: false,
         config_mismatch: false,
         served_config_id: Some(served_config_id.to_string()),
@@ -3771,7 +4876,10 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
     format!(
         "khive — request-only MCP surface. One tool, `request`, \
          dispatches verbs through the loaded pack registry. Configure packs via \
-         KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
+         KHIVE_PACKS or --pack (built-ins: {builtins}). The kg pack's verbs are \
+         unprefixed (create, get, list, search, link, neighbors, ...); every other pack's \
+         verbs are written pack.verb. Read verbs return their record or hits directly \
+         unless the verb's help says it wraps them in an envelope. Verbs registered on this \
          server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
          plugin's SKILL.md files.\n\
          Docs: https://ohdearquant.github.io/khive/ (hosted) or docs/*.md in the repo \
@@ -3783,6 +4891,30 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
 
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        // The router turns parameter-deserialization failures into tool errors.
+        // Plan isolation requires the JSON-RPC invalid_params response instead.
+        if request.name == "request" {
+            if let Some(args) = request.arguments.as_ref() {
+                if args.get("plan") == Some(&Value::Bool(true)) {
+                    for field in crate::tools::request::PLAN_COMPANIONS {
+                        if args.contains_key(field) {
+                            return Err(invalid_request_error(format!(
+                                "plan=true cannot be combined with {field}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(context).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
@@ -3805,6 +4937,19 @@ impl ServerHandler for KhiveMcpServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         let mut tools = Self::tool_router().list_all();
+        self.registry.mounted_verb_catalog().await.map_err(|_| {
+            McpError::internal_error(
+                "mounted catalog unavailable",
+                Some(error_with_disposition(
+                    json!({
+                        "kind": "unavailable",
+                        "message": "mounted catalog unavailable",
+                        "details": {"class": "tool_error", "reason": "catalog_drift"},
+                    }),
+                    DomainDisposition::NotCommitted,
+                )),
+            )
+        })?;
         let catalog = self.verb_catalog();
         for t in &mut tools {
             if t.name == "request" {
@@ -3826,9 +4971,51 @@ impl ServerHandler for KhiveMcpServer {
 mod tests {
     use super::*;
     use crate::coordinator::BackendSearchFailure;
+    include!("server/plan_tests.rs");
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn remember_key_named_disposition_preserves_details_and_other_errors() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = "k".repeat(512);
+        let error = khive_types::KhiveError::conflict("held").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_conflict".to_owned()),
+                ("key", key.clone()),
+                ("existing_id", id.clone()),
+            ]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Committed);
+        assert_eq!(value["kind"], "conflict");
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"]["key"], key);
+        assert_eq!(value["details"]["existing_id"], id);
+
+        let unresolved = khive_types::KhiveError::unavailable("holder missing").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_holder_unresolved".to_owned()),
+                ("key", String::new()),
+            ]),
+        );
+        assert_eq!(
+            runtime_error_value(unresolved.into(), DomainDisposition::Committed)
+                ["domain_disposition"],
+            "unknown"
+        );
+        for error in [
+            khive_types::KhiveError::conflict("unrelated"),
+            khive_types::KhiveError::unavailable("unrelated"),
+        ] {
+            let mut expected = serde_json::to_value(&error).unwrap();
+            expected["domain_disposition"] = json!("unknown");
+            assert_eq!(
+                runtime_error_value(error.into(), DomainDisposition::Unknown),
+                expected
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -3867,25 +5054,8 @@ mod tests {
         }
     }
 
-    // Freeze lingering `-wal`/`-shm` sidecars left by a writable fixture whose
-    // connections close asynchronously; read-only admission rejects a writable
-    // `-shm` as potentially live.
     #[cfg(unix)]
-    fn freeze_snapshot_sidecars(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["-wal", "-shm"] {
-            let mut name = path.file_name().expect("db file name").to_os_string();
-            name.push(suffix);
-            let sidecar = path.parent().expect("db parent dir").join(name);
-            if sidecar.exists() {
-                let mut permissions = std::fs::metadata(&sidecar)
-                    .expect("sidecar metadata")
-                    .permissions();
-                permissions.set_mode(0o444);
-                std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-            }
-        }
-    }
+    use khive_storage::test_support::freeze_snapshot_sidecars;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -3900,7 +5070,73 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
+    async fn bridge_executable_replacement_refuses_at_request_boundary() {
+        use crate::daemon::{
+            fire_pending_self_heal, reset_self_heal_counters, REEXEC_INVOKED_COUNT,
+        };
+
+        reset_self_heal_counters();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge");
+        std::fs::write(&path, b"binary image").unwrap();
+        let executable = crate::daemon::executable::BridgeExecutable::at(path.clone()).unwrap();
+        let mut server = KhiveMcpServer::from_registry(VerbRegistryBuilder::new().build().unwrap());
+        server.bridge_executable = Some(Arc::new(std::sync::Mutex::new(executable)));
+        std::fs::copy(&path, dir.path().join("next")).unwrap();
+        std::fs::rename(dir.path().join("next"), path).unwrap();
+
+        for params in [
+            RequestParams {
+                ops: "stats()".to_string(),
+                plan: Some(true),
+                ..Default::default()
+            },
+            RequestParams {
+                ops: "stats(".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let error = server.request_with_cancellation(params).await.expect_err(
+                "the stale stdio bridge must refuse before planning, parsing or dispatch",
+            );
+            assert_eq!(error.data.unwrap()["reason"], "executable_replaced");
+        }
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 0);
+        fire_pending_self_heal();
+        fire_pending_self_heal();
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bridge_request_id_is_unconditional_and_preserves_caller_value() {
+        let mut generated = RequestParams {
+            ops: "stats()".to_string(),
+            ..Default::default()
+        };
+        let first = ensure_bridge_request_id(&mut generated);
+        assert_ne!(first, 0, "bridge-generated request ids are nonzero");
+        assert_eq!(generated.request_id, Some(first));
+        assert_eq!(
+            ensure_bridge_request_id(&mut generated),
+            first,
+            "one admitted MCP attempt keeps one stable id"
+        );
+
+        let mut supplied = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(ensure_bridge_request_id(&mut supplied), 42);
+        assert_eq!(supplied.request_id, Some(42));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn wire_dispatch_retains_raw_one_mib_input_limit() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -3912,6 +5148,7 @@ mod tests {
         .expect("in-memory runtime");
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let params = RequestParams {
+            plan: None,
             ops: json!({
                 "tool": "stats",
                 "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
@@ -3950,14 +5187,15 @@ mod tests {
     /// this spy observes precisely what the real
     /// `forward_or_spawn_with_config_and_packs` call would receive. Two independent
     /// mutations must both redden this test:
-    /// - swapping the production `forward_fn(&frame, Some(resolved_packs))`
-    ///   call for `forward_fn(&frame, Some(Vec::new()))` — the restricted
+    /// - swapping the production `forward_fn(frame, Some(resolved_packs))`
+    ///   call for `forward_fn(frame, Some(Vec::new()))` — the restricted
     ///   two-pack registry built here (`kg`, `gtd`) no longer matches what
     ///   the spy records;
-    /// - swapping that same call for `forward_fn(&frame, None)` — the spy
+    /// - swapping that same call for `forward_fn(frame, None)` — the spy
     ///   records `None` instead of `Some(vec!["kg", "gtd"])`.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_forward_seam() {
         thread_local! {
             static SPY_CAPTURED_PACKS: std::cell::RefCell<Option<Option<Vec<String>>>> =
@@ -3965,9 +5203,10 @@ mod tests {
         }
 
         fn spy_forward(
-            _frame: &khive_runtime::DaemonRequestFrame,
+            _frame: khive_runtime::DaemonRequestFrame,
             packs: Option<Vec<String>>,
-        ) -> ForwardFuture<'_> {
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
             SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
             Box::pin(async {
                 Some(Ok(json!({
@@ -3991,6 +5230,7 @@ mod tests {
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4015,6 +5255,919 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    mod read_replay_tests {
+        use super::*;
+
+        thread_local! {
+            static CAPTURED_FORWARD: std::cell::RefCell<Option<(String, bool)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn capture_forward_policy(
+            frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            replay_read_only: bool,
+        ) -> ForwardFuture {
+            CAPTURED_FORWARD.with(|capture| {
+                *capture.borrow_mut() = Some((frame.ops, replay_read_only));
+            });
+            Box::pin(async { Some(Ok("forwarded-policy-fixture".to_string())) })
+        }
+
+        fn live_server() -> KhiveMcpServer {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string(), "comm".to_string(), "memory".to_string()],
+                ..RuntimeConfig::default()
+            })
+            .expect("in-memory replay registry");
+            KhiveMcpServer::new(runtime).expect("live kg, comm and memory handlers")
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn request_forward_policy_requires_every_operation_to_be_an_opted_in_read() {
+            let server = live_server();
+            let cases = [
+                ("stats()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("comm.inbox(wait_ms=30000, box=\"sent\", limit=1)", true),
+                ("comm.unread()", true),
+                (
+                    "comm.delivered(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("[stats(), comm.unread(), comm.inbox(limit=1)]", true),
+                ("stats() | comm.unread()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\") | \
+                     comm.thread(id=$prev.thread_id) | comm.thread(id=$prev.thread_id)",
+                    true,
+                ),
+                (
+                    r#"[{"tool":"stats"},{"tool":"comm.unread","args":{}}]"#,
+                    true,
+                ),
+                ("stats(help=true)", true),
+                ("comm.send(to=\"bob\", content=\"policy-fixture\")", false),
+                (
+                    "[comm.unread(), comm.send(to=\"bob\", content=\"policy-fixture\")]",
+                    false,
+                ),
+                (
+                    "comm.send(to=\"bob\", content=\"policy-fixture\") | comm.thread(id=$prev.id)",
+                    false,
+                ),
+                ("[stats(), unknown.read()]", false),
+                ("unknown.read()", false),
+                ("unknown.read(help=true)", false),
+                ("comm.send(help=true)", false),
+                ("stats() | comm.send(help=$prev.help)", false),
+                ("memory.prune(dry_run=true)", false),
+                ("merge(dry_run=true)", false),
+                (
+                    "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
+                    false,
+                ),
+                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
+                ("memory.recall(query=\"policy-fixture\")", false),
+                ("get(id=\"00000000-0000-0000-0000-000000000001\")", false),
+            ];
+
+            for (ops, expected) in cases {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let response = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("forward preflight rejected {ops}: {error}"));
+                assert_eq!(response, "forwarded-policy-fixture");
+                assert_eq!(
+                    CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                    Some((ops.to_string(), expected)),
+                    "forwarded replay policy for {ops}",
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn malformed_and_atomic_wrapper_requests_never_reach_forwarding() {
+            let server = live_server();
+            for ops in [
+                "",
+                "stats(",
+                "[stats(), comm.unread()",
+                r#"{"atomic":true,"ops":[{"tool":"stats"}]}"#,
+            ] {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let error = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .expect_err("invalid DSL must fail before forwarding");
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data["reason"].as_str()),
+                    Some("parse-error"),
+                );
+                assert!(CAPTURED_FORWARD.with(|capture| capture.borrow().is_none()));
+            }
+        }
+
+        struct ImpostorCommPack;
+
+        impl khive_types::Pack for ImpostorCommPack {
+            const NAME: &'static str = "comm";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+                name: "comm.thread",
+                description: "untrusted same-name replay fixture",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            }];
+        }
+
+        #[async_trait::async_trait]
+        impl khive_runtime::PackRuntime for ImpostorCommPack {
+            fn name(&self) -> &str {
+                <Self as khive_types::Pack>::NAME
+            }
+
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+                <Self as khive_types::Pack>::HANDLERS
+            }
+
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &khive_runtime::NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                panic!("the forwarding policy fixture must not dispatch locally")
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn custom_same_name_pack_cannot_enable_replay_at_request_boundary() {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(ImpostorCommPack);
+            let registry = builder.build().expect("custom comm fixture registry");
+            assert_eq!(
+                registry.verb_category("comm.thread"),
+                Some(khive_runtime::VerbCategory::Assertive),
+            );
+            let server = KhiveMcpServer::from_registry(registry);
+            let ops = "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")";
+            CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    capture_forward_policy,
+                )
+                .await
+                .expect("custom call reaches forwarding without replay permission");
+            assert_eq!(
+                CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                Some((ops.to_string(), false)),
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[serial_test::serial(config_ledger)]
+        async fn mixed_comm_batch_commits_once_when_its_daemon_response_is_lost() {
+            clear_daemon_env();
+            let dir = tempfile::tempdir().expect("mixed batch socket directory");
+            let socket = dir.path().join("khived.sock");
+            std::env::set_var("KHIVE_SOCKET", &socket);
+            std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+            let client = live_server();
+            let daemon = live_server();
+            let baseline = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client baseline");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon");
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let observed_mutations = Arc::clone(&mutations);
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon_task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        incoming = listener.accept() => incoming.expect("accept mixed batch"),
+                    };
+                    let payload = khive_runtime::daemon::read_frame(&mut stream)
+                        .await
+                        .expect("receive full mixed batch");
+                    let frame: khive_runtime::DaemonRequestFrame =
+                        serde_json::from_slice(&payload).expect("decode mixed batch frame");
+                    assert!(
+                        !frame.probe_only,
+                        "mixed response loss must not trigger recovery"
+                    );
+                    let response = daemon
+                        .dispatch_request_local(RequestParams {
+                            ops: frame.ops,
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("execute mixed batch before losing the response");
+                    let envelope: Value = serde_json::from_str(&response).expect("batch response");
+                    assert_eq!(envelope["summary"]["succeeded"], 2, "{envelope}");
+                    let committed = envelope["results"]
+                        .as_array()
+                        .expect("batch entries")
+                        .iter()
+                        .filter(|entry| entry["tool"] == "comm.send" && entry["ok"] == true)
+                        .count();
+                    observed_mutations.fetch_add(committed, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+
+            let result = client
+                .request(
+                    Parameters(RequestParams {
+                        ops: "[comm.unread(), comm.send(to=\"bob\", content=\"mixed-replay-fixture\")]"
+                            .to_string(),
+                        ..Default::default()
+                    }),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let _ = stop_tx.send(());
+            let stopped = daemon_task.await;
+            clear_daemon_env();
+            stopped.expect("fake daemon exits cleanly");
+
+            let error = result.expect_err("the mixed batch must preserve its ambiguous outcome");
+            assert!(error.message.contains("not retrying"), "{error}");
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                1,
+                "comm.send committed more than once"
+            );
+            let after = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client state after remote response loss");
+            assert_eq!(
+                stats_without_request_local_usage(&after),
+                stats_without_request_local_usage(&baseline),
+                "a lost mixed response must not dispatch comm.send locally",
+            );
+        }
+    }
+
+    /// A cancellation notification after daemon admission must not replace the
+    /// daemon's actual per-op outcome with a bare RPC-level error. The daemon
+    /// response is the only source that can say which independent operations
+    /// committed and which failed validation.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn forwarded_cancellation_returns_the_actual_partial_envelope() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_RELEASE: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        // Gated on an explicit release signal rather than a sleep, so the
+        // test can prove the ordering it actually needs (cancellation must
+        // land while the forward is still outstanding) instead of hoping a
+        // fixed delay is long enough.
+        fn delayed_partial_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            let release = FORWARD_RELEASE
+                .with(|c| c.borrow().clone())
+                .expect("release notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Some(Ok(json!({
+                    "results": [
+                        {"ok": true, "tool": "comm.send", "result": {"id": "sent"}},
+                        {"ok": false, "tool": "link", "error": "invalid endpoint pair"}
+                    ],
+                    "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+                    "status": "partial"
+                })
+                .to_string()))
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+        FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        // The forward cannot possibly complete before `release` fires below,
+        // so once this task observes admission and cancels, the handler's
+        // select is guaranteed to take the cancellation arm — no race with
+        // the task-result arm is possible.
+        let canceller = tokio::spawn(async move {
+            started.notified().await;
+            cancel_after_admission.cancel();
+            release.notify_one();
+        });
+
+        let response = scope_mcp_request_read_cancellation(
+            cancellation,
+            server.request_with_forward(
+                RequestParams {
+                    ops: "[stats(), stats()]".to_string(),
+                    ..Default::default()
+                },
+                delayed_partial_forward,
+            ),
+        )
+        .await
+        .expect("cancellation after admission must preserve the daemon response");
+        canceller.await.expect("canceller task completes");
+
+        let response: Value = serde_json::from_str(&response).expect("response envelope is JSON");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["summary"]["succeeded"], 1);
+        assert_eq!(response["summary"]["failed"], 1);
+        assert_eq!(response["results"][1]["error"], "invalid endpoint pair");
+    }
+
+    /// The pre-admission cancellation check must run before the `save_to`
+    /// bypass branch, not inside it: a cancelled request that happens to
+    /// carry `save_to` must never fall through to local dispatch and start
+    /// mutating work before cancellation is ever checked. `save_to` bypasses
+    /// daemon forwarding either way (MCP-AUD-002), so the forward seam here
+    /// exists only to prove it is never reached; the real assertion is that
+    /// nothing was created.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn cancelled_request_with_save_to_refuses_before_local_dispatch() {
+        fn unreachable_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            panic!("save_to must bypass daemon forwarding regardless of cancellation");
+        }
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let (_tx, cancelled_rx) = tokio::sync::watch::channel(true);
+        let result = khive_storage::scope_request_read_cancellation(cancelled_rx, async {
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: "create(kind=\"entity\", entity_kind=\"concept\", \
+                              name=\"fix2337-cancelled-save-to-probe\")"
+                            .to_string(),
+                        save_to: Some("unused.jsonl".to_string()),
+                        ..Default::default()
+                    },
+                    unreachable_forward,
+                )
+                .await
+        })
+        .await;
+
+        let error = result
+            .expect_err("a cancelled request with save_to set must be refused before dispatch");
+        assert!(
+            error.message.contains("cancelled"),
+            "unexpected error message: {error}"
+        );
+
+        let stats = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("probe stats() must succeed");
+        let stats: Value = serde_json::from_str(&stats).expect("probe response is JSON");
+        assert_eq!(
+            stats["results"][0]["result"]["entities"], 0,
+            "cancellation before save_to dispatch must mean no entity was ever \
+             created: {stats}"
+        );
+    }
+
+    /// `tokio::select!` is unbiased: when a forward seam sets the
+    /// cancellation flag itself and then resolves to `None` in the same
+    /// poll, the task-result arm can win the select exactly as often as the
+    /// cancellation arm (both branches become ready together). The old code
+    /// only refused local fallback when the cancellation *arm* had won
+    /// (`cancelled_during_forward`); this loops enough attempts to land the
+    /// task-result-arm outcome at least once and asserts every attempt
+    /// refuses regardless of which arm actually won, so the fix does not
+    /// depend on getting lucky with the race.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn cancellation_visible_after_forward_returns_none_refuses_local_dispatch() {
+        thread_local! {
+            static CANCEL_TX: std::cell::RefCell<Option<tokio::sync::watch::Sender<bool>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn cancel_then_none_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            Box::pin(async move {
+                CANCEL_TX.with(|c| {
+                    c.borrow()
+                        .as_ref()
+                        .expect("cancel sender armed")
+                        .send(true)
+                        .expect("cancellation receiver still live")
+                });
+                None
+            })
+        }
+
+        for attempt in 0..50 {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string()],
+                ..RuntimeConfig::default()
+            })
+            .expect("in-memory runtime");
+            let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            CANCEL_TX.with(|c| *c.borrow_mut() = Some(cancel_tx));
+
+            let result = khive_storage::scope_request_read_cancellation(
+                cancel_rx,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "create(kind=\"entity\", entity_kind=\"concept\", \
+                              name=\"fix2337-none-race-probe\")"
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    cancel_then_none_forward,
+                ),
+            )
+            .await;
+
+            let error = result.expect_err(&format!(
+                "attempt {attempt}: cancellation visible after the forward returns None \
+                 must refuse local dispatch, not run it"
+            ));
+            assert_eq!(
+                error.data.as_ref().map(|d| d["outcome"].clone()),
+                Some(json!("not_dispatched")),
+                "attempt {attempt}: unexpected error data: {error:?}"
+            );
+
+            let stats = server
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("probe stats() must succeed");
+            let stats: Value = serde_json::from_str(&stats).expect("probe response is JSON");
+            assert_eq!(
+                stats["results"][0]["result"]["entities"], 0,
+                "attempt {attempt}: cancellation visible after None must mean no entity \
+                 was ever created: {stats}"
+            );
+        }
+    }
+
+    /// Once daemon forwarding is admitted, dropping the outer MCP handler
+    /// must detach rather than cancel the socket exchange. Otherwise the
+    /// daemon can commit while the bridge silently discards the only result.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dropping_handler_does_not_drop_an_admitted_forward() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_RELEASE: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+            static FORWARD_COMPLETED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        // Gated on explicit release/completion signals rather than sleeps:
+        // the forward only proceeds past admission once the test releases
+        // it (after aborting the outer handler), and completion is observed
+        // by waiting on a notification instead of hoping a fixed delay was
+        // long enough for the detached task to finish.
+        fn slow_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            let release = FORWARD_RELEASE
+                .with(|c| c.borrow().clone())
+                .expect("release notify armed");
+            let completed = FORWARD_COMPLETED
+                .with(|c| c.borrow().clone())
+                .expect("completed notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                completed.notify_one();
+                Some(Ok(json!({
+                    "results": [{"ok": true, "tool": "stats", "result": {}}],
+                    "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
+                    "status": "success"
+                })
+                .to_string()))
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+        FORWARD_RELEASE.with(|c| *c.borrow_mut() = Some(release.clone()));
+        FORWARD_COMPLETED.with(|c| *c.borrow_mut() = Some(completed.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let handler = tokio::spawn(async move {
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        ..Default::default()
+                    },
+                    slow_forward,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("forward never reached admission");
+        handler.abort();
+        let _ = handler.await;
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .expect("dropping the handler must not cancel an already-admitted daemon forward");
+    }
+
+    /// An admitted forward must not shield a cancelled request forever: if
+    /// the daemon (or the socket read underneath it) never answers, the
+    /// post-cancellation wait is bounded by the remaining time on the
+    /// request's own absolute deadline (captured at admission via
+    /// `scope_mcp_request_read_cancellation`'s `scope_request_read_deadline`
+    /// call), falling back to a fresh `request_read_timeout()` only when no
+    /// deadline was installed. Cancellation here arrives immediately after
+    /// admission, so the remaining time is nearly the full ceiling — this is
+    /// the control case; see
+    /// `admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a_fresh_ceiling`
+    /// for the case where only a sliver of the deadline is left. On expiry
+    /// the handler reports an outcome-unknown error rather than hanging. The
+    /// forward task itself is left running (never aborted), so this only
+    /// asserts the handler's own return, not the task's fate.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_that_never_resolves_reports_unknown_outcome_after_the_bound() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        let handler = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(
+                cancel_after_admission,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        request_id: Some(7777),
+                        ..Default::default()
+                    },
+                    never_resolves_forward,
+                ),
+            )
+            .await
+        });
+
+        started.notified().await;
+        cancellation.cancel();
+
+        let bound = request_read_timeout();
+        let result = tokio::time::timeout(bound.saturating_add(Duration::from_secs(5)), handler)
+            .await
+            .expect("handler never returned after the post-cancellation bound elapsed")
+            .expect("handler task must not panic");
+
+        let error =
+            result.expect_err("an admitted forward that never resolves must not hang forever");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(data["retryable"], false);
+        assert_eq!(
+            data["request_id"], 7777,
+            "unknown-outcome error must carry the request id: {data}"
+        );
+    }
+
+    /// A request cancelled a moment before its own absolute deadline must be
+    /// bounded by the remaining time to THAT deadline, not by a fresh
+    /// `request_read_timeout()` ceiling starting from the cancel. Before the
+    /// fix the post-cancellation wait always restarted a full
+    /// `request_read_timeout()` from the moment cancellation was observed,
+    /// so this test would only return after almost another full ceiling past
+    /// the point the clock was advanced to (i.e. close to
+    /// `2 * request_read_timeout()` total); after the fix it returns within
+    /// the small margin left on the original deadline.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_cancelled_near_deadline_bounds_by_remaining_time_not_a_fresh_ceiling()
+    {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_after_admission = cancellation.clone();
+        let handler = tokio::spawn(async move {
+            scope_mcp_request_read_cancellation(
+                cancel_after_admission,
+                server.request_with_forward(
+                    RequestParams {
+                        ops: "stats()".to_string(),
+                        request_id: Some(4242),
+                        ..Default::default()
+                    },
+                    never_resolves_forward,
+                ),
+            )
+            .await
+        });
+
+        started.notified().await;
+
+        // Advance the paused clock to shortly before the request's own
+        // absolute deadline before cancelling, so only a small margin of
+        // that deadline remains.
+        let bound = request_read_timeout();
+        let margin = Duration::from_millis(200);
+        tokio::time::advance(bound.saturating_sub(margin)).await;
+        cancellation.cancel();
+
+        let wait_started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(margin * 10, handler)
+            .await
+            .expect(
+                "handler did not return near the request's own deadline; it appears to have \
+                 restarted a fresh full ceiling instead of using the remaining time",
+            )
+            .expect("handler task must not panic");
+        let elapsed = tokio::time::Instant::now() - wait_started;
+
+        let error = result
+            .expect_err("an admitted forward that never resolves past its deadline must not hang");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(
+            data["request_id"], 4242,
+            "unknown-outcome error must carry the request id: {data}"
+        );
+        assert!(
+            elapsed < bound / 2,
+            "expected the post-cancellation wait to be bounded by the remaining time on the \
+             request's own deadline (~{margin:?}), not a fresh full ceiling of {bound:?}; \
+             observed elapsed {elapsed:?}"
+        );
+    }
+
+    /// Control for the fallback branch: `request_with_forward` called
+    /// without going through `scope_mcp_request_read_cancellation` (so no
+    /// absolute request deadline is ever installed — only a bare
+    /// cancellation receiver, via `khive_storage::scope_request_read_cancellation`
+    /// directly, as some callers do) must still bound the post-cancellation
+    /// wait by `request_read_timeout()` rather than hanging forever.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn admitted_forward_without_installed_deadline_falls_back_to_request_read_timeout() {
+        thread_local! {
+            static FORWARD_STARTED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn never_resolves_forward(
+            _frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
+        ) -> ForwardFuture {
+            let started = FORWARD_STARTED
+                .with(|c| c.borrow().clone())
+                .expect("started notify armed");
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("this forward seam must never resolve");
+            })
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        FORWARD_STARTED.with(|c| *c.borrow_mut() = Some(started.clone()));
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let handler = tokio::spawn(khive_storage::scope_request_read_cancellation(
+            cancel_rx,
+            async move {
+                server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: "stats()".to_string(),
+                            request_id: Some(9191),
+                            ..Default::default()
+                        },
+                        never_resolves_forward,
+                    )
+                    .await
+            },
+        ));
+
+        started.notified().await;
+        cancel_tx
+            .send(true)
+            .expect("cancellation receiver still live");
+
+        let bound = request_read_timeout();
+        let result = tokio::time::timeout(bound.saturating_add(Duration::from_secs(5)), handler)
+            .await
+            .expect("handler never returned after the fallback bound elapsed")
+            .expect("handler task must not panic");
+
+        let error =
+            result.expect_err("an admitted forward that never resolves must not hang forever");
+        let data = error
+            .data
+            .expect("unknown-outcome error must carry structured data");
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(
+            data["request_id"], 9191,
+            "unknown-outcome error must carry the request id: {data}"
+        );
+    }
+
     /// Adapter-boundary regression: `restricted_registry_pack_list_reaches_forward_seam`
     /// above proves the derivation site (`Some(resolved_packs)` in
     /// `request_with_forward`) folds the right pack list, but its `spy_forward`
@@ -4029,6 +6182,7 @@ mod tests {
     /// adapter's `packs.as_deref()` argument to `None` reddens this test.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn restricted_registry_pack_list_reaches_real_adapter_boundary() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
@@ -4044,6 +6198,7 @@ mod tests {
         crate::daemon::test_forward_seam::arm();
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4069,10 +6224,71 @@ mod tests {
         );
     }
 
+    /// `ensure_bridge_request_id` unit-tests the helper in isolation, but the
+    /// invariant "every admitted MCP request carries a bridge correlation
+    /// id" is actually established at `request_with_cancellation`, the real
+    /// production entry point. A test that only calls the helper directly
+    /// cannot prove that boundary applies it. This drives
+    /// `request_with_cancellation` itself and observes the `request_id` the
+    /// real daemon adapter boundary received, via the same
+    /// `test_forward_seam` hook `restricted_registry_pack_list_reaches_real_adapter_boundary`
+    /// above uses for the pack list.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn request_with_cancellation_stamps_bridge_id_at_the_real_adapter_boundary() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        crate::daemon::test_forward_seam::arm();
+        let without_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: None,
+            ..Default::default()
+        };
+        let result = server.request_with_cancellation(without_id).await;
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        let minted = crate::daemon::test_forward_seam::take_captured_request_id()
+            .expect("hook was armed and must have observed a call")
+            .expect("the bridge must mint a request id when the caller supplied none");
+        assert_ne!(minted, 0, "bridge-generated ids must be nonzero");
+
+        crate::daemon::test_forward_seam::arm();
+        let with_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(4242),
+            ..Default::default()
+        };
+        let result = server.request_with_cancellation(with_id).await;
+        assert!(
+            result.is_ok(),
+            "the intercepted dispatch through the real production entry point must \
+             succeed: {result:?}"
+        );
+        assert_eq!(
+            crate::daemon::test_forward_seam::take_captured_request_id(),
+            Some(Some(4242)),
+            "an explicit caller-supplied request id must reach the real adapter \
+             boundary unchanged"
+        );
+    }
+
     /// ADR-118's serving toggle is baked into a runtime. Opposite policies
     /// must never share one warm daemon even when every `RuntimeConfig` field
     /// is otherwise identical.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_ann_fresh_tail_policy_differs() {
         let config = RuntimeConfig::no_embeddings();
 
@@ -4083,11 +6299,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_id_separates_git_actor_resolver_and_fault_configuration() {
+        use khive_runtime::engine_config::GitWriteActorConfig;
+
+        let mut base = RuntimeConfig::no_embeddings();
+        base.git_write.actors.insert(
+            "example".to_string(),
+            GitWriteActorConfig {
+                name: "Example".to_string(),
+                email: "example@example.invalid".to_string(),
+                credential_ref: "example-reference".to_string(),
+                platform_identity: "example-login".to_string(),
+            },
+        );
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let original = fingerprint(&base);
+        for field in [
+            "name",
+            "email",
+            "credential_ref",
+            "platform_identity",
+            "actor",
+            "resolver",
+            "contract_faults",
+            "fault",
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "name" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .name
+                    .push('x'),
+                "email" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .email
+                    .push('x'),
+                "credential_ref" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .credential_ref
+                    .push('x'),
+                "platform_identity" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .platform_identity
+                    .push('x'),
+                "actor" => {
+                    changed.git_write.actors.clear();
+                }
+                "resolver" => changed.git_write.credential_resolver[0].push('x'),
+                "contract_faults" => changed.git_write.contract_faults = true,
+                "fault" => {
+                    changed.git_write.fault = Some("git.push:reply-lost-after-effect".to_string())
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(original, fingerprint(&changed), "changed {field}");
+        }
+        assert!(!original.contains("example-reference"));
+        assert_eq!(original, fingerprint(&base.clone()));
+    }
+
+    #[test]
+    fn config_id_separates_brain_read_policy_and_normalizes_reader_sets() {
+        let base = RuntimeConfig::no_embeddings();
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let mut configured = base.clone();
+        configured.brain.fleet_readers =
+            vec!["lambda:reader".to_string(), "lambda:auditor".to_string()];
+        let configured_id = fingerprint(&configured);
+        assert_ne!(configured_id, fingerprint(&base));
+        assert!(!configured_id.contains("lambda:reader"));
+        assert!(!configured_id.contains("lambda:auditor"));
+
+        let mut reordered = configured.clone();
+        reordered.brain.fleet_readers.reverse();
+        reordered
+            .brain
+            .fleet_readers
+            .push("lambda:reader".to_string());
+        assert_eq!(configured_id, fingerprint(&reordered));
+
+        let mut revoked = configured;
+        revoked.brain.fleet_readers.pop();
+        assert_ne!(configured_id, fingerprint(&revoked));
+        revoked.brain.fleet_readers.clear();
+        assert_eq!(fingerprint(&revoked), fingerprint(&base));
+    }
+
+    #[test]
+    fn config_id_differs_when_caller_enrollment_policy_differs() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+
+        assert_ne!(
+            compute_config_id_with_runtime_policies(&enrolled, None, true, false),
+            compute_config_id_with_runtime_policies(&revoked, None, true, false),
+            "different caller-enrollment policies must not share one warm daemon"
+        );
+    }
+
     /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
     /// PERSISTS the resulting instant, so a warm daemon reused across two
     /// runtimes differing only in that field writes an instant wrong by the
     /// offset between the zones. Identity must separate them.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_display_timezone_differs() {
         // One base, cloned, for the reason spelled out on the test below — and
         // it matters MORE here. This assertion is `assert_ne!`, so the shared
@@ -4097,10 +6439,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let utc = RuntimeConfig {
             display_timezone: "UTC".parse().expect("UTC is a known IANA zone"),
+            events_split: None,
             ..base.clone()
         };
         let new_york = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base
         };
 
@@ -4116,6 +6460,7 @@ mod tests {
     /// The other direction, so the assertion above cannot pass for an
     /// incidental reason: identical zones must still collapse to one identity.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_matches_when_display_timezone_matches() {
         // ONE base, cloned — not two constructor calls. `RuntimeConfig::default`
         // reads `HOME` to build `db_path`, and `db_path` is folded into the id,
@@ -4131,10 +6476,12 @@ mod tests {
         let base = RuntimeConfig::no_embeddings();
         let a = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base.clone()
         };
         let b = RuntimeConfig {
             display_timezone: "America/New_York".parse().expect("known IANA zone"),
+            events_split: None,
             ..base
         };
 
@@ -4146,6 +6493,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_treats_absent_and_explicit_default_blob_hydration_budget_as_equivalent() {
         use khive_runtime::engine_config::RuntimeSectionConfig;
         use khive_runtime::{runtime_config_from_khive_config, KhiveConfig};
@@ -4170,6 +6518,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_differs_when_resolved_blob_hydration_budget_differs() {
         let config = RuntimeConfig::no_embeddings();
         let mut changed = config.clone();
@@ -4213,13 +6562,38 @@ mod tests {
         const NAME: &'static str = "large-result-test";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
-            name: "large_result",
-            description: "returns a caller-sized test result",
-            visibility: khive_runtime::Visibility::Verb,
-            category: khive_runtime::VerbCategory::Assertive,
-            params: &[],
-        }];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "large_result",
+                description: "returns a caller-sized test result",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "large_write",
+                description: "returns a caller-sized test result for a state-changing verb",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "record_write",
+                description: "records a small committed write, for chain-ordering tests",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "memory.recall",
+                description: "test double matching the real memory.recall verb's name and \
+                               Assertive category, to exercise the qualified pack.verb name \
+                               through the real registry lookup",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
     }
 
     #[async_trait::async_trait]
@@ -4242,11 +6616,17 @@ mod tests {
 
         async fn dispatch(
             &self,
-            _verb: &str,
+            verb: &str,
             params: Value,
             _registry: &VerbRegistry,
             _token: &khive_runtime::NamespaceToken,
         ) -> Result<Value, RuntimeError> {
+            if verb == "record_write" {
+                return Ok(json!({
+                    "committed": true,
+                    "marker": params.get("marker").cloned().unwrap_or(Value::Null),
+                }));
+            }
             if let Some(bytes) = params
                 .get("table_bytes")
                 .and_then(Value::as_u64)
@@ -4358,6 +6738,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn canonical_request_deadline_wrapper_does_not_embed_dispatch_pipeline() {
         // Construct the generators on an explicitly roomy stack so this
         // regression reports their footprint instead of reproducing the LLVM
@@ -4425,6 +6806,7 @@ mod tests {
     // the canonical scope reached the database; the test below independently
     // pins absolute Tokio-deadline ordering.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4448,6 +6830,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
     async fn replay_dispatch_installs_the_default_request_read_deadline() {
         let server = slow_sql_read_test_server();
         let expected = request_read_timeout();
@@ -4472,6 +6855,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial(config_ledger)]
     async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
         let server = slow_sql_read_test_server();
         let outer = Duration::from_millis(50);
@@ -4521,6 +6905,7 @@ mod tests {
                 param_type: "string",
                 required: true,
                 description: "distinguishes reports in one request group",
+                resolution_mode: khive_types::IdResolutionMode::NotApplicable,
             }],
         }];
     }
@@ -4654,6 +7039,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
         assert_request_group_receipts(
             r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
@@ -4694,6 +7080,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
         let ops = vec![
             typed_test_op("update", json!({"id": "same-id", "name": "new"})),
@@ -4736,7 +7123,7 @@ mod tests {
             assert_eq!(serial_row["ok"], false);
             assert_eq!(serial_row["tool"], parallel_row["tool"]);
             assert_eq!(serial_row["error"], parallel_row["error"]);
-            assert!(serial_row["error"]
+            assert!(serial_row["error"]["message"]
                 .as_str()
                 .expect("conflict error")
                 .contains("writes overlap"));
@@ -4744,6 +7131,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
         let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
         let ops: Vec<TypedJsonOp> = (0..12)
@@ -4779,7 +7167,7 @@ mod tests {
         let first_serial_budget_error = serial_rows
             .iter()
             .position(|row| {
-                row["error"]
+                row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains("batch response budget"))
             })
@@ -4793,7 +7181,7 @@ mod tests {
             .all(|row| row["ok"] == json!(true)));
         assert!(serial_rows[first_serial_budget_error..].iter().all(|row| {
             row["ok"] == json!(false)
-                && row["error"]
+                && row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
         }));
@@ -4802,16 +7190,17 @@ mod tests {
             .as_array()
             .expect("parallel rows")
             .iter()
-            .find_map(|row| row["error"].as_str())
+            .find_map(|row| row["error"]["message"].as_str())
             .expect("parallel undispatched tail must use the same budget error");
         assert_eq!(
-            serial_rows[first_serial_budget_error]["error"],
+            serial_rows[first_serial_budget_error]["error"]["message"],
             json!(parallel_budget_error),
             "serial and default typed scheduling must single-source the budget/error contract"
         );
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_preserves_input_order() {
         let count = MAX_BATCH_CONCURRENCY + 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -4839,6 +7228,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_enforces_aggregate_response_budget() {
         assert_eq!(
             BATCH_RESPONSE_BUDGET_BYTES,
@@ -4911,7 +7301,9 @@ mod tests {
             .skip(10)
         {
             assert_eq!(entry["ok"], false);
-            let error = entry["error"].as_str().expect("budget error string");
+            let error = entry["error"]["message"]
+                .as_str()
+                .expect("budget error message");
             assert!(error.contains("batch response budget"));
             assert!(error.contains(&budget.to_string()));
         }
@@ -4920,6 +7312,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn save_to_writes_full_results_without_inline_response_budgeting() {
         let server = large_result_test_server();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4928,6 +7321,7 @@ mod tests {
         let response = server
             .dispatch_request_inner(
                 RequestParams {
+                    plan: None,
                     ops: format!(
                         "[large_result(bytes={result_bytes}), large_result(bytes={result_bytes})]"
                     ),
@@ -4964,11 +7358,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_returns_result_larger_than_daemon_frame() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!("large_result(bytes={result_bytes})"),
                 presentation: None,
                 presentation_per_op: None,
@@ -4993,7 +7389,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_dispatch_degrades_result_larger_than_frame() {
+    #[serial_test::serial(config_ledger)]
+    async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable() {
         let server = large_result_test_server();
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = dispatch_large_result_through_daemon(
@@ -5004,16 +7401,142 @@ mod tests {
         .await;
 
         let envelope: Value = serde_json::from_str(&response).expect("response envelope");
-        assert_eq!(envelope["results"][0]["ok"], true);
+        assert_eq!(envelope["results"][0]["ok"], false);
         assert!(envelope["results"][0].get("result").is_none());
-        assert!(envelope["results"][0].get("result_omitted").is_some());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // A frame-budget overflow is never a pace-and-retry condition —
+        // reissuing the identical request overflows identically — so
+        // `retryable` stays false even for a side-effect-free `Assertive`
+        // verb; `recoverable` carries the actual guidance.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "reduce_result_size"
+        );
+        assert!(envelope["results"][0].get("executed").is_none());
+        assert_eq!(envelope["summary"]["succeeded"], 0);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["status"], "partial");
         assert!(rendered_response_fits_daemon_frame(
             &response,
             &server.config_id
         ));
     }
 
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_side_effecting_assertive_verb_non_retryable_and_executed(
+    ) {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("memory.recall(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `memory.recall` is declared `Assertive`, but every dispatch
+        // schedules a persisted `brain.record_serve` write
+        // (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`); a lost response
+        // must not be advertised as safe to reissue, or a caller acting on
+        // that advice duplicates the serve-ledger write. This also proves
+        // the omission decision resolves a qualified `pack.verb` name
+        // (containing a `.`) through the same registry lookup as a bare
+        // verb name.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!("large_write(bytes={result_bytes})"),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert!(envelope["results"][0].get("result").is_none());
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        // `large_write` is Commissive: it already committed its change before
+        // the transport discovered the response was too large to return, so
+        // a caller must not be told it is safe to reissue the operation.
+        assert_eq!(envelope["results"][0]["error"]["retryable"], false);
+        assert_eq!(
+            envelope["results"][0]["error"]["recoverable"],
+            "read_outcome"
+        );
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert!(rendered_response_fits_daemon_frame(
+            &response,
+            &server.config_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_omission() {
+        let server = large_result_test_server();
+        let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
+        let response = dispatch_large_result_through_daemon(
+            &server,
+            format!(r#"large_write(bytes={result_bytes}) | record_write(marker="second")"#),
+            None,
+        )
+        .await;
+
+        let envelope: Value = serde_json::from_str(&response).expect("response envelope");
+        // The frame-budget decision is made at render time, after `run_parsed`
+        // has already dispatched every chain operation — `record_write` really
+        // ran and committed. Its entry must report that real outcome, not a
+        // fabricated `aborted: true`, even though the sibling entry before it
+        // is reported as failed.
+        assert_eq!(envelope["results"][0]["ok"], false);
+        assert_eq!(envelope["results"][0]["executed"], true);
+        assert_eq!(
+            envelope["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(envelope["results"][1]["ok"], true);
+        assert_eq!(envelope["results"][1]["tool"], "record_write");
+        assert!(envelope["results"][1].get("aborted").is_none());
+        assert_eq!(envelope["results"][1]["result"]["committed"], true);
+        assert_eq!(envelope["results"][1]["result"]["marker"], "second");
+        assert_eq!(envelope["summary"]["total"], 2);
+        assert_eq!(envelope["summary"]["succeeded"], 1);
+        assert_eq!(envelope["summary"]["failed"], 1);
+        assert_eq!(envelope["summary"]["aborted"], 0);
+        // `batch_status` only distinguishes success/partial; a frame-budget
+        // omission must not be reported as an abort trigger.
+        assert_eq!(envelope["status"], "partial");
+    }
+
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_read_only_audit_store();
@@ -5049,40 +7572,130 @@ mod tests {
         assert!(response["results"][2].get("advisories").is_none());
         assert!(response["results"][3].get("advisories").is_none());
 
-        let omitted = frame_budget_omission(&response["results"][0]);
+        let omitted = frame_budget_omission(&response["results"][0], &registry);
         assert!(
             omitted.get("advisories").is_some(),
             "frame-budget degradation must preserve the warning"
         );
     }
 
-    #[test]
-    fn frame_budget_omission_preserves_search_degradation_advisory() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "partial",
-            "partial": true,
-            "missing_backends": ["archive"],
-            "backend_errors": {
-                "archive": {
-                    "kind": "backend_error",
-                    "message": "storage unavailable"
-                }
-            },
-        }));
+    /// Registry carrying just the verb categories the `frame_budget_omission`
+    /// unit tests below need to resolve: `search` (Assertive, matches the KG
+    /// pack) and `create` (Commissive, matches the KG pack).
+    struct FrameBudgetCategoryTestPack;
 
-        assert_eq!(omitted["ok"], json!(true));
-        assert_eq!(omitted["status"], json!("partial"));
-        assert_eq!(omitted["partial"], json!(true));
-        assert_eq!(omitted["missing_backends"], json!(["archive"]));
+    impl khive_types::Pack for FrameBudgetCategoryTestPack {
+        const NAME: &'static str = "frame-budget-category-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
+            khive_runtime::HandlerDef {
+                name: "search",
+                description: "test double matching the KG pack's Assertive search category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            },
+            khive_runtime::HandlerDef {
+                name: "create",
+                description: "test double matching the KG pack's Commissive create category",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for FrameBudgetCategoryTestPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({}))
+        }
+    }
+
+    fn frame_budget_category_test_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(FrameBudgetCategoryTestPack);
+        builder
+            .build()
+            .expect("frame-budget category test registry")
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn frame_budget_omission_preserves_search_degradation_advisory() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "partial",
+                "partial": true,
+                "missing_backends": ["archive"],
+                "backend_errors": {
+                    "archive": {
+                        "kind": "backend_error",
+                        "message": "storage unavailable"
+                    }
+                },
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        // ADR-130 defines `status`/`partial`/`missing_backends`/`backend_errors`
+        // only on a successful search entry; once `ok` flips to false they no
+        // longer appear at the top level, but the diagnostic survives under
+        // `error.search`.
+        assert!(omitted.get("status").is_none());
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("missing_backends").is_none());
+        assert!(omitted.get("backend_errors").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("partial"));
+        assert_eq!(omitted["error"]["search"]["partial"], json!(true));
         assert_eq!(
-            omitted["backend_errors"]["archive"]["message"],
+            omitted["error"]["search"]["missing_backends"],
+            json!(["archive"])
+        );
+        assert_eq!(
+            omitted["error"]["search"]["backend_errors"]["archive"]["message"],
             json!("storage unavailable")
         );
         assert!(omitted.get("result").is_none());
-        assert!(omitted.get("result_omitted").is_some());
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+        // `search` is Assertive, but the kg pack's real handler schedules a
+        // best-effort `SearchExecuted` telemetry event on every dispatch
+        // with no dedup key (`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`),
+        // so a lost response must not be advertised as safe to reissue.
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+        assert_eq!(omitted["executed"], json!(true));
     }
 
     #[test]
@@ -5113,21 +7726,25 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_error_evidence_has_aggregate_budget_and_exact_key_parity() {
         fn degraded_result(reverse: bool) -> CoordSearchResult {
             let mut per_backend: Vec<crate::coordinator::BackendSearchResult> = (0
                 ..MAX_BACKEND_ERROR_ENTRIES + 9)
                 .map(|index| crate::coordinator::BackendSearchResult {
-                    backend_id: khive_runtime::BackendId::new(format!(
+                    backend_id: khive_runtime::BackendId::parse(format!(
                         "backend-{index:03}-{}",
                         "x".repeat(MAX_BACKEND_ERROR_KEY_CHARS)
-                    )),
+                    ))
+                    .expect("valid backend id"),
                     entity_hits: Vec::new(),
                     note_hits: Vec::new(),
+                    vector_selected: true,
                     error: Some(BackendSearchFailure::backend(format!(
                         "backend failure {index}: {}",
                         "\0\"\\".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS)
                     ))),
+                    vector_error: None,
                 })
                 .collect();
             if reverse {
@@ -5142,12 +7759,13 @@ mod tests {
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
+                note_versions: std::collections::HashMap::new(),
                 note_names: std::collections::HashMap::new(),
             }
         }
 
-        let forward = SearchDegradation::from_result(&degraded_result(false));
-        let reversed = SearchDegradation::from_result(&degraded_result(true));
+        let forward = SearchDegradation::from_result(&degraded_result(false), &json!([]));
+        let reversed = SearchDegradation::from_result(&degraded_result(true), &json!([]));
 
         assert!(!forward.backend_errors.is_empty());
         assert!(forward.backend_errors.len() <= MAX_BACKEND_ERROR_ENTRIES);
@@ -5192,23 +7810,67 @@ mod tests {
         );
     }
 
+    /// A populated `vector_error` is itself proof the vector arm was
+    /// selected and failed. `vector_selected` on the backend can be a
+    /// registry miss (stale/absent metadata) — it must never hide a
+    /// recorded vector-arm failure.
     #[test]
+    #[serial_test::serial(config_ledger)]
+    fn vector_error_reports_arm_failure_even_when_vector_selected_is_false() {
+        let result = CoordSearchResult {
+            entity_hits: Vec::new(),
+            note_hits: Vec::new(),
+            per_backend: vec![crate::coordinator::BackendSearchResult {
+                backend_id: khive_runtime::BackendId::parse("main").expect("valid backend id"),
+                entity_hits: Vec::new(),
+                note_hits: Vec::new(),
+                vector_selected: false,
+                error: None,
+                vector_error: Some("injected vector-arm failure".to_string()),
+            }],
+            partial: false,
+            entity_kinds: std::collections::HashMap::new(),
+            note_kinds: std::collections::HashMap::new(),
+            entity_created_at: std::collections::HashMap::new(),
+            note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
+            note_names: std::collections::HashMap::new(),
+        };
+
+        let degradation = SearchDegradation::from_result(&result, &json!([]));
+        let arm_participation = degradation
+            .arm_participation
+            .expect("arm participation must be computed");
+        assert_eq!(
+            arm_participation.vector.status,
+            SearchArmStatus::Error,
+            "a recorded vector_error must report the vector arm as failed \
+             regardless of the backend's vector_selected flag"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
     fn backend_id_credentials_are_absent_from_wire_and_warning() {
         let secret = format!("archive auth token sk_live_{}", "c".repeat(32));
         let result = CoordSearchResult {
             entity_hits: Vec::new(),
             note_hits: Vec::new(),
             per_backend: vec![crate::coordinator::BackendSearchResult {
-                backend_id: khive_runtime::BackendId::new(secret.clone()),
+                backend_id: khive_runtime::BackendId::parse(secret.clone())
+                    .expect("valid backend id"),
                 entity_hits: Vec::new(),
                 note_hits: Vec::new(),
+                vector_selected: true,
                 error: Some(BackendSearchFailure::backend("storage unavailable")),
+                vector_error: None,
             }],
             partial: true,
             entity_kinds: std::collections::HashMap::new(),
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
         let captured = SearchCapturedLog::default();
@@ -5218,7 +7880,7 @@ mod tests {
             .without_time()
             .finish();
         let degradation = tracing::subscriber::with_default(subscriber, || {
-            SearchDegradation::from_result(&result)
+            SearchDegradation::from_result(&result, &json!([]))
         });
         let wire = search_diagnostic_value(&degradation).to_string();
         let logs = captured.contents();
@@ -5348,29 +8010,57 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_complete_search_status() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": true,
-            "tool": "search",
-            "result": "oversized",
-            "status": "complete",
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "search",
+                "result": "oversized",
+                "status": "complete",
+                "arm_participation": {
+                    "text": {"status": "ran", "candidate_count": 0},
+                    "vector": {"status": "skipped", "candidate_count": 0}
+                },
+            }),
+            &registry,
+        );
 
-        assert_eq!(omitted["ok"], json!(true));
-        assert_eq!(omitted["status"], json!("complete"));
+        assert_eq!(omitted["ok"], json!(false));
+        assert!(omitted.get("status").is_none());
+        assert!(omitted.get("arm_participation").is_none());
         assert!(omitted.get("partial").is_none());
         assert!(omitted.get("result").is_none());
+        assert_eq!(omitted["error"]["search"]["status"], json!("complete"));
+        assert_eq!(
+            omitted["error"]["search"]["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            })
+        );
+        assert_eq!(
+            omitted["error"]["code"],
+            json!("response_frame_budget_exceeded")
+        );
     }
 
     /// ADR-130 §Compatibility: the `search_incomplete` error is small and
     /// typed — it must survive frame-budget omission untransformed, not
     /// collapse to the generic omitted-error string.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
+        let registry = frame_budget_category_test_registry();
         let error = json!({
             "kind": "search_incomplete",
             "message": "no-match was not established because selected backends failed",
             "retryable": false,
+            "arm_participation": {
+                "text": {"status": "error", "candidate_count": 0},
+                "vector": {"status": "error", "candidate_count": 0}
+            },
             "missing_backends": ["archive"],
             "backend_errors": {
                 "archive": {
@@ -5381,34 +8071,88 @@ mod tests {
             "backend_errors_truncated": true,
             "backend_errors_omitted": 2,
         });
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "search",
-            "error": error,
-        }));
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "search",
+                "error": error,
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(omitted["error"], error);
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn frame_budget_omission_still_collapses_other_large_errors() {
-        let omitted = frame_budget_omission(&json!({
-            "ok": false,
-            "tool": "create",
-            "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
-        }));
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": false,
+                "tool": "create",
+                "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
+            }),
+            &registry,
+        );
 
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(
             omitted["error"],
-            json!(
-                "operation failed; error details omitted because the response frame budget was exceeded"
-            )
+            json!({
+                "kind": "response_frame_budget_exceeded",
+                "code": "response_frame_budget_exceeded",
+                "message": "operation failed; error details omitted because the response frame budget was exceeded",
+                "domain_disposition": "unknown",
+                "max_frame_bytes": khive_runtime::daemon::MAX_FRAME_BYTES,
+                "retryable": false
+            })
         );
     }
 
+    #[test]
+    fn frame_budget_omission_marks_commissive_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "create",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+        assert_eq!(
+            omitted["error"]["kind"],
+            json!("response_frame_budget_exceeded")
+        );
+    }
+
+    #[test]
+    fn frame_budget_omission_marks_unknown_verb_non_retryable() {
+        let registry = frame_budget_category_test_registry();
+        let omitted = frame_budget_omission(
+            &json!({
+                "ok": true,
+                "tool": "some_future_unregistered_verb",
+                "result": "oversized",
+            }),
+            &registry,
+        );
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["executed"], json!(true));
+        assert_eq!(omitted["error"]["retryable"], json!(false));
+        assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
+    }
+
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
         let server = large_result_test_server();
         let row_bytes = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
@@ -5433,6 +8177,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn daemon_frame_fitting_preserves_reason_when_error_body_is_omitted() {
         let entry = json!({
             "ok": false,
@@ -5441,23 +8186,212 @@ mod tests {
             "reason": "gate-refusal",
         });
         let envelope = parallel_batch_envelope(vec![entry.clone()]);
+        let registry = frame_budget_category_test_registry();
         let fitted = fit_rendered_batch_envelope(
             envelope.as_object().expect("batch envelope object"),
             std::slice::from_ref(&entry),
             vec![entry.clone()],
             "test-config",
+            &registry,
         );
         let fitted = Value::Object(fitted);
 
         assert_eq!(fitted["results"][0]["ok"], false);
         assert_eq!(fitted["results"][0]["reason"], "gate-refusal");
-        assert!(fitted["results"][0]["error"]
+        assert!(fitted["results"][0]["error"]["message"]
             .as_str()
             .is_some_and(|error| error.contains("frame budget was exceeded")));
-        assert!(response_value_fits_daemon_frame(&fitted, "test-config"));
+        assert!(rendered_response_fits_daemon_frame(
+            &serialize_response_value(&fitted),
+            "test-config"
+        ));
+    }
+
+    /// `envelope_escaped_len` claims that a batch envelope's daemon-frame
+    /// length can be derived from `envelope_metadata_escaped_len` (the
+    /// envelope with `results: []`) plus each entry's own escaped length
+    /// plus separators, without ever re-serializing the populated envelope.
+    /// Check that claim by direct measurement across shapes that stress the
+    /// escaping (nested containers, quotes, backslashes, control characters).
+    #[test]
+    fn envelope_escaped_len_matches_direct_daemon_frame_serialization() {
+        let served_config_id = "escape-probe";
+        let shapes: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![json!({"ok": true, "tool": "t", "result": 1})],
+            (0..5)
+                .map(|i| json!({"ok": true, "tool": format!("t{i}"), "result": i}))
+                .collect(),
+            vec![
+                json!({
+                    "ok": true,
+                    "tool": "t",
+                    "result": {"nested": [1, 2, [3, 4], "a\"b\\c\nline\ttab\u{1}ctrl\u{7f}del"]},
+                }),
+                json!({
+                    "ok": false,
+                    "tool": "t2",
+                    "error": "quote \" backslash \\ newline \n unicode \u{1}",
+                }),
+            ],
+        ];
+
+        for results in shapes {
+            let entry_count = results.len();
+            let envelope = parallel_batch_envelope(results.clone());
+            let map = envelope.as_object().expect("batch envelope object");
+            let metadata = envelope_metadata(map);
+            let metadata_len = envelope_metadata_escaped_len(&metadata);
+            let entry_lens: Vec<usize> = results.iter().map(entry_escaped_len).collect();
+
+            let incremental = empty_rendered_daemon_frame_len(served_config_id)
+                + envelope_escaped_len(&entry_lens, metadata_len);
+            let direct = rendered_response_daemon_frame_len(
+                &serialize_response_value(&envelope),
+                served_config_id,
+            );
+            assert_eq!(
+                incremental, direct,
+                "shape with {entry_count} entries: incremental frame length must match \
+                 direct serialization"
+            );
+        }
+    }
+
+    /// Reproduces a defect found while writing this fixture: the pre-incremental
+    /// `fit_rendered_batch_envelope` computed `rendered_frame_bytes -
+    /// compact_frame_bytes` as a plain (eagerly evaluated) argument to
+    /// `bool::then_some`, so the subtraction ran unconditionally — including
+    /// when `compact_frame_bytes >= rendered_frame_bytes`, i.e. exactly the
+    /// case Agent JSON reduction introduces (canonical retains `full_id`/
+    /// `namespace` and so can be the larger side). That underflowed and
+    /// panicked in a debug/test build; in a release build (no overflow
+    /// checks) it wrapped to a huge value that would have sorted the
+    /// oversized canonical form to the FRONT of the fallback queue instead
+    /// of excluding it. This test fails loudly (panic) if that pattern comes
+    /// back, and separately asserts the entry is left untouched rather than
+    /// silently swapped.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn fit_rendered_batch_envelope_never_falls_back_when_compact_is_larger() {
+        let registry = frame_budget_category_test_registry();
+        let rendered_kept = Value::String("kept-rendered".to_string());
+        let compact_larger =
+            Value::String("kept-rendered-with-extra-canonical-metadata-suffix".to_string());
+        let oversized = Value::String("Z".repeat(9_000_000));
+
+        let compact_results = vec![
+            json!({"ok": true, "tool": "small-a", "result": compact_larger}),
+            json!({"ok": true, "tool": "big-b", "result": oversized.clone()}),
+        ];
+        let out_results = vec![
+            json!({"ok": true, "tool": "small-a", "result": rendered_kept.clone()}),
+            json!({"ok": true, "tool": "big-b", "result": oversized}),
+        ];
+        let envelope = parallel_batch_envelope(compact_results.clone());
+        let map = envelope.as_object().expect("batch envelope object");
+
+        let fitted = fit_rendered_batch_envelope(
+            map,
+            &compact_results,
+            out_results,
+            "compact-larger-probe",
+            &registry,
+        );
+        let fitted = Value::Object(fitted);
+
+        assert_eq!(
+            fitted["results"][0]["result"], rendered_kept,
+            "entry whose canonical form is larger than its rendered form must never fall back"
+        );
+        assert_eq!(fitted["results"][1]["ok"], false);
+        assert_eq!(
+            fitted["results"][1]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+    }
+
+    /// Snapshot equivalence: this fixture avoids any canonical-larger-than-
+    /// rendered entry (see the dedicated test above for that case, which the
+    /// pre-incremental code could not even run without panicking) so it can
+    /// be run unmodified against the pre-incremental `fit_rendered_batch_envelope`
+    /// for a baseline. Captured before the incremental rewrite:
+    ///
+    /// ```text
+    /// PROBE index=0 tool=big-a ok=Some(false) result_len=None error_kind=Some("response_frame_budget_exceeded")
+    /// PROBE index=1 tool=mid-b ok=Some(true) result_len=Some(2900000) error_kind=None
+    /// PROBE index=2 tool=small-c ok=Some(true) result_len=Some(5) error_kind=None
+    /// PROBE summary={"aborted":0,"failed":1,"succeeded":2,"total":3}
+    /// PROBE status="partial"
+    /// PROBE total_serialized_len=2900530
+    /// ```
+    ///
+    /// i.e. the modest compact-fallback saving on `big-a` (150,000 bytes)
+    /// isn't enough alone, `mid-b`'s fallback is applied, and `big-a` is the
+    /// one omitted afterward (largest current entry) — never `mid-b` or
+    /// `small-c`.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn fit_rendered_batch_envelope_matches_pre_incremental_behavior_for_fixed_fixture() {
+        let registry = frame_budget_category_test_registry();
+        let rendered0 = Value::String("A".repeat(6_000_000));
+        let compact0 = Value::String("A".repeat(5_900_000));
+        let rendered1 = Value::String("B".repeat(3_000_000));
+        let compact1 = Value::String("B".repeat(2_900_000));
+        let small = Value::String("small".to_string());
+
+        let compact_results = vec![
+            json!({"ok": true, "tool": "big-a", "result": compact0}),
+            json!({"ok": true, "tool": "mid-b", "result": compact1}),
+            json!({"ok": true, "tool": "small-c", "result": small.clone()}),
+        ];
+        let out_results = vec![
+            json!({"ok": true, "tool": "big-a", "result": rendered0}),
+            json!({"ok": true, "tool": "mid-b", "result": rendered1}),
+            json!({"ok": true, "tool": "small-c", "result": small}),
+        ];
+        let envelope = parallel_batch_envelope(compact_results.clone());
+        let map = envelope.as_object().expect("batch envelope object");
+
+        let fitted = fit_rendered_batch_envelope(
+            map,
+            &compact_results,
+            out_results,
+            "probe-config",
+            &registry,
+        );
+        let fitted = Value::Object(fitted);
+
+        assert_eq!(fitted["results"][0]["ok"], false);
+        assert_eq!(
+            fitted["results"][0]["error"]["kind"],
+            "response_frame_budget_exceeded"
+        );
+        assert_eq!(fitted["results"][1]["ok"], true);
+        assert_eq!(
+            fitted["results"][1]["result"].as_str().map(str::len),
+            Some(2_900_000)
+        );
+        assert_eq!(fitted["results"][2]["result"], json!("small"));
+        assert_eq!(
+            fitted["summary"],
+            json!({"total": 3, "succeeded": 2, "failed": 1, "aborted": 0})
+        );
+        assert_eq!(fitted["status"], "partial");
+        assert_eq!(
+            fitted["results"][0]["error"]["domain_disposition"],
+            "committed"
+        );
+        // A3 adds this one field to the historic byte snapshot; omission
+        // selection, remaining payloads, and aggregate counts stay identical.
+        assert_eq!(
+            serialized_response_len(&fitted),
+            2_900_530 + r#","domain_disposition":"committed""#.len()
+        );
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn auto_rendered_batch_stays_within_daemon_frame_cap() {
         // Auto renders a single record as compact JSON, so a lone object can
         // no longer balloon past its compact form (the kv-block renderer is
@@ -5519,6 +8453,7 @@ mod tests {
             ok: true,
             result: Some(rendered),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some("test".to_string()),
@@ -5535,6 +8470,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_op_error_does_not_abort_siblings() {
         let count = 5;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5571,6 +8507,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn bounded_batch_never_exceeds_concurrency_limit() {
         let count = MAX_BATCH_CONCURRENCY * 3;
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -5614,6 +8551,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn single_pack_verbs_unchanged() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5626,6 +8564,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn duplicate_verb_concatenates_descriptions_with_pack_attribution() {
         let catalog = build_verb_catalog([
             t("kg", "create", "Create an entity or note."),
@@ -5649,6 +8588,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn catalog_is_sorted_alphabetically() {
         let catalog = build_verb_catalog([
             t("kg", "search", "Search."),
@@ -5680,6 +8620,7 @@ mod tests {
     /// token's namespace identical, so the signal lands on the active slot
     /// instead of the cold-namespace queue.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
         let config = RuntimeConfig {
             db_path: None,
@@ -5737,6 +8678,7 @@ mod tests {
     /// fail without it (occupancy false; forged value survives) and pass
     /// with it restored.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn single_runtime_boot_installs_note_write_validator() {
         let config = RuntimeConfig {
             db_path: None,
@@ -5816,6 +8758,7 @@ mod tests {
     /// serving or writing the wrong project's data.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_backend_path() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -5838,6 +8781,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("./data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -5868,6 +8812,7 @@ mod tests {
     /// - read-only `/.../archive.db`
     /// - writable `/.../archive.db:read_only`
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5890,6 +8835,7 @@ mod tests {
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -5898,6 +8844,7 @@ mod tests {
                     path: Some(path),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only,
                 },
             ],
@@ -5905,6 +8852,7 @@ mod tests {
                 "knowledge".to_string(),
                 PackConfig {
                     backend: "archive".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5925,6 +8873,7 @@ mod tests {
     /// identity, avoiding an unnecessary one-time fallback/restart for the
     /// overwhelmingly common configuration shape.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
         use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
 
@@ -5943,12 +8892,14 @@ mod tests {
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             packs: std::collections::HashMap::from([(
                 "kg".to_string(),
                 PackConfig {
                     backend: "main".to_string(),
+                    no_embed: false,
                 },
             )]),
             ..KhiveConfig::default()
@@ -5966,6 +8917,151 @@ mod tests {
     }
 
     #[test]
+    fn config_id_differs_when_backend_served_kinds_differ() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig};
+        use khive_types::SubstrateKind;
+
+        let runtime = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |served_kinds| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                served_kinds,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let legacy = topology_for(None);
+        let entity_only = topology_for(Some(std::collections::BTreeSet::from([
+            SubstrateKind::Entity,
+        ])));
+        assert_ne!(
+            compute_config_id(&runtime, Some(&legacy)),
+            compute_config_id(&runtime, Some(&entity_only)),
+            "dispatch-shaping served-kind metadata must move daemon identity"
+        );
+    }
+
+    /// The legacy and escaped topology encodings in `encode_backend_topology`
+    /// each formatted their own `:serves=` suffix independently. Drive the
+    /// same served-kinds set through both branches (a name containing `:`
+    /// forces the escaped branch; a plain name keeps the legacy branch) and
+    /// assert they agree, now that both call the shared formatter.
+    #[test]
+    fn served_kinds_suffix_matches_between_legacy_and_escaped_topology_encodings() {
+        use khive_runtime::{BackendConfig, BackendKind, KhiveConfig};
+        use khive_types::SubstrateKind;
+
+        let served_kinds = Some(std::collections::BTreeSet::from([
+            SubstrateKind::Entity,
+            SubstrateKind::Note,
+        ]));
+        let base_backend = BackendConfig {
+            name: "main".to_string(),
+            kind: BackendKind::Memory,
+            path: None,
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: served_kinds.clone(),
+            read_only: false,
+        };
+
+        let legacy_topology = KhiveConfig {
+            backends: vec![base_backend.clone()],
+            ..KhiveConfig::default()
+        };
+        // A `:` in the name is reserved syntax, forcing the escaped
+        // (non-legacy-safe) encoding path instead.
+        let escaped_topology = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "ma:in".to_string(),
+                ..base_backend
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let legacy_encoded = encode_backend_topology(&legacy_topology);
+        let escaped_encoded = encode_backend_topology(&escaped_topology);
+
+        // `BTreeSet<SubstrateKind>` iterates in discriminant order (Note=0,
+        // Entity=1), so the joined suffix is "note+entity", not input order.
+        let expected_suffix = format_served_kinds_suffix(Some("note+entity"));
+        assert!(
+            legacy_encoded.contains(&expected_suffix),
+            "legacy topology encoding must carry the served-kinds suffix: {legacy_encoded}"
+        );
+        assert!(
+            escaped_encoded.contains(&expected_suffix),
+            "escaped topology encoding must carry the SAME served-kinds suffix as the \
+             legacy encoding, produced by the same formatter: {escaped_encoded}"
+        );
+    }
+
+    /// `no_embed` changes runtime behavior (that pack's runtime carries zero
+    /// embedders), so two configs differing only in it must not share a
+    /// `config_id` — a shared id would let a daemon serve a client whose
+    /// embedding policy it does not implement. Absent/false keeps the
+    /// pre-existing spelling so already-deployed configs keep their id.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn config_id_differs_when_pack_no_embed_differs() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("no_embed topology tempdir");
+        let main_path = dir.path().join("main.db");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["comm".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology_for = |no_embed: bool| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                served_kinds: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "main".to_string(),
+                    no_embed,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let with_flag = compute_config_id(&runtime, Some(&topology_for(true)));
+        let without_flag = compute_config_id(&runtime, Some(&topology_for(false)));
+        assert_ne!(
+            with_flag, without_flag,
+            "configs differing only in no_embed must not share a config_id"
+        );
+        assert!(
+            with_flag.contains("comm=main:no_embed"),
+            "no_embed must appear in the pack fingerprint; got {with_flag}"
+        );
+        assert!(
+            without_flag.contains("comm=main]"),
+            "absent no_embed keeps the legacy pack spelling; got {without_flag}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_separates_effective_read_only_storage_modes() {
         use khive_runtime::{BackendId, BackendKind, KhiveConfig, Namespace};
 
@@ -5999,6 +9095,7 @@ mod tests {
                 path: runtime.db_path.clone(),
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -6019,6 +9116,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn config_id_auto_detects_chmod_read_only_single_backend() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6052,6 +9150,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn runtime_owned_config_id_keeps_captured_writable_mode_after_post_open_chmod() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6118,6 +9217,7 @@ mod tests {
     /// project serve requests meant for the other's database.
     #[test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     fn config_id_does_not_collide_across_projects_with_same_relative_db_override() {
         use khive_runtime::Namespace;
 
@@ -6343,6 +9443,16 @@ mod tests {
             degradation: SearchDegradation {
                 status: Some(SearchStatus::Partial),
                 retryable: false,
+                arm_participation: Some(SearchArmParticipation {
+                    text: SearchArmEvidence {
+                        status: SearchArmStatus::Error,
+                        candidate_count: 1,
+                    },
+                    vector: SearchArmEvidence {
+                        status: SearchArmStatus::Error,
+                        candidate_count: 0,
+                    },
+                }),
                 missing_backends: vec!["archive".to_string()],
                 backend_errors: BTreeMap::from([(
                     "archive".to_string(),
@@ -6376,6 +9486,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn chain_with_deep_accumulated_prev_result_errors_cleanly() {
         // Real end-to-end reproduction: chain N `create` ops where each step's
         // `properties.inner` embeds the previous op's full `properties` via
@@ -6454,6 +9565,7 @@ mod tests {
     // ── request-boundary regression: raw controls survive wire decoding ─────
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_boundary_raw_control_bytes_reach_handler() {
         // Simulates the actual MCP wire: a JSON-RPC client sends the tool's
         // `ops` argument as a JSON string using the standard JSON `\n`
@@ -6551,6 +9663,7 @@ mod tests {
     /// the caller supplied none.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn wire_daemon_frame_forwards_request_id() {
         let server = make_daemon_save_to_test_server();
 
@@ -6600,6 +9713,7 @@ mod tests {
     /// daemon-forward path.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         std::env::set_var("KHIVE_NO_DAEMON", "1");
@@ -6608,11 +9722,11 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    // Explicit `namespace="local"` so the write lands in the
+                    // Explicit `namespace="test"` so the write lands in the
                     // same namespace the server's audit `EventStore` handle is
-                    // scoped to at construction (`Namespace::local()`), matching
+                    // scoped to at construction, matching
                     // `find_audit_event_with_request_id`'s read scope.
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     request_id: Some(9001),
                     ..Default::default()
                 }),
@@ -6639,6 +9753,7 @@ mod tests {
     /// survives that path too.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6649,7 +9764,7 @@ mod tests {
         server
             .request(
                 Parameters(RequestParams {
-                    ops: "stats(namespace=\"local\")".to_string(),
+                    ops: "stats(namespace=\"test\")".to_string(),
                     save_to: Some(sink_path.to_string_lossy().to_string()),
                     request_id: Some(9002),
                     ..Default::default()
@@ -6698,6 +9813,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6721,6 +9837,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "stats()".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -6763,6 +9880,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_parse_error_stays_typed_with_warm_daemon_available() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6830,6 +9948,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6863,6 +9982,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -6877,6 +9997,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -6907,6 +10028,7 @@ mod tests {
 
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -6946,6 +10068,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
@@ -6972,6 +10095,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -6986,7 +10110,9 @@ mod tests {
         fn assert_fallback_error(entry: &Value, tool: &str) {
             assert_eq!(entry["ok"], json!(false), "entry: {entry}");
             assert_eq!(entry["tool"], json!(tool), "entry: {entry}");
-            let msg = entry["error"].as_str().expect("error must be a string");
+            let msg = entry["error"]["message"]
+                .as_str()
+                .expect("error must carry its message");
             assert!(
                 msg.contains("KHIVE_DAEMON_STRICT"),
                 "error must name the strict mode that rejected the fallback: {msg}"
@@ -7005,6 +10131,7 @@ mod tests {
         let single_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -7033,6 +10160,7 @@ mod tests {
         let batch_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
                        comm.send(to=\"bob\", content=\"strict-batch-2\")]"
                         .to_string(),
@@ -7063,6 +10191,7 @@ mod tests {
         let chain_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
                       comm.send(to=\"bob\", content=\"strict-chain-2\")"
                         .to_string(),
@@ -7084,7 +10213,7 @@ mod tests {
         assert_fallback_error(&chain_results[0], "comm.send");
         assert_eq!(
             chain_results[1],
-            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+            json!({ "ok": false, "tool": "comm.send", "aborted": true, "domain_disposition":"not_committed" })
         );
         assert_eq!(
             chain["summary"],
@@ -7094,6 +10223,7 @@ mod tests {
         // ── no local dispatch ever happened for any of the three calls ─────
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -7135,12 +10265,14 @@ mod tests {
     /// genuine no-match and a populated result — with no possible "partial"
     /// state for a lone backend. Other verbs must not gain a `status` field.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn single_backend_search_reports_status_complete() {
         let server = in_memory_kg_server();
 
         let resp = server
             .dispatch_request_local(RequestParams {
-                ops: r#"search(kind="entity", query="nothing here")"#.to_string(),
+                plan: None,
+                ops: r#"search(kind="entity", query="a deliberately long keyword dense query whose terms cannot all match any entity in this empty corpus")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -7155,6 +10287,14 @@ mod tests {
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
         assert_eq!(search["result"], json!([]));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 0},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            }),
+            "a dense zero-hit query must prove that text ran without a match"
+        );
         assert!(search.get("partial").is_none());
 
         // Chain (`|`), not a parallel batch: `search` must observe the
@@ -7162,6 +10302,7 @@ mod tests {
         // guarantee (bounded-concurrency ops have no relative ordering).
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"kg-search-status\") \
                        | search(kind=\"entity\", query=\"kg-search-status\")"
                     .to_string(),
@@ -7183,6 +10324,14 @@ mod tests {
         );
         assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
         assert_eq!(search["status"], json!("complete"));
+        assert_eq!(
+            search["arm_participation"],
+            json!({
+                "text": {"status": "ran", "candidate_count": 1},
+                "vector": {"status": "skipped", "candidate_count": 0}
+            }),
+            "an exact-name presence check must expose its text-arm evidence"
+        );
         assert!(
             search["result"]
                 .as_array()
@@ -7210,10 +10359,163 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn scheduled_replay_reads_its_own_actor_namespace_and_never_the_daemons_visibility() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory replay runtime");
+        let server = KhiveMcpServer::new(runtime).expect("replay server");
+
+        for actor_id in [Some("lambda:scheduled-replay"), None] {
+            let verified_actor = actor_id
+                .map(|actor| khive_runtime::VerifiedActor::new(actor).expect("verified creator"));
+            let raw = server
+                .dispatch_request_replay_as(
+                    RequestParams {
+                        ops: "whoami()".to_string(),
+                        presentation: Some("verbose".to_string()),
+                        format: Some("json".to_string()),
+                        ..Default::default()
+                    },
+                    "local",
+                    verified_actor,
+                )
+                .await
+                .expect("scheduled replay dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("replay JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            let identity = &envelope["results"][0]["result"];
+            assert_eq!(identity["actor_id"], actor_id.unwrap_or("local"));
+            assert_eq!(
+                identity["actor_kind"],
+                if actor_id.is_some() {
+                    "actor"
+                } else {
+                    "anonymous"
+                }
+            );
+            assert_eq!(identity["unattributed"], actor_id.is_none());
+            assert_eq!(identity["namespace"], "local");
+            // A replay reads exactly what its verified actor reads on every
+            // other path: `local` plus the actor's own namespace (ADR-007 Rev 4
+            // Rule 3b, folded where the token is minted), and nothing from the
+            // daemon's configured visibility. An anonymous replay keeps `local`.
+            let expected = match actor_id {
+                Some(actor) => json!(["local", actor]),
+                None => json!(["local"]),
+            };
+            assert_eq!(
+                identity["visible_namespaces"],
+                expected,
+                "replay inherits its own actor namespace and never the daemon's visibility: {identity}"
+            );
+            assert!(
+                !identity["visible_namespaces"]
+                    .as_array()
+                    .map(|v| v.iter().any(|ns| ns == "daemon-visible"))
+                    .unwrap_or(true),
+                "daemon visibility leaked into a scheduled replay: {identity}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue_2427_coordinator_search_consumes_normalized_identity_visibility() {
+        use crate::coordinator::tests::MockCoordinator;
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory coordinator runtime");
+        let coordinator = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::new(runtime)
+            .expect("coordinator server")
+            .with_coordinator(Arc::clone(&coordinator) as Arc<dyn CoordinatorService>);
+
+        // Supply the boundary's normalized output directly; daemon-frame parsing
+        // and transport coverage belong to the daemon tests, not this fixture.
+        for (visible, explicit_namespace, mut expected) in [
+            (
+                vec!["lambda:request-actor", "client-visible"],
+                false,
+                vec!["lambda:request-actor", "client-visible", "local"],
+            ),
+            (vec![], false, vec!["local"]),
+            // A reconstructed token carrying an explicit list is consumed as
+            // given: the coordinator adds `local` and nothing else, so neither
+            // the request actor's own namespace nor the daemon's configured
+            // visibility is folded in behind the caller's back.
+            (
+                vec!["client-visible"],
+                false,
+                vec!["client-visible", "local"],
+            ),
+            (vec!["lambda:request-actor", "client-visible"], true, vec![]),
+        ] {
+            let mut identity = request_identity_with_visible_namespaces(visible);
+            identity.actor_id = Some("lambda:request-actor".to_string());
+            let ops = if explicit_namespace {
+                r#"search(kind="entity", query="visibility", namespace="chosen")"#
+            } else {
+                r#"search(kind="entity", query="visibility")"#
+            };
+            coordinator.search_called.store(false, Ordering::SeqCst);
+            let raw = server
+                .dispatch_request_inner(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                    Some(identity),
+                    DispatchOrigin::Local,
+                )
+                .await
+                .expect("coordinator dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("coordinator JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            assert!(
+                coordinator.search_called.load(Ordering::SeqCst),
+                "search must reach the coordinator, not the single-backend registry"
+            );
+            let mut actual: Vec<String> = coordinator
+                .last_extra_visible
+                .lock()
+                .expect("captured coordinator visibility")
+                .iter()
+                .map(|namespace| namespace.as_str().to_string())
+                .collect();
+            actual.sort();
+            expected.sort();
+            assert_eq!(
+                actual, expected,
+                "coordinator must consume supplied visibility without widening internal identities"
+            );
+        }
+    }
+
     /// No per-request identity: falls back to the registry's operator-baked
     /// `visible_namespaces`, widened with `local` — mirrors the normal
     /// registry dispatch path's default-case widening.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_registry_defaults_when_no_identity() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7234,6 +10536,7 @@ mod tests {
     /// baked defaults entirely (ADR-096 Fork 1) — the registry's "tenant-a"
     /// must NOT leak into a request identity scoped to "tenant-b" only.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_widens_to_identity_visible_namespaces() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7265,6 +10568,7 @@ mod tests {
     /// the caller's full `visible_namespaces` set, silently overriding the
     /// caller's intended narrowing.
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn coordinator_search_visibility_narrows_to_empty_when_namespace_explicit() {
         let registry =
             registry_with_visible_namespaces(vec![
@@ -7284,6 +10588,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unknown_verb_with_invalid_namespace_is_not_classified_as_verb_refused() {
         let server = in_memory_kg_server();
         let response = server
@@ -7295,7 +10600,7 @@ mod tests {
             .expect("dispatch failures remain in the per-operation envelope");
         let response: Value = serde_json::from_str(&response).expect("response envelope");
         assert!(
-            response["results"][0]["error"]
+            response["results"][0]["error"]["message"]
                 .as_str()
                 .is_some_and(|error| error.contains("invalid namespace")),
             "unexpected error: {response}"
@@ -7307,10 +10612,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_success_when_every_op_in_batch_succeeds() {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-1\"), \
                        create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-2\")]"
                     .to_string(),
@@ -7332,11 +10639,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_batch_op_fails() {
         let server = in_memory_kg_server();
         // The second op targets an unknown kind and fails; the first succeeds.
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops:
                     "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-partial-1\"), \
                        search(kind=\"not_a_real_kind\", query=\"x\")]"
@@ -7362,10 +10671,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn request_status_is_partial_when_a_chain_op_is_aborted() {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "search(kind=\"not_a_real_kind\", query=\"x\") | \
                       create(kind=\"entity\", entity_kind=\"concept\", name=\"status-chain-aborted\")"
                     .to_string(),
@@ -7423,6 +10734,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stdio_eof_cancels_root_and_request_read_before_rmcp_drain() {
         use rmcp::transport::async_rw::AsyncRwTransport;
         use tokio::io::AsyncWriteExt;
@@ -7436,9 +10748,12 @@ mod request_read_cancellation_tests {
         let root = tokio_util::sync::CancellationToken::new();
         let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
         let (read, write) = tokio::io::split(server_io);
-        let transport = crate::transport::CancelOnEofTransport::new(
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
             AsyncRwTransport::new_server(read, write),
             root.clone(),
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
         );
         let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
 
@@ -7474,7 +10789,447 @@ mod request_read_cancellation_tests {
         );
     }
 
+    /// An idle stdio bridge — pipe still open, no request sent — must
+    /// be reaped the same way a real EOF is, not held open indefinitely.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_idle_timeout_cancels_root_without_eof() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let probe = EofProbeServer {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            Some(Duration::from_millis(50)),
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        // Deliberately never write anything and never drop `client_io`: the
+        // pipe stays open exactly like an abandoned bridge's client — this
+        // must still be reaped once the idle timeout elapses.
+        // Observe the cancellation BEFORE consuming the service, and it has to
+        // be in this order. `RunningService` holds a `dg: DropGuard`
+        // (rmcp 1.8.0, `src/service.rs:712`) and `waiting(mut self)` consumes
+        // `self`, so the guard cancels this very token as `waiting` returns
+        // whatever the transport did. Asserting `root.is_cancelled()` after
+        // that await therefore passes even with the adapter's cancel deleted:
+        // it measures rmcp's drop guard, not the idle path. Awaiting
+        // `root.cancelled()` while the service is still alive is the only
+        // ordering that can tell the two apart.
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("idle timeout must cancel the exact root token passed into rmcp");
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), running.waiting())
+            .await
+            .expect("idle timeout never closed the session")
+            .expect("rmcp service task panicked");
+        assert!(
+            matches!(
+                reason,
+                rmcp::service::QuitReason::Closed | rmcp::service::QuitReason::Cancelled
+            ),
+            "unexpected rmcp quit reason after idle timeout: {reason:?}"
+        );
+        drop(client_io);
+    }
+
+    #[derive(Clone)]
+    struct SlowProbeServer {
+        started: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl rmcp::ServerHandler for SlowProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let started = self.started.clone();
+            let delay = self.delay;
+            async move {
+                started.notify_one();
+                tokio::time::sleep(delay).await;
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Regression: two outstanding obligations under one request id are
+    /// refused, not resolved by guessing.
+    ///
+    /// Retirement matches on request id, so two live entries sharing an id
+    /// make it ambiguous which one a completing response discharges — and both
+    /// resolutions are wrong in opposite directions. Removing the first match
+    /// can leave a *completed* request's instant as the newest entry, so the
+    /// freshness check defers past the older obligation's TTL: the unbounded
+    /// session this whole mechanism exists to close. Removing the last match
+    /// can leave the older instant, so the session closes out from under a
+    /// live handler. The transport cannot tell the two apart, so it refuses
+    /// the second admission instead.
+    ///
+    /// Idle reaping is off and the pipe is deliberately never closed, so the
+    /// refusal is the only thing that can end this session. A build that
+    /// admitted the duplicate would leave `root` uncancelled and this test
+    /// would exhaust its bound.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_refuses_a_second_outstanding_obligation_under_one_request_id() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(Duration::from_secs(3600)),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        // Premise: id 1 is genuinely still outstanding. Without this the second
+        // request would just be a reuse after retirement, which is legitimate
+        // and not what this test is about.
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            1,
+            "fixture premise: the first request must still be outstanding when the duplicate \
+             arrives, otherwise nothing is ambiguous"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the duplicate-id request");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "a second outstanding obligation under an id that already has one must close the \
+             session; admitting it leaves retirement to pick an entry arbitrarily, which \
+             corrupts the freshness check in one direction or the other"
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: an id whose obligation has gone STALE is still a duplicate.
+    ///
+    /// Staleness is a statement about the freshness check, not about the
+    /// handler: rmcp keeps a spawned handler alive independently of this
+    /// receive loop, so an entry past its TTL routinely names a request that
+    /// is still running and has simply not answered yet. If the staleness drop
+    /// runs before the duplicate scan, that entry is gone by the time the scan
+    /// looks, the reused id is admitted as a fresh obligation, and the first of
+    /// the two eventual responses retires the NEW entry by id match — leaving
+    /// the older live handler untracked and the idle branch free to close out
+    /// from under it. Scanning before pruning refuses the reuse instead.
+    ///
+    /// This is the arm the earlier ordering passed: the plain duplicate test
+    /// above uses an hour-long TTL, so its entry is never stale and the two
+    /// orderings are indistinguishable there.
+    ///
+    /// Idle reaping is off and the pipe is never closed, so the refusal is the
+    /// only thing that can end this session.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_refuses_a_reused_id_whose_obligation_is_already_stale() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+
+        let first_admitted = Arc::new(tokio::sync::Notify::new());
+        let probe = OutOfOrderProbeServer {
+            first_admitted: first_admitted.clone(),
+            // Parks forever on the first call: the handler outlives its TTL.
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // No idle timer: only the duplicate-id refusal can close this.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+        let (_client_read, mut client_write) = tokio::io::split(client_io);
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+                        \"params\":{\"name\":\"probe\",\"arguments\":{}}}\n";
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the first request");
+        tokio::time::timeout(Duration::from_secs(2), first_admitted.notified())
+            .await
+            .expect("rmcp never admitted the first request");
+
+        tokio::time::sleep(OBLIGATION_TTL * 3).await;
+
+        // Premise, asserted rather than assumed: the entry is still in the
+        // queue AND the transport's own freshness rule already calls it stale.
+        // Both halves matter — a test that only slept would pass against a
+        // build that pruned the entry, since an empty queue also admits the
+        // reuse without closing, which is the very defect under test.
+        {
+            let queue = obligations.lock().expect("obligation queue poisoned");
+            let (id, admitted_at) = queue
+                .front()
+                .expect(
+                    "fixture premise: the unanswered obligation must still be queued when the \
+                     reused id arrives; an empty queue means something pruned it and this test \
+                     can no longer distinguish the orderings",
+                )
+                .clone();
+            assert_eq!(
+                id,
+                rmcp::model::NumberOrString::Number(1),
+                "fixture premise: the queued entry must be the request under test"
+            );
+            assert!(
+                admitted_at.elapsed() >= OBLIGATION_TTL,
+                "fixture premise: the entry must already be STALE by the transport's own rule, \
+                 otherwise this is just the plain duplicate case"
+            );
+        }
+        assert!(
+            !root.is_cancelled(),
+            "fixture premise: a single outstanding request must not have closed the session"
+        );
+
+        client_write
+            .write_all(request)
+            .await
+            .expect("write the request reusing the stale id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            root.is_cancelled(),
+            "reusing an id whose obligation is stale but whose handler is still alive must close \
+             the session. Admitting it lets the first response retire the wrong entry, which \
+             leaves a live handler untracked and the idle close free to fire under it."
+        );
+
+        drop(client_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: the obligation queue must not grow without bound.
+    ///
+    /// Retirement is keyed by request id, so it only ever removes the entry
+    /// whose response was actually written. A request that never produces one
+    /// — a handler that panics, a request the peer cancels — leaves its entry
+    /// behind. Under the earlier oldest-first retirement any completion
+    /// removed *some* entry, so the queue tracked admissions minus
+    /// completions; keying by id means an unanswered request now holds its
+    /// slot for the life of the session unless something drops it.
+    ///
+    /// Nothing here waits on the idle timer: it is disabled, so the only thing
+    /// that can bound this queue is the staleness drop.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_obligation_queue_drops_entries_past_their_ttl() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const OBLIGATION_TTL: Duration = Duration::from_millis(100);
+        // Longer than the TTL, so every earlier admission is already stale by
+        // the time the next one arrives and the queue can never hold two.
+        const ADMISSION_GAP: Duration = Duration::from_millis(150);
+        const ADMISSIONS: u32 = 4;
+
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            // Never answers, so nothing is ever retired by id.
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            // Idle reaping off: this test is about the queue, not the timer.
+            None,
+            None,
+            Some(OBLIGATION_TTL),
+        );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=ADMISSIONS {
+            client_io
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\
+                         \"params\":{{\"name\":\"probe\",\"arguments\":{{}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            tokio::time::sleep(ADMISSION_GAP).await;
+        }
+
+        let outstanding = obligations.lock().expect("obligation queue poisoned").len();
+        assert!(
+            outstanding <= 1,
+            "an unanswered request must not hold its obligation slot past the TTL: after \
+             {ADMISSIONS} admissions spaced {}ms apart against a {}ms TTL the queue holds \
+             {outstanding} entries. Without the staleness drop it would hold {ADMISSIONS}, one \
+             per admission, and would keep growing for as long as the session lives.",
+            ADMISSION_GAP.as_millis(),
+            OBLIGATION_TTL.as_millis(),
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Regression: a peer that keeps sending requests without consuming
+    /// responses cannot make the transport's outstanding state grow without
+    /// limit. The third request is rejected before rmcp can spawn its handler.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stdio_closes_when_outstanding_request_limit_is_reached() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::AsyncWriteExt;
+
+        const MAX_OUTSTANDING: usize = 2;
+        let probe = SlowProbeServer {
+            started: Arc::new(tokio::sync::Notify::new()),
+            delay: Duration::from_secs(3600),
+        };
+        let root = tokio_util::sync::CancellationToken::new();
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let transport =
+            crate::transport::CancelOnEofTransport::with_idle_timeout_and_max_outstanding(
+                AsyncRwTransport::new_server(server_read, server_write),
+                root.clone(),
+                None,
+                None,
+                Some(Duration::from_secs(3600)),
+                MAX_OUTSTANDING,
+            );
+        let obligations = transport.in_flight_handle();
+        let running = rmcp::service::serve_directly_with_ct(probe, transport, None, root.clone());
+
+        for id in 1..=MAX_OUTSTANDING + 1 {
+            let request = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": "probe", "arguments": {}}
+                })
+            );
+            client_io
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), root.cancelled())
+            .await
+            .expect("the transport must close after reaching its admission limit");
+        assert_eq!(
+            obligations.lock().expect("obligation queue poisoned").len(),
+            MAX_OUTSTANDING,
+            "the rejected request must not enter the outstanding tracker"
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(2), running.waiting()).await;
+    }
+
+    /// Parks forever on the first call and answers every later one promptly,
+    /// so a test can produce out-of-order response completion: the request
+    /// admitted first stays outstanding while a later one completes.
+    #[derive(Clone)]
+    struct OutOfOrderProbeServer {
+        first_admitted: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for OutOfOrderProbeServer {
+        fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<rmcp::model::CallToolResult, McpError>> + Send + '_
+        {
+            let first_admitted = self.first_admitted.clone();
+            let calls = self.calls.clone();
+            async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    first_admitted.notify_one();
+                    // Never answers. This is the older obligation, and it is
+                    // the one whose TTL must govern when the session closes.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(rmcp::model::CallToolResult::success(Vec::new()))
+            }
+        }
+    }
+
+    /// Distinguishes handler behavior by tool name: `"slow"` blocks for
+    /// `slow_delay` (keeping `in_flight` above zero across several idle
+    /// windows), `"quick"` (or anything else) completes immediately — used
+    /// to admit a second request while the first is still running.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn rmcp_cancellation_token_reaches_request_read_scope() {
         let token = tokio_util::sync::CancellationToken::new();
         let token_for_scope = token.clone();
@@ -7496,6 +11251,7 @@ mod request_read_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn already_cancelled_rmcp_token_is_visible_without_yielding() {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
@@ -7513,6 +11269,7 @@ mod request_read_cancellation_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn request_tool_path_honors_an_already_cancelled_rmcp_token() {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -7556,4 +11313,490 @@ mod request_read_cancellation_tests {
             }
         }
     }
+
+    // ── KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must not disable the bound ──
+
+    /// The response-delivery deadline used to treat `0` as "disable
+    /// the bound", mirroring `KHIVE_BRIDGE_IDLE_TIMEOUT_SECS=0`. Unlike the
+    /// idle timeout, an unbounded response-delivery deadline restores the
+    /// exact defect this deadline exists to close (a peer that admits a
+    /// request and stops reading pins the bridge's response write forever)
+    /// — so `0` is now a hard startup error instead of a supported opt-out.
+    #[test]
+    #[serial_test::serial]
+    fn response_deadline_from_env_rejects_zero() {
+        std::env::set_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS", "0");
+        let result = stdio_bridge_response_deadline_from_env();
+        std::env::remove_var("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS");
+
+        let error = result.expect_err(
+            "KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS=0 must be rejected, not silently accepted \
+             as \"disable the bound\"",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS"),
+            "error must name the offending variable: {rendered}"
+        );
+        assert!(
+            rendered.contains("=0"),
+            "error must name the rejected value: {rendered}"
+        );
+        assert!(
+            rendered.contains("1..=u64::MAX"),
+            "error must state the accepted range: {rendered}"
+        );
+    }
+
+    /// The response-delivery deadline had no test that ever let it elapse:
+    /// the only coverage rejected `0` at startup, which exercises the parser
+    /// and not the bound. A bound whose expiry is never observed is a claim,
+    /// so this drives a real write against a peer that has stopped reading.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_past_its_deadline_is_abandoned_and_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // A 16-byte pipe that nobody reads. `_client_io` is held, not dropped,
+        // so this is a peer that is present and simply not reading — the case
+        // the deadline exists for. Dropping it would produce a broken pipe
+        // instead, which is a different failure and already handled.
+        let (server_io, _client_io) = tokio::io::duplex(16);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+
+        // An error response is a response for this purpose: `send` bounds
+        // `Response` and `Error` alike, because either one can leave the write
+        // pinned.
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("x".repeat(4096), None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("the deadline must resolve the write; it hung instead")
+            .expect_err("a write that outlived its deadline must not report success");
+
+        assert!(
+            error.to_string().contains("deadline"),
+            "the error must name the deadline that abandoned the write: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a peer that stops reading must close the session, not just fail one write"
+        );
+    }
+
+    /// Discriminating arm for the test above. Without this, that test would
+    /// also pass against a deadline that fired on every response regardless of
+    /// whether the peer was reading.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_inside_its_deadline_succeeds_and_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_io, mut client_io) = tokio::io::duplex(16 * 1024);
+        let (read, write) = tokio::io::split(server_io);
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(read, write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = client_io.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("read by the peer", None),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
+
+        assert!(
+            !root.is_cancelled(),
+            "a response delivered inside its deadline must not close the session"
+        );
+        let _ = reader.await;
+    }
+
+    /// The deadline bounds a write left PENDING. It says nothing about a write
+    /// that fails immediately, which is what a half-closed peer produces: one
+    /// that closes the side it reads from while keeping the side it writes to
+    /// open. rmcp does not close the session for us there — the response-send
+    /// task logs the error and returns (`rmcp-1.8.0` `src/service.rs:1105-1112`)
+    /// — the receive loop stays pending on the still-open read side, and idle
+    /// reaping is off by default, so before this the session outlived the
+    /// peer's ability to receive anything from it.
+    ///
+    /// Two independent pipes, because a single `duplex` cannot be half-closed:
+    /// dropping either end closes both directions, and `tokio::io::split`
+    /// keeps the stream alive until both halves drop. Separate pipes for the
+    /// read source and the write sink are what let the peer close exactly one.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn response_write_that_fails_fast_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        // peer -> server: held open and silent, so the receive side would stay
+        // pending forever. This is what makes the missing cancel a leak rather
+        // than a race with EOF.
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        // server -> peer: the peer has closed the side it reads from, so every
+        // write fails with BrokenPipe.
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this
+            // write. If the fix were the deadline rather than the error path,
+            // the 2s bound below would trip instead of the assertion.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("peer closed its read side", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a response that could not be written must close the session; rmcp only logs it"
+        );
+    }
+
+    /// A failed NOTIFICATION write closes the session too, and this test used
+    /// to assert the opposite. The rule was scoped to responses on the ground
+    /// that rmcp carried its own accounting for server-initiated messages. It
+    /// does carry accounting and the accounting does not close anything: a
+    /// failed notification send delivers `ServiceError::TransportSend` to the
+    /// notification's own responder (`rmcp-1.8.0` `src/service.rs:1074-1093`)
+    /// and a failed request send does the same to the caller's responder
+    /// (`:1066-1073`), while the serve loop's only exits are receive EOF, token
+    /// cancellation, and a send-task join error (`:1028-1062`). So the same
+    /// broken writer strands the session whatever class of message hit it.
+    ///
+    /// The discriminating arm is now
+    /// `notification_write_to_a_reading_peer_leaves_the_session_open`: without
+    /// it, this test would pass against a transport that cancelled on every
+    /// write, successful ones included.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn notification_write_that_fails_fast_also_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, peer_read_side) = tokio::io::duplex(1024);
+        drop(peer_read_side);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a closed pipe must fail fast, not wait out its deadline")
+            .expect_err("a write to a closed pipe must not report success");
+
+        assert!(
+            !error.to_string().contains("deadline"),
+            "this must exercise the error path, not the deadline path: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "a notification that could not be written must close the session; rmcp hands the \
+             error to the notification's own responder and never breaks the serve loop"
+        );
+    }
+
+    /// Discriminating arm for the two fail-fast tests above. Without it, both
+    /// would pass against a transport that cancelled on every write rather than
+    /// on every FAILED write, which is a far worse rule than either.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn notification_write_to_a_reading_peer_leaves_the_session_open() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncReadExt;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let (server_write, mut peer_read_side) = tokio::io::duplex(16 * 1024);
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, server_write),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        // This peer reads.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let _ = peer_read_side.read(&mut buf).await;
+            buf
+        });
+
+        let message = rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            notification: rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: rmcp::model::ProgressToken(
+                        rmcp::model::NumberOrString::Number(1),
+                    ),
+                    progress: 1.0,
+                    total: None,
+                    message: None,
+                }),
+            ),
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(message))
+            .await
+            .expect("a write to a reading peer must not hit the 2s test bound")
+            .expect("a write to a reading peer must succeed");
+
+        assert!(
+            !root.is_cancelled(),
+            "a delivered notification must not close the session"
+        );
+        let _ = reader.await;
+    }
+
+    /// A writer whose first flush is interrupted and which works from then on.
+    ///
+    /// This is the shape Tokio's blocking stdout adapter presents on EINTR: it
+    /// restores its idle state and puts the writer back before returning the
+    /// flush error (`tokio-1.52.4/src/io/blocking.rs:146-176`), and its
+    /// `uninterruptibly!` retry macro (`:183-192`) is not applied to that
+    /// branch. Writes are accepted and discarded, because what this arm asserts
+    /// is the session's fate, not the bytes.
+    struct InterruptOnceWriter {
+        interrupted_yet: bool,
+    }
+
+    impl tokio::io::AsyncWrite for InterruptOnceWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.interrupted_yet {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.interrupted_yet = true;
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "flush interrupted by a signal",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The exception to "every failed outbound write closes the session", and
+    /// it is narrower than the writer's health alone.
+    ///
+    /// An interrupted flush leaves the writer usable, so closing on it would
+    /// trade a lost message for a lost session. The second send is what makes
+    /// that claim rather than assuming it: if the transport were dead the
+    /// assertion could not distinguish a correct decision from a lucky one.
+    ///
+    /// This arm uses a NOTIFICATION because the exception is scoped to the
+    /// classes whose loss someone can observe. See
+    /// `an_interrupted_response_still_closes_the_session` for the other side of
+    /// that boundary, which is the arm that would go red if the scope were
+    /// dropped.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn an_interrupted_write_leaves_the_session_open_and_the_writer_usable() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let notification = || {
+            rmcp::model::JsonRpcMessage::Notification(rmcp::model::JsonRpcNotification {
+                jsonrpc: rmcp::model::JsonRpcVersion2_0,
+                notification: rmcp::model::ServerNotification::ProgressNotification(
+                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                        progress_token: rmcp::model::ProgressToken(
+                            rmcp::model::NumberOrString::Number(1),
+                        ),
+                        progress: 1.0,
+                        total: None,
+                        message: None,
+                    }),
+                ),
+            })
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            !root.is_cancelled(),
+            "an interrupted write must not close the session; the writer is still usable"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), transport.send(notification()))
+            .await
+            .expect("the second write must resolve, not hang")
+            .expect("the writer is usable after an interrupted flush, so the next write succeeds");
+        assert!(
+            !root.is_cancelled(),
+            "a successful write after an interrupted one must leave the session open"
+        );
+    }
+
+    /// The boundary of that exception: a usable writer is not enough when the
+    /// message was a RESPONSE.
+    ///
+    /// The interrupted flush leaves the writer able to carry the next message,
+    /// exactly as in the notification arm, so this test differs from that one
+    /// in the message class and nothing else. The outcome differs because rmcp
+    /// treats the classes differently. A failed notification or server-initiated
+    /// request send reaches a local responder (`rmcp-1.8.0`
+    /// `src/service.rs:1074-1093` and `:1066-1073`), so something in the process
+    /// learns the message was lost. A failed response send is only logged
+    /// (`:1095-1112`): nothing goes to the peer, no local caller is waiting, and
+    /// the serve loop keeps running. The client that asked the question would
+    /// wait on an answer that is not coming and could not tell that from a slow
+    /// one. Closing is what turns that into an EOF it can act on.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn an_interrupted_response_still_closes_the_session() {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use rmcp::transport::Transport;
+
+        let (server_read, _peer_write_side) = tokio::io::duplex(1024);
+        let writer = InterruptOnceWriter {
+            interrupted_yet: false,
+        };
+
+        let root = tokio_util::sync::CancellationToken::new();
+        let mut transport = crate::transport::CancelOnEofTransport::with_idle_timeout(
+            AsyncRwTransport::new_server(server_read, writer),
+            root.clone(),
+            None,
+            // Long enough that the deadline cannot be what resolves this write,
+            // so a pass here cannot come from the timeout path.
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let response = rmcp::model::JsonRpcMessage::Error(rmcp::model::JsonRpcError {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: Some(rmcp::model::RequestId::Number(1)),
+            error: rmcp::model::ErrorData::internal_error("answering a request", None),
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(2), transport.send(response))
+            .await
+            .expect("an interrupted flush must resolve, not hang")
+            .expect_err("an interrupted flush must be reported as an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "this arm must exercise the interrupted class, not some other failure: {error}"
+        );
+        assert!(
+            root.is_cancelled(),
+            "an interrupted RESPONSE must still close the session: the writer's health does not \
+             help a peer that is waiting on an answer rmcp will only log the loss of"
+        );
+    }
 }
+
+#[cfg(test)]
+mod disposition_tests;

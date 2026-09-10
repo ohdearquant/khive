@@ -7,8 +7,8 @@
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
-    EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef, HandlerDef, ParamDef,
-    VerbCategory, Visibility,
+    EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef, HandlerDef,
+    IdResolutionMode, ParamDef, VerbCategory, Visibility,
 };
 
 /// Shared open/closed lifecycle for `issue` and `pull_request`. See
@@ -39,7 +39,10 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
 
 /// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
 /// crates/khive-pack-git/docs/api/vocab.md#git_schema_plan_stmts.
-pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
+pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 5] = [
+    crate::receipts::RECEIPTS_TABLE_SQL,
+    crate::receipts::RECEIPTS_ACTOR_INDEX_SQL,
+    crate::receipts::RECEIPTS_SESSION_INDEX_SQL,
     "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
         project_id   TEXT NOT NULL,\
         kind         TEXT NOT NULL,\
@@ -74,7 +77,37 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 16] = [
+    crate::local_vocab::INIT,
+    crate::local_vocab::CHECKOUT,
+    crate::local_vocab::DIFF,
+    crate::local_vocab::RECEIPTS,
+    crate::local_vocab::GATES,
+    crate::local_vocab::RECONCILE,
+    crate::local_vocab::STATUS,
+    crate::local_vocab::LOG,
+    HandlerDef {
+        name: "git.ingest_cursor",
+        description: "Read the stored ingest cursor and checkpoint for a project and source kind in one snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor writes.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "project",
+                param_type: "uuid",
+                required: true,
+                description: "Full UUID of the live project anchor. Canonical get authorization applies with the caller's identity; by-ID reads are namespace-agnostic.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
+            },
+            ParamDef {
+                name: "source_kind",
+                param_type: "string",
+                required: true,
+                description: "One of commits, issues, pull_requests. Commits use a SHA cursor; issues and pull_requests use timestamp cursors with page checkpoints.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     HandlerDef {
         name: "git.digest",
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
@@ -94,6 +127,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                                non-github.com hosts degrade to commits-only (gh cannot serve \
                                their issues/PRs). ssh://, git://, http://, and scp-shorthand \
                                (user@host:path) sources are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "project",
@@ -104,6 +138,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                                exact then normalized properties.repo_url reconciliation, or \
                                created if no identity evidence matches (see the response's \
                                project_id and project_created). Names are never a match key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "max_items",
@@ -112,6 +147,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 description: "Bounded work for this call, counted across commits + issues + PRs \
                                (default 500, clamped to 1..=2000). Cursor-resumable: call again \
                                while the response's done field is false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "include",
@@ -119,29 +155,34 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 required: false,
                 description: "Which record kinds to ingest this call: any of commits | issues | \
                                pull_requests (default: all three).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "git.commit",
-        description: "Stage and commit against a local git repo (ADR-108). Shells to system git \
-                       with hardened, allowlisted argv construction — no shell interpolation. \
-                       Returns the resulting commit SHA.",
+        description: "Commit a complete tree manifest with actor identity and an atomic expected-head compare, or use the legacy paths form. Tree commits require the tool pack and actor mapping, preserve the index/worktree, and return receipt_id with the SHA. Paths retain their legacy behavior.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            crate::local_vocab::BRANCH,
+            crate::local_vocab::TREE,
+            crate::local_vocab::EXPECTED_HEAD,
+            crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",
                 param_type: "string",
                 required: true,
                 description: "Absolute local path to a git repository (must contain a .git \
                                entry).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "message",
                 param_type: "string",
                 required: true,
                 description: "Commit message, passed to git as a single -m argument value.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "paths",
@@ -150,78 +191,51 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
                 description: "Relative paths to stage and scope the commit to. Absent commits \
                                everything currently staged/modified in tracked files (git \
                                commit -a) — never auto-adds new untracked files.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "author",
                 param_type: "string",
                 required: false,
                 description: "Override the commit author, e.g. \"Name <email>\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "git.branch",
-        description: "Create a branch in a local git repo, optionally from a named ref or SHA \
-                       (ADR-108).",
+        description: "Create a branch from a ref or SHA (default HEAD) using a create-only atomic ref compare. Existing and symbolic target refs refuse. Requires the tool pack; returns legacy keys plus ref, sha and receipt_id.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            crate::local_vocab::EXPECTED,
+            crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",
                 param_type: "string",
                 required: true,
                 description: "Absolute local path to a git repository (must contain a .git \
                                entry).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "name",
                 param_type: "string",
                 required: true,
                 description: "New branch name.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "from",
                 param_type: "string",
                 required: false,
                 description: "Ref or SHA to branch from. Absent uses the repo's current HEAD.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
-    HandlerDef {
-        name: "git.push",
-        description: "Push a branch to a remote (ADR-108). Force-push is always denied — no \
-                       policy or argument combination can authorize it through this verb.",
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: &[
-            ParamDef {
-                name: "repo",
-                param_type: "string",
-                required: true,
-                description: "Absolute local path to a git repository (must contain a .git \
-                               entry).",
-            },
-            ParamDef {
-                name: "branch",
-                param_type: "string",
-                required: true,
-                description: "Branch to push.",
-            },
-            ParamDef {
-                name: "remote",
-                param_type: "string",
-                required: false,
-                description: "Remote to push to (default: origin).",
-            },
-            ParamDef {
-                name: "force",
-                param_type: "bool",
-                required: false,
-                description: "Always rejected when true — force-push is never permitted through \
-                               this verb (ADR-108 hard rule 1). Present only so a caller's \
-                               explicit force=true request fails loudly rather than being \
-                               silently ignored.",
-            },
-        ],
-    },
+    crate::remote_vocab::PUSH,
+    crate::remote_vocab::PR_OPEN,
+    crate::remote_vocab::PR_REVIEW,
+    crate::remote_vocab::PR_MERGE,
 ];

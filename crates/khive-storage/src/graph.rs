@@ -1,6 +1,7 @@
 //! Graph storage capability — edge CRUD and traversal.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use khive_types::EdgeRelation;
 use uuid::Uuid;
 
@@ -20,6 +21,31 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
+    /// Replace an edge only when the persisted row still matches the
+    /// caller's read snapshot.
+    ///
+    /// `expected_updated_at` is the snapshot revision and
+    /// `expected_deleted_at` closes the soft-delete race. The replacement
+    /// edge's `updated_at` must be strictly greater than that persisted
+    /// revision. Returns `false` when the row disappeared, changed, or was
+    /// supplied a non-advancing replacement revision. This is the full-edge
+    /// compare-and-swap seam used when a caller derives coupled fields from
+    /// that snapshot before persistence — mirrors
+    /// [`crate::NoteStore::replace_note_if_unchanged`]. The default returns
+    /// `Unsupported` rather than falling back to an unguarded upsert and
+    /// reintroducing the stale-snapshot race.
+    async fn replace_edge_if_unchanged(
+        &self,
+        _edge: Edge,
+        _expected_updated_at: DateTime<Utc>,
+        _expected_deleted_at: Option<DateTime<Utc>>,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "replace_edge_if_unchanged".into(),
+            message: "this backend does not implement guarded edge replacement".into(),
+        })
+    }
     /// Insert or update a single edge, re-checking that both endpoints still
     /// exist (and are not soft-deleted) as part of the same write, not a
     /// separate prior read. Closes the TOCTOU window between an async
@@ -88,7 +114,9 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
-    /// Query edges with filter, sort, and pagination.
+    /// Query edges with filter, sort, and pagination without an implicit
+    /// exact count. Implementations should return `total: None`; callers that
+    /// need a count use [`Self::count_edges`] explicitly.
     async fn query_edges(
         &self,
         filter: EdgeFilter,
@@ -102,7 +130,9 @@ pub trait GraphStore: Send + Sync + 'static {
     /// prefixes and slicing a client-side merge floats the window between
     /// calls (silent duplicate/skip enumeration). Backends without batched
     /// namespace support retain the single-namespace path and reject
-    /// multi-namespace requests explicitly.
+    /// multi-namespace requests explicitly. Implementations should return
+    /// `total: None`; callers that need a count use
+    /// [`Self::count_edges_in_namespaces`] explicitly.
     async fn query_edges_in_namespaces(
         &self,
         namespaces: &[String],
@@ -113,7 +143,7 @@ pub trait GraphStore: Send + Sync + 'static {
         match namespaces.len() {
             0 => Ok(Page {
                 items: Vec::new(),
-                total: Some(0),
+                total: None,
             }),
             1 => self.query_edges(filter, sort, page).await,
             _ => Err(StorageError::Unsupported {

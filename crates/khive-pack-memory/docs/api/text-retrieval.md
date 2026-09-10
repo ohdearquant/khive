@@ -28,6 +28,14 @@ Missing statistics remain eligible but sort behind measured selective terms. The
 
 CJK queries can bypass statistical selection because whitespace term boundaries are not a reliable segmentation mechanism. The storage query always retains the memory kind and namespace constraints. `Ranked` returns the legacy top-ranked rows; rank-within-cap mode first bounds the match set, then ranks within that cap.
 
+The memory-kind constraint is part of candidate retrieval, not a filter after
+the shared note MATCH. SQLite FTS stores the granular note kind in its indexed
+`record_kind` column and intersects `record_kind : "memory"` with the query
+postings before ranking. It also retains an exact `record_kind = "memory"` row
+predicate as a trigram-tokenizer correctness backstop. The same corpus scope is
+used for term statistics, so document frequency and IDF describe memories
+rather than all notes.
+
 ## Query embedding cache
 
 `QueryEmbeddingCache` is a thread-safe LRU local to the pack. The key is the model name plus exact query text, so embeddings cannot cross model spaces. Capacity is non-zero and defaults to 512 entries. Reads update recency; insertion replaces an existing key and evicts the least-recently-used entry when necessary.

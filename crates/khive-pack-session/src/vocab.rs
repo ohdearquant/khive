@@ -1,6 +1,6 @@
 //! Session pack vocabulary: handler definitions and shared constants.
 
-use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
 pub(crate) const SESSION_KIND: &str = "session";
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
@@ -63,30 +63,35 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: true,
                 description: "Verbatim transcript or summary content.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "title",
                 param_type: "string",
                 required: false,
                 description: "Human-readable session title stored as note.name.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "provider",
                 param_type: "string",
                 required: false,
                 description: "Provider label such as codex, claude_code, or openai.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "provider_session_id",
                 param_type: "string",
                 required: false,
                 description: "Provider-native continuity anchor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
                 description: "Caller labels stored in properties.tags.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -101,30 +106,35 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 param_type: "integer",
                 required: false,
                 description: "Page size from 1 to 200; default 20.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "offset",
                 param_type: "integer",
                 required: false,
                 description: "Pagination offset; default 0.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "provider",
                 param_type: "string",
                 required: false,
                 description: "Exact filter on properties.provider.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "agent_id",
                 param_type: "string",
                 required: false,
                 description: "Exact filter on properties.agent_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "since",
                 param_type: "string",
                 required: false,
                 description: "RFC 3339 lower bound on note.created_at (inclusive).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -138,6 +148,7 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
             param_type: "string",
             required: true,
             description: "Full UUID or 8+ hex short prefix.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -151,12 +162,14 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: true,
                 description: "Full UUID or 8+ hex short prefix.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "format",
                 param_type: "string",
                 required: false,
                 description: "json | markdown; default json.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },

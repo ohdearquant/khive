@@ -172,12 +172,14 @@ proptest! {
                     description: Some(None),
                     properties: None,
                     tags: None,
+                    entity_type: None,
                 }),
                 UpdatePreimage::Entity(EntityPreimage {
                     name: preimage_name,
                     description: Some(Some("prior-description".to_string())),
                     properties: None,
                     tags: None,
+                    entity_type: None,
                 }),
             )
             .unwrap(),
@@ -408,5 +410,106 @@ fn probe_rejects_unknown_field_inside_delete_preimage() {
     assert!(
         result.is_err(),
         "unknown fields inside full-record preimages must not be silently dropped"
+    );
+}
+
+// ---- ADR-014 tri-state entity_type on the changeset surface ----
+
+fn entity_type_op(patch_type: Option<Option<String>>, preimage_type: Option<Option<String>>) -> Op {
+    let op = UpdateOp::new(
+        Id128::from_u128(1),
+        UpdatePatch::Entity(EntityPatch {
+            name: None,
+            description: None,
+            properties: None,
+            tags: None,
+            entity_type: patch_type,
+        }),
+        UpdatePreimage::Entity(EntityPreimage {
+            name: None,
+            description: None,
+            properties: None,
+            tags: None,
+            entity_type: preimage_type,
+        }),
+    )
+    .expect("congruent entity_type pair must construct");
+    Op::Update(op)
+}
+
+#[test]
+fn update_entity_type_set_roundtrips_through_ndjson() {
+    let cs = ChangeSet::new(
+        Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1)),
+        vec![entity_type_op(
+            Some(Some("algorithm".to_string())),
+            Some(Some("paper".to_string())),
+        )],
+    );
+    assert_roundtrips_byte_identical(&cs);
+}
+
+#[test]
+fn update_entity_type_clear_roundtrips_through_ndjson() {
+    let cs = ChangeSet::new(
+        Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1)),
+        vec![entity_type_op(
+            Some(None),
+            Some(Some("algorithm".to_string())),
+        )],
+    );
+    let text = khive_changeset::to_ndjson(&cs).expect("serialize");
+    assert!(
+        text.contains("\"entity_type\":null"),
+        "the clear must be serialized as an explicit null, not dropped: {text}"
+    );
+    assert_roundtrips_byte_identical(&cs);
+}
+
+#[test]
+fn update_entity_type_congruence_rejects_mismatched_preimage() {
+    // patch sets entity_type but the preimage omits the prior value.
+    assert!(
+        UpdateOp::new(
+            Id128::from_u128(1),
+            UpdatePatch::Entity(EntityPatch {
+                name: None,
+                description: None,
+                properties: None,
+                tags: None,
+                entity_type: Some(Some("algorithm".to_string())),
+            }),
+            UpdatePreimage::Entity(EntityPreimage {
+                name: None,
+                description: None,
+                properties: None,
+                tags: None,
+                entity_type: None,
+            }),
+        )
+        .is_err(),
+        "a touched entity_type without a captured prior value must be rejected"
+    );
+    // preimage captures entity_type but the patch leaves it unchanged.
+    assert!(
+        UpdateOp::new(
+            Id128::from_u128(1),
+            UpdatePatch::Entity(EntityPatch {
+                name: None,
+                description: None,
+                properties: None,
+                tags: None,
+                entity_type: None,
+            }),
+            UpdatePreimage::Entity(EntityPreimage {
+                name: None,
+                description: None,
+                properties: None,
+                tags: None,
+                entity_type: Some(Some("algorithm".to_string())),
+            }),
+        )
+        .is_err(),
+        "an unchanged entity_type with a preimage value must be rejected"
     );
 }

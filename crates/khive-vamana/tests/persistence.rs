@@ -835,6 +835,8 @@ fn v2_corrupt_reverse_adj_not_inverse_of_graph_triggers_rebuild() {
     // Verify phantom_src is not already in reverse_adj[0] (must not create a dup).
     let neighbors_start = node0_offset + 4;
     let neighbors_end = neighbors_start + degree0 * 4;
+    // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let already_present = lifecycle_bytes[neighbors_start..neighbors_end]
         .chunks_exact(4)
         .any(|b| u32::from_le_bytes(b.try_into().unwrap()) == phantom_src);

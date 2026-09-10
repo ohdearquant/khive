@@ -14,6 +14,10 @@ for provenance edges. ADR-088 Amendment 1 adds exactly one verb
 parent→child commit lineage). See `crates/khive-pack-git/src/pack.rs` for
 how this vocabulary is wired into `GitPack`.
 
+The proposed 2026-09-10 rider adds the `Assertive` read `git.ingest_cursor` for
+persisted cursor/checkpoint inspection. It uses the existing auxiliary table and
+canonical project read gate; see [its contract](ingest_cursor.md).
+
 ## `GIT_LIFECYCLE`
 
 Lifecycle declaration shared by `issue` and `pull_request` — both track an

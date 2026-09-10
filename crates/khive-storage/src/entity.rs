@@ -145,6 +145,31 @@ pub trait EntityStore: Send + Sync + 'static {
     }
     /// Insert or update a batch of entities.
     async fn upsert_entities(&self, entities: Vec<Entity>) -> StorageResult<BatchWriteSummary>;
+    /// Replace an entity only when the persisted row still matches the
+    /// caller's read snapshot.
+    ///
+    /// `expected_updated_at` is the snapshot revision and
+    /// `expected_deleted_at` closes the soft-delete race. The replacement
+    /// entity's `updated_at` must be strictly greater than that persisted
+    /// revision. Returns `false` when the row disappeared, changed, or was
+    /// supplied a non-advancing replacement revision. This is the full-entity
+    /// compare-and-swap seam used when a caller derives coupled fields from
+    /// that snapshot before persistence — mirrors
+    /// [`crate::NoteStore::replace_note_if_unchanged`]. The default returns
+    /// `Unsupported` rather than falling back to an unguarded upsert and
+    /// reintroducing the stale-snapshot race.
+    async fn replace_entity_if_unchanged(
+        &self,
+        _entity: Entity,
+        _expected_updated_at: i64,
+        _expected_deleted_at: Option<i64>,
+    ) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "replace_entity_if_unchanged".into(),
+            message: "this backend does not implement guarded entity replacement".into(),
+        })
+    }
     /// Fetch an entity by UUID, returning `None` if absent.
     async fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>>;
     /// Delete an entity by UUID using the specified delete mode.

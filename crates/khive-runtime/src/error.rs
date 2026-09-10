@@ -9,6 +9,155 @@ use uuid::Uuid;
 /// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
+/// What this dispatch boundary can establish about its own domain operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainDisposition {
+    /// The handler returned its canonical success value before a later failure.
+    Committed,
+    /// The operation was refused before its handler was invoked.
+    NotCommitted,
+    /// The handler failed, so its domain effects are not established here.
+    Unknown,
+}
+
+impl DomainDisposition {
+    /// Stable wire spelling, shared by request and daemon envelopes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::NotCommitted => "not_committed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// An unchanged runtime error with provenance from one dispatch boundary.
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct DispatchError {
+    #[source]
+    source: RuntimeError,
+    disposition: DomainDisposition,
+}
+
+impl DispatchError {
+    pub(crate) fn new(source: RuntimeError, disposition: DomainDisposition) -> Self {
+        Self {
+            source,
+            disposition,
+        }
+    }
+
+    pub(crate) fn before_dispatch(source: RuntimeError) -> Self {
+        Self::new(source, DomainDisposition::NotCommitted)
+    }
+
+    pub(crate) fn after_handler(source: RuntimeError, domain_succeeded: bool) -> Self {
+        Self::new(
+            source,
+            if domain_succeeded {
+                DomainDisposition::Committed
+            } else {
+                DomainDisposition::Unknown
+            },
+        )
+    }
+
+    /// Borrow the original error without changing its classification.
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    /// Read provenance belonging to this dispatch, not to a nested operation.
+    pub fn disposition(&self) -> DomainDisposition {
+        self.disposition
+    }
+
+    /// Separate the original error from its dispatch provenance.
+    pub fn into_parts(self) -> (RuntimeError, DomainDisposition) {
+        (self.source, self.disposition)
+    }
+
+    /// Compatibility path for callers that consume runtime errors directly.
+    pub fn into_source(self) -> RuntimeError {
+        self.source
+    }
+}
+
+/// Typed cause of a post-dispatch audit or durable-receipt failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditObligationReason {
+    /// The audit batch reported one of its closed terminal outcomes.
+    Terminal(crate::audit_batch::AuditTerminalReason),
+    /// Receipt setup failed before submission produced a terminal outcome.
+    GitDigestReceiptFailure,
+}
+
+/// An obligation failure preserves its typed cause and any storage source.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct AuditObligationFailure {
+    /// Machine-readable terminal or receipt-setup cause.
+    pub reason: AuditObligationReason,
+    /// Domain verb whose post-dispatch obligation failed.
+    pub verb: String,
+    /// Stable caller-visible explanation; excludes the canonical domain value.
+    pub message: String,
+    #[source]
+    source: Option<khive_storage::StorageError>,
+}
+
+impl AuditObligationFailure {
+    /// Preserve a terminal audit outcome without parsing its display text.
+    pub fn new(verb: impl Into<String>, reason: crate::audit_batch::AuditTerminalReason) -> Self {
+        let verb = verb.into();
+        Self {
+            message: format!("audit obligation commit failed for verb {verb:?}: {reason:?}"),
+            verb,
+            reason: AuditObligationReason::Terminal(reason),
+            source: None,
+        }
+    }
+
+    pub(crate) fn from_store(verb: &str, source: khive_storage::StorageError) -> Self {
+        let mut failure = Self::new(verb, crate::audit_batch::AuditTerminalReason::StoreFailure);
+        failure.message = format!("audit obligation commit failed for verb {verb:?}: {source}");
+        failure.source = Some(source);
+        failure
+    }
+
+    pub(crate) fn git_digest_receipt(branch: &'static str) -> Self {
+        Self {
+            reason: AuditObligationReason::GitDigestReceiptFailure,
+            verb: "git.digest".into(),
+            message: format!("git_digest_receipt_persist_failed: {branch}; git.digest writes may have committed, but no durable success receipt was confirmed; inspect ingest state before retrying"),
+            source: None,
+        }
+    }
+
+    /// Closed wire-code mapping: a new batch terminal reason requires an arm.
+    pub const fn wire_code(&self) -> &'static str {
+        use crate::audit_batch::AuditTerminalReason;
+        match self.reason {
+            AuditObligationReason::Terminal(reason) => match reason {
+                AuditTerminalReason::PreflightRejected => "preflight_rejected",
+                AuditTerminalReason::AdmissionClosed => "admission_closed",
+                AuditTerminalReason::QueueAdmissionExhausted => "queue_admission_exhausted",
+                AuditTerminalReason::AdmissionDeadlineExpired => "admission_deadline_expired",
+                AuditTerminalReason::IdentityConflict => "identity_conflict",
+                AuditTerminalReason::StoreFailure => "store_failure",
+                AuditTerminalReason::IdempotencyUnsupported => "idempotency_unsupported",
+                AuditTerminalReason::DriverPanicked => "driver_panicked",
+                AuditTerminalReason::DriverCancelled => "driver_cancelled",
+                AuditTerminalReason::DriverJoinLost => "driver_join_lost",
+                AuditTerminalReason::DriverExitedInconsistent => "driver_exited_inconsistent",
+            },
+            AuditObligationReason::GitDigestReceiptFailure => "git_digest_receipt_failure",
+        }
+    }
+}
+
 /// Stable ADR-135 F6 stage and wire code for a finite-wait pooled writer
 /// checkout that expires before SQLite executes.
 pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
@@ -21,6 +170,32 @@ pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 /// queue accepted a request but before its operation closure ran.
 pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 
+/// Stable wire code/stage for an ordinary writer request whose operation or
+/// COMMIT failed after the task proved its transaction was rolled back.
+pub const WRITER_TASK_REQUEST_FAILED_STAGE: &str = "writer_task_request_failed";
+
+/// Stable wire code/stage for a request reported by a permanently retired
+/// writer seam.
+pub const WRITER_TASK_TERMINATED_STAGE: &str = "writer_task_terminated";
+
+/// Stable wire code/stage for a bounded storage-admission wait (a
+/// reader/writer handle slot or a pooled reader checkout) that elapsed
+/// before anything was acquired. The operation never started, so the
+/// failure is safe to retry.
+pub const STORAGE_ADMISSION_TIMEOUT_STAGE: &str = "storage_admission_timeout";
+
+/// Stable wire code/stage for a cached read-only transaction proactively
+/// rolled back after pinning a WAL snapshot past the configured
+/// `read_tx_max_age` bound (#1846). Always safe to retry: the eviction only
+/// ever fires on a read-only handle, so no side effect can exist for a
+/// retry to duplicate. Shared by both
+/// [`khive_storage::StorageError::ReadTransactionAgeEvicted`] (clean
+/// rollback) and
+/// [`khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed`]
+/// (rollback denied or failed outright) — the rendered `message` field
+/// distinguishes the two; retry behavior is identical for both.
+pub const READ_TX_AGE_EVICTED_STAGE: &str = "read_tx_age_evicted";
+
 /// Stable ADR-131:251 `scope` discriminator carried on a
 /// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
 /// admission saturation from other `unavailable` failure kinds that share
@@ -29,15 +204,17 @@ pub const WRITER_TASK_BEGIN_BUSY_STAGE: &str = "writer_task_begin_busy";
 /// ADR-131-defined scope and carries `None`).
 pub const WRITER_ADMISSION_SCOPE: &str = "writer_admission";
 
-/// Structured context for a pre-execution write-admission failure: either a
-/// finite-wait pooled writer checkout timeout or a bounded write-queue
-/// enqueue timeout. Both happen before SQLite executes the request, so both
+/// Structured context for a pre-execution admission failure: a finite-wait
+/// pooled writer checkout timeout, a bounded write-queue enqueue timeout, or
+/// a bounded storage-admission wait (reader/writer handle slot or pooled
+/// reader checkout). All happen before SQLite executes the request, so all
 /// are safe to classify as retryable — the request was never accepted, let
 /// alone started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionFailureContext {
-    /// Stable wire stage/code: one of [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`]
-    /// or [`WRITER_QUEUE_SATURATED_STAGE`].
+    /// Stable wire stage/code: one of [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`],
+    /// [`WRITER_QUEUE_SATURATED_STAGE`], or
+    /// [`STORAGE_ADMISSION_TIMEOUT_STAGE`].
     pub stage: &'static str,
     /// The configured deadline that elapsed.
     pub timeout: Duration,
@@ -80,6 +257,24 @@ pub struct RetryableFailureContext {
     pub scope: Option<&'static str>,
     /// Server backoff hint when a governing contract defines one.
     pub retry_after_ms: Option<u64>,
+}
+
+/// Structured writer-request finality recovered from a storage error.
+///
+/// `request_state` answers whether effects are known absent or ambiguous;
+/// `task_terminated` separately answers whether the writer seam remains
+/// usable. `retryable` retains the source error's transient policy and must
+/// not be inferred from rollback finality alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterTaskFailureContext {
+    /// Stable MCP code/stage for the error family.
+    pub stage: &'static str,
+    /// What the writer can prove about this request's effects.
+    pub request_state: khive_storage::WriterTaskRequestState,
+    /// Whether the writer seam was permanently retired.
+    pub task_terminated: bool,
+    /// Whether the source failure is transient independently of finality.
+    pub retryable: bool,
 }
 
 impl From<AdmissionFailureContext> for RetryableFailureContext {
@@ -240,16 +435,87 @@ impl std::error::Error for CircularPackDependency {}
 
 /// All errors produced by the khive-runtime layer.
 ///
+/// Where the `GateDenied` audit row of a refused dispatch ended up.
+///
+/// A refusal reaches the caller whatever happens to its audit row; this value
+/// says whether the row the caller could cite exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialAuditOutcome {
+    /// The row committed, or an identical row was already present, and
+    /// `audit_event_id` on the refusal names it.
+    Committed,
+    /// The row was built and submitted but did not commit; the audit
+    /// obligation wire code says why.
+    NotCommitted(&'static str),
+    /// No event store is configured, so no row was written.
+    NoStore,
+    /// The refusal comes from a path that writes no audit row (namespace
+    /// authorization, channel policy).
+    NotAudited,
+}
+
+impl DenialAuditOutcome {
+    /// Closed wire spelling: `committed`, `not_committed:<code>`, `no_store`,
+    /// `not_audited`.
+    pub fn wire_code(&self) -> String {
+        match self {
+            Self::Committed => "committed".to_string(),
+            Self::NotCommitted(code) => format!("not_committed:{code}"),
+            Self::NoStore => "no_store".to_string(),
+            Self::NotAudited => "not_audited".to_string(),
+        }
+    }
+}
+
+/// What a refused dispatch can cite: the `GateDenied` audit row's id when
+/// one committed, and where the row ended up otherwise. Boxed on the error
+/// so a refusal does not widen every `Result<_, RuntimeError>` in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialReceipt {
+    /// The audit row's event id when `audit_outcome` is `Committed`.
+    pub audit_event_id: Option<uuid::Uuid>,
+    /// Whether the row the caller could cite exists.
+    pub audit_outcome: DenialAuditOutcome,
+}
+
+impl DenialReceipt {
+    /// The refusal's path writes no audit row.
+    pub fn not_audited() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NotAudited,
+        }
+    }
+
+    /// No event store is configured, so no row was written.
+    pub fn no_store() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NoStore,
+        }
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// The domain handler succeeded, but its post-dispatch obligation did not.
+    #[error("{failure}")]
+    AuditObligation {
+        /// Typed reason and source of the obligation failure.
+        #[source]
+        failure: Box<AuditObligationFailure>,
+        /// Exact canonical value held after the domain handler succeeded.
+        domain_result: serde_json::Value,
+    },
+
     #[error("storage: {0}")]
     Storage(#[from] khive_storage::StorageError),
 
     #[error("sqlite: {0}")]
-    Sqlite(#[from] khive_db::SqliteError),
+    Sqlite(khive_db::SqliteError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -342,8 +608,16 @@ pub enum RuntimeError {
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
     /// `GateDecision::Deny`. The pack is never invoked. The `reason` field
     /// carries the deny message produced by the gate implementation.
+    ///
+    /// `receipt` carries the id of the `GateDenied` audit row when one
+    /// committed, so the caller can cite the refusal, and says whether such
+    /// a row exists.
     #[error("permission denied for verb {verb:?}: {reason}")]
-    PermissionDenied { verb: String, reason: String },
+    PermissionDenied {
+        verb: String,
+        reason: String,
+        receipt: Box<DenialReceipt>,
+    },
 
     /// The configured gate could not produce an authorization decision.
     ///
@@ -458,7 +732,25 @@ pub enum RuntimeError {
     },
 }
 
+impl From<khive_db::SqliteError> for RuntimeError {
+    fn from(error: khive_db::SqliteError) -> Self {
+        match error {
+            khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
+            error => Self::Sqlite(error),
+        }
+    }
+}
+
 impl RuntimeError {
+    /// A gate refusal from a path that writes no audit row.
+    pub fn permission_denied(verb: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::PermissionDenied {
+            verb: verb.into(),
+            reason: reason.into(),
+            receipt: Box::new(DenialReceipt::not_audited()),
+        }
+    }
+
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
@@ -480,6 +772,7 @@ impl RuntimeError {
     /// Stable top-level variant name used by typed policy classifiers.
     const fn variant_name(&self) -> &'static str {
         match self {
+            Self::AuditObligation { .. } => "AuditObligation",
             Self::Storage(_) => "Storage",
             Self::Sqlite(_) => "Sqlite",
             Self::Query(_) => "Query",
@@ -575,7 +868,50 @@ impl RuntimeError {
                 retry_after_ms: Some(*timeout_ms),
             });
         }
+        if let Self::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation,
+            timeout_ms,
+        }) = self
+        {
+            return Some(AdmissionFailureContext {
+                stage: STORAGE_ADMISSION_TIMEOUT_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
         None
+    }
+
+    /// Recover writer-request finality without parsing the rendered storage
+    /// error. Ordinary proven rollbacks and terminal writer failures are
+    /// deliberately distinct even when they carry the same request state.
+    pub fn writer_task_failure_context(&self) -> Option<WriterTaskFailureContext> {
+        let Self::Storage(error) = self else {
+            return None;
+        };
+        match error {
+            khive_storage::StorageError::WriterTaskRequestFailed {
+                request_state,
+                source,
+            } => Some(WriterTaskFailureContext {
+                stage: WRITER_TASK_REQUEST_FAILED_STAGE,
+                request_state: *request_state,
+                task_terminated: false,
+                retryable: source.is_retryable(),
+            }),
+            khive_storage::StorageError::WriterTaskTerminated { request_state } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_TASK_TERMINATED_STAGE,
+                    request_state: *request_state,
+                    task_terminated: true,
+                    retryable: false,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Recover every typed failure for which this process can prove that
@@ -584,17 +920,48 @@ impl RuntimeError {
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self else {
-            return None;
-        };
-        Some(RetryableFailureContext {
-            stage: WRITER_TASK_BEGIN_BUSY_STAGE,
-            timeout: Duration::from_millis(*timeout_ms),
-            capability: None,
-            operation: Some("writer_task_begin".to_string()),
-            scope: None,
-            retry_after_ms: None,
-        })
+        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = self {
+            return Some(RetryableFailureContext {
+                stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: Some("writer_task_begin".to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
+            operation,
+            max_age_secs,
+        }) = self
+        {
+            return Some(RetryableFailureContext {
+                stage: READ_TX_AGE_EVICTED_STAGE,
+                timeout: Duration::from_secs(*max_age_secs),
+                capability: Some(khive_storage::StorageCapability::Sql),
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        if let Self::Storage(
+            khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                operation,
+                max_age_secs,
+                ..
+            },
+        ) = self
+        {
+            return Some(RetryableFailureContext {
+                stage: READ_TX_AGE_EVICTED_STAGE,
+                timeout: Duration::from_secs(*max_age_secs),
+                capability: Some(khive_storage::StorageCapability::Sql),
+                operation: Some(operation.to_string()),
+                scope: None,
+                retry_after_ms: None,
+            });
+        }
+        None
     }
 }
 
@@ -659,10 +1026,12 @@ mod channel_ingest_failure_class_tests {
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
         let first = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: None,
             masked: "first-rendering".to_string(),
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
         });
 
@@ -716,5 +1085,132 @@ mod channel_ingest_failure_class_tests {
             },
             "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
         );
+    }
+
+    #[test]
+    fn writer_task_failure_context_separates_request_finality_from_task_liveness() {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+
+        let rolled_back = RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        });
+        let rolled_back_context = rolled_back
+            .writer_task_failure_context()
+            .expect("proven rollback must remain typed through RuntimeError");
+        assert_eq!(
+            rolled_back_context.request_state,
+            WriterTaskRequestState::TransactionRolledBack
+        );
+        assert_eq!(
+            rolled_back_context.stage,
+            super::WRITER_TASK_REQUEST_FAILED_STAGE
+        );
+        assert!(!rolled_back_context.task_terminated);
+        assert!(rolled_back_context.retryable);
+
+        let unknown = RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        });
+        let unknown_context = unknown
+            .writer_task_failure_context()
+            .expect("ambiguous finality must remain typed through RuntimeError");
+        assert_eq!(
+            unknown_context.request_state,
+            WriterTaskRequestState::SideEffectsUnknown
+        );
+        assert_eq!(unknown_context.stage, super::WRITER_TASK_TERMINATED_STAGE);
+        assert!(unknown_context.task_terminated);
+        assert!(!unknown_context.retryable);
+    }
+
+    #[test]
+    fn storage_admission_timeout_is_a_retryable_admission_failure() {
+        let admission = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation: "sql_bridge.writer_handle".into(),
+            timeout_ms: 30_000,
+        });
+        let context = admission
+            .admission_failure_context()
+            .expect("a storage admission timeout happens before the operation starts");
+        assert_eq!(context.stage, super::STORAGE_ADMISSION_TIMEOUT_STAGE);
+        assert_eq!(context.timeout, Duration::from_millis(30_000));
+        assert_eq!(
+            context.operation.as_deref(),
+            Some("sql_bridge.writer_handle")
+        );
+        assert_eq!(context.scope, None);
+        assert_eq!(context.retry_after_ms, None);
+        assert_eq!(
+            admission.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Retryable { reason: "Storage" }
+        );
+
+        // The general mid-flight timeout stays unclassified: it proves
+        // nothing about whether work was in flight when the deadline expired.
+        let mid_flight = RuntimeError::Storage(khive_storage::StorageError::Timeout {
+            operation: "sql_bridge.reader_open".into(),
+        });
+        assert!(mid_flight.admission_failure_context().is_none());
+        assert!(mid_flight.retryable_failure_context().is_none());
+    }
+
+    /// Binds both age-eviction outcomes a cached-reader rollback can produce
+    /// (clean rollback vs. failed/denied cleanup) to the same retryable wire
+    /// stage: a regression that reverted either branch back to generic
+    /// `StorageError::Transaction` would drop this match arm entirely and
+    /// fail here, since `Transaction` does have a `retryable_failure_context`
+    /// mapping distinct from `super::READ_TX_AGE_EVICTED_STAGE`.
+    #[test]
+    fn both_read_tx_age_eviction_outcomes_map_to_the_same_retryable_stage() {
+        let clean = RuntimeError::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
+            operation: "query_all".into(),
+            max_age_secs: 120,
+        });
+        let clean_context = clean
+            .retryable_failure_context()
+            .expect("a clean age eviction must be typed-retryable");
+        assert_eq!(clean_context.stage, super::READ_TX_AGE_EVICTED_STAGE);
+        assert_eq!(clean_context.timeout, Duration::from_secs(120));
+        assert_eq!(clean_context.operation.as_deref(), Some("query_all"));
+        assert_eq!(
+            clean_context.capability,
+            Some(khive_storage::StorageCapability::Sql)
+        );
+
+        let cleanup_failed = RuntimeError::Storage(
+            khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
+                operation: "query_all".into(),
+                max_age_secs: 120,
+                message: "rollback failed: disk I/O error".into(),
+            },
+        );
+        let cleanup_failed_context = cleanup_failed
+            .retryable_failure_context()
+            .expect("a failed cleanup rollback must remain typed-retryable");
+        assert_eq!(
+            cleanup_failed_context.stage,
+            super::READ_TX_AGE_EVICTED_STAGE
+        );
+        assert_eq!(cleanup_failed_context.timeout, Duration::from_secs(120));
+        assert_eq!(
+            cleanup_failed_context.operation.as_deref(),
+            Some("query_all")
+        );
+        assert_eq!(
+            cleanup_failed_context.capability,
+            Some(khive_storage::StorageCapability::Sql)
+        );
+
+        assert_ne!(
+            clean.to_string(),
+            cleanup_failed.to_string(),
+            "the rendered message must distinguish a clean eviction from a failed cleanup even \
+             though both map to the same wire stage"
+        );
+        assert!(cleanup_failed.to_string().contains("rollback failed"));
     }
 }

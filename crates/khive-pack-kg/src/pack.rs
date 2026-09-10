@@ -73,13 +73,7 @@ pub struct KgPack {
 
 impl Pack for KgPack {
     const NAME: &'static str = "kg";
-    const NOTE_KINDS: &'static [&'static str] = &[
-        "observation",
-        "insight",
-        "question",
-        "decision",
-        "reference",
-    ];
+    const NOTE_KINDS: &'static [&'static str] = crate::vocab::NoteKind::NAMES;
     const ENTITY_KINDS: &'static [&'static str] = &[
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
         "resource",
@@ -98,7 +92,22 @@ impl KgPack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
     use khive_types::EndpointKind;
+
+    #[tokio::test]
+    async fn kg_pack_registers_all_canonical_note_kinds() {
+        assert_eq!(KgPack::NOTE_KINDS, crate::vocab::NoteKind::NAMES);
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(runtime));
+        let registry = builder.build().expect("registry build");
+        let kinds = registry.all_note_kinds();
+
+        assert_eq!(kinds, crate::vocab::NoteKind::NAMES);
+        assert!(kinds.contains(&"head"));
+    }
 
     fn endpoint_str(ep: &EndpointKind) -> &'static str {
         match ep {

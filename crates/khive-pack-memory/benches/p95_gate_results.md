@@ -1,10 +1,10 @@
-# ADR-116 gate condition 2 — p95 baseline results
+# Historical warm ANN p95 baseline results
 
 Baseline `memory.recall` latency on the warm ANN path, measured against file-backed WAL
-SQLite databases matching the corpus shapes ADR-116's warm-hit generation-read gate is
-defined against. ADR-116 (PR #1080, currently in review, not yet merged) is Proposed; the
-durable per-model generation check it specifies has not landed yet. This baseline exists
-so that PR can diff its added cost against these numbers.
+SQLite databases at one and three queried models. These measurements were originally
+recorded for the retired ADR-116 proposal and remain as historical data. The maintained
+performance-gate contract is the self-contained threshold and methodology in
+`p95_gate.rs`; ADR-107 governs the ANN lifecycle behavior, not this numeric threshold.
 
 ## Method
 
@@ -16,18 +16,18 @@ so that PR can diff its added cost against these numbers.
   recording or refreshing baselines.
 - Database: file-backed SQLite in a fresh tempdir per configuration, WAL mode, not
   in-memory.
-- ADR-116's warm-hit gate is defined "at one and three models" — the number of embedding
-  models a single `memory.recall` call *queries* (M), not the number of models registered
-  on the runtime. The harness measures exactly those two gate configurations, each
-  against its own runtime/database, plus one informational beyond-gate row:
-  - **one-model** (M=1 queried, ADR-116 gate): one model registered (`BgeSmallEnV15`),
+- The maintained harness compares one and three queried models — the number of embedding
+  models a single `memory.recall` call _queries_ (M), not the number registered on the
+  runtime. It measures those two gate configurations, each against its own
+  runtime/database, plus one informational beyond-gate row:
+  - **one-model** (M=1 queried): one model registered (`BgeSmallEnV15`),
     `memory.recall` called with that model explicit.
-  - **three-model fan-out** (M=3 queried, ADR-116 gate): three models registered
+  - **three-model fan-out** (M=3 queried): three models registered
     (`BgeSmallEnV15` + `MultilingualE5Small` + `AllMiniLmL6V2`), `memory.recall` called
     with no `embedding_model` so it fans out to all three.
-  - **four-model fan-out** (M=4 queried, beyond the gate — informational only): four
+  - **four-model fan-out** (M=4 queried, beyond the maintained gate — informational): four
     models registered (adds `ParaphraseMultilingualMiniLmL12V2`), same fan-out call.
-    ADR-116 does not gate M=4; this row is not a primary-only baseline.
+    This row is not a primary-only baseline or a gate reference.
 - Corpus: 200 memories per registered model, per configuration — 200 total for one-model,
   600 for three-model fan-out, 800 for four-model fan-out.
 - Per configuration: seed, poll `memory.recall` until 5 consecutive responses are clean
@@ -35,7 +35,16 @@ so that PR can diff its added cost against these numbers.
   interval plus one settle call, then 200 timed `memory.recall` calls. Every timed sample
   is asserted clean (non-degraded, non-empty); the ANN-warm event count is snapshotted
   immediately before and after the 200-call window and asserted unchanged. The harness
-  panics immediately if either check fails.
+  panics immediately if either check fails. The settle call can enqueue but does not
+  await a detached rebuild; if that work overlaps timing and its `memory.ann_warm`
+  events persist, the event-count check rejects the run as potentially contaminated
+  and it must be repeated after quiescence. Event emission is best-effort, per arm: a
+  missing event store returns without logging (the harness's own count oracle requires
+  the store, so that arm aborts the run rather than passing it), a serialization
+  failure logs a warning and returns, and an append failure logs a warning while the
+  rebuild completes without a persisted event. An overlap whose events fail to persist
+  is therefore an evidence gap this check cannot see, limited to failures that leave
+  the count oracle usable.
 - Machine: Apple M2 Max, macOS 27.0, arm64.
 - Commit: 7b55beea3 (branch `p95-bench-harness`, the harness code measured below).
 
@@ -50,9 +59,10 @@ That marker does not cover the internal sqlite-vec exact-fallback path (taken on
 an ANN search error), which returns valid, non-degraded results. To positively assert
 against that path too, the harness uses a second, independent signal: `memory.ann_warm`
 phase-started/completed events, recorded through `KhiveRuntime::events` (a `pub` accessor
-returning `khive_storage::EventStore`; `count_events` is a `pub` trait method). No ANN
-rebuild happens without one of these events, and the sqlite-vec fallback clears the
-model's cached graph as a side effect — the *next* recall for that model would trigger
+returning `khive_storage::EventStore`; `count_events` is a `pub` trait method). Every ANN
+rebuild attempts one of these events (emission is best-effort; see the caveat in the
+methodology note above), and the sqlite-vec fallback clears the
+model's cached graph as a side effect — the _next_ recall for that model would trigger
 exactly such a rebuild. The harness snapshots this event count immediately before and
 after the 200-call timed window and asserts it is unchanged, which is strong (though not
 airtight) evidence that none of the timed samples took the exact-fallback path.
@@ -80,18 +90,18 @@ supersede this baseline.
 
 ## Results
 
-| configuration                            | p50 ms | p95 ms | p99 ms |   n | note                              |
-| ----------------------------------------- | -----: | -----: | -----: | --: | --------------------------------- |
-| one-model (M=1 queried)                   |  3.964 |  4.343 |  4.903 | 200 | ADR-116 gate case                 |
-| three-model fan-out (M=3 queried)         |  5.961 |  6.809 |  6.940 | 200 | ADR-116 gate case                 |
-| four-model fan-out (M=4 queried)          |  6.379 | 21.801 | 33.440 | 200 | beyond gate — informational only  |
+| configuration                     | p50 ms | p95 ms | p99 ms |   n | note                             |
+| --------------------------------- | -----: | -----: | -----: | --: | -------------------------------- |
+| one-model (M=1 queried)           |  3.964 |  4.343 |  4.903 | 200 | maintained gate reference        |
+| three-model fan-out (M=3 queried) |  5.961 |  6.809 |  6.940 | 200 | maintained gate reference        |
+| four-model fan-out (M=4 queried)  |  6.379 | 21.801 | 33.440 | 200 | beyond gate — informational only |
 
 ## Gate reference
 
-Per ADR-116 §Warm hit (PR #1080): the added per-model durable generation check must cost
-at most 1.0ms absolute p95 **and** at most 5% of the matching M=1 or M=3 baseline's warm
-`memory.recall` p95 above — both conditions must hold, so the permitted regression is
-whichever cap is *smaller* at each baseline.
+The maintained harness contract allows a warm-route change to add at most 1.0ms absolute
+p95 **and** at most 5% of the matching M=1 or M=3 baseline's warm `memory.recall` p95
+above. Both conditions must hold, so the permitted regression is whichever cap is
+_smaller_ at each baseline.
 
 - Against the M=1 baseline (4.343ms p95): 5% is ~0.217ms, well under the 1.0ms absolute
   cap, so the 5% bound is the binding constraint.
@@ -100,6 +110,6 @@ whichever cap is *smaller* at each baseline.
 - The 1.0ms absolute cap only binds on its own if a baseline's warm p95 exceeds 20ms
   (5% x 20ms = 1.0ms) — neither measured baseline is near that.
 
-The M=4 row (21.801ms p95) is beyond ADR-116's stated gate configurations and is not a
+The M=4 row (21.801ms p95) is beyond the maintained gate configurations and is not a
 constraint reference; it is kept for context only, and — per the isolation note above —
 its absolute value here should be read as noisy rather than a tight bound.

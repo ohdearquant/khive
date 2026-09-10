@@ -10,13 +10,14 @@ module doc-comment carries only a concise summary and points here.
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
 not unconditional passes: a credential trigger word in the surrounding window dominates, with
-exactly two narrow trigger-context exceptions (file paths and VCS revisions, defined below),
-both of which run only after the reconstruction checks and only outside credential-value syntax
-per the clause-label guard.** A UUID or a sha-prefixed content hash sitting directly beside
+narrow exemptions for file paths and explicit VCS revisions (defined below), gated by the
+clause-label guard, and a separate line-local trigger rule for bare Git-length hex values.
+The latter changes only which trigger context applies; it does not change fragment reconstruction.** A UUID or a sha-prefixed content hash sitting directly beside
 "api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
 through to explicit detection instead of being silently allowed.
 
-- Pure hex strings (sha256, git SHA) — passed when not near a trigger.
+- Pure hex strings (sha256, git SHA) — passed when not near a trigger in their applicable context.
+  Bare 40-hex values use the line-local rule below; other lengths retain the cross-line window.
 - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
 - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI hashes, npm lockfile
   integrity) — passed when not near a trigger and not preceded by a known-vendor prefix. Bare
@@ -32,11 +33,14 @@ through to explicit detection instead of being silently allowed.
   whitespace. The literal-prefix checks (Layer 1) treat any non-ASCII-alphanumeric char (CJK,
   accented text, emoji) as a token boundary, so a known-prefix secret is caught whether the
   adjacent non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
-- Known provider prefixes (Layer 1) require the configured minimum token length and reject one
-  narrow filename shape: after the prefix, a payload ending in `.py`, `.rs`, `.ts`, `.js`, `.sh`,
-  `.md`, `.toml`, or `.json` is treated as a source filename only when its stem contains lowercase
-  ASCII letters, contains at least one filename separator, and otherwise consists solely of
-  lowercase letters plus `_`, `-`, `/`, and `.`. This admits ordinary names such as
+- Known provider prefixes (Layer 1) require the configured minimum token length. Fine-grained
+  GitHub PATs require 93 total characters, OpenAI project keys require 88, and Anthropic keys
+  require 108. A registered `sk-` vendor prefix remains governed by its specific threshold rather
+  than falling through to the generic `sk-` detector. Prefix detectors also reject one narrow
+  filename shape: after the prefix, a payload ending in `.py`, `.rs`, `.ts`, `.js`, `.sh`, `.md`,
+  `.toml`, or `.json` is treated as a source filename only when its stem contains lowercase ASCII
+  letters, contains at least one filename separator, and otherwise consists solely of lowercase
+  letters plus `_`, `-`, `/`, and `.`. This admits ordinary names such as
   `vercel_deployment_monitor.py`. An uppercase letter, digit, or separator-free payload is
   independent value-shape evidence and preserves the prefix match even when the token ends in a
   source extension. Markdown/prose punctuation around the filename is ignored. This check only
@@ -198,6 +202,45 @@ credential-config compounds keep firing: `SECRET_KEY=...` (Django/Flask-style co
 half. This is implemented by parameterizing the boundary rule (`contains_word`'s
 `underscore_is_word_char` argument) rather than sharing one rule between the two callers.
 
+## Bare Git-length hex context and refusal diagnostics (2026-09-10)
+
+A standalone token of exactly 40 ASCII hex digits after delimiter stripping uses its own physical
+line as trigger context,
+within the existing 120-byte radius on either side. CR, LF, and CRLF delimit lines. The radius is
+in bytes, snapped to UTF-8 boundaries, not 120 Unicode characters. The candidate itself remains
+excluded from context. A trigger on a different line does not label this bare value, with one
+conservative exception: the immediately preceding line contributes its trigger if its last
+non-whitespace character is `:` or `=`. Indentation and outer backticks around the value do not
+remove that association. A blank intervening line breaks it; a preceding line without a delimiter
+does not contribute. The existing radius still bounds the previous-line check.
+
+Examples: `auth changes`, then `ready`, then a bare 40-hex revision is allowed, as is a trigger
+more than 120 bytes away. Direct `sha:` / `commit` references retain their existing guarded
+exemption. `token: <40hex>` on one line and `token:` or `token=` followed immediately by a newline
+and the value remain blocked. Any genuine trigger on the same line still counts, including one
+after the value. Tokens with a `0x`/`0X` prefix do not qualify. An anchor with multiple fragments in the existing
+bounded bridge retains full-window context for checking and masking, so the line-local rule
+cannot leave one fragment visible. Bridgeability also crosses newlines and admits alphanumeric
+neighbors of at least eight characters, so `auth changes`, then `completed`, then a bare revision
+retains the conservative block: the line-local exception is for isolated candidates, and cannot
+classify a bridgeable neighbor as prose. Inline assignments, separator-bearing tokens, pure
+32/64/128-hex values, UUIDs, base64 values, provider prefixes and entropy thresholds retain their
+existing rules. A caller can therefore place a real bare 40-hex credential on a different line
+without an immediate delimited label and pass this heuristic; this is the explicit ambiguity
+tradeoff for unmarked Git revisions, not proof that an allowed value is public.
+
+The public `SecretMatch` includes `trigger: Option<&'static str>`. Layer-2 detections carry a
+canonical trigger selected by the same context helper used for detection; UUID diagnostics use
+the narrower credential-label predicate. Selection is deterministic: context before the token,
+then after it, then inline labels, then a previous-line assignment label; within a context the
+existing trigger-table order wins, not nearest distance. Compound labels may report their bare
+trigger component when that component matches the existing word-boundary rule. Only names from
+the closed trigger vocabulary are returned; no source window is copied. Known-prefix rules have
+no trigger. Caller-visible refusals name the detector and, when present, `near '<trigger>'`, then
+existing guidance. They show no candidate text, even its first six characters. The existing
+`masked` field remains a bounded internal excerpt; typed error classification and masking spans
+are unchanged. `check` and `mask_secrets` share the same detection context.
+
 ## find_prefix_token
 
 Known provider-prefix matching remains context-free and requires both a token boundary and the
@@ -261,9 +304,15 @@ while the surrounding prose is preserved. Spans are discovered left to right aga
 text via `scan_from`: each scan advances a `from` cursor past the previous span but always
 evaluates trigger context over the full input. This closes the entropy-context gap — a
 high-entropy value whose only trigger word sits to the left of an earlier-redacted secret is
-still detected, because the trigger window is never sliced away. The known-prefix detectors (real
-API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub, Stripe, …) are context-free and matched the
-same way.
+still detected, because the trigger window is never sliced away. The entropy detector tokenizes
+the full input once per masking call, then uses the first token at or after the cursor on each
+pass; the known-prefix detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
+Stripe, …) remain context-free and scan the suffix. Masking limits cumulative suffix bytes
+submitted to those repeated detector sweeps to 2 MiB; the first sweep is always allowed for
+larger or multibyte callers. If dense credential-shaped input reaches that work budget with text
+remaining, the last confirmed secret span is extended through the rest of the input. This
+fail-closed tail redaction bounds repeated scan work without allowing an unscanned credential to
+survive.
 
 ## trigger_words
 
@@ -309,7 +358,8 @@ For each token, in order:
    which require an exact shape match. This is a small bounded iteration over separator positions
    in one token, not an allocation-heavy scan. Off-trigger, a UUID or content hash is allowlisted
    outright.
-2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests). Trigger-adjacent hex
+2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests), using the line-local rule
+   above for bare 40-hex values. Trigger-adjacent hex
    requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`) to earn the
    same exemption, and only when the surrounding clause carries no credential label (`api key
    value is commit <hex>` is a labeled credential wearing a marker, not a VCS citation). The

@@ -14,6 +14,17 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
     fn impl_name(&self) -> &'static str {
         std::any::type_name::<Self>()
     }
+
+    /// Return an opaque, deterministic fingerprint when this gate's policy
+    /// must participate in warm-daemon identity.
+    ///
+    /// The default preserves the legacy identity of programmatically supplied
+    /// gates whose configuration is managed outside khive. Built-in gates with
+    /// construction-baked policy override this so a stale daemon can never
+    /// serve requests under a different policy.
+    fn configuration_fingerprint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Shareable handle to a `Gate` impl.

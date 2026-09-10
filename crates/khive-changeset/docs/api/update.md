@@ -12,7 +12,7 @@ The operation's fields are private so this constructor is the only in-memory con
 
 `UpdatePatch` is tagged by `target` and selects entity, note, or edge fields. An absent field means unchanged. Nullable mutable fields use `Option<Option<T>>`: outer `None` means unchanged, `Some(None)` means explicitly clear to JSON `null`, and `Some(Some(value))` means set.
 
-`EntityPatch` can change name, nullable description, properties, and tags. `NotePatch` can change content, nullable salience/decay factor, properties, and tags. `EdgePatch` can change relation and weight.
+`EntityPatch` can change name, nullable description, nullable `entity_type`, properties, and tags. `NotePatch` can change content, nullable salience/decay factor, properties, and tags. `EdgePatch` can change relation and weight.
 
 An edge patch weight, when present, must be finite and within `[0.0, 1.0]`; custom deserialization enforces the same constraint as link creation and the live edge model.
 

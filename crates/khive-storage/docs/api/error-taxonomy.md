@@ -12,7 +12,7 @@ at first write rather than a `tokio::spawn`-outside-runtime panic. Flag-off
 callers never see this variant — `writer_task_handle` only attempts to spawn
 when `PoolConfig::write_queue_enabled` is set.
 
-## `WriterTaskTerminated` and `WriterTaskRequestState`
+## Writer-request finality
 
 `WriterTaskTerminated { request_state }` is the public error returned when a
 single-writer request cannot complete because its writer-task instance has terminated or the
@@ -22,7 +22,7 @@ what the execution seam can prove about the individual request:
 | State                   | Meaning                                                                                                                 |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `NotStarted`            | The request was not accepted, or it was drained from the closed queue without invoking its operation closure            |
-| `TransactionRolledBack` | A transaction-wrapped operation panicked, and the writer task successfully rolled back its enclosing SQLite transaction |
+| `TransactionRolledBack` | The writer successfully rolled back the request's enclosing SQLite transaction; no wrapped database write committed       |
 | `SideEffectsUnknown`    | The operation may have started, and the task cannot prove its final transaction or side-effect state                    |
 
 A top-level operation has no enclosing transaction, so a panic is always
@@ -42,26 +42,35 @@ its rendered `writer task terminated` prefix retain their historical names for w
 compatibility.
 
 If rollback after a non-panic operation or commit failure succeeds and restores autocommit mode,
-no terminal error is introduced: the caller receives the original operation error or the existing
-retryable commit pool error, and the writer remains available. A caught operation panic remains
-terminal even when its transaction was provably rolled back.
+the caller receives
+`WriterTaskRequestFailed { request_state: TransactionRolledBack, source }`.
+This wrapper carries the proof that the request left no committed SQLite effect without claiming
+the writer task terminated. The writer remains available, and the request closure is never
+re-executed internally. `source` is the original operation error or the typed
+`writer_task_commit` pool error. `capability()`, `is_retryable()`, and the specialized FTS/UNIQUE
+classifiers delegate to that source: rollback finality makes replay effect-safe but does not make a
+deterministic error transient. A caught operation panic remains terminal even when its transaction
+was provably rolled back.
 
-This error has no storage capability attribution (`capability()` returns
+`WriterTaskTerminated` has no storage capability attribution (`capability()` returns
 `None`) and is not automatically retryable (`is_retryable()` returns `false`).
 In particular, callers must not blindly retry `SideEffectsUnknown`: the first
 attempt may have committed a side effect. Retry decisions belong to the
 operation's idempotency contract.
 
-Neither `WriterTaskTerminated` nor `WriterTaskRequestState` has a serialized
-wire representation. Runtime and MCP error envelopes continue to flatten this
-storage error through `Display`; the rendered form is
-`writer task terminated (request_state=<state>)`, where `<state>` is one of
-`not_started`, `transaction_rolled_back`, or `side_effects_unknown`. This adds
-typed in-process information without changing the enclosing runtime/MCP error
-schema. `StorageError` is a public enum without `#[non_exhaustive]`, so adding
-this variant is nevertheless a Rust source-compatibility change for downstream
-code that exhaustively matches every variant; those matches must add a
-`WriterTaskTerminated` arm.
+`RuntimeError::writer_task_failure_context()` preserves the request state, source retryability, and
+whether the writer seam terminated. MCP serializes that context with stable
+`writer_task_request_failed` / `writer_task_terminated` code and stage fields plus
+`request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
+request-failed versus task-terminated disposition and reconstructs the matching storage variant.
+
+The rendered forms remain stable:
+
+- `writer task request failed (request_state=<state>): <source>`
+- `writer task terminated (request_state=<state>)`
+
+`StorageError` is a public enum without `#[non_exhaustive]`, so
+`WriterTaskRequestFailed` is a Rust source-compatibility change for downstream exhaustive matches.
 
 ## Bounded blob read failures
 
@@ -125,6 +134,65 @@ MCP preserves this proof with `code`/`stage` set to
 `writer_queue_saturated`, the queue did accept this request, and no separate
 backoff policy is defined. Other `BEGIN IMMEDIATE` failures retain the generic
 pool error and are not promoted by rendered-message matching.
+
+## Typed storage-admission timeout
+
+`StorageError::AdmissionTimeout { operation, timeout_ms }` means a bounded
+wait for storage admission — a reader/writer handle slot or a pooled reader
+checkout — elapsed before anything was acquired. The operation never started,
+so retrying cannot duplicate a side effect. This is distinct from
+`StorageError::Timeout`, which makes no claim about whether work was in
+flight when the deadline expired; only the admission variant is promoted to
+a structured retryable failure, and only by its typed variant, never by
+rendered-message matching.
+
+One carve-out: the raw-SQL reader admission paths (`sql_bridge.reader_open`
+and `sql_bridge.reader_operation`) keep returning `StorageError::Timeout` on
+saturation, as the ADR-005 reader-admission amendment requires. The typed
+admission variant covers the writer-handle, atomic-unit, and pooled-reader
+checkout budgets.
+
+MCP emits `code`/`stage` of `storage_admission_timeout` with the failing
+`operation`, the elapsed `timeout_ms`, and `retryable: true`. `capability`,
+`scope`, and `retry_after_ms` are null: the handle-slot and reader-checkout
+budgets are capability-neutral and no separate backoff policy is defined.
+
+## Typed cached-reader read-transaction age eviction
+
+`sql_bridge`'s cached-reader read path proactively rolls back an admitted
+read transaction once it has pinned a WAL snapshot past the configured
+`read_tx_max_age` (#1846). Two typed, capability-neutral, `is_retryable() ==
+true` variants report the outcome, both public and both introduced by this
+change:
+
+- `StorageError::ReadTransactionAgeEvicted { operation, max_age_secs }` — the
+  `ROLLBACK` succeeded and autocommit was restored; the connection returns to
+  the pool ready for a fresh read snapshot.
+- `StorageError::ReadTransactionAgeEvictionCleanupFailed { operation,
+  max_age_secs, message }` — the `ROLLBACK` was denied or errored, or it
+  reported success without actually restoring autocommit. The connection is
+  discarded instead of being returned to the pool. `message` names which of
+  the two cleanup failures occurred.
+
+Both are always safe to retry: the age check runs before any read on the
+connection, so no side effect exists for a retry to duplicate, regardless of
+which cleanup outcome followed. Both are distinct from the generic
+`StorageError::Transaction` variant, whose other cases (write-side ambiguity,
+unrelated rollback failures) are not uniformly safe to retry — callers must
+not detect this condition by parsing rendered text.
+
+MCP maps both variants to the same `code`/`stage` of `read_tx_age_evicted`
+(`khive_runtime::error::READ_TX_AGE_EVICTED_STAGE`), the failing `operation`,
+`capability: "sql"`, `retryable: true`, and `timeout_ms` set to
+`max_age_secs * 1000`. `scope` and `retry_after_ms` are null. The rendered
+`message` field is the only wire-visible way to distinguish a clean eviction
+from a failed cleanup.
+
+`StorageError` is a public enum without `#[non_exhaustive]`, so adding these
+two variants is a Rust source-compatibility change for downstream code that
+exhaustively matches every variant; those matches must add
+`ReadTransactionAgeEvicted` and `ReadTransactionAgeEvictionCleanupFailed`
+arms.
 
 ## `is_fts5_syntax_error`
 

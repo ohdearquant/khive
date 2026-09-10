@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-20 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+24 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                          |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -30,7 +30,12 @@ workspace declares it as a dependency.
 | `context`        | Entity-anchored graph context in one call (ADR-089)                                                                                                                                                                                                                                                                                                                                                   |
 | `resolve`        | Resolve natural-language references to record ids                                                                                                                                                                                                                                                                                                                                                     |
 | `whoami`         | Report the caller identity this request resolved to                                                                                                                                                                                                                                                                                                                                                   |
-| `db_diagnostics` | Writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics: aggregate plus pooled/standalone/writer-task acquisition counters, pooled timeouts, writer-task request failures and their unknown-side-effects subset, swallowed audit failures, additive audit-batch flush-failure/degraded-row/degraded fields (present once a runtime audit-batch control is wired), duplicate edge-ID and list-ledger counts, checkpoint counters, PASSIVE probe, WAL size, and explicitly qualified holder census (probe may backfill WAL frames; never TRUNCATE, never creates or deletes files) |
+| `db_diagnostics` | Reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics: reader admission capacity/availability, pooled checkouts, separately attributed standalone opens, timeouts and hold lifecycle; aggregate plus pooled/standalone/writer-task writer acquisitions, writer-task failures, swallowed audit failures, duplicate edge-ID/list-ledger counts, checkpoint counters, PASSIVE probe, WAL size, and qualified holder census (probe may backfill WAL frames; never TRUNCATE or create/delete files) |
+
+| `stream.append` | Append immutable JSON with a dense sequence and optional expected_seq precondition |
+| `stream.read` | Read an ordered page, head_seq and next_after from one snapshot |
+| `stream.stat` | Count entries and read head_seq from one snapshot |
+| `stream.batch` | Append over several streams in one request, atomic under a fence or per member |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).
@@ -80,8 +85,9 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of twelve packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`,
+`khive-mcp` loads a default set of fourteen packs: `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session`, `tool`, `exec`, `git`, `code`,
+`workspace`, `blob`,
 with `kg` always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
@@ -103,3 +109,50 @@ Governing ADRs:
 ## License
 
 Apache-2.0.
+
+
+## Ordered streams
+
+`stream.append(stream, record, expected_seq=None, note_kind="observation", tags=None)`
+stores any JSON value, including a scalar or null, as an immutable note. Stream
+names are namespace scoped and at most 512 UTF-8 bytes, with no U+0000. Each stream
+starts at sequence 1. `expected_seq` is the number the new entry must receive;
+a mismatch returns `conflict` with string-valued `details.reason="seq_conflict"`,
+`stream`, `expected_seq` and `next_seq`, without inserting a note or ledger row.
+The result is `{seq, id, created_at}`.
+
+`stream.read(stream, after=0, limit=1000)` returns `{entries, head_seq, next_after}`.
+Entries carry `{seq, id, record, created_at}` and are ordered by sequence, strictly
+after the supplied cursor. `next_after` is the last returned sequence when more
+entries remain, otherwise null. An unknown stream is an empty page with head 0.
+`stream.stat(stream)` returns `{head_seq, count}` from a single snapshot; count
+and head are read independently to expose any density defect.
+
+Entry content, properties (including tags), kind and namespace are immutable;
+soft and hard deletion are refused with `details.reason="stream_member"` and
+string-valued `id`, `stream` and `seq`. Display name, salience and decay factor
+remain editable. Write a separate annotation note to add information.
+
+To reconcile a lost reply, retry the same `expected_seq`. On conflict, read
+`after=expected_seq-1, limit=1` and compare your distinguishable record. A request
+chain (`|`) preserves caller order; a request array gives dense numbers in writer
+admission order, which need not be array order.
+
+A supplied `fence`, including null, is refused until the later slice with
+versioned leases. This slice adds no lease fence, batch verb, retention, drop,
+subscription or protocol version change.
+
+```text
+request(ops='stream.append(stream="run", record={"step":1}, expected_seq=1)', presentation="verbose")
+kkernel exec 'stream.read(stream="run", after=0, limit=1000)' --presentation verbose
+```
+
+```python
+from khive import Khive, op
+
+client = Khive()
+client.batch([op("stream.append", stream="run", record=None, expected_seq=1)])
+```
+
+Use verbose JSON for full identifiers and canonical timestamps. Agent presentation
+also preserves each stream record exactly and keeps empty pages and terminal cursors.

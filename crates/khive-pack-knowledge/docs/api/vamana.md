@@ -100,6 +100,14 @@ both empty and operational `Failed` outcomes may be retried by a later request. 
 outcome keeps a failed Stale-rebuild replacement retryable even though ADR-079 rule 8 leaves its
 older bridge available to search. Search's bounded wait and FTS degradation timing are unchanged.
 
+`finish_warm`'s Ready decision (reading `AnnState::indexes` for the just-built bridge) and its
+publication into `warm_states` share one `indexes` read-lock critical section: the guard stays held
+across the `warm_states` write, so the rotation watcher's eviction (below), which takes `indexes`
+write then `warm_states` under the same discipline, can never interleave between the decision and
+the publish (issue #2340). Either the eviction blocks on the write lock until the guard drops and
+then observes and clears the Ready state it orphaned, or it has already run and removed the bridge
+before the guard is taken, so the decision observes the absence and publishes `Failed` instead.
+
 ## `AnnState::generations` (per-namespace write-generation counter, issue #770)
 
 Bumped by `clear_namespace` whenever a corpus mutation invalidates a namespace's ANN
@@ -117,12 +125,34 @@ flight for it.
 
 Acquires `<segment-dir>/.bridge-checkpoint.lock`, writes Vamana index segments via
 `VamanaIndex::save_atomic` (which commits a v2 `KHVVAMG2` record in `metadata.bin` carrying a
-`content_hash`), then writes the id-map sidecar (`external_ids.bin`) atomically via a
+`content_hash` and a fresh per-publication nonce), then writes the id-map sidecar (`external_ids.bin`) atomically via a
 tmp-then-rename sequence stamped with the commit digest. Checkpoint callers retain that same lock
 through mmap re-adoption and the conditional consumer-watermark transition. Sentinel publication
 takes it too, preventing both mixed commit/sidecar pairs and a checkpoint racing registry-loss
 recovery. A per-key process lock wraps the same checkpoint on every runtime, including pathless
 in-memory runtimes, so a later durable raise cannot be followed by an older cache install.
+
+## Rotated mmap generation release (#2081)
+
+File-backed pack warm starts one five-second watcher for the shared `AnnState`. Its unchanged path
+reads only each installed bridge's small `metadata.bin`. The publication nonce makes the commit
+digest change on every successful rotation, including a byte-identical index rebuild, so it is an
+honest file-generation identity rather than only a content fingerprint.
+
+On a changed identity the watcher takes the per-key process checkpoint lock followed by
+`<segment-dir>/.bridge-checkpoint.lock`, matching writer lock order. It rechecks the identity,
+loads and validates the Vamana files plus UUID sidecar, rejects a regressing write-log watermark,
+and swaps the replacement with the incumbent namespace generation. Dropping the replaced bridge
+releases the unlinked vector/code mappings without waiting for a search or process exit. If the
+changed publication is incomplete or invalid, `evict_bridge_and_ready_state` removes the predecessor
+and clears the key's Ready ownership under one `indexes` write-lock critical section, so the normal
+request warm can retry Cold; invalid bytes never become servable and the predecessor cannot remain
+as hidden deleted-file disk usage. The state cleanup is keyed on the evicted bridge's own
+generation, not "any Ready" — a later build's Ready state sharing the key is left alone.
+
+The task retains only the ANN root and a weak state reference between ticks and exits on daemon
+shutdown or state drop. The stdio idle timeout is merely an optional process-lifetime backstop;
+rotation release does not depend on it.
 
 ## `ensure_ann_for_model` load order
 

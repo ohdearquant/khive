@@ -20,8 +20,10 @@ use crate::capability::StorageCapability;
 pub enum WriterTaskRequestState {
     /// The request's operation closure was never invoked.
     NotStarted,
-    /// The request panicked inside `BEGIN IMMEDIATE`, and that transaction was
-    /// successfully rolled back on the connection that owned it.
+    /// The request ran inside `BEGIN IMMEDIATE`, and that transaction was
+    /// successfully rolled back on the connection that owned it. The request
+    /// may have returned an error, failed COMMIT, or panicked; none of its
+    /// wrapped SQLite writes committed.
     TransactionRolledBack,
     /// The request was accepted, but its exact outcome cannot be established;
     /// it may already have produced side effects and must not be blindly
@@ -118,9 +120,61 @@ pub enum StorageError {
     #[error("timeout during {operation}")]
     Timeout { operation: Cow<'static, str> },
 
+    /// A bounded wait for storage admission (a reader/writer handle slot or a
+    /// pooled reader checkout) elapsed before anything was acquired. The
+    /// operation never started, so retrying cannot duplicate a side effect —
+    /// distinct from [`StorageError::Timeout`], which makes no claim about
+    /// whether work was in flight when the deadline expired.
+    #[error("admission timeout during {operation} after {timeout_ms}ms")]
+    AdmissionTimeout {
+        operation: Cow<'static, str>,
+        /// The configured admission deadline that elapsed, in milliseconds.
+        timeout_ms: u64,
+    },
+
     #[error("sql transaction failure during {operation}: {message}")]
     Transaction {
         operation: Cow<'static, str>,
+        message: String,
+    },
+
+    /// A cached read-only handle's admitted transaction pinned a WAL
+    /// snapshot past the configured `read_tx_max_age` bound and was
+    /// proactively rolled back so the next call can open a fresh snapshot
+    /// (#1846). Distinct from the generic [`StorageError::Transaction`]
+    /// variant — which also covers failed-cleanup and write-side ambiguity
+    /// cases that are not uniformly safe to retry — so callers (and MCP
+    /// dispatch) can recognize this specific, always-safe-to-retry
+    /// condition by variant rather than by parsing rendered text.
+    #[error(
+        "cached read-only transaction exceeded the maximum read-transaction age \
+         ({max_age_secs}s) during {operation} and was rolled back; retry to open a fresh \
+         read snapshot"
+    )]
+    ReadTransactionAgeEvicted {
+        operation: Cow<'static, str>,
+        max_age_secs: u64,
+    },
+
+    /// A cached read-only handle's admitted transaction pinned a WAL
+    /// snapshot past `read_tx_max_age`, and the proactive rollback used to
+    /// end the eviction (#1846) did not restore autocommit, or the rollback
+    /// itself failed. The connection is discarded either way rather than
+    /// returned to the pool. The age check that triggered this still ran
+    /// before any read on the connection, so — exactly like
+    /// [`StorageError::ReadTransactionAgeEvicted`] — retrying the caller's
+    /// operation on a fresh connection is always safe; this variant exists
+    /// only to keep that guarantee distinguishable from a clean eviction in
+    /// the rendered message and to keep [`StorageError::Transaction`] (whose
+    /// other cases are not uniformly safe to retry) out of this path.
+    #[error(
+        "cached read-only transaction exceeded the maximum read-transaction age \
+         ({max_age_secs}s) during {operation} but could not be cleanly rolled back \
+         ({message}); the connection was discarded, retry to open a fresh read snapshot"
+    )]
+    ReadTransactionAgeEvictionCleanupFailed {
+        operation: Cow<'static, str>,
+        max_age_secs: u64,
         message: String,
     },
 
@@ -159,6 +213,18 @@ pub enum StorageError {
         "writer task could not begin within {timeout_ms}ms because SQLite remained busy; request was not executed"
     )]
     WriterTaskBusy { timeout_ms: u64 },
+
+    /// One transaction-wrapped writer request returned an error, and the
+    /// writer then proved that request's SQLite transaction was rolled back.
+    /// Unlike [`StorageError::WriterTaskTerminated`], this does not retire the
+    /// writer seam. `source` preserves the operation or COMMIT error so its
+    /// capability and retry policy remain independently inspectable.
+    #[error("writer task request failed (request_state={request_state}): {source}")]
+    WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState,
+        #[source]
+        source: Box<StorageError>,
+    },
 
     /// A single-writer execution seam has terminated permanently. This is the
     /// historical writer-task variant and display name; the fail-closed
@@ -229,9 +295,13 @@ impl StorageError {
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
+            Self::WriterTaskRequestFailed { source, .. } => source.capability(),
             Self::Pool { .. }
             | Self::Timeout { .. }
+            | Self::AdmissionTimeout { .. }
             | Self::Transaction { .. }
+            | Self::ReadTransactionAgeEvicted { .. }
+            | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
             | Self::WriteQueueFull { .. }
             | Self::WriterTaskBusy { .. }
             | Self::WriterTaskTerminated { .. }
@@ -242,11 +312,17 @@ impl StorageError {
 
     /// Whether this error is transient and the operation may succeed on retry.
     pub fn is_retryable(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_retryable();
+        }
         matches!(
             self,
             Self::Pool { .. }
                 | Self::Timeout { .. }
+                | Self::AdmissionTimeout { .. }
                 | Self::Transaction { .. }
+                | Self::ReadTransactionAgeEvicted { .. }
+                | Self::ReadTransactionAgeEvictionCleanupFailed { .. }
                 | Self::WriteQueueFull { .. }
                 | Self::WriterTaskBusy { .. }
         )
@@ -268,6 +344,9 @@ impl StorageError {
     /// "successful" search (issue #389).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_fts5_syntax_error`.
     pub fn is_fts5_syntax_error(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_fts5_syntax_error();
+        }
         let Self::Driver {
             capability,
             operation,
@@ -300,6 +379,9 @@ impl StorageError {
     /// also hide genuine write failures (disk full, corruption).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_unique_constraint_violation`.
     pub fn is_unique_constraint_violation(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_unique_constraint_violation();
+        }
         let Self::Driver {
             capability,
             operation,
@@ -370,6 +452,47 @@ mod tests {
             "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
         );
         assert_eq!(error.capability(), None);
+    }
+
+    #[test]
+    fn writer_task_request_failure_preserves_source_policy_and_rollback_state() {
+        let error = StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        };
+
+        assert_eq!(error.capability(), None);
+        assert!(
+            error.is_retryable(),
+            "rollback finality must not discard the source error's retry policy"
+        );
+        assert_eq!(
+            error.to_string(),
+            "writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused"
+        );
+        assert_eq!(
+            StdError::source(&error).map(ToString::to_string),
+            Some("pool failure during writer_task_commit: commit refused".to_string()),
+            "the original typed storage error must remain the public source"
+        );
+    }
+
+    #[test]
+    fn writer_task_request_failure_does_not_invent_retryability() {
+        let error = StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "append_note".into(),
+                message: "deterministic refusal".into(),
+            }),
+        };
+
+        assert!(!error.is_retryable());
+        assert_eq!(error.capability(), Some(StorageCapability::Notes));
     }
 
     #[test]

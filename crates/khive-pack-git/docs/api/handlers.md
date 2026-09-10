@@ -2,6 +2,9 @@
 
 Extracted from `crates/khive-pack-git/src/handlers.rs` doc-comments.
 
+For the separate read of persisted ingest progress, see
+[`git.ingest_cursor`](ingest_cursor.md). It does not run this digest handler.
+
 ## `RemoteRecoveryStage` / `RemoteCommitRecovery`
 
 Issue #765 remote-only repair policy: at most one `git fetch --refetch`,
@@ -24,11 +27,15 @@ passed through).
 
 The handler preserves the caller's `include` bits when it enters
 `run_ingest`; it never masks issues/pull requests merely because the parsed
-source URL is not on GitHub. The handler supplies the canonical source's
-expected GitHub slug when available; otherwise the ingest core derives it
-from `origin`. The core owns the truthful source-bound `gh` probe and records
-requested-but-unusable sources as `Skipped`, which is
-required for accurate `history_exhausted` reporting.
+source URL is not on GitHub. A remote source acquires a scratch clone only
+when commits are requested; issues/pull-requests-only passes supply the
+canonical source's GitHub slug directly and execute source-bound `gh` calls
+from a neutral working directory. If that remote URL has no GitHub slug, the
+core does not derive an unrelated `origin` from the neutral directory and
+records requested remote sources as `Skipped`. Local-path and administrative
+callers may still derive the slug from their checkout's `origin`. This
+truthful probe behavior is required for accurate `history_exhausted`
+reporting.
 
 The handler serializes `IngestReport` with no `receipt_id`. Both normal and
 multi-backend runtime dispatch paths then persist the complete successful

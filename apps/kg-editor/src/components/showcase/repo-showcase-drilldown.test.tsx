@@ -321,7 +321,7 @@ describe("repository showcase analysis drilldown", () => {
       .getByRole("heading", { level: 4, name: labels.metrics.fan_in })
       .closest("section")!;
     await user.click(within(fanInSection).getByRole("button", {
-      name: dependent.source_path,
+      name: `Inspect ${dependent.source_path}`,
     }));
     await waitFor(() =>
       expect(within(inspector).getByRole("heading", { level: 3 }))
@@ -342,7 +342,7 @@ describe("repository showcase analysis drilldown", () => {
       .getByRole("heading", { level: 4, name: labels.metrics.fan_out })
       .closest("section")!;
     await user.click(within(fanOutSection).getByRole("button", {
-      name: dependency.source_path,
+      name: `Inspect ${dependency.source_path}`,
     }));
     await waitFor(() =>
       expect(within(inspector).getByRole("heading", { level: 3 }))
@@ -366,7 +366,7 @@ describe("repository showcase analysis drilldown", () => {
       })
       .closest("section")!;
     await user.click(within(couplingSection).getByRole("button", {
-      name: coupling.module.source_path,
+      name: `Inspect ${coupling.module.source_path}`,
     }));
     await waitFor(() =>
       expect(within(inspector).getByRole("heading", { level: 3 }))

@@ -119,8 +119,13 @@ impl SqlEventStore {
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         } else {
+            // Atomic SQL units release the connection guard between statements;
+            // share their unit budget so this transaction cannot overlap one.
+            let unit_slot = crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?;
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
+                // Cancellation of the caller must not release the slot before this job ends.
+                let _unit_slot = unit_slot;
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
                 f(guard.conn()).map_err(|e| map_err(e, op))
             })
@@ -134,37 +139,13 @@ impl SqlEventStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Events,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Events,
-                op,
-                move |scope| {
-                    let mut guard = pool
-                        .reader_until(|| scope.should_stop())
-                        .map_err(|e| map_sqlite_err(e, op))?
-                        .ok_or_else(|| StorageError::Timeout {
-                            operation: op.into(),
-                        })?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Events,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -389,8 +370,7 @@ fn batch_append_events_dml(
     Ok(BatchWriteSummary {
         attempted,
         affected,
-        failed: 0,
-        first_error: String::new(),
+        ..BatchWriteSummary::default()
     })
 }
 
@@ -1277,18 +1257,18 @@ impl EventStore for SqlEventStore {
         })?;
 
         self.with_reader("query_events", move |conn| {
+            // No `COUNT(*)` here, and `total` is therefore `None`. The count
+            // carried no `LIMIT`, so it scanned the whole filtered set on every
+            // paged read while the data query below fetches only
+            // `offset + limit` rows — and on the merged event plane a single
+            // read paid it twice, once per underlying store. `Page.total` is
+            // `Option<u64>` precisely so a store may decline to compute it, and
+            // the merged fold in `khive-runtime::events_split` propagates `None`
+            // rather than inventing a number. `count_events` below remains for
+            // callers that genuinely want a cardinality.
             let (where_clause, filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
 
-            let count_sql = format!("SELECT COUNT(*) FROM events{}", where_clause);
-            let total: i64 = {
-                let mut stmt = conn.prepare(&count_sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    filter_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
-
-            let (_, data_filter_params) = build_event_filter_sql(conn, &namespace, &filter)?;
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
             all_params.push(Box::new(limit_i64));
             all_params.push(Box::new(offset_i64));
 
@@ -1313,10 +1293,7 @@ impl EventStore for SqlEventStore {
                 items.push(row?);
             }
 
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            Ok(Page { items, total: None })
         })
         .await
     }

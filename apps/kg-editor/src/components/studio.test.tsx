@@ -217,7 +217,7 @@ describe("KG Studio", () => {
     await user.click(screen.getByRole("button", { name: /Approve locally/i }));
 
     expect(
-      screen.getAllByText(/ADR-102 requires a reviewer outside family:demo-frontier/i),
+      screen.getAllByText(/ADR-102 requires a reviewer outside family:demo-author/i),
     ).toHaveLength(2);
     expect(screen.queryByText(/Local decision: approved/i)).not.toBeInTheDocument();
   });
@@ -227,11 +227,11 @@ describe("KG Studio", () => {
     render(<Studio initialBundle={demoReviewFixture} />);
 
     const reviewer = screen.getByRole("combobox", { name: "Reviewer model family" });
-    await user.selectOptions(reviewer, "family:independent-reasoner");
+    await user.selectOptions(reviewer, "family:demo-reviewer");
     await user.click(screen.getByRole("button", { name: /Approve locally/i }));
     expect(screen.getByText(/Local decision: approved/i)).toBeVisible();
 
-    await user.selectOptions(reviewer, "family:demo-frontier");
+    await user.selectOptions(reviewer, "family:demo-author");
     expect(screen.queryByText(/Local decision: approved/i)).not.toBeInTheDocument();
   });
 

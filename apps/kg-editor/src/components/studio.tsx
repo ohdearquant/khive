@@ -79,9 +79,9 @@ const viewLabels: Record<View, string> = {
 };
 
 const reviewerFamilies = [
-  "family:demo-frontier",
-  "family:independent-reasoner",
-  "family:human-curator",
+  "family:demo-author",
+  "family:demo-reviewer",
+  "family:demo-auditor",
 ];
 
 function formatDate(value: string): string {

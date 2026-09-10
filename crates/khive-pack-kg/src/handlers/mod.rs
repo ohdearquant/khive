@@ -9,15 +9,19 @@ mod graph;
 mod link;
 mod list;
 mod merge;
+mod note_list;
 mod params;
 mod proposal;
 mod resolve;
 mod search;
 mod stats;
+mod stream;
 mod update;
 mod whoami;
 
-pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relation};
+pub(crate) use common::{
+    canonical_entity_kind, canonical_note_kind, parse_relation, validate_entity_type,
+};
 
 /// ADR-099 B3: real `pub` re-export so kkernel's `--atomic` seam validates through the
 /// SAME canonical param structs the handlers deserialize, reproducing
@@ -43,3 +47,6 @@ pub(crate) use common::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stream_tests;

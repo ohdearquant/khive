@@ -9,12 +9,12 @@ use serde_json::{json, Value};
 
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventView, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
-    VerbRegistry,
+    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeError, VerbRegistry, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
-use khive_types::HandlerDef;
+use khive_types::{HandlerDef, IdResolutionMode};
 
 use crate::event::interpret;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
@@ -55,6 +55,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Specific parameter to query: \"recall::relevance_weight\" | \"recall::salience_weight\" | \"recall::temporal_weight\". Omit to return all.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -67,6 +68,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "integer",
             required: false,
             description: "Maximum events to return (default 20, max 100).",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -90,18 +92,22 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             total_cost_unit_page_scoped) instead of being returned under its normal name. \
             window_event_total always carries the true count regardless. \
             `kind`/`actor` filters are applied in SQL before the internal window cap \
-            — `window_event_total` reflects the exact filtered total even when \
-            truncated=true. For an exact per-actor count of a specific low-frequency kind, pass \
+            — `window_event_total` reflects the filtered total as counted at its own read \
+            instant (an independent read from the returned rows) even when \
+            truncated=true. For a per-actor count of a specific low-frequency kind, pass \
             `kind=` explicitly rather than reading it out of an unfiltered call's \
             counts_by_kind/counts_by_actor breakdown, which is capped over the mixed-kind \
             window and can undercount a low-frequency kind relative to noisier ones. The \
             unfiltered default view (no `kind`) segregates the high-volume `audit` kind from \
             the shared truncation budget so it cannot crowd other kinds out of counts_by_kind. \
-            Pass exhaustive=true for an exact, non-sampled full-window aggregate (paginates \
+            Pass exhaustive=true for a non-sampled full-window aggregate (paginates \
             internally; still one call) instead of a single bounded page — higher cost, use \
-            for coverage-panel/audit-style queries. Exhaustive windows matching more than \
+            for coverage-panel/audit-style queries. Aggregation is a point-in-time view of \
+            the live event plane: rows appended while the call paginates may be excluded; \
+            bound `until` in the past for a closed population. Exhaustive windows matching more than \
             2,000,000 events are rejected rather than returned as partial aggregates; narrow \
-            since/until or add actor/kind filters.",
+            since/until or add actor/kind filters. Scope defaults to the caller; named foreign \
+            actors must be visible, and all_actors=true requires the serving brain.fleet_readers allowlist.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -110,39 +116,54 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Window start, ISO-8601/RFC-3339 datetime (e.g. \"2026-07-01T00:00:00Z\"). Inclusive. A date-only value (\"2026-07-01\") anchors to that day's earliest instant in the configured display timezone.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "until",
                 param_type: "string",
                 required: false,
                 description: "Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now. A date-only value covers the whole named day: it anchors to the NEXT day's earliest instant in the configured display timezone.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Filter to a single actor. Stored actor strings are prefixed \
-                    (e.g. \"actor:lambda:khive\"); pass either the bare seat form \
-                    (\"lambda:khive\") or the stored prefixed form — both match. Omit for all \
-                    actors.",
+                description: "Defaults to the caller; a named foreign actor must be visible to the caller. \
+                    Ordinary actor ids match actor: plus the unchanged id; a historical bare alias also \
+                    matches only when the id has no reserved runtime kind prefix (actor:, anonymous:, agent:). \
+                    An explicit reserved-prefix value matches exactly and checks structural caller identity; \
+                    visibility uses the id after one actor: prefix, otherwise the unchanged label. Default-scoped \
+                    counts use one caller-label key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "all_actors",
+                param_type: "boolean",
+                required: false,
+                description: "Default false; true reads all actors only when the caller's actor id is in the serving brain.fleet_readers config and cannot be combined with actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "exhaustive",
                 param_type: "boolean",
                 required: false,
                 description: "When true, paginate through every matching event instead of a \
-                    single bounded page, returning an exact (non-sampled) full-window \
-                    aggregate in one call. Higher cost than the default bounded page \
+                    single bounded page, returning a non-sampled full-window aggregate \
+                    over a best-effort live view in one call (rows appended while the \
+                    call paginates may be included or excluded). Higher cost than the default bounded page \
                     (internally issues multiple storage queries); intended for coverage-panel \
                     / audit-style queries over large windows. Windows above the 2,000,000-event \
                     exhaustive limit are rejected; narrow since/until or add filters. Default \
                     false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -156,6 +177,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Filter profiles by lifecycle state: \"active\" | \"inactive\" | \"archived\". Omit to return all.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -168,11 +190,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier. Alias: id.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
         name: "brain.resolve",
-        description: "Show which profile would serve a caller context",
+        description: "Show which profile would serve the caller; a named foreign actor must be visible to the caller.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -181,18 +204,21 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Verb or operation type the caller is about to perform (e.g. \"recall\").",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Caller actor identifier. Defaults to the caller's dispatch identity; anonymous callers match only wildcard bindings. Pass explicitly to query another identity.",
+                description: "Defaults to the caller's dispatch identity; a named foreign actor must be visible to the caller, and omitted anonymous actors match only wildcard bindings.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Namespace for binding resolution. Defaults to \"*\" wildcard match.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -207,6 +233,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to activate (e.g. \"balanced-recall-v1\").",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -219,6 +246,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to deactivate.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -231,6 +259,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: true,
             description: "Profile ID to archive.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -243,6 +272,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             param_type: "string",
             required: false,
             description: "Profile ID to reset (must exist and be active). Defaults to \"balanced-recall-v1\". Use brain.profiles() to list profiles.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     HandlerDef {
@@ -258,42 +288,49 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
                               or entity the feedback applies to. Prefix resolution is \
                               namespace-unfiltered under ADR-007.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: true,
                 description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\" | \"explicit_positive\" | \"explicit_negative\" | \"implicit_positive\" | \"implicit_negative\" | \"correction\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the result being rated. Recorded in the event payload.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_attribution",
                 param_type: "string",
                 required: false,
                 description: "Serve-time attribution state: \"profile\" | \"unattributed\" | \"unspecified\". Unattributed implicit feedback is forced to zero weight; explicit/correction feedback is rejected. It never falls back to a binding/default profile.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "section_signals",
                 param_type: "object",
                 required: false,
                 description: "Per-section feedback signals: {\"section_name\": \"useful\"|\"not_useful\"|\"wrong\"}. For knowledge_compose profiles.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -311,54 +348,63 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Recall query that produced the results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects retained as candidate context. No result is credited by rank position.",
+                description: "Recall result objects retained as candidate context: an array of objects, each with an id field (the result UUID or compact id) and optionally served_by_profile_id; bare id strings are rejected. No result is credited by rank position.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "target_id",
                 param_type: "string",
                 required: false,
                 description: "Exact full UUID or compact id value of the one result being judged. Required when signal is supplied and must occur exactly once in results.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: false,
                 description: "Feedback signal. Omission means abstain: no FeedbackExplicit event or posterior update.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the recall. Defaults like brain.feedback.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_attribution",
                 param_type: "string",
                 required: false,
                 description: "Serve-time attribution state. Top-level attribution fields form one pair; when neither is supplied, both are copied from the selected recall result.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
                 description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Exact feedback namespace override (ADR-007 Rev 6 escape hatch). The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -375,30 +421,35 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Consumer kind that served these results, e.g. \"recall\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID resolved at serve time. Omitted when unresolved.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "target_ids",
                 param_type: "array",
                 required: true,
                 description: "Note/entity ids that were served; one ledger row per id.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "query_raw",
                 param_type: "string",
                 required: true,
                 description: "Raw query text; query_class is derived from this deterministically.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_at",
                 param_type: "integer",
                 required: false,
                 description: "Serve timestamp in epoch microseconds. Defaults to now.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -421,6 +472,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             description: "Free-form label for this unit of work (e.g. \"wake\", \"turn\"), \
                 recorded in the event payload's `phase` field for debugging. Does not affect \
                 the work_class grouping, which stays fixed at \"actor_turn\".",
+            resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
@@ -435,30 +487,35 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Profile ID to bind (must exist).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Actor identifier to match. Default \"*\" (all actors). Cannot contain \"*\" inside a real value.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Namespace to match. Default \"*\" (all namespaces).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Registered brain consumer kind to match. Default \"*\" (all kinds). Unknown kinds are rejected with the loaded valid set.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "priority",
                 param_type: "integer",
                 required: false,
                 description: "Binding priority; higher wins when multiple bindings match (default 0).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -473,30 +530,34 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this profile ID. All filters use AND semantics. At least one filter is required.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this namespace.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this consumer_kind.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "brain.bindings",
-        description: "List rows in the profile resolution table, optionally filtered",
+        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -505,24 +566,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by profile ID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by actor.",
+                description: "Defaults to the caller's actor label; a named foreign actor must be visible to the caller.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by namespace.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Filter bindings by consumer_kind.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -537,24 +602,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Profile ID / name (alphanumeric, hyphens allowed, e.g. \"my-profile-v1\"). Must be unique.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
                 description: "Human-readable description for this profile.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
                 description: "Operation kind this profile targets (e.g. \"recall\"). Default \"recall\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "seed_priors",
                 param_type: "object",
                 required: false,
                 description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -570,24 +639,28 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: true,
                 description: "Stable identifier for the adapter (used as the entity name).",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "content_hash",
                 param_type: "string",
                 required: true,
                 description: "Content hash of the adapter weights for integrity verification.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "base_model_revision",
                 param_type: "string",
                 required: true,
                 description: "Base model revision the adapter was trained against. Must match the active revision or registration is rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "metadata",
                 param_type: "object",
                 required: false,
                 description: "Optional additional metadata merged into entity properties.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -605,18 +678,21 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Complete UUID or globally unique 8+ hex prefix of the record the \
                               feedback applies to. Prefix resolution is namespace-unfiltered \
                               under ADR-007.",
+                resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: true,
                 description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\". Deprecated: use brain.feedback instead.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the result.",
+                resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
@@ -821,6 +897,32 @@ impl BrainPack {
         }
     }
 
+    fn caller_actor_label(token: &NamespaceToken) -> String {
+        let actor = token.actor();
+        if actor.kind == "actor" {
+            actor.id.clone()
+        } else {
+            format!("{}:{}", actor.kind, actor.id)
+        }
+    }
+
+    fn split_stamped_actor_label(label: &str) -> Option<(&str, &str)> {
+        label
+            .split_once(':')
+            .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
+    }
+
+    fn check_read_actor(token: &NamespaceToken, actor: &str) -> Result<(), RuntimeError> {
+        if actor != Self::caller_actor_label(token)
+            && !token.visible_namespace_strs().contains(&actor)
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "actor {actor:?} is not visible to this caller"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_event_counts(
         &self,
         token: &NamespaceToken,
@@ -830,6 +932,7 @@ impl BrainPack {
         #[serde(deny_unknown_fields)]
         struct EventCountsParams {
             actor: Option<String>,
+            all_actors: Option<bool>,
             kind: Option<String>,
             // `Option`, not a required `String`: a bare-missing `since` must go through
             // the same named-field-plus-example-format error as a malformed one, not
@@ -838,13 +941,50 @@ impl BrainPack {
             until: Option<String>,
             // #21: opt into full-window aggregation (paginates through every
             // matching event instead of a single bounded page) so a coverage
-            // panel gets exact per-verb/kind/actor counts in one call, without
-            // stitching sampled windows client-side. Default false — the
+            // panel gets non-sampled per-verb/kind/actor counts in one call,
+            // without stitching sampled windows client-side. The window is a
+            // best-effort live view, not a snapshot (see the walk's docs). Default false — the
             // bounded page is cheaper and sufficient for most callers.
             exhaustive: Option<bool>,
         }
         let p: EventCountsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let all_actors = p.all_actors.unwrap_or(false);
+        if all_actors && p.actor.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "all_actors=true cannot be combined with actor".into(),
+            ));
+        }
+        if all_actors
+            && !self
+                .runtime
+                .config()
+                .brain
+                .fleet_readers
+                .contains(&token.actor().id)
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "actor {:?} is not a configured fleet reader",
+                token.actor().id
+            )));
+        }
+        let caller = Self::caller_actor_label(token);
+        if let Some(actor) = p.actor.as_deref() {
+            let (identity, is_self) = match Self::split_stamped_actor_label(actor) {
+                Some((kind, id)) => (
+                    if kind == "actor" { id } else { actor },
+                    token.actor().kind == kind && token.actor().id == id,
+                ),
+                None => (actor, actor == caller),
+            };
+            if !is_self && !token.visible_namespace_strs().contains(&identity) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "actor {identity:?} is not visible to this caller"
+                )));
+            }
+        }
+        let default_scope = !all_actors && p.actor.is_none();
 
         let since_raw = p.since.as_deref().ok_or_else(|| {
             RuntimeError::InvalidInput(
@@ -868,15 +1008,21 @@ impl BrainPack {
             None => None,
         };
 
-        // Stored actor strings are prefixed (`actor:<kind>:<id>`). Callers naturally pass the
-        // bare seat form (e.g. "lambda:khive"), which would silently match nothing against an
-        // exact-match filter. Match either spelling by expanding the filter to both forms —
-        // `EventFilter.actors` is an IN-list, so this is a pure OR, never a guess. A caller who
-        // already passes the stored `actor:`-prefixed form keeps exact-match behavior.
+        // A prefixed id has no bare alias: that spelling belongs to another
+        // principal's canonical events. Only default scope coalesces actor keys.
         let actor_filters: Vec<String> = match p.actor.as_deref() {
-            Some(a) if a.starts_with("actor:") => vec![a.to_string()],
+            Some(a) if Self::split_stamped_actor_label(a).is_some() => vec![a.to_string()],
             Some(a) => vec![a.to_string(), format!("actor:{a}")],
-            None => Vec::new(),
+            None if all_actors => Vec::new(),
+            None if token.actor().kind == "actor"
+                && Self::split_stamped_actor_label(&caller).is_some() =>
+            {
+                vec![format!("actor:{caller}")]
+            }
+            None if token.actor().kind == "actor" => {
+                vec![caller.clone(), format!("actor:{caller}")]
+            }
+            None => vec![caller.clone()],
         };
 
         let store = self.runtime.events(token)?;
@@ -942,7 +1088,8 @@ impl BrainPack {
             *counts_by_kind
                 .entry(event.kind.name().to_string())
                 .or_insert(0) += 1;
-            *counts_by_actor.entry(event.actor.clone()).or_insert(0) += 1;
+            let actor_key = if default_scope { &caller } else { &event.actor };
+            *counts_by_actor.entry(actor_key.clone()).or_insert(0) += 1;
             *counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
             if event.kind == khive_types::EventKind::FeedbackExplicit {
                 let originating_verb = event
@@ -1155,14 +1302,15 @@ impl BrainPack {
         let p: ResolveParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        // #741: an omitted `actor` defaults to the caller's dispatch identity so
-        // this introspection verb reports what the serve path (#708) actually
-        // does. Anonymous callers stay `None` and match only wildcard bindings;
-        // an explicit `actor` param wins so evaluation tooling can query other
-        // identities.
+        let caller = Self::caller_actor_label(token);
+        // Anonymous omission must retain the serve path's wildcard-only resolution.
         let actor = match p.actor.as_deref() {
-            Some(a) => Some(a),
-            None => token.actor().binding_id(),
+            Some(a) => {
+                Self::check_read_actor(token, a)?;
+                Some(a)
+            }
+            None if token.actor().is_anonymous() => None,
+            None => Some(caller.as_str()),
         };
 
         let state = self.state.lock().unwrap();
@@ -1862,12 +2010,14 @@ impl BrainPack {
                 .as_ref()
                 .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
             let namespace = token.namespace().as_str().to_string();
+            let attribution = EventAttribution::from_token(token);
             // Forced-zero unattributed events do not touch the mass table, so
             // this sentinel is an atomic-unit routing key only and can never be
             // mistaken for a registered serving profile.
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
                 &namespace,
+                attribution,
                 "__unattributed__",
                 &target_id,
                 gate_mode,
@@ -2428,7 +2578,12 @@ impl BrainPack {
                 });
 
                 let removed = before - state.bindings.len();
-                Ok(json!({ "unbound": removed }))
+                // `removed` is the canonical mutation count. Keep `unbound`
+                // as a compatibility alias for existing callers and smoke
+                // tests. In particular, both fields remain present at zero so
+                // a successful no-op cannot be mistaken for a confirmed
+                // removal.
+                Ok(json!({ "removed": removed, "unbound": removed }))
             },
         )
         .await
@@ -2436,7 +2591,11 @@ impl BrainPack {
 
     // ── brain.bindings ────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_bindings(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_bindings(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Inspection verb — list binding rows, optionally filtered.
         #[derive(Deserialize)]
         struct BindingsParams {
@@ -2448,13 +2607,17 @@ impl BrainPack {
         let p: BindingsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
+        let caller = Self::caller_actor_label(token);
+        let actor = p.actor.as_deref().unwrap_or(&caller);
+        Self::check_read_actor(token, actor)?;
+
         let state = self.state.lock().unwrap();
         let rows: Vec<Value> = state
             .bindings
             .iter()
             .filter(|b| {
                 p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id)
-                    && p.actor.as_ref().is_none_or(|a| &b.actor == a)
+                    && b.actor == actor
                     && p.namespace.as_ref().is_none_or(|n| &b.namespace == n)
                     && p.consumer_kind
                         .as_ref()
@@ -2730,6 +2893,14 @@ impl BrainPack {
 /// Returns the concatenated items, the true total matching the filter (exact,
 /// via `Page::total`'s unbounded `COUNT(*)` — see `khive-db`'s `query_events`),
 /// and whether either half was truncated against its own `page_limit`.
+/// Transport-safe per-request page bound for every event read this module
+/// issues. The events-split daemon refuses `QueryEvents` pages above its cap
+/// (`khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS`), and the
+/// split store's merged read forwards `offset + limit` as one daemon page —
+/// so windows wider than the cap are collected by cursor-walking in pages of
+/// at most this many rows at `offset: 0`, never by one wide request.
+pub(crate) const TRANSPORT_PAGE_ROWS: u32 = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
+
 pub(crate) async fn fetch_event_counts_window(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
@@ -2737,19 +2908,19 @@ pub(crate) async fn fetch_event_counts_window(
     page_limit: u32,
 ) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
     if !unfiltered {
-        let page = store
-            .query_events(
-                base_filter.clone(),
-                PageRequest {
-                    offset: 0,
-                    limit: page_limit,
-                },
-            )
+        let window_event_total = store
+            .count_events(base_filter.clone())
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let window_event_total = page.total.unwrap_or(page.items.len() as u64);
-        let truncated = window_event_total > page.items.len() as u64;
-        return Ok((page.items, window_event_total, truncated));
+        let items = collect_events_cursor_walk(
+            store,
+            base_filter,
+            TRANSPORT_PAGE_ROWS,
+            u64::from(page_limit),
+        )
+        .await?;
+        let truncated = window_event_total > items.len() as u64;
+        return Ok((items, window_event_total, truncated));
     }
 
     let non_audit_kinds: Vec<khive_types::EventKind> = khive_types::EventKind::ALL
@@ -2766,37 +2937,172 @@ pub(crate) async fn fetch_event_counts_window(
         ..base_filter.clone()
     };
 
-    let audit_page = store
-        .query_events(
-            audit_filter,
-            PageRequest {
-                offset: 0,
-                limit: page_limit,
-            },
-        )
+    let audit_total = store
+        .count_events(audit_filter.clone())
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-    let non_audit_page = store
-        .query_events(
-            non_audit_filter,
-            PageRequest {
-                offset: 0,
-                limit: page_limit,
-            },
-        )
+    let non_audit_total = store
+        .count_events(non_audit_filter.clone())
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+    let audit_items = collect_events_cursor_walk(
+        store,
+        &audit_filter,
+        TRANSPORT_PAGE_ROWS,
+        u64::from(page_limit),
+    )
+    .await?;
+    let non_audit_items = collect_events_cursor_walk(
+        store,
+        &non_audit_filter,
+        TRANSPORT_PAGE_ROWS,
+        u64::from(page_limit),
+    )
+    .await?;
 
-    let audit_total = audit_page.total.unwrap_or(audit_page.items.len() as u64);
-    let non_audit_total = non_audit_page
-        .total
-        .unwrap_or(non_audit_page.items.len() as u64);
-    let truncated = audit_total > audit_page.items.len() as u64
-        || non_audit_total > non_audit_page.items.len() as u64;
+    let truncated =
+        audit_total > audit_items.len() as u64 || non_audit_total > non_audit_items.len() as u64;
     let window_event_total = audit_total + non_audit_total;
-    let mut items = audit_page.items;
-    items.extend(non_audit_page.items);
+    let mut items = audit_items;
+    items.extend(non_audit_items);
     Ok((items, window_event_total, truncated))
+}
+
+/// Collect up to `max_rows` events for `base_filter` by walking a strict
+/// descending `before` cursor at `offset: 0`, requesting at most
+/// [`TRANSPORT_PAGE_ROWS`] rows per query so no request exceeds the
+/// events-daemon page cap.
+///
+/// `before` is a strict `created_at <` bound, so stepping the cursor to the
+/// last row's timestamp would drop rows sharing that microsecond beyond the
+/// page edge. Step to `last.created_at + 1` instead — which re-admits the
+/// boundary microsecond — and drop the re-read rows by id. Aggregation is
+/// order-independent, so delivery order across pages does not matter; each
+/// row must simply arrive exactly once. A timestamp tie run wider than the
+/// transport cap cannot be paged past (widening the page is refused by the
+/// daemon) and is reported as a typed error rather than looping.
+///
+/// Read consistency: the walk issues independent page (and, at the cap,
+/// count) reads against a live event plane with no snapshot spanning them.
+/// The result is a best-effort live-window view, not a snapshot — a row
+/// appended concurrently with the walk may be excluded or included
+/// depending on where the cursor stands when it lands (never duplicated,
+/// and never an error), and a total observed by an independent
+/// `count_events` read can differ from the collected rows. Callers needing
+/// a closed population bound the window with `until` in the past, which is
+/// closed only insofar as the event plane appends rows stamped at append
+/// time rather than backdated.
+pub(crate) async fn collect_events_cursor_walk(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+) -> Result<Vec<Event>, RuntimeError> {
+    let mut items: Vec<Event> = Vec::new();
+    let mut cursor: Option<i64> = base_filter.before;
+    let mut boundary_at: Option<i64> = None;
+    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    let mut fetch_limit = page_size.clamp(1, TRANSPORT_PAGE_ROWS);
+    while (items.len() as u64) < max_rows {
+        let mut filter = base_filter.clone();
+        filter.before = cursor;
+        let page = store
+            .query_events(
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: fetch_limit,
+                },
+            )
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let fetched = page.items.len() as u64;
+        let fresh: Vec<Event> = page
+            .items
+            .into_iter()
+            .filter(|event| !boundary_ids.contains(&event.id))
+            .collect();
+        if fresh.is_empty() {
+            if fetched < u64::from(fetch_limit) {
+                // The store returned everything under the cursor and all of
+                // it was already collected: the window is exhausted.
+                break;
+            }
+            // A full page of already-collected boundary rows: the tie run at
+            // this microsecond fills the page. Widen and re-read — but only
+            // up to the transport cap, past which the daemon refuses the
+            // request.
+            if fetch_limit >= TRANSPORT_PAGE_ROWS {
+                // At the cap, distinguish a tie run that exactly fills the
+                // page (fully collected, pageable by stepping the strict
+                // bound to the boundary itself) from one wider than the cap
+                // (genuinely unpageable with a timestamp cursor). Every
+                // collected row is >= the boundary microsecond, so equality
+                // of the at-or-above count with the collected count proves
+                // the run is complete.
+                let boundary = boundary_at.ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "event cursor walk saw duplicate rows before any boundary".to_string(),
+                    )
+                })?;
+                let mut ge_boundary = base_filter.clone();
+                // `after` is a strict `created_at >` bound, so at-or-above
+                // the boundary is `> boundary - 1`. At `i64::MIN` every row
+                // already satisfies at-or-above; keep the base bound.
+                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
+                let ge_total = store
+                    .count_events(ge_boundary)
+                    .await
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                if ge_total == items.len() as u64 {
+                    cursor = Some(boundary);
+                    continue;
+                }
+                return Err(RuntimeError::InvalidInput(format!(
+                    "brain.event_counts cannot page this window: more than {fetch_limit} \
+                     events share one created_at microsecond, which exceeds the event \
+                     transport's page cap; narrow `since`/`until` or add filters (`actor` \
+                     or `kind`)"
+                )));
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(TRANSPORT_PAGE_ROWS);
+            continue;
+        }
+        // Pages come back created_at DESC, so the last fresh row carries the
+        // new boundary microsecond.
+        let boundary = fresh
+            .last()
+            .map(|event| event.created_at)
+            .expect("fresh is non-empty");
+        if boundary_at != Some(boundary) {
+            boundary_ids.clear();
+            boundary_at = Some(boundary);
+        }
+        boundary_ids.extend(
+            fresh
+                .iter()
+                .filter(|event| event.created_at == boundary)
+                .map(|event| event.id),
+        );
+        items.extend(fresh);
+        // `i64::MAX` admits no exclusive bound above it: keep the cursor as
+        // is and re-read — dedup drops the re-admitted rows, and the
+        // at-the-cap completeness check above advances past the boundary (or
+        // reports the dense tie) once a page comes back all-duplicates.
+        cursor = if boundary == i64::MAX {
+            cursor
+        } else {
+            Some(boundary + 1)
+        };
+        if fetched < u64::from(fetch_limit) {
+            break;
+        }
+    }
+    // A page may carry the collection past `max_rows`; the bound is a row
+    // budget, so surplus rows from the final page are dropped rather than
+    // returned over-budget.
+    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    Ok(items)
 }
 
 /// #21: full-window aggregation for `brain.event_counts(exhaustive=true)`.
@@ -2843,26 +3149,14 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
         )));
     }
 
-    let mut items: Vec<Event> = Vec::new();
-    let mut offset: u64 = 0;
-    loop {
-        let page = store
-            .query_events(
-                base_filter.clone(),
-                PageRequest {
-                    offset,
-                    limit: page_size,
-                },
-            )
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let page_len = page.items.len() as u64;
-        items.extend(page.items);
-        if page_len < page_size as u64 {
-            break;
-        }
-        offset += page_size as u64;
-    }
+    // Walk the window with a descending `before` cursor instead of a growing
+    // offset (see `collect_events_cursor_walk`): every query runs at
+    // `offset: 0` in transport-cap-sized pages, so the walk is linear on a
+    // single-store backend and stays inside the merged events-split store's
+    // bounded materialization window — and under the events daemon's
+    // per-request page cap — at any depth. The count check above already
+    // bounds the window, so the walk runs to exhaustion.
+    let items = collect_events_cursor_walk(store, base_filter, page_size, max_events).await?;
 
     let truncated = (items.len() as u64) < window_event_total;
     Ok((items, window_event_total, truncated))
@@ -3198,7 +3492,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,
             "brain.resolve" => self.handle_resolve(token, params).await,
-            "brain.bindings" => self.handle_bindings(params).await,
+            "brain.bindings" => self.handle_bindings(token, params).await,
             // Commissive
             "brain.activate" => self.handle_activate(token, params).await,
             "brain.deactivate" => self.handle_deactivate(token, params).await,

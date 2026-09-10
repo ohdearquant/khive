@@ -121,20 +121,8 @@ mod tests {
         drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let db_path = config.db_path.as_ref().expect("db path");
-            for suffix in ["-wal", "-shm"] {
-                let mut name = db_path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = db_path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
+            khive_storage::test_support::freeze_snapshot_sidecars(db_path);
         }
         let runtime = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
         let token = runtime

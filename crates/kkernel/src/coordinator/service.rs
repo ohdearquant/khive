@@ -71,14 +71,19 @@ impl CoordinatorService for SubstrateCoordinatorService {
         self.inner
             .link_cross_backend(namespace, source_id, target_id, relation, weight, metadata)
             .await
-            .map(|edge| {
+            .and_then(|edge| {
                 let cross_backend = edge.target_backend.is_some();
-                let target_backend_id = edge.target_backend.as_deref().map(BackendId::new);
-                CoordLinkResult {
+                let target_backend_id = edge
+                    .target_backend
+                    .as_deref()
+                    .map(BackendId::parse)
+                    .transpose()
+                    .map_err(|error| format!("stored target backend is invalid: {error}"))?;
+                Ok(CoordLinkResult {
                     edge,
                     cross_backend,
                     target_backend_id,
-                }
+                })
             })
             .map_err(|msg| {
                 if msg.contains("not found on any backend") {
@@ -135,6 +140,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         // Batch-fetch note kind + name + created_at for each merged note hit.
         let mut note_kinds: HashMap<Uuid, String> = HashMap::new();
         let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_versions: HashMap<Uuid, i64> = HashMap::new();
         let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
         for hit in &note_hits {
             if khive_storage::request_read_is_cancelled() {
@@ -147,6 +153,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
                     if let Ok(token) = rt.authorize(namespace.clone()) {
                         if let Ok(store) = rt.notes(&token) {
                             if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                                note_versions.insert(hit.note_id, note.version);
                                 note_created_at.insert(hit.note_id, note.created_at);
                                 note_names.insert(hit.note_id, note.name.clone());
                                 note_kinds.insert(hit.note_id, note.kind);
@@ -159,19 +166,28 @@ impl CoordinatorService for SubstrateCoordinatorService {
 
         let coord_per_backend: Vec<CoordBackendResult> = per_backend
             .into_iter()
-            .map(|r| CoordBackendResult {
-                backend_id: r.backend_id,
-                entity_hits: r.hits,
-                note_hits: r.note_hits,
-                error: r.error.map(|failure| CoordBackendFailure {
-                    kind: match failure.kind {
-                        BackendSearchFailureKind::BackendError => {
-                            CoordBackendFailureKind::BackendError
-                        }
-                        BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
-                    },
-                    message: failure.message,
-                }),
+            .map(|r| {
+                let vector_selected = self
+                    .inner
+                    .registry()
+                    .get(&r.backend_id)
+                    .is_some_and(|entry| entry.runtime.vector_arm_selected());
+                CoordBackendResult {
+                    backend_id: r.backend_id,
+                    entity_hits: r.hits,
+                    note_hits: r.note_hits,
+                    vector_selected,
+                    error: r.error.map(|failure| CoordBackendFailure {
+                        kind: match failure.kind {
+                            BackendSearchFailureKind::BackendError => {
+                                CoordBackendFailureKind::BackendError
+                            }
+                            BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
+                        },
+                        message: failure.message,
+                    }),
+                    vector_error: r.vector_error,
+                }
             })
             .collect();
 
@@ -184,6 +200,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
             note_kinds,
             entity_created_at,
             note_created_at,
+            note_versions,
             note_names,
         }
     }

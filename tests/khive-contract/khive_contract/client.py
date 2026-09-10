@@ -8,6 +8,7 @@ never open subprocesses directly.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 from pathlib import Path
@@ -57,12 +58,36 @@ class KhiveOperationError(KhiveMcpError):
         message: str,
         index: int,
         envelope: Mapping[str, Any],
+        detail: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(f"verb '{tool}' (index {index}) failed: {message}")
         self.tool = tool
         self.message = message
         self.index = index
         self.envelope = envelope
+        # The structured fields beside the message (kind, domain_disposition,
+        # domain_result) when the server sent an object rather than a string.
+        self.detail: Mapping[str, Any] = detail or {}
+
+
+def error_text(op_result: Mapping[str, Any]) -> str:
+    """Return the human-readable text of a per-op error.
+
+    A per-op error is an object carrying `message` alongside its disposition
+    fields; the daemon text protocol still sends a bare string. Callers that
+    want to assert on the wording read it through here so both shapes work,
+    and so an assertion failure quotes the text rather than a dict repr.
+    """
+    err = op_result.get("error")
+    if isinstance(err, Mapping):
+        return str(err.get("message", ""))
+    return str(err or "")
+
+
+def error_detail(op_result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the structured fields of a per-op error, empty for the text form."""
+    err = op_result.get("error")
+    return err if isinstance(err, Mapping) else {}
 
 
 def _find_repo_root(start: Path) -> Path | None:
@@ -78,6 +103,17 @@ def _find_repo_root(start: Path) -> Path | None:
     return None
 
 
+def _load_shared_resolver(repo_root: Path):
+    """Import tests/kkernel_binary.py by path; this package has no import path to it."""
+    module_path = repo_root / "tests" / "kkernel_binary.py"
+    spec = importlib.util.spec_from_file_location("kkernel_binary", module_path)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(f"shared kkernel resolver not found at {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _resolve_binary(binary: str | Path | None) -> Path:
     if binary is not None:
         return Path(binary)
@@ -88,10 +124,13 @@ def _resolve_binary(binary: str | Path | None) -> Path:
         return Path(env_val)
     repo_root = _find_repo_root(Path(__file__).parent)
     if repo_root is not None:
-        release = repo_root / "crates" / "target" / "release" / "kkernel"
+        # One resolution rule for every harness: tests/kkernel_binary.py mirrors
+        # scripts/ci.sh, so a custom CARGO_TARGET_DIR selects the same binary
+        # here as in the smoke harnesses.
+        release = Path(_load_shared_resolver(repo_root).resolve_binary_path())
         if release.exists():
             return release
-        debug = repo_root / "crates" / "target" / "debug" / "kkernel"
+        debug = release.parent.parent / "debug" / "kkernel"
         if debug.exists():
             return debug
     raise FileNotFoundError(
@@ -385,9 +424,10 @@ class KhiveMcpSession:
         if not first.get("ok", False):
             raise KhiveOperationError(
                 tool=first.get("tool", name),
-                message=first.get("error", "<no error string>"),
+                message=error_text(first) or "<no error string>",
                 index=0,
                 envelope=envelope,
+                detail=error_detail(first),
             )
         return first.get("result")
 

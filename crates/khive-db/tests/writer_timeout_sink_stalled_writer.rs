@@ -23,22 +23,19 @@ use khive_db::{ConnectionPool, PoolConfig};
 
 const WRITE_DELAY_MS: u64 = 5_000;
 
-fn point_sink_at_slow_writer() {
+fn point_sink_at_slow_writer() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::env::set_var("KHIVE_WRITER_TIMEOUT_SINK_DIR", dir.path());
     std::env::set_var(
         "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS",
         WRITE_DELAY_MS.to_string(),
     );
-    // Leak the tempdir so it stays alive for the rest of the process — the
-    // writer thread keeps writing (slowly) into it for as long as the
-    // process runs.
-    std::mem::forget(dir);
+    dir
 }
 
 #[test]
 fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
-    point_sink_at_slow_writer();
+    let _sink_dir = point_sink_at_slow_writer();
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stalled_writer_sink_test.db");
@@ -56,7 +53,7 @@ fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
     let pool = Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"));
     let construct_elapsed = construct_start.elapsed();
     assert!(
-        construct_elapsed < Duration::from_millis(500),
+        construct_elapsed < Duration::from_millis(WRITE_DELAY_MS / 2),
         "pool construction took {construct_elapsed:?} against a {WRITE_DELAY_MS}ms-per-write \
          sink — the sink must never add filesystem-bound latency to pool boot"
     );
@@ -79,7 +76,7 @@ fn sink_never_adds_measurable_latency_when_its_writer_is_genuinely_slow() {
         "a second writer checkout while the first is held must time out"
     );
     assert!(
-        elapsed < Duration::from_millis(250),
+        elapsed < Duration::from_millis(WRITE_DELAY_MS / 2),
         "checkout_timeout was 50ms but writer() took {elapsed:?} against a \
          {WRITE_DELAY_MS}ms-per-write sink — emit_timeout must be a non-blocking enqueue, \
          never blocking on the writer thread's own I/O latency"

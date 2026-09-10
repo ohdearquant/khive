@@ -14,10 +14,12 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
+use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
-    validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
+    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
@@ -119,7 +121,7 @@ async fn require_existing_thread_root(
     };
     let store = runtime.notes(token)?;
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -187,6 +189,19 @@ fn inbox_note_matches(
     content_needle: Option<&str>,
 ) -> bool {
     let props = note.properties.as_ref();
+    if params.kind.as_deref().is_some_and(|kind| note.kind != kind) {
+        return false;
+    }
+    if params.tags.as_ref().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            !props
+                .and_then(|properties| properties.get("tags"))
+                .and_then(Value::as_array)
+                .is_some_and(|stored| stored.iter().any(|value| value.as_str() == Some(tag)))
+        })
+    }) {
+        return false;
+    }
     let sender = props
         .and_then(|properties| properties.get("from_actor"))
         .and_then(Value::as_str);
@@ -278,15 +293,8 @@ fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
 ///
-/// Known gap (external desk review, 2026-07-21): there is no idempotency
-/// guard here, so a retrying caller that repeats an identical `send` (same
-/// `to`/`content`) produces a fresh duplicate outbound+inbound pair every
-/// call. `comm.ingest`'s `external_id` dedup key is a different mechanism
-/// (transport-level dedup for channel-delivered inbound mail) and does not
-/// apply to caller-composed sends. Fixing this needs a caller-supplied
-/// idempotency key param on `SendParams` (additive) — a content-hash dedup
-/// invented here would risk collapsing legitimate repeated messages, so this
-/// is left as a design decision rather than implemented speculatively.
+/// Caller-keyed sends reconcile through the atomic outbound claim and its
+/// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
@@ -349,7 +357,18 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (outbound_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "send", "to": to_actor, "content": p.content,
+            "subject": p.subject, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+        })
+    })?;
+    let MessageWrite {
+        outbound: outbound_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -364,9 +383,12 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // `thread_id` is a strict full-UUID input on a later send. Surface the
     // canonical value persisted by `dual_write_message` so this response can
@@ -385,6 +407,9 @@ pub(crate) async fn handle_send(
         "subject": p.subject,
         "sent_at": sent_at,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &outbound_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -466,6 +491,11 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
+    let thread_id = p
+        .thread_id
+        .as_deref()
+        .map(|raw| canonicalize_thread_id("inbox", raw))
+        .transpose()?;
     validate_message_projection_fields("inbox", p.fields.as_deref())?;
     let wait_ms = p.wait_ms.unwrap_or(0);
     if wait_ms > MAX_INBOX_WAIT_MS {
@@ -554,15 +584,23 @@ pub(crate) async fn handle_inbox(
     }
 
     if raw_limit == 0 {
-        let unread_count = if mailbox == "inbox" {
-            count_unread_messages(runtime, token, &token.actor().id).await?
+        let unread = if mailbox == "inbox" {
+            let store = runtime.notes(token)?;
+            count_unread_messages(
+                store.as_ref(),
+                token.namespace().as_str(),
+                &token.actor().id,
+            )
+            .await?
         } else {
-            0
+            UnreadCount::zero()
         };
         return Ok(json!({
             "messages": [],
             "count": 0,
-            "unread_count": unread_count,
+            "unread_count": unread.count,
+            "unread_count_cap": unread.cap,
+            "unread_count_saturated": unread.saturated,
             "offset": offset,
             "next_offset": Value::Null,
             "has_more": false,
@@ -603,11 +641,15 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
-        // visible; closes the #199 multi-actor read leak for non-"local" callers.
+        // ADR-057 Q3: to_actor filter, legacy to_actor-less messages stay visible;
+        // closes the #199 multi-actor read leak for non-"local" callers.
+        // EqOrLegacyIndexed (not EqOrMissing) so this seeks
+        // idx_notes_unread_probe_recipient_direction on status="unread" instead of
+        // falling back to a namespace-wide direction-only scan; both partitions match
+        // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
+            op: FilterOp::EqOrLegacyIndexed,
             value: SqlValue::Text(caller_actor.clone()),
         });
         if let Some(from_actor) = p.from_actor.as_ref() {
@@ -636,6 +678,14 @@ pub(crate) async fn handle_inbox(
         }
     }
 
+    if let Some(thread_id) = thread_id {
+        property_filters.push(PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(thread_id),
+        });
+    }
+
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
@@ -661,6 +711,7 @@ pub(crate) async fn handle_inbox(
         query_inbox_response(
             store,
             namespace,
+            &caller_actor,
             &filter,
             &p,
             before_micros,
@@ -727,6 +778,7 @@ where
 async fn query_inbox_response(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
+    caller_actor: &str,
     filter: &NoteFilter,
     params: &InboxParams,
     before_micros: Option<i64>,
@@ -735,7 +787,9 @@ async fn query_inbox_response(
     offset: u64,
     limit: usize,
 ) -> Result<Value, RuntimeError> {
-    let has_post_filter = params.from_prefix.is_some()
+    let has_post_filter = params.kind.is_some()
+        || params.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+        || params.from_prefix.is_some()
         || params.exclude_from_actor.is_some()
         || before_micros.is_some()
         || subject_needle.is_some()
@@ -744,23 +798,40 @@ async fn query_inbox_response(
     // Offset is defined over the fully-filtered sequence. When a filter cannot
     // be represented by `NoteFilter`, scan the indexed base query and count only
     // matching rows before collecting one lookahead item for `has_more`.
+    //
+    // Each page is fetched from a keyset boundary (`NoteFilter.after`), not a
+    // growing `PageRequest.offset`: an offset re-walks every earlier row on
+    // every page, so this loop's total work was quadratic in the number of
+    // pages scanned before a post-filter match was found. Seeking from the
+    // last row's `(created_at, id)` makes each page's fetch cost independent
+    // of how many pages came before it. `filter.order_by` is always `None`
+    // here (see its construction above), which `after` requires.
     let mut messages: Vec<Value> = if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
         let mut matched: u64 = 0;
-        let mut db_offset: u64 = 0;
+        let mut cursor: Option<khive_storage::note::NoteSeekAfter> = None;
         loop {
+            let mut page_filter = filter.clone();
+            page_filter.after = cursor;
             let page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     namespace,
-                    filter,
+                    &page_filter,
                     PageRequest {
                         limit: PAGE_SIZE,
-                        offset: db_offset,
+                        offset: 0,
                     },
                 )
                 .await?;
             let fetched = page.items.len() as u32;
+            cursor = page
+                .items
+                .last()
+                .map(|n| khive_storage::note::NoteSeekAfter {
+                    created_at: n.created_at,
+                    id: n.id,
+                });
             for n in &page.items {
                 if !inbox_note_matches(n, params, before_micros, subject_needle, content_needle) {
                     continue;
@@ -777,14 +848,11 @@ async fn query_inbox_response(
             if collected.len() > limit || fetched < PAGE_SIZE {
                 break;
             }
-            db_offset = db_offset.checked_add(u64::from(PAGE_SIZE)).ok_or_else(|| {
-                RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
-            })?;
         }
         collected
     } else {
         let page = store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 namespace,
                 filter,
                 PageRequest {
@@ -801,18 +869,11 @@ async fn query_inbox_response(
         messages.truncate(limit);
     }
     let count = messages.len();
-    // #66: cheap derived stat over the page already fetched above — no extra
-    // DB round-trip. The count is inbox-only: sent rows have no recipient read
-    // state and report zero. For inbox `status="unread"`, this equals `count`;
-    // for `"read"`/`"all"`, it counts unread rows in this page (not a global
-    // total — `comm.unread` is the verb for that).
-    let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
-        messages
-            .iter()
-            .filter(|m| !m["read"].as_bool().unwrap_or(false))
-            .count()
+    // This is a mailbox-wide signal; page and status filters only shape `messages`.
+    let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
+        count_unread_messages(store, namespace, caller_actor).await?
     } else {
-        0
+        UnreadCount::zero()
     };
     let next_offset = if has_more {
         Some(offset.checked_add(count as u64).ok_or_else(|| {
@@ -828,7 +889,9 @@ async fn query_inbox_response(
     Ok(json!({
         "messages": messages,
         "count": count,
-        "unread_count": unread_count,
+        "unread_count": unread.count,
+        "unread_count_cap": unread.cap,
+        "unread_count_saturated": unread.saturated,
         "offset": offset,
         "next_offset": next_offset,
         "has_more": has_more,
@@ -837,14 +900,6 @@ async fn query_inbox_response(
 
 /// `unread` — count-only view of the caller's unread inbound messages (#66):
 /// same filter stack as `inbox(status="unread")`.
-///
-/// `NoteStore` has no filtered `COUNT(*)` projection (only `count_notes`,
-/// which counts a whole namespace/kind with no property filter) — adding one
-/// is an OSS `khive-storage` change, out of scope here. This pages through
-/// `query_notes_filtered` the same way `handle_inbox`'s `#493` from_actor/
-/// from_prefix path already does, summing page lengths instead of fetching a
-/// bounded `limit` of full payloads — heavier than a real `COUNT(*)` but
-/// correct, and consistent with the pagination style already in this file.
 pub(crate) async fn handle_unread(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -852,17 +907,43 @@ pub(crate) async fn handle_unread(
 ) -> Result<Value, RuntimeError> {
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
-    let count = count_unread_messages(runtime, token, &caller_actor).await?;
+    let store = runtime.notes(token)?;
+    let unread =
+        count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
 
-    Ok(json!({ "count": count, "actor": caller_actor }))
+    Ok(json!({
+        "count": unread.count,
+        "count_cap": unread.cap,
+        "count_saturated": unread.saturated,
+        "actor": caller_actor,
+    }))
+}
+
+const UNREAD_COUNT_CAP: u32 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnreadCount {
+    count: u64,
+    cap: u64,
+    saturated: bool,
+}
+
+impl UnreadCount {
+    fn zero() -> Self {
+        Self {
+            count: 0,
+            cap: u64::from(UNREAD_COUNT_CAP),
+            saturated: false,
+        }
+    }
 }
 
 async fn count_unread_messages(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
+    store: &dyn khive_storage::NoteStore,
+    namespace: &str,
     caller_actor: &str,
-) -> Result<u64, RuntimeError> {
-    let property_filters = vec![
+) -> Result<UnreadCount, RuntimeError> {
+    let base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
             op: FilterOp::Eq,
@@ -873,46 +954,58 @@ async fn count_unread_messages(
             op: FilterOp::JsonTypeNeMissing,
             value: SqlValue::Text("true".to_string()),
         },
-        // ADR-057 Q3: EqOrMissing so legacy to_actor-less messages still count
-        // (same visibility rule `inbox` applies).
-        PropertyFilter {
-            json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrMissing,
-            value: SqlValue::Text(caller_actor.to_string()),
-        },
     ];
-
-    let filter = NoteFilter {
-        kind: Some("message".to_string()),
-        property_filters,
-        order_by: None,
-        ..Default::default()
-    };
-    let store = runtime.notes(token)?;
-
-    const PAGE_SIZE: u32 = 200;
-    let mut count: u64 = 0;
-    let mut db_offset: u32 = 0;
-    loop {
-        let page = store
-            .query_notes_filtered(
-                token.namespace().as_str(),
-                &filter,
-                PageRequest {
-                    limit: PAGE_SIZE,
-                    offset: db_offset.into(),
-                },
-            )
-            .await?;
-        let fetched = page.items.len() as u32;
-        count += u64::from(fetched);
-        if fetched < PAGE_SIZE {
-            break;
+    let count_filter = |op| {
+        let mut property_filters = base_filters.clone();
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op,
+            value: SqlValue::Text(caller_actor.to_string()),
+        });
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters,
+            order_by: None,
+            ..Default::default()
         }
-        db_offset += PAGE_SIZE;
+    };
+    // Count the disjoint addressed and legacy-recipient partitions in one
+    // storage snapshot. Both predicates retain the recipient key expression
+    // required by idx_notes_unread_probe_recipient_direction, and the
+    // leading `direction = 'inbound'` filter in base_filters retains that
+    // index's direction key column, so the scan never walks the recipient's
+    // own outbound send history (every comm.send leaves a durable outbound
+    // copy addressed to the recipient that is never marked read). Each
+    // limited subquery stops after cap + 1 matches; together they retain the
+    // exact value below the public cap and make saturation explicit above
+    // it.
+    let counts = store
+        .count_notes_filtered_bounded_in_snapshot(
+            namespace,
+            &[
+                count_filter(FilterOp::EqOrMissingIndexed),
+                count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
+            ],
+            UNREAD_COUNT_CAP,
+        )
+        .await?;
+    let [exact, legacy] = counts.as_slice() else {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid partition count vector".into(),
+        ));
+    };
+    let cap = u64::from(UNREAD_COUNT_CAP);
+    if exact.cap != cap || legacy.cap != cap {
+        return Err(RuntimeError::Internal(
+            "comm.unread: storage returned an invalid bounded-count cap".into(),
+        ));
     }
-
-    Ok(count)
+    let observed = exact.count.saturating_add(legacy.count);
+    Ok(UnreadCount {
+        count: observed.min(cap),
+        cap,
+        saturated: exact.saturated || legacy.saturated || observed > cap,
+    })
 }
 
 /// `read` — mark a message as read.
@@ -1000,13 +1093,25 @@ async fn mark_read_targets_best_effort(
         let original_properties = note.properties.clone();
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(result),
-            Err(error) => results.push(json!({
-                "id": short_id(id),
-                "full_id": id.as_hyphenated().to_string(),
-                "read": false,
-                "mark_error": error.to_string(),
-                "properties": original_properties,
-            })),
+            Err(error) => {
+                let (status, read) = match &error {
+                    RuntimeError::Storage(storage_error) => {
+                        match classify_mark_read_error(storage_error) {
+                            MarkReadFailure::Unknown => ("unknown", Value::Null),
+                            MarkReadFailure::Failed => ("failed", json!(false)),
+                        }
+                    }
+                    _ => ("failed", json!(false)),
+                };
+                results.push(json!({
+                    "id": short_id(id),
+                    "full_id": id.as_hyphenated().to_string(),
+                    "status": status,
+                    "read": read,
+                    "mark_error": error.to_string(),
+                    "properties": original_properties,
+                }));
+            }
         }
     }
     Ok(bulk_read_response(requested_count, results))
@@ -1046,6 +1151,7 @@ async fn mark_read_targets_atomic(
         results.push(json!({
             "id": short_id(id),
             "full_id": id.as_hyphenated().to_string(),
+            "status": "success",
             "read": true,
             "properties": properties,
         }));
@@ -1058,13 +1164,28 @@ fn bulk_read_response(requested_count: usize, results: Vec<Value>) -> Value {
         .iter()
         .filter(|result| result["read"].as_bool() == Some(true))
         .count();
+    let unknown_count = results
+        .iter()
+        .filter(|result| result["status"].as_str() == Some("unknown"))
+        .count();
     let unique_count = results.len();
-    let failed_count = unique_count - marked_count;
+    let failed_count = unique_count - marked_count - unknown_count;
+    let status = if failed_count == 0 && unknown_count == 0 {
+        "success"
+    } else if marked_count == 0 && unknown_count == 0 {
+        "failed"
+    } else if marked_count == 0 && failed_count == 0 {
+        "unknown"
+    } else {
+        "partial"
+    };
     json!({
         "results": results,
+        "status": status,
         "requested_count": requested_count,
         "unique_count": unique_count,
         "marked_count": marked_count,
+        "unknown_count": unknown_count,
         "failed_count": failed_count,
     })
 }
@@ -1169,6 +1290,28 @@ fn read_recheck_filter(caller_actor: &str) -> NoteFilter {
     }
 }
 
+/// Whether a mark-read write error means the patch definitely did not apply,
+/// or whether the writer seam terminated after accepting the request with no
+/// way to tell whether it landed.
+enum MarkReadFailure {
+    Failed,
+    Unknown,
+}
+
+/// Classify a mark-read storage error by its real variant, never by its
+/// display text. `SideEffectsUnknown` means the write was accepted before its
+/// execution seam terminated — the patch may already be committed, so it must
+/// not be reported as a definite failure. Same match shape as
+/// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
+fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
+    match error {
+        khive_storage::StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        } => MarkReadFailure::Unknown,
+        _ => MarkReadFailure::Failed,
+    }
+}
+
 async fn mark_read_target(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1263,12 +1406,14 @@ fn read_response(
         Ok(true) => json!({
             "id": short,
             "full_id": full,
+            "status": "success",
             "read": true,
             "properties": patched_properties,
         }),
         Ok(false) => json!({
             "id": short,
             "full_id": full,
+            "status": "failed",
             "read": false,
             "mark_error": "no live row updated",
             "properties": original_properties,
@@ -1278,15 +1423,26 @@ fn read_response(
                 id = %full,
                 error = %e,
                 "comm mark-read: update failed under writer contention; \
-                 degrading to read:false (best-effort)"
+                 degrading (best-effort)"
             );
-            json!({
-                "id": short,
-                "full_id": full,
-                "read": false,
-                "mark_error": e.to_string(),
-                "properties": original_properties,
-            })
+            match classify_mark_read_error(&e) {
+                MarkReadFailure::Unknown => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "unknown",
+                    "read": Value::Null,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+                MarkReadFailure::Failed => json!({
+                    "id": short,
+                    "full_id": full,
+                    "status": "failed",
+                    "read": false,
+                    "mark_error": e.to_string(),
+                    "properties": original_properties,
+                }),
+            }
         }
     }
 }
@@ -1443,7 +1599,18 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (reply_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+            "subject": reply_subject_opt, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+        })
+    })?;
+    let MessageWrite {
+        outbound: reply_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -1458,9 +1625,12 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // Replying is the strongest possible read signal, and callers universally
     // chained `reply | read` to say so — fold it in. Skips only an explicitly
@@ -1484,7 +1654,7 @@ pub(crate) async fn handle_reply(
     let caller_is_addressee = original_to_actor
         .as_deref()
         .is_none_or(|addressee| addressee == from_actor_label);
-    let marked_read = if original_direction == "outbound" || !caller_is_addressee {
+    let marked_read = if replayed || original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
         let updated_at = Utc::now().timestamp_micros();
@@ -1510,6 +1680,9 @@ pub(crate) async fn handle_reply(
         "sent_at": sent_at,
         "marked_read": marked_read,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &reply_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -1614,7 +1787,7 @@ pub(crate) async fn handle_thread(
     let mut seen_row_ids = HashSet::new();
     loop {
         let page = thread_store
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &thread_filter,
                 PageRequest {
@@ -1941,7 +2114,7 @@ pub(crate) async fn handle_ingest(
                     ..Default::default()
                 };
                 let corr_page = store
-                    .query_notes_filtered(
+                    .query_notes_filtered_count_free(
                         ns,
                         &corr_filter,
                         PageRequest {
@@ -2008,7 +2181,7 @@ pub(crate) async fn handle_ingest(
                         ..Default::default()
                     };
                     let thread_page = store
-                        .query_notes_filtered(
+                        .query_notes_filtered_count_free(
                             ns,
                             &thread_filter,
                             PageRequest {
@@ -2161,7 +2334,7 @@ pub(crate) async fn handle_ingest(
                 ..Default::default()
             };
             let duplicate_page = store
-                .query_notes_filtered(
+                .query_notes_filtered_count_free(
                     ns,
                     &duplicate_filter,
                     PageRequest {
@@ -2326,6 +2499,8 @@ pub(crate) async fn handle_heartbeat(
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
+    #[cfg(test)]
+    race_seam::pause_after_read().await;
 
     let now = Utc::now();
     // A supplied `at` must resolve to an instant before it is stored: the
@@ -2389,7 +2564,29 @@ pub(crate) async fn handle_heartbeat(
         .map(|n| n.created_at)
         .unwrap_or_else(|| now.timestamp_micros());
 
+    // `updated_at` is also the optimistic-concurrency revision `replace_note_if_unchanged`
+    // checks with `?10 > updated_at`. Two heartbeats landing in the same stored microsecond,
+    // or a backward wall-clock step, must not report a conflict when no concurrent writer
+    // touched the row — make the replacement revision strictly advance past the existing
+    // snapshot instead of trusting `Utc::now()` alone (mirrors
+    // `update_note_from_snapshot_with_embedding_report`). A brand-new channel has no prior
+    // revision to advance past.
+    let updated_at_micros = match existing.as_ref() {
+        Some(snapshot) => {
+            let minimum = snapshot.updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "heartbeat: channel {}:{} updated_at is already at i64::MAX and cannot advance",
+                    p.channel_kind, p.channel_slug
+                ))
+            })?;
+            now.timestamp_micros().max(minimum)
+        }
+        None => now.timestamp_micros(),
+    };
+
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: ns.to_string(),
         kind: "channel_health".to_string(),
@@ -2401,14 +2598,58 @@ pub(crate) async fn handle_heartbeat(
         expires_at: None,
         properties: Some(props),
         created_at,
-        updated_at: now.timestamp_micros(),
+        updated_at: updated_at_micros,
         deleted_at: None,
     };
 
-    store
-        .upsert_note(note)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("heartbeat: upsert_note: {e}")))?;
+    // Guard the read-modify-write: `props` above was carried forward from
+    // `existing`, so a concurrent heartbeat that committed after that read
+    // (e.g. flipping `consecutive_failures`/`last_error`) must not be
+    // silently discarded by this write — the same shape
+    // `replace_note_if_unchanged` uses for every other guarded note update
+    // (khive-runtime's `update_note_from_snapshot_with_embedding_report`).
+    //
+    // The `None` branch needs its own guard, and being a new row is not what
+    // makes it safe. The hazard there is not losing prior state, it is two
+    // concurrent FIRST writes: the note id is deterministic per channel, so two
+    // heartbeats racing on a channel's first report can both read `None` and
+    // both take that branch. `upsert_note` rewrites every mutable column on an
+    // id conflict and reports no conflict outcome, so the later write would
+    // silently replace the earlier report. `insert_note_if_absent` leaves an
+    // existing row untouched and reports whether this call inserted it, so the
+    // loser is told it lost — the same conflict the `Some` arm returns, reached
+    // from the other direction.
+    match existing {
+        Some(snapshot) => {
+            let persisted = store
+                .replace_note_if_unchanged(note, snapshot.updated_at, snapshot.deleted_at)
+                .await
+                .map_err(|e| {
+                    RuntimeError::Internal(format!("heartbeat: replace_note_if_unchanged: {e}"))
+                })?;
+            if !persisted {
+                return Err(RuntimeError::Khive(khive_types::KhiveError::conflict(
+                    format!(
+                        "heartbeat: channel {}:{} changed concurrently after it was read; retry",
+                        p.channel_kind, p.channel_slug
+                    ),
+                )));
+            }
+        }
+        None => {
+            let inserted = store.insert_note_if_absent(note).await.map_err(|e| {
+                RuntimeError::Internal(format!("heartbeat: insert_note_if_absent: {e}"))
+            })?;
+            if !inserted {
+                return Err(RuntimeError::Khive(khive_types::KhiveError::conflict(
+                    format!(
+                        "heartbeat: channel {}:{} was first reported concurrently; retry",
+                        p.channel_kind, p.channel_slug
+                    ),
+                )));
+            }
+        }
+    }
 
     Ok(json!({
         "ok": true,
@@ -2609,7 +2850,7 @@ pub(crate) async fn handle_health(
         ..Default::default()
     };
     let page = store
-        .query_notes_filtered(
+        .query_notes_filtered_count_free(
             token.namespace().as_str(),
             &filter,
             PageRequest {
@@ -3225,13 +3466,37 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
     tokens.join(" ")
 }
 
+/// Test-only pause point at `handle_heartbeat`'s read/write boundary, so a
+/// race between two concurrent callers of the PRODUCTION handler (not the
+/// underlying `replace_note_if_unchanged` store primitive) can be reproduced
+/// deterministically instead of relying on scheduler luck or sleeps. A no-op
+/// unless the calling task runs inside `AFTER_READ_BARRIER.scope(...)`;
+/// production dispatch never establishes that scope, so `pause_after_read`
+/// costs nothing outside these regression tests, and it does not exist at
+/// all in non-test builds.
+#[cfg(test)]
+mod race_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(crate) static AFTER_READ_BARRIER: Arc<Barrier>;
+    }
+
+    pub(crate) async fn pause_after_read() {
+        if let Ok(barrier) = AFTER_READ_BARRIER.try_with(Arc::clone) {
+            barrier.wait().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        add_embedding_truncation_warning, build_references_header, channel_stalled,
-        heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, read_response, sanitize_reference_token, send_response_thread_id,
-        validate_read_target, wait_for_inbox_response, wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, bulk_read_response,
+        channel_stalled, heartbeat_note_id, mark_read_target, message_id_match_candidates,
+        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
+        send_response_thread_id, validate_read_target, wait_for_inbox_response, wrap_message_id,
     };
     use crate::inbox_signal::InboxSignal;
     use khive_storage::note::Note;
@@ -3336,8 +3601,11 @@ mod tests {
 
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3350,6 +3618,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -3387,6 +3656,476 @@ mod tests {
             signal.snapshot(),
             generation_after_commit,
             "a deduplicated ingest must not publish a wake"
+        );
+    }
+
+    /// Regression for the heartbeat lost-update race (khive #1753). Two
+    /// readers observe the SAME existing heartbeat row (deterministic: this
+    /// test is the only writer, so two sequential `get_note` calls before
+    /// either write are guaranteed to see one shared revision — no barrier
+    /// needed to force it). Each derives an independent poll outcome from
+    /// that snapshot, mirroring exactly what `handle_heartbeat` builds for a
+    /// "failure" vs. a "success" report, then the two writes commit through
+    /// the SAME `NoteStore::replace_note_if_unchanged` call `handle_heartbeat`
+    /// now uses. Before that guard, `handle_heartbeat` called
+    /// `store.upsert_note` unconditionally, so B's write would also succeed
+    /// and A's `consecutive_failures`/`last_error` update would be silently
+    /// discarded. This reddens if the write in `handle_heartbeat`'s `Some(snapshot)`
+    /// branch reverts to an unconditional `upsert_note`: the second
+    /// `replace_note_if_unchanged` call below would then need to be an
+    /// `upsert_note` too, which always returns `()`/succeeds, so the
+    /// `!... .unwrap()` assertion would fail to compile-flag the regression
+    /// and the final `consecutive_failures`/`last_failure_at` assertions
+    /// would observe B's fields instead of A's.
+    ///
+    /// SCOPE: the race here is two direct `replace_note_if_unchanged` calls
+    /// against the STORE PRIMITIVE. `handle_heartbeat` IS invoked, once, at the
+    /// top, and only to seed the row — so reverting the handler's guarded
+    /// branch to an unconditional `upsert_note` changes the seed and not the
+    /// race, and this test stays green. That is measured: under exactly that
+    /// wiring mutation the only test that reddens is
+    /// `production_handle_heartbeat_refuses_concurrent_stale_writer`, which is
+    /// what covers the wiring. Both are required, neither substitutes for the
+    /// other.
+    #[tokio::test]
+    async fn concurrent_heartbeats_from_one_revision_only_one_survives() {
+        let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "race@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "race@example.com");
+        let snapshot_for_a = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+        let snapshot_for_b = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+        assert_eq!(
+            snapshot_for_a.updated_at, snapshot_for_b.updated_at,
+            "both readers must observe the same pre-write revision for this to be a real race"
+        );
+
+        // Writer A: a "failure" report built from the shared snapshot —
+        // mirrors handle_heartbeat's failure branch exactly.
+        let mut note_a = snapshot_for_a.clone();
+        let mut props_a = note_a.properties.clone().unwrap_or_else(|| json!({}));
+        props_a["last_failure_at"] = json!("2026-08-26T00:00:00Z");
+        props_a["consecutive_failures"] = json!(1);
+        props_a["last_error"] =
+            json!({"class": "timeout", "message": "boom", "at": "2026-08-26T00:00:00Z"});
+        note_a.properties = Some(props_a);
+        note_a.updated_at = snapshot_for_a.updated_at + 1;
+
+        // Writer B: a "success" report ALSO derived from the SAME stale
+        // snapshot — as if B's own internal `get_note` raced A's.
+        let mut note_b = snapshot_for_b.clone();
+        let mut props_b = note_b.properties.clone().unwrap_or_else(|| json!({}));
+        props_b["last_success_at"] = json!("2026-08-26T00:00:01Z");
+        props_b["consecutive_failures"] = json!(0);
+        note_b.properties = Some(props_b);
+        note_b.updated_at = snapshot_for_b.updated_at + 1;
+
+        assert!(
+            store
+                .replace_note_if_unchanged(
+                    note_a,
+                    snapshot_for_a.updated_at,
+                    snapshot_for_a.deleted_at
+                )
+                .await
+                .expect("writer A CAS query"),
+            "the first committer from a shared revision must win"
+        );
+        assert!(
+            !store
+                .replace_note_if_unchanged(
+                    note_b,
+                    snapshot_for_b.updated_at,
+                    snapshot_for_b.deleted_at
+                )
+                .await
+                .expect("writer B CAS query"),
+            "the second committer from the SAME stale revision must be refused, not merged"
+        );
+
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert_eq!(
+            final_props["consecutive_failures"],
+            json!(1),
+            "writer A's failure count must survive: {final_props:?}"
+        );
+        assert_eq!(
+            final_props["last_failure_at"],
+            json!("2026-08-26T00:00:00Z")
+        );
+        assert!(
+            final_props.get("last_success_at") != Some(&json!("2026-08-26T00:00:01Z")),
+            "writer B's success timestamp must not be silently merged into the persisted row: {final_props:?}"
+        );
+    }
+
+    /// Same race as `concurrent_heartbeats_from_one_revision_only_one_survives`,
+    /// but driven entirely through the PRODUCTION entry point
+    /// (`handle_heartbeat`) rather than `replace_note_if_unchanged` directly.
+    /// This closes a gap the primitive-level test cannot: it would still pass
+    /// unchanged if `handle_heartbeat` were reverted to an unconditional
+    /// `upsert_note`, since it never invokes the handler at all. Uses
+    /// `race_seam::pause_after_read` (test-only, compiled out of non-test
+    /// builds) to force both concurrent callers to observe the identical
+    /// pre-write revision deterministically — no sleeps, no reliance on
+    /// scheduler ordering.
+    #[tokio::test]
+    async fn production_handle_heartbeat_refuses_concurrent_stale_writer() {
+        let runtime =
+            std::sync::Arc::new(khive_runtime::KhiveRuntime::memory().expect("in-memory runtime"));
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "production-race@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "production-race@example.com",
+                            "outcome": "failure",
+                            "error_class": "timeout",
+                            "error_message": "boom",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+        let writer_b = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "production-race@example.com",
+                            "poll_interval_secs": 9,
+                            "outcome": "success",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one production caller must win the race; the other must be refused: \
+             a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(khive_runtime::RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing production caller must surface a typed conflict, not \
+                     silently overwrite: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "production-race@example.com");
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert!(
+            !(final_props.get("last_failure_at").is_some()
+                && final_props["poll_interval_secs"] == json!(9)),
+            "both racers' fields must never both land: that would mean the loser's stale \
+             write silently succeeded: {final_props:?}"
+        );
+    }
+
+    /// The same production race, but with NO row seeded first, so both callers
+    /// take the `None` arm.
+    ///
+    /// `production_handle_heartbeat_refuses_concurrent_stale_writer` seeds the
+    /// row before racing, so it can only ever exercise the `Some(snapshot)`
+    /// CAS branch — it stays green against a build whose `None` arm is an
+    /// unconditional upsert. That is the first-write race: the heartbeat note
+    /// id is deterministic per channel, so two callers reporting a channel for
+    /// the first time both read absence, and an upsert resolves that by
+    /// overwriting, losing the first report with no error to either caller.
+    #[tokio::test]
+    async fn production_handle_heartbeat_refuses_concurrent_first_writer() {
+        let runtime =
+            std::sync::Arc::new(khive_runtime::KhiveRuntime::memory().expect("in-memory runtime"));
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        let id = super::heartbeat_note_id("local", "email", "first-write-race@example.com");
+        // The premise this test rests on: nothing is seeded, so both racers
+        // must take the `None` arm. Without this the test could silently
+        // degrade into a copy of the seeded one.
+        assert!(
+            runtime
+                .notes(&token)
+                .expect("note store")
+                .get_note(id)
+                .await
+                .expect("read the heartbeat row")
+                .is_none(),
+            "fixture premise: no heartbeat row may exist for this channel before the race, \
+             otherwise both callers take the guarded `Some` arm and the first-write race is \
+             never exercised"
+        );
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_a = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "first-write-race@example.com",
+                            "outcome": "failure",
+                            "error_class": "timeout",
+                            "error_message": "boom",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+        let writer_b = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let token = token.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(
+                super::race_seam::AFTER_READ_BARRIER.scope(barrier, async move {
+                    super::handle_heartbeat(
+                        &runtime,
+                        &token,
+                        json!({
+                            "channel_kind": "email",
+                            "channel_slug": "first-write-race@example.com",
+                            "poll_interval_secs": 9,
+                            "outcome": "success",
+                        }),
+                    )
+                    .await
+                }),
+            )
+        };
+
+        let result_a = writer_a.await.expect("writer A task");
+        let result_b = writer_b.await.expect("writer B task");
+        let successes = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one first-writer must win; the other must be refused rather than \
+             silently replacing the winner's report: a={result_a:?} b={result_b:?}"
+        );
+        let refused = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        match &refused {
+            Err(khive_runtime::RuntimeError::Khive(khive_error)) => {
+                assert_eq!(
+                    khive_error.kind(),
+                    khive_types::ErrorKind::Conflict,
+                    "the losing first-writer must surface a typed conflict: {refused:?}"
+                );
+            }
+            other => panic!("expected a typed conflict error, got {other:?}"),
+        }
+
+        let store = runtime.notes(&token).expect("note store");
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("the winner's heartbeat row must exist");
+        let final_props = final_note.properties.expect("heartbeat properties");
+        // The winner's report must be intact, not a blend of both. Each racer
+        // reports a distinguishing field the other never sends.
+        let is_a = final_props.get("last_failure_at").is_some();
+        let is_b = final_props["poll_interval_secs"] == json!(9);
+        assert!(
+            is_a ^ is_b,
+            "the surviving row must be exactly one racer's report, never both racers' fields \
+             merged, which is what a losing write silently succeeding would produce: \
+             {final_props:?}"
+        );
+    }
+
+    /// A heartbeat's replacement revision must strictly advance past the
+    /// existing row's own `updated_at`, not just past `Utc::now()`: two
+    /// heartbeats landing in the same stored microsecond, or a backward
+    /// wall-clock step, are the SAME code path as this test forces (the
+    /// fix's `max(now, snapshot+1)` does not distinguish "now == snapshot"
+    /// from "now < snapshot" — both take the `snapshot+1` branch). Before the
+    /// fix, `handle_heartbeat` derived the replacement revision straight from
+    /// `Utc::now().timestamp_micros()`, so forcing the stored snapshot ahead
+    /// of wall-clock time reproduces both scenarios deterministically without
+    /// a clock-injection seam.
+    ///
+    /// SCOPE: this is a revision-clamp test, NOT CAS regression coverage. Its
+    /// assertion is that the heartbeat write SUCCEEDS, which an unconditional
+    /// `upsert_note` also satisfies, so it stays green if the
+    /// `updated_at = ?13` / `?10 > updated_at` guard is dropped entirely. The
+    /// guard's regression coverage is
+    /// `concurrent_heartbeats_from_one_revision_only_one_survives` (primitive)
+    /// and `production_handle_heartbeat_refuses_concurrent_stale_writer`
+    /// (production wiring); do not count this test toward it.
+    #[tokio::test]
+    async fn handle_heartbeat_does_not_false_conflict_when_snapshot_is_ahead_of_wall_clock() {
+        let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(khive_runtime::Namespace::parse("local").unwrap())
+            .expect("authorize");
+
+        super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "clock-skew@example.com",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("seed heartbeat");
+
+        let store = runtime.notes(&token).expect("note store");
+        let id = super::heartbeat_note_id("local", "email", "clock-skew@example.com");
+        let seeded = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("seeded heartbeat row");
+
+        // Force the stored revision far ahead of any `Utc::now()` the next
+        // handler call will observe — the same condition as an equal-
+        // microsecond write or a backward clock step.
+        let future_updated_at = seeded.updated_at + 60_000_000; // +60s
+        let mut ahead = seeded.clone();
+        ahead.updated_at = future_updated_at;
+        let forced = store
+            .replace_note_if_unchanged(ahead, seeded.updated_at, seeded.deleted_at)
+            .await
+            .expect("test setup: force the snapshot ahead of wall-clock time");
+        assert!(
+            forced,
+            "test setup CAS must succeed against the freshly seeded row"
+        );
+
+        let result = super::handle_heartbeat(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "clock-skew@example.com",
+                "outcome": "failure",
+                "error_class": "timeout",
+                "error_message": "boom",
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a heartbeat with no competing writer must not be refused just because the \
+             stored revision is at or ahead of wall-clock now: {result:?}"
+        );
+
+        let final_note = store
+            .get_note(id)
+            .await
+            .unwrap()
+            .expect("heartbeat row still exists");
+        assert!(
+            final_note.updated_at > future_updated_at,
+            "the replacement revision must still strictly advance past the forced-ahead \
+             snapshot: {final_note:?}"
+        );
+        let final_props = final_note.properties.expect("heartbeat properties");
+        assert_eq!(
+            final_props["consecutive_failures"],
+            json!(1),
+            "the accepted write must actually be the failure report just sent: {final_props:?}"
         );
     }
 
@@ -3745,6 +4484,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("success"));
         assert_eq!(resp["read"], json!(true));
         assert_eq!(resp["properties"], patched);
         assert!(
@@ -3766,6 +4506,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["mark_error"],
@@ -3791,6 +4532,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -3817,6 +4559,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(resp["mark_error"], json!(err_text));
         assert_eq!(
@@ -3840,6 +4583,7 @@ mod tests {
         );
         assert_eq!(resp["id"], json!("abc123"));
         assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["status"], json!("failed"));
         assert_eq!(resp["read"], json!(false));
         assert_eq!(
             resp["properties"],
@@ -3847,6 +4591,103 @@ mod tests {
             "a stored SQL-NULL properties column must round-trip as JSON \
              null, never as {{}}; got {resp}"
         );
+    }
+
+    #[test]
+    fn read_response_side_effects_unknown_reports_unknown_not_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        };
+        let err_text = err.to_string();
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original.clone()),
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(
+            resp["status"],
+            json!("unknown"),
+            "a write whose seam terminated after acceptance may already have \
+             landed and must not be reported as a definite failure; got {resp}"
+        );
+        assert_eq!(
+            resp["read"],
+            Value::Null,
+            "an indeterminate outcome is neither true nor false; got {resp}"
+        );
+        assert_eq!(resp["mark_error"], json!(err_text));
+        assert_eq!(resp["properties"], original);
+    }
+
+    #[test]
+    fn read_response_writer_task_terminated_rolled_back_still_reports_failed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+        };
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original),
+            patched,
+        );
+        assert_eq!(
+            resp["status"],
+            json!("failed"),
+            "a proven rollback is a definite failure, not an indeterminate \
+             outcome; got {resp}"
+        );
+        assert_eq!(resp["read"], json!(false));
+    }
+
+    #[test]
+    fn bulk_read_response_reports_success_partial_failed_and_unknown_statuses() {
+        let response = |outcomes: &[bool]| {
+            bulk_read_response(
+                outcomes.len(),
+                outcomes
+                    .iter()
+                    .map(|read| json!({ "read": read }))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(response(&[true, true])["status"], "success");
+        assert_eq!(response(&[true, false])["status"], "partial");
+        assert_eq!(response(&[false, false])["status"], "failed");
+
+        let mixed = bulk_read_response(
+            3,
+            vec![
+                json!({ "status": "success", "read": true }),
+                json!({ "status": "failed", "read": false }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(mixed["status"], "partial");
+        assert_eq!(mixed["marked_count"], 1);
+        assert_eq!(mixed["failed_count"], 1);
+        assert_eq!(mixed["unknown_count"], 1);
+
+        let all_unknown = bulk_read_response(
+            2,
+            vec![
+                json!({ "status": "unknown", "read": Value::Null }),
+                json!({ "status": "unknown", "read": Value::Null }),
+            ],
+        );
+        assert_eq!(all_unknown["status"], "unknown");
+        assert_eq!(all_unknown["marked_count"], 0);
+        assert_eq!(all_unknown["failed_count"], 0);
+        assert_eq!(all_unknown["unknown_count"], 2);
     }
 
     // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)
@@ -3863,8 +4704,11 @@ mod tests {
 
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
             db_path: None,
             blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3877,6 +4721,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -3888,6 +4733,8 @@ mod tests {
         let created_at = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),
@@ -3980,8 +4827,11 @@ mod tests {
         ] {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+                events_split: None,
                 db_path: None,
                 blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::parse(&ns).unwrap(),
@@ -3994,6 +4844,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             })
             .expect("in-memory runtime");
             let token = runtime
@@ -4004,6 +4855,8 @@ mod tests {
             let id = Uuid::new_v4();
             let created_at = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),

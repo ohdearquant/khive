@@ -3,7 +3,8 @@
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
-    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, ParamDef, VerbCategory, Visibility,
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, IdResolutionMode, ParamDef,
+    VerbCategory, Visibility,
 };
 
 /// `code.ingest` — the pack's first verb (ADR-085 Amendment 2 B1).
@@ -21,6 +22,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: true,
             description: "Folder to ingest — a monorepo subtree (a single crate/package) is \
                            first-class, not a special case of whole-repo ingest.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "db",
@@ -28,6 +30,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: false,
             description: "Target map database path. Defaults to <path>/.khive/code-map.db. \
                            The shared production database is always rejected, with no override.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "languages",
@@ -35,6 +38,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: false,
             description: "Restrict ingest to a subset of rust | python | typescript. Omission \
                            accepts all three; the report lists only languages observed under path.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "tiers",
@@ -42,6 +46,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: false,
             description: "Select any of l1 | l1.5 | l2. Defaults to l1 and l1.5; l2 is \
                            opt-in and currently scans Rust sources only.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ],
 }];

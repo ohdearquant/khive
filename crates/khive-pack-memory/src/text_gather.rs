@@ -89,6 +89,7 @@ pub async fn collect_text_hits(
     let filter = Some(TextFilter {
         namespaces: namespaces.to_vec(),
         kinds: vec![SubstrateKind::Note],
+        record_kinds: vec!["memory".to_string()],
         ..TextFilter::default()
     });
 
@@ -128,6 +129,7 @@ pub async fn collect_text_hits(
                 filter: Some(TextFilter {
                     namespaces: namespaces.to_vec(),
                     kinds: vec![SubstrateKind::Note],
+                    record_kinds: vec!["memory".to_string()],
                     ..TextFilter::default()
                 }),
             })
@@ -289,6 +291,7 @@ mod collect_text_hits_tests {
         let doc = TextDocument {
             subject_id: id,
             kind: SubstrateKind::Note,
+            record_kind: Some("memory".to_string()),
             title: None,
             body: body.to_string(),
             tags: vec![],
@@ -317,6 +320,7 @@ mod collect_text_hits_tests {
             .upsert_document(TextDocument {
                 subject_id: fixture_id,
                 kind: SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
                 title: None,
                 body: "quantum_xqzzy_unique signal_phrase_fixture relevant_term".to_string(),
                 tags: vec![],
@@ -432,6 +436,7 @@ mod collect_text_hits_tests {
             .upsert_document(TextDocument {
                 subject_id: rare_id,
                 kind: SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
                 title: None,
                 body: "rare_xqzzy_token common_word_term context".to_string(),
                 tags: vec![],
@@ -539,6 +544,7 @@ mod collect_text_hits_tests {
             .upsert_document(TextDocument {
                 subject_id: cjk_id,
                 kind: SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
                 title: None,
                 body: "这是一个中文注释关于机器学习的内容".to_string(),
                 tags: vec![],
@@ -593,6 +599,7 @@ mod collect_text_hits_tests {
             .upsert_document(TextDocument {
                 subject_id: id1,
                 kind: SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
                 title: None,
                 body: "alpha_tok beta_tok primary content".to_string(),
                 tags: vec![],
@@ -606,6 +613,7 @@ mod collect_text_hits_tests {
             .upsert_document(TextDocument {
                 subject_id: id2,
                 kind: SubstrateKind::Note,
+                record_kind: Some("memory".to_string()),
                 title: None,
                 body: "alpha_tok secondary content".to_string(),
                 tags: vec![],

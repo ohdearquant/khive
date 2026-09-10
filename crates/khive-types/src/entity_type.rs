@@ -18,8 +18,11 @@ use crate::entity::EntityKind;
 /// collapsed to a single `_` → leading/trailing `_` stripped.
 ///
 /// This implements the ADR-001:106 write-time normalisation step that precedes
-/// alias resolution.
-fn to_snake_case(s: &str) -> String {
+/// alias resolution. `pub` (not `pub(crate)`) so callers outside this crate —
+/// e.g. `khive-pack-kg`'s alias-substitution reporting — can compare a raw
+/// value against this SAME cosmetic normalisation instead of maintaining a
+/// separate, drift-prone copy of the rule.
+pub fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_sep = true; // treat start as separator so leading _ are stripped
     for ch in s.chars() {
@@ -89,6 +92,21 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         kind: EntityKind::Document,
         type_name: "thesis",
         aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "page",
+        aliases: &["web_page"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "machine_view",
+        aliases: &["view"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "agent_skill",
+        aliases: &["skill_manifest"],
     },
     // ── Concept ─────────────────────────────────────────────────────────────
     EntityTypeDef {
@@ -328,7 +346,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     // ── Service ──────────────────────────────────────────────────────────────
     // Service subtypes: inference_engine, retrieval_engine,
-    // embedding_engine, api, database, search_engine, mcp_server.
+    // embedding_engine, api, database, search_engine, mcp_server, site, agent_tool.
     EntityTypeDef {
         kind: EntityKind::Service,
         type_name: "inference_engine",
@@ -363,6 +381,16 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         kind: EntityKind::Service,
         type_name: "mcp_server",
         aliases: &["mcp"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "site",
+        aliases: &["origin"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "agent_tool",
+        aliases: &["mcp_tool"],
     },
     // Person  — no standard subtypes (roles are metadata, not subtypes).
 ];
@@ -997,6 +1025,80 @@ mod tests {
             Some("structure"),
             "class must still resolve to formal-math structure, not datatype"
         );
+    }
+
+    #[test]
+    fn entity_type_registry_accepts_web_tokens_and_aliases() {
+        let r = reg();
+        for (kind, canonical, alias) in [
+            (EntityKind::Service, "site", "origin"),
+            (EntityKind::Document, "page", "web_page"),
+            (EntityKind::Document, "machine_view", "view"),
+            (EntityKind::Service, "agent_tool", "mcp_tool"),
+            (EntityKind::Document, "agent_skill", "skill_manifest"),
+        ] {
+            for raw in [canonical, alias] {
+                let resolved = r
+                    .resolve(kind, Some(raw))
+                    .unwrap_or_else(|e| panic!("{raw:?} must resolve for {kind}: {e}"));
+                assert_eq!(resolved.kind, kind);
+                assert_eq!(resolved.entity_type.as_deref(), Some(canonical));
+                for other_kind in EntityKind::ALL {
+                    if other_kind != kind {
+                        r.resolve(other_kind, Some(raw))
+                            .expect_err("web subtypes belong to exactly one base kind");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn web_tokens_and_aliases_have_unique_registry_owners() {
+        for token in [
+            "site",
+            "origin",
+            "page",
+            "web_page",
+            "machine_view",
+            "view",
+            "agent_tool",
+            "mcp_tool",
+            "agent_skill",
+            "skill_manifest",
+        ] {
+            let owners: Vec<_> = BUILTIN_DEFS
+                .iter()
+                .filter(|def| {
+                    to_snake_case(def.type_name) == token
+                        || def
+                            .aliases
+                            .iter()
+                            .any(|alias| to_snake_case(alias) == token)
+                })
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "{token:?} has conflicting owners: {owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_vocabulary_preserves_tool_as_a_project_subtype() {
+        let r = reg();
+        assert_eq!(
+            r.resolve(EntityKind::Project, Some("tool"))
+                .expect("tool remains a project subtype")
+                .entity_type
+                .as_deref(),
+            Some("tool")
+        );
+        r.resolve(EntityKind::Service, Some("tool"))
+            .expect_err("tool is not a service subtype");
+        r.resolve(EntityKind::Document, Some("skill"))
+            .expect_err("skill is not a document subtype");
     }
 
     // ── check_extra_collisions: ADR-001 normalisation (PR #925) ──

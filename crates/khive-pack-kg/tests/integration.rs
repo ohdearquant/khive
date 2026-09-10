@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
+use khive_runtime::presentation::{present, PresentationMode};
 use khive_runtime::{
     arm_prefix_resolve_fail_scoped, EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken,
     ParamDef, RuntimeError, VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
@@ -56,10 +57,10 @@ impl Clone for Fixture {
 
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-    let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt));
     Fixture {
         registry: builder.build().expect("registry build must succeed"),
@@ -92,12 +93,12 @@ fn list_items(response: &Value) -> &[Value] {
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
 // db_diagnostics (ADR-091 operator surface).
 #[test]
-fn pack_verbs_returns_twenty() {
+fn pack_verbs_returns_twenty_four() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        20,
-        "KgPack must expose exactly 20 verbs (19 previous + db_diagnostics)"
+        24,
+        "KgPack must expose exactly 24 verbs including ordered streams"
     );
 }
 
@@ -126,6 +127,10 @@ fn pack_verbs_names_are_correct() {
         "resolve",
         "whoami",
         "db_diagnostics",
+        "stream.append",
+        "stream.batch",
+        "stream.read",
+        "stream.stat",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -243,6 +248,150 @@ async fn create_entity_alias_paper_normalizes_to_document() {
         kind,
         Some("document"),
         "alias 'paper' must normalize to 'document'; got: {result}"
+    );
+}
+
+// entity_type alias resolution (e.g. the built-in `method` -> `function`
+// mapping, ADR-085) is deliberate — but it must never be invisible. A caller
+// who wrote `method` must see `function` come back, not silently get data
+// they didn't write.
+#[tokio::test]
+async fn create_entity_type_alias_method_normalizes_and_is_echoed() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Tokenizer.encode",
+                "entity_kind": "concept",
+                "entity_type": "method",
+            }),
+        )
+        .await
+        .expect("entity_type alias 'method' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("function"),
+        "stored entity_type must be the canonical 'function'; got: {result}"
+    );
+    let applied = result.get("entity_type_normalized").unwrap_or_else(|| {
+        panic!("response must echo the applied alias substitution; got: {result}")
+    });
+    assert_eq!(
+        applied.get("requested").and_then(Value::as_str),
+        Some("method"),
+        "echoed normalization must name what the caller requested; got: {applied}"
+    );
+    assert_eq!(
+        applied.get("stored").and_then(Value::as_str),
+        Some("function"),
+        "echoed normalization must name what was actually stored; got: {applied}"
+    );
+}
+
+// A cosmetic-only difference (case/hyphen/space folding to the SAME word)
+// must not be flagged as an alias substitution — only a genuine word
+// substitution (a different registered alias) counts.
+#[tokio::test]
+async fn create_entity_type_case_only_difference_is_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "Algorithm",
+            }),
+        )
+        .await
+        .expect("entity_type 'Algorithm' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "case-only folding must not be reported as an alias substitution; got: {result}"
+    );
+}
+
+// Repeated, leading, and trailing separators (space/hyphen/underscore) are
+// cosmetic — same word as the canonical registry entry once collapsed and
+// stripped — and must not be flagged as an alias substitution either. This
+// pins the fix for `normalize_for_comparison` diverging from the registry's
+// own `to_snake_case`: a naive space/hyphen-only substitution turns
+// "--Algorithm__" into "__algorithm__" (never collapsing or stripping), which
+// then compares unequal to the stored "algorithm" and misreports a purely
+// cosmetic normalization as a genuine alias substitution.
+#[tokio::test]
+async fn create_entity_type_repeated_leading_trailing_separators_are_not_flagged_as_normalized() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "Some Other Algorithm",
+                "entity_kind": "concept",
+                "entity_type": "--Algorithm__",
+            }),
+        )
+        .await
+        .expect("entity_type '--Algorithm__' must succeed");
+    assert_eq!(
+        result.get("entity_type").and_then(Value::as_str),
+        Some("algorithm")
+    );
+    assert!(
+        result.get("entity_type_normalized").is_none(),
+        "repeated/leading/trailing separator folding must not be reported as an alias \
+         substitution; got: {result}"
+    );
+}
+
+// Bulk create must surface the same alias visibility even when `verbose` is
+// left at its default `false` — the atomic-path summary response is the
+// only place a non-verbose bulk caller ever sees the applied entity_type.
+#[tokio::test]
+async fn create_bulk_entity_type_alias_echoed_without_verbose() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "BulkMethod", "entity_type": "method"},
+                    {"kind": "concept", "name": "BulkPlain"},
+                ]
+            }),
+        )
+        .await
+        .expect("bulk create must succeed");
+    assert_eq!(result.get("created").and_then(Value::as_u64), Some(2));
+    let normalized = result
+        .get("entity_type_normalized")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "bulk response must echo entity_type aliasing even without verbose; got: {result}"
+            )
+        });
+    assert_eq!(
+        normalized.len(),
+        1,
+        "only the 'method' item aliased; got: {result}"
+    );
+    assert_eq!(normalized[0].get("index").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        normalized[0].get("requested").and_then(Value::as_str),
+        Some("method")
+    );
+    assert_eq!(
+        normalized[0].get("stored").and_then(Value::as_str),
+        Some("function")
     );
 }
 
@@ -2392,6 +2541,78 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
 }
 
 #[tokio::test]
+async fn search_source_filter_is_strict_and_applied_before_limit() {
+    let fixture = pack_with_memory();
+
+    fixture
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "SourceFilteredSearchProbe",
+                "description": "text retrieval source filter coverage"
+            }),
+        )
+        .await
+        .expect("create source-filter probe entity");
+
+    let text_result = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "text",
+                "limit": 1
+            }),
+        )
+        .await
+        .expect("text is a valid source filter");
+    let text_hits = text_result.as_array().expect("search result is an array");
+    assert_eq!(text_hits.len(), 1, "the text hit survives the limit");
+    assert!(text_hits.iter().all(|hit| hit["source"] == "text"));
+
+    let vector_result = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "vector",
+                "limit": 1
+            }),
+        )
+        .await
+        .expect("vector is a valid source filter");
+    assert_eq!(
+        vector_result,
+        json!([]),
+        "a text-only in-memory hit must not satisfy source=vector"
+    );
+
+    let err = fixture
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "SourceFilteredSearchProbe",
+                "source": "semantic"
+            }),
+        )
+        .await
+        .expect_err("unknown source filters must fail closed");
+    assert!(
+        is_invalid_input(&err),
+        "invalid source must be InvalidInput: {err:?}"
+    );
+    assert!(
+        invalid_input_message(&err).contains("source must be one of: text, vector, both"),
+        "invalid-source error must enumerate the wire values: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn search_bogus_kind_lists_memory_in_error() {
     // The error message for an unknown kind must list ALL registered kinds,
     // including those contributed by FakeMemoryPack. This proves the error
@@ -2645,6 +2866,7 @@ async fn link_by_name_exact_match_wins_over_many_prefix_matching_decoys() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_kind_returns_items_envelope() {
     let pack = pack_with_events();
     // Create an entity first so there are audit events to find.
@@ -2678,6 +2900,7 @@ async fn list_event_kind_returns_items_envelope() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn get_event_uuid_returns_event_wrapper() {
     let pack = pack_with_events();
     pack.dispatch(
@@ -2741,6 +2964,7 @@ async fn get_event_uuid_returns_event_wrapper() {
 /// #393 already established for entity/note/edge. Guards against the residual
 /// event-UUID resolver path #393 did not cover.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn get_event_uuid_cross_namespace_succeeds() {
     let pack = pack_with_events();
     pack.dispatch(
@@ -2803,6 +3027,7 @@ async fn get_event_uuid_cross_namespace_succeeds() {
 // not a raw microsecond integer.
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_created_at_is_iso8601_string() {
     let pack = pack_with_events();
     pack.dispatch("create", json!({"kind": "concept", "name": "IsoEventList"}))
@@ -2841,6 +3066,7 @@ async fn list_event_created_at_is_iso8601_string() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn get_event_created_at_is_iso8601_string() {
     let pack = pack_with_events();
     pack.dispatch("create", json!({"kind": "concept", "name": "IsoEventGet"}))
@@ -2885,6 +3111,7 @@ async fn get_event_created_at_is_iso8601_string() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn update_event_uuid_returns_immutable_error() {
     let pack = pack_with_events();
     pack.dispatch(
@@ -2926,6 +3153,7 @@ async fn update_event_uuid_returns_immutable_error() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
     let pack = pack_with_events();
     pack.dispatch(
@@ -2975,6 +3203,7 @@ async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_events_pagination_returns_distinct_pages() {
     let pack = pack_with_events();
     // Create three entities to generate three create audit events.
@@ -3016,6 +3245,7 @@ async fn list_events_pagination_returns_distinct_pages() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_events_pagination_four_items_full_disjointness() {
     let pack = pack_with_events();
     for name in ["Pg4-A", "Pg4-B", "Pg4-C", "Pg4-D"] {
@@ -3063,6 +3293,7 @@ async fn list_events_pagination_four_items_full_disjointness() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_events_pagination_offset_beyond_end_returns_empty() {
     let pack = pack_with_events();
     for name in ["BeyondEnd-A", "BeyondEnd-B", "BeyondEnd-C"] {
@@ -3092,6 +3323,7 @@ async fn list_events_pagination_offset_beyond_end_returns_empty() {
 // scan_incomplete when that ceiling was reached before exhausting matches.
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_events_outcome_filter_scan_incomplete_true() {
     let pack = pack_with_events();
     // 25 create events, all outcome=success — with limit=1 the scan ceiling
@@ -3122,6 +3354,7 @@ async fn list_events_outcome_filter_scan_incomplete_true() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_events_outcome_filter_scan_incomplete_absent_when_not_truncated() {
     let pack = pack_with_events();
     for name in ["SmallA", "SmallB", "SmallC"] {
@@ -3552,6 +3785,7 @@ async fn bulk_link_verbose_controls_edges_key() {
 /// Update an entity → list entity_updated events → assert payload has id, namespace,
 /// changed_fields per ADR-014.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn curation_update_entity_event_payload_has_adr014_fields() {
     let pack = pack_with_events();
 
@@ -3624,6 +3858,7 @@ async fn curation_update_entity_event_payload_has_adr014_fields() {
 /// Merge two entities → list entity_merged events → assert payload has into_id, from_id,
 /// policy, edges_rewired per ADR-014.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn curation_merge_entity_event_payload_has_adr014_fields() {
     let pack = pack_with_events();
 
@@ -3770,6 +4005,7 @@ async fn merge_handler_wires_explicit_prefer_from_content_strategy() {
 /// Delete an entity with hard=true → list entity_deleted events → assert payload has
 /// id, namespace, hard=true per ADR-014.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
     let pack = pack_with_events();
 
@@ -3828,6 +4064,7 @@ async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
 /// list(kind="event", observed=[uuid]) must pass the filter down to storage and
 /// return only events whose observed list contains that UUID.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_observed_filter_is_wired_through_to_storage() {
     let pack = pack_with_events();
 
@@ -3864,6 +4101,7 @@ async fn list_event_observed_filter_is_wired_through_to_storage() {
 /// list(kind="event", selected=[uuid]) must pass the filter down to storage without
 /// returning a parse error.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_selected_filter_is_wired_through_to_storage() {
     let pack = pack_with_events();
 
@@ -3895,6 +4133,7 @@ async fn list_event_selected_filter_is_wired_through_to_storage() {
 
 /// list(kind="event", observed=["not-a-uuid"]) must return InvalidInput.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_observed_filter_invalid_uuid_returns_invalid_input() {
     let pack = pack_with_events();
     let err = pack
@@ -4019,6 +4258,478 @@ async fn update_entity_without_kind_resolves_from_uuid() {
         desc.contains("updated via UUID inference"),
         "updated entity must carry new description; got: {updated}"
     );
+}
+
+/// A property-only historical type can be promoted into the indexed
+/// `entity_type` column without replacing any unrelated entity fields.
+#[tokio::test]
+async fn update_entity_type_promotes_property_type_into_typed_listing() {
+    let pack = pack();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "HistoricalAlgorithm",
+                "description": "predates the entity_type column",
+                "properties": {"type": "algorithm", "keep": "preserved"},
+                "tags": ["historical", "control"]
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"]
+        .as_str()
+        .expect("create response must contain an id")
+        .to_string();
+
+    let before = pack
+        .dispatch(
+            "list",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm"
+            }),
+        )
+        .await
+        .expect("typed list before backfill must succeed");
+    assert!(
+        list_items(&before).iter().all(|item| item["id"] != id),
+        "a property-only historical type must not satisfy the column-backed filter"
+    );
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "entity_type": "algorithm"}))
+        .await
+        .expect("update must accept a registered entity_type");
+
+    assert_eq!(updated["entity_type"], "algorithm");
+    assert_eq!(updated["name"], "HistoricalAlgorithm");
+    assert_eq!(updated["description"], "predates the entity_type column");
+    assert_eq!(updated["properties"]["type"], "algorithm");
+    assert_eq!(updated["properties"]["keep"], "preserved");
+    assert_eq!(updated["tags"], json!(["historical", "control"]));
+
+    let after = pack
+        .dispatch(
+            "list",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm"
+            }),
+        )
+        .await
+        .expect("typed list after backfill must succeed");
+    assert_eq!(
+        list_items(&after)
+            .iter()
+            .filter(|item| item["id"] == id)
+            .count(),
+        1,
+        "the backfilled entity must appear exactly once in typed listing"
+    );
+}
+
+#[tokio::test]
+async fn update_unrelated_entity_field_preserves_entity_type() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "TypedControl",
+                "properties": {"keep": true},
+                "tags": ["preserve"]
+            }),
+        )
+        .await
+        .expect("create must succeed");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": created["id"],
+                "description": "unrelated patch"
+            }),
+        )
+        .await
+        .expect("unrelated update must succeed");
+
+    assert_eq!(updated["entity_type"], "algorithm");
+    assert_eq!(updated["name"], "TypedControl");
+    assert_eq!(updated["description"], "unrelated patch");
+    assert_eq!(updated["properties"], json!({"keep": true}));
+    assert_eq!(updated["tags"], json!(["preserve"]));
+}
+
+#[tokio::test]
+async fn update_entity_type_rejects_unregistered_value_without_mutating_entity() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "InvalidTypeControl"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let err = pack
+        .dispatch("update", json!({"id": id, "entity_type": "not_registered"}))
+        .await
+        .expect_err("an unregistered entity_type must be rejected");
+    let message = invalid_input_message(&err);
+    assert!(message.contains("entity_type"), "error: {message}");
+    assert!(message.contains("not_registered"), "error: {message}");
+    assert!(message.contains("algorithm"), "error: {message}");
+
+    let entity = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("rejected update must leave the entity readable");
+    assert!(
+        entity["entity_type"].is_null(),
+        "a rejected update must not mutate entity_type: {entity}"
+    );
+}
+
+#[tokio::test]
+async fn update_entity_type_is_rejected_for_non_entity_substrates() {
+    let pack = pack();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "note control"}),
+        )
+        .await
+        .expect("create note");
+    let note_err = pack
+        .dispatch(
+            "update",
+            json!({"id": note["id"], "entity_type": "algorithm"}),
+        )
+        .await
+        .expect_err("entity_type on a note must be rejected");
+    assert!(
+        invalid_input_message(&note_err).contains("not valid for a note"),
+        "error: {note_err}"
+    );
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EntityTypeEdgeSource"}),
+        )
+        .await
+        .expect("create source");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "EntityTypeEdgeTarget"}),
+        )
+        .await
+        .expect("create target");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "supports"
+            }),
+        )
+        .await
+        .expect("create edge");
+    let edge_err = pack
+        .dispatch(
+            "update",
+            json!({"id": edge["id"], "entity_type": "algorithm"}),
+        )
+        .await
+        .expect_err("entity_type on an edge must be rejected");
+    assert!(
+        invalid_input_message(&edge_err).contains("not valid for an edge"),
+        "error: {edge_err}"
+    );
+}
+
+/// ADR-014 tri-state: an explicit JSON `null` clears a stored entity type
+/// (and reindexes), unlike absent (unchanged) — the pre-fix
+/// `Option<String>` collapsed null into absent and could never clear.
+#[tokio::test]
+async fn update_entity_type_null_clears_stored_type() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "NullClearEntity"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "entity_type": null}))
+        .await
+        .expect("entity_type: null must clear the stored type");
+    assert!(
+        updated["entity_type"].is_null(),
+        "entity_type: null must clear the column: {updated}"
+    );
+    assert_eq!(updated["name"], "NullClearEntity");
+
+    let listed = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "entity_kind": "concept", "entity_type": "algorithm"}),
+        )
+        .await
+        .expect("typed list must succeed");
+    assert!(
+        list_items(&listed).iter().all(|item| item["id"] != id),
+        "a cleared entity must drop out of the typed listing: {listed}"
+    );
+}
+
+/// ADR-014 tri-state: a PRESENT `entity_type` key — including JSON `null` —
+/// is inapplicable to note and edge targets and must be rejected (not
+/// silently accepted).
+#[tokio::test]
+async fn update_null_entity_type_rejected_for_note_and_edge() {
+    let pack = pack();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "null type note"}),
+        )
+        .await
+        .expect("create note");
+    let note_err = pack
+        .dispatch("update", json!({"id": note["id"], "entity_type": null}))
+        .await
+        .expect_err("entity_type: null on a note must be rejected");
+    assert!(
+        invalid_input_message(&note_err).contains("not valid for a note"),
+        "error: {note_err}"
+    );
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "NullTypeEdgeSource"}),
+        )
+        .await
+        .expect("create source");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "NullTypeEdgeTarget"}),
+        )
+        .await
+        .expect("create target");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "supports"
+            }),
+        )
+        .await
+        .expect("create edge");
+    let edge_err = pack
+        .dispatch("update", json!({"id": edge["id"], "entity_type": null}))
+        .await
+        .expect_err("entity_type: null on an edge must be rejected");
+    assert!(
+        invalid_input_message(&edge_err).contains("not valid for an edge"),
+        "error: {edge_err}"
+    );
+}
+
+/// ADR-046 parity: a proposal UpdateEntity patch setting `entity_type`
+/// survives propose -> approve -> apply with normalization and persistence.
+#[tokio::test]
+async fn proposal_update_entity_type_apply_sets_and_normalizes() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": "ProposedTyped"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "SetEntityTypeViaProposal",
+                "description": "Set the entity type through the proposal path",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": " Algorithm "}
+                }
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let updated = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get");
+    assert_eq!(
+        updated["entity_type"], "algorithm",
+        "proposal apply must normalize + persist entity_type: {updated}"
+    );
+}
+
+/// ADR-014/ADR-046 parity: a proposal patch `entity_type: null` clears the
+/// stored type on apply.
+#[tokio::test]
+async fn proposal_update_entity_type_null_apply_clears() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "entity_type": "algorithm",
+                "name": "ProposedClear"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "ClearEntityTypeViaProposal",
+                "description": "Clear the entity type through the proposal path",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": null}
+                }
+            }),
+        )
+        .await
+        .expect("propose must accept entity_type: null");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let updated = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get");
+    assert!(
+        updated["entity_type"].is_null(),
+        "proposal apply must clear entity_type: {updated}"
+    );
+}
+
+/// ADR-046 parity: an (kind, entity_type) pair the vocabulary rejects is
+/// refused at apply time — the proposal reverts to `approved`, the entity
+/// is unmutated, and no applied event is emitted.
+#[tokio::test]
+async fn proposal_update_invalid_entity_type_pair_reverts() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": "ProposedInvalid"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created["id"].as_str().expect("id").to_string();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "InvalidEntityTypeViaProposal",
+                "description": "Reject an invalid kind and entity type pair on apply",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": entity_id,
+                    "patch": {"entity_type": "not_registered"}
+                }
+            }),
+        )
+        .await
+        .expect("propose must succeed (validation happens at apply)");
+    let proposal_id = propose_result["id"].as_str().expect("id").to_string();
+
+    pack.dispatch("review", json!({"id": proposal_id, "decision": "approve"}))
+        .await
+        .expect("review(approve) must succeed");
+
+    let entity = pack
+        .dispatch("get", json!({"id": entity_id}))
+        .await
+        .expect("get after failed apply");
+    assert!(
+        entity["entity_type"].is_null(),
+        "a failed apply must not mutate entity_type: {entity}"
+    );
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_applied", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_applied must succeed");
+    // The apply attempt is still audited, but its recorded result must be the
+    // failure, never a successful application.
+    let items = list_items(&events);
+    assert!(
+        !items.is_empty(),
+        "the failed apply must be audited: {events}"
+    );
+    for item in items {
+        let result = &item["payload"]["result"];
+        assert!(
+            !result["failed"].is_null(),
+            "proposal_applied must record the failed result: {item}"
+        );
+        assert_eq!(
+            result["failed"]["applied_step_count"], 0,
+            "no step may have applied: {item}"
+        );
+    }
 }
 
 /// ADR-014: `delete` without `kind` resolves the substrate from the UUID.
@@ -5322,6 +6033,7 @@ static FAKE_SUBHANDLER_HANDLERS: [HandlerDef; 2] = [
             param_type: "string",
             required: false,
             description: "Internal embedding input.",
+            resolution_mode: khive_types::IdResolutionMode::NotApplicable,
         }],
     },
 ];
@@ -6712,6 +7424,7 @@ async fn delete_note_cross_namespace_succeeds() {
 /// assert payload.expiry is a JSON string starting with "20" (ISO year prefix),
 /// NOT a bare integer.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_created_event_expiry_is_iso8601_string() {
     let pack = pack_with_events();
 
@@ -6796,6 +7509,7 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
 /// `handlers.rs:2713` and `handlers.rs:2729` — injecting such a shape through
 /// the live event store would require bypassing the typed payload structs.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
     // We exercise the recursive walker through the live propose→approve→applied
     // dispatch path. The ProposalAppliedPayload has applied_at at the payload
@@ -6879,6 +7593,7 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
 /// array-shaped payload through the live event store requires bypassing the typed
 /// payload structs.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn event_list_created_at_normalized_via_live_dispatch() {
     // All created_at values on events from list(kind="event") must be ISO strings.
     // This confirms the array path of walk_timestamps is wired into normalize_event_timestamps_array.
@@ -6922,6 +7637,7 @@ async fn event_list_created_at_normalized_via_live_dispatch() {
 /// at `handlers.rs:2713` — the live event store does not expose a raw i64 field
 /// that bypasses the typed payload structs.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_created_event_expiry_normalized_via_live_dispatch() {
     let pack = pack_with_events();
 
@@ -6973,6 +7689,7 @@ async fn proposal_created_event_expiry_normalized_via_live_dispatch() {
 /// list(kind="event", event_kind="proposal_applied") →
 /// assert payload.applied_at is a JSON string starting with "20", NOT an integer.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_applied_event_applied_at_is_iso8601_string() {
     let pack = pack_with_events();
 
@@ -7143,6 +7860,7 @@ fn changeset_add_entity() -> Value {
 /// BUG-3 regression: `list(kind=proposal)` must return `last_decision` as a
 /// bare string ("approve") not a double-JSON-encoded string ("\"approve\"").
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
     let f = pack_with_events();
     let propose = f
@@ -7192,6 +7910,7 @@ async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
 /// BUG-5 regression: `review(approve)` on an already-approved proposal must
 /// return an error, not silently increment approve_count.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn review_approve_on_already_approved_proposal_returns_error() {
     let f = pack_with_events();
     let propose = f
@@ -7232,6 +7951,7 @@ async fn review_approve_on_already_approved_proposal_returns_error() {
 /// BUG-6 regression: `propose` with a non-existent `parent_id` must return
 /// an `InvalidInput` error, not silently create an orphaned proposal.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_with_nonexistent_parent_id_returns_error() {
     let f = pack_with_events();
     let fake_parent = "00000000-0000-0000-0000-000000000042";
@@ -7266,6 +7986,7 @@ async fn propose_with_nonexistent_parent_id_returns_error() {
 /// Changeset error-shape split, identifier arm: a malformed identifier inside
 /// the changeset keeps the full-UUID resolution hint.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_changeset_bad_identifier_keeps_full_uuid_hint() {
     let f = pack_with_events();
     let err = f
@@ -7293,6 +8014,7 @@ async fn propose_changeset_bad_identifier_keeps_full_uuid_hint() {
 /// Changeset error-shape split, generic arm: a wrong-typed field surfaces
 /// serde's own message WITHOUT the misleading identifier hint.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_changeset_wrong_type_omits_identifier_hint() {
     let f = pack_with_events();
     let err = f
@@ -7323,6 +8045,7 @@ async fn propose_changeset_wrong_type_omits_identifier_hint() {
 /// the SQL-level CAS by issuing two sequential withdraw calls after the status
 /// is already 'withdrawn' from the first.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_on_already_withdrawn_proposal_returns_error() {
     let f = pack_with_events();
     let propose = f
@@ -7694,6 +8417,7 @@ async fn create_note_dedup_never_runs() {
 /// After approval the proposal status must be "applied" (via the
 /// ProposalApplyWorker) and at least one `proposal_applied` event must exist.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_review_approve_lifecycle() {
     let f = pack_with_events();
 
@@ -7754,6 +8478,7 @@ async fn propose_review_approve_lifecycle() {
 
 /// Lifecycle: propose → review(reject) → status becomes "rejected".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_review_reject_lifecycle() {
     let f = pack_with_events();
 
@@ -7816,6 +8541,7 @@ async fn propose_review_reject_lifecycle() {
 
 /// Lifecycle: propose → withdraw → status becomes "withdrawn".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_withdraw_lifecycle() {
     let f = pack_with_events();
 
@@ -7881,6 +8607,7 @@ async fn propose_withdraw_lifecycle() {
 /// Creates two proposals: one left open, one immediately withdrawn.
 /// list(status=open) must contain the open one and must NOT contain the withdrawn one.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_proposals_status_filter() {
     let f = pack_with_events();
 
@@ -7943,6 +8670,7 @@ async fn list_proposals_status_filter() {
 /// Negative path: withdraw on an applied proposal must fail.
 /// propose → approve (auto-applies) → withdraw → expect error mentioning "applied".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_after_apply_returns_error() {
     let f = pack_with_events();
 
@@ -7979,6 +8707,7 @@ async fn withdraw_after_apply_returns_error() {
 /// Negative path: review on a rejected proposal must fail.
 /// propose → reject → attempt second review → expect error mentioning "rejected".
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn review_after_reject_returns_error() {
     let f = pack_with_events();
 
@@ -8022,6 +8751,7 @@ async fn review_after_reject_returns_error() {
 /// In practice with SQLite WAL mode, the approve+apply commits before the
 /// withdraw starts. This test verifies the CAS guard catches the terminal state.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_cas_divergence_after_approval() {
     let f = pack_with_events();
 
@@ -8265,6 +8995,7 @@ fn is_secret_detected(err: &RuntimeError) -> bool {
 
 /// propose.description containing a fake AWS key must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_blocks_secret_in_description() {
     let f = pack_with_events();
     let result = f
@@ -8285,6 +9016,7 @@ async fn propose_blocks_secret_in_description() {
 
 /// propose.changeset containing a fake AWS key in proposed entity properties must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_blocks_secret_in_changeset_entity_properties() {
     let f = pack_with_events();
     let result = f
@@ -8312,6 +9044,7 @@ async fn propose_blocks_secret_in_changeset_entity_properties() {
 
 /// propose changeset with a secret in proposed note content must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_blocks_secret_in_changeset_note_content() {
     let f = pack_with_events();
     let result = f
@@ -8338,6 +9071,7 @@ async fn propose_blocks_secret_in_changeset_note_content() {
 
 /// review.comment containing a fake credential must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn review_blocks_secret_in_comment() {
     let f = pack_with_events();
 
@@ -8374,6 +9108,7 @@ async fn review_blocks_secret_in_comment() {
 
 /// withdraw.rationale containing a fake credential must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_blocks_secret_in_rationale() {
     let f = pack_with_events();
 
@@ -8409,6 +9144,7 @@ async fn withdraw_blocks_secret_in_rationale() {
 
 /// propose.changeset with a credential as an object KEY must be rejected.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn propose_blocks_secret_as_changeset_key() {
     let f = pack_with_events();
     let result = f
@@ -9053,6 +9789,7 @@ async fn hard_delete_soft_deleted_edge_without_kind_purges_row() {
 /// deserialized ProposalCreatedPayload and inserts `id`.  This test asserts
 /// the absence side so a dual-emit regression would be caught immediately.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn get_proposal_wire_key_is_id_not_proposal_id() {
     let f = pack_with_events();
 
@@ -9097,6 +9834,7 @@ async fn get_proposal_wire_key_is_id_not_proposal_id() {
 /// longer than 8 chars structurally could not match the hyphenated
 /// `proposal_id` column.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn get_proposal_by_compact_hex_prefix_over_8_chars() {
     let f = pack_with_events();
 
@@ -9138,6 +9876,7 @@ async fn get_proposal_by_compact_hex_prefix_over_8_chars() {
 /// `hex_prefix_to_uuid_pattern`, so any prefix longer than 8 chars
 /// structurally could not match the hyphenated `proposal_id` column.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn review_proposal_by_compact_hex_prefix_over_8_chars() {
     let f = pack_with_events();
 
@@ -9175,6 +9914,7 @@ async fn review_proposal_by_compact_hex_prefix_over_8_chars() {
 /// PR #816: `withdraw(id=<compact-hex-prefix>)` must resolve
 /// via `resolve_proposal_uuid` (proposal.rs) the same way `review` does.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_proposal_by_compact_hex_prefix_over_8_chars() {
     let f = pack_with_events();
 
@@ -9217,6 +9957,7 @@ async fn withdraw_proposal_by_compact_hex_prefix_over_8_chars() {
 /// succeed (id is present, proposal_id silently ignored), so a passing test here is a
 /// genuine regression guard.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn review_with_old_proposal_id_param_is_rejected() {
     let f = pack_with_events();
 
@@ -9273,6 +10014,7 @@ async fn review_with_old_proposal_id_param_is_rejected() {
 /// authenticated principal becomes the acting principal through this pack's
 /// handlers, with no changes to `proposal.rs` itself.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_as_routes_verified_actor_to_review_handler() {
     let f = pack_with_events();
 
@@ -9311,6 +10053,7 @@ async fn dispatch_as_routes_verified_actor_to_review_handler() {
 /// the existence of `dispatch_as` — the default/anonymous actor path through
 /// `propose`/`review` behaves exactly as before this API was added.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_unchanged_after_dispatch_as_added() {
     let f = pack_with_events();
 
@@ -9349,6 +10092,7 @@ async fn dispatch_unchanged_after_dispatch_as_added() {
 /// so an `actor` key in `params` is rejected exactly like any other unknown
 /// field — it never reaches (and can never override) the verified actor.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn dispatch_as_rejects_actor_key_in_params() {
     let f = pack_with_events();
 
@@ -9398,6 +10142,7 @@ async fn dispatch_as_rejects_actor_key_in_params() {
 /// succeed (id is present, proposal_id silently ignored), so a passing test here is a
 /// genuine regression guard.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn withdraw_with_old_proposal_id_param_is_rejected() {
     let f = pack_with_events();
 
@@ -10166,6 +10911,7 @@ async fn create_bulk_items_invalid_entity_type_rejects_batch() {
 ///  4. (non-vacuous) entity from the changeset EXISTS in the KG — this is the
 ///     assertion that catches a silent apply-worker failure even when steps 1-3 pass.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_add_entity_changeset_entity_exists_in_kg_after_apply() {
     let f = pack_with_events();
 
@@ -10251,6 +10997,7 @@ async fn proposal_add_entity_changeset_entity_exists_in_kg_after_apply() {
 ///  4. (non-vacuous) note from the changeset EXISTS in the note store — this is
 ///     the assertion that catches a silent apply-worker failure for note changesets.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
     let f = pack_with_events();
 
@@ -10476,6 +11223,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
 // ---- context (ADR-089): entity-anchored graph context in one call ----
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_requires_query_or_entity_ids() {
     let pack = pack();
     let err = pack
@@ -10492,6 +11240,7 @@ async fn context_requires_query_or_entity_ids() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_empty_entity_ids_and_absent_query_is_rejected() {
     let pack = pack();
     let err = pack
@@ -10502,6 +11251,7 @@ async fn context_empty_entity_ids_and_absent_query_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_anchor_carries_full_entity_record() {
     let pack = pack();
     let a = pack
@@ -10543,6 +11293,7 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
     // a syntactically valid but nonexistent UUID must
     // error, not silently vanish from the response.
@@ -10569,6 +11320,7 @@ async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_note_uuid_is_rejected_as_non_entity() {
     // A note's UUID is syntactically a valid UUID but not an entity substrate;
     // it must be rejected, not silently dropped.
@@ -10602,6 +11354,7 @@ async fn context_entity_ids_note_uuid_is_rejected_as_non_entity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_edge_uuid_is_rejected_as_non_entity() {
     // An edge's UUID is syntactically a valid UUID but not an entity substrate;
     // it must be rejected, not silently dropped.
@@ -10651,6 +11404,7 @@ async fn context_entity_ids_edge_uuid_is_rejected_as_non_entity() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_unresolvable_prefix_is_rejected() {
     // A hex-looking prefix that matches nothing must error at resolution time
     // (existing resolve_uuid_async behavior), not fall through silently.
@@ -10663,6 +11417,7 @@ async fn context_entity_ids_unresolvable_prefix_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_unresolvable_name_is_rejected() {
     // A non-hex string that resolves through the name-lookup fallback and
     // matches nothing must error, not fall through silently.
@@ -10681,6 +11436,7 @@ async fn context_entity_ids_unresolvable_name_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
     let pack = pack();
     let a = pack
@@ -10728,6 +11484,7 @@ async fn context_hop1_neighbor_carries_relation_direction_hop_and_null_via() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_default_direction_is_both_unlike_neighbors_outgoing_default() {
     let pack = pack();
     let a = pack
@@ -10769,6 +11526,7 @@ async fn context_default_direction_is_both_unlike_neighbors_outgoing_default() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hops_two_expands_second_hop_with_via_set_to_hop1_parent() {
     let pack = pack();
     let a = pack
@@ -10842,6 +11600,7 @@ async fn context_hops_two_expands_second_hop_with_via_set_to_hop1_parent() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_hops_zero_does_not_expand_even_with_edges_present() {
     let pack = pack();
     let a = pack
@@ -10875,6 +11634,7 @@ async fn context_hops_zero_does_not_expand_even_with_edges_present() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor() {
     let pack = pack();
     let a = pack
@@ -10939,6 +11699,7 @@ async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor()
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_anchor_never_relisted_as_neighbor_of_another_anchor() {
     let pack = pack();
     let a = pack
@@ -10982,6 +11743,7 @@ async fn context_anchor_never_relisted_as_neighbor_of_another_anchor() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_explicit_entity_ids_never_clamped_by_limit() {
     let pack = pack();
     let mut ids = Vec::new();
@@ -11012,6 +11774,7 @@ async fn context_explicit_entity_ids_never_clamped_by_limit() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_selects_anchors_via_hybrid_search() {
     let pack = pack();
     pack.dispatch(
@@ -11048,6 +11811,7 @@ async fn context_query_selects_anchors_via_hybrid_search() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fills() {
     let pack = pack();
     let explicit = pack
@@ -11091,6 +11855,7 @@ async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fil
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anchor() {
     // if the query's top hit is also an explicit anchor,
     // the query leg must still fill up to `limit` DISTINCT non-explicit anchors
@@ -11151,6 +11916,7 @@ async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anch
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_relations_filter_restricts_expansion() {
     let pack = pack();
     let a = pack
@@ -11208,6 +11974,7 @@ async fn context_relations_filter_restricts_expansion() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_symmetric_relation_direction_is_reported_as_both() {
     let pack = pack();
     let a = pack
@@ -11251,6 +12018,7 @@ async fn context_symmetric_relation_direction_is_reported_as_both() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_fanout_caps_neighbors_per_node_per_hop() {
     let pack = pack();
     let a = pack
@@ -11295,6 +12063,7 @@ async fn context_fanout_caps_neighbors_per_node_per_hop() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_order() {
     // khive-runtime's neighbors_with_query re-sorts hits by
     // (node_id, edge_id) for dedup and, before this fix, never restored the
@@ -11378,6 +12147,7 @@ async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_orde
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_both_direction_mixed_weights_interleave_in_global_order() {
     // ADR-089 context-verb optimization (single UNION ALL query for
     // direction="both" expand, replacing two separate direction-scoped
@@ -11496,6 +12266,7 @@ async fn context_both_direction_mixed_weights_interleave_in_global_order() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_budget_truncation_sets_flag_and_dropped_counts() {
     let pack = pack();
     let a = pack
@@ -11546,6 +12317,7 @@ async fn context_budget_truncation_sets_flag_and_dropped_counts() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor() {
     // Regression test: a higher-ranked anchor with a large neighbor fan-out must
     // not consume the entire budget and push a lower-ranked (but still
@@ -11642,6 +12414,7 @@ async fn context_bloated_anchor_neighbors_do_not_starve_a_later_relevant_anchor(
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_ample_budget_reports_no_truncation() {
     let pack = pack();
     let a = pack
@@ -11680,6 +12453,7 @@ async fn context_ample_budget_reports_no_truncation() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_out_of_range_params_are_clamped_not_rejected() {
     let pack = pack();
     let a = pack
@@ -11704,6 +12478,7 @@ async fn context_out_of_range_params_are_clamped_not_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_unknown_relation_in_filter_is_rejected() {
     let pack = pack();
     let a = pack
@@ -12247,6 +13022,14 @@ async fn stats_reports_edges_by_relation() {
         .dispatch("stats", json!({}))
         .await
         .expect("stats must succeed");
+    assert_eq!(
+        result.get("count_scope"),
+        Some(&json!({
+            "namespaces": "caller_visible",
+            "rows": "live_only",
+        })),
+        "stats must disclose that its counts cover live rows in caller-visible namespaces"
+    );
     let by_relation = result
         .get("edges_by_relation")
         .and_then(Value::as_object)
@@ -12918,6 +13701,7 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
 
 /// `list(kind="event")` uses the common items envelope below its cap too.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_limit_under_cap_honored_exactly() {
     let f = pack_with_events();
     for i in 0..4u32 {
@@ -12945,6 +13729,7 @@ async fn list_event_limit_under_cap_honored_exactly() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_zero_limit_preserves_requested_value_and_returns_no_rows() {
     let f = pack_with_events();
     f.dispatch(
@@ -12965,6 +13750,7 @@ async fn list_event_zero_limit_preserves_requested_value_and_returns_no_rows() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_event_limit_over_cap_reports_effective_limit() {
     let f = pack_with_events();
     f.dispatch(
@@ -12986,6 +13772,7 @@ async fn list_event_limit_over_cap_reports_effective_limit() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_proposal_limit_over_cap_reports_effective_limit() {
     let f = pack_with_events();
     f.dispatch(
@@ -13017,12 +13804,13 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
 /// proposal_id DESC` order (with one shared `updated_at`, that is `proposal_id
 /// DESC`). Uniqueness alone would still pass with a wrong tiebreak direction.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn list_proposals_offset_sweep_covers_all_exactly_once() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(Namespace::local()).unwrap();
-    let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt.clone()));
     let f = Fixture {
         registry: builder.build().expect("registry build must succeed"),
@@ -13475,6 +14263,7 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
 /// by driving the MCP server, because the audit row is only reachable from the
 /// pack surface. That one-line wrapper is not covered here.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn envelope_usage_equals_audit_row_resource_units() {
     use khive_runtime::usage::{UsageContext, UsageUnit};
 
@@ -13869,7 +14658,7 @@ async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
     assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }
 
-// ---- db_diagnostics: ADR-133 D8 additive writer-contention fields ----
+// ---- db_diagnostics: ADR-165 reader + ADR-133 writer contention fields ----
 
 #[tokio::test]
 async fn db_diagnostics_runtime_audit_fields_are_additive() {
@@ -13880,6 +14669,32 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         .await
         .expect("db_diagnostics must succeed against an in-memory backend");
 
+    let reader_contention = report
+        .get("reader_contention")
+        .expect("reader_contention section must be present");
+    for field in [
+        "reader_admission_capacity",
+        "available_reader_admission_slots",
+        "reader_acquisitions",
+        "pooled_reader_checkouts",
+        "standalone_reader_opens",
+        "infrastructure_standalone_reader_opens",
+        "reader_checkout_timeouts",
+        "active_pooled_reader_checkouts",
+        "peak_active_pooled_reader_checkouts",
+        "completed_pooled_reader_checkouts",
+        "max_completed_reader_hold_micros",
+        "reader_replacement_open_failures",
+    ] {
+        let value = reader_contention.get(field).unwrap_or_else(|| {
+            panic!("reader_contention.{field} must be present in the wire payload")
+        });
+        assert!(
+            value.is_u64(),
+            "reader_contention.{field} must be a non-negative integer, got {value:?}"
+        );
+    }
+
     let writer_contention = report
         .get("writer_contention")
         .expect("writer_contention section must be present");
@@ -13888,6 +14703,8 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
     // Option, regardless of whether the caller is the runtime or a direct
     // khive-db user — they come straight off the pool.
     for field in [
+        "writer_task_begin_busy",
+        "writer_task_begin_busy_absorbed",
         "writer_task_request_failures",
         "writer_task_side_effects_unknown",
     ] {
@@ -13947,4 +14764,55 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
              {writer_contention:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn update_empty_string_property_survives_agent_echo_and_readback() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Empty property update target",
+                "properties": {"summary": "before"}
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created["id"].as_str().expect("created id").to_string();
+
+    let updated = pack
+        .dispatch("update", json!({"id": id, "properties": {"summary": ""}}))
+        .await
+        .expect("empty-string property update must succeed");
+    assert_eq!(
+        updated["properties"]["summary"],
+        json!(""),
+        "canonical update response must reflect the stored empty string"
+    );
+
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("readback must succeed");
+    assert_eq!(
+        fetched["properties"]["summary"],
+        json!(""),
+        "canonical readback must retain the empty string"
+    );
+
+    let agent_echo = present(updated, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_echo["properties"]["summary"],
+        json!(""),
+        "Agent update echo must not render the property as deleted: {agent_echo}"
+    );
+
+    let agent_readback = present(fetched, PresentationMode::Agent, 0);
+    assert_eq!(
+        agent_readback["properties"]["summary"],
+        json!(""),
+        "Agent readback must retain the same empty-string value: {agent_readback}"
+    );
 }

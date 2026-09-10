@@ -1191,3 +1191,40 @@ async fn reply_loss_after_commit_retries_exactly_once() {
     );
     assert!(store.get_event(id).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn query_events_declines_to_compute_a_total() {
+    let store = setup_memory_store();
+
+    for _ in 0..3 {
+        store.append_event(make_event("default")).await.unwrap();
+    }
+
+    // The paged read returns no total: the unconditional `COUNT(*)` it used to
+    // run carried no `LIMIT`, so it scanned the whole filtered set on every
+    // page while the data query fetched only `offset + limit` rows. `total` is
+    // `Option<u64>` so a store may decline it, and no caller of this path reads
+    // it.
+    let page = store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                limit: 2,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.total, None);
+
+    // The page itself is unaffected: the limit still applies and the rows are
+    // still returned. This is the arm that fails if the change removed more
+    // than the count.
+    assert_eq!(page.items.len(), 2);
+
+    // A caller that genuinely wants a cardinality still has one, and it sees
+    // all three rows rather than the page's two — so `None` above is a
+    // declined count, not a broken query.
+    let counted = store.count_events(EventFilter::default()).await.unwrap();
+    assert_eq!(counted, 3);
+}

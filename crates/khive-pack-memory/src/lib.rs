@@ -8,6 +8,7 @@ pub(crate) mod query_cache;
 pub mod recall_feedback;
 pub mod rerank;
 pub mod scoring;
+mod store_access;
 #[doc(hidden)]
 pub mod text_gather;
 pub mod tunable;

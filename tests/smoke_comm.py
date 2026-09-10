@@ -16,10 +16,9 @@ import sys
 import os
 import uuid
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+from kkernel_binary import resolve_binary_path
+
+BINARY = resolve_binary_path()
 
 request_id = 0
 
@@ -91,7 +90,13 @@ def call_verb_expect_error(proc, name, args):
         raise AssertionError(
             f"{name} succeeded but an error was expected; result={first.get('result')}"
         )
-    return first.get("error", "")
+    err = first.get("error", "")
+    # Since the runtime started preserving domain outcomes, a per-op error is a
+    # structured object ({"kind", "message", "domain_disposition", ...}); the
+    # assertions below read its message text.
+    if isinstance(err, dict):
+        err = str(err.get("message") or err)
+    return err
 
 
 def init_proc(proc, client_name="comm-smoke"):

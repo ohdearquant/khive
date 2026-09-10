@@ -64,6 +64,8 @@ fn effective_config_uses_defaults() {
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
+        exclude_tags: None,
+        include_source_id: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -93,6 +95,8 @@ fn effective_config_legacy_overrides() {
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
+        exclude_tags: None,
+        include_source_id: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -124,6 +128,8 @@ fn effective_config_explicit_config_wins() {
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
+        exclude_tags: None,
+        include_source_id: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -159,6 +165,8 @@ fn test_weighted_strategy_preserves_pack_weights() {
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
+        exclude_tags: None,
+        include_source_id: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -217,6 +225,8 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         include_breakdown: None,
         tags: None,
         tag_mode: TagMode::Any,
+        exclude_tags: None,
+        include_source_id: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -302,6 +312,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg_rrf = RecallConfig {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },
@@ -317,6 +328,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg_weighted = RecallConfig {
         fuse_strategy: FusionStrategy::Weighted {
@@ -376,6 +388,7 @@ fn vector_only_fusion_unions_hits_across_every_engine() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::VectorOnly,
@@ -422,6 +435,7 @@ fn vector_only_with_zero_vector_models_never_leaks_text_hits() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::VectorOnly,
@@ -473,6 +487,7 @@ fn keyword_only_with_zero_vector_models_still_returns_text_hits() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::KeywordOnly,
@@ -534,6 +549,7 @@ fn multi_engine_rrf_gives_each_engine_a_separate_rank_contribution() {
         visible_namespaces: vec!["local".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
     let cfg = RecallConfig {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },
@@ -868,6 +884,7 @@ fn vector_candidates_per_model_shape_is_array_of_model_objects() {
         visible_namespaces: vec!["test".to_string()],
         ann_degraded: false,
         ann_degraded_reason: None,
+        timings: RecallStageTimings::default(),
     };
 
     let per_model: Vec<Value> = candidates

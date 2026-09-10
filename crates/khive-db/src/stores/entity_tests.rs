@@ -1773,3 +1773,71 @@ fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
             );
         });
 }
+
+/// Both refusal arms of the pooled-reader checkout, exercised through a typed
+/// store. The typed-store paths previously inverted the pair: genuine pool
+/// exhaustion surfaced as a non-retryable Driver failure while a cancelled
+/// request surfaced as the retryable AdmissionTimeout — so a saturated read
+/// was never retried and an abandoned one was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PoolConfig {
+        path: Some(dir.path().join("entity_checkout_classes.db")),
+        max_readers: 1,
+        checkout_timeout: Duration::from_millis(200),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+        .unwrap();
+    // Production-shaped file-backed reads must contend on the same bounded
+    // reader pool. Before ADR-165 Slice 2 they opened a fresh standalone
+    // connection here, silently bypassing the sole pooled reader held below.
+    let store = SqlEntityStore::new(Arc::clone(&pool), true);
+    let held_reader = pool.reader().expect("hold the sole pooled reader");
+
+    // Admission expiry with no cancellation: `checkout_timeout` runs to
+    // exhaustion and must surface as the retryable AdmissionTimeout.
+    let exhausted = store.get_entity(Uuid::new_v4()).await.unwrap_err();
+    assert!(
+        matches!(exhausted, StorageError::AdmissionTimeout { .. }),
+        "pool exhaustion through a typed store must be the retryable \
+         AdmissionTimeout, got {exhausted:?}"
+    );
+
+    // Cancellation before checkout: must return promptly as the non-retryable
+    // Timeout, never AdmissionTimeout, and never wait out `checkout_timeout`.
+    let cancel_store = SqlEntityStore::new(Arc::clone(&pool), true);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let waiting = tokio::spawn(khive_storage::scope_request_read_cancellation(
+        cancel_rx,
+        async move { cancel_store.get_entity(Uuid::new_v4()).await },
+    ));
+    tokio::task::yield_now().await;
+    cancel_tx.send(true).unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_millis(100), waiting)
+        .await
+        .expect("cancelled checkout waited for the pool checkout timeout")
+        .expect("checkout task panicked")
+        .unwrap_err();
+    assert!(
+        matches!(cancelled, StorageError::Timeout { .. }),
+        "cancellation before checkout through a typed store must be the \
+         non-retryable Timeout, got {cancelled:?}"
+    );
+
+    drop(held_reader);
+    let reader = pool.reader_acquisition_snapshot();
+    assert_eq!(reader.pooled_checkouts, 1);
+    assert_eq!(reader.checkout_timeouts, 1);
+    assert_eq!(reader.completed_pooled_checkouts, 1);
+    assert_eq!(reader.active_pooled_checkouts, 0);
+    assert_eq!(
+        reader.standalone_opens, 0,
+        "neither saturation nor cancellation may fall back to a standalone reader"
+    );
+}

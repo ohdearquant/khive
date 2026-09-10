@@ -441,7 +441,14 @@ pub enum DslError {
     InvalidJson {
         error: String,
     },
-    UnclosedString,
+    /// A quoted string reached end of input without a closing quote.
+    UnclosedString {
+        start: usize,
+    },
+    /// A function call reached end of input without its closing `)`.
+    UnclosedCall {
+        start: usize,
+    },
     UnclosedBracket {
         kind: char,
     },
@@ -496,7 +503,7 @@ impl fmt::Display for DslError {
             DslError::NestingTooDeep { pos, depth, max } => {
                 write!(
                     f,
-                    "at position {pos}: container nesting depth {depth} exceeds max {max}"
+                    "at byte {pos}: container nesting depth {depth} exceeds max {max}"
                 )
             }
             DslError::UnexpectedChar {
@@ -504,7 +511,7 @@ impl fmt::Display for DslError {
                 found,
                 expected,
             } => {
-                write!(f, "at position {pos}: expected {expected}, found {found:?}")
+                write!(f, "at byte {pos}: expected {expected}, found {found:?}")
             }
             DslError::UnexpectedEof { expected } => {
                 write!(f, "unexpected end of input; expected {expected}")
@@ -512,22 +519,27 @@ impl fmt::Display for DslError {
             DslError::InvalidIdentifier { pos } => {
                 write!(
                     f,
-                    "at position {pos}: invalid identifier (expected [A-Za-z_][A-Za-z0-9_]*)"
+                    "at byte {pos}: invalid identifier (expected [A-Za-z_][A-Za-z0-9_]*)"
                 )
             }
             DslError::DuplicateArg { name } => write!(f, "duplicate argument {name:?}"),
             DslError::InvalidValue { pos, error } => {
-                write!(f, "at position {pos}: invalid value: {error}")
+                write!(f, "at byte {pos}: invalid value: {error}")
             }
             DslError::InvalidJson { error } => write!(f, "invalid JSON form: {error}"),
-            DslError::UnclosedString => write!(f, "unterminated string literal"),
+            DslError::UnclosedString { start } => {
+                write!(f, "unterminated string literal starting at byte {start}")
+            }
+            DslError::UnclosedCall { start } => {
+                write!(f, "unclosed call starting at byte {start}; expected ')'")
+            }
             DslError::UnclosedBracket { kind } => {
                 write!(f, "unclosed bracket: {kind:?} has no matching close")
             }
             DslError::PrevRefOutsideChain { pos } => {
                 write!(
                     f,
-                    "at position {pos}: $prev reference is only valid in chain (|) mode; \
+                    "at byte {pos}: $prev reference is only valid in chain (|) mode; \
                      use function-call form with '|' to chain ops"
                 )
             }
@@ -554,7 +566,7 @@ impl fmt::Display for DslError {
             DslError::UnsupportedVerbNesting { pos } => {
                 write!(
                     f,
-                    "at position {pos}: only single-level dotted verb names are supported \
+                    "at byte {pos}: only single-level dotted verb names are supported \
                      (e.g. brain.state); use a shorter name or register a pack alias"
                 )
             }
@@ -579,7 +591,7 @@ impl fmt::Display for DslError {
             DslError::TrailingComma { pos } => {
                 write!(
                     f,
-                    "at position {pos}: trailing comma before ']' — a batch cannot end with \
+                    "at byte {pos}: trailing comma before ']' — a batch cannot end with \
                      an empty element; remove the comma or add another op after it"
                 )
             }

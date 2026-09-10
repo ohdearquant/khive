@@ -99,7 +99,8 @@ pub struct ProposalCreatedPayload {
 pub enum ProposalChangeset {
     /// Add a new entity. Fields validated against ADR-001 + pack kind specs.
     AddEntity { entity: EntityDraft },
-    /// Modify an existing entity's properties / tags / description.
+    /// Modify an existing entity's properties / tags / description / entity type
+    /// (absent = unchanged, null = clear, string = set-and-validate).
     UpdateEntity { id: Uuid, patch: EntityPatch },
     /// Add a new edge. Validated against ADR-002 endpoints + pack EDGE_RULES.
     AddEdge { source: Uuid, target: Uuid, relation: EdgeRelation, weight: Option<f32> },

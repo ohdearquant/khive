@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
-    deser, enrich_allowlist_error, format_edge_output, parse_relation, resolve_uuid_unfiltered,
-    to_json, validate_weight, LinkParams,
+    deser, enrich_allowlist_error, enrich_bulk_atomic_allowlist_error, format_edge_output,
+    parse_relation, resolve_uuid_unfiltered, to_json, validate_weight, LinkParams,
 };
 use crate::KgPack;
 
@@ -30,9 +30,13 @@ impl KgPack {
             let atomic = p.atomic.unwrap_or(true);
             if atomic {
                 let mut specs = Vec::with_capacity(attempted);
+                // Caller entry index per spec: duplicate-skips shift spec
+                // positions, so error attribution must map back to the
+                // caller's entry list.
+                let mut entry_indices = Vec::with_capacity(attempted);
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
-                for entry in entries {
+                for (idx, entry) in entries.into_iter().enumerate() {
                     let source =
                         resolve_uuid_unfiltered(&entry.source_id, &self.runtime, token).await?;
                     let target =
@@ -54,6 +58,7 @@ impl KgPack {
                     }
                     let weight = validate_weight(entry.weight)?;
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
+                    entry_indices.push(idx);
                     specs.push(LinkSpec {
                         namespace: Some(token.namespace().as_str().to_owned()),
                         source_id: source,
@@ -66,7 +71,23 @@ impl KgPack {
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
                     .await?;
-                let edges = self.runtime.link_many(token, specs).await?;
+                let edges = match self.runtime.link_many(token, specs.clone()).await {
+                    Ok(edges) => edges,
+                    Err(RuntimeError::InvalidInput(ref msg))
+                        if msg.contains("not in the base endpoint allowlist") =>
+                    {
+                        let enriched = enrich_bulk_atomic_allowlist_error(
+                            msg,
+                            &self.runtime,
+                            token,
+                            &specs,
+                            &entry_indices,
+                        )
+                        .await;
+                        return Err(RuntimeError::InvalidInput(enriched));
+                    }
+                    Err(e) => return Err(e),
+                };
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": edges.len(),
@@ -157,6 +178,20 @@ impl KgPack {
                         .await
                     {
                         Ok(edge) => results.push(to_json(&edge)?),
+                        Err(RuntimeError::InvalidInput(ref msg))
+                            if msg.contains("not in the base endpoint allowlist") =>
+                        {
+                            let enriched = enrich_allowlist_error(
+                                msg,
+                                &self.runtime,
+                                token,
+                                source,
+                                target,
+                                relation,
+                            )
+                            .await;
+                            error_list.push(json!({"index": idx, "error": enriched}));
+                        }
                         Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }

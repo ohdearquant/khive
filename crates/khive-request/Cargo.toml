@@ -15,12 +15,13 @@ description = "Request DSL — parses verb-dispatch strings (function-call, JSON
 bench = false
 
 [dependencies]
-khive-types = { version = "0.7.0", path = "../khive-types" }
+khive-types = { version = "0.8.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+syn = { workspace = true }
 
 [[bench]]
 name = "request_bench"

@@ -11,7 +11,7 @@ description = "KG import/export format adapters — CSV, JSON, and future format
 
 [dependencies]
 chrono = { workspace = true }
-khive-types = { version = "0.7.0", path = "../khive-types" }
+khive-types = { version = "0.8.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

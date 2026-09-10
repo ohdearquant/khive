@@ -45,22 +45,16 @@ The KKERNEL_BINARY env var overrides the default binary path. The server is the
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import traceback
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Binary location
-# ---------------------------------------------------------------------------
+from kkernel_binary import resolve_binary_path
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
-    ),
-)
+BINARY = resolve_binary_path()
 
 # ---------------------------------------------------------------------------
 # Low-level JSON-RPC + MCP helpers
@@ -87,7 +81,16 @@ def _send(proc: subprocess.Popen, method: str, params: Any = None) -> None:
 def _recv(proc: subprocess.Popen) -> dict:
     line = proc.stdout.readline()
     if not line:
-        raise RuntimeError("MCP server closed stdout unexpectedly")
+        message = "MCP server closed stdout unexpectedly"
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.poll() is not None and proc.stderr is not None:
+            stderr = proc.stderr.read().decode(errors="replace").strip()
+            if stderr:
+                message = f"{message}\nstderr:\n{stderr}"
+        raise RuntimeError(message)
     return json.loads(line)
 
 
@@ -167,6 +170,24 @@ def _tool(proc: subprocess.Popen, name: str, args: dict) -> Any:
     return value
 
 
+def _op_error_text(error: Any) -> str:
+    """Return the human-readable text of a per-op error.
+
+    Per-op errors are structured objects carrying `message` alongside
+    `kind` and `domain_disposition`; servers before that change sent a bare
+    string. The object is the current contract, so a dict that does not carry
+    a string `message` is a contract failure rather than something to coerce.
+    """
+    if isinstance(error, dict):
+        message = error.get("message")
+        assert isinstance(message, str), (
+            f"a structured per-op error must carry a string 'message'; got: {error!r}"
+        )
+        return message
+    assert isinstance(error, str), f"per-op error must be an object or a string; got: {error!r}"
+    return error
+
+
 def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
     """Assert the verb call fails. Return the error message string.
 
@@ -184,7 +205,7 @@ def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
         return err.get("message", str(err))
 
     if "_op_error" in result:
-        return result["_op_error"]
+        return _op_error_text(result["_op_error"])
 
     raise AssertionError(
         f"Expected verb '{name}' to fail but got success:\n{result.get('_ok')!r}"
@@ -200,9 +221,13 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_server(db_path: str) -> subprocess.Popen:
+def _start_server(db_path: str, config_path: str) -> subprocess.Popen:
     """Spawn a fresh `kkernel mcp` process backed by a temp SQLite file."""
-    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
+    env = {
+        **os.environ,
+        "KHIVE_CONFIG": config_path,
+        "KHIVE_NO_DAEMON": "1",
+    }
     proc = subprocess.Popen(
         [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
@@ -240,10 +265,19 @@ _results: list[tuple[str, bool, str]] = []
 
 
 def _run_test(name: str, fn) -> None:
-    """Execute a test function; record pass/fail."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-    proc = _start_server(db_path)
+    """Execute a test function; record pass/fail.
+
+    The database lives inside a private (0700) temporary directory, not bare
+    in /tmp: the events sidecar database is opened beside the main database,
+    and the server refuses to serve events from a directory other local
+    users can write (a bare /tmp parent fails that trust walk).
+    """
+    work_dir = tempfile.mkdtemp(prefix="khive-contract-")
+    db_path = os.path.join(work_dir, "contract.db")
+    config_path = os.path.join(work_dir, "contract.toml")
+    with open(config_path, "w", encoding="utf-8"):
+        pass
+    proc = _start_server(db_path, config_path)
     try:
         fn(proc)
         _results.append((name, True, ""))
@@ -255,10 +289,7 @@ def _run_test(name: str, fn) -> None:
         print(f"         {exc}")
     finally:
         _stop_server(proc)
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1080,39 @@ def test_batch_outcome_status(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Harness contract — ambient home config isolation
+# ---------------------------------------------------------------------------
+
+def test_home_config_isolation(proc: subprocess.Popen) -> None:
+    """An ambient multi-backend home config must not affect this test server.
+
+    The harness points the server at a freshly-minted temp database, so the
+    entity listing must start empty: a server that resolved the ambient home
+    configuration instead would surface that backend's pre-existing rows. The
+    sentinel round-trip then pins the write path to the same store.
+    """
+    before = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    assert before == [], (
+        f"fresh temp database lists pre-existing entities: {before!r}"
+    )
+
+    sentinel = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "IsolationSentinel",
+        "description": "Written through the temp-config server",
+    })
+    fetched = _tool(proc, "get", {"id": sentinel["id"]})
+    assert fetched["name"] == "IsolationSentinel", fetched
+
+    listed = _tool(proc, "list", {"kind": "entity", "limit": 10})
+    names = [e.get("name") for e in listed]
+    assert names == ["IsolationSentinel"], (
+        f"sentinel is not the sole visible entity: {names!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1136,32 @@ def main() -> int:
         ("epistemic_edge_endpoints", test_epistemic_edge_endpoints),
         ("batch_outcome_status", test_batch_outcome_status),
     ]
+
+    with tempfile.TemporaryDirectory(prefix="khive-contract-home-") as home:
+        config_dir = os.path.join(home, ".khive")
+        os.makedirs(config_dir)
+        config_path = os.path.join(config_dir, "config.toml")
+        with open(config_path, "w", encoding="utf-8") as config:
+            config.write(
+                "[[backends]]\n"
+                'name = "main"\n'
+                'kind = "sqlite"\n'
+                f"path = {json.dumps(os.path.join(home, 'main.db'))}\n\n"
+                "[[backends]]\n"
+                'name = "sessions"\n'
+                'kind = "sqlite"\n'
+                f"path = {json.dumps(os.path.join(home, 'sessions.db'))}\n"
+            )
+
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            _run_test("home_config_isolation", test_home_config_isolation)
+        finally:
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
 
     for name, fn in tests:
         _run_test(name, fn)

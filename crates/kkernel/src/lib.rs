@@ -10,6 +10,7 @@ pub mod engine;
 pub mod exec;
 pub mod git_ingest;
 pub mod kg;
+pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
 pub mod repo;
@@ -35,18 +36,24 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    use khive_pack_exec::ExecPack as _;
+    #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
     use khive_pack_knowledge::KnowledgePack as _;
     use khive_pack_memory::MemoryPack as _;
+    #[cfg(feature = "pack-moodboard")]
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    use khive_pack_tool::ToolPack as _;
+    use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;
 }

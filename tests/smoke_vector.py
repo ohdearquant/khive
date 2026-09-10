@@ -32,6 +32,8 @@ import os
 import subprocess
 import sys
 
+from kkernel_binary import resolve_binary_path
+
 # Primary embedder validated by this gate. Pinning both memory.remember and
 # memory.recall to this model prevents kkernel's multi-model fan-out
 # (operations.rs:2055) from targeting the secondary default model
@@ -40,10 +42,7 @@ import sys
 # model is never built and never downloads from HuggingFace.
 EMBED_MODEL = "all-minilm-l6-v2"
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+BINARY = resolve_binary_path()
 
 # Fall back to the installed binary when the release build does not exist.
 _INSTALLED = os.path.expanduser("~/.cargo/bin/kkernel")

@@ -33,6 +33,10 @@ impl KgPack {
         let edges_by_relation = self.runtime.count_edges_by_relation(token).await?;
         let notes = self.runtime.count_notes(token, None).await?;
         Ok(serde_json::json!({
+            "count_scope": {
+                "namespaces": "caller_visible",
+                "rows": "live_only",
+            },
             "entities": entities,
             "edges": edges,
             "edges_by_relation": edges_by_relation,

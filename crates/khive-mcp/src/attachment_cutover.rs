@@ -4,11 +4,42 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use khive_db::migrations::AttachmentCutoverStatus;
-use khive_runtime::{BlobHydrator, StorageBackend};
+use khive_runtime::{BlobHydrator, LegacyPreferenceVerifier, RuntimeError, StorageBackend};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::{Attachment, AttachmentSubstrate};
+use khive_storage::{Attachment, AttachmentSubstrate, SqlAccess};
 
 const FANN_NETWORK_ROLE: &str = "fann-network";
+
+/// Count legacy (pre-V21) moodboard preference-model artifact rows,
+/// including soft-deleted ones.
+///
+/// This is the core-side twin of `khive_pack_moodboard::legacy_preference_model_count`
+/// (same SQL, same label) — it lets V21 detect legacy moodboard rows without
+/// linking `khive-pack-moodboard`, which is an optional dependency. The
+/// query itself uses no moodboard types: it is a plain count over `entities`.
+/// `'moodboard_model'` is a value in the data, not a code dependency on the
+/// pack.
+pub(crate) async fn legacy_preference_model_count(
+    sql: &dyn SqlAccess,
+) -> Result<u64, RuntimeError> {
+    let mut reader = sql.reader().await?;
+    match reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM entities \
+                  WHERE kind = 'artifact' AND entity_type = 'moodboard_model' \
+                    AND content_ref IS NOT NULL"
+                .to_string(),
+            params: vec![],
+            label: Some("moodboard_legacy_preference_model_count".to_string()),
+        })
+        .await?
+    {
+        Some(SqlValue::Integer(count)) if count >= 0 => Ok(count as u64),
+        other => Err(RuntimeError::Internal(format!(
+            "moodboard legacy preference model count returned invalid value {other:?}"
+        ))),
+    }
+}
 
 enum CutoverMode {
     Main,
@@ -90,6 +121,24 @@ async fn scalar_count(
     }
 }
 
+/// The V21 legacy-moodboard verifier for this build, or `None` when compiled
+/// without the `pack-moodboard` feature.
+///
+/// Boot call sites use this instead of naming `khive-pack-moodboard`
+/// directly, so the optional dependency stays confined to this one seam.
+#[cfg(feature = "pack-moodboard")]
+pub(crate) fn legacy_preference_verifier() -> Option<Arc<dyn LegacyPreferenceVerifier>> {
+    Some(Arc::new(
+        khive_pack_moodboard::MoodboardLegacyPreferenceVerifier,
+    ))
+}
+
+/// See the `pack-moodboard` variant above; this build ships no verifier.
+#[cfg(not(feature = "pack-moodboard"))]
+pub(crate) fn legacy_preference_verifier() -> Option<Arc<dyn LegacyPreferenceVerifier>> {
+    None
+}
+
 async fn cutover_status(backend: Arc<StorageBackend>) -> anyhow::Result<AttachmentCutoverStatus> {
     tokio::task::spawn_blocking(move || backend.attachment_cutover_status())
         .await
@@ -152,8 +201,9 @@ pub(crate) async fn require_secondary_attachment_empty(
 pub(crate) async fn coordinate_attachment_cutover(
     backend: Arc<StorageBackend>,
     hydrator: Option<Arc<BlobHydrator>>,
+    verifier: Option<Arc<dyn LegacyPreferenceVerifier>>,
 ) -> anyhow::Result<()> {
-    coordinate_attachment_cutover_inner(backend, hydrator, CutoverMode::Main).await
+    coordinate_attachment_cutover_inner(backend, hydrator, verifier, CutoverMode::Main).await
 }
 
 /// Finish an interrupted empty secondary without ever making it an
@@ -165,6 +215,7 @@ pub(crate) async fn coordinate_empty_secondary_attachment_cutover(
     coordinate_attachment_cutover_inner(
         backend,
         None,
+        None,
         CutoverMode::EmptySecondary {
             backend_name: backend_name.to_string(),
         },
@@ -175,6 +226,7 @@ pub(crate) async fn coordinate_empty_secondary_attachment_cutover(
 async fn coordinate_attachment_cutover_inner(
     backend: Arc<StorageBackend>,
     hydrator: Option<Arc<BlobHydrator>>,
+    verifier: Option<Arc<dyn LegacyPreferenceVerifier>>,
     mode: CutoverMode,
 ) -> anyhow::Result<()> {
     if cutover_status(Arc::clone(&backend)).await? == AttachmentCutoverStatus::Complete {
@@ -227,25 +279,30 @@ async fn coordinate_attachment_cutover_inner(
             Vec::new()
         } else {
             let sql = backend.sql();
-            let legacy_model_count =
-                khive_pack_moodboard::legacy_preference_model_count(sql.as_ref())
-                    .await
-                    .context("count legacy moodboard preference models")?;
+            let legacy_model_count = legacy_preference_model_count(sql.as_ref())
+                .await
+                .context("count legacy moodboard preference models")?;
             if legacy_model_count == 0 {
                 Vec::new()
             } else {
+                let verifier = verifier.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "V21 found {legacy_model_count} legacy moodboard preference model(s), but \
+                         this build has no moodboard support (compiled without the \
+                         `pack-moodboard` feature); rebuild with that feature enabled to \
+                         migrate them, then retry boot"
+                    )
+                })?;
                 let hydrator = hydrator.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "V21 found {legacy_model_count} legacy moodboard preference model(s), but \
                          no BlobHydrator is configured; configure [storage.blob] and retry boot"
                     )
                 })?;
-                let verified = khive_pack_moodboard::verify_legacy_preference_attachments(
-                    sql.as_ref(),
-                    hydrator.as_ref(),
-                )
-                .await
-                .context("verify legacy moodboard bundle/event/FANN evidence")?;
+                let verified = verifier
+                    .verify_legacy_preference_attachments(sql.as_ref(), hydrator.as_ref())
+                    .await
+                    .context("verify legacy moodboard bundle/event/FANN evidence")?;
                 if verified.len() as u64 != legacy_model_count {
                     anyhow::bail!(
                         "legacy moodboard verification returned {} attachment(s) for \
@@ -372,7 +429,7 @@ mod tests {
             ATTACHMENT_CUTOVER_VERSION - 1,
             "ordinary migration must stop before the coordinated legacy cutover"
         );
-        coordinate_attachment_cutover(Arc::clone(&backend), None)
+        coordinate_attachment_cutover(Arc::clone(&backend), None, None)
             .await
             .expect("non-model legacy content needs no BlobHydrator");
         assert_eq!(
@@ -400,8 +457,18 @@ mod tests {
         assert_eq!(legacy_columns, 0, "final V21 must drop the legacy column");
     }
 
+    /// Legacy count > 0 and no verifier installed (the default, feature-off
+    /// build) must fail closed rather than silently dropping the legacy
+    /// column with unmigrated models still on disk.
+    ///
+    /// Was: `legacy_model_without_hydrator_stays_incomplete_and_gc_refuses_to_run`,
+    /// which asserted the error contained "no BlobHydrator is configured".
+    /// Now: no verifier is ever passed in this test, so the *new* fail-closed
+    /// arm fires first — before hydrator configuration is even consulted —
+    /// and the assertion moves to the new message naming the legacy count
+    /// and the missing `pack-moodboard` feature.
     #[tokio::test]
-    async fn legacy_model_without_hydrator_stays_incomplete_and_gc_refuses_to_run() {
+    async fn legacy_model_without_verifier_fails_closed_and_gc_refuses_to_run() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy-model.db");
         create_v20_database_fixture(&db_path, "moodboard_model", None);
@@ -411,7 +478,51 @@ mod tests {
             ATTACHMENT_CUTOVER_VERSION - 1
         );
 
-        let error = coordinate_attachment_cutover(Arc::clone(&backend), None)
+        let error = coordinate_attachment_cutover(Arc::clone(&backend), None, None)
+            .await
+            .expect_err("legacy model evidence requires an installed verifier");
+        let message = error.to_string();
+        assert!(
+            message.contains("1 legacy moodboard preference model"),
+            "error must name the legacy count: {message}"
+        );
+        assert!(
+            message.contains("pack-moodboard"),
+            "error must tell the operator which feature to rebuild with: {message}"
+        );
+        assert_eq!(
+            backend.attachment_cutover_status().unwrap(),
+            AttachmentCutoverStatus::Incomplete,
+            "a failed application stage must remain durably resumable"
+        );
+
+        let store = FsBlobStore::new(temp.path().join("blobs"), 0).unwrap();
+        let sweep_error = store
+            .transactional_orphan_sweep(backend.sql().as_ref(), false)
+            .await
+            .expect_err("GC must not run over an incomplete dual representation");
+        assert!(sweep_error.to_string().contains("fencing"));
+    }
+
+    /// With the `pack-moodboard` feature enabled, a verifier is installed but
+    /// no `BlobHydrator` is configured: the pre-existing hydrator-required
+    /// error must still fire, unchanged, for that case (only reachable past
+    /// the new fail-closed arm once a verifier exists).
+    #[cfg(feature = "pack-moodboard")]
+    #[tokio::test]
+    async fn legacy_model_with_verifier_but_no_hydrator_stays_incomplete_and_gc_refuses_to_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("legacy-model.db");
+        create_v20_database_fixture(&db_path, "moodboard_model", None);
+        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        assert_eq!(
+            backend.prepare_core_schema().unwrap(),
+            ATTACHMENT_CUTOVER_VERSION - 1
+        );
+
+        let verifier: Arc<dyn LegacyPreferenceVerifier> =
+            Arc::new(khive_pack_moodboard::MoodboardLegacyPreferenceVerifier);
+        let error = coordinate_attachment_cutover(Arc::clone(&backend), None, Some(verifier))
             .await
             .expect_err("legacy model evidence requires configured blob hydration");
         assert!(error.to_string().contains("no BlobHydrator is configured"));
@@ -466,8 +577,16 @@ mod tests {
             std::fs::canonicalize(&db_path).expect("canonical fixture database"),
             Arc::clone(&barrier),
         );
-        let first = tokio::spawn(coordinate_attachment_cutover(Arc::clone(&backend), None));
-        let second = tokio::spawn(coordinate_attachment_cutover(Arc::clone(&backend), None));
+        let first = tokio::spawn(coordinate_attachment_cutover(
+            Arc::clone(&backend),
+            None,
+            None,
+        ));
+        let second = tokio::spawn(coordinate_attachment_cutover(
+            Arc::clone(&backend),
+            None,
+            None,
+        ));
 
         tokio::time::timeout(std::time::Duration::from_secs(5), barrier.wait())
             .await

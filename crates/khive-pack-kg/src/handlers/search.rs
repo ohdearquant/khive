@@ -11,7 +11,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, SearchSource, VerbRegistry,
+};
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
@@ -49,6 +51,7 @@ pub struct ValidatedSearchRequest {
     include_superseded: bool,
     properties: Option<Value>,
     tags: Vec<String>,
+    source: Option<SearchSource>,
     min_score: f64,
 }
 
@@ -72,6 +75,17 @@ impl ValidatedSearchRequest {
         let tags = p.tags.unwrap_or_default();
         let limit = p.limit.unwrap_or(10).min(100);
         let min_score = p.min_score.unwrap_or(0.0).max(0.0);
+        let source = match p.source.as_deref() {
+            None => None,
+            Some("text") => Some(SearchSource::Text),
+            Some("vector") => Some(SearchSource::Vector),
+            Some("both") => Some(SearchSource::Both),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "source must be one of: text, vector, both".to_string(),
+                ));
+            }
+        };
 
         match resolve_kind_spec(kind_raw, registry)? {
             KindSpec::Entity { specific } => {
@@ -109,6 +123,7 @@ impl ValidatedSearchRequest {
                     include_superseded: false,
                     properties,
                     tags,
+                    source,
                     min_score,
                 })
             }
@@ -138,6 +153,7 @@ impl ValidatedSearchRequest {
                     include_superseded: p.include_superseded.unwrap_or(false),
                     properties,
                     tags,
+                    source,
                     min_score,
                 })
             }
@@ -196,6 +212,11 @@ impl ValidatedSearchRequest {
         &self.tags
     }
 
+    /// Exact retrieval leg membership required by the caller.
+    pub fn source(&self) -> Option<SearchSource> {
+        self.source
+    }
+
     /// Non-negative result-score floor.
     pub fn min_score(&self) -> f64 {
         self.min_score
@@ -203,7 +224,7 @@ impl ValidatedSearchRequest {
 
     /// Bounded backend candidate window used to preserve filtered-result recall.
     pub fn candidate_limit(&self) -> u32 {
-        if self.properties.is_some() || !self.tags.is_empty() {
+        if self.properties.is_some() || !self.tags.is_empty() || self.source.is_some() {
             self.limit.saturating_mul(50).min(FILTERED_SCAN_CAP)
         } else {
             self.limit
@@ -241,6 +262,7 @@ impl KgPack {
             SearchSubstrate::Entity => {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
+                let source_filter = request.source();
                 let hits = self
                     .runtime
                     .hybrid_search(
@@ -288,20 +310,25 @@ impl KgPack {
                             .collect()
                     };
 
-                let filtered_hits = if props_filter.is_some() || tag_filter.is_some() {
-                    hits.into_iter()
-                        .filter(|h| {
-                            let Some((_, props, tags, _)) = entity_meta.get(&h.entity_id) else {
-                                return false;
-                            };
-                            props_filter.is_none_or(|pf| props_match(props.as_ref(), pf))
-                                && tag_filter.is_none_or(|wanted| tags_match_any(tags, wanted))
-                        })
-                        .take(request.limit() as usize)
-                        .collect::<Vec<_>>()
-                } else {
-                    hits
-                };
+                let filtered_hits =
+                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
+                        hits.into_iter()
+                            .filter(|h| {
+                                if source_filter.is_some_and(|source| h.source != source) {
+                                    return false;
+                                }
+                                let Some((_, props, tags, _)) = entity_meta.get(&h.entity_id)
+                                else {
+                                    return false;
+                                };
+                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf))
+                                    && tag_filter.is_none_or(|wanted| tags_match_any(tags, wanted))
+                            })
+                            .take(request.limit() as usize)
+                            .collect::<Vec<_>>()
+                    } else {
+                        hits
+                    };
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
@@ -339,6 +366,7 @@ impl KgPack {
             SearchSubstrate::Note => {
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
+                let source_filter = request.source();
                 let hits = self
                     .runtime
                     .search_notes(
@@ -357,60 +385,64 @@ impl KgPack {
                 // N individual gets. Notes absent from the batch result (deleted
                 // between the search and the fetch) are simply absent from the map
                 // and filtered out by the `note_meta.get` guard below.
-                let note_meta: HashMap<Uuid, (String, Option<Value>, Option<String>, i64)> =
-                    if hits.is_empty() {
-                        HashMap::new()
-                    } else {
-                        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
-                        let note_store = self.runtime.notes(token)?;
-                        note_store
-                            .get_notes_batch(&candidate_ids)
-                            .await
-                            .map_err(RuntimeError::Storage)?
-                            .into_iter()
-                            .map(|n| (n.id, (n.kind, n.properties, n.name, n.created_at)))
-                            .collect()
-                    };
-
-                let filtered_hits: Vec<_> = if props_filter.is_some() || tag_filter.is_some() {
-                    hits.into_iter()
-                        .filter(|h| {
-                            let Some((_, props, _, _)) = note_meta.get(&h.note_id) else {
-                                return false;
-                            };
-                            let props_ok =
-                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
-                            let tags_ok = tag_filter.is_none_or(|wanted| {
-                                let note_tags: Vec<String> = props
-                                    .as_ref()
-                                    .and_then(|p| p.get("tags"))
-                                    .and_then(Value::as_array)
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(Value::as_str)
-                                            .map(str::to_owned)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                tags_match_any(&note_tags, wanted)
-                            });
-                            props_ok && tags_ok
-                        })
-                        .take(request.limit() as usize)
-                        .collect()
+                let note_meta: HashMap<Uuid, khive_storage::note::Note> = if hits.is_empty() {
+                    HashMap::new()
                 } else {
-                    hits
+                    let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
+                    let note_store = self.runtime.notes(token)?;
+                    note_store
+                        .get_notes_batch(&candidate_ids)
+                        .await
+                        .map_err(RuntimeError::Storage)?
+                        .into_iter()
+                        .map(|n| (n.id, n))
+                        .collect()
                 };
+
+                let filtered_hits: Vec<_> =
+                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
+                        hits.into_iter()
+                            .filter(|h| {
+                                if source_filter.is_some_and(|source| h.source != source) {
+                                    return false;
+                                }
+                                let Some(note) = note_meta.get(&h.note_id) else {
+                                    return false;
+                                };
+                                let props = &note.properties;
+                                let props_ok =
+                                    props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
+                                let tags_ok = tag_filter.is_none_or(|wanted| {
+                                    let note_tags: Vec<String> = props
+                                        .as_ref()
+                                        .and_then(|p| p.get("tags"))
+                                        .and_then(Value::as_array)
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(Value::as_str)
+                                                .map(str::to_owned)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    tags_match_any(&note_tags, wanted)
+                                });
+                                props_ok && tags_ok
+                            })
+                            .take(request.limit() as usize)
+                            .collect()
+                    } else {
+                        hits
+                    };
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
                     .filter(|h| h.score.to_f64() >= request.min_score())
-                    .map(|h| {
-                        let meta = note_meta.get(&h.note_id);
-                        let note_kind = meta.map(|(k, _, _, _)| k.as_str());
-                        let name = meta.and_then(|(_, _, name, _)| name.clone());
-                        let created_at = meta.map(|(_, _, _, c)| micros_to_iso(*c));
-                        serde_json::json!({
+                    .filter_map(|h| {
+                        let note = note_meta.get(&h.note_id)?;
+                        let note_kind = note.kind.as_str();
+                        let name = &note.name;
+                        let created_at = micros_to_iso(note.created_at);
+                        Some(serde_json::json!({
                             "id": h.note_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
                             // `note_kind`/`title` are kept for compatibility.
@@ -422,7 +454,8 @@ impl KgPack {
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
-                        })
+                            "version": note.version,
+                        }))
                     })
                     .collect();
                 self.track_search_serve(

@@ -109,6 +109,7 @@ and the production integration boundary.
 | `InvalidValue`           | Literal value could not be parsed          |
 | `InvalidJson`            | JSON-form input is malformed               |
 | `UnclosedString`         | String literal is not terminated           |
+| `UnclosedCall`           | Function call has no closing `)`            |
 | `UnclosedBracket`        | `[`, `{`, or `(` has no matching close     |
 | `PrevRefOutsideChain`    | `$prev` in a non-chain context             |
 | `PrevRefInJsonForm`      | `$prev` string found in JSON-form input    |

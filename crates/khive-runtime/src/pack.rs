@@ -23,8 +23,8 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
-    PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
+    NoteLifecycleSpec, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
     RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
@@ -51,19 +51,108 @@ const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by th
     search. Strict identifier responses use canonical lowercase dashed UUIDs.";
 const SHORT_PREFIX_IDENTIFIER_HELP: &str = "A short UUID prefix is at least 8 hexadecimal \
     characters without dashes that do not parse as a complete UUID. It is a resolution, not a \
-    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope belongs to the consuming parameter: \
-    operations governed by ADR-007's by-ID contract resolve without a namespace filter, while \
-    other resolvers may search only the caller's primary namespace. A prefix can be missing or \
-    ambiguous.";
+    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope \
+    belongs to the consuming parameter — see `identifier_resolution.resolution_modes` for the \
+    exhaustive per-mode rule, and each `uuid`/`array of uuid` parameter's own description for \
+    which mode it uses. A prefix can be missing or ambiguous.";
 const IDENTIFIER_PARAMETER_HELP: &str = "A parameter that requires a full UUID rejects prefixes \
     and explains the resolution consequence. Its corresponding response field remains a \
     canonical full UUID so the value can be submitted again.";
 
+/// Single-source, per-[`IdResolutionMode`] contract text.
+///
+/// Every `uuid`/`array of uuid` [`ParamDef`] declares which of these modes its
+/// handler actually implements (see [`IdResolutionMode`]'s own doc comment).
+/// [`VerbRegistry::describe_verb`] renders the SAME text in two places: once
+/// per matching parameter's description, and once in the top-level
+/// `identifier_resolution.resolution_modes` map — so the wording can never
+/// drift between the two call sites, and a caller reading only the top-level
+/// envelope still sees every mode that exists on the wire, not just the ones
+/// this particular verb happens to use.
+///
+/// `None` for [`IdResolutionMode::NotApplicable`]: nothing is appended to a
+/// non-identifier parameter's description, and it is never listed in
+/// `resolution_modes`.
+fn resolution_mode_contract(mode: IdResolutionMode) -> Option<&'static str> {
+    match mode {
+        IdResolutionMode::NotApplicable => None,
+        IdResolutionMode::UnscopedById => Some(
+            "ID contract (unscoped by-ID, ADR-007 Rev 6): a full UUID and a short hex prefix \
+             (8+ hex chars) both resolve with no namespace filter — the caller already knows \
+             the specific record, and authorization is the Gate's seam, not resolution's. A \
+             prefix matching nothing or matching more than one record is rejected. Used by \
+             get/update/delete/merge/link (link's source_id/target_id resolve through the same \
+             unfiltered path as the four record-level by-ID verbs), GTD's lifecycle id \
+             parameters, and brain's feedback target_id.",
+        ),
+        IdResolutionMode::PrefixScopedToPrimary => Some(
+            "ID contract (prefix scoped to primary namespace): a full UUID resolves as given, \
+             with no namespace check performed by this resolver. A short hex prefix (8+ hex \
+             chars) is resolved by searching only the caller's primary namespace, and is \
+             rejected if it matches nothing or matches more than one record there.",
+        ),
+        IdResolutionMode::FullAndPrefixScopedToPrimary => Some(
+            "ID contract (full UUID and prefix both scoped to primary namespace): both a full \
+             UUID and a short hex prefix (8+ hex chars) are validated against the caller's \
+             primary namespace — a record that exists but belongs to a different namespace \
+             resolves as not found. A prefix matching more than one record in that namespace \
+             is rejected as ambiguous.",
+        ),
+        IdResolutionMode::FullUuidOnlyScopedToPrimary => Some(
+            "ID contract (full UUID only, scoped to primary namespace): only a complete UUID \
+             is accepted — a short hex prefix is rejected outright because this field stores \
+             an explicit stable reference — and the UUID is validated against the caller's own \
+             (primary) namespace; a record that exists in a different namespace resolves as \
+             not found.",
+        ),
+        IdResolutionMode::UnscopedFullUuidOnly => Some(
+            "ID contract (full UUID only, unscoped): only a complete UUID is accepted — a \
+             short hex prefix is rejected outright — and no namespace check is performed on \
+             this parameter itself; any namespace scoping comes from the enclosing operation, \
+             not from this identifier.",
+        ),
+    }
+}
+
+/// Stable wire key for an [`IdResolutionMode`], used as the key under
+/// `identifier_resolution.resolution_modes`.
+fn resolution_mode_key(mode: IdResolutionMode) -> &'static str {
+    match mode {
+        IdResolutionMode::NotApplicable => "not_applicable",
+        IdResolutionMode::UnscopedById => "unscoped_by_id",
+        IdResolutionMode::PrefixScopedToPrimary => "prefix_scoped_to_primary",
+        IdResolutionMode::FullAndPrefixScopedToPrimary => "full_and_prefix_scoped_to_primary",
+        IdResolutionMode::FullUuidOnlyScopedToPrimary => "full_uuid_only_scoped_to_primary",
+        IdResolutionMode::UnscopedFullUuidOnly => "unscoped_full_uuid_only",
+    }
+}
+
 fn identifier_resolution_help() -> Value {
+    let modes: serde_json::Map<String, Value> = [
+        IdResolutionMode::UnscopedById,
+        IdResolutionMode::PrefixScopedToPrimary,
+        IdResolutionMode::FullAndPrefixScopedToPrimary,
+        IdResolutionMode::FullUuidOnlyScopedToPrimary,
+        IdResolutionMode::UnscopedFullUuidOnly,
+    ]
+    .into_iter()
+    .map(|mode| {
+        (
+            resolution_mode_key(mode).to_string(),
+            Value::String(
+                resolution_mode_contract(mode)
+                    .expect("every non-NotApplicable mode has contract text")
+                    .to_string(),
+            ),
+        )
+    })
+    .collect();
+
     serde_json::json!({
         "full_uuid": FULL_UUID_IDENTIFIER_HELP,
         "short_prefix": SHORT_PREFIX_IDENTIFIER_HELP,
         "parameter_rule": IDENTIFIER_PARAMETER_HELP,
+        "resolution_modes": modes,
     })
 }
 
@@ -120,7 +209,8 @@ pub trait DispatchHook: Send + Sync {
 }
 
 use crate::error::{
-    CircularPackDependency, MissingPackDependencies, MissingPackDependency, RuntimeError,
+    AuditObligationFailure, CircularPackDependency, DispatchError, MissingPackDependencies,
+    MissingPackDependency, RuntimeError,
 };
 use crate::KhiveRuntime;
 
@@ -151,6 +241,11 @@ pub trait PackRuntime: Send + Sync {
 
     /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
     fn handlers(&self) -> &'static [HandlerDef];
+
+    /// Optional canonical input schema owned by the pack; ParamDefs remain available.
+    fn input_schema(&self, _verb: &str) -> Option<Value> {
+        None
+    }
 
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
@@ -296,6 +391,30 @@ pub trait PackRuntime: Send + Sync {
     /// See `docs/api/pack.md#registered_embedding_model_names` for the ADR-103 consumer.
     fn registered_embedding_model_names(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    fn mounted_namespace(&self) -> Option<&str> {
+        None
+    }
+
+    /// Advisory owned catalog only: no storage, process, gate, or audit work.
+    fn mounted_catalog_snapshot(&self) -> Vec<crate::mounted_verb::MountedVerb> {
+        Vec::new()
+    }
+
+    async fn mounted_catalog(&self) -> Result<Vec<crate::mounted_verb::MountedVerb>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn dispatch_mounted(
+        &self,
+        _definition: &crate::mounted_verb::MountedVerb,
+        verb: &str,
+        params: Value,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.dispatch(verb, params, registry, token).await
     }
 
     /// Dispatch a verb call. Returns serialized JSON response.
@@ -458,6 +577,17 @@ pub trait PackByIdResolver: Send + Sync {
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    /// Parallel to `packs`: whether the composition root vouches for the
+    /// pack at the same index, recorded by the registration method the
+    /// *caller* chose rather than anything the pack reports about itself.
+    /// [`Self::register`] (public, reachable from any pack crate) always
+    /// pushes `false`; `register_boxed` (crate-private, exercised only by
+    /// [`PackRegistry::register_packs`]'s `inventory`-discovered factories)
+    /// and the test-only `register_trusted` push `true`. A pack has no API
+    /// surface to set its own entry here — see
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s doc for why
+    /// `pack.name()` alone cannot be trusted for this decision.
+    pack_trusted: Vec<bool>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
     gate: GateRef,
     default_namespace: String,
@@ -499,6 +629,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            pack_trusted: Vec::new(),
             resolvers: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
@@ -536,19 +667,67 @@ impl VerbRegistryBuilder {
 
     /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
     /// declares vocabulary via `Pack` consts alongside runtime dispatch.
+    ///
+    /// This is the untrusted path: reachable from any external pack crate,
+    /// so the pack registered here is never eligible for admission-degrade
+    /// under `VerbRegistry::admission_degrade_safe`, regardless of what
+    /// `pack.name()`/handler category it reports. Use `register_boxed`
+    /// (composition root) or `register_trusted` (tests) for a pack the
+    /// caller actually vouches for.
     pub fn register<P: khive_types::Pack + PackRuntime + 'static>(&mut self, pack: P) -> &mut Self {
         self.packs.push(Box::new(pack));
+        self.pack_trusted.push(false);
         self
     }
 
-    /// Register a boxed pack directly.
+    /// Register a boxed pack directly, vouched for by the composition root.
     ///
-    /// Crate-private: only [`PackRegistry::register_packs`] should call this.
-    /// External callers must use the typed [`Self::register`] which enforces the
-    /// `Pack + PackRuntime` dual-impl contract at the call site.  Here the
+    /// Crate-private: only [`PackRegistry::register_packs`]/
+    /// `register_packs_with_runtimes` should call this — both resolve the
+    /// pack from an `inventory`-discovered `&'static dyn PackFactory`
+    /// (collected at link time from `inventory::submit!` call sites, not
+    /// from request-time data), so the trust grant recorded here reflects a
+    /// decision the composition root made, never something the pack itself
+    /// supplied. External callers must use the typed [`Self::register`]
+    /// which enforces the `Pack + PackRuntime` dual-impl contract at the
+    /// call site but is never trusted. Here the `Pack + PackRuntime`
     /// contract is satisfied upstream at the [`PackFactory::create`] site.
     pub(crate) fn register_boxed(&mut self, pack: Box<dyn PackRuntime>) -> &mut Self {
         self.packs.push(pack);
+        self.pack_trusted.push(true);
+        self
+    }
+
+    /// Register an owned mounted namespace without native-pack trust privileges.
+    pub fn register_mounted(
+        &mut self,
+        pack: Box<dyn PackRuntime>,
+    ) -> Result<&mut Self, RuntimeError> {
+        if pack.mounted_namespace() != Some(pack.name()) || !pack.handlers().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "invalid mounted namespace registration".into(),
+            ));
+        }
+        self.packs.push(pack);
+        self.pack_trusted.push(false);
+        Ok(self)
+    }
+
+    /// Test-only trusted registration, mirroring `register_boxed`'s trust
+    /// grant for external test binaries (e.g.
+    /// `tests/read_verb_admission_exhaustion.rs`) that cannot reach a
+    /// crate-private method directly — the same reason
+    /// [`VerbRegistry::admission_degrade_safe_probe`] is `pub` rather than
+    /// `pub(crate)`. A test using this method is asserting that the pack it
+    /// registers stands in for a pack the real composition root would load,
+    /// not an untrusted/third-party one.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn register_trusted<P: khive_types::Pack + PackRuntime + 'static>(
+        &mut self,
+        pack: P,
+    ) -> &mut Self {
+        self.packs.push(Box::new(pack));
+        self.pack_trusted.push(true);
         self
     }
 
@@ -599,6 +778,36 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Configure the registry's trusted audit sink from a runtime.
+    ///
+    /// Registry audit constructors stamp namespace and actor directly from
+    /// each resolved [`GateRequest`], including per-request daemon identity
+    /// overrides. This deliberately uses the runtime's undecorated sink: the
+    /// public token-scoped [`KhiveRuntime::events`] decorator would otherwise
+    /// replace every per-request stamp with the single actor that happened to
+    /// construct the registry.
+    pub fn with_runtime_event_store(
+        &mut self,
+        runtime: &KhiveRuntime,
+    ) -> Result<&mut Self, RuntimeError> {
+        let store = runtime.raw_events_for_namespace(self.default_namespace.as_str())?;
+        Ok(self.with_event_store(store))
+    }
+
+    /// Override the ADR-133 audit-batch seam's tunables, applied when
+    /// `build()` lazily constructs the batch from `event_store`.
+    /// `None` (the default) uses `AuditBatchConfig::default()`. Exposed for
+    /// tests that need to force a small `max_pending_rows` or a short
+    /// `admission_deadline` to exercise admission-pressure paths
+    /// deterministically (#2117, #2147, #2208, #2217).
+    pub fn with_audit_batch_config(
+        &mut self,
+        config: crate::audit_batch::AuditBatchConfig,
+    ) -> &mut Self {
+        self.audit_batch_config = Some(config);
+        self
+    }
+
     /// Mark audit persistence unavailable because its backend is read-only.
     ///
     /// No `EventStore` is retained, so dispatch never attempts a write that is
@@ -640,6 +849,22 @@ impl VerbRegistryBuilder {
                     first_idx: prev_idx,
                     second_idx: idx,
                 });
+            }
+        }
+
+        for mounted in packs
+            .iter()
+            .filter(|pack| pack.mounted_namespace().is_some())
+        {
+            let prefix = format!("{}.", mounted.name());
+            if packs
+                .iter()
+                .flat_map(|pack| pack.handlers())
+                .any(|handler| handler.name.starts_with(&prefix))
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "mounted namespace collides with a native verb".into(),
+                ));
             }
         }
 
@@ -718,11 +943,24 @@ impl VerbRegistryBuilder {
             ));
         }
 
-        let mut slots: Vec<Option<Box<dyn PackRuntime>>> = packs.into_iter().map(Some).collect();
-        let ordered_packs: Vec<Box<dyn PackRuntime>> = ordered_indices
-            .into_iter()
-            .map(|idx| slots[idx].take().expect("topological index must exist"))
-            .collect();
+        let mut pack_slots: Vec<Option<Box<dyn PackRuntime>>> =
+            packs.into_iter().map(Some).collect();
+        let mut trusted_slots: Vec<Option<bool>> =
+            self.pack_trusted.into_iter().map(Some).collect();
+        let mut ordered_packs: Vec<Box<dyn PackRuntime>> = Vec::with_capacity(pack_slots.len());
+        let mut ordered_trusted: Vec<bool> = Vec::with_capacity(trusted_slots.len());
+        for idx in ordered_indices {
+            ordered_packs.push(
+                pack_slots[idx]
+                    .take()
+                    .expect("topological index must exist"),
+            );
+            ordered_trusted.push(
+                trusted_slots[idx]
+                    .take()
+                    .expect("topological index must exist"),
+            );
+        }
 
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
@@ -735,6 +973,38 @@ impl VerbRegistryBuilder {
             .filter(|h| matches!(h.visibility, Visibility::Verb))
             .map(|h| h.name)
             .collect();
+
+        // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
+        // once here, from the trust bit the composition root recorded at
+        // registration time (never from `pack.name()`'s self-report) plus
+        // each handler's declared category and the `(pack, verb)` allowlist —
+        // see `VerbRegistry::admission_degrade_safe`'s doc. A verb is
+        // globally unique across `Visibility::Verb` handlers at this point
+        // (`validate_unique_verb_names` above already enforced that), so a
+        // flat `HashSet<&'static str>` is an unambiguous key: no dispatch
+        // call site needs to re-resolve which pack owns a verb to answer
+        // this question, and none does (`VerbRegistry::admission_degrade_safe`
+        // is a single hash-set lookup with no per-call pack/handler scan).
+        let mut degrade_safe_verbs: HashSet<&'static str> = HashSet::new();
+        for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
+            if !trusted {
+                continue;
+            }
+            let pack_name = pack.name();
+            for handler in pack.handlers() {
+                if !matches!(handler.visibility, Visibility::Verb)
+                    || handler.category != VerbCategory::Assertive
+                {
+                    continue;
+                }
+                let eligible = VerbRegistry::admission_degrade_safe_sorted()
+                    .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(handler.name)))
+                    .is_ok();
+                if eligible {
+                    degrade_safe_verbs.insert(handler.name);
+                }
+            }
+        }
 
         // ADR-133: incidental audit writes route through one batch seam per
         // configured `EventStore` instead of taking a writer-task
@@ -779,6 +1049,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,
         })
@@ -967,6 +1238,12 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     available_verbs: Arc<Vec<&'static str>>,
+    /// Verbs eligible for admission-pressure audit degradation, precomputed
+    /// once at `build()` time from registration-time pack trust plus each
+    /// handler's declared category and
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
+    /// [`VerbRegistry::admission_degrade_safe`].
+    degrade_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,
     /// actor-scoped, never persisted — see `crate::reference_ring`. Shared
     /// across every clone of this registry via the `Arc`, so admissions made
@@ -1309,6 +1586,15 @@ impl VerbRegistry {
     /// `KhiveRuntime::db_diagnostics_with_audit_metrics` so an operator can
     /// see flush failures and pure-observability degradation instead of the
     /// permanently-unavailable placeholder a bare `KhiveRuntime` reports.
+    ///
+    /// `admission_refused_obligations` and `admission_unresolved_obligations`
+    /// are sourced separately from [`audit_admission_refused_obligation_count`]
+    /// and [`audit_admission_unresolved_obligation_count`] rather than from
+    /// `batch.health_metrics()`: they count a decision made in
+    /// `append_audit_event_best_effort` (ADR-103 Amendment 3 / ADR-133
+    /// Amendment 1), not a property of the batch itself, so they are
+    /// process-wide like the rest of this struct's fields rather than
+    /// per-`AuditBatch`.
     pub fn audit_batch_metrics(&self) -> Option<khive_db::diagnostics::RuntimeAuditBatchMetrics> {
         self.audit_batch.as_ref().map(|batch| {
             let m = batch.health_metrics();
@@ -1316,8 +1602,20 @@ impl VerbRegistry {
                 flush_failures: m.flush_failures,
                 degraded_rows: m.degraded_rows,
                 degraded: m.degraded,
+                admission_refused_obligations: audit_admission_refused_obligation_count(),
+                admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
             }
         })
+    }
+
+    /// Test/diagnostic-only accessor for the underlying ADR-133 audit-batch
+    /// seam. `None` when no `EventStore` was configured (the batch is lazily
+    /// constructed from one). Exposed so admission-pressure mechanism tests
+    /// can saturate and drain the SAME instance a real dispatch uses
+    /// (#2117, #2147, #2208, #2217) instead of testing a
+    /// look-alike.
+    pub fn audit_batch_handle(&self) -> Option<Arc<crate::audit_batch::AuditBatch>> {
+        self.audit_batch.clone()
     }
 
     /// Stop admitting new audit rows and wait for every already-accepted row
@@ -1354,6 +1652,218 @@ impl VerbRegistry {
         })
     }
 
+    /// Explicit, fail-closed opt-in for admission-pressure audit degradation
+    /// (#2147/#2217). `VerbCategory::Assertive` alone is NOT a
+    /// sound proxy for "safe to drop this dispatch's own audit row under
+    /// audit-lane admission pressure": several Assertive handlers have
+    /// their own durable or accounting-bearing side effects. The reviewed
+    /// exclusions are:
+    /// - `memory.recall` dispatches `brain.record_serve` as a background
+    ///   write; degrading `memory.recall`'s row raises the risk that a
+    ///   serve goes unaccounted for if the ledger dispatch itself later
+    ///   also races admission pressure.
+    /// - `db_diagnostics` may backfill WAL frames via a PASSIVE checkpoint
+    ///   probe — physical I/O, not a pure in-memory read.
+    /// - `knowledge.search`, `knowledge.suggest`, and auto
+    ///   `knowledge.compose` may start persistent ANN consumer/checkpoint
+    ///   maintenance from their nominal read path.
+    /// - `git.checkout`, `git.diff` and `git.reconcile` persist a durable
+    ///   receipt on every dispatch (checkout and diff also write a manifest
+    ///   or diff blob), so their accounting row is not droppable.
+    ///
+    /// What membership here means, precisely: the verb performs no domain
+    /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
+    /// under transient admission pressure without the caller losing a
+    /// meaningful result (ADR-103 Amendment 3, ADR-133 Amendment 1). It does
+    /// NOT mean the handler is free of every event-plane write: `search`
+    /// still fires its own best-effort `SearchExecuted` telemetry, and
+    /// `context` still records a one-time `ConfigLocked` event, both on
+    /// independent code paths this mechanism never touches — those events
+    /// commit or fail on their own terms, unaffected by whether this
+    /// dispatch's own audit row degrades.
+    ///
+    /// Every entry here MUST be declared `VerbCategory::Assertive` in its
+    /// named pack's live vocabulary. The
+    /// `admission_degrade_safe_assertive_census_matches_live_pack_sources`
+    /// test below scans every pack that currently declares public Assertive
+    /// handlers and requires every such handler to be classified exactly
+    /// once as safe or as a known incidental writer. A new Assertive verb
+    /// therefore fails closed both at runtime and in the source census until
+    /// it receives an explicit side-effect review.
+    ///
+    /// Entries are `(owning pack name, verb)` pairs, not bare verb names:
+    /// [`Self::admission_degrade_safe`] requires the handler actually
+    /// resolved for `verb` to belong to the exact pack named here. A verb
+    /// name alone is not a sound key — any pack registered through the same
+    /// [`PackRegistry`]/[`VerbRegistryBuilder`] path can declare a handler
+    /// under any name it likes, including one that collides with a name on
+    /// this list, and unique-verb-name validation only rejects that
+    /// collision when the real owning pack is *also* loaded. A deployment
+    /// that omits the real pack (or loads a third-party pack instead) would
+    /// let a same-named write-performing handler inherit degrade-safety it
+    /// never earned. Binding to the pack closes that gap.
+    const ADMISSION_DEGRADE_SAFE_VERBS: &'static [(&'static str, &'static str)] = &[
+        // agent
+        ("agent", "agent.observe"),
+        // exec (reads of the blob store, the run receipt and event tables, or
+        // the resolved configuration; the writers are exec.tree and
+        // exec.tree_put, Declarations, and exec.run, a Directive)
+        ("exec", "exec.tree_get"),
+        ("exec", "exec.tree_diff"),
+        ("exec", "exec.receipt"),
+        ("exec", "exec.runs"),
+        ("exec", "exec.events"),
+        ("exec", "exec.identity"),
+        // git (receipt list, allowlist, working-tree and history reads;
+        // checkout, diff and reconcile persist receipts and are excluded)
+        ("git", "git.receipts"),
+        ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
+        // Canonical get project check plus bounded cursor SELECT; no domain writes.
+        ("git", "git.ingest_cursor"),
+        // blob
+        ("blob", "blob.get"),
+        ("blob", "blob.stat"),
+        // brain
+        ("brain", "brain.event_counts"),
+        ("brain", "brain.profiles"),
+        ("brain", "brain.profile"),
+        ("brain", "brain.resolve"),
+        ("brain", "brain.bindings"),
+        // comm
+        ("comm", "comm.delivered"),
+        ("comm", "comm.inbox"),
+        ("comm", "comm.unread"),
+        ("comm", "comm.thread"),
+        ("comm", "comm.health"),
+        ("comm", "comm.probe"),
+        // gtd
+        ("gtd", "gtd.next"),
+        ("gtd", "gtd.tasks"),
+        // kg
+        ("kg", "get"),
+        ("kg", "list"),
+        ("kg", "stats"),
+        ("kg", "search"),
+        ("kg", "neighbors"),
+        ("kg", "traverse"),
+        ("kg", "context"),
+        ("kg", "query"),
+        ("kg", "resolve"),
+        ("kg", "whoami"),
+        ("kg", "verbs"),
+        ("kg", "stream.read"),
+        ("kg", "stream.stat"),
+        // knowledge (ANN-maintaining search/suggest/compose are excluded)
+        ("knowledge", "knowledge.get"),
+        ("knowledge", "knowledge.list"),
+        ("knowledge", "knowledge.stats"),
+        ("knowledge", "knowledge.fold"),
+        ("knowledge", "knowledge.topic"),
+        // moodboard
+        ("moodboard", "moodboard.model"),
+        ("moodboard", "moodboard.search"),
+        ("moodboard", "moodboard.preference"),
+        // schedule
+        ("schedule", "schedule.agenda"),
+        // session
+        ("session", "session.list"),
+        ("session", "session.resume"),
+        ("session", "session.export"),
+        // tool (registry, grant and policy reads; tool.suggest runs the same
+        // hybrid search as the kg search and context verbs above)
+        ("tool", "tool.suggest"),
+        ("tool", "tool.describe"),
+        ("tool", "tool.list"),
+        ("tool", "tool.check"),
+        ("tool", "tool.requests"),
+        ("tool", "tool.policies"),
+    ];
+
+    /// Sorted copy of [`Self::ADMISSION_DEGRADE_SAFE_VERBS`], built once, so
+    /// [`VerbRegistryBuilder::build`] can decide each trusted handler's
+    /// eligibility with a binary search instead of a linear scan over every
+    /// entry. Consulted exactly once per registry, at `build()` time — see
+    /// [`Self::admission_degrade_safe`] for why no per-dispatch scan exists
+    /// anymore. The source list above stays grouped by pack (with a `//
+    /// <pack>` comment per group) for human review; this is a derived,
+    /// lookup-shaped view of the same data, not a second source of truth.
+    fn admission_degrade_safe_sorted() -> &'static [(&'static str, &'static str)] {
+        static SORTED: std::sync::LazyLock<Vec<(&'static str, &'static str)>> =
+            std::sync::LazyLock::new(|| {
+                let mut pairs = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS.to_vec();
+                pairs.sort_unstable();
+                pairs
+            });
+        &SORTED
+    }
+
+    /// Whether `verb` is both declared [`VerbCategory::Assertive`] (the
+    /// speech-act tag for handlers that "retrieve and present facts" rather
+    /// than committing a domain change) AND explicitly opted in to
+    /// admission-pressure audit degradation via
+    /// [`Self::ADMISSION_DEGRADE_SAFE_VERBS`] under the exact pack that
+    /// registered it, AND declared by a pack the composition root actually
+    /// vouches for (see [`VerbRegistryBuilder::register_boxed`]'s doc).
+    /// Unknown, non-opted-in, wrong-pack, or untrusted-pack verbs are
+    /// conservatively `false` — fail-closed, so a new Assertive handler (or
+    /// one registered by a pack other than the one the allowlist names, or
+    /// one registered through [`VerbRegistryBuilder::register`] rather than
+    /// the trusted path) hard-fails its audit obligation like any write
+    /// until someone deliberately reviews it and adds it to the allowlist.
+    ///
+    /// `pack.name()` is a value the `PackRuntime` trait object reports about
+    /// itself — any pack registered through the public
+    /// [`VerbRegistryBuilder::register`] path can claim any name, including
+    /// one on the allowlist, whether or not the pack that name actually
+    /// belongs to is also loaded (verb names are unique per registry, so an
+    /// impostor's same-named handler is only reachable when the real pack
+    /// is absent). Binding eligibility to registration-time trust — decided
+    /// by the *caller*, never by the pack instance — is why this checks
+    /// `degrade_safe_verbs` rather than resolving `pack.name()` at query
+    /// time; [`VerbRegistryBuilder::build`] already excluded every untrusted
+    /// pack's handlers from that set.
+    ///
+    /// The whole decision is precomputed once in `VerbRegistryBuilder::build`
+    /// into [`VerbRegistry::degrade_safe_verbs`] — a verb name is unique
+    /// across `Visibility::Verb` handlers within one registry
+    /// (`validate_unique_verb_names`), so this is a single hash-set lookup,
+    /// not a per-dispatch scan over every registered pack's handler list.
+    ///
+    /// Used only to decide whether a dispatch's own audit-obligation row may
+    /// degrade to best-effort on transient audit-lane admission pressure
+    /// (`append_audit_event_best_effort`) — a read that performed no domain
+    /// write must not fail the caller just because the audit lane is
+    /// momentarily saturated. Never used for permission checking, transport
+    /// routing, or return-shape selection.
+    fn admission_degrade_safe(&self, verb: &str) -> bool {
+        self.degrade_safe_verbs.contains(verb)
+    }
+
+    /// Narrow transport replay opt-in. These trusted built-in handlers have no
+    /// domain mutations for any arguments. A repeated dispatch may append a new
+    /// ordinary audit row; its request id remains correlation, not deduplication.
+    /// Unknown and custom handlers cannot inherit safety from a name/category.
+    pub fn is_read_replay_safe(&self, verb: &str) -> bool {
+        self.degrade_safe_verbs.contains(verb)
+            && matches!(
+                verb,
+                "stats" | "comm.thread" | "comm.inbox" | "comm.unread" | "comm.delivered"
+            )
+    }
+
+    /// White-box accessor for [`Self::admission_degrade_safe`], needed
+    /// because the admission-pressure regression tests in
+    /// `tests/read_verb_admission_exhaustion.rs` compile as a separate
+    /// external binary and cannot reach a crate-private method directly —
+    /// the same reason [`audit_admission_refused_obligation_count`] and
+    /// `AuditBatch::test_snapshot` are `pub` rather than `pub(crate)`.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn admission_degrade_safe_probe(&self, verb: &str) -> bool {
+        self.admission_degrade_safe(verb)
+    }
+
     /// Return the help schema envelope for a verb.
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
@@ -1362,6 +1872,14 @@ impl VerbRegistry {
     /// `link`'s envelope additionally carries `endpoint_rules` — the composed
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
+    /// Every `uuid`/`array of uuid` parameter description has its
+    /// declared [`IdResolutionMode`]'s contract text appended — the same
+    /// text rendered under `identifier_resolution.resolution_modes` — so the
+    /// full-UUID-vs-short-prefix rule is stated once per mode (in
+    /// `resolution_mode_contract`) and inherited by every matching param,
+    /// instead of restating it per param across every `HandlerDef` in every
+    /// pack. Parameters whose mode is [`IdResolutionMode::NotApplicable`]
+    /// (every non-identifier parameter) are left unchanged.
     /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
     /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
@@ -1373,11 +1891,15 @@ impl VerbRegistry {
                         .params
                         .iter()
                         .map(|p| {
+                            let description = match resolution_mode_contract(p.resolution_mode) {
+                                Some(contract) => format!("{} {}", p.description, contract),
+                                None => p.description.to_string(),
+                            };
                             serde_json::json!({
                                 "name": p.name,
                                 "type": p.param_type,
                                 "required": p.required,
-                                "description": p.description,
+                                "description": description,
                             })
                         })
                         .collect();
@@ -1408,6 +1930,9 @@ impl VerbRegistry {
                         "params": params_arr,
                         "identifier_resolution": identifier_resolution_help(),
                     });
+                    if let Some(schema) = pack.input_schema(verb) {
+                        envelope["input_schema"] = schema;
+                    }
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
                     }
@@ -1438,14 +1963,10 @@ impl VerbRegistry {
         let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
         match self.gate.check(&req) {
             Ok(decision) if decision.is_allow() => Ok(()),
-            Ok(GateDecision::Deny { reason }) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason,
-            }),
-            Ok(_) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(GateDecision::Deny { reason }) => {
+                Err(RuntimeError::permission_denied("authorize", reason))
+            }
+            Ok(_) => Err(RuntimeError::permission_denied("authorize", "gate denied")),
             Err(e) => {
                 tracing::warn!(
                     error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
@@ -1510,8 +2031,58 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_metadata_and_disposition(verb, params, identity, dispatch)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Append the `GateDenied` row of a refused dispatch and report what the
+    /// caller may cite: the row's id when it committed, otherwise why not.
+    async fn append_gate_denied_row(
+        &self,
+        store: &Arc<dyn EventStore>,
+        event: Event,
+        verb: &str,
+    ) -> crate::error::DenialReceipt {
+        let audit_event_id = event.id;
+        match append_audit_event_best_effort(
+            self.audit_batch.as_ref(),
+            store,
+            event,
+            verb,
+            crate::audit_batch::AuditProducer::GateDenied,
+            false,
+        )
+        .await
+        {
+            Ok(()) => crate::error::DenialReceipt {
+                audit_event_id: Some(audit_event_id),
+                audit_outcome: crate::error::DenialAuditOutcome::Committed,
+            },
+            Err(failure) => crate::error::DenialReceipt {
+                audit_event_id: None,
+                audit_outcome: crate::error::DenialAuditOutcome::NotCommitted(failure.wire_code()),
+            },
+        }
+    }
+
+    /// Execute an intercepted operation while retaining this boundary's failure provenance.
+    /// Successful canonical results and typed metadata are returned unchanged.
+    pub async fn dispatch_intercepted_with_metadata_and_disposition<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, DispatchError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
-        let gate_req = self.gate_request_with_identity(verb, params, identity)?;
+        let gate_req = self
+            .gate_request_with_identity(verb, params, identity)
+            .map_err(DispatchError::before_dispatch)?;
         let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
@@ -1521,44 +2092,45 @@ impl VerbRegistry {
                     "gate.check"
                 );
                 if let GateDecision::Deny { reason } = decision {
-                    if let Some(store) = &self.event_store {
-                        let event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // The dispatch already returns `PermissionDenied`
-                        // below regardless of whether this row commits — a
-                        // deny never reports success — so a persistent
-                        // commit failure here has no caller-visible outcome
-                        // to fold into; it is still logged and counted by
-                        // the helper.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                        )
-                        .await;
-                    }
-                    return Err(RuntimeError::PermissionDenied {
-                        verb: verb.to_string(),
-                        reason,
-                    });
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            let event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // The dispatch returns `PermissionDenied` below
+                            // whether or not this row commits — a deny never
+                            // reports success — so a commit failure has no
+                            // caller-visible outcome to fold into; the receipt
+                            // on the refusal says whether the row the caller
+                            // could cite exists.
+                            self.append_gate_denied_row(store, event, verb).await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
+                    return Err(DispatchError::before_dispatch(
+                        RuntimeError::PermissionDenied {
+                            verb: verb.to_string(),
+                            reason,
+                            receipt: Box::new(receipt),
+                        },
+                    ));
                 }
                 Some(audit)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         let started = Instant::now();
         let mut result = dispatch(gate_req.namespace.clone()).await;
+        let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
             let resource = result.as_ref().ok().map(|outcome| {
@@ -1614,10 +2186,10 @@ impl VerbRegistry {
                         request_id,
                     )
                     .await;
-                result = fold_audit_obligation(result, audit_outcome);
+                result = fold_audit_obligation(result, audit_outcome, |outcome| outcome.result);
             }
         }
-        result
+        result.map_err(|error| DispatchError::after_handler(error, domain_succeeded))
     }
 
     async fn persist_intercepted_audit(
@@ -1628,7 +2200,7 @@ impl VerbRegistry {
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), AuditObligationFailure> {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
@@ -1694,8 +2266,33 @@ impl VerbRegistry {
         } else {
             crate::audit_batch::AuditProducer::DispatchFailed
         };
-        append_audit_event_best_effort(self.audit_batch.as_ref(), store, event, verb, producer)
-            .await
+        append_audit_event_best_effort(
+            self.audit_batch.as_ref(),
+            store,
+            event,
+            verb,
+            producer,
+            self.admission_degrade_safe(verb),
+        )
+        .await
+    }
+
+    /// A create refusal may reveal its key holder only when the same caller can list it.
+    pub fn allows_note_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        key: &str,
+    ) -> bool {
+        let request = GateRequest::new(
+            token.actor().clone(),
+            token.namespace().clone(),
+            "list",
+            serde_json::json!({"kind":"note", "note_kind":kind, "key_prefix":key}),
+        );
+        self.gate
+            .check(&request)
+            .is_ok_and(|decision| decision.is_allow())
     }
 
     fn gate_request_with_identity(
@@ -1745,6 +2342,7 @@ impl VerbRegistry {
                 event,
                 gate_req.verb.as_str(),
                 crate::audit_batch::AuditProducer::GateUnavailable,
+                false,
             )
             .await;
         }
@@ -1789,9 +2387,32 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, RuntimeError> {
+        self.dispatch_with_disposition(verb, params, identity)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Dispatch with provenance for this operation's own domain result.
+    /// Errors returned by a nested dispatch remain handler errors at this boundary.
+    pub async fn dispatch_with_disposition(
+        &self,
+        verb: &str,
+        params: Value,
+        identity: Option<RequestIdentity>,
+    ) -> Result<Value, DispatchError> {
         // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
-            return self.describe_verb(verb);
+            let result = match self.describe_verb(verb) {
+                Ok(value) => Ok(value),
+                Err(error) => match self.mounted_verb_catalog().await {
+                    Ok(catalog) => catalog
+                        .into_iter()
+                        .find(|entry| entry["verb"] == verb)
+                        .ok_or(error),
+                    Err(error) => Err(error),
+                },
+            };
+            return result.map_err(DispatchError::before_dispatch);
         }
         // Resolve namespace before `params` is moved into pack.dispatch, so the
         // post-dispatch hook can reference it.
@@ -1813,7 +2434,9 @@ impl VerbRegistry {
         // Resolved once via the shared actor-identity policy and reused for
         // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
-        let gate_req = self.gate_request_with_identity(verb, &params, identity.as_ref())?;
+        let gate_req = self
+            .gate_request_with_identity(verb, &params, identity.as_ref())
+            .map_err(DispatchError::before_dispatch)?;
         let ns = gate_req.namespace.clone();
         let resolved_actor = gate_req.actor.clone();
 
@@ -1870,6 +2493,7 @@ impl VerbRegistry {
                                 storage_event,
                                 "config.lock",
                                 crate::audit_batch::AuditProducer::ConfigLocked,
+                                false,
                             )
                             .await;
                         }
@@ -1894,40 +2518,37 @@ impl VerbRegistry {
                 // ingest writes with no response and no completed receipt.
                 let defer_audit = !is_deny;
 
-                // Persist to EventStore immediately only for denied calls.
-                if !defer_audit {
-                    if let Some(store) = &self.event_store {
-                        // ADR-103 Decision (a): the closed `work_class` enum
-                        // is stamped on every event, denial included -- only
-                        // `resource.cost_unit` is scoped to a successful
-                        // dispatch by Amendment 1. `base_resource_payload()`
-                        // carries `work_class` alone, no `cost_unit` key.
-                        let storage_event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // As above (line ~1513): this path always returns
-                        // `PermissionDenied` below regardless, so there is no
-                        // success outcome to fold a commit failure into.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            storage_event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                        )
-                        .await;
-                    }
-                }
-
+                // Persist to EventStore immediately only for denied calls;
+                // the receipt rides on the refusal so the caller can cite
+                // the row.
                 let reason = if is_deny {
                     let reason = match decision {
                         GateDecision::Deny { reason } => reason,
                         _ => String::new(),
                     };
-                    Some(reason)
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            // ADR-103 Decision (a): the closed `work_class` enum
+                            // is stamped on every event, denial included -- only
+                            // `resource.cost_unit` is scoped to a successful
+                            // dispatch by Amendment 1. `base_resource_payload()`
+                            // carries `work_class` alone, no `cost_unit` key.
+                            let storage_event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // This path always returns `PermissionDenied`
+                            // below, so there is no success outcome to fold a
+                            // commit failure into; the receipt says whether
+                            // the row exists.
+                            self.append_gate_denied_row(store, storage_event, verb)
+                                .await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
+                    Some((reason, receipt))
                 } else {
                     None
                 };
@@ -1935,18 +2556,22 @@ impl VerbRegistry {
                 (reason, deferred)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         // Hard enforcement: Deny is authoritative.
-        if let Some(reason) = gate_blocked {
-            return Err(RuntimeError::PermissionDenied {
-                verb: verb.to_string(),
-                reason,
-            });
+        if let Some((reason, receipt)) = gate_blocked {
+            return Err(DispatchError::before_dispatch(
+                RuntimeError::PermissionDenied {
+                    verb: verb.to_string(),
+                    reason,
+                    receipt: Box::new(receipt),
+                },
+            ));
         }
 
         // Mint the authorized storage token at the dispatch boundary.
@@ -1999,16 +2624,45 @@ impl VerbRegistry {
                     .collect(),
                 None => self.visible_namespaces.clone(),
             };
+            // ADR-007 Rev 4 Rule 3b, applied once at the seam every identity
+            // path shares: a non-`local` actor reads its own namespace by
+            // default (its episodic memories land there), whether the identity
+            // came from the config loader, a daemon frame, a scheduled replay
+            // or an embedding host. Writes stay pinned to `local` (Rule 0).
+            if let Some(actor_namespace) = resolved_actor
+                .binding_id()
+                .filter(|id| *id != Namespace::LOCAL)
+                .and_then(|id| Namespace::parse(id).ok())
+            {
+                extra_visible.push(actor_namespace);
+            }
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
         }
+        .with_gate_namespace(ns.clone())
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
         });
 
         for pack in self.packs.iter() {
-            if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
+            let handler_def = pack.handlers().iter().find(|v| v.name == verb);
+            let mounted_name = pack.mounted_namespace().and_then(|prefix| {
+                verb.strip_prefix(prefix)
+                    .and_then(|suffix| suffix.strip_prefix('.'))
+            });
+            if handler_def.is_some() || mounted_name.is_some() {
+                let definition = if let Some(name) = mounted_name {
+                    pack.mounted_catalog().await.and_then(|catalog| {
+                        catalog
+                            .into_iter()
+                            .find(|definition| definition.name == name)
+                            .map(Some)
+                            .ok_or_else(|| RuntimeError::UnknownVerb(verb.to_owned()))
+                    })
+                } else {
+                    Ok(None)
+                };
                 // Strip `namespace` from params before forwarding to packs.
                 // The registry has already consumed it to mint the NamespaceToken.
                 //
@@ -2018,8 +2672,18 @@ impl VerbRegistry {
                 // — not a transport routing key — and must be passed through
                 // unchanged. Stripping it would silently default the binding to the
                 // "*" wildcard, broadening profile scope across namespaces.
-                let handler_accepts_namespace =
-                    handler_def.params.iter().any(|p| p.name == "namespace");
+                let handler_accepts_namespace = handler_def
+                    .is_some_and(|h| h.params.iter().any(|p| p.name == "namespace"))
+                    || definition
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.as_ref())
+                        .is_some_and(|definition| {
+                            definition
+                                .input_schema
+                                .get("properties")
+                                .is_some_and(|properties| properties.get("namespace").is_some())
+                        });
                 let params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
@@ -2031,7 +2695,18 @@ impl VerbRegistry {
                     params
                 };
                 let dispatch_start = Instant::now();
-                let mut result = pack.dispatch(verb, params, self, &token).await;
+                let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
+                    serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
+                });
+                let mut result = match definition {
+                    Ok(Some(definition)) => {
+                        pack.dispatch_mounted(&definition, verb, params, self, &token)
+                            .await
+                    }
+                    Ok(None) => pack.dispatch(verb, params, self, &token).await,
+                    Err(error) => Err(error),
+                };
+                let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
                 // Unlike ordinary audit rows, a successful `git.digest`
@@ -2084,7 +2759,7 @@ impl VerbRegistry {
                         // only needs `audit_outcome` afterward, and folding a
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
-                        let audit_outcome: Result<(), RuntimeError> = match &result {
+                        let audit_outcome: Result<(), AuditObligationFailure> = match &result {
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -2126,6 +2801,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                            self.admission_degrade_safe(verb),
                                         )
                                         .await
                                     }
@@ -2148,6 +2824,7 @@ impl VerbRegistry {
                                             storage_event,
                                             verb,
                                             crate::audit_batch::AuditProducer::DispatchSucceeded,
+                                            self.admission_degrade_safe(verb),
                                         )
                                         .await
                                     }
@@ -2194,15 +2871,19 @@ impl VerbRegistry {
                                 } else {
                                     crate::audit_batch::AuditProducer::DispatchFailed
                                 };
-                                let storage_event =
+                                let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Some(metadata) = &mounted_audit {
+                                    storage_event.payload["mounted_tool"] = metadata.clone();
+                                }
                                 append_audit_event_best_effort(
                                     self.audit_batch.as_ref(),
                                     store,
                                     storage_event,
                                     verb,
                                     producer,
+                                    self.admission_degrade_safe(verb),
                                 )
                                 .await
                             }
@@ -2212,7 +2893,8 @@ impl VerbRegistry {
                         // already-erroring dispatch (DispatchFailed producer)
                         // keeps its original error, matching
                         // `fold_audit_obligation`'s contract.
-                        result = fold_audit_obligation(result, audit_outcome);
+                        result =
+                            fold_audit_obligation(result, audit_outcome, std::convert::identity);
                     }
                 }
 
@@ -2310,7 +2992,8 @@ impl VerbRegistry {
                     }
                 }
 
-                return result;
+                return result
+                    .map_err(|error| DispatchError::after_handler(error, domain_succeeded));
             }
         }
 
@@ -2341,6 +3024,7 @@ impl VerbRegistry {
                     storage_event,
                     verb,
                     crate::audit_batch::AuditProducer::UnknownVerb,
+                    false,
                 )
                 .await;
             }
@@ -2349,9 +3033,11 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::UnknownVerb(format!(
-            "unknown verb {verb:?}; available: {}",
-            self.available_verbs.join(", ")
+        Err(DispatchError::before_dispatch(RuntimeError::UnknownVerb(
+            format!(
+                "unknown verb {verb:?}; available: {}",
+                self.available_verbs.join(", ")
+            ),
         )))
     }
 
@@ -2507,6 +3193,28 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.handlers().iter())
             .any(|h| h.name == verb)
+    }
+
+    /// Advisory metadata for synchronous planning and MCP initialization.
+    pub fn mounted_verb_snapshot(&self) -> Vec<Value> {
+        self.packs
+            .iter()
+            .flat_map(|pack| {
+                pack.mounted_catalog_snapshot()
+                    .into_iter()
+                    .map(|verb| verb.describe(pack.name()))
+            })
+            .collect()
+    }
+
+    pub async fn mounted_verb_catalog(&self) -> Result<Vec<Value>, RuntimeError> {
+        let mut catalog = Vec::new();
+        for pack in self.packs.iter() {
+            for definition in pack.mounted_catalog().await? {
+                catalog.push(definition.describe(pack.name()));
+            }
+        }
+        Ok(catalog)
     }
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
@@ -2799,6 +3507,52 @@ impl VerbRegistry {
         khive_types::VerbPresentationPolicy::Standard
     }
 
+    /// Resolve the declared [`VerbCategory`] for a verb name.
+    ///
+    /// Walks all registered handlers (including subhandlers) for the first
+    /// matching name and returns its speech-act category. Returns `None` for
+    /// an unregistered verb name, so a caller deciding transport-level
+    /// behavior (e.g. whether a post-dispatch condition is safe to retry)
+    /// can fail closed on an unknown verb instead of guessing a category.
+    pub fn verb_category(&self, verb: &str) -> Option<VerbCategory> {
+        self.packs
+            .iter()
+            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+            .map(|handler| handler.category)
+    }
+
+    /// Verbs classified [`VerbCategory::Assertive`] that nonetheless schedule
+    /// a persisted write on every successful dispatch, so a caller re-issuing
+    /// a call in this list after a lost response duplicates that write:
+    ///
+    /// - `memory.recall` schedules `brain.record_serve`, which inserts a
+    ///   serve-ledger row keyed in part on a `served_at` timestamp captured
+    ///   fresh at dispatch time — a second dispatch inserts a second row
+    ///   rather than colliding with the first.
+    /// - `search` (the `kg` pack's bare verb) appends a `search_executed`
+    ///   event with a freshly generated id and no natural key at all.
+    ///
+    /// The speech-act category alone cannot rule this out — it describes
+    /// what the verb tells the *caller*, not what it schedules against
+    /// storage. Adding a verb here (or removing one because its side effect
+    /// was made idempotent) is a correctness decision requiring the same
+    /// scrutiny as the categorization itself.
+    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] = &["memory.recall", "search"];
+
+    /// Whether a response lost to the daemon frame budget may be truthfully
+    /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
+    /// (no institutional commitment was made) and is not on
+    /// `Self::SIDE_EFFECTING_ASSERTIVE_VERBS` (no persisted write to
+    /// duplicate on a second dispatch). An unregistered verb name resolves to
+    /// `None` from [`Self::verb_category`] and fails closed here.
+    ///
+    /// Used only by the MCP daemon's frame-budget omission decision; never
+    /// for permission checking or return-shape selection.
+    pub fn is_retry_safe_after_frame_omission(&self, verb: &str) -> bool {
+        matches!(self.verb_category(verb), Some(VerbCategory::Assertive))
+            && !Self::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&verb)
+    }
+
     /// Returns `true` if the named verb exists and is tagged
     /// `Visibility::Subhandler` (internal / operator-only).
     ///
@@ -3009,6 +3763,16 @@ pub trait PackFactory: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether this pack intentionally exposes no top-level MCP verbs.
+    ///
+    /// Defaults to `false` so a declared pack whose runtime contributes no
+    /// [`Visibility::Verb`] handlers fails at registration instead of silently
+    /// disappearing from the served surface. Vocabulary- or ontology-only
+    /// packs must opt in explicitly.
+    fn intentionally_verbless(&self) -> bool {
+        false
+    }
+
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
 
@@ -3058,6 +3822,12 @@ pub enum PackLoadError {
         /// The dependency that is missing from the requested pack list.
         dep: String,
     },
+    /// A declared pack contributed no top-level verbs without explicitly
+    /// declaring itself vocabulary/ontology-only.
+    NoPublicVerbs {
+        /// The declared pack name.
+        pack: String,
+    },
 }
 
 impl std::fmt::Display for PackLoadError {
@@ -3069,17 +3839,60 @@ impl std::fmt::Display for PackLoadError {
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
             ),
+            PackLoadError::NoPublicVerbs { pack } => write!(
+                f,
+                "declared pack {pack:?} registers no public verbs; if this pack is \
+                 intentionally vocabulary- or ontology-only, its factory must declare \
+                 intentionally_verbless() = true"
+            ),
         }
     }
 }
 
 impl std::error::Error for PackLoadError {}
 
+/// Reject a declared pack whose runtime contributes no [`Visibility::Verb`]
+/// handlers unless its factory explicitly opts out via
+/// [`PackFactory::intentionally_verbless`].
+fn check_pack_has_public_verbs(
+    factory: &dyn PackFactory,
+    install: &PackInstall,
+    name: &str,
+) -> Result<(), PackLoadError> {
+    if !factory.intentionally_verbless()
+        && !install
+            .runtime
+            .handlers()
+            .iter()
+            .any(|handler| matches!(handler.visibility, Visibility::Verb))
+    {
+        return Err(PackLoadError::NoPublicVerbs {
+            pack: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Registry of pack factories discovered via `inventory` at link time.
 ///
 /// No instance is needed — all methods are associated functions that walk the
 /// globally-collected [`PackRegistration`] slice.
 pub struct PackRegistry;
+
+/// Whether [`PackRegistry::build_ingest_registry`] attaches the runtime's
+/// event store to the registry it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestAuditStore {
+    /// Mirror `KhiveMcpServer::with_packs` (`khive-mcp/src/server.rs`): a
+    /// writable runtime attaches its own event store, logging and continuing
+    /// on failure rather than refusing to build; a read-only runtime retains
+    /// no `EventStore` handle and an advisory travels beside each result
+    /// instead.
+    Attach,
+    /// Build the registry with no audit event store, for a caller with no use
+    /// for persisted audit rows.
+    Detach,
+}
 
 impl PackRegistry {
     /// Names of all pack factories discovered via `inventory`.
@@ -3141,6 +3954,7 @@ impl PackRegistry {
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             let install = factory.create_install(runtime.clone());
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -3156,6 +3970,50 @@ impl PackRegistry {
         }
 
         Ok(())
+    }
+
+    /// Build a `VerbRegistry` from `runtime`'s own configuration: gate,
+    /// default namespace, visible namespaces, actor id, and the configured
+    /// pack set, then install the registry's aggregated edge rules back onto
+    /// `runtime`. This is the wiring shared by every one-shot CLI ingest path
+    /// (`kkernel code-ingest`, `kkernel git-ingest`) that needs a real
+    /// registry to dispatch through outside of a live MCP server.
+    ///
+    /// `audit_store` selects whether the registry gets the runtime's event
+    /// store; see [`IngestAuditStore`] for what each variant does.
+    ///
+    /// This helper carries only the subset every ingest path duplicated
+    /// verbatim. The MCP server's own registry construction additionally
+    /// wires channel-loop admission, `config_id`, embedder/entity-type/
+    /// note-mutation-hook registration, schema-plan application, and the WAL
+    /// checkpoint pool handle — all server-only concerns a one-shot CLI pass
+    /// has no use for, so `KhiveMcpServer::with_packs` keeps its own
+    /// construction rather than calling this helper.
+    pub fn build_ingest_registry(
+        runtime: &KhiveRuntime,
+        audit_store: IngestAuditStore,
+    ) -> Result<VerbRegistry, RuntimeError> {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(runtime.config().gate.clone());
+        builder.with_default_namespace(runtime.config().default_namespace.as_str());
+        builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
+        builder.with_actor_id(runtime.config().actor_id.clone());
+        if audit_store == IngestAuditStore::Attach {
+            if runtime.is_read_only() {
+                builder.with_read_only_audit_store();
+            } else if let Err(error) = builder.with_runtime_event_store(runtime) {
+                tracing::warn!(%error, "ingest registry audit event store is unavailable");
+            }
+        }
+        Self::register_packs(
+            &runtime.config().packs.clone(),
+            runtime.clone(),
+            &mut builder,
+        )
+        .map_err(|e| RuntimeError::Internal(format!("pack registration failed: {e:?}")))?;
+        let registry = builder.build()?;
+        runtime.install_edge_rules(registry.all_edge_rules());
+        Ok(registry)
     }
 
     /// Register the named packs into `builder`, routing each pack to its own runtime.
@@ -3205,6 +4063,7 @@ impl PackRegistry {
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
             let install = factory.create_install(runtime);
+            check_pack_has_public_verbs(factory, &install, name)?;
             if CHANNEL_INGEST_CAPABLE_PACKS.contains(&name.as_str()) {
                 install
                     .runtime
@@ -3297,6 +4156,63 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of `DispatchObligation` rows **refused before they
+/// could be enqueued** (`AuditTerminalReason::QueueAdmissionExhausted`) for an
+/// [`VerbRegistry::admission_degrade_safe`] verb (#2147/#2217).
+/// This is a confirmed, terminal accounting loss: the row never shared a
+/// generation with anyone and will never commit. Disjoint from both
+/// [`AUDIT_APPEND_FAILURES`] and [`AUDIT_OBLIGATION_APPEND_FAILURES`]: this
+/// case is neither. It is not [`AUDIT_APPEND_FAILURES`] — that counter's own
+/// contract (`khive-db`'s `WriterContentionDiagnostics::audit_append_failures`
+/// doc) says an obligation-bearing row's commit failure "either fail[s] the
+/// dispatch... or [is] tracked by the runtime's own separate
+/// obligation-failure counter instead", and this dispatch does neither: it
+/// reports the caller's already-computed success with no error. It is not
+/// [`AUDIT_OBLIGATION_APPEND_FAILURES`] either — that counter's contract is
+/// "most call sites fold this failure into the dispatch's own error", which
+/// is exactly the propagation this admission-degrade path exists to avoid.
+/// Also disjoint from [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`] — that
+/// counter's row was enqueued and may still commit; this one's was not.
+/// Read in production by [`VerbRegistry::audit_batch_metrics`], which feeds
+/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_refused_obligations`
+/// and from there into the `db_diagnostics` verb's
+/// `writer_contention.audit_admission_refused_obligations` field (ADR-103
+/// Amendment 3) — an operator can read this counter without a test-only
+/// feature gate. The mechanism tests also read it directly, including the
+/// admission-pressure regression tests in `tests/read_verb_admission_exhaustion.rs`,
+/// which (like `khive-runtime/src/audit_batch.rs`'s own `test_internals`
+/// module) need it as `pub`, not `pub(crate)`, since they compile as a
+/// separate external binary outside this crate.
+static AUDIT_ADMISSION_REFUSED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn audit_admission_refused_obligation_count() -> u64 {
+    AUDIT_ADMISSION_REFUSED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide count of `DispatchObligation` rows that were **already
+/// enqueued but had not resolved by the time the caller's admission wait
+/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for a
+/// succeeded dispatch of any verb (#2147/#2217 introduced the count for
+/// [`VerbRegistry::admission_degrade_safe`] reads; writes joined it once a
+/// committed write stopped reporting failure over a row that still commits).
+/// Unlike [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`], a row counted here is not
+/// a confirmed loss: per `AuditTerminalReason::AdmissionDeadlineExpired`'s own
+/// doc, the row may still be committed (or terminally failed) by the
+/// generation driver independently of the caller's timeout, so this counter
+/// is an upper bound on the eventual undercount, not the undercount itself.
+/// Read in production by [`VerbRegistry::audit_batch_metrics`], which feeds
+/// it into `khive_db::diagnostics::RuntimeAuditBatchMetrics::admission_unresolved_obligations`
+/// and from there into the `db_diagnostics` verb's
+/// `writer_contention.audit_admission_unresolved_obligations` field (ADR-103
+/// Amendment 3).
+static AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn audit_admission_unresolved_obligation_count() -> u64 {
+    AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
     "git_digest_receipt_persist_failed: git.digest writes may have committed, but no durable \
      success receipt was confirmed; inspect ingest state before retrying";
@@ -3315,6 +4231,20 @@ enum GitDigestReceiptOutcome {
     /// best-effort append would either be impossible or duplicate the same
     /// known store failure, so the caller must not retry it here.
     PersistenceUnavailable,
+}
+
+fn fail_git_digest_receipt(
+    result: &mut Result<Value, RuntimeError>,
+    failure: AuditObligationFailure,
+) {
+    let Ok(value) = result else {
+        return;
+    };
+    let domain_result = std::mem::take(value);
+    *result = Err(RuntimeError::AuditObligation {
+        failure: Box::new(failure),
+        domain_result,
+    });
 }
 
 /// Persist the complete successful `git.digest` report as a schema-v2 audit
@@ -3344,7 +4274,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt store is not configured"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("event store is not configured"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
     let Some(audit) = audit else {
@@ -3352,7 +4285,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt cannot be built because the gate produced no audit decision"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit decision is absent"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
 
@@ -3361,7 +4297,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler returned a non-object report"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     let Some(project_id) = report_object
@@ -3373,7 +4312,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler report omitted a valid project_id"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report has no valid project_id"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
 
@@ -3409,7 +4351,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "gate audit serialization did not produce an object"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit payload is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     if let Some(resource) = resource {
@@ -3433,11 +4378,14 @@ async fn persist_git_digest_receipt(
             })
             .await
             .map(|_outcome| ())
-            .map_err(|reason| format!("{reason:?}"))
+            .map_err(|reason| AuditObligationFailure::new("git.digest", reason))
     } else {
-        store.append_event(event).await.map_err(|e| e.to_string())
+        store
+            .append_event(event)
+            .await
+            .map_err(|error| AuditObligationFailure::from_store("git.digest", error))
     };
-    if let Err(store_err) = submit_result {
+    if let Err(mut failure) = submit_result {
         // `GitDigestReceipt` is always `DispatchObligation` (see
         // `crate::audit_batch::classify`) and this failure always
         // propagates below, so it belongs on the obligation counter, not
@@ -3445,11 +4393,15 @@ async fn persist_git_digest_receipt(
         AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
-            error = %store_err,
+            error = %failure,
             receipt_id = %receipt_id,
             "durable digest receipt append failed"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        failure.message = format!(
+            "{GIT_DIGEST_RECEIPT_FAILURE}; audit submission failed ({})",
+            failure.wire_code()
+        );
+        fail_git_digest_receipt(result, failure);
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     }
     GitDigestReceiptOutcome::Persisted
@@ -3471,8 +4423,32 @@ async fn persist_git_digest_receipt(
 /// failure is logged and counted but never returned, matching the pre-ADR-133
 /// best-effort contract.
 ///
-/// Every failure — obligation or observability — increments the
-/// process-wide diagnostics counter above.
+/// Every failure — obligation or observability — increments one of the
+/// process-wide diagnostics counters above; the one exception is the
+/// admission-degrade case below, which increments one of its own dedicated
+/// [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`] /
+/// [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`] counters instead — it is
+/// neither a swallowed observability failure nor a propagated obligation
+/// failure.
+///
+/// `degrade_allowlisted` (#2147/#2217) narrows that obligation for
+/// one specific case: a *successful* dispatch (`AuditProducer::DispatchSucceeded`)
+/// for a verb that [`VerbRegistry::admission_degrade_safe`] has explicitly
+/// opted in (Assertive alone is not a sufficient signal — see that method's
+/// doc) performs no domain write, so this row's own admission being
+/// transiently refused or timed out (`AuditTerminalReason::QueueAdmissionExhausted`
+/// / `AdmissionDeadlineExpired`) degrades to best-effort instead of failing
+/// the dispatch — the caller-visible read result is preserved. This function
+/// derives eligibility from `producer` itself rather than trusting the
+/// caller's `degrade_allowlisted` answer in isolation, so a `DispatchFailed`
+/// row can never take the degrade path no matter what a caller passes: every
+/// failed dispatch and every gate-denial/unknown-verb/git.digest row stays
+/// strictly obligation-bearing. A succeeded write degrades on exactly one
+/// reason, `AdmissionDeadlineExpired`: its row is already enqueued and its
+/// generation commits it independently of the caller's wait, so failing the
+/// dispatch would report a committed domain write as failed while changing
+/// nothing about the row. `QueueAdmissionExhausted` (refused before enqueue,
+/// a confirmed loss) still fails a write's dispatch.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -3487,10 +4463,22 @@ async fn append_audit_event_best_effort(
     event: Event,
     verb: &str,
     producer: crate::audit_batch::AuditProducer,
-) -> Result<(), RuntimeError> {
-    use crate::audit_batch::{classify, AuditBatchControl, AuditProductionClass};
+    degrade_allowlisted: bool,
+) -> Result<(), AuditObligationFailure> {
+    use crate::audit_batch::{
+        classify, AuditBatchControl, AuditProducer, AuditProductionClass, AuditTerminalReason,
+    };
 
     let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
+    let admission_degrade_eligible =
+        degrade_allowlisted && producer == AuditProducer::DispatchSucceeded;
+    // A row that was enqueued before the caller's admission wait elapsed is
+    // committed by its generation independently of this response, so the
+    // only thing failing the dispatch would do is report a committed domain
+    // write as failed. That holds for every succeeded dispatch, allowlisted
+    // read or not; the refused-before-enqueue arm below stays strict for
+    // writes because that one is a confirmed audit loss.
+    let enqueued_row_outlives_deadline = producer == AuditProducer::DispatchSucceeded;
 
     if let Some(audit_batch) = audit_batch {
         if let Err(reason) = audit_batch
@@ -3498,15 +4486,58 @@ async fn append_audit_event_best_effort(
             .await
         {
             if is_obligation {
+                // #2147/#2217: a read verb performs no domain write, so
+                // when the audit-lane's OWN admission is merely under transient
+                // pressure (the row was refused before enqueue, or the caller's
+                // wait deadline elapsed on a row that is still likely to commit),
+                // failing the read discards a valid result to protect an
+                // obligation the read never needed as strictly as a write does.
+                // Any other reason (a definite store/durability failure) still
+                // fails the dispatch for reads exactly as it does for writes.
+                //
+                // The two admission-pressure reasons are not the same fact and
+                // are counted on separate counters: `QueueAdmissionExhausted`
+                // never enqueued, so it is a confirmed terminal loss, while
+                // `AdmissionDeadlineExpired` was already enqueued and may still
+                // commit later — see `AuditTerminalReason::AdmissionDeadlineExpired`'s
+                // own doc.
+                if enqueued_row_outlives_deadline
+                    && reason == AuditTerminalReason::AdmissionDeadlineExpired
+                {
+                    AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        degrade_allowlisted,
+                        "audit obligation row was still enqueued and unresolved when \
+                         the caller's admission wait deadline elapsed; its generation \
+                         commits it independently of this response. Dispatch reports \
+                         its own committed result (non-fatal)"
+                    );
+                    return Ok(());
+                }
+                if admission_degrade_eligible
+                    && reason == AuditTerminalReason::QueueAdmissionExhausted
+                {
+                    AUDIT_ADMISSION_REFUSED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        "read verb's audit obligation row was refused before \
+                         enqueue under audit-lane admission pressure; dispatch \
+                         still reports its own result (non-fatal)"
+                    );
+                    return Ok(());
+                }
                 AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     verb,
                     reason = ?reason,
                     "audit obligation batch submission failed; failing dispatch"
                 );
-                return Err(RuntimeError::Internal(format!(
-                    "audit obligation commit failed for verb {verb:?}: {reason:?}"
-                )));
+                return Err(AuditObligationFailure::new(verb, reason));
             }
             AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
@@ -3526,9 +4557,7 @@ async fn append_audit_event_best_effort(
                 error = %store_err,
                 "audit obligation store write failed; failing dispatch"
             );
-            return Err(RuntimeError::Internal(format!(
-                "audit obligation commit failed for verb {verb:?}: {store_err}"
-            )));
+            return Err(AuditObligationFailure::from_store(verb, store_err));
         }
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
@@ -3549,11 +4578,15 @@ async fn append_audit_event_best_effort(
 /// not on replacing one error with another.
 fn fold_audit_obligation<T>(
     result: Result<T, RuntimeError>,
-    audit_outcome: Result<(), RuntimeError>,
+    audit_outcome: Result<(), AuditObligationFailure>,
+    domain_value: impl FnOnce(T) -> Value,
 ) -> Result<T, RuntimeError> {
     match (result, audit_outcome) {
         (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(audit_err)) => Err(audit_err),
+        (Ok(value), Err(failure)) => Err(RuntimeError::AuditObligation {
+            failure: Box::new(failure),
+            domain_result: domain_value(value),
+        }),
         (Err(err), _) => Err(err),
     }
 }
@@ -3655,6 +4688,651 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
+    mod disposition {
+        include!("pack_disposition_tests.rs");
+    }
+
+    /// Verbs known, by cross-pack source review (#2147/#2217), to have
+    /// their own durable or accounting-bearing side effect despite being declared
+    /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
+    /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
+    /// distinguish these from a genuinely side-effect-free read (that is the
+    /// whole reason the allowlist exists instead of a bare category check),
+    /// so this denylist is the mechanizable guard against silently
+    /// reintroducing one of them: a category-only census would stay green if
+    /// any name were re-added to the allowlist.
+    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
+        "db_diagnostics",
+        "git.checkout",
+        "git.diff",
+        "git.reconcile",
+        "knowledge.compose",
+        "knowledge.search",
+        "knowledge.suggest",
+        "memory.recall",
+    ];
+
+    /// Classification outcome for one `HandlerDef {` occurrence in pack
+    /// source, returned by [`classify_handler_def_occurrence`]. `Signature`
+    /// and `StructLiteral` are the two shapes the live cross-pack census
+    /// currently expects; `Unclassified` exists so neither the census nor a
+    /// direct unit test has to rely on a panic to observe a shape that is
+    /// neither — see `classify_handler_def_occurrence_reports_unclassifiable_shapes`
+    /// below.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HandlerDefOccurrence {
+        /// A function/closure signature merely naming the type in
+        /// return-tail position (`-> &'static HandlerDef {`, possibly
+        /// qualified), not a declared handler.
+        Signature,
+        /// A struct-literal field block whose `name`/`visibility`/`category`
+        /// fields were all found at one consistent indentation.
+        StructLiteral {
+            name: String,
+            visibility: String,
+            category: String,
+        },
+        /// Neither of the above: not a signature tail, and the block does
+        /// not parse as a `name`/`visibility`/`category` struct literal at a
+        /// single consistent indentation either.
+        Unclassified { first_field_line: String },
+    }
+
+    /// Classify one `HandlerDef {` occurrence at `source[match_start..match_end]`
+    /// (`match_end` is the byte offset just past the token). Shared by the
+    /// live cross-pack census
+    /// (`admission_degrade_safe_assertive_census_matches_live_pack_sources`)
+    /// and `classify_handler_def_occurrence_reports_unclassifiable_shapes`'s
+    /// direct unit coverage of the `Unclassified` arm — extracting this as
+    /// its own function is what makes the negative arm testable without
+    /// corrupting a real pack source file to trigger it.
+    fn classify_handler_def_occurrence(
+        source: &str,
+        match_start: usize,
+        match_end: usize,
+    ) -> HandlerDefOccurrence {
+        // A struct literal is never preceded on its own line by `->`; a
+        // signature tail always is.
+        let line_start = source[..match_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if source[line_start..match_start].contains("->") {
+            return HandlerDefOccurrence::Signature;
+        }
+
+        let next_marker = source[match_end..].find("HandlerDef {");
+        let block_end = next_marker.map(|o| match_end + o).unwrap_or(source.len());
+        let block = &source[match_end..block_end];
+
+        // The field indentation is read from the block's own first line
+        // rather than hardcoded: array-element declarations (`&[HandlerDef
+        // {`) indent fields one level deeper than the single-element
+        // `static X: [HandlerDef; 1] = [HandlerDef {` shape, and a
+        // hardcoded depth would silently stop matching whichever shape it
+        // didn't anticipate — exactly how the narrower delimiter this
+        // replaced went unnoticed.
+        let Some(first_field_line) = block.lines().find(|line| !line.trim().is_empty()) else {
+            return HandlerDefOccurrence::Unclassified {
+                first_field_line: String::new(),
+            };
+        };
+        let indent_len = first_field_line.len() - first_field_line.trim_start().len();
+        let indent = &first_field_line[..indent_len];
+        let name_prefix = format!("{indent}name: \"");
+        let visibility_prefix = format!("{indent}visibility: ");
+        let category_prefix = format!("{indent}category: ");
+
+        let name = block.lines().find_map(|line| {
+            line.strip_prefix(name_prefix.as_str())
+                .and_then(|rest| rest.strip_suffix("\","))
+        });
+        let visibility = block
+            .lines()
+            .find_map(|line| line.strip_prefix(visibility_prefix.as_str()));
+        let category = block
+            .lines()
+            .find_map(|line| line.strip_prefix(category_prefix.as_str()));
+
+        match (name, visibility, category) {
+            (Some(name), Some(visibility), Some(category)) => HandlerDefOccurrence::StructLiteral {
+                name: name.to_string(),
+                visibility: visibility.to_string(),
+                category: category.to_string(),
+            },
+            _ => HandlerDefOccurrence::Unclassified {
+                first_field_line: first_field_line.to_string(),
+            },
+        }
+    }
+
+    /// khive-oss#2311: before this fix, the live census's per-file
+    /// `classified_count == raw_token_count` assertion incremented
+    /// `classified_count` once per loop iteration — before any
+    /// classification ran — so it counted exactly the same occurrences
+    /// `raw_token_count` counts, by the same method, and could never
+    /// disagree regardless of what the loop body did afterward: a silently
+    /// dropped classification branch would have stayed green. This proves
+    /// the replacement — [`classify_handler_def_occurrence`], now called
+    /// once per occurrence and the sole source of the census's per-branch
+    /// counters — actually distinguishes an unclassifiable shape from the
+    /// two shapes the census expects, using a hand-built snippet with a
+    /// `HandlerDef {` block that is neither a signature tail nor a
+    /// well-formed struct literal (its `category:` field is missing at the
+    /// expected indentation).
+    #[test]
+    fn classify_handler_def_occurrence_reports_unclassifiable_shapes() {
+        let signature_snippet = "fn describe() -> &'static HandlerDef {\n    HANDLER\n}\n";
+        let match_start = signature_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert_eq!(
+            classify_handler_def_occurrence(signature_snippet, match_start, match_end),
+            HandlerDefOccurrence::Signature
+        );
+
+        let struct_literal_snippet = "        HandlerDef {\n            name: \"probe\",\n            visibility: Visibility::Verb,\n            category: VerbCategory::Assertive,\n        }\n";
+        let match_start = struct_literal_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert_eq!(
+            classify_handler_def_occurrence(struct_literal_snippet, match_start, match_end),
+            HandlerDefOccurrence::StructLiteral {
+                name: "probe".to_string(),
+                visibility: "Visibility::Verb,".to_string(),
+                category: "VerbCategory::Assertive,".to_string(),
+            }
+        );
+
+        // Missing `category:` at the expected indentation: not a signature
+        // tail (no `->`), and not a parseable struct literal either.
+        let unclassifiable_snippet = "        HandlerDef {\n            name: \"probe\",\n            visibility: Visibility::Verb,\n        }\n";
+        let match_start = unclassifiable_snippet.find("HandlerDef {").unwrap();
+        let match_end = match_start + "HandlerDef {".len();
+        assert!(
+            matches!(
+                classify_handler_def_occurrence(unclassifiable_snippet, match_start, match_end),
+                HandlerDefOccurrence::Unclassified { .. }
+            ),
+            "a HandlerDef block missing an expected field must classify as Unclassified, not \
+             silently fall through as a recognized shape"
+        );
+    }
+
+    /// khive-runtime links no real pack crates in its own test binary (see
+    /// the comment on `CommProbeFactory` below), so
+    /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] cannot be checked
+    /// against a live registered `HandlerDef` here. Instead this re-derives
+    /// the complete public Assertive surface from each owning pack's live
+    /// source — the same fail-closed pattern as `adr133_writer_census.rs`'s
+    /// `reclassify_from_live_source`.
+    ///
+    /// Every occurrence of the literal `HandlerDef {` token in scanned source
+    /// is classified into exactly one of: a struct-literal field block, or a
+    /// function/closure signature merely naming the type
+    /// (`-> &'static HandlerDef {`) — a per-file count assertion fails
+    /// closed if any occurrence goes unclassified, so a handler declared in
+    /// an unanticipated shape (a prior version of this census silently
+    /// dropped the single-element `static X: [HandlerDef; 1] = [HandlerDef {`
+    /// shape used by `khive-pack-code` and `khive-pack-template`) cannot
+    /// drop out of the count without failing the test. This also verifies
+    /// that each [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`] entry's
+    /// claimed owning pack matches the pack whose source actually declares
+    /// that verb.
+    ///
+    /// This test proves category membership (`VerbCategory::Assertive`),
+    /// pack ownership, non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`],
+    /// and exhaustive classification of every currently public Assertive
+    /// handler. It does NOT prove general effect-purity: an Assertive
+    /// handler may still emit its own
+    /// observability/config events on an independent, best-effort background
+    /// path (`search`'s `SearchExecuted` telemetry, `context`'s one-time
+    /// `ConfigLocked` event) that this test does not inspect and that this
+    /// PR's admission-degrade mechanism does not touch — those events commit
+    /// or fail on their own path regardless of what happens to this
+    /// dispatch's own audit row. Proving general effect-purity would require
+    /// an explicit per-handler effect/accounting capability tag, which is
+    /// out of scope here (see ADR-103 Amendment 3's "why this is accepted"
+    /// section); this census instead locks down the properties that are
+    /// mechanizable today: declared category and an exhaustive, reviewed
+    /// safe-versus-incidental classification.
+    #[test]
+    fn admission_degrade_safe_assertive_census_matches_live_pack_sources() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
+
+        fn collect_rust_sources(dir: &Path, sources: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+                panic!("failed to read source directory {}: {e}", dir.display())
+            });
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|e| {
+                    panic!("failed to read entry under {}: {e}", dir.display())
+                });
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap_or_else(|e| {
+                    panic!("failed to stat source entry {}: {e}", path.display())
+                });
+                if file_type.is_dir() {
+                    collect_rust_sources(&path, sources);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = manifest_dir
+            .parent()
+            .expect("khive-runtime manifest must live under the workspace crates directory");
+        let mut handler_sources = Vec::new();
+        let crate_entries = std::fs::read_dir(crates_dir).unwrap_or_else(|e| {
+            panic!(
+                "failed to enumerate pack crates under {}: {e}",
+                crates_dir.display()
+            )
+        });
+        for entry in crate_entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!("failed to read entry under {}: {e}", crates_dir.display())
+            });
+            if !entry
+                .file_type()
+                .unwrap_or_else(|e| {
+                    panic!("failed to stat crate entry {}: {e}", entry.path().display())
+                })
+                .is_dir()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("khive-pack-")
+            {
+                continue;
+            }
+            collect_rust_sources(&entry.path().join("src"), &mut handler_sources);
+        }
+        handler_sources.sort_unstable();
+        assert!(
+            !handler_sources.is_empty(),
+            "cross-pack Assertive census found no pack source files"
+        );
+
+        // verb name -> (owning pack, relative source path)
+        let mut live_assertive = BTreeMap::<String, (String, String)>::new();
+        for path in handler_sources {
+            let relative = path
+                .strip_prefix(crates_dir)
+                .expect("pack source must be inside the workspace crates directory");
+            let relative_path = relative.display().to_string();
+            let crate_dir_name = relative
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let owning_pack = crate_dir_name
+                .strip_prefix("khive-pack-")
+                .unwrap_or_else(|| {
+                    panic!("{relative_path}: expected a khive-pack-<name> crate directory")
+                })
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+            // Every literal occurrence of `HandlerDef {` is classified by
+            // `classify_handler_def_occurrence` into a struct-literal field
+            // block, a function/closure signature merely naming the type
+            // (`-> &'static HandlerDef {`), or `Unclassified`. The count
+            // assertion below sums the first two — counted only where each
+            // branch actually fires, not once per occurrence found — against
+            // `raw_token_count`, computed by an independent method
+            // (`str::matches`). Unlike comparing two counts of the same
+            // occurrences by the same method, this sum can fall short: an
+            // `Unclassified` occurrence increments neither counter, so a
+            // future shape neither branch recognizes fails this assertion
+            // instead of silently passing (`classify_handler_def_occurrence_reports_unclassifiable_shapes`
+            // proves the classifier itself reports `Unclassified` rather
+            // than mis-slotting such a shape into one of the two branches).
+            let raw_token_count = source.matches("HandlerDef {").count();
+            let mut signature_count = 0usize;
+            let mut struct_literal_count = 0usize;
+            let mut unclassified: Vec<String> = Vec::new();
+            let mut search_from = 0usize;
+            while let Some(rel_pos) = source[search_from..].find("HandlerDef {") {
+                let match_start = search_from + rel_pos;
+                let match_end = match_start + "HandlerDef {".len();
+                search_from = match_end;
+
+                match classify_handler_def_occurrence(&source, match_start, match_end) {
+                    HandlerDefOccurrence::Signature => {
+                        signature_count += 1;
+                    }
+                    HandlerDefOccurrence::StructLiteral {
+                        name,
+                        visibility,
+                        category,
+                    } => {
+                        struct_literal_count += 1;
+                        if !visibility.contains("Visibility::Verb")
+                            || !category.contains("VerbCategory::Assertive")
+                        {
+                            continue;
+                        }
+
+                        let prior = live_assertive
+                            .insert(name.clone(), (owning_pack.clone(), relative_path.clone()));
+                        assert!(
+                            prior.is_none(),
+                            "public Assertive verb {name:?} is declared in both {prior:?} and \
+                             ({owning_pack:?}, {relative_path:?}); the registry surface must \
+                             remain collision-free"
+                        );
+                    }
+                    HandlerDefOccurrence::Unclassified { first_field_line } => {
+                        unclassified.push(format!(
+                            "byte {match_start} (first field line {first_field_line:?})"
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                signature_count + struct_literal_count,
+                raw_token_count,
+                "{relative_path}: found {raw_token_count} occurrences of the `HandlerDef {{` \
+                 token but classified {signature_count} as signatures and \
+                 {struct_literal_count} as struct literals; unclassified: {unclassified:?} — \
+                 extend this census's parser to handle the shape instead of silently excluding it"
+            );
+        }
+
+        let safe: BTreeSet<(&str, &str)> = VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            safe.len(),
+            VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS.len(),
+            "ADMISSION_DEGRADE_SAFE_VERBS contains duplicate (pack, verb) pairs"
+        );
+        let safe_verbs: BTreeSet<&str> = safe.iter().map(|&(_, v)| v).collect();
+        assert_eq!(
+            safe_verbs.len(),
+            safe.len(),
+            "ADMISSION_DEGRADE_SAFE_VERBS names the same verb under two different packs; a verb \
+             belongs to exactly one pack"
+        );
+        for &(pack, verb) in &safe {
+            let live_owner = live_assertive
+                .get(verb)
+                .map(|(owning_pack, _)| owning_pack.as_str());
+            assert_eq!(
+                live_owner,
+                Some(pack),
+                "ADMISSION_DEGRADE_SAFE_VERBS claims {verb:?} is owned by pack {pack:?}, but its \
+                 live declaration says otherwise (found: {live_owner:?})"
+            );
+        }
+        let incidental: BTreeSet<&str> = KNOWN_INCIDENTAL_WRITE_VERBS.iter().copied().collect();
+        assert!(
+            safe_verbs.is_disjoint(&incidental),
+            "a public Assertive verb cannot be both admission-degrade-safe and an incidental writer: {:?}",
+            safe_verbs.intersection(&incidental).collect::<Vec<_>>()
+        );
+
+        let classified: BTreeSet<&str> = safe_verbs.union(&incidental).copied().collect();
+        let live: BTreeSet<&str> = live_assertive.keys().map(String::as_str).collect();
+        assert_eq!(
+            classified, live,
+            "every public Assertive handler must be classified exactly once after a live-source \
+             effect review; live declarations: {live_assertive:#?}"
+        );
+    }
+
+    /// A pack whose `handlers()` counts every call, so a test can prove a
+    /// query touches (or does not touch) it after `VerbRegistryBuilder::build`
+    /// has already run once over every registered pack's handler list.
+    struct CountingHandlersPack {
+        name: &'static str,
+        handlers: &'static [HandlerDef],
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Pack for CountingHandlersPack {
+        const NAME: &'static str = "counting";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait]
+    impl PackRuntime for CountingHandlersPack {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.handlers
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": self.name, "verb": verb }))
+        }
+    }
+
+    /// khive-oss#2311: before this fix, `admission_degrade_safe` resolved
+    /// the owning pack by scanning every registered pack's `handlers()` on
+    /// every audited dispatch (`self.packs.iter().find_map(|pack|
+    /// pack.handlers().iter().find(...))`). Eligibility is now decided once
+    /// in `VerbRegistryBuilder::build` into `VerbRegistry::degrade_safe_verbs`,
+    /// so `admission_degrade_safe` is a hash-set lookup that never touches
+    /// `handlers()` again. Proves it directly: `handlers()` is called some
+    /// number of times during `build()` (unique-name validation, the
+    /// reserved-envelope-arg check, `available_verbs`, and this
+    /// eligibility precompute all read it), but that count must not move
+    /// across any number of `admission_degrade_safe_probe` calls afterward
+    /// — for an allowlisted verb (a hit) and for one that is not (a miss).
+    #[test]
+    fn admission_degrade_safe_is_a_build_time_lookup_with_no_per_call_pack_scan() {
+        static KG_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+            name: "list",
+            description: "list widgets",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CountingHandlersPack {
+            name: "kg",
+            handlers: &KG_HANDLERS,
+            calls: calls.clone(),
+        });
+        let registry = builder.build().expect("registry builds");
+
+        let after_build = calls.load(Ordering::SeqCst);
+        assert!(
+            after_build > 0,
+            "build() is expected to read handlers() at least once (unique-name validation, \
+             available_verbs, and the degrade-safe precompute all do); a count of 0 means this \
+             test's premise (build-time reads happen) is wrong, not that the property under \
+             test holds"
+        );
+
+        assert!(
+            registry.admission_degrade_safe_probe("list"),
+            "\"list\" is Assertive and (\"kg\", \"list\") is allowlisted under trusted \
+             registration, so this must be a hit"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_build,
+            "a hit must not re-scan any pack's handlers() — eligibility was already decided at \
+             build() time"
+        );
+
+        assert!(
+            !registry.admission_degrade_safe_probe("not-a-real-verb"),
+            "an unregistered verb name is never eligible"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_build,
+            "a miss must not re-scan any pack's handlers() either"
+        );
+    }
+
+    #[test]
+    fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
+        static HANDLERS: [HandlerDef; 5] = [
+            HandlerDef {
+                name: "stats",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.thread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.inbox",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.unread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.delivered",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+
+        for (owner, handlers) in [("kg", &HANDLERS[..1]), ("comm", &HANDLERS[1..])] {
+            for (name, trusted, expected) in [
+                (owner, true, true),
+                (owner, false, false),
+                ("custom-impostor", true, false),
+            ] {
+                let mut builder = VerbRegistryBuilder::new();
+                let pack = CountingHandlersPack {
+                    name,
+                    handlers,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                };
+                if trusted {
+                    builder.register_trusted(pack);
+                } else {
+                    builder.register(pack);
+                }
+                let registry = builder.build().expect("replay fixture registry");
+                for handler in handlers {
+                    assert_eq!(
+                        registry.is_read_replay_safe(handler.name),
+                        expected,
+                        "verb={}, owner={name}, trusted={trusted}",
+                        handler.name,
+                    );
+                }
+                assert!(!registry.is_read_replay_safe("unknown.read"));
+            }
+        }
+    }
+
+    #[test]
+    fn read_replay_rejects_a_trusted_opted_in_name_with_mutating_category() {
+        static HANDLERS: [HandlerDef; 1] = [HandlerDef {
+            name: "stats",
+            description: "same name with a state-changing contract",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CountingHandlersPack {
+            name: "kg",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = builder.build().expect("mutating fixture registry");
+        assert!(!registry.is_read_replay_safe("stats"));
+    }
+
+    /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
+    /// classification from its owning pack's live source, the same
+    /// fail-closed pattern as `admission_degrade_safe_verbs_are_registered_assertive`
+    /// above: a category-only census would stay green even if a verb here
+    /// were quietly dropped to a different category, leaving
+    /// `is_retry_safe_after_frame_omission`'s exclusion pointed at a name
+    /// the category check would already exclude on its own — silently
+    /// removing test coverage for the exclusion list without anyone
+    /// noticing.
+    #[test]
+    fn side_effecting_assertive_verbs_are_registered_assertive() {
+        let sources: &[(&str, &str)] = &[
+            ("search", "/../khive-pack-kg/src/handler_defs.rs"),
+            ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
+        ];
+        assert_eq!(
+            sources.len(),
+            VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.len(),
+            "every entry in SIDE_EFFECTING_ASSERTIVE_VERBS needs a source-file mapping in \
+             this census, or a newly added verb would go unchecked"
+        );
+        for (verb, rel_path) in sources {
+            assert!(
+                VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(verb),
+                "census source table lists {verb:?}, which is missing from \
+                 SIDE_EFFECTING_ASSERTIVE_VERBS; keep the table and the list in sync"
+            );
+            let path = format!("{}{rel_path}", env!("CARGO_MANIFEST_DIR"));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+            let needle = format!("\n        name: \"{verb}\",");
+            let name_pos = source.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "side-effecting-assertive verb {verb:?} has no top-level `HandlerDef` \
+                     in {path}; update SIDE_EFFECTING_ASSERTIVE_VERBS's source table or \
+                     this census"
+                )
+            });
+            let block_end = source[name_pos..]
+                .find("HandlerDef {")
+                .map(|offset| name_pos + offset)
+                .unwrap_or(source.len());
+            let block = &source[name_pos..block_end];
+            assert!(
+                block.contains("VerbCategory::Assertive"),
+                "side-effecting-assertive verb {verb:?} is declared in {path} but is not \
+                 VerbCategory::Assertive; is_retry_safe_after_frame_omission's exclusion \
+                 list only needs to cover verbs the category check would otherwise wave \
+                 through"
+            );
+        }
+    }
+
     static COMM_PROBE_GRANTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     static OTHER_PROBE_GRANTED: std::sync::atomic::AtomicBool =
@@ -3665,6 +5343,7 @@ pub(crate) mod tests {
     /// `comm` name is free for the probe here.
     struct CommProbeFactory;
     struct OtherProbeFactory;
+    struct AccidentalZeroVerbFactory;
 
     fn probe_pack(
         _runtime: KhiveRuntime,
@@ -3708,6 +5387,9 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "comm"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &COMM_PROBE_GRANTED)
         }
@@ -3717,6 +5399,18 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "grant-probe-other"
         }
+        fn intentionally_verbless(&self) -> bool {
+            true
+        }
+        fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
+            probe_pack(runtime, &OTHER_PROBE_GRANTED)
+        }
+    }
+
+    impl PackFactory for AccidentalZeroVerbFactory {
+        fn name(&self) -> &'static str {
+            "accidental-zero-verb"
+        }
         fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
             probe_pack(runtime, &OTHER_PROBE_GRANTED)
         }
@@ -3724,6 +5418,7 @@ pub(crate) mod tests {
 
     inventory::submit! { PackRegistration(&CommProbeFactory) }
     inventory::submit! { PackRegistration(&OtherProbeFactory) }
+    inventory::submit! { PackRegistration(&AccidentalZeroVerbFactory) }
 
     #[test]
     fn channel_ingest_grant_reaches_only_allowlisted_pack_names() {
@@ -3743,6 +5438,47 @@ pub(crate) mod tests {
             !OTHER_PROBE_GRANTED.load(std::sync::atomic::Ordering::SeqCst),
             "a factory outside CHANNEL_INGEST_CAPABLE_PACKS must never be granted"
         );
+    }
+
+    #[test]
+    fn declared_zero_verb_pack_requires_explicit_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs(
+            &["accidental-zero-verb".to_string()],
+            runtime,
+            &mut builder,
+        )
+        .expect_err("an unmarked zero-verb pack must fail registration");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("intentionally_verbless() = true"),
+            "operator error must name the explicit exemption: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_backend_loader_enforces_zero_verb_intent_metadata() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        let error = PackRegistry::register_packs_with_runtimes(
+            &["accidental-zero-verb".to_string()],
+            &HashMap::new(),
+            &runtime,
+            &mut builder,
+        )
+        .expect_err("multi-backend registration must enforce the same invariant");
+
+        assert!(matches!(
+            error,
+            PackLoadError::NoPublicVerbs { ref pack } if pack == "accidental-zero-verb"
+        ));
     }
 
     #[test]
@@ -4006,6 +5742,7 @@ pub(crate) mod tests {
                 param_type: "object",
                 required: false,
                 description: "invalid collision with the request envelope",
+                resolution_mode: IdResolutionMode::NotApplicable,
             }],
         }];
     }
@@ -4142,6 +5879,7 @@ pub(crate) mod tests {
                     param_type: "string",
                     required: false,
                     description: "invalid collision with the request envelope",
+                    resolution_mode: IdResolutionMode::NotApplicable,
                 }],
             }];
         }
@@ -4647,6 +6385,99 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn denied_dispatch_returns_the_id_of_its_committed_gate_denied_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed
+        );
+        let audit_event_id = receipt
+            .audit_event_id
+            .expect("a committed row carries its id");
+        let events = store.events.lock().unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.id == audit_event_id)
+            .expect("the receipt names a row the store holds");
+        assert_eq!(row.outcome, EventOutcome::Denied);
+        assert_eq!(row.kind, EventKind::Audit);
+        assert_eq!(row.verb, "create");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn denied_dispatch_without_an_event_store_reports_no_store() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::PermissionDenied { ref receipt, .. }
+                    if **receipt == crate::error::DenialReceipt::no_store()
+            ),
+            "expected a no-store receipt, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    #[serial_test::serial(audit_append_failures)]
+    #[serial_test::serial(audit_obligation_append_failures)]
+    async fn denied_dispatch_whose_row_fails_to_commit_still_refuses_and_names_no_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { verb, receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "create");
+        assert_eq!(
+            receipt.audit_event_id, None,
+            "a row that did not commit is not cited"
+        );
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::NotCommitted("store_failure")
+        );
+        assert!(store.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_allow_verb_succeeds_even_with_deny_gate_for_other_verb() {
         // Deny only "create" — "list" must still work.
         let gate = Arc::new(CountingGate {
@@ -5028,6 +6859,126 @@ pub(crate) mod tests {
         assert_eq!(gate_actor.id, "actor-alpha");
     }
 
+    struct VisibilityCapturingPack {
+        visible: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Pack for VisibilityCapturingPack {
+        const NAME: &'static str = "alpha";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
+    }
+
+    #[async_trait]
+    impl PackRuntime for VisibilityCapturingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.visible.lock().unwrap().push(
+                token
+                    .visible_namespace_strs()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            );
+            Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        }
+    }
+
+    /// ADR-007 Rev 4 Rule 3b at the token seam: a per-request identity that
+    /// names a non-`local` actor reads that actor's namespace by default even
+    /// when its `visible_namespaces` list is empty, the actor appears once when
+    /// the list already names it, an anonymous identity keeps exactly `local`,
+    /// and an explicit `namespace=` stays a precise single-namespace scope.
+    #[tokio::test]
+    async fn dispatch_with_identity_folds_the_actor_namespace_into_default_reads() {
+        let visible = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(VisibilityCapturingPack {
+            visible: visible.clone(),
+        });
+        let reg = builder.build().expect("registry builds");
+        let identity = |actor: Option<&str>, listed: &[&str]| RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: actor.map(str::to_string),
+            visible_namespaces: listed.iter().map(|ns| ns.to_string()).collect(),
+            ..Default::default()
+        };
+
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &["lambda:probe"])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity("list", Value::Null, Some(identity(None, &[])))
+            .await
+            .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "lambda:probe"}),
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+
+        let captured = visible.lock().unwrap();
+        let count = |set: &Vec<String>, ns: &str| set.iter().filter(|s| s.as_str() == ns).count();
+        assert_eq!(
+            count(&captured[0], "lambda:probe"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[0], "local"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[1], "lambda:probe"),
+            1,
+            "listed once: {:?}",
+            captured[1]
+        );
+        assert_eq!(
+            captured[2],
+            vec!["local".to_string()],
+            "anonymous keeps exactly local"
+        );
+        assert_eq!(
+            captured[3],
+            vec!["lambda:probe".to_string()],
+            "explicit namespace is a precise scope, never widened"
+        );
+    }
+
     /// Same identity check with no configured `actor_id`: both the gate and
     /// the storage token must independently land on `ActorRef::anonymous()`.
     #[tokio::test]
@@ -5225,7 +7176,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason }
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. }
                 if verb == "create" && reason == "policy evaluation failed"),
             "expected PermissionDenied with the static classified reason for a missing rego entrypoint, got {err:?}"
         );
@@ -5700,6 +7651,9 @@ pub(crate) mod tests {
         /// the audit submission, which is the only way to observe that the
         /// audit row is written after the handler rather than before it.
         trace: Option<Arc<std::sync::Mutex<Vec<TraceEntry>>>>,
+        /// Hold a real batch append across the caller's audit deadline.
+        append_started: Option<Arc<tokio::sync::Notify>>,
+        append_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl MemoryEventStore {
@@ -5765,8 +7719,7 @@ pub(crate) mod tests {
             Ok(BatchWriteSummary {
                 attempted,
                 affected,
-                failed: 0,
-                first_error: String::new(),
+                ..BatchWriteSummary::default()
             })
         }
         async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
@@ -5803,6 +7756,12 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
+            if let Some(started) = &self.append_started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.append_release {
+                release.notified().await;
+            }
             self.trace_submission(&events);
             if self.fail_appends
                 || self
@@ -5837,6 +7796,792 @@ pub(crate) mod tests {
         }
     }
 
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every `crates/<crate>/src/**/*.rs` and `crates/<crate>/tests/**/*.rs`
+    /// file in the workspace, read to a `String` alongside its path.
+    ///
+    /// This is the compiled-test population an event-backed registry
+    /// constructor can actually be reached from: unit tests live under
+    /// `src/`, integration tests live under `tests/`. Anything outside those
+    /// two directories per crate (benches, examples) never runs as `cargo
+    /// test` and is out of scope for this census.
+    fn workspace_rust_sources() -> Vec<(std::path::PathBuf, String)> {
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("khive-runtime's Cargo.toml lives directly under crates/")
+            .to_path_buf();
+        let mut files = Vec::new();
+        let Ok(crate_dirs) = std::fs::read_dir(&crates_root) else {
+            return Vec::new();
+        };
+        for crate_dir in crate_dirs.filter_map(Result::ok) {
+            let crate_dir = crate_dir.path();
+            if !crate_dir.is_dir() {
+                continue;
+            }
+            for sub in ["src", "tests"] {
+                let sub_dir = crate_dir.join(sub);
+                if sub_dir.is_dir() {
+                    collect_rust_files(&sub_dir, &mut files);
+                }
+            }
+        }
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
+
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// `true` if `line`, once whitespace is trimmed, is a top-level `fn`
+    /// signature start (covering the `pub`/`pub(crate)`/`pub(super)` and
+    /// `async` modifiers actually used across this workspace).
+    fn is_fn_signature_line(trimmed: &str) -> bool {
+        fn_name_from_signature(trimmed).is_some()
+    }
+
+    /// Blank out the contents of every `"..."` string literal in `text`
+    /// (escapes included), line by line, so a seam name mentioned in an
+    /// error message or `.expect(...)` string — e.g. `pack.rs`'s own
+    /// `"...do not call with_event_store() for this backend."` — can never
+    /// read as a call. This only needs to handle ordinary quoted strings:
+    /// nothing in this workspace's actual seam-adjacent code uses raw
+    /// strings or multi-line string literals for text that could collide
+    /// with a seam or helper name.
+    fn strip_string_literals(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        // Persists across lines on purpose: this workspace's longer error
+        // and `.expect(...)` messages routinely use backslash-newline
+        // string continuations (see `pack.rs`'s own
+        // `IncompatibleEventStore` message), so a literal spanning several
+        // source lines must stay "in string" across all of them.
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line, and a call
+    /// site that happens to fit on one line today is not a
+    /// property this scan may rely on), with a non-identifier character (or
+    /// start of text) before it, not immediately preceded by `fn ` (which
+    /// would make this the definition, not a call), and not inside a string
+    /// literal (which would make this prose, not a call).
+    ///
+    /// The identifier-boundary check is load-bearing: a naive
+    /// `text.contains(format!("{name}("))` matches `fixture(` inside
+    /// `daemon_script_fixture(`, which is a different, unrelated function —
+    /// this is the difference between a real population scan and one that
+    /// explodes into every helper in the workspace that happens to share a
+    /// suffix.
+    fn calls_name(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — `rustfmt` can and does break a call onto its
+    /// own line, and a scanner that only sees same-line whitespace would
+    /// silently stop finding calls the moment one gets formatted that way.
+    #[test]
+    fn calls_name_matches_across_a_newline_before_the_parenthesis() {
+        let text = "async fn wraps_it() {\n    with_event_store\n        (store)\n}";
+        assert!(calls_name(text, "with_event_store"));
+    }
+
+    /// `(name, body)` for every function defined in `text`, where `body`
+    /// spans from the function's signature line to the matching close of
+    /// its opening brace, found by [`brace_bounded_fn_end`]. The line
+    /// before the *next* function signature (or EOF) is passed to
+    /// `brace_bounded_fn_end` only as its own fallback bound — used when
+    /// brace counting never returns to depth zero, e.g. a signature shape
+    /// this scan doesn't recognize, or an actual brace imbalance — never as
+    /// this function's primary way of finding where a body ends.
+    fn fn_bodies(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| is_fn_signature_line(line.trim_start()))
+            .map(|(index, _)| index)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &start)| {
+                let hard_limit = starts.get(index + 1).copied().unwrap_or(lines.len());
+                let end = brace_bounded_fn_end(&lines, start, hard_limit);
+                let name = fn_name_from_signature(lines[start].trim_start())?;
+                Some((name.to_string(), lines[start..end].join("\n")))
+            })
+            .collect()
+    }
+
+    /// The exclusive end index (within `lines`) of the function whose
+    /// signature line is `lines[sig_start]`, found by counting brace depth
+    /// from that line until it returns to zero, bounded by `hard_limit` (a
+    /// caller-supplied fallback — the next known function signature, or
+    /// EOF) if brace counting never finds a close.
+    ///
+    /// Bounding by "next signature" alone (the original design of
+    /// `fn_bodies`) reads past a function's real end whenever anything
+    /// between its `{` and the *next* recognized signature is not itself
+    /// matched as a signature — a nested nested `fn` with an unrecognized
+    /// visibility spelling, a closure, or simply a long function with a lot
+    /// of code after its logical end — and keeps scanning into whatever
+    /// comes next, which can misattribute an unrelated later call as this
+    /// function's own. Brace counting fixes that; `hard_limit` stays as a
+    /// safety net, never a primary bound, for the rare text this scan
+    /// cannot fully make sense of (a signature line this scan doesn't
+    /// recognize, or an actual brace imbalance).
+    fn brace_bounded_fn_end(lines: &[&str], sig_start: usize, hard_limit: usize) -> usize {
+        let joined = lines[sig_start..hard_limit].join("\n");
+        let stripped = strip_string_literals(&joined);
+        let mut depth = 0i32;
+        let mut opened = false;
+        for (line_index, line) in stripped.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(comment_at) => &line[..comment_at],
+                None => line,
+            };
+            for ch in code.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if opened && depth <= 0 {
+                return (sig_start + line_index + 1).min(hard_limit);
+            }
+        }
+        hard_limit
+    }
+
+    /// `seed`, plus the name of every function *defined in this same text*
+    /// that transitively calls one of the `seed` names through a chain of
+    /// unambiguous same-text helpers — e.g. a local test-fixture helper
+    /// (`pack_with_events()`, `fixture()`, ...) that itself constructs an
+    /// event-backed registry, or a verb handler that calls a
+    /// `record_config_locked`-wrapping config reader through one or more
+    /// intermediate helpers (`handle_context` → `context_profile_enabled`
+    /// → `record_config_locked`).
+    ///
+    /// Two deliberate boundaries keep this from over-matching:
+    ///
+    /// - **Per input text, not per workspace.** A private helper named
+    ///   `fixture()` in one crate's test binary has nothing to do with an
+    ///   unrelated `fixture()` in another crate's — they're different
+    ///   functions in different compiled binaries. Resolving against
+    ///   exactly the text handed in (one file, or one crate's concatenated
+    ///   `src/` tree — the caller decides which) matches a real visibility
+    ///   boundary instead of conflating same-named helpers across the whole
+    ///   tree.
+    /// - **Closure gated by per-step uniqueness, not free transitive
+    ///   chasing.** Growing the known set one full pass at a time, and only
+    ///   ever promoting a name that is unambiguous (defined exactly once in
+    ///   the text) at the moment it is promoted, is what keeps a generic
+    ///   name like `new` or `build` — reused by dozens of unrelated types —
+    ///   from becoming a global false-positive match. Each pass reuses the
+    ///   exact single-hop check the uniqueness gate already relied on; only
+    ///   the number of passes changed; a wrapper that itself wraps a
+    ///   wrapper is still only promoted once every name on its path to
+    ///   `seed` has independently cleared that gate.
+    fn file_seam_names(text: &str, seed: &[&str]) -> Vec<String> {
+        let bodies = fn_bodies(text);
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _) in &bodies {
+            *name_counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (name, body) in &bodies {
+                if known.iter().any(|k| k == name) {
+                    continue;
+                }
+                if name_counts.get(name.as_str()).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if known.iter().any(|seam| calls_name(body, seam)) {
+                    known.push(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known
+    }
+
+    /// [`file_seam_names`]'s closure, widened to resolve an ordinary
+    /// function-call chain that crosses source files within one crate —
+    /// e.g. a coordinator method defined in one file calling a config
+    /// reader defined in another — while still rejecting a name this scan
+    /// cannot safely resolve.
+    ///
+    /// `bodies_by_file` is one [`fn_bodies`] list per file; each entry
+    /// keeps the same per-file uniqueness gate `file_seam_names` applies
+    /// (a name only counts as *that file's* definition when it is the only
+    /// one *in that file's own text*), but growth is shared across every
+    /// file, so a name promoted from one file's chain is immediately
+    /// available to every other file's bodies on the next pass.
+    ///
+    /// A name defined identically in more than one file of the crate (the
+    /// same function name reused by two unrelated types — this workspace
+    /// has a real instance: a coordinator's own search method and an
+    /// unrelated service wrapper by the same name, in different files) is
+    /// promoted only when *every* one of its per-file-unique definitions
+    /// independently reaches the known set. Requiring the concatenated
+    /// text's exact-one-definition count instead would block such a name
+    /// forever — even though each definition, read in its own file, is
+    /// unambiguous — so this loosens the count check exactly as far as
+    /// keeping every resolution provably seam-reaching allows, and no
+    /// further: a name with even one non-reaching definition among its
+    /// per-file-unique occurrences is never promoted, which is what keeps
+    /// a generic name like `new` from becoming a crate-wide false match
+    /// the moment any single type's constructor happens to reach a seam.
+    fn crate_seam_names(bodies_by_file: &[Vec<(String, String)>], seed: &[&str]) -> Vec<String> {
+        let per_file_unique: Vec<Vec<(&str, &str)>> = bodies_by_file
+            .iter()
+            .map(|bodies| {
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for (name, _) in bodies {
+                    *counts.entry(name.as_str()).or_insert(0) += 1;
+                }
+                bodies
+                    .iter()
+                    .filter(|(name, _)| counts.get(name.as_str()).copied() == Some(1))
+                    .map(|(name, body)| (name.as_str(), body.as_str()))
+                    .collect()
+            })
+            .collect();
+
+        let mut occurrences: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for unique_in_file in &per_file_unique {
+            for (name, body) in unique_in_file {
+                occurrences.entry(name).or_default().push(body);
+            }
+        }
+
+        let mut known: Vec<String> = seed.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mut grew = false;
+            for (name, bodies) in &occurrences {
+                if known.iter().any(|k| k == name) {
+                    continue;
+                }
+                if bodies
+                    .iter()
+                    .all(|body| known.iter().any(|seam| calls_name(body, seam)))
+                {
+                    known.push((*name).to_string());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known
+    }
+
+    /// The `crates/<name>` crate this source `path` belongs to, or `None`
+    /// if `path` is not under a `crates/<name>/...` layout.
+    fn crate_key(path: &std::path::Path) -> Option<String> {
+        let mut components = path.components();
+        while let Some(component) = components.next() {
+            if component.as_os_str() == "crates" {
+                return components
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
+
+    /// The first `handle_*` call found in `text`, if any — used to read off
+    /// the handler a dispatch match arm routes to.
+    fn find_handle_call(text: &str) -> Option<String> {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find("handle_") {
+            let start = search_from + rel;
+            if start > 0 && is_ident_byte(bytes[start - 1]) {
+                search_from = start + 1;
+                continue;
+            }
+            let mut end = start + "handle_".len();
+            while end < bytes.len() && is_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return Some(text[start..end].to_string());
+            }
+            search_from = end.max(start + 1);
+        }
+        None
+    }
+
+    /// `(verb, handler)` for every `"verb" => ... handle_name(` dispatch
+    /// match arm found in `text` — the pattern every pack's `dispatch`
+    /// (`crates/khive-pack-*/src/{dispatch,pack}.rs`) uses to route a verb
+    /// string to its handler method.
+    ///
+    /// This workspace's dispatch tables write one verb per arm ending in a
+    /// `self.handle_*(...)` call, occasionally wrapped in a short `{ }`
+    /// block (`"memory.recall" => { self.handle_recall_with_deadline(...)
+    /// .await }`), so the handler is looked up in a bounded window after
+    /// the arm's `=>` rather than requiring it on the same line. A combined
+    /// arm that dispatches on a second, nested `match` (`"create" | "list"
+    /// | "search" => { match verb { "create" => self.handle_create(...),
+    /// ... } }`) can misattribute the outer alias to the first inner
+    /// handler call instead of its real one; that under-attributes rather
+    /// than over-attributes a verb as ledger-reaching (a missed producer
+    /// verb is a false negative here, not a false positive), and none of
+    /// this workspace's combined arms currently route to a ledger
+    /// producer.
+    fn dispatch_verb_handlers(text: &str) -> Vec<(String, String)> {
+        let bytes = text.as_bytes();
+        let mut arms: Vec<(String, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'"' {
+                i += 1;
+                continue;
+            }
+            let literal = &text[start..j];
+            let verb_like = !literal.is_empty()
+                && literal
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.');
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if verb_like && k + 1 < bytes.len() && bytes[k] == b'=' && bytes[k + 1] == b'>' {
+                arms.push((literal.to_string(), start - 1, k + 2));
+            }
+            i = j + 1;
+        }
+
+        let mut out = Vec::new();
+        for (index, (verb, _quote_start, arrow_end)) in arms.iter().enumerate() {
+            let next_arm_start = arms.get(index + 1).map(|arm| arm.1).unwrap_or(bytes.len());
+            let window_end = next_arm_start.min(arrow_end + 400).min(bytes.len());
+            if window_end <= *arrow_end {
+                continue;
+            }
+            if let Some(handler) = find_handle_call(&text[*arrow_end..window_end]) {
+                out.push((verb.clone(), handler));
+            }
+        }
+        out
+    }
+
+    /// `true` if `text` contains `dispatch(` (optional whitespace,
+    /// including newlines, before the `(`) whose first argument is the
+    /// exact string literal `"verb"` — the call shape every test in this
+    /// workspace uses to exercise a pack verb (`pack.dispatch("context",
+    /// ...)`, `registry.dispatch("memory.recall", ...)`).
+    fn calls_dispatch_with_verb(text: &str, verb: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let bytes = text.as_bytes();
+        let name = "dispatch";
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if before_ok && j < bytes.len() && bytes[j] == b'(' {
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let quoted = format!("\"{verb}\"");
+                if text[k..].starts_with(&quoted) {
+                    return true;
+                }
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// The exclusive end index (within `lines`) of the test function whose
+    /// `#[test]`/`#[tokio::test]` attribute starts at `lines[start]`,
+    /// bounded by `hard_limit` (the next test attribute, or EOF) as a
+    /// fallback if brace counting cannot find a close.
+    ///
+    /// A previous version bounded a test's span only by "next `#[test]`
+    /// attribute", which pulls a sibling helper function sitting between
+    /// two tests into the *first* test's span — a helper defined after one
+    /// test and before the next reads as part of the first test's body
+    /// even though it is a wholly separate top-level item. Ending the span
+    /// at the matching closing brace of the test's own `fn` instead means a
+    /// sibling helper's seam call is never misattributed.
+    fn test_body_end(lines: &[&str], start: usize, hard_limit: usize) -> usize {
+        let Some(sig_offset) = lines[start..hard_limit]
+            .iter()
+            .position(|line| is_fn_signature_line(line.trim_start()))
+        else {
+            return hard_limit;
+        };
+        brace_bounded_fn_end(lines, start + sig_offset, hard_limit)
+    }
+
+    /// An event-backed registry can drain the process-wide config ledger at
+    /// dispatch, and `record_config_locked` (and every `OnceLock` reader
+    /// that wraps it — `context_profile_enabled`, `recall_profile_enabled`,
+    /// `ann_overfetch_max_rounds`, `ann_ready_timeout_ms`,
+    /// `recall_deadline_ms`, `request_read_timeout`,
+    /// `backend_search_timeout_ms`, ... — enumerated here only as the
+    /// evidence that motivated widening the seed, never as the source of
+    /// truth for who counts) writes to it, so every compiled test that
+    /// reaches either — directly, through a same-text wrapper, or by
+    /// dispatching a verb whose handler reaches one — must join the
+    /// ledger's serial group even when its own assertion is about another
+    /// audit field.
+    ///
+    /// The seed is deliberately just the two true seams
+    /// (`with_event_store`, `record_config_locked`) rather than a
+    /// hand-maintained list of every wrapper: `file_seam_names` grows the
+    /// known set to a fixed point, so a future `OnceLock` reader that wraps
+    /// `record_config_locked` is picked up the moment it exists, without
+    /// anyone remembering to add it here.
+    #[test]
+    fn event_store_test_fixtures_are_config_ledger_serialized() {
+        let sources = workspace_rust_sources();
+        assert!(
+            !sources.is_empty(),
+            "the workspace source scan found no .rs files under crates/*/src or \
+             crates/*/tests; the census's own file walk is broken, not the population \
+             it walks"
+        );
+
+        let base_seed = ["with_event_store", "record_config_locked"];
+
+        // A dispatch match arm (`"context" => self.handle_context(...)`)
+        // and the handler it names are frequently split across files
+        // within one crate (`khive-pack-kg`'s `dispatch.rs` vs.
+        // `handlers/context.rs`), so resolving "does verb X's handler reach
+        // a ledger producer" needs a wider-than-one-file view. Per crate is
+        // still a real visibility boundary — a pack's dispatch table only
+        // ever calls its own handlers — unlike a workspace-wide view,
+        // which would risk resolving a handler name that happens to
+        // collide across unrelated crates. Built from `src/` text only:
+        // `tests/` helpers of the same name must never leak into what
+        // counts as "the crate's own handler".
+        let mut crate_src_blobs: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut crate_src_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
+        for (path, text) in &sources {
+            if !path.components().any(|c| c.as_os_str() == "src") {
+                continue;
+            }
+            let Some(key) = crate_key(path) else {
+                continue;
+            };
+            let blob = crate_src_blobs.entry(key.clone()).or_default();
+            blob.push_str(text);
+            blob.push('\n');
+            crate_src_bodies
+                .entry(key)
+                .or_default()
+                .push(fn_bodies(text));
+        }
+        let mut crate_ledger_verbs: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (crate_name, blob) in &crate_src_blobs {
+            let empty = Vec::new();
+            let bodies_by_file = crate_src_bodies.get(crate_name).unwrap_or(&empty);
+            let producers = crate_seam_names(bodies_by_file, &base_seed);
+            let verbs: Vec<String> = dispatch_verb_handlers(blob)
+                .into_iter()
+                .filter(|(_, handler)| producers.iter().any(|p| p == handler))
+                .map(|(verb, _)| verb)
+                .collect();
+            crate_ledger_verbs.insert(crate_name.clone(), verbs);
+        }
+
+        // Every source file in the crate (`src/` and `tests/` alike) —
+        // resolves an ordinary same-crate function-call chain that crosses
+        // files (a coordinator method in `dispatch.rs` calling a config
+        // reader that lands in `dispatch.rs` too, reached from a test in
+        // `tests.rs`) for the direct-call match below. Kept separate from
+        // `crate_src_bodies` above: that population stays `src/`-only so a
+        // `tests/`-only helper can never be misread as a pack's own
+        // dispatch handler.
+        //
+        // A pack's own verb-dispatch table (`dispatch_verb_handlers`'s own
+        // target shape — one function whose body is a `"verb" => ...
+        // handle_x(...)` match with many arms) is excluded from this
+        // population: "body contains a call to a known name" is sound only
+        // for a body that always makes that call, and a dispatch table's
+        // body contains a call to nearly every handler in the pack while
+        // any one invocation only ever takes one arm. Leaving it in would
+        // promote the dispatch function itself the moment *any* single
+        // verb's handler reaches a seam, which reads as "every verb reaches
+        // the ledger" — the false-positive an ordinary wrapper closure
+        // cannot produce, verb-routing is already resolved precisely by the
+        // separate `crate_ledger_verbs`/`calls_dispatch_with_verb` path
+        // above, keyed by which verb string was actually invoked.
+        let mut crate_all_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
+            std::collections::HashMap::new();
+        for (path, text) in &sources {
+            let Some(key) = crate_key(path) else {
+                continue;
+            };
+            let bodies: Vec<(String, String)> = fn_bodies(text)
+                .into_iter()
+                .filter(|(_, body)| dispatch_verb_handlers(body).len() <= 1)
+                .collect();
+            crate_all_bodies.entry(key).or_default().push(bodies);
+        }
+        let mut crate_direct_seams: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (crate_name, bodies_by_file) in &crate_all_bodies {
+            crate_direct_seams.insert(
+                crate_name.clone(),
+                crate_seam_names(bodies_by_file, &base_seed),
+            );
+        }
+
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+        let mut order_offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let seam_names = file_seam_names(text, &base_seed);
+            let crate_key_for_path = crate_key(path);
+            let crate_verbs = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_ledger_verbs.get(key));
+            let crate_seams = crate_key_for_path
+                .as_deref()
+                .and_then(|key| crate_direct_seams.get(key));
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let hard_limit = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let end = test_body_end(&lines, start, hard_limit);
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+
+                // `serial_test`'s derive sorts lock keys only *within* one
+                // `#[serial(...)]` attribute (`raw_args.sort()`), never
+                // across two attributes stacked on the same item. A test
+                // that takes the unkeyed group and `config_ledger` must
+                // therefore fix the acquisition order itself: two tests
+                // stacking the same pair of attributes in opposite textual
+                // order take the two locks in opposite order and deadlock
+                // each other, and every other serial test queues behind
+                // them. Checked unconditionally over every test span, not
+                // just config-ledger-reaching candidates below — the
+                // deadlock risk is about which attributes are stacked, not
+                // about whether this census's reachability heuristic can
+                // prove the seam call.
+                let unkeyed_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial]" || trimmed == "#[serial_test::serial]"
+                });
+                let config_ledger_attr_pos = span.iter().position(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if let (Some(unkeyed_idx), Some(config_ledger_idx)) =
+                    (unkeyed_attr_pos, config_ledger_attr_pos)
+                {
+                    if config_ledger_idx < unkeyed_idx {
+                        let signature_offset = span
+                            .iter()
+                            .position(|line| is_fn_signature_line(line.trim_start()))
+                            .expect("test span has a function signature");
+                        let name = fn_name_from_signature(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                        order_offenders.push(format!("{}:{name}", path.display()));
+                    }
+                }
+
+                let matched_direct = seam_names
+                    .iter()
+                    .chain(crate_seams.into_iter().flatten())
+                    .find(|seam| calls_name(&span_text, seam));
+                let matched: Option<String> = matched_direct.cloned().or_else(|| {
+                    crate_verbs.and_then(|verbs| {
+                        verbs
+                            .iter()
+                            .find(|verb| calls_dispatch_with_verb(&span_text, verb))
+                            .map(|verb| format!("dispatch(\"{verb}\")"))
+                    })
+                });
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                let has_group = span.iter().any(|line| {
+                    let trimmed = line.trim();
+                    trimmed == "#[serial(config_ledger)]"
+                        || trimmed == "#[serial_test::serial(config_ledger)]"
+                });
+                if !has_group {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| is_fn_signature_line(line.trim_start()))
+                        .expect("test span has a function signature");
+                    let name = fn_name_from_signature(span[signature_offset].trim_start())
+                        .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches config-ledger seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            candidate_count > 0,
+            "census found zero config-ledger-reaching test candidates across the whole \
+             workspace scan ({} source files) — the scan is broken, not the \
+             population it should have found (khive-runtime's own config-ledger \
+             tests alone are known callers)",
+            sources.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "config-ledger-reaching pack tests must use #[serial(config_ledger)]; \
+             offenders: {offenders:?}"
+        );
+        assert!(
+            order_offenders.is_empty(),
+            "a test stacking the unkeyed #[serial] group with #[serial(config_ledger)] \
+             must take the unkeyed attribute first: serial_test's derive sorts lock \
+             keys only within one #[serial(...)] attribute, never across two \
+             attributes stacked on the same item, so a test taking these two locks in \
+             the opposite textual order deadlocks against every test that took them in \
+             the canonical order; offenders: {order_offenders:?}"
+        );
+    }
+
     fn only_git_digest_event(store: &MemoryEventStore) -> Event {
         let events: Vec<Event> = store
             .events
@@ -5855,6 +8600,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_success_returns_complete_durable_receipt() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -5900,6 +8646,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn malformed_git_digest_report_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -5913,8 +8660,8 @@ pub(crate) mod tests {
             .expect_err("malformed receipt identity must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -5931,6 +8678,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
@@ -5952,9 +8700,9 @@ pub(crate) mod tests {
             .await
             .expect_err("receipt persistence failure must fail the response");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
-                    && message.contains("writes may have committed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
+                    && failure.message.contains("writes may have committed")),
             "error is stable, safe, and retry-aware: {err}"
         );
         // The git.digest receipt is obligation-bearing (`GitDigestReceipt`
@@ -5982,12 +8730,13 @@ pub(crate) mod tests {
             .expect_err("a successful digest needs a durable store");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn git_digest_gate_unavailable_precedes_the_receipt_contract() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6026,6 +8775,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation() {
         #[derive(Debug)]
         struct FailingGate;
@@ -6036,6 +8786,13 @@ pub(crate) mod tests {
                 ))
             }
         }
+
+        // Entry reset, not exit: a `config_ledger`-grouped test that panics
+        // after queueing a row (elsewhere in this group) would otherwise
+        // leave it for whichever test the serial lock hands off to next;
+        // this test's exact `events.len() == 1` assertion below has no
+        // tolerance for an inherited row.
+        let _ = crate::config_ledger::drain_config_locked();
 
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);
@@ -6089,6 +8846,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
         #[derive(Debug)]
         struct DenyingGate;
@@ -6097,6 +8855,10 @@ pub(crate) mod tests {
                 Ok(GateDecision::deny("intercepted policy denied"))
             }
         }
+
+        // Entry reset, not exit — see the sibling test above for why an
+        // exact `events.len() == 1` assertion needs a clean ledger.
+        let _ = crate::config_ledger::drain_config_locked();
 
         let invoked = Arc::new(AtomicUsize::new(0));
         let invoked_by_operation = Arc::clone(&invoked);
@@ -6114,15 +8876,30 @@ pub(crate) mod tests {
             .await
             .expect_err("explicit gate denial must refuse intercepted dispatch");
 
-        assert!(matches!(
-            err,
-            RuntimeError::PermissionDenied { ref verb, ref reason }
-                if verb == "list" && reason == "intercepted policy denied"
-        ));
+        let RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } = err
+        else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "list");
+        assert_eq!(reason, "intercepted policy denied");
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed,
+            "the intercepted path commits its denial row before refusing"
+        );
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
 
         let events = store.events.lock().unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(
+            Some(events[0].id),
+            receipt.audit_event_id,
+            "the receipt names the committed row"
+        );
         assert_eq!(events[0].outcome, EventOutcome::Denied);
         assert_eq!(events[0].payload["decision"], "deny");
         assert_eq!(
@@ -6132,6 +8909,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_uses_the_same_receipt_contract() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6166,6 +8944,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_receipt_preserves_typed_metadata() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -6199,6 +8978,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_malformed_git_digest_appends_one_generic_error_audit() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6221,8 +9001,8 @@ pub(crate) mod tests {
             .expect_err("malformed intercepted receipt must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -6316,7 +9096,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason } if verb == "guarded" && reason.contains("always deny")),
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "guarded" && reason.contains("always deny")),
             "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
         );
         assert_eq!(
@@ -6429,7 +9209,7 @@ pub(crate) mod tests {
             .expect_err("denied absent-id update must not resolve the id");
 
         let denial = |error: RuntimeError| match error {
-            RuntimeError::PermissionDenied { verb, reason } => (verb, reason),
+            RuntimeError::PermissionDenied { verb, reason, .. } => (verb, reason),
             other => panic!("expected gate refusal, got {other:?}"),
         };
         let present_denial = denial(present_error);
@@ -6450,6 +9230,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_allow() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -6482,6 +9263,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     #[serial(audit_obligation_append_failures)]
     async fn audit_append_failure_fails_an_obligation_bearing_dispatch() {
@@ -6528,8 +9310,8 @@ pub(crate) mod tests {
                 "a persistent obligation-bearing audit commit failure must fail the dispatch",
             );
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "error names the obligation failure so it is distinguishable from a handler error: {err}"
         );
 
@@ -6577,15 +9359,15 @@ pub(crate) mod tests {
     /// Not pinned here: that the row commits on a SEPARATE writer acquisition from the
     /// handler's. The store double has no writer to observe, so that half of the mechanism
     /// needs a different fixture than this one.
-    #[tokio::test]
-    #[serial(audit_append_failures)]
-    #[serial(audit_obligation_append_failures)]
     // The config ledger is process-global and an event-store dispatch drains its
     // queue before invoking the pack, so a concurrent config_ledger test can land
     // a submission ahead of this handler's effect and break the first-entry
     // assertion below. That group is held for the position assertion, not for the
-    // audit counters the two groups above cover.
+    // audit counters the other two groups cover.
+    #[tokio::test]
     #[serial(config_ledger)]
+    #[serial(audit_append_failures)]
+    #[serial(audit_obligation_append_failures)]
     async fn obligation_failure_reports_a_write_that_already_committed() {
         /// `total` is what `cost_unit` is computed from, so this number is the
         /// test's handle on whether the audit row was built from the return
@@ -6675,8 +9457,8 @@ pub(crate) mod tests {
             .await
             .expect_err("an obligation commit failure must fail the dispatch");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "the error must name the obligation failure, since that string is what tells a \
              caller the effect landed: {err}"
         );
@@ -6879,8 +9661,7 @@ pub(crate) mod tests {
             Ok(BatchWriteSummary {
                 attempted,
                 affected: attempted,
-                failed: 0,
-                first_error: String::new(),
+                ..BatchWriteSummary::default()
             })
         }
         async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
@@ -6910,6 +9691,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(config_ledger)]
     fn build_rejects_a_configured_event_store_incompatible_with_the_audit_batch_seam() {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -6996,9 +9778,26 @@ pub(crate) mod tests {
             .writer_contention
             .audit_degraded_unavailable_reason
             .is_some());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_refused_obligations
+            .is_none());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_refused_obligations_unavailable_reason
+            .is_some());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_unresolved_obligations
+            .is_none());
+        assert!(bare_report
+            .writer_contention
+            .audit_admission_unresolved_obligations_unavailable_reason
+            .is_some());
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_duration_us_reflects_measured_dispatch_time() {
         // The persisted audit row's `duration_us` must carry the measured
         // pack-dispatch time, not the `Event::new` default of 0 (persisting
@@ -7035,6 +9834,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_unknown_verb_allowed_by_gate_still_persists_audit_row() {
         // Generalizing audit-row deferral to every Allow-outcome verb (not
         // just singleton `link`) must not silently drop the audit row for a
@@ -7072,6 +9872,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_persists_to_event_store_on_deny() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -7114,6 +9915,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         #[derive(Debug)]
         struct FailingGate;
@@ -7172,6 +9974,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     #[serial(audit_append_failures)]
     async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error() {
         #[derive(Debug)]
@@ -7376,6 +10179,7 @@ pub(crate) mod tests {
     // verifies the complete envelope survives append_event → query_events.
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_deny_reason_and_gate_impl_through_event_store() {
         #[derive(Debug)]
         struct DenyGateWithName;
@@ -7448,6 +10252,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_envelope_round_trips_obligations_through_event_store() {
         use khive_gate::Obligation;
 
@@ -7515,6 +10320,7 @@ pub(crate) mod tests {
     // (Event.data is stored as TEXT and parsed back on read).
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_deny_reason_gate_impl_and_obligations() {
         #[derive(Debug)]
         struct SqlTestDenyGate;
@@ -7614,6 +10420,7 @@ pub(crate) mod tests {
     //   1. Raw Event.data["obligations"] is a non-empty JSON array.
     //   2. Deserialized AuditEvent.obligations[0] matches the expected variant.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn sql_backed_audit_envelope_round_trips_non_empty_obligations() {
         use khive_gate::Obligation;
 
@@ -7720,6 +10527,7 @@ pub(crate) mod tests {
     // through the EventStore. Ensures the wire shape is independent of which verb
     // triggers the gate check.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_payload_shape_for_create_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -7889,6 +10697,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_non_embedding_successful_dispatch() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -7917,6 +10726,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_scales_with_registered_model_count_for_create() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -7948,6 +10758,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_zero_registered_models_is_base_weight_only() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -7976,6 +10787,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_error() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8015,6 +10827,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_when_no_pack_owns_the_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8044,6 +10857,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_denied_dispatch() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -8080,6 +10894,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_cost_unit_present_on_link_singleton_success() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8127,6 +10942,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn resource_work_class_present_cost_unit_absent_on_link_dispatch_failure() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8164,6 +10980,7 @@ pub(crate) mod tests {
 
     // Registry audit event must carry target_id when dispatch params include it.
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn audit_event_threads_target_id_from_dispatch_args() {
         let store = Arc::new(MemoryEventStore::default());
         let target = uuid::Uuid::new_v4();
@@ -8264,6 +11081,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_enriches_successful_singleton_with_edge_v2() {
         let store = Arc::new(MemoryEventStore::default());
         let edge_id = uuid::Uuid::new_v4();
@@ -8333,6 +11151,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_dispatch_fails() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8402,6 +11221,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_falls_back_to_v1_when_result_missing_edge_fields() {
         let store = Arc::new(MemoryEventStore::default());
         let target_arg = uuid::Uuid::new_v4();
@@ -8448,6 +11268,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn link_audit_bulk_links_get_no_enrichment() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
@@ -8587,9 +11408,66 @@ pub(crate) mod tests {
         page.items[0].clone()
     }
 
+    /// A fresh `MemoryEventStore` for a test that will assert `first_event`'s
+    /// exact one-event count, with the process-wide config ledger drained
+    /// first.
+    ///
+    /// `first_event` itself runs *after* dispatch, so it cannot fix this: a
+    /// `config_ledger`-grouped test that panics after queueing a row (a
+    /// direct `record_config_locked` call, or a `OnceLock` reader it
+    /// invoked) but before its own event-backed dispatch never drains that
+    /// row itself, leaving it queued for whichever test the serial lock
+    /// hands off to next. If that next test builds its store with plain
+    /// `Arc::new(MemoryEventStore::default())`, its own dispatch call
+    /// drains the inherited row as an extra `ConfigLocked` event alongside
+    /// the one it expects, and `first_event`'s exact `page.items.len() ==
+    /// 1` assertion sees two. The fix has to run before dispatch, so it
+    /// lives in the store constructor every exact-one-event test calls, not
+    /// in the post-dispatch helper that reads the count.
+    fn clean_ledger_event_store() -> Arc<MemoryEventStore> {
+        let _ = crate::config_ledger::drain_config_locked();
+        Arc::new(MemoryEventStore::default())
+    }
+
+    /// Regression: a preceding
+    /// `config_ledger`-grouped test that queues a row (directly, or via a
+    /// `OnceLock` reader it invoked) and then panics before its own
+    /// event-backed dispatch drains it leaves that row queued for whichever
+    /// test the serial lock hands to next. Simulate exactly that leaked row
+    /// here and prove `clean_ledger_event_store` — not `first_event` itself,
+    /// which only runs after dispatch and so cannot fix a pre-dispatch race
+    /// — is what keeps `first_event`'s exact one-event assertion honest.
     #[tokio::test]
+    #[serial(config_ledger)]
+    async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
+        let _ = crate::config_ledger::drain_config_locked();
+        crate::config_ledger::record_config_locked("simulated_leaked_key", "leaked_value");
+
+        let store = clean_ledger_event_store();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "test-ns"}),
+            Some(RequestIdentity {
+                request_id: Some(9_001),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_success() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
@@ -8612,8 +11490,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(FailingProbePack);
         builder.with_event_store(store.clone());
@@ -8638,6 +11517,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_denied() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -8647,7 +11527,7 @@ pub(crate) mod tests {
             }
         }
 
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(AlwaysDenyGate));
@@ -8672,8 +11552,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v2_success() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let edge_id = uuid::Uuid::new_v4();
         let source_id = uuid::Uuid::new_v4();
         let target_id = uuid::Uuid::new_v4();
@@ -8716,8 +11597,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_link_v1_fallback() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(LinkResultPack::err("target endpoint not found"));
         builder.with_event_store(store.clone());
@@ -8751,8 +11633,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_stamps_request_id_on_unknown_verb() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
@@ -8778,8 +11661,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial(config_ledger)]
     async fn dispatch_with_identity_omits_request_id_key_when_absent() {
-        let store = Arc::new(MemoryEventStore::default());
+        let store = clean_ledger_event_store();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
@@ -9413,12 +12297,14 @@ mod help_tests {
             param_type: "string",
             required: true,
             description: "Granular kind (concept | document | ...).",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "name",
             param_type: "string",
             required: false,
             description: "Human-readable name.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ];
 
@@ -9428,18 +12314,53 @@ mod help_tests {
             param_type: "string",
             required: true,
             description: "Semantic recall query.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
         ParamDef {
             name: "limit",
             param_type: "integer",
             required: false,
             description: "Maximum memories to return.",
+            resolution_mode: IdResolutionMode::NotApplicable,
         },
     ];
 
     // A subhandler with no params — mirrors recall.embed / brain.emit / etc.
     // Used to test that help=true on a Subhandler returns callable_via_mcp: false.
     static EMBED_PARAMS: [ParamDef; 0] = [];
+
+    // A uuid-typed param declaring IdResolutionMode::UnscopedById, used to
+    // verify `describe_verb` appends `resolution_mode_contract`'s rendering
+    // to every uuid-typed description instead of requiring each `HandlerDef`
+    // to paste the contract in by hand.
+    static GET_PARAMS: [ParamDef; 1] = [ParamDef {
+        name: "id",
+        param_type: "uuid",
+        required: true,
+        description: "UUID of the record to fetch.",
+        resolution_mode: IdResolutionMode::UnscopedById,
+    }];
+
+    // Mirrors link's real source_id/target_id params (both `param_type:
+    // "uuid"`, `IdResolutionMode::UnscopedById`) — used to verify the shared
+    // id contract is appended to link's endpoint params too, matching the
+    // enumeration in `resolution_mode_contract`'s `UnscopedById` text.
+    static LINK_PARAMS: [ParamDef; 2] = [
+        ParamDef {
+            name: "source_id",
+            param_type: "uuid",
+            required: true,
+            description: "Source node UUID.",
+            resolution_mode: IdResolutionMode::UnscopedById,
+        },
+        ParamDef {
+            name: "target_id",
+            param_type: "uuid",
+            required: true,
+            description: "Target node UUID.",
+            resolution_mode: IdResolutionMode::UnscopedById,
+        },
+    ];
 
     struct HelpPack {
         invocations: Arc<AtomicUsize>,
@@ -9478,7 +12399,14 @@ mod help_tests {
                 description: "Create a typed directed edge",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
-                params: &[],
+                params: &LINK_PARAMS,
+            },
+            HandlerDef {
+                name: "get",
+                description: "Fetch a record by id",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &GET_PARAMS,
             },
         ];
     }
@@ -9593,6 +12521,103 @@ mod help_tests {
         assert!(identifier_help["parameter_rule"]
             .as_str()
             .is_some_and(|text| text.contains("submitted again")));
+    }
+
+    /// `describe_verb` appends `resolution_mode_contract(p.resolution_mode)`
+    /// to every uuid-typed parameter's description, so the full-UUID-vs-
+    /// short-prefix rule is stated once per mode (in
+    /// `resolution_mode_contract`) and inherited by every verb declaring
+    /// that mode, rather than requiring each `HandlerDef` to paste its own
+    /// explanation — or, worse, one blanket explanation getting appended to
+    /// parameters whose actual resolver behaves differently (see
+    /// `IdResolutionMode`'s doc comment: this is exactly the bug the mode
+    /// field replaced — a single shared string asserted namespace-agnostic
+    /// full-UUID acceptance on every uuid param, which was false for
+    /// primary-scoped and namespace-filtered resolvers).
+    /// This test covers `IdResolutionMode::UnscopedById`; the full mode
+    /// enumeration is exercised against real pack definitions by
+    /// `kkernel::pack_introspect::tests::
+    /// every_uuid_param_across_every_registered_pack_declares_a_resolution_mode`
+    /// and its `describe_verb_renders_mode_specific_contract_for_real_handlers`
+    /// companion (khive-runtime cannot depend on the pack crates itself
+    /// without a circular dependency).
+    ///
+    /// The namespace assertion below is deliberately specific. It first
+    /// asserted only `description.contains("namespace")`, which passes
+    /// identically whether the contract says prefix resolution *is* or *is
+    /// not* namespace-scoped — so it passed while the contract stated the
+    /// opposite of what the by-ID verbs do. A test that cannot separate the
+    /// two readings protects neither.
+    #[tokio::test]
+    async fn test_help_true_uuid_param_carries_shared_id_contract() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("get", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for a known verb");
+
+        let params = result["params"]
+            .as_array()
+            .expect("params must be a JSON array");
+        let id_param = params
+            .iter()
+            .find(|p| p["name"] == "id")
+            .expect("params array must include the 'id' parameter");
+        let description = id_param["description"]
+            .as_str()
+            .expect("description must be a string");
+
+        // The verb-specific text must still be present...
+        assert!(
+            description.contains("UUID of the record to fetch"),
+            "shared contract must be appended, not replace, the verb-specific text; got: {description}"
+        );
+        // ...and the shared contract must state the ACTUAL by-ID rule, in a
+        // form that separates it from its negation. Must-match and
+        // must-not-match together: either arm alone still admits a contract
+        // that merely mentions namespaces without committing to a rule.
+        assert!(
+            description.contains("no namespace filter"),
+            "id contract must state that by-ID prefix resolution applies NO namespace filter \
+             (ADR-007 Rev 6, `resolve_prefix_unfiltered`); got: {description}"
+        );
+        assert!(
+            !description.contains("namespace-scoped resolution"),
+            "id contract must not claim prefix resolution is namespace-scoped — get/update/\
+             delete/merge resolve prefixes unfiltered; got: {description}"
+        );
+        assert!(
+            description.to_ascii_lowercase().contains("prefix"),
+            "id contract must describe short-prefix semantics; got: {description}"
+        );
+
+        // `link`'s source_id/target_id are `param_type: "uuid"` too (they
+        // resolve through the same unfiltered path as get/update/delete/
+        // merge — see `crates/khive-pack-kg/src/handlers/link.rs`), so the
+        // contract's enumerated verb list must name `link` explicitly, not
+        // just the four record-level by-ID verbs.
+        let link_result = reg
+            .dispatch("link", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for link");
+        let link_params = link_result["params"]
+            .as_array()
+            .expect("link params must be a JSON array");
+        let source_id_param = link_params
+            .iter()
+            .find(|p| p["name"] == "source_id")
+            .expect("link params must include 'source_id'");
+        let source_id_description = source_id_param["description"]
+            .as_str()
+            .expect("description must be a string");
+        assert!(
+            source_id_description.contains("get/update/delete/merge/link"),
+            "id contract's by-ID verb enumeration must include 'link' alongside get/update/\
+             delete/merge, since link's source_id/target_id resolve through the same \
+             unfiltered path; got: {source_id_description}"
+        );
     }
 
     /// help=true on `recall` returns a schema envelope including the `query` param.
@@ -10194,21 +13219,7 @@ mod help_tests {
             writable.prepare_core_schema().expect("current schema");
         }
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let mut name = path.file_name().expect("db file name").to_os_string();
-                name.push(suffix);
-                let sidecar = path.parent().expect("db parent dir").join(name);
-                if sidecar.exists() {
-                    let mut permissions = std::fs::metadata(&sidecar)
-                        .expect("sidecar metadata")
-                        .permissions();
-                    permissions.set_mode(0o444);
-                    std::fs::set_permissions(&sidecar, permissions).expect("freeze sidecar");
-                }
-            }
-        }
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
         let backend = khive_db::StorageBackend::sqlite_read_only(&path).expect("read-only backend");
         let empty_map: HashMap<&str, &khive_db::StorageBackend> = HashMap::new();
 

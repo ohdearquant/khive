@@ -9,6 +9,8 @@
 //!
 //! - **DSL mode** (default): `kkernel exec '<dsl>'` — executes a single verb DSL
 //!   expression or batch against the configured database and namespace.
+//! - **Plan mode**: `kkernel exec --plan '<dsl>'` — parses through an already
+//!   running daemon and prints its plan without dispatch or local construction.
 //! - **Pending-events mode**: `kkernel exec --pending-events` — one-shot drain that
 //!   fires all due `scheduled_event` notes. Mutually exclusive with the positional
 //!   `ops` argument. Cron-friendly: run every minute for minute-granularity delivery.
@@ -61,6 +63,8 @@ use khive_runtime::KhiveRuntime;
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
 use khive_runtime::{KhiveConfig, Namespace, RuntimeConfig};
 use khive_types::RefusalReason;
+
+mod plan;
 
 /// Stable stderr prefix for machine-classifiable exec refusals.
 const REFUSAL_PREFIX: &str = "kkernel-refusal: ";
@@ -397,6 +401,21 @@ pub struct ExecArgs {
     /// Mutually exclusive with `--pending-events` and `--ops-file`.
     pub ops: Option<String>,
 
+    /// Check grammar and list stages without executing operations.
+    ///
+    /// Requires an already-running daemon with matching configuration. Prints
+    /// the plan as JSON; a grammar error is a successful `parsed=false` result.
+    #[arg(
+        long,
+        requires = "ops",
+        conflicts_with_all = [
+            "presentation", "strict", "output_format", "save_file", "ops_file",
+            "pending_events", "dry_run", "serial", "atomic", "atomic_max_ops",
+            "verbose", "actor", "expect_actor", "namespace"
+        ]
+    )]
+    pub plan: bool,
+
     /// One-shot drain: fire all `scheduled_event` notes whose `trigger_at <= now`.
     ///
     /// Scans all namespaces, dispatches each event's action in its own namespace,
@@ -447,7 +466,11 @@ pub struct ExecArgs {
     /// canonical shape — unlike the MCP `request` tool, which defaults to
     /// `Agent` for token efficiency. Pass `--presentation agent` to opt into
     /// the trimmed shape, or `--presentation human` for pretty terminal output.
-    #[arg(long, default_value = "verbose")]
+    #[arg(
+        long,
+        default_value = "verbose",
+        default_value_if("plan", "true", None)
+    )]
     pub presentation: Option<String>,
 
     /// Output format for verb results (ADR-078 §2 precedence: this flag >
@@ -1682,6 +1705,12 @@ where
 /// skipped entirely, and all ops are dispatched through the in-process runtime
 /// in chunks (see module-level docs).
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
+    if args.plan {
+        let result = plan::run(&args).await?;
+        writeln!(std::io::stdout().lock(), "{result}")?;
+        return Ok(());
+    }
+
     // Clap enforces these relations for normal CLI entry. Keep the same
     // boundary for library callers that construct `ExecArgs` directly.
     if args.serial && (args.ops_file.is_none() || args.ops.is_some() || args.atomic) {
@@ -1763,6 +1792,19 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             packs: None,
             brain_profile: None,
         })?;
+
+    // ADR-170 embedded mode: `kkernel exec`'s in-process fallback is a
+    // one-shot — a socket forwarder would be reaped at process exit before
+    // delivering, losing every event. The shared resolver already emits
+    // direct (socket-less) mode for exactly this class of host; only the
+    // resident daemon entrypoints upgrade to forwarding
+    // (`enable_events_forwarding_for_daemon`). SQLite's per-file
+    // cross-process exclusion covers direct appends overlapping a running
+    // events daemon.
+    debug_assert!(cfg
+        .events_split
+        .as_ref()
+        .is_none_or(|split| split.socket_path.is_none()));
 
     // Apply the explicit actor only AFTER the shared resolver has loaded the
     // project/config/environment fallbacks. This makes the CLI value the true
@@ -2090,6 +2132,12 @@ fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+fn disclose_resolved_actor(cfg: &RuntimeConfig) {
+    use std::io::Write;
+    let line = khive_mcp::serve::resolved_actor_disclosure(cfg.actor_id.as_deref());
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 #[derive(Default)]
 struct ExecDbContext {
     raw: Option<String>,
@@ -2238,6 +2286,7 @@ async fn run_exec_inline_with_forward(
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_actor(&cfg);
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
@@ -2272,6 +2321,7 @@ async fn run_exec_inline_with_forward(
                 compute_config_id(&cfg, Some(&khive_cfg))
             },
             protocol_version: PROTOCOL_VERSION,
+            plan: false,
             probe_only: false,
             metrics_only: false,
             format: output_format.clone(),
@@ -2355,6 +2405,7 @@ async fn run_exec_inline_with_forward(
     .await?;
 
     let params = RequestParams {
+        plan: None,
         ops,
         presentation,
         presentation_per_op: None,
@@ -2392,7 +2443,8 @@ async fn build_local_fallback_server(
     if khive_cfg.backends.is_empty() {
         let rt = build_single_backend_runtime(cfg, khive_cfg).await?;
         let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        Ok(KhiveMcpServer::new(rt)
+        Ok(KhiveMcpServer::new_with_mounts(rt)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_default_output_format(env_fmt))
     } else {
@@ -2533,6 +2585,7 @@ async fn run_exec_ops_file(
     }
 
     disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_actor(&cfg);
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -2870,25 +2923,65 @@ mod tests {
         }
     }
 
-    /// RAII guard restoring `KHIVE_PACKS`, `HOME`, and the working directory
-    /// to their pre-test values on every exit path, including an unwinding
-    /// panic — a bare cleanup call at the end of a test function only runs
-    /// when every earlier statement (setup and assertions alike) succeeds,
-    /// which leaks process-globals to later `#[serial]` tests otherwise.
+    const DAEMON_SPAWN_TEST_ENV_VARS: [&str; 7] = [
+        "KHIVE_EMBEDDING_MODEL",
+        "KHIVE_ADDITIONAL_EMBEDDING_MODELS",
+        "KHIVE_ACTOR",
+        "KHIVE_REQUIRE_ATTRIBUTED_ACTOR",
+        "KHIVE_DB",
+        "KHIVE_PACKS",
+        "HOME",
+    ];
+
     struct EnvAndCwdGuard {
-        original_packs: Option<std::ffi::OsString>,
-        original_home: Option<std::ffi::OsString>,
+        original_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         original_cwd: std::path::PathBuf,
+    }
+
+    impl EnvAndCwdGuard {
+        fn capture() -> Self {
+            Self {
+                original_env: DAEMON_SPAWN_TEST_ENV_VARS
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+                original_cwd: std::env::current_dir().expect("read cwd"),
+            }
+        }
     }
 
     impl Drop for EnvAndCwdGuard {
         fn drop(&mut self) {
-            match self.original_packs.take() {
-                Some(v) => std::env::set_var("KHIVE_PACKS", v),
-                None => std::env::remove_var("KHIVE_PACKS"),
+            for (name, original) in self.original_env.drain(..) {
+                match original {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
-            restore_home(self.original_home.take());
             let _ = std::env::set_current_dir(&self.original_cwd);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_spawn_env_guard_restores_every_mutated_variable() {
+        let _restore_machine_env = EnvAndCwdGuard::capture();
+        for name in DAEMON_SPAWN_TEST_ENV_VARS {
+            std::env::set_var(name, format!("sentinel-{name}"));
+        }
+
+        {
+            let _guard = EnvAndCwdGuard::capture();
+            for name in DAEMON_SPAWN_TEST_ENV_VARS {
+                std::env::remove_var(name);
+            }
+        }
+
+        for name in DAEMON_SPAWN_TEST_ENV_VARS {
+            assert_eq!(
+                std::env::var(name).as_deref(),
+                Ok(format!("sentinel-{name}").as_str())
+            );
         }
     }
 
@@ -3176,6 +3269,7 @@ mod tests {
             .unwrap();
         let raw = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="actor pin attribution")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -3827,6 +3921,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-main.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -3835,6 +3930,7 @@ id = "lambda:fallback"
                     path: Some(std::path::PathBuf::from("/tmp/khive-parity-sessions.db")),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -3844,6 +3940,7 @@ id = "lambda:fallback"
                     "session".to_string(),
                     PackConfig {
                         backend: "sessions".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -3939,6 +4036,7 @@ id = "lambda:fallback"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
                 BackendConfig {
@@ -3947,6 +4045,7 @@ id = "lambda:fallback"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    served_kinds: None,
                     read_only: false,
                 },
             ],
@@ -3956,6 +4055,7 @@ id = "lambda:fallback"
                     "comm".to_string(),
                     PackConfig {
                         backend: "secondary".to_string(),
+                        no_embed: false,
                     },
                 );
                 m
@@ -3992,6 +4092,7 @@ id = "lambda:fallback"
 
         let send = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary", self_send=true)"#
                     .to_string(),
                 presentation: None,
@@ -4024,6 +4125,7 @@ id = "lambda:fallback"
             let probe = KhiveMcpServer::new(rt).expect("server on backend file");
             let raw = probe
                 .dispatch_request_local(RequestParams {
+                    plan: None,
                     ops: r#"list(kind="message")"#.to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -4079,6 +4181,7 @@ id = "lambda:fallback"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                served_kinds: None,
                 read_only: false,
             }],
             ..KhiveConfig::default()
@@ -4118,6 +4221,7 @@ id = "lambda:fallback"
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
+            packs: RuntimeConfig::built_in_packs(),
             ..RuntimeConfig::default()
         };
         let khive_cfg = KhiveConfig::default();
@@ -4218,6 +4322,7 @@ id = "lambda:fallback"
 
             for i in 0..count {
                 let params = RequestParams {
+                    plan: None,
                     ops: format!(
                         r#"create(kind="observation", content="{writer_label} note {i} — boot race marker")"#
                     ),
@@ -4648,6 +4753,7 @@ id = "lambda:fallback"
 
         // Verify all 3 entities are present.
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4741,9 +4847,9 @@ id = "lambda:fallback"
             .as_array()
             .expect("failure rows")
             .iter()
-            .all(|failure| failure["error"]
+            .all(|failure| failure["error"]["message"]
                 .as_str()
-                .unwrap_or_default()
+                .expect("error.message is text")
                 .contains("sql_bridge.reader_open")));
 
         let (serial_server, _, serial_max) = concurrency_probe_server(true);
@@ -5118,6 +5224,7 @@ id = "lambda:fallback"
         let db_path = db_file.path().to_str().expect("utf8").to_string();
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: serde_json::json!({
                 "tool": "stats",
                 "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
@@ -5278,6 +5385,7 @@ id = "lambda:fallback"
         // it describes. The stable list contract wraps rows in `items` whether or
         // not the requested limit reaches the entity cap.
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept", limit=200)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5364,6 +5472,7 @@ id = "lambda:fallback"
             .contains("absent or an existing regular file"));
 
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5624,6 +5733,7 @@ id = "lambda:fallback"
 
         async fn dispatch(server: &KhiveMcpServer, ops: &str) -> serde_json::Value {
             let params = RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -5767,6 +5877,7 @@ id = "lambda:fallback"
         // Verify nothing was written by checking with a fresh server.
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6758,6 +6869,7 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn env_khive_packs_reaches_daemon_spawn_seam() {
+        let _guard = EnvAndCwdGuard::capture();
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -6790,8 +6902,6 @@ path = "{}"
         )
         .await;
 
-        std::env::remove_var("KHIVE_PACKS");
-
         assert!(
             result.is_ok(),
             "forwarded dispatch must succeed: {result:?}"
@@ -6818,10 +6928,6 @@ path = "{}"
     #[tokio::test]
     #[serial]
     async fn no_env_control_forwards_built_in_default_packs_to_spawn_seam() {
-        let original_cwd = std::env::current_dir().expect("read cwd");
-        let original_packs = std::env::var_os("KHIVE_PACKS");
-        let original_home = std::env::var_os("HOME");
-
         // Declared first so it drops LAST (reverse declaration order):
         // constructing the guard here, before either tempdir is created and
         // before any process-global mutation, means every panic from this
@@ -6832,11 +6938,7 @@ path = "{}"
         // `empty_project_root` is removed while it is still the process cwd
         // (verified empirically below: `TempDir::drop` tolerates removing the
         // current working directory on macOS and ignores its own errors).
-        let _guard = EnvAndCwdGuard {
-            original_packs,
-            original_home,
-            original_cwd,
-        };
+        let _guard = EnvAndCwdGuard::capture();
 
         // Isolate both HOME and cwd: with `db: None` config discovery falls
         // through to tier-2 (`<cwd>/khive.toml`) then tier-4
@@ -7488,6 +7590,7 @@ backend = "sessions"
         // Because parse failed, no dispatch happened → DB is clean.
         let server = isolated_server(&db_path);
         let params = RequestParams {
+            plan: None,
             ops: r#"list(kind="concept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7524,6 +7627,7 @@ backend = "sessions"
         // need the real id back out so it can feed straight into `update`/
         // `delete`/`link` args.
         let params = RequestParams {
+            plan: None,
             ops: ops.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
