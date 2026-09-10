@@ -754,6 +754,17 @@ what the earlier "the value found" left open for a field that is not there. `exp
 names is the deadline the entry pinned, and the caller needs it beside `now` to see the window it
 lost. Acceptance arm 3 reads `value_type` and asserts `value` is absent.
 
+Traversal (2026-09-10, same correction): the path is split on `.` and each segment is read as an
+object key, left to right; anything else resolves to nothing and refuses `live_until_unreadable`
+with `value_type: "absent"`. So a segment applied to an array, a number or a string resolves to
+nothing (there is no positional indexing and a numeric segment is an object key, not an index); an
+empty segment, which a leading, trailing or doubled `.` produces, is read as the empty key and so
+resolves to nothing in any document that does not hold one; a document whose root is not an object
+resolves to nothing; and a key containing a literal `.` is unreachable, because the separator is not
+escapable. Every one of these is a refusal, never a pass, so an
+unresolvable path can only ever cost the caller a batch, and two implementations reading the same
+document and the same path agree.
+
 No predicate on the field's meaning is added. khive compares one timestamp with one clock; whether the
 field is a lease expiry, a handle deadline or anything else is the caller's convention, as the fence
 key's convention is (§2 alternatives, "the layer that owns the convention passes the fence").

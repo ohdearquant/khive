@@ -177,6 +177,53 @@ async fn expiry_arm4_dotted_path_and_offset_instants() {
 }
 
 #[tokio::test]
+async fn expiry_arm4b_paths_that_cannot_resolve_refuse_and_never_pass() {
+    let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    // One document with a nested deadline, an array holding one, and a flat string, so every
+    // refusing path below is refusing against a document that DOES carry a readable timestamp
+    // somewhere: the refusal is the traversal's doing, not a missing value.
+    let doc = json!({"lease": {"expires_at": future}, "list": [future], "flat": future});
+    for path in [
+        "list.0",            // a segment applied to an array is a key, not an index
+        "flat.expires_at",   // a segment applied to a string
+        "",                  // the empty key
+        ".expires_at",       // leading separator
+        "lease.expires_at.", // trailing separator
+        "lease..expires_at", // doubled separator
+        "lease.expires_at.deeper",
+        "missing.expires_at",
+    ] {
+        let (rt, registry) = expiry_surface();
+        document(&registry, "lease", doc.clone(), None).await;
+        let error = refused_unchanged(
+            &rt,
+            &registry,
+            publication(json!([observation("lease", 1, Some(path))])),
+            "live_until_unreadable",
+            "lease",
+        )
+        .await;
+        assert_eq!(error["details"]["value_type"], "absent", "path {path}");
+        assert_eq!(error["details"]["field"], path);
+    }
+
+    // Control: the one path that resolves commits, so the arm above is not passing because
+    // every live_until refuses.
+    let (_, registry) = expiry_surface();
+    document(&registry, "lease", doc, None).await;
+    assert_eq!(
+        registry
+            .dispatch(
+                "stream.batch",
+                publication(json!([observation("lease", 1, Some("lease.expires_at"))]))
+            )
+            .await
+            .unwrap()["committed"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn expiry_arm5_null_version_refused_before_members() {
     let (rt, registry) = expiry_surface();
     let counts = population(&rt).await;
