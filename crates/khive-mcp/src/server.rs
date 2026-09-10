@@ -468,6 +468,7 @@ fn search_diagnostic_value(degradation: &SearchDegradation) -> Value {
     });
     if let Some(participation) = degradation.arm_participation {
         value["arm_participation"] = search_arm_participation_value(participation);
+    }
     if let Some(retry_after_ms) = degradation.retry_after_ms {
         value["retry_after_ms"] = json!(retry_after_ms);
     }
@@ -7941,10 +7942,13 @@ mod tests {
                 .into_iter()
                 .map(
                     |(backend_id, error)| crate::coordinator::BackendSearchResult {
-                        backend_id: khive_runtime::BackendId::new(backend_id),
+                        backend_id: khive_runtime::BackendId::parse(backend_id)
+                            .expect("valid backend id"),
                         entity_hits: Vec::new(),
                         note_hits: Vec::new(),
+                        vector_selected: false,
                         error: Some(error),
+                        vector_error: None,
                     },
                 )
                 .collect(),
@@ -7953,6 +7957,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         }
     }
@@ -7964,7 +7969,7 @@ mod tests {
             BackendSearchFailure::timeout("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(true));
         assert_eq!(diagnostic["retry_after_ms"], json!(2_000));
@@ -7989,7 +7994,7 @@ mod tests {
             BackendSearchFailure::backend("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -8012,7 +8017,7 @@ mod tests {
             ),
         ]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result));
+        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -8040,7 +8045,7 @@ mod tests {
             "zzzz-hidden-backend".to_string(),
             BackendSearchFailure::backend("storage unavailable"),
         ));
-        let degradation = SearchDegradation::from_result(&degraded_search_result(failures));
+        let degradation = SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -8062,7 +8067,7 @@ mod tests {
                 BackendSearchFailure::timeout("backend search timed out after 5000ms"),
             )
         });
-        let degradation = SearchDegradation::from_result(&degraded_search_result(failures));
+        let degradation = SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
