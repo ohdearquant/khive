@@ -1647,3 +1647,84 @@ never runs a corpus-sized `COUNT`. Malformed/missing structure data degrades
 to `fts_segments_error`. `db_diagnostics.fts_maintenance` exposes the bounded
 maintenance counters. This adds derived-index writes only; it changes no
 logical records, migrations, recall ordering, or WAL escalation policy.
+
+### 2026-09-08 amendment (Amendment 17): stream-append write scope
+
+**What this adds.** Amendment 11's audit table is normative and exhaustive, and its review guard
+requires any new `SqlAccess::atomic_unit` caller to be entered in it. The stream ledger introduced
+with the `note_streams` migration adds one such caller, `KhiveRuntime::stream_append` in
+`crates/khive-runtime/src/streams.rs`. This amendment records its audit row rather than editing
+Amendment 11 in place, so the inventory grows by append and the earlier text stays readable as
+what was true when it was written.
+
+| Transaction owner                   | Production scopes/callers         | Work inside the transaction                                                                                                                                                                                   | Verdict  |
+| ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::stream_append` | One head `SELECT COALESCE(MAX(seq), 0)`, a checked integer increment, a comparison against the caller's expected sequence, the note plan's prepared statements with their row guards, and one ledger `INSERT` | SQL-only |
+
+**Why the row holds.** Everything the append needs is materialized before the transaction opens:
+the record is serialized, and the note plan, with its content, index and vector statements, is
+produced by the shared note preparation path. The closure's only awaited value is the writer it
+is handed. It performs no filesystem, process or network work, calls into no other subsystem, and
+computes no embedding. The statement loop is bounded by the prepared plan for a single note. The
+sequence precondition is evaluated inside the same transaction that installs the row, which is the
+point of putting it there: a precondition checked outside the writer would be advisory.
+
+**Conflict is a return, not an error path.** A failed expected-sequence comparison returns a
+conflict outcome from the closure and lets the transaction end normally, so a losing conditional
+append does not roll back through the error path or hold the writer while a caller decides what to
+do. The refusal is reported after the transaction closes.
+
+**Metadata compare-and-set keeps its existing owner.** The stream work also updates record
+metadata through a single prepared statement under the transaction owners already inventoried in
+Amendment 11. That path adds no new scope and needs no row of its own; it is named here only so a
+reader auditing the stream surface does not go looking for a missing entry.
+
+**Basis, stated plainly.** This row was established by reading the caller through its commit edge.
+The first-poll enforcement arm and the fault-injection arms for this caller have not been executed;
+they run with the stream work's own gate. The row is entered under the same review guard it
+documents, and the guard's requirement is that the entry exists and the body respects the
+invariant, which is what was checked.
+
+### 2026-09-10 amendment (Amendment 18): stream-batch write scope, and its one open bound
+
+**What this adds.** Amendment 17 entered the single-append caller. The batch surface that landed
+after it adds a second caller under the same owner, `run_prepared_stream_batch` in
+`crates/khive-runtime/src/streams.rs`, and Amendment 11's review guard requires its own row. This
+amendment records it, again by appending rather than editing either earlier table.
+
+| Transaction owner                   | Production scopes/callers                     | Work inside the transaction                                                                                                                                                                                                                                                                                                           | Verdict                                                    |
+| ----------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::run_prepared_stream_batch` | At most one `SELECT khive_now_micros()`, taken only when an observation carries a deadline; the batch fence check; one paired `SELECT id, version` per observed entry; then per member either a prepared note plan with its row guards and one ledger `INSERT`, or a keyed write's prepared plan and one `SELECT version, updated_at` | SQL-only; hold size unbounded by member count (issue 2543) |
+
+**Why the row holds.** Every member arrives as a prepared action: the note is serialized and its
+plan produced by the shared preparation path before the transaction opens, so the closure binds
+and executes statements and folds bounded results. It performs no filesystem, process or network
+work, calls into no other subsystem, computes no embedding, and awaits nothing but the writer it
+is handed. The stream head is read at most once per distinct stream in the batch and memoized for
+the rest of it. A refusal, whether from the fence, an observation, a sequence comparison or a
+member's own row guard, returns from the closure and rolls the transaction back through the normal
+path.
+
+**Why the predicates are inside.** The fence and the observation set are preconditions for the
+whole batch, so they are evaluated in the same transaction that installs the writes; checked
+outside the writer they would be advisory, which is the same reason Amendment 17 gives for the
+single append's sequence comparison. The deadline comparison reads the writer's own clock through
+SQLite rather than the process clock, so one transaction has one time.
+
+**The per-member mode is bounded by construction.** `stream_batch_per_member` runs the same
+closure with a one-element member list, once per member, so each writer hold covers exactly one
+member and admits no fence or observation set.
+
+**The open bound, stated rather than implied.** In atomic mode the statement count inside the
+writer hold grows with the number of members and observations the caller sends. The verb refuses
+an empty list, and it does not cap a large one: the only ceiling today is the daemon's 8 MiB frame,
+which is a transport limit rather than a decision about writer hold time, and it admits a member
+count on the order of a hundred thousand. Every comparable path in this document names its own
+number instead: web manifest ingest at 10,000 entities and 50,000 edges, blob GC at 128 rows per
+unit. This row is entered with that gap named, not resolved; the verb-level cap is a change to the
+stream contract and belongs to that contract's own amendment, not to this inventory.
+
+**Basis.** Read at `crates/khive-runtime/src/streams.rs` through the closure's commit and refusal
+edges and through both member kinds, and at `crates/khive-pack-kg/src/handlers/stream.rs` for what
+the verb admits. The frame constant is `crates/khive-runtime/src/daemon.rs`. No new arms were run
+for this row; the stream suites that cover these paths ran with the work that introduced them.
