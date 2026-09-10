@@ -1000,3 +1000,75 @@ acceptance 2.
     With `observed` admitted in per-member mode, arm 10's second half goes red, which is the arm that
     proves the second filter site is unreachable rather than merely unused. Each run quoted with its
     exit code.
+
+## Amendment 7 (2026-09-10): the batch admits a bounded list
+
+### The gap
+
+`stream.batch` refuses an empty `ops` list and says why: an empty list takes the writer for a batch
+that writes nothing. It does not refuse a large one.
+
+In atomic mode the whole list executes inside one `BEGIN IMMEDIATE`. Each observation is a paired
+`SELECT id, version`, each append member is a prepared note plan plus a ledger `INSERT`, and each
+write member is a prepared plan plus a `SELECT version, updated_at`. The statement count inside a
+single writer hold is therefore whatever the caller sent. The only ceiling today is the daemon's
+8 MiB frame, which is a transport limit rather than a decision about hold time, and for a minimal
+append member it admits a member count on the order of a hundred thousand. SQLite admits one
+writer, so one such call extends every competing writer's wait.
+
+Every comparable admission in the store names its own number: web manifest ingest at 10,000
+entities and 50,000 edges, blob GC at 128 rows per unit, both recorded in ADR-091 Amendment 11.
+That amendment's inventory now carries the batch caller as Amendment 18, entered with this gap
+named and deliberately unresolved, because the number is a change to this verb's contract and
+belongs here.
+
+This is not the per-namespace or per-stream quota that §6 puts out of scope. It is an admission
+bound on one request's list, and the record size limit is still the note's.
+
+### A7.1 The numbers
+
+`stream.batch` admits at most **1000 members** in `ops` and at most **100 entries** in `observed`.
+A list over either bound refuses with `invalid_input` before anything is prepared, and the refusal
+names both the cap and the count that was sent, so a caller learns how far over it is without
+bisecting.
+
+The member bound is the one that governs writer hold time. The observation bound is smaller because
+each observation is a read the batch performs while holding the writer purely to decide whether to
+proceed, and a precondition list that long is a sign the caller wants a query rather than a
+precondition.
+
+### A7.2 The bound is on the list, in both modes
+
+The cap applies to the list the caller sends, not to the transaction, so it holds in both batch
+modes. Per-member mode already runs one member per transaction and its hold is bounded by
+construction; it is capped anyway, so one input is refused the same way whatever the mode and a
+caller moving between modes does not discover a new limit at the boundary. `observed` requires
+atomic mode, so its cap has one mode by construction.
+
+### A7.3 Where the refusal sits
+
+The cap is checked at admission, before any member is parsed into an action, before any note plan
+is prepared, and before a writer is requested. A cap enforced after preparation would still bound
+the hold, but it would pay for the work first, and the refusal exists precisely to avoid paying.
+
+### Acceptance
+
+1. **At the cap.** 1000 members commit, and 1000 members with 100 observations commit. This is the
+   arm that keeps the bound from silently drifting below its stated number.
+2. **Over the cap.** 1001 members refuse `invalid_input`, and the message names 1001 and 1000.
+   Nothing is written: the stream head is unchanged, which is the control that the refusal preceded
+   the writer rather than rolling back after it.
+3. **Observations over the cap.** 101 observations refuse `invalid_input` naming 101 and 100, with
+   a member list well inside its own bound so the two caps are told apart.
+4. **Per-member mode.** 1001 members refuse the same way, with no partial results returned and the
+   store unchanged, so the mode that could have absorbed the list still refuses it.
+5. **Refusal precedes preparation.** With a list over the cap whose members would each be refused
+   for their own reasons, the error is the cap and not a member's, proving the check runs before
+   members are interpreted.
+6. **Help.** `stream.batch(help=true)` names both caps and their refusal.
+7. **Mutation.** With the member cap raised above the count arm 2 sends, arm 2 goes red. With the
+   check moved after member preparation, arm 5 goes red. Each run quoted with its exit code.
+
+The implementing change publishes the measured writer hold time at the cap beside the hold at the
+largest member count the 8 MiB frame admits, so the number this amendment fixes is defended by a
+measurement rather than by an argument.
