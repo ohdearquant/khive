@@ -519,3 +519,49 @@ async fn observed_id_arm10_disclosure_uses_observation_key_and_existing_policy()
         }
     }
 }
+
+#[tokio::test]
+async fn observed_id_arm6_identity_then_version_then_deadline() {
+    for (replaced, asserted_version, expired, expected) in [
+        (false, 2, false, None),
+        (true, 2, true, Some("identity_conflict")),
+        (false, 1, true, Some("version_conflict")),
+        (false, 2, true, Some("expired")),
+    ] {
+        let (rt, reg) = surface();
+        lease(&reg, "target").await;
+        let original = lease(&reg, "lease").await;
+        let current = if replaced {
+            reg.dispatch("delete", json!({"id":original["id"]}))
+                .await
+                .unwrap();
+            lease(&reg, "lease").await
+        } else {
+            original.clone()
+        };
+        let deadline = if expired {
+            "2000-01-01T00:00:00Z"
+        } else {
+            "2999-01-01T00:00:00Z"
+        };
+        reg.dispatch("update", json!({"id":current["id"],"expected_version":1,"content":json!({"lease":{"expires_at":deadline}}).to_string()})).await.unwrap();
+        let mut observed = observation("lease", json!(asserted_version), Some(&original["id"]));
+        observed["live_until"] = json!("lease.expires_at");
+        let args = publication(json!([observed]));
+        if let Some(expected) = expected {
+            let before = snapshot(&rt, &reg).await;
+            let error = reason(
+                reg.dispatch("stream.batch", args).await.unwrap_err(),
+                expected,
+            );
+            assert_eq!(error["details"]["key"], "lease");
+            if expected == "identity_conflict" {
+                assert_eq!(error["details"]["current_id"], current["id"]);
+                assert!(error["details"].get("field").is_none());
+            }
+            assert_eq!(snapshot(&rt, &reg).await, before);
+        } else {
+            assert_committed(&reg, args).await;
+        }
+    }
+}

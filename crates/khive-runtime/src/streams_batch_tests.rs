@@ -1601,3 +1601,84 @@ async fn observed_id_arm1_trace_one_row_read_inside_transaction_before_members()
 
 #[path = "streams_expiry_tests.rs"]
 mod expiry_tests;
+
+#[tokio::test]
+async fn observed_id_arm6_trace_replacement_precedes_deadline_read() {
+    let (runtime, token, registry) = fixture();
+    for (replaced, version, key, expected) in [
+        (true, 1, "expired", Some("identity_conflict")),
+        (false, 2, "expired", Some("version_conflict")),
+        (false, 1, "expired", Some("expired")),
+        (false, 1, "live", None),
+    ] {
+        let prepared = runtime
+            .prepare_stream_batch(&token, vec![append("identity-expiry", None)], &registry)
+            .await
+            .unwrap();
+        let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
+        let result = run_prepared_stream_batch(
+            &trace,
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![StreamObservation {
+                key: key.into(),
+                kind: "head".into(),
+                version: Some(version),
+                id: Some(if replaced {
+                    Uuid::new_v4()
+                } else {
+                    Uuid::nil()
+                }),
+                live_until: Some("expires_at".into()),
+            }],
+        )
+        .await;
+        let statements = trace.0.lock().unwrap();
+        let identities: Vec<_> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.label.as_deref() == Some("stream-batch-observed"))
+            .map(|(i, _)| i)
+            .collect();
+        let deadlines: Vec<_> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.label.as_deref() == Some("stream-batch-live-until"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(identities.len(), 1);
+        if replaced || version != 1 {
+            assert!(
+                deadlines.is_empty(),
+                "identity and version must refuse before reading replacement content"
+            );
+        } else {
+            assert_eq!(deadlines.len(), 1);
+            assert!(identities[0] < deadlines[0]);
+        }
+        assert_eq!(statements[0].sql, "BEGIN");
+        if expected.is_some() {
+            assert!(!statements.iter().any(|s| s.sql.starts_with("INSERT")));
+            assert_eq!(statements.last().unwrap().sql, "ROLLBACK");
+        } else {
+            assert!(
+                deadlines[0]
+                    < statements
+                        .iter()
+                        .position(|s| s.sql.starts_with("INSERT"))
+                        .unwrap()
+            );
+            assert_eq!(statements.last().unwrap().sql, "COMMIT");
+        }
+        drop(statements);
+        if let Some(expected) = expected {
+            let Err(RuntimeError::Khive(error)) = result else {
+                panic!("expected structured refusal: {result:?}")
+            };
+            assert_eq!(error.details().unwrap().get("reason"), Some(expected));
+        } else {
+            assert!(result.unwrap().is_ok());
+        }
+    }
+}
