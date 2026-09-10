@@ -684,6 +684,8 @@ acceptance 2.
 
 **Status**: Proposed.
 
+**Implementation (2026-09-10):** `live_until` checks share one SQL clock reading inside the atomic writer transaction; write results return the stored `updated_at` before commit.
+
 ### The gap
 
 Amendment 4 lets a caller pin what it read: an `observed` entry with a version holds only while the

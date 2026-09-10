@@ -1498,3 +1498,6 @@ mod fence_batches;
 
 #[path = "stream_mixed_fence_tests.rs"]
 mod mixed_fences;
+
+#[path = "stream_expiry_tests.rs"]
+mod expiry_tests;

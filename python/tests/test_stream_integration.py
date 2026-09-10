@@ -165,7 +165,7 @@ def test_stream_batch_two_processes_per_member_increase_and_interleave(scratch_d
 
 
 def _without_per_call_fields(result):
-    return [{k: v for k, v in member.items() if k not in {"seq", "id", "created_at"}} for member in result["results"]]
+    return [{k: v for k, v in member.items() if k not in {"seq", "id", "created_at", "updated_at"}} for member in result["results"]]
 
 
 def test_stream_batch_python_cli_same_result_and_error_objects(scratch_daemon):
