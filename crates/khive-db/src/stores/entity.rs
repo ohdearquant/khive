@@ -576,7 +576,13 @@ fn build_entity_where(
                 format!("?{}", params.len())
             })
             .collect();
-        conditions.push(format!("entity_type IN ({})", placeholders.join(", ")));
+        let type_expr = if filter.legacy_entity_type_fallback {
+            "COALESCE(entity_type, CASE WHEN json_type(properties, '$.type') = 'text' \
+             THEN json_extract(properties, '$.type') END)"
+        } else {
+            "entity_type"
+        };
+        conditions.push(format!("{type_expr} IN ({})", placeholders.join(", ")));
     }
 
     if let Some(ref prefix) = filter.name_prefix {

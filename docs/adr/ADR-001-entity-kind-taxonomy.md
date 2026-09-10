@@ -102,6 +102,20 @@ pub struct Entity {
 
 `entity_type` replaces raw `properties.type` as the canonical subtype field.
 
+#### Entity-list compatibility (2026-09-10)
+
+For `list` entity-type filtering only, a non-null `entity_type` is authoritative.
+When that column is null, a string-valued `properties.type` is compared instead.
+Missing, null, and non-string property values do not supply a fallback type. The
+legacy value is compared exactly, without write-time alias normalization.
+
+This read-side rule applies before counts and pagination, including tagged and
+cursor listings. It neither migrates stored rows nor synthesizes `entity_type`
+in returned records: a matched legacy row still returns `entity_type: null`.
+Clearing an explicit column therefore makes any retained legacy string eligible
+again. Search, endpoint validation, and other exact-column filter consumers do
+not opt into this listing compatibility rule.
+
 #### Registry contract
 
 The `EntityTypeRegistry` governs which `entity_type` values are valid for each `EntityKind`:

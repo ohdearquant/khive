@@ -295,7 +295,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "entity_type",
                 param_type: "string",
                 required: false,
-                description: "Filter by entity type field when kind=\"entity\" (e.g. \"paper\", \"algorithm\", \"tool\").",
+                description: "Filter entities by entity_type (e.g. \"paper\", \"algorithm\", \"tool\"); only when that column is null, match a string properties.type instead. A non-null column takes precedence. Filtering happens before pagination and does not change returned fields or stored rows.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

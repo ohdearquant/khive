@@ -263,6 +263,12 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 
 List records with optional filtering.
 
+For entity `entity_type` filtering, the non-null column takes precedence. Only
+when it is null does `list` compare a string-valued `properties.type`, before
+pagination. Returned fields and stored rows are unchanged; a matched legacy row
+can still return `entity_type: null`. This fallback is specific to `list`, not
+`search`.
+
 | Param                        | Type                     | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |

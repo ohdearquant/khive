@@ -379,6 +379,7 @@ impl KgPack {
                                 .as_deref()
                                 .map(|t| vec![t.to_string()])
                                 .unwrap_or_default(),
+                            legacy_entity_type_fallback: true,
                             tags_any: tag_list.clone(),
                             namespaces: token
                                 .visible_namespace_strs()
