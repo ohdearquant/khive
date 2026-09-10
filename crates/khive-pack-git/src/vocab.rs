@@ -77,12 +77,15 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 12] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 15] = [
+    crate::local_vocab::INIT,
     crate::local_vocab::CHECKOUT,
     crate::local_vocab::DIFF,
     crate::local_vocab::RECEIPTS,
     crate::local_vocab::GATES,
     crate::local_vocab::RECONCILE,
+    crate::local_vocab::STATUS,
+    crate::local_vocab::LOG,
     HandlerDef {
         name: "git.digest",
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \

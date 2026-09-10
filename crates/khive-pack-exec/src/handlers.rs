@@ -80,6 +80,168 @@ pub async fn tree_store(rt: &KhiveRuntime, params: Value) -> Result<Value, Runti
     Ok(json!({ "tree": tree_ref }))
 }
 
+/// One validated edit, held until every sibling has validated too. Content bytes are carried
+fn edit_mode(edit: &Value, index: usize) -> Result<Option<u64>, RuntimeError> {
+    match edit.get("mode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let mode = value.as_u64().ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("edits[{index}].mode must be an integer"))
+            })?;
+            // Modes here are the decimal 644 and 755 the manifest stores, not octal literals.
+            if mode != 644 && mode != 755 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}].mode must be 644 or 755, got {mode}"
+                )));
+            }
+            Ok(Some(mode))
+        }
+    }
+}
+
+/// Apply a list of edits to a tree and return the new tree. The tree is an immutable manifest
+/// blob, so this mints a new one and never mutates the input; a single-path edit is a list of one.
+///
+/// The atomicity promised is a property of the RESULT: one call yields exactly one new tree
+/// reference or none, and a refusal on any entry leaves the blob store with no new object from
+/// the call, including objects for entries that were fine. That is why content bytes are hashed
+/// rather than written during validation. `digest_hex` is the same BLAKE3 the blob store keys on,
+/// so a content edit's reference is known before the byte is stored, the whole candidate manifest
+/// is validated through `tree::parse_entries`, and only a manifest that will parse causes a write.
+pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
+    let tree_ref = req_str(&params, "tree")?;
+    let edits = params
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput("edits is required and must be an array".into())
+        })?;
+    // An empty list refuses rather than returning the input tree. An empty edit is almost always
+    // a caller bug, and handing back the input would make a no-op look like work, which is the
+    // same failure shape as silently accepting a delete of a path the tree does not hold.
+    if edits.is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "edits is empty; an empty edit list is refused rather than returning the input tree"
+                .into(),
+        ));
+    }
+    let base = tree::load(rt, &tree_ref).await?;
+    let mut entries: BTreeMap<String, (String, u64)> = base
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                (entry.content_ref.clone(), u64::from(entry.mode)),
+            )
+        })
+        .collect();
+
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut supplied_refs: Vec<String> = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        if !edit.is_object() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edits[{index}] must be an object"
+            )));
+        }
+        let path = edit.get("path").and_then(Value::as_str).ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("edits[{index}].path is required"))
+        })?;
+        let path = tree::validate_relative_path(path, &format!("edits[{index}]"))?;
+        // Duplicates refuse rather than last-one-wins: these lists are built by generated code and
+        // by models, both of which produce duplicates, and last-one-wins makes the caller's second
+        // intent vanish where nothing downstream can see that it happened.
+        if let Some(first) = seen.get(&path) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edits[{first}] and edits[{index}] both name path {path:?}; duplicate paths are refused"
+            )));
+        }
+        seen.insert(path.clone(), index);
+
+        let deleting = matches!(edit.get("delete"), Some(Value::Bool(true)));
+        let reference = opt_str(edit, "ref")?;
+        let content = opt_str(edit, "content")?;
+        let named = usize::from(deleting)
+            + usize::from(reference.is_some())
+            + usize::from(content.is_some());
+        if named != 1 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edits[{index}] names {named} of ref, content and delete; exactly one is required"
+            )));
+        }
+        if deleting {
+            if edit.get("mode").is_some_and(|mode| !mode.is_null()) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}] is a delete and cannot carry a mode"
+                )));
+            }
+            // A delete of a path the tree does not hold refuses rather than succeeding quietly,
+            // because a silent no-op is how a caller comes to believe it removed something.
+            if entries.remove(&path).is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}] deletes path {path:?}, which the tree does not hold"
+                )));
+            }
+            continue;
+        }
+        let mode = edit_mode(edit, index)?
+            .or_else(|| entries.get(&path).map(|(_, mode)| *mode))
+            .unwrap_or(644);
+        let content_ref = match (reference, content) {
+            (Some(reference), None) => {
+                ContentRef::from_hex(&reference).map_err(|e| {
+                    RuntimeError::InvalidInput(format!("edits[{index}].ref {reference:?}: {e}"))
+                })?;
+                supplied_refs.push(reference.clone());
+                reference
+            }
+            (None, Some(content)) => {
+                let bytes = content.into_bytes();
+                let computed = digest_hex(&bytes);
+                pending.push((computed.clone(), bytes));
+                computed
+            }
+            _ => unreachable!("the exactly-one check above admits only these two shapes"),
+        };
+        entries.insert(path, (content_ref, mode));
+    }
+
+    // Validate the whole candidate manifest through the pack's one entry validator, which is what
+    // enforces the file-versus-directory rule this verb could otherwise violate by construction.
+    let candidate = Value::Array(
+        entries
+            .iter()
+            .map(|(path, (content_ref, mode))| json!({"path": path, "ref": content_ref, "mode": mode}))
+            .collect(),
+    );
+    let next = tree::parse_entries(&candidate)?;
+    // A caller-supplied ref that names no object refuses here, still before any write.
+    let referenced: Vec<TreeEntry> = next
+        .iter()
+        .filter(|entry| supplied_refs.contains(&entry.content_ref))
+        .cloned()
+        .collect();
+    tree::verify_blobs(rt, &referenced).await?;
+
+    // Validation is complete, so from here every write is one the whole call has earned.
+    let blobs = tree::blob_store(rt)?;
+    for (expected, bytes) in pending {
+        let stored = blobs.put(bytes).await?;
+        debug_assert_eq!(
+            stored.as_str(),
+            expected,
+            "blob store keys on a different digest"
+        );
+    }
+    let next_ref = tree::store(rt, &next).await?;
+    let changed: Vec<Value> = tree::diff(&base, &next)
+        .iter()
+        .map(Change::to_json)
+        .collect();
+    Ok(json!({ "tree": next_ref, "base": tree_ref, "entries": next.len(), "changed": changed }))
+}
+
 pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let tree_ref = req_str(&params, "tree")?;
     let entries = tree::load(rt, &tree_ref).await?;

@@ -393,5 +393,78 @@
       "expected_head"
     ],
     "additionalProperties": false
+  },
+  "git.status": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "untracked": {
+        "type": "string",
+        "enum": [
+          "no",
+          "normal",
+          "all"
+        ]
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5000
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "additionalProperties": false
+  },
+  "git.log": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "ref": {
+        "type": "string",
+        "minLength": 1
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500
+      },
+      "path": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "additionalProperties": false
+  },
+  "git.init": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "branch": {
+        "type": "string",
+        "minLength": 1
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "additionalProperties": false
   }
 }

@@ -1706,18 +1706,20 @@ impl VerbRegistry {
         // agent
         ("agent", "agent.observe"),
         // exec (reads of the blob store, the run receipt and event tables, or
-        // the resolved configuration; the writers are exec.tree, a Declaration,
-        // and exec.run, a Directive)
+        // the resolved configuration; the writers are exec.tree and
+        // exec.tree_put, Declarations, and exec.run, a Directive)
         ("exec", "exec.tree_get"),
         ("exec", "exec.tree_diff"),
         ("exec", "exec.receipt"),
         ("exec", "exec.runs"),
         ("exec", "exec.events"),
         ("exec", "exec.identity"),
-        // git (receipt list and allowlist reads; checkout, diff and reconcile
-        // persist receipts and are excluded)
+        // git (receipt list, allowlist, working-tree and history reads;
+        // checkout, diff and reconcile persist receipts and are excluded)
         ("git", "git.receipts"),
         ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
         // blob
         ("blob", "blob.get"),
         ("blob", "blob.stat"),
