@@ -3,19 +3,30 @@
 //! rows. A batch is that transaction over several members (atomic mode) or one
 //! such transaction per member, in list order (per-member mode).
 use std::any::Any;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use khive_storage::{
-    AtomicUnitOp, Note, SqlRow, SqlStatement, SqlValue, StorageCapability, StorageError,
+    AtomicUnitOp, Note, SqlAccess, SqlRow, SqlStatement, SqlValue, SqlWriter, StorageCapability,
+    StorageError,
 };
 use khive_types::{Details, KhiveError};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
-use crate::atomic_plan::PlanStatement;
-use crate::atomic_runner::AtomicOpPlan;
-use crate::note_write::{NoteFences, NoteWriteConflict, NoteWriteGuard};
+use crate::atomic_plan::{PlanStatement, PostCommitEffect};
+use crate::atomic_runner::{
+    apply_plan, atomic_unit_error_allows_recorded_refusal, AtomicOpFailure, AtomicOpPlan,
+    CommittedPostCommitEffects,
+};
+use crate::note_write::{
+    NoteFence, NoteFences, NoteWriteConflict, NoteWriteGuard, NoteWriteOptions,
+};
 use crate::{
     micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
+    VerbRegistry,
 };
 
 fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
@@ -72,15 +83,35 @@ pub struct StreamAppendSpec {
     pub fence: Option<NoteFences>,
 }
 
-/// A batch member as the verb layer resolved it: an append to run, or the
-/// refusal the member already earned (an op naming no member operation, a
-/// member kind this server does not carry). The mode places the refusal.
+/// A keyed document write. Kinds are canonical note-kind names. A missing
+/// expected version creates only; a positive version updates only.
+#[derive(Clone, Debug)]
+pub struct StreamWriteSpec {
+    pub key: String,
+    pub kind: String,
+    pub doc: Value,
+    pub tags: Option<Vec<String>>,
+    pub embed: Option<bool>,
+    pub expected_version: Option<i64>,
+}
+
+/// An exact live-key observation; `None` asserts that the key is unheld.
+#[derive(Clone, Debug)]
+pub struct StreamObservation {
+    pub key: String,
+    pub kind: String,
+    pub version: Option<i64>,
+}
+
+/// A batch member or its already established refusal. The mode places it.
 pub enum StreamBatchMember {
     Append(StreamAppendSpec),
+    Write(StreamWriteSpec),
     Refused(KhiveError),
 }
 
 /// The member refusal that stopped an atomic batch; nothing was written.
+#[derive(Debug)]
 pub struct StreamBatchRefusal {
     pub member: usize,
     pub error: KhiveError,
@@ -124,14 +155,309 @@ fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
 
 enum BatchOutcome {
     Appended(Vec<i64>),
-    Conflict {
-        member: usize,
-        next: i64,
+    Conflict { next: i64 },
+    FenceConflict { conflict: NoteWriteConflict },
+}
+
+struct PreparedBatchMember {
+    index: usize,
+    action: PreparedBatchAction,
+}
+
+enum PreparedBatchAction {
+    Append {
+        stream: String,
+        expected_seq: Option<i64>,
+        note: Box<Note>,
+        plan: AtomicOpPlan,
+        fence: Option<NoteFences>,
     },
-    FenceConflict {
-        member: usize,
-        conflict: NoteWriteConflict,
+    Write {
+        key: String,
+        kind: String,
+        id: Uuid,
+        version: i64,
+        plan: AtomicOpPlan,
+        after_create: Option<Value>,
     },
+    Refused(KhiveError),
+}
+
+#[derive(Deserialize)]
+struct StreamCreateFields {
+    content: String,
+    name: Option<String>,
+    properties: Option<Value>,
+    tags: Option<Vec<String>>,
+    salience: Option<f64>,
+    embed: Option<bool>,
+}
+
+fn batch_create_hooks(members: &[PreparedBatchMember]) -> Vec<(Uuid, String, Value)> {
+    members
+        .iter()
+        .filter_map(|member| match &member.action {
+            PreparedBatchAction::Write {
+                id,
+                kind,
+                after_create: Some(args),
+                ..
+            } => Some((*id, kind.clone(), args.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn place_member(error: KhiveError, member: Option<usize>) -> RuntimeResult<KhiveError> {
+    let pairs = member
+        .into_iter()
+        .map(|member| ("member".to_owned(), member.to_string()))
+        .chain(
+            error
+                .details()
+                .into_iter()
+                .flat_map(Details::iter)
+                .filter(|(key, _)| *key != "member")
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+    let details = Details::deserialize(serde::de::value::MapDeserializer::<
+        _,
+        serde::de::value::Error,
+    >::new(pairs))
+    .map_err(|error| RuntimeError::Internal(format!("stream member details: {error}")))?;
+    Ok(error.with_details(details))
+}
+
+fn missing_write(key: &str) -> KhiveError {
+    KhiveError::not_found("note key", key).with_details(Details::new_owned([
+        ("reason", "stream_write_not_found".into()),
+        ("key", key.into()),
+    ]))
+}
+
+async fn check_observed(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    observed: &[StreamObservation],
+) -> Result<Option<KhiveError>, StorageError> {
+    for (index, entry) in observed.iter().enumerate() {
+        let current = writer.query_scalar(SqlStatement {
+            sql: "SELECT version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
+            params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
+            label: Some("stream-batch-observed".into()),
+        }).await?;
+        let current = match current {
+            None => None,
+            Some(SqlValue::Integer(version)) => Some(version),
+            Some(_) => {
+                return Err(StorageError::Internal(
+                    "invalid observed note version".into(),
+                ))
+            }
+        };
+        if current != entry.version {
+            let mut details = vec![
+                ("reason", "version_conflict".into()),
+                ("key", entry.key.clone()),
+                ("index", index.to_string()),
+            ];
+            if let Some(expected) = entry.version {
+                details.push(("expected_version", expected.to_string()));
+            }
+            if let Some(current) = current {
+                details.push(("current_version", current.to_string()));
+            }
+            return Ok(Some(
+                KhiveError::conflict("stream observation precondition failed")
+                    .with_details(Details::new_owned(details)),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+struct BatchFailure {
+    member: Option<usize>,
+    error: RuntimeError,
+}
+
+async fn run_prepared_stream_batch(
+    access: &dyn SqlAccess,
+    namespace: String,
+    members: Vec<PreparedBatchMember>,
+    fence: Option<NoteFence>,
+    observed: Vec<StreamObservation>,
+) -> RuntimeResult<Result<(Vec<Value>, CommittedPostCommitEffects), StreamBatchRefusal>> {
+    let failure = Arc::new(Mutex::new(None::<BatchFailure>));
+    let recorded = Arc::clone(&failure);
+    let op: AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let guard = NoteWriteGuard {
+                namespace: namespace.clone(),
+                target_id: Uuid::nil(),
+                expected_version: None,
+                fence: fence.map(Into::into),
+                create_key: None,
+            };
+            let predicate_error = if let Some(conflict) = guard.check_fence(writer).await? {
+                Some(conflict.into_error())
+            } else {
+                check_observed(writer, &namespace, &observed).await?
+            };
+            if let Some(error) = predicate_error {
+                *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
+                    member: None,
+                    error: error.into(),
+                });
+                return Err(StorageError::Internal(
+                    "stream batch predicate refused".into(),
+                ));
+            }
+            let mut results = Vec::with_capacity(members.len());
+            let mut effects = Vec::new();
+            // Member fences observe the transaction's initial state, even when
+            // an earlier keyed write changes a fenced note in this batch.
+            for member in &members {
+                if let PreparedBatchAction::Append { fence, .. } = &member.action {
+                    let guard = NoteWriteGuard {
+                        namespace: namespace.clone(),
+                        target_id: Uuid::nil(),
+                        expected_version: None,
+                        fence: fence.clone(),
+                        create_key: None,
+                    };
+                    if let Some(conflict) = guard.check_fence(writer).await? {
+                        *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
+                            member: Some(member.index),
+                            error: conflict.into_error().into(),
+                        });
+                        return Err(StorageError::Internal("stream append fence refused".into()));
+                    }
+                }
+            }
+            for member in members {
+                let result = apply_stream_member(writer, &namespace, member.action).await;
+                match result {
+                    Ok((value, effect)) => {
+                        results.push(value);
+                        if let Some(effect) = effect {
+                            effects.push(effect);
+                        }
+                    }
+                    Err(error) => {
+                        *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
+                            member: Some(member.index),
+                            error,
+                        });
+                        return Err(StorageError::Internal("stream batch member refused".into()));
+                    }
+                }
+            }
+            Ok(Box::new((results, effects)) as Box<dyn Any + Send>)
+        })
+    });
+    match access.atomic_unit(op).await {
+        Ok(payload) => {
+            let (results, effects) = *payload
+                .downcast::<(Vec<Value>, Vec<PostCommitEffect>)>()
+                .map_err(|_| RuntimeError::Internal("invalid stream batch outcome".into()))?;
+            Ok(Ok((results, CommittedPostCommitEffects::new(effects))))
+        }
+        Err(error) => {
+            if !atomic_unit_error_allows_recorded_refusal(&error) {
+                return Err(error.into());
+            }
+            let recorded = failure.lock().expect("stream failure slot").take();
+            match recorded {
+                Some(BatchFailure {
+                    member: Some(member),
+                    error: RuntimeError::Khive(error),
+                }) => Ok(Err(StreamBatchRefusal {
+                    member,
+                    error: place_member(error, Some(member))?,
+                })),
+                Some(BatchFailure { error, .. }) => Err(error),
+                None => Err(error.into()),
+            }
+        }
+    }
+}
+
+async fn apply_stream_member(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    action: PreparedBatchAction,
+) -> RuntimeResult<(Value, Option<PostCommitEffect>)> {
+    match action {
+        PreparedBatchAction::Refused(error) => Err(error.into()),
+        PreparedBatchAction::Append {
+            stream,
+            expected_seq,
+            note,
+            plan,
+            ..
+        } => {
+            let head = writer.query_scalar(statement(
+                "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
+                vec![SqlValue::Text(namespace.into()), SqlValue::Text(stream.clone())],
+            )).await?;
+            let Some(SqlValue::Integer(head)) = head else {
+                return Err(RuntimeError::Internal("invalid stream head".into()));
+            };
+            let next = head
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::InvalidInput("stream sequence exhausted".into()))?;
+            if let Some(expected) = expected_seq.filter(|expected| *expected != next) {
+                return Err(seq_conflict(&stream, expected, next, None).into());
+            }
+            let applied = apply_plan(writer, &plan, false).await.map_err(|error| {
+                RuntimeError::Internal(format!("stream append plan failed: {error:?}"))
+            })?;
+            writer
+                .execute(statement(
+                    "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
+                    vec![
+                        SqlValue::Text(namespace.into()),
+                        SqlValue::Text(stream),
+                        SqlValue::Integer(next),
+                        SqlValue::Text(note.id.to_string()),
+                    ],
+                ))
+                .await?;
+            Ok((
+                json!({"seq": next, "id": note.id, "created_at": micros_to_iso(note.created_at)}),
+                applied.effect,
+            ))
+        }
+        PreparedBatchAction::Write {
+            key,
+            kind,
+            id,
+            version,
+            plan,
+            ..
+        } => match apply_plan(writer, &plan, true).await {
+            Ok(applied) => Ok((
+                json!({"id": id, "version": applied.note_version.unwrap_or(version)}),
+                applied.effect,
+            )),
+            Err(AtomicOpFailure::NoteConflict(conflict)) => Err(conflict.into_error().into()),
+            Err(AtomicOpFailure::GuardFailed { .. }) => {
+                let holder = writer.query_scalar(statement(
+                        "SELECT id FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
+                        vec![SqlValue::Text(namespace.into()), SqlValue::Text(kind), SqlValue::Text(key.clone())],
+                    )).await?;
+                if holder.is_none() {
+                    Err(missing_write(&key).into())
+                } else {
+                    Err(crate::curation::stale_note_snapshot_error(id))
+                }
+            }
+            Err(error) => Err(RuntimeError::Internal(format!(
+                "stream write plan failed: {error:?}"
+            ))),
+        },
+    }
 }
 
 impl KhiveRuntime {
@@ -234,9 +560,9 @@ impl KhiveRuntime {
                     heads.push((stream.clone(), head));
                 }
                 let mut assigned = Vec::with_capacity(entries.len());
-                for (member, (stream, expected_seq, _, _, guard)) in entries.iter().enumerate() {
+                for (stream, expected_seq, _, _, guard) in &entries {
                     if let Some(conflict) = guard.check_fence(writer).await? {
-                        return Ok(Box::new(BatchOutcome::FenceConflict { member, conflict })
+                        return Ok(Box::new(BatchOutcome::FenceConflict { conflict })
                             as Box<dyn Any + Send>);
                     }
                     let head = heads
@@ -248,8 +574,7 @@ impl KhiveRuntime {
                         .checked_add(1)
                         .ok_or_else(|| write_failure("stream sequence exhausted"))?;
                     if expected_seq.is_some_and(|expected| expected != next) {
-                        return Ok(Box::new(BatchOutcome::Conflict { member, next })
-                            as Box<dyn Any + Send>);
+                        return Ok(Box::new(BatchOutcome::Conflict { next }) as Box<dyn Any + Send>);
                     }
                     *head = next;
                     assigned.push(next);
@@ -314,8 +639,8 @@ impl KhiveRuntime {
         let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
         match self.run_stream_appends(token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
-            BatchOutcome::FenceConflict { conflict, .. } => Err(conflict.into_error().into()),
-            BatchOutcome::Conflict { next, .. } => Err(seq_conflict(
+            BatchOutcome::FenceConflict { conflict } => Err(conflict.into_error().into()),
+            BatchOutcome::Conflict { next } => Err(seq_conflict(
                 stream,
                 expected_seq.expect("only conditional appends conflict"),
                 next,
@@ -325,56 +650,316 @@ impl KhiveRuntime {
         }
     }
 
-    /// One writer transaction over every member. Shape and content are
-    /// validated for every member before anything is written; a refused member
-    /// (its own refusal or a sequence conflict) refuses the whole batch with
-    /// nothing written, and success means every member committed.
+    fn validate_stream_batch(&self, members: &[StreamBatchMember]) -> RuntimeResult<()> {
+        if members.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "stream.batch requires at least one member".into(),
+            ));
+        }
+        let mut keys = HashSet::new();
+        for member in members {
+            match member {
+                StreamBatchMember::Append(spec) => {
+                    validate_stream(&spec.stream)?;
+                    self.validate_note_kind(&spec.note_kind)?;
+                    if let Some(fences) = &spec.fence {
+                        fences.validate()?;
+                        for fence in fences.entries() {
+                            self.validate_note_kind(&fence.kind)?;
+                        }
+                    }
+                    crate::secret_gate::check(
+                        &serde_json::to_string(&spec.record)
+                            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
+                    )?;
+                }
+                StreamBatchMember::Write(spec) => {
+                    self.validate_note_kind(&spec.kind)?;
+                    NoteWriteOptions {
+                        key: Some(spec.key.clone()),
+                        expected_version: spec.expected_version,
+                        embed: spec.embed,
+                        fence: None,
+                    }
+                    .validate()?;
+                    if spec.kind == "scheduled_event" {
+                        return Err(RuntimeError::InvalidInput(
+                            "scheduled_event notes are not writable through stream.batch; use schedule verbs".into(),
+                        ));
+                    }
+                    if !keys.insert((&spec.kind, &spec.key)) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "stream.batch repeats write key {:?} for kind {:?}",
+                            spec.key, spec.kind,
+                        )));
+                    }
+                    crate::secret_gate::check(
+                        &serde_json::to_string(&spec.doc)
+                            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
+                    )?;
+                    if let Some(tags) = &spec.tags {
+                        crate::secret_gate::check_json(&json!({"tags": tags}))?;
+                    }
+                }
+                StreamBatchMember::Refused(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepare_stream_write(
+        &self,
+        token: &NamespaceToken,
+        spec: StreamWriteSpec,
+        registry: &VerbRegistry,
+    ) -> RuntimeResult<PreparedBatchAction> {
+        let content = serde_json::to_string(&spec.doc)
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        if let Some(expected) = spec.expected_version {
+            let snapshot = match self
+                .get_note_by_key(token, &spec.key, Some(&spec.kind), false)
+                .await
+            {
+                Ok(note) => note,
+                Err(RuntimeError::Khive(error))
+                    if error.kind() == khive_types::ErrorKind::NotFound =>
+                {
+                    return Ok(PreparedBatchAction::Refused(missing_write(&spec.key)));
+                }
+                Err(error) => return Err(error),
+            };
+            let id = snapshot.id;
+            let version = snapshot
+                .version
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::InvalidInput("note version exhausted".into()))?;
+            let mut args = json!({
+                "id": id, "kind": "note", "note_kind": spec.kind,
+                "content": content, "expected_version": expected,
+                "namespace": token.namespace().as_str(),
+            });
+            if let Some(tags) = spec.tags {
+                args["properties"] = json!({"tags": tags});
+            }
+            if let Some(embed) = spec.embed {
+                args["embed"] = json!(embed);
+            }
+            registry
+                .prepare_note_update_hook(self, token, &snapshot, &mut args)
+                .await?;
+            let plan = crate::atomic_prepare::prepare_update_from_note_snapshot(
+                self, token, &args, None, snapshot,
+            )
+            .await?;
+            return Ok(PreparedBatchAction::Write {
+                key: spec.key,
+                kind: spec.kind,
+                id,
+                version,
+                plan,
+                after_create: None,
+            });
+        }
+        let mut args = json!({
+            "kind": "note", "note_kind": spec.kind, "key": spec.key,
+            "content": content, "namespace": token.namespace().as_str(),
+        });
+        if let Some(tags) = spec.tags {
+            args["tags"] = json!(tags);
+        }
+        if let Some(embed) = spec.embed {
+            args["embed"] = json!(embed);
+        }
+        if let Some(hook) = registry.find_kind_hook(&spec.kind) {
+            hook.prepare_create(self, &mut args).await?;
+        }
+        let mut fields: StreamCreateFields = serde_json::from_value(args.clone())
+            .map_err(|error| RuntimeError::InvalidInput(format!("stream write fields: {error}")))?;
+        if let Some(tags) = fields.tags.filter(|tags| !tags.is_empty()) {
+            let mut properties = match fields.properties.take() {
+                None => serde_json::Map::new(),
+                Some(Value::Object(properties)) => properties,
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(
+                        "note tags require object properties".into(),
+                    ))
+                }
+            };
+            properties.insert("tags".into(), json!(tags));
+            fields.properties = Some(Value::Object(properties));
+        }
+        let mut candidate = Note::new(token.namespace().as_str(), &spec.kind, &fields.content);
+        candidate.name = fields.name.clone();
+        candidate.properties = fields.properties.clone();
+        crate::note_write::validate_head(&candidate)?;
+        let (mut prepared, _) = crate::note_create::prepare_note_create(
+            self,
+            AtomicNoteSpec {
+                token,
+                id: None,
+                kind: &spec.kind,
+                name: fields.name.as_deref(),
+                content: &fields.content,
+                properties: fields.properties,
+            },
+            AtomicNoteOptions {
+                salience: fields.salience,
+                key: Some(&spec.key),
+                embed: Some(fields.embed.unwrap_or(spec.kind != "head")),
+                ..Default::default()
+            },
+            &[],
+            crate::note_create::KeyPublication::AtInsert,
+        )
+        .await?;
+        let note = prepared.notes.remove(0);
+        let mut plan = prepared.plans.remove(0);
+        let AtomicOpPlan::AddNote(add) = &mut plan else {
+            return Err(RuntimeError::Internal(
+                "stream keyed create did not prepare a note".into(),
+            ));
+        };
+        add.post_commit = PostCommitEffect::NoteChanged {
+            note_id: note.id,
+            kind: note.kind.clone(),
+        };
+        Ok(PreparedBatchAction::Write {
+            key: spec.key,
+            kind: spec.kind,
+            id: note.id,
+            version: note.version,
+            plan,
+            after_create: Some(args),
+        })
+    }
+
+    async fn prepare_stream_batch(
+        &self,
+        token: &NamespaceToken,
+        members: Vec<StreamBatchMember>,
+        registry: &VerbRegistry,
+    ) -> RuntimeResult<Vec<PreparedBatchMember>> {
+        let appends: Vec<_> = members
+            .iter()
+            .filter_map(|member| match member {
+                StreamBatchMember::Append(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        let contents: Vec<_> = appends
+            .iter()
+            .map(|spec| serde_json::to_string(&spec.record))
+            .collect::<Result<_, _>>()
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let append_specs = appends
+            .iter()
+            .zip(&contents)
+            .map(|(spec, content)| AtomicNoteSpec {
+                token,
+                id: None,
+                kind: &spec.note_kind,
+                name: None,
+                content,
+                properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
+            })
+            .collect();
+        let notes = prepare_atomic_notes(self, append_specs, AtomicNoteOptions::default()).await?;
+        let mut append_plans = notes.notes.into_iter().zip(notes.plans);
+        let mut prepared = Vec::with_capacity(members.len());
+        for (index, member) in members.into_iter().enumerate() {
+            let action = match member {
+                StreamBatchMember::Refused(error) => PreparedBatchAction::Refused(error),
+                StreamBatchMember::Write(spec) => {
+                    match self.prepare_stream_write(token, spec, registry).await {
+                        Ok(action) => action,
+                        Err(RuntimeError::Khive(error))
+                            if error.kind() == khive_types::ErrorKind::Conflict =>
+                        {
+                            PreparedBatchAction::Refused(error)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                StreamBatchMember::Append(spec) => {
+                    let (note, plan) = append_plans.next().expect("one plan per append");
+                    PreparedBatchAction::Append {
+                        stream: spec.stream,
+                        expected_seq: spec.expected_seq,
+                        note: Box::new(note),
+                        plan,
+                        fence: spec.fence,
+                    }
+                }
+            };
+            prepared.push(PreparedBatchMember { index, action });
+        }
+        Ok(prepared)
+    }
+
+    async fn stream_batch_after_create(
+        &self,
+        registry: &VerbRegistry,
+        hooks: Vec<(Uuid, String, Value)>,
+    ) {
+        for (id, kind, args) in hooks {
+            if let Some(hook) = registry.find_kind_hook(&kind) {
+                if let Err(error) = hook.after_create(self, id, &args).await {
+                    tracing::warn!(%id, %kind, %error, "stream batch after_create failed after commit");
+                }
+            }
+        }
+    }
+
+    /// All members share one transaction. Batch predicates precede member DML;
+    /// effects become executable only after the complete unit commits.
     pub async fn stream_batch_atomic(
         &self,
         token: &NamespaceToken,
         members: Vec<StreamBatchMember>,
+        fence: Option<NoteFence>,
+        observed: Vec<StreamObservation>,
+        registry: &VerbRegistry,
     ) -> RuntimeResult<Result<Vec<Value>, StreamBatchRefusal>> {
-        // A member's refusal refuses the whole batch, so it is read before
-        // anything is prepared: preparation embeds every member and creates
-        // each model's vector table, which is work for a write this batch is
-        // no longer going to make.
+        self.validate_stream_batch(&members)?;
+        if let Some(fence) = &fence {
+            fence.validate()?;
+            self.validate_note_kind(&fence.kind)?;
+        }
+        for entry in &observed {
+            crate::keyed_memory::validate_memory_key(&entry.key)?;
+            self.validate_note_kind(&entry.kind)?;
+            if entry.version.is_some_and(|version| version < 1) {
+                return Err(RuntimeError::InvalidInput(
+                    "observed version must be positive or null".into(),
+                ));
+            }
+        }
         for (member, item) in members.iter().enumerate() {
             if let StreamBatchMember::Refused(error) = item {
                 return Ok(Err(StreamBatchRefusal {
                     member,
-                    error: error.clone(),
+                    error: place_member(error.clone(), Some(member))?,
                 }));
             }
         }
-        let specs: Vec<&StreamAppendSpec> = members
-            .iter()
-            .filter_map(|member| match member {
-                StreamBatchMember::Append(spec) => Some(spec),
-                StreamBatchMember::Refused(_) => None,
-            })
-            .collect();
-        let prepared = self.prepare_stream_appends(token, &specs).await?;
-        match self.run_stream_appends(token, &prepared).await? {
-            BatchOutcome::Appended(seqs) => Ok(Ok(prepared
-                .iter()
-                .zip(seqs)
-                .map(|(append, seq)| append_result(append, seq))
-                .collect())),
-            BatchOutcome::FenceConflict { member, conflict } => Ok(Err(StreamBatchRefusal {
-                member,
-                error: conflict.into_error_at_member(Some(member)),
-            })),
-            BatchOutcome::Conflict { member, next } => Ok(Err(StreamBatchRefusal {
-                member,
-                error: seq_conflict(
-                    &prepared[member].stream,
-                    prepared[member]
-                        .expected_seq
-                        .expect("only conditional appends conflict"),
-                    next,
-                    Some(member),
-                ),
-            })),
+        let prepared = self.prepare_stream_batch(token, members, registry).await?;
+        let hooks = batch_create_hooks(&prepared);
+        match run_prepared_stream_batch(
+            self.sql().as_ref(),
+            token.namespace().as_str().into(),
+            prepared,
+            fence,
+            observed,
+        )
+        .await?
+        {
+            Ok((results, effects)) => {
+                crate::atomic_prepare::apply_post_commit_effects_with_report(self, token, effects)
+                    .await?;
+                self.stream_batch_after_create(registry, hooks).await;
+                Ok(Ok(results))
+            }
+            Err(refusal) => Ok(Err(refusal)),
         }
     }
 
@@ -386,48 +971,35 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         members: Vec<StreamBatchMember>,
+        registry: &VerbRegistry,
     ) -> RuntimeResult<Vec<Value>> {
-        let specs: Vec<&StreamAppendSpec> = members
-            .iter()
-            .filter_map(|member| match member {
-                StreamBatchMember::Append(spec) => Some(spec),
-                StreamBatchMember::Refused(_) => None,
-            })
-            .collect();
-        let mut prepared = self
-            .prepare_stream_appends(token, &specs)
-            .await?
-            .into_iter();
+        self.validate_stream_batch(&members)?;
         let mut results = Vec::with_capacity(members.len());
-        for member in &members {
-            match member {
-                StreamBatchMember::Refused(error) => results.push(refusal_value(error)?),
-                StreamBatchMember::Append(_) => {
-                    let append = prepared
-                        .next()
-                        .ok_or_else(|| RuntimeError::Internal("prepared append missing".into()))?;
-                    match self
-                        .run_stream_appends(token, std::slice::from_ref(&append))
-                        .await?
-                    {
-                        BatchOutcome::Appended(seqs) => {
-                            results.push(append_result(&append, seqs[0]))
-                        }
-                        BatchOutcome::FenceConflict { conflict, .. } => {
-                            results.push(refusal_value(&conflict.into_error())?)
-                        }
-                        BatchOutcome::Conflict { next, .. } => {
-                            results.push(refusal_value(&seq_conflict(
-                                &append.stream,
-                                append
-                                    .expected_seq
-                                    .expect("only conditional appends conflict"),
-                                next,
-                                None,
-                            ))?)
-                        }
-                    }
+        let prepared = self.prepare_stream_batch(token, members, registry).await?;
+        for member in prepared {
+            if let PreparedBatchAction::Refused(error) = &member.action {
+                results.push(refusal_value(&place_member(error.clone(), None)?)?);
+                continue;
+            }
+            let hooks = batch_create_hooks(std::slice::from_ref(&member));
+            match run_prepared_stream_batch(
+                self.sql().as_ref(),
+                token.namespace().as_str().into(),
+                vec![member],
+                None,
+                vec![],
+            )
+            .await?
+            {
+                Ok((mut values, effects)) => {
+                    crate::atomic_prepare::apply_post_commit_effects_with_report(
+                        self, token, effects,
+                    )
+                    .await?;
+                    self.stream_batch_after_create(registry, hooks).await;
+                    results.append(&mut values);
                 }
+                Err(refusal) => results.push(refusal_value(&place_member(refusal.error, None)?)?),
             }
         }
         Ok(results)
@@ -518,6 +1090,10 @@ impl KhiveRuntime {
         .transpose()
     }
 }
+
+#[cfg(test)]
+#[path = "streams_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {

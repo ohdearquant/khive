@@ -177,13 +177,16 @@ def test_stream_batch_python_cli_same_result_and_error_objects(scratch_daemon):
     env["KHIVE_SOCKET"] = str(scratch_daemon["socket"])
     env["KHIVE_PID"] = str(scratch_daemon["root"] / "khived.pid")
     env.pop("KHIVE_NO_DAEMON", None)
-    for args in [
-        {"ops": [{"op": "append", "stream": stream, "record": None}, {"op": "nope"}, {"op": "write", "key": "h", "kind": "head", "doc": {}}]},
-        {"ops": [{"op": "append", "stream": stream, "record": None, "expected_seq": 99}], "atomic": True},
-        {"ops": [{"op": "append", "stream": stream, "record": None}], "fence": {"key": "k", "kind": "head", "expected_version": 1}},
+    # Each side gets its own keyed-write key: a write member creates the key on
+    # its first run, so replaying one string on both transports would compare a
+    # creation against a key conflict instead of two equal creations.
+    for make_args in [
+        lambda: {"ops": [{"op": "append", "stream": stream, "record": None}, {"op": "nope"}, {"op": "write", "key": f"h-{uuid.uuid4()}", "kind": "head", "doc": {}}]},
+        lambda: {"ops": [{"op": "append", "stream": stream, "record": None, "expected_seq": 99}], "atomic": True},
+        lambda: {"ops": [{"op": "append", "stream": stream, "record": None}], "fence": {"key": "k", "kind": "head", "expected_version": 1}},
     ]:
-        ops = encode([op("stream.batch", **args)])
-        expected = client.request(ops)[0]
+        expected = client.request(encode([op("stream.batch", **make_args())]))[0]
+        ops = encode([op("stream.batch", **make_args())])
         proc = subprocess.run([binary, "exec", ops, "--config", str(scratch_daemon["root"] / "khive.toml"), "--db", str(scratch_daemon["root"] / "scratch.db"), "--presentation", "verbose", "--output-format", "json"], env=env, cwd=scratch_daemon["root"], capture_output=True, text=True, timeout=60)
         actual = json.loads(proc.stdout)["results"][0]
         assert actual["ok"] == expected["ok"], (actual, expected, proc.stderr)

@@ -1,10 +1,13 @@
 //! Thin adapters: the runtime owns stream semantics on every transport.
 use khive_runtime::{
-    NamespaceToken, RuntimeError, StreamAppendSpec, StreamBatchMember, VerbRegistry,
+    note_write::{NoteFence, NoteWriteOptions},
+    NamespaceToken, RuntimeError, StreamAppendSpec, StreamBatchMember, StreamObservation,
+    StreamWriteSpec, VerbRegistry,
 };
 use khive_types::{Details, KhiveError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use super::common::{canonical_note_kind, deser};
 use crate::KgPack;
@@ -70,10 +73,101 @@ struct AppendMember {
     fence: Option<khive_runtime::note_write::NoteFences>,
 }
 
-/// The keyed-note surface a fence, an observation set and the write member
-/// need; named in every refusal until it lands on this server.
-const MISSING_KEYED_SURFACE: &str =
-    "requires versioned keyed notes (expected_version), which this server does not carry yet";
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteMember {
+    #[serde(rename = "op")]
+    _op: String,
+    key: String,
+    kind: String,
+    doc: Value,
+    tags: Option<Vec<String>>,
+    embed: Option<bool>,
+    expected_version: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedMember {
+    key: String,
+    kind: String,
+    version: Option<i64>,
+}
+
+fn batch_fence(value: Value, registry: &VerbRegistry) -> Result<NoteFence, RuntimeError> {
+    if value.is_array() {
+        return Err(RuntimeError::InvalidInput(
+            "stream.batch fence requires one object; list-valued fences are a later surface".into(),
+        ));
+    }
+    let mut fence: NoteFence = deser(value)?;
+    fence.kind = canonical_note_kind(&fence.kind, registry)?;
+    fence.validate()?;
+    Ok(fence)
+}
+
+fn batch_observed(
+    value: Value,
+    registry: &VerbRegistry,
+) -> Result<Vec<StreamObservation>, RuntimeError> {
+    let entries: Vec<Value> = deser(value)?;
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if entry.get("version").is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch observed entry {index} requires version (positive integer or null)"
+                )));
+            }
+            let entry: ObservedMember = deser(entry)?;
+            NoteWriteOptions {
+                key: Some(entry.key.clone()),
+                expected_version: entry.version,
+                ..Default::default()
+            }
+            .validate()?;
+            Ok(StreamObservation {
+                key: entry.key,
+                kind: canonical_note_kind(&entry.kind, registry)?,
+                version: entry.version,
+            })
+        })
+        .collect()
+}
+
+fn batch_key_error(
+    error: RuntimeError,
+    writes: &[Option<(String, String)>],
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+) -> RuntimeError {
+    let RuntimeError::Khive(error) = error else {
+        return error;
+    };
+    let Some(details) = error.details() else {
+        return error.into();
+    };
+    if details.get("reason") != Some("key_conflict") {
+        return error.into();
+    }
+    let member = details.get("member");
+    let write = member
+        .and_then(|index| index.parse::<usize>().ok())
+        .and_then(|index| writes.get(index))
+        .and_then(Option::as_ref);
+    if write.is_some_and(|(kind, key)| registry.allows_note_key_disclosure(token, kind, key)) {
+        return error.into();
+    }
+    let mut pairs = vec![("reason", "key_conflict".into())];
+    if let Some(key) = details.get("key") {
+        pairs.push(("key", key.to_string()));
+    }
+    if let Some(member) = member {
+        pairs.push(("member", member.to_string()));
+    }
+    error.with_details(Details::new_owned(pairs)).into()
+}
 
 /// A member's own refusal: the ADR-172 error shape with its discriminator and,
 /// in atomic mode, the list index of the member that earned it.
@@ -167,16 +261,13 @@ impl KgPack {
                     .into(),
             ));
         }
-        if fence.is_some() {
-            return Err(RuntimeError::InvalidInput(format!(
-                "stream.batch fence {MISSING_KEYED_SURFACE}"
-            )));
-        }
-        if observed.is_some() {
-            return Err(RuntimeError::InvalidInput(format!(
-                "stream.batch observed {MISSING_KEYED_SURFACE}"
-            )));
-        }
+        let fence = fence
+            .map(|value| batch_fence(value, registry))
+            .transpose()?;
+        let observed = observed
+            .map(|value| batch_observed(value, registry))
+            .transpose()?
+            .unwrap_or_default();
         if p.ops.is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "stream.batch requires at least one member: an empty ops list takes the writer for a batch that writes nothing".into(),
@@ -184,6 +275,8 @@ impl KgPack {
         }
         let note_kind = canonical_note_kind("observation", registry)?;
         let mut members = Vec::with_capacity(p.ops.len());
+        let mut writes = Vec::with_capacity(p.ops.len());
+        let mut write_keys = HashSet::new();
         for (index, member) in p.ops.into_iter().enumerate() {
             let Some(op) = member.get("op").and_then(Value::as_str) else {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -191,6 +284,7 @@ impl KgPack {
                 )));
             };
             let placed = atomic.then_some(index);
+            writes.push(None);
             members.push(match op {
                 "append" => {
                     if member.get("record").is_none() {
@@ -210,16 +304,45 @@ impl KgPack {
                         fence: m.fence,
                     })
                 }
-                "write" => member_refusal(
-                    KhiveError::invalid_input(format!(
-                        "stream.batch write member {MISSING_KEYED_SURFACE}"
-                    )),
-                    vec![
-                        ("reason", "member_unavailable".into()),
-                        ("op", "write".into()),
-                    ],
-                    placed,
-                ),
+                "write" => {
+                    if member.get("doc").is_none() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "stream.batch member {index} requires doc (any JSON value, including null)"
+                        )));
+                    }
+                    let m: WriteMember = deser(member).map_err(|error| {
+                        RuntimeError::InvalidInput(format!("stream.batch member {index}: {error}"))
+                    })?;
+                    let kind = canonical_note_kind(&m.kind, registry)?;
+                    if kind == "scheduled_event" {
+                        return Err(RuntimeError::InvalidInput(
+                            "scheduled_event writes require schedule verbs".into(),
+                        ));
+                    }
+                    NoteWriteOptions {
+                        key: Some(m.key.clone()),
+                        expected_version: m.expected_version,
+                        embed: m.embed,
+                        ..Default::default()
+                    }
+                    .validate()?;
+                    let identity = (kind.clone(), m.key.clone());
+                    if !write_keys.insert(identity.clone()) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "stream.batch repeats write target ({kind}, {}) at member {index}",
+                            m.key
+                        )));
+                    }
+                    writes[index] = Some(identity);
+                    StreamBatchMember::Write(StreamWriteSpec {
+                        key: m.key,
+                        kind,
+                        doc: m.doc,
+                        tags: m.tags,
+                        embed: m.embed,
+                        expected_version: m.expected_version,
+                    })
+                }
                 other => member_refusal(
                     KhiveError::conflict("stream.batch member names no member operation"),
                     vec![("reason", "unknown_op".into()), ("op", other.into())],
@@ -228,12 +351,39 @@ impl KgPack {
             });
         }
         let results = if atomic {
-            match self.runtime.stream_batch_atomic(token, members).await? {
+            match self
+                .runtime
+                .stream_batch_atomic(token, members, fence, observed, registry)
+                .await
+                .map_err(|error| batch_key_error(error, &writes, token, registry))?
+            {
                 Ok(results) => results,
-                Err(refusal) => return Err(refusal.error.into()),
+                Err(refusal) => {
+                    return Err(batch_key_error(
+                        refusal.error.into(),
+                        &writes,
+                        token,
+                        registry,
+                    ));
+                }
             }
         } else {
-            self.runtime.stream_batch_per_member(token, members).await?
+            let mut results = self
+                .runtime
+                .stream_batch_per_member(token, members, registry)
+                .await?;
+            for (result, write) in results.iter_mut().zip(&writes) {
+                if result["details"]["reason"] == "key_conflict"
+                    && !write.as_ref().is_some_and(|(kind, key)| {
+                        registry.allows_note_key_disclosure(token, kind, key)
+                    })
+                {
+                    if let Some(details) = result["details"].as_object_mut() {
+                        details.remove("existing_id");
+                    }
+                }
+            }
+            results
         };
         Ok(json!({"results": results, "committed": true}))
     }

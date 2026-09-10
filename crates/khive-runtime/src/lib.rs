@@ -51,7 +51,10 @@ pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
 mod streams;
-pub use streams::{refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal};
+pub use streams::{
+    refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal, StreamObservation,
+    StreamWriteSpec,
+};
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;

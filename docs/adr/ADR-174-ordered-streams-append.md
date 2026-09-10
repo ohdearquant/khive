@@ -323,6 +323,8 @@ Both forms are load-bearing, so the verb carries both and names which one it is 
 
 ### A1.1 `stream.batch`
 
+**Implementation (2026-09-09):** Object fences and version observations execute in the atomic writer transaction; keyed `write` members execute in either batch mode.
+
 `stream.batch(ops, fence=None, observed=None, atomic=None, namespace=None)` takes a list of member
 operations, each `{"op": "append", "stream": S, "record": R, "expected_seq": N | null}` or
 `{"op": "write", "key": K, "kind": <note kind>, "doc": D, "tags": [...] | null, "embed": bool | null,
@@ -334,6 +336,12 @@ its Amendment 2 defines them, `embed` defaulting by the note kind). Common to bo
   with `KhiveError::invalid_input` and writes nothing. An op string that names no member operation
   is not a shape error: it is that member's refusal, `unknown_op`, and the mode below decides
   whether it stops the batch or returns as the member's value.
+- Decision (2026-09-10): a batch names each `(kind, key)` write target at most once, in either
+  mode. A repeated target is a shape error (`invalid_input`, naming the member index), not a
+  per-member `key_conflict`: version observations are taken once before the first member runs, so
+  a second write to the same key inside one request would either observe a stale version or
+  conflict with its own sibling, and neither outcome is useful to a caller. Create-then-update is
+  two requests, the second carrying the version the first returned.
 - A member refusal, wherever it surfaces, carries the ADR-172 §2 error shape plus
   `domain_disposition: not_committed` (ADR-133 Amendment 3), and a `key_conflict` names the holder
   as `existing_id` (ADR-179 D5), so the consumer rule of ADR-133 Amendment 3 reads it without a
@@ -573,6 +581,8 @@ codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fenc
 ## Amendment 4 (2026-09-09): an `observed` entry may assert that a key is unheld
 
 **Status**: Proposed.
+
+**Implementation (2026-09-09):** `observed` entries with a version or `null` are checked inside the atomic writer transaction before member writes.
 
 ### The gap
 
