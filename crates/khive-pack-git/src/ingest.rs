@@ -4,7 +4,7 @@
 //! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md
 //! and crates/khive-pack-git/docs/ingest.md for the full design notes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -93,7 +93,7 @@ impl IngestOptions {
     }
 }
 
-/// Bounds new-record creation attempts across a `run_ingest` pass. See
+/// Bounds fresh record visits, including existing records and failed attempts. See
 /// crates/khive-pack-git/docs/api/ingest.md#budget.
 struct Budget {
     remaining: Option<u64>,
@@ -114,6 +114,14 @@ impl Budget {
     fn exhausted(&self) -> bool {
         matches!(self.remaining, Some(0))
     }
+}
+
+/// Publish the stall at its origin: a later fallible read or checkpoint must
+/// not erase the already-observed record failure from the structured report.
+fn stall_cursor(cursor_stalled: &mut bool, report: &mut IngestReport) {
+    *cursor_stalled = true;
+    report.cursor_stalled = true;
+    report.done = false;
 }
 
 /// A newly created note this pass, for `link_references`'s
@@ -1296,6 +1304,149 @@ async fn write_cursor(
     Ok(())
 }
 
+/// The timestamp remains the public cursor. Exact boundary acknowledgments let
+/// an inclusive search resume even with max_items=1, without dropping unseen
+/// ties. UUIDs also restore PR linking maps without another natural-key lookup.
+#[derive(Debug, Serialize, Deserialize)]
+struct PageCheckpoint {
+    version: u8,
+    namespace: String,
+    floor: Option<String>,
+    at_floor: BTreeMap<u64, Uuid>,
+    undated: BTreeMap<u64, Uuid>,
+}
+
+impl PageCheckpoint {
+    fn new(namespace: &str, floor: Option<String>) -> Self {
+        Self {
+            version: 1,
+            namespace: namespace.into(),
+            floor,
+            at_floor: BTreeMap::new(),
+            undated: BTreeMap::new(),
+        }
+    }
+
+    fn acknowledged(&self, number: u64, updated: Option<&str>) -> Option<Uuid> {
+        match updated {
+            None => self.undated.get(&number).copied(),
+            Some(u) if self.floor.as_deref() == Some(u) => self.at_floor.get(&number).copied(),
+            Some(_) => None,
+        }
+    }
+
+    /// Only called before a stall. Refuse an unbounded acknowledgment set;
+    /// dropping an entry would otherwise make a tiny-budget pass cycle forever.
+    fn acknowledge(&mut self, number: u64, updated: Option<&str>, id: Uuid) -> bool {
+        let entries = match updated {
+            None => &mut self.undated,
+            Some(u) => {
+                if self.floor.as_deref().is_none_or(|floor| u > floor) {
+                    self.floor = Some(u.to_owned());
+                    self.at_floor.clear();
+                }
+                if self.floor.as_deref() != Some(u) {
+                    return true;
+                }
+                &mut self.at_floor
+            }
+        };
+        if entries.len() >= PAGE_LIMIT && !entries.contains_key(&number) {
+            return false;
+        }
+        entries.insert(number, id);
+        true
+    }
+}
+
+async fn read_page_checkpoint(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project_id: Uuid,
+    kind: &str,
+    warnings: &mut Vec<String>,
+) -> Result<PageCheckpoint> {
+    // One read snapshot: a concurrent atomic checkpoint cannot tear this pair.
+    let row = runtime.sql().reader().await?.query_row(SqlStatement {
+        sql: "SELECT \
+              (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2) AS floor, \
+              (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?3) AS progress".into(),
+        params: vec![SqlValue::Text(project_id.to_string()), SqlValue::Text(kind.into()),
+            SqlValue::Text(format!("{kind}_checkpoint"))],
+        label: Some("git_ingest_read_page_checkpoint".into()),
+    }).await?;
+    let floor = match row.as_ref().and_then(|r| r.get("floor")) {
+        Some(SqlValue::Text(raw)) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Some(
+                dt.with_timezone(&Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            Err(_) => {
+                warnings.push(format!(
+                    "{kind}: invalid stored timestamp cursor; restarting the window"
+                ));
+                None
+            }
+        },
+        _ => None,
+    };
+    let namespace = token.namespace().as_str();
+    if let Some(SqlValue::Text(raw)) = row.as_ref().and_then(|r| r.get("progress")) {
+        // Two maps of at most PAGE_LIMIT UUIDs fit comfortably below this cap.
+        let parsed = (raw.len() <= 256 * 1024)
+            .then(|| serde_json::from_str::<PageCheckpoint>(raw).ok())
+            .flatten();
+        if let Some(progress) = parsed.filter(|p| {
+            p.version == 1
+                && p.namespace == namespace
+                && p.floor == floor
+                && p.at_floor.len() <= PAGE_LIMIT
+                && p.undated.len() <= PAGE_LIMIT
+                && (p.floor.is_some() || p.at_floor.is_empty())
+        }) {
+            return Ok(progress);
+        }
+        warnings.push(format!(
+            "{kind}: incompatible checkpoint metadata; resuming from the timestamp cursor"
+        ));
+    }
+    Ok(PageCheckpoint::new(namespace, floor))
+}
+
+async fn write_page_checkpoint(
+    runtime: &KhiveRuntime,
+    project_id: Uuid,
+    kind: &str,
+    checkpoint: &PageCheckpoint,
+) -> Result<()> {
+    // One statement commits the timestamp and exact acknowledgments together.
+    // An undated-only window has no main timestamp row yet.
+    let mut statement = SqlStatement {
+        sql: "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) \
+              VALUES(?1, ?2, ?3, ?4)"
+            .into(),
+        params: vec![
+            SqlValue::Text(project_id.to_string()),
+            SqlValue::Text(format!("{kind}_checkpoint")),
+            SqlValue::Text(serde_json::to_string(checkpoint)?),
+            SqlValue::Integer(Utc::now().timestamp_micros()),
+        ],
+        label: Some("git_ingest_write_page_checkpoint".into()),
+    };
+    if let Some(floor) = &checkpoint.floor {
+        statement.sql.push_str(", (?1, ?5, ?6, ?4)");
+        statement
+            .params
+            .extend([SqlValue::Text(kind.into()), SqlValue::Text(floor.clone())]);
+    }
+    statement.sql.push_str(
+        " ON CONFLICT(project_id, kind) DO UPDATE SET \
+        cursor_value=excluded.cursor_value, updated_at=excluded.updated_at",
+    );
+    runtime.sql().writer().await?.execute(statement).await?;
+    Ok(())
+}
+
 // ── commits ─────────────────────────────────────────────────────────────────
 
 const RECORD_SEP: char = '\u{1e}';
@@ -1844,7 +1995,7 @@ async fn ingest_commits(
     ));
     // The last record (walk is oldest-first) is the exact snapshot HEAD the
     // module index binds against; the walk itself is never truncated by
-    // `max_items` — only the create loop below is.
+    // `max_items` — only the record-visit loop below is.
     let snapshot_head = commits
         .last()
         .expect("non-empty commit snapshot checked above")
@@ -1866,11 +2017,10 @@ async fn ingest_commits(
             }
         };
 
-    // `cursor_stalled` freezes `last_sha` at the last contiguous success so a
+    // `cursor_stalled` freezes the persisted SHA at the last contiguous success so a
     // failed record is retried next pass instead of skipped forever; later
     // records this pass are still attempted. See crates/khive-pack-git/docs/
     // ingest.md#commit-walk-ancestor-divergence-and-cursor-stall.
-    let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
     // Bounded detail for the per-run ambiguous-module-skip warning: the
     // masked skipped paths in encounter order, capped so one pathological
@@ -1880,26 +2030,25 @@ async fn ingest_commits(
     let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
     // Parent SHA -> note id for commits created earlier this pass; combined
     // with `find_commit_by_sha`'s DB lookup, resolves parent edges regardless
-    // of which pass the parent landed in. The stall guard on the `last_sha`
-    // advances below prevents stranding a failed commit behind an advanced
+    // of which pass the parent landed in. The stall guard on the cursor
+    // writes below prevents stranding a failed commit behind an advanced
     // floor. See crates/khive-pack-git/docs/ingest.md
     // #commit-walk-ancestor-divergence-and-cursor-stall.
     let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
-        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
-            local_sha_to_id.insert(c.sha.clone(), existing);
-            report.commits_skipped_existing += 1;
-            if !cursor_stalled {
-                last_sha = Some(c.sha.clone());
-            }
-            continue;
-        }
-
-        if budget.exhausted() {
+        if !budget.try_consume() {
             report.sources.commits = Some(IngestSourceState::StoppedEarly(
                 "budget exhausted before the commit history was exhausted".into(),
             ));
             break;
+        }
+        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
+            local_sha_to_id.insert(c.sha.clone(), existing);
+            report.commits_skipped_existing += 1;
+            if !cursor_stalled {
+                write_cursor(runtime, project_id, "commits", &c.sha).await?;
+            }
+            continue;
         }
 
         let masked = MaskedCommitFields::new(c);
@@ -1914,7 +2063,7 @@ async fn ingest_commits(
         // passes disagree; surface it instead of silently storing the `[]`
         // the contract reserves for a genuinely empty commit.
         let Some(touched_paths) = files_by_sha.get(&c.sha) else {
-            cursor_stalled = true;
+            stall_cursor(&mut cursor_stalled, report);
             let recipient_detail = commits
                 .iter()
                 .position(|candidate| candidate.sha == c.sha)
@@ -2038,15 +2187,11 @@ async fn ingest_commits(
             create_request["embedding_content"] = json!(head);
         }
 
-        budget.try_consume();
         match crate::dispatch_from_token(registry, token, "create", create_request).await {
             Ok(v) => {
                 report.commits_ingested += 1;
                 if embedding_head.is_some() {
                     report.commit_embeddings_truncated += 1;
-                }
-                if !cursor_stalled {
-                    last_sha = Some(c.sha.clone());
                 }
                 if let Some(id) = v
                     .get("id")
@@ -2096,13 +2241,17 @@ async fn ingest_commits(
             }
             Err(e) => {
                 record_write_failure(report, "create", "commit", c.sha.clone(), e);
-                cursor_stalled = true;
+                stall_cursor(&mut cursor_stalled, report);
             }
+        }
+        if !cursor_stalled {
+            // Exclusive SHA resume: each contiguous success survives a later
+            // database, subprocess, or request-deadline failure.
+            write_cursor(runtime, project_id, "commits", &c.sha).await?;
         }
     }
 
     if cursor_stalled {
-        report.cursor_stalled = true;
         report.done = false;
         report.sources.commits = Some(IngestSourceState::StoppedEarly(
             "a per-record write failure froze the commits cursor (cursor_stalled)".into(),
@@ -2122,15 +2271,6 @@ async fn ingest_commits(
             report.sources.commits = Some(IngestSourceState::Completed);
             *walk_complete = true;
         }
-    }
-    if let Some(sha) = last_sha {
-        // A stalled cursor has already frozen `last_sha` at the last
-        // contiguous success above; the write persists exactly that floor.
-        // A failure here surfaces at the call site, which distinguishes it
-        // from a pre-walk failure by the already-recorded source state and
-        // downgrades the pass to stopped-early in-band (never a hard
-        // abort of the whole ingest).
-        write_cursor(runtime, project_id, "commits", &sha).await?;
     }
     // One bounded line per run (never one per path): filenames are
     // attacker/repo-controlled and may be long, so the count is the
@@ -2594,22 +2734,23 @@ async fn ingest_prs(
     new_records: &mut Vec<NewRecordForRef>,
     walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = match read_cursor(runtime, project_id, "prs").await {
-        Ok(since) => since,
-        Err(e) => {
-            report.sources.pull_requests = Some(IngestSourceState::Skipped(format!(
-                "local cursor/database read failed before pull request listing: {e}"
-            )));
-            return Err(e);
-        }
-    };
+    let mut checkpoint =
+        match read_page_checkpoint(runtime, token, project_id, "prs", &mut report.warnings).await {
+            Ok(checkpoint) => checkpoint,
+            Err(e) => {
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(format!(
+                    "local cursor/database read failed before pull request listing: {e}"
+                )));
+                return Err(e);
+            }
+        };
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
-    // in this pass's warnings), but `max_updated` no longer advances past the
+    // in this pass's warnings), but `checkpoint.floor` no longer advances past the
     // stall point — the next pass re-fetches from before the failure and
     // retries it, while already-landed PRs are no-ops via the natural key.
-    let mut max_updated: Option<String> = since.clone();
+    let since = checkpoint.floor.clone();
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
@@ -2645,10 +2786,36 @@ async fn ingest_prs(
         // Re-sorted defensively for the frozen-cursor invariant; `is_new` is
         // inclusive for tie handling. See crates/khive-pack-git/docs/api/
         // ingest.md#ingest_prs--ingest_issues-cursor-semantics.
-        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        page.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then(a.number.cmp(&b.number))
+        });
         let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
+        let undated: BTreeSet<u64> = page
+            .iter()
+            .filter(|p| p.updated_at.is_none())
+            .map(|p| p.number)
+            .collect();
+        checkpoint
+            .undated
+            .retain(|number, _| undated.contains(number));
 
         for masked in page {
+            if let Some(existing) =
+                checkpoint.acknowledged(masked.number, masked.updated_at.as_deref())
+            {
+                number_to_pr.insert(masked.number, existing);
+                if let Some(oid) = masked.merge_commit_oid.as_ref() {
+                    merge_sha_to_pr.insert(oid.clone(), existing);
+                }
+                continue;
+            }
+            if !budget.try_consume() {
+                window_complete = false;
+                stop_reason = Some("budget exhausted before the pull_request window completed");
+                break;
+            }
             if let Some(existing) =
                 find_by_number(runtime, token, "pull_request", project_id, masked.number).await?
             {
@@ -2657,19 +2824,17 @@ async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
-                // Advancing the floor past a stalled pass's later records
-                // would skip the refused record forever; see
-                // crates/khive-pack-git/docs/api/ingest.md#ingest_prs--ingest_issues-cursor-semantics.
-                if !cursor_stalled {
-                    if let Some(u) = &masked.updated_at {
-                        if max_updated
-                            .as_deref()
-                            .map(|m| u.as_str() > m)
-                            .unwrap_or(true)
-                        {
-                            max_updated = Some(u.clone());
-                        }
-                    }
+                if !cursor_stalled
+                    && !checkpoint.acknowledge(
+                        masked.number,
+                        masked.updated_at.as_deref(),
+                        existing,
+                    )
+                {
+                    report
+                        .warnings
+                        .push("prs: checkpoint boundary exceeds the remote page limit".into());
+                    stall_cursor(&mut cursor_stalled, report);
                 }
                 continue;
             }
@@ -2685,14 +2850,7 @@ async fn ingest_prs(
             if !is_new {
                 continue;
             }
-            if budget.exhausted() {
-                // Records after this point were never visited even on a short
-                // page — a short page proves only the remote window ended, not
-                // that the local walk covered it.
-                window_complete = false;
-                stop_reason = Some("budget exhausted before the pull request window completed");
-                break;
-            }
+
             let content = masked.body;
             let properties = json!({
                 "number": masked.number,
@@ -2710,7 +2868,6 @@ async fn ingest_prs(
                 NAME_MAX_CHARS,
             );
 
-            budget.try_consume();
             let result = match crate::dispatch_from_token(
                 registry,
                 token,
@@ -2734,16 +2891,16 @@ async fn ingest_prs(
                         format!("#{}", masked.number),
                         e,
                     );
-                    cursor_stalled = true;
+                    stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
 
-            if let Some(id) = result
+            let id = result
                 .get("id")
                 .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok())
-            {
+                .and_then(|s| Uuid::parse_str(s).ok());
+            if let Some(id) = id {
                 number_to_pr.insert(masked.number, id);
                 if let Some(oid) = masked.merge_commit_oid {
                     merge_sha_to_pr.insert(oid, id);
@@ -2755,18 +2912,27 @@ async fn ingest_prs(
             }
             report.prs_ingested += 1;
             if !cursor_stalled {
-                if let Some(u) = &masked.updated_at {
-                    if max_updated
-                        .as_deref()
-                        .map(|m| u.as_str() > m)
-                        .unwrap_or(true)
-                    {
-                        max_updated = Some(u.clone());
+                match id {
+                    Some(id)
+                        if checkpoint.acknowledge(
+                            masked.number,
+                            masked.updated_at.as_deref(),
+                            id,
+                        ) => {}
+                    _ => {
+                        report.warnings.push(
+                            "prs: record could not be acknowledged in the bounded checkpoint"
+                                .into(),
+                        );
+                        stall_cursor(&mut cursor_stalled, report);
                     }
                 }
             }
         }
 
+        // Save completed and budget-truncated pages before another fetch can
+        // fail. A stalled pass persists only its contiguous-success prefix.
+        write_page_checkpoint(runtime, project_id, "prs", &checkpoint).await?;
         match decide_page_outcome(
             page_len,
             floor.as_deref(),
@@ -2811,7 +2977,6 @@ async fn ingest_prs(
         // A stalled PR cursor means records past the frozen floor were never
         // retried; `done: true` here would tell the caller the slot is
         // complete when it is permanently behind (issue #1645).
-        report.cursor_stalled = true;
         report.done = false;
         // See the `!window_complete` arm above for the seed invariant.
         pin_stopped_early(
@@ -2827,9 +2992,6 @@ async fn ingest_prs(
         *walk_complete = true;
     }
 
-    if let Some(cursor) = max_updated {
-        write_cursor(runtime, project_id, "prs", &cursor).await?;
-    }
     Ok(())
 }
 
@@ -2846,8 +3008,16 @@ async fn ingest_issues(
     new_records: &mut Vec<NewRecordForRef>,
     walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = match read_cursor(runtime, project_id, "issues").await {
-        Ok(since) => since,
+    let mut checkpoint = match read_page_checkpoint(
+        runtime,
+        token,
+        project_id,
+        "issues",
+        &mut report.warnings,
+    )
+    .await
+    {
+        Ok(checkpoint) => checkpoint,
         Err(e) => {
             report.sources.issues = Some(IngestSourceState::Skipped(format!(
                 "local cursor/database read failed before issue listing: {e}"
@@ -2858,10 +3028,10 @@ async fn ingest_issues(
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
-    // pass are still attempted, but `max_updated` freezes at the stall point
+    // pass are still attempted, but `checkpoint.floor` freezes at the stall point
     // so the next pass retries the failed record instead of skipping it
     // forever; already-landed records are no-ops via the natural key.
-    let mut max_updated: Option<String> = since.clone();
+    let since = checkpoint.floor.clone();
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
@@ -2897,31 +3067,51 @@ async fn ingest_issues(
         // walking records in nondecreasing updated_at order, which `--search
         // sort:updated-asc` does not itself guarantee across ties — sort
         // defensively, using the canonicalized (not raw) timestamp.
-        masked_page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        masked_page.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then(a.number.cmp(&b.number))
+        });
         let last_updated_at = masked_page.last().and_then(|i| i.updated_at.clone());
+        // Undated acknowledgments cover this fetched window, not every undated
+        // record ever encountered. Retain present rows across timestamp advances
+        // (tiny budgets must not replay them forever), and prune absent rows.
+        let undated: BTreeSet<u64> = masked_page
+            .iter()
+            .filter(|i| i.updated_at.is_none())
+            .map(|i| i.number)
+            .collect();
+        checkpoint
+            .undated
+            .retain(|number, _| undated.contains(number));
 
         for masked in masked_page {
-            if find_by_number(runtime, token, "issue", project_id, masked.number)
-                .await?
+            if checkpoint
+                .acknowledged(masked.number, masked.updated_at.as_deref())
                 .is_some()
             {
+                continue;
+            }
+            if !budget.try_consume() {
+                window_complete = false;
+                stop_reason = Some("budget exhausted before the issue window completed");
+                break;
+            }
+            if let Some(existing) =
+                find_by_number(runtime, token, "issue", project_id, masked.number).await?
+            {
                 report.issues_skipped_existing += 1;
-                // See `ingest_prs`: while this pass is stalled, advancing
-                // the floor past records walked after the stall point would
-                // persist a cursor strictly newer than the refused record's
-                // timestamp and skip it forever instead of retrying it. A
-                // clean (non-stalled) all-existing pass still advances
-                // normally.
-                if !cursor_stalled {
-                    if let Some(u) = &masked.updated_at {
-                        if max_updated
-                            .as_deref()
-                            .map(|m| u.as_str() > m)
-                            .unwrap_or(true)
-                        {
-                            max_updated = Some(u.clone());
-                        }
-                    }
+                if !cursor_stalled
+                    && !checkpoint.acknowledge(
+                        masked.number,
+                        masked.updated_at.as_deref(),
+                        existing,
+                    )
+                {
+                    report
+                        .warnings
+                        .push("issues: checkpoint boundary exceeds the remote page limit".into());
+                    stall_cursor(&mut cursor_stalled, report);
                 }
                 continue;
             }
@@ -2935,15 +3125,6 @@ async fn ingest_issues(
             if !is_new {
                 continue;
             }
-            if budget.exhausted() {
-                // See `ingest_prs`: unvisited records remain, so the walk
-                // stops early even when the page is short; the
-                // exact-budget boundary resolves conservatively and a
-                // resumed pass completes idempotently.
-                window_complete = false;
-                stop_reason = Some("budget exhausted before the issue window completed");
-                break;
-            }
 
             let number = masked.number;
             let updated_at = masked.updated_at.clone();
@@ -2956,7 +3137,7 @@ async fn ingest_issues(
                 report.warnings.push(format!(
                     "issue #{number}: stateReason is not one of the governed values, record skipped"
                 ));
-                cursor_stalled = true;
+                stall_cursor(&mut cursor_stalled, report);
                 continue;
             }
 
@@ -2976,7 +3157,6 @@ async fn ingest_issues(
             }
             let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
-            budget.try_consume();
             let result = match crate::dispatch_from_token(
                 registry,
                 token,
@@ -2994,15 +3174,15 @@ async fn ingest_issues(
                 Ok(v) => v,
                 Err(e) => {
                     record_write_failure(report, "create", "issue", format!("#{number}"), e);
-                    cursor_stalled = true;
+                    stall_cursor(&mut cursor_stalled, report);
                     continue;
                 }
             };
-            if let Some(id) = result
+            let id = result
                 .get("id")
                 .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok())
-            {
+                .and_then(|s| Uuid::parse_str(s).ok());
+            if let Some(id) = id {
                 new_records.push(NewRecordForRef {
                     id,
                     text: content.clone(),
@@ -3011,18 +3191,23 @@ async fn ingest_issues(
 
             report.issues_ingested += 1;
             if !cursor_stalled {
-                if let Some(u) = &updated_at {
-                    if max_updated
-                        .as_deref()
-                        .map(|m| u.as_str() > m)
-                        .unwrap_or(true)
-                    {
-                        max_updated = Some(u.clone());
+                match id {
+                    Some(id)
+                        if checkpoint.acknowledge(masked.number, updated_at.as_deref(), id) => {}
+                    _ => {
+                        report.warnings.push(
+                            "issues: record could not be acknowledged in the bounded checkpoint"
+                                .into(),
+                        );
+                        stall_cursor(&mut cursor_stalled, report);
                     }
                 }
             }
         }
 
+        // Save completed and budget-truncated pages before another fetch can
+        // fail. A stalled pass persists only its contiguous-success prefix.
+        write_page_checkpoint(runtime, project_id, "issues", &checkpoint).await?;
         match decide_page_outcome(
             page_len,
             floor.as_deref(),
@@ -3062,7 +3247,6 @@ async fn ingest_issues(
         // Same contract as the commits and PR paths: a frozen issue cursor
         // means unretried records exist past the floor, so the slot is not
         // complete (issue #1645).
-        report.cursor_stalled = true;
         report.done = false;
         // See the `!window_complete` arm above for the seed invariant.
         pin_stopped_early(
@@ -3077,9 +3261,6 @@ async fn ingest_issues(
         *walk_complete = true;
     }
 
-    if let Some(cursor) = max_updated {
-        write_cursor(runtime, project_id, "issues", &cursor).await?;
-    }
     Ok(())
 }
 

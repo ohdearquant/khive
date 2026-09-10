@@ -46,10 +46,16 @@ rather than falling back.
 
 ## `Budget`
 
-Bounds the number of new-record creation attempts across a `run_ingest`
-pass (ADR-088 Amendment 1 `max_items`). Only creation attempts (success or
-failure) consume budget — cheap natural-key "already exists" skips do not,
-since they are not the work the bound exists to limit.
+Bounds fresh record visits across commits, PRs, and issues (ADR-088 Amendment 1
+`max_items`). A record consumes one unit **before** its natural-key lookup, whether
+it already exists, creates successfully, or fails validation or creation. Existing
+tracker records therefore cannot turn a small bound into an unbounded database scan.
+An exact durable boundary acknowledgment skips the lookup and consumes no unit;
+these replays do not increment `*_skipped_existing` (that count measures actual
+existence checks). Related lookups and enrichment within one record are not separate
+units. The bound does not limit git snapshot construction, the size of a fetched
+remote page, or subprocess wall time. Exact-budget passes retain the conservative
+`done=false` result; a subsequent pass proves completion.
 
 ## Secret-gate refusal accounting
 
@@ -200,18 +206,39 @@ see `find_document_for_path_tests`).
 
 ## `write_cursor`
 
-Called once per section (commits/prs/issues) after that section's loop
-finishes, with a value that stops advancing at the first per-record create
-failure (see the `cursor_stalled` handling in each `ingest_*` loop) — so
-the next pass re-walks from before the failure and retries it, while
-records that already landed (including ones ingested later in a stalled
-pass) are no-ops via natural-key dedupe.
-While a pass is stalled, the persisted floor also never advances on the
-strength of an ALREADY-EXISTING record walked after the stall point (its
-natural-key lookup proves only its own landing): advancing past one would
-persist a cursor strictly newer than the refused record's timestamp, and
-the next pass's inclusive `updated >= cursor` filter would skip the refused
-record forever instead of retrying it.
+Commits persist their exclusive SHA cursor after each contiguous successful or
+already-existing record. Issues and PRs persist a paired page checkpoint after each
+fetched page is processed, including a partial page stopped by the visit budget,
+and before fetching the next page. A later fetch or database failure therefore
+preserves the earlier saved prefix. A failure within a page can replay that page.
+
+The main `issues`/`prs` cursor remains a canonical timestamp. Versioned JSON in the
+same table under `issues_checkpoint`/`prs_checkpoint` holds the matching floor,
+namespace, and exact number-to-note-UUID maps for acknowledged boundary and undated
+records. Both rows are read in one snapshot and written by one multi-row UPSERT.
+A timestamp-only legacy cursor starts with empty acknowledgments; mismatched,
+malformed, oversized, or unknown-version metadata warns and falls back to the main
+cursor. Invalid main timestamps warn and restart the window, never enter `gh` argv.
+Metadata is not a public cursor format or a schema migration.
+
+Acknowledgments are durable completion facts, not a cache of live note existence.
+Deleting a mirrored note locally does not reset ingest progress, including at the
+inclusive boundary. To deliberately reimport deleted records, reset both the main
+cursor and its checkpoint row for that project/source kind. This is also required
+before relying on refreshed PR UUIDs for enrichment after local deletion.
+
+Acknowledgments remain after completion so a quiescent PR boundary cannot repeatedly
+spend the budget before issues or commits are reached. PR replay restores the merge
+SHA and PR-number linking maps using the stored UUID and current masked remote
+fields. Each map is capped at the 1,000-record remote page limit; undated entries
+are pruned to the currently fetched page. A cap overflow stops with a stalled
+cursor instead of silently dropping progress. Records acknowledged before an upstream
+edit are still governed by the existing append-only natural-key ingest behavior.
+
+Any per-record failure freezes the saved prefix. Neither later new nor existing
+records may advance it or be acknowledged beyond that failure. Publish this stall
+in the report before a fallible checkpoint write. The next pass retries the failed
+record; already-landed later records remain idempotent via natural-key dedupe.
 
 ## Issue #765: commit-snapshot recovery
 
@@ -349,10 +376,10 @@ last fetched page.
 
 `cursor_stalled` mirrors `ingest_commits`: once one record fails to create,
 later records in this pass are still attempted (so every failure surfaces
-in this pass's warnings), but `max_updated` no longer advances past the
+in this pass's warnings), but `checkpoint.floor` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
 it, while already-landed records are no-ops via the natural key.
-The freeze applies on every `max_updated` advance, including the
+The freeze applies on every `checkpoint.floor` advance, including the
 already-existing-record branch: while stalled, a later existing record with
 a newer timestamp must not pull the floor past the refused record (see
 `write_cursor` above).
@@ -361,9 +388,19 @@ Each page is already `sort:updated-asc` server-side, but `--search` makes
 no hard ordering guarantee across ties — both loops re-sort defensively so
 the frozen-cursor invariant (records walked in nondecreasing `updated_at`
 order) holds regardless. `is_new` is inclusive (`updated >= cursor`) for
-exactly the tie reason: a successful and a failing record sharing one
-`updated_at` must both be re-examined next pass until the cursor moves past
-that tie.
+exactly the tie reason: a failing or unseen record sharing the boundary
+`updated_at` must remain eligible. Only exact acknowledged numbers at that timestamp
+are replayed without lookup; a lower but unseen number remains eligible. Sorting
+uses `(updated_at, number)` for deterministic local order, not a remote numeric
+high-water predicate. Canonical undated records also retain exact acknowledgments,
+so `max_items=1` can progress without persisting malformed timestamp text.
+
+The existing remote search ceiling remains: a full 1,000-record page at one timestamp
+cannot prove that no further ties exist, so it reports stopped early rather than
+jumping past the timestamp. Arrivals older than an advanced floor remain outside
+this high-water contract. PRs still precede issues and commits to preserve enrichment;
+continuously arriving or permanently failing earlier-source work has no new fairness
+guarantee.
 
 In both `ingest_issues` and `ingest_prs`, the entire fetched page is
 classified before anything else—including the sort and paging-cursor

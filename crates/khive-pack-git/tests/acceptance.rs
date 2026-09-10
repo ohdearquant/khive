@@ -30,6 +30,8 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[path = "support/digest_resume.rs"]
+mod digest_resume;
 #[path = "support/digest_scale.rs"]
 mod digest_scale;
 
@@ -4195,8 +4197,8 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
         "only #20 (now corrected) is newly created on pass 2: {report2:?}"
     );
     assert_eq!(
-        report2.issues_skipped_existing, 2,
-        "#5 and #10 are found by natural key, not duplicated: {report2:?}"
+        report2.issues_skipped_existing, 1,
+        "#5 replays its checkpoint; #10 is found by natural key; neither duplicates: {report2:?}"
     );
     assert!(
         report2.warnings.iter().all(|w| !w.contains("issue #20")),
@@ -4330,8 +4332,8 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         "only #20 (embedder fuse now spent) is newly created on pass 2: {report2:?}"
     );
     assert_eq!(
-        report2.prs_skipped_existing, 2,
-        "#5 and #10 are found by natural key, not duplicated: {report2:?}"
+        report2.prs_skipped_existing, 1,
+        "#5 replays its checkpoint; #10 is found by natural key; neither duplicates: {report2:?}"
     );
     assert!(
         report2
@@ -4576,9 +4578,8 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
          tied timestamp did not strand it: {report2:?}"
     );
     assert_eq!(
-        report2.issues_skipped_existing, 1,
-        "#5 is found by natural key, not duplicated, even though it is \
-         re-examined every pass at the tied cursor timestamp: {report2:?}"
+        report2.issues_skipped_existing, 0,
+        "#5 is acknowledged at the tied cursor; no duplicate or repeat lookup: {report2:?}"
     );
     assert!(
         report2.warnings.iter().all(|w| !w.contains("issue #20")),
@@ -4689,9 +4690,8 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
          tied timestamp did not strand it: {report2:?}"
     );
     assert_eq!(
-        report2.prs_skipped_existing, 1,
-        "#5 is found by natural key, not duplicated, even though it is \
-         re-examined every pass at the tied cursor timestamp: {report2:?}"
+        report2.prs_skipped_existing, 0,
+        "#5 is acknowledged at the tied cursor; no duplicate or repeat lookup: {report2:?}"
     );
     assert!(
         report2
@@ -5967,7 +5967,7 @@ esac
 
 /// The walked-then-failed invariant (the walked-then-failed finding), driven
 /// through the one post-visit Err site the standing stub infra can reach:
-/// the cursor write at the end of the issue walk. A pass that walks the
+/// the checkpoint write after the issue page. A pass that walks the
 /// window to completion and THEN fails persisting the cursor must never
 /// regress to `skipped` ("never walked") — and must not stay `completed`
 /// either: the walk happened but the pass failed, so the state downgrades
@@ -6004,8 +6004,8 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
     // Sabotage ONLY the cursor write: read_cursor must keep working (it is
     // the walker's first statement, before any page fetch), so the table
     // stays, with a trigger that aborts every INSERT. The walker then runs
-    // the full pass — records land, completion states are recorded — and
-    // fails at the final `write_cursor`, after the walk.
+    // page — records land and the walk-start state is recorded — and
+    // fails saving the page checkpoint before completion is reported.
     let mut writer = rt.sql().writer().await.expect("writer");
     writer
         .execute(SqlStatement {
@@ -6032,9 +6032,9 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
     match &report.sources.issues {
         Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
             assert!(
-                reason.contains("walk completed but the pass then failed")
+                reason.contains("pass then failed after the walk")
                     && reason.contains("sabotaged cursor write"),
-                "the completed walk downgrades to stopped-early with the cause: {reason:?}"
+                "the walked page stays stopped-early with the cause: {reason:?}"
             );
         }
         other => panic!("a walked-then-failed source is never skipped or completed: {other:?}"),
@@ -6169,7 +6169,10 @@ async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
         report2.prs_ingested, 1,
         "the refused record is retried and lands once the upstream failure clears: {report2:?}"
     );
-    assert_eq!(report2.prs_skipped_existing, 2, "{report2:?}");
+    assert_eq!(
+        report2.prs_skipped_existing, 1,
+        "#5 is acknowledged; #10 needs a lookup: {report2:?}"
+    );
     assert!(!report2.cursor_stalled, "{report2:?}");
 
     let cursor_after_pass2 = read_git_cursor(&rt, project_id, "prs")
@@ -6270,7 +6273,10 @@ async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
         .await
         .expect("ingest ok (pass 2)");
     assert_eq!(report2.issues_ingested, 1, "{report2:?}");
-    assert_eq!(report2.issues_skipped_existing, 2, "{report2:?}");
+    assert_eq!(
+        report2.issues_skipped_existing, 1,
+        "#5 is acknowledged; #10 needs a lookup: {report2:?}"
+    );
     assert!(!report2.cursor_stalled, "{report2:?}");
 
     let cursor_after_pass2 = read_git_cursor(&rt, project_id, "issues")
@@ -6414,7 +6420,7 @@ async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
     commit(&repo, &["README.md"], "Initial commit");
 
     // Sabotage ONLY the cursor write: the commit itself must land first, so
-    // the walker records `completed` before the final `write_cursor` fails.
+    // the walker has recorded its walk-start state before the checkpoint fails.
     let mut writer = rt.sql().writer().await.expect("writer");
     writer
         .execute(SqlStatement {
@@ -6441,9 +6447,9 @@ async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
     match &report.sources.commits {
         Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
             assert!(
-                reason.contains("walk completed but the pass then failed")
+                reason.contains("pass then failed after the walk")
                     && reason.contains("sabotaged cursor write"),
-                "the completed commit walk downgrades to stopped-early with the cause: {reason:?}"
+                "the walked commit stays stopped-early with the cause: {reason:?}"
             );
         }
         other => {

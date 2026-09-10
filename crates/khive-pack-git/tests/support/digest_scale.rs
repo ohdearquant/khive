@@ -1,13 +1,13 @@
 //! Opt-in diagnostic: full-history replay against existing file-backed issue notes.
 //! Run with `cargo test -p khive-pack-git --test acceptance digest_scale -- --ignored --nocapture`.
-//! Timing is evidence, not a normal CI assertion or proof about another store.
+//! The explicit scale run asserts bounded visits and a controlled 30-second resume.
+//! Timings are evidence about this fixture, not proof about another store.
 
 use super::*;
 use std::time::{Duration, Instant};
 
 const ISSUES: usize = 5_000;
 const UNRELATED: usize = 50_000;
-const VISITS: u64 = 5_005; // Inclusive paging revisits each of five boundary rows.
 
 async fn file_fixture(path: &Path) -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let rt = KhiveRuntime::new(RuntimeConfig {
@@ -49,23 +49,23 @@ fn paged_gh(repo: &Path, bin: &Path, logs: &Path) {
                 "labels":[],"body":"Already stored fixture issue."})
         })
         .collect();
-    let mut arms = String::new();
-    let mut first = 0;
-    let mut floor = "sort:updated-asc".to_string();
-    loop {
-        let end = (first + 1_000).min(rows.len());
-        let file = logs.join(format!("page-{first}.json"));
-        std::fs::write(&file, serde_json::to_vec(&rows[first..end]).unwrap()).unwrap();
+    let rows_file = logs.join("issues.jsonl");
+    std::fs::write(
+        &rows_file,
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let mut arms = "    'sort:updated-asc') first=1 ;;\n".to_owned();
+    for first in 0..ISSUES {
         arms.push_str(&format!(
-            "    {}) cat {} ;;\n",
-            shell_quote(&floor),
-            shell_quote(file.to_str().unwrap())
+            "    {}) first={} ;;\n",
+            shell_quote(&format!("sort:updated-asc updated:>={}", timestamp(first))),
+            first + 1
         ));
-        if end == rows.len() {
-            break;
-        }
-        first = end - 1;
-        floor = format!("sort:updated-asc updated:>={}", timestamp(first));
     }
     let script = format!(
         r#"#!/bin/sh
@@ -89,7 +89,11 @@ printf '%s\n' "$search" >> {log}
 case "$search" in
 {arms}    *) printf '%s\n' 'unexpected fixture floor' >&2; exit 5 ;;
 esac
+printf '['
+sed -n "${{first}},$((first + 999))p" {rows_file} | paste -sd, -
+printf ']\n'
 "#,
+        rows_file = shell_quote(rows_file.to_str().unwrap()),
         log = shell_quote(logs.join("pages.log").to_str().unwrap())
     );
     // write_fake_gh already set the executable bit on this exact file.
@@ -113,7 +117,7 @@ fn reader_statements(project: Uuid) -> Vec<SqlStatement> {
     vec![
         stmt("git_digest_find_projects_by_slug", "SELECT id FROM entities WHERE kind='project' AND namespace=?1 AND deleted_at IS NULL AND json_extract(properties,'$.repo_slug')=?2 ORDER BY created_at ASC, id ASC", vec![ns.clone(),slug.clone()]),
         stmt("git_digest_find_projects_without_canonical_slug", "SELECT id, json_extract(properties,'$.repo_url') AS repo_url FROM entities WHERE kind='project' AND namespace=?1 AND deleted_at IS NULL AND json_extract(properties,'$.repo_url') IS NOT NULL AND (json_extract(properties,'$.repo_slug') IS NULL OR json_extract(properties,'$.repo_slug')<>?2) ORDER BY created_at ASC, id ASC", vec![ns.clone(),slug]),
-        stmt("git_ingest_read_cursor", "SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2", vec![id.clone(),SqlValue::Text("issues".into())]),
+        stmt("git_ingest_read_page_checkpoint", "SELECT (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2) AS floor, (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?3) AS progress", vec![id.clone(),SqlValue::Text("issues".into()),SqlValue::Text("issues_checkpoint".into())]),
         stmt("git_ingest_find_by_number", "SELECT id FROM notes WHERE kind=?1 AND namespace=?2 AND deleted_at IS NULL AND json_extract(properties,'$.number')=?3 AND json_extract(properties,'$.project_id')=?4 LIMIT 1", vec![SqlValue::Text("issue".into()),ns.clone(),SqlValue::Integer(ISSUES as i64),id.clone()]),
         stmt("git_ingest_count_commit_notes", "SELECT COUNT(*) FROM notes n JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace WHERE n.kind = 'commit' AND n.namespace = ?1 AND n.deleted_at IS NULL AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL", vec![ns,id]),
     ]
@@ -137,7 +141,7 @@ async fn query_plans(rt: &KhiveRuntime, project: Uuid) {
     // SqlReader (and queue-backed SqlWriter::explain) correctly refuses an
     // INSERT capability, even under EXPLAIN. Use only this fixture's raw
     // connection for its write plan. EXPLAIN never executes the cursor write.
-    let query = stmt("git_ingest_write_cursor", "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) VALUES(?1, ?2, ?3, ?4) ON CONFLICT(project_id, kind) DO UPDATE SET cursor_value=excluded.cursor_value, updated_at=excluded.updated_at", vec![SqlValue::Text(project.to_string()),SqlValue::Text("issues".into()),SqlValue::Text(timestamp(ISSUES-1)),SqlValue::Integer(0)]);
+    let query = stmt("git_ingest_write_page_checkpoint", "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) VALUES(?1, ?2, ?3, ?4), (?1, ?5, ?6, ?4) ON CONFLICT(project_id, kind) DO UPDATE SET cursor_value=excluded.cursor_value, updated_at=excluded.updated_at", vec![SqlValue::Text(project.to_string()),SqlValue::Text("issues_checkpoint".into()),SqlValue::Text("{}".into()),SqlValue::Integer(0),SqlValue::Text("issues".into()),SqlValue::Text(timestamp(ISSUES-1))]);
     let writer = rt.backend().pool().try_writer().unwrap();
     let mut prepared = writer
         .conn()
@@ -145,7 +149,14 @@ async fn query_plans(rt: &KhiveRuntime, project: Uuid) {
         .unwrap();
     let plan: Vec<Value> = prepared
         .query_map(
-            (project.to_string(), "issues", timestamp(ISSUES - 1), 0_i64),
+            (
+                project.to_string(),
+                "issues_checkpoint",
+                "{}",
+                0_i64,
+                "issues",
+                timestamp(ISSUES - 1),
+            ),
             |row| {
                 Ok(
                     json!({"id": row.get::<_, i64>(0)?, "parent": row.get::<_, i64>(1)?,
@@ -185,15 +196,16 @@ async fn digest_scale_existing_tracker() {
         "DIGEST_SCALE_CONTROLS {}",
         json!({
         "issues":ISSUES,"unrelated_notes":UNRELATED,"unrelated_kind":"observation",
-        "namespace":"local","expected_visits":VISITS,"expected_pages":6,
+        "namespace":"local","expected_visits":"min(effective max_items, 5000); acknowledged boundary rows cost no lookup",
         "max_items":[10,200,20000],"new_creates_expected":0,
-        "deadline_seconds":30,"timing_assertions":false,
+        "deadline_seconds":30,"timing_assertions":"scoped max_items=10 first and resumed call each below 30s",
         "cursor":"absent/full-history-replay; cleared before each arm",
         "seed_shape":"minimal issue properties number/project_id plus annotates edges; small content; no live-store import",
         "background_index_scope":"observation notes share namespace but not the issue kind index range",
         "failure_observability":"terminal error only; first failing SQL and visited count unavailable on error",
         "hold_observability":"maximum since each fresh pool opened, including disclosed bootstrap maximum",
-        "expectation":"unscoped core completes with all existing; scoped verb either completes or reports actual deadline failure; no production fix inferred from source alone"})
+        "baseline":"28d8c58d9: all six arms Ok in about 11.3s, 5005 visits each; original timeout not reproduced",
+        "expectation":"existing visits are bounded; incomplete windows stop early; second scoped max10 call reloads the database and visits the next ten records"})
     );
 
     let project;
@@ -307,13 +319,84 @@ async fn digest_scale_existing_tracker() {
             match result {
                 Ok(report) => {
                     assert_eq!(report["issues_ingested"], 0);
-                    assert_eq!(report["issues_skipped_existing"], VISITS);
-                    assert_eq!(report["sources"]["issues"]["state"], "completed");
-                    assert_eq!(pages, 6);
+                    let effective = if scoped {
+                        max_items.min(2000)
+                    } else {
+                        max_items
+                    };
+                    let expected = effective.min(ISSUES as u64);
+                    assert_eq!(report["issues_skipped_existing"], expected);
+                    assert_eq!(
+                        report["sources"]["issues"]["state"],
+                        if expected < ISSUES as u64 {
+                            "stopped_early"
+                        } else {
+                            "completed"
+                        }
+                    );
+                    assert_eq!(report["done"], expected == ISSUES as u64);
+                    let expected_pages = if expected <= 1000 {
+                        1
+                    } else {
+                        (expected as usize - 1001) / 999 + 2
+                    };
+                    assert_eq!(pages, expected_pages);
+                    assert_eq!(
+                        read_git_cursor(&rt, project, "issues").await,
+                        Some(timestamp(expected as usize - 1))
+                    );
                 }
                 Err(error) => {
                     failures.push(format!("max_items={max_items} scoped={scoped}: {error}"))
                 }
+            }
+            if scoped && max_items == 10 {
+                assert!(
+                    elapsed < Duration::from_secs(30),
+                    "first max10 call: {elapsed:?}"
+                );
+                drop(registry);
+                drop(token);
+                drop(rt);
+                // Reconstruct the pool/registry: continuation must come from
+                // disk, never this invocation's in-memory checkpoint.
+                let (rt, _token, registry) = file_fixture(&db).await;
+                assert_eq!(
+                    read_git_cursor(&rt, project, "issues").await,
+                    Some(timestamp(9))
+                );
+                std::fs::write(logs.join("pages.log"), "").unwrap();
+                let started = Instant::now();
+                let resumed = khive_storage::scope_request_read_deadline(
+                    Duration::from_secs(30),
+                    registry.dispatch(
+                        "git.digest",
+                        json!({"source":"https://github.com/fixture/repository",
+                        "include":["issues"],"max_items":10}),
+                    ),
+                )
+                .await
+                .unwrap();
+                let elapsed = started.elapsed();
+                let cursor = read_git_cursor(&rt, project, "issues").await;
+                let searches = std::fs::read_to_string(logs.join("pages.log")).unwrap();
+                println!(
+                    "DIGEST_SCALE_RESUME {}",
+                    json!({"elapsed_ms":elapsed.as_secs_f64()*1000.0,
+                    "cursor_before":timestamp(9),"cursor_after":cursor,"searches":searches,"result":resumed})
+                );
+                assert!(
+                    elapsed < Duration::from_secs(30),
+                    "resumed max10 call: {elapsed:?}"
+                );
+                assert_eq!(resumed["issues_skipped_existing"], 10);
+                assert_eq!(resumed["issues_ingested"], 0);
+                assert_eq!(resumed["sources"]["issues"]["state"], "stopped_early");
+                assert_eq!(cursor, Some(timestamp(19)));
+                assert_eq!(
+                    searches.lines().collect::<Vec<_>>(),
+                    vec![format!("sort:updated-asc updated:>={}", timestamp(9))]
+                );
             }
         }
     }
