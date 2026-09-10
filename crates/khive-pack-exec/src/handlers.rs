@@ -339,6 +339,7 @@ struct Receipt {
     tree_out: Option<String>,
     exit_code: Option<i64>,
     exit_signal: Option<i64>,
+    limiting_resource: Option<&'static str>,
     timed_out: bool,
     denied: bool,
     success: bool,
@@ -378,6 +379,7 @@ impl Receipt {
             "tree_out": self.tree_out,
             "exit_code": self.exit_code,
             "exit_signal": self.exit_signal,
+            "limiting_resource": self.limiting_resource,
             "timed_out": self.timed_out,
             "denied": self.denied,
             "success": self.success,
@@ -523,6 +525,7 @@ pub async fn run(
         tree_out: None,
         exit_code: None,
         exit_signal: None,
+        limiting_resource: None,
         timed_out: false,
         denied: false,
         success: false,
@@ -945,7 +948,18 @@ async fn execute(
     let err_task = tokio::spawn(async move { drain(stderr, cap).await });
 
     let status = match tokio::time::timeout(req.timeout, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
+        Ok(Ok(status)) => {
+            use std::os::unix::process::ExitStatusExt;
+            // Only the delivered signal for a configured limit is observable
+            // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
+            // resource evidence; timeout keeps the initial explicit null.
+            receipt.limiting_resource = match status.signal() {
+                Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
+                Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
+                _ => None,
+            };
+            Some(status)
+        }
         Ok(Err(_)) => None,
         Err(_) => {
             receipt.timed_out = true;

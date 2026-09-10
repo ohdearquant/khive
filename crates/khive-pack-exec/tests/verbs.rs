@@ -7,7 +7,7 @@ use khive_pack_blob::BlobPack;
 use khive_pack_exec::ExecPack;
 use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
-use khive_runtime::engine_config::ExecSectionConfig;
+use khive_runtime::engine_config::{ExecLimitsConfig, ExecSectionConfig};
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
@@ -23,6 +23,10 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with_keep(keep: bool) -> Fixture {
+    fixture_with_limits(keep, ExecLimitsConfig::default())
+}
+
+fn fixture_with_limits(keep: bool, limits: ExecLimitsConfig) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
@@ -37,7 +41,7 @@ fn fixture_with_keep(keep: bool) -> Fixture {
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
             keep,
-            limits: Default::default(),
+            limits,
         },
         // No embedding model: tool.register would otherwise build the default
         // embedder, which needs a model file the test host may not have.
@@ -1658,4 +1662,197 @@ async fn run_denies_version_control_and_the_never_set_at_the_kernel() {
             "{cmd}: the kernel refusal is in stderr: {stderr:?}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+const LIMIT_SPIN: &str = "while :; do :; done";
+
+#[cfg(target_os = "macos")]
+fn observable_limits() -> ExecLimitsConfig {
+    ExecLimitsConfig {
+        cpu_seconds: Some(1),
+        file_size: Some(1024),
+        ..Default::default()
+    }
+}
+
+/// Check the JSON key itself: indexing a missing key also produces Value::Null.
+#[cfg(target_os = "macos")]
+async fn check_limiting_resource(f: &Fixture, receipt: &Value, expected: Value) {
+    assert_eq!(
+        receipt.get("limiting_resource"),
+        Some(&expected),
+        "{receipt}"
+    );
+    let stored = f.call("exec.receipt", json!({"id": receipt["id"]})).await;
+    assert_eq!(&stored, receipt, "returned and persisted receipt agree");
+    assert_eq!(stored.get("limiting_resource"), Some(&expected));
+    let runs = f.call("exec.runs", json!({"actor": "local"})).await;
+    let listed = runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == receipt["id"])
+        .expect("receipt listed");
+    assert_eq!(listed.get("limiting_resource"), Some(&expected));
+    assert!(root_is_empty(f), "run directory and profile are cleaned up");
+}
+
+#[cfg(target_os = "macos")]
+async fn limit_run(f: &Fixture, script: &str, timeout_s: f64) -> Value {
+    f.register_sh("limit-sh", "allow").await;
+    let tree = f.tree(&[]).await;
+    f.call(
+        "exec.run",
+        json!({"tree": tree, "tool": "limit-sh", "args": ["-c", script],
+               "actor": "local", "timeout_s": timeout_s}),
+    )
+    .await["receipt"]
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_cpu_seconds_observed_on_wait() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, LIMIT_SPIN, 9.0).await;
+    assert_eq!(r["timed_out"], false, "{r}");
+    assert_eq!(r["exit_signal"], libc::SIGXCPU, "{r}");
+    // Signal termination retains the existing null exit_code representation.
+    assert!(r["exit_code"].is_null(), "{r}");
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["limits"]["enforced"]["cpu_seconds"], 1, "{r}");
+    check_limiting_resource(&f, &r, json!("cpu_seconds")).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_file_size_observed_on_wait() {
+    let f = fixture_with_limits(false, observable_limits());
+    // exec preserves the directly waited PID. The default signal disposition
+    // of yes avoids a shell translating its child's signal to an exit code.
+    let r = limit_run(&f, "exec /usr/bin/yes > capped", 9.0).await;
+    assert_eq!(r["timed_out"], false, "{r}");
+    assert_eq!(r["exit_signal"], libc::SIGXFSZ, "{r}");
+    assert!(r["exit_code"].is_null(), "{r}");
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["limits"]["enforced"]["file_size"], 1024, "{r}");
+    check_limiting_resource(&f, &r, json!("file_size")).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_exit_zero_is_present_null() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, "exit 0", 5.0).await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["timed_out"], false, "{r}");
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_sigterm_is_present_null() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, "kill -TERM $$", 5.0).await;
+    assert_eq!(r["exit_signal"], libc::SIGTERM, "{r}");
+    assert_eq!(r["timed_out"], false, "{r}");
+    assert_eq!(r["success"], false, "{r}");
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_timeout_is_present_null() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, "exec /bin/sleep 5", 0.2).await;
+    assert_eq!(r["timed_out"], true, "{r}");
+    assert_eq!(r["success"], false, "{r}");
+    assert!(r["exit_signal"].is_null(), "{r}");
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_spin_without_cpu_limit_reaches_timeout() {
+    let f = fixture();
+    let r = limit_run(&f, LIMIT_SPIN, 0.2).await;
+    assert_eq!(r["timed_out"], true, "no CPU limit ended this child: {r}");
+    assert!(r["limits"]["requested"].get("cpu_seconds").is_none());
+    assert!(r["limits"]["enforced"].get("cpu_seconds").is_none());
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_requires_the_matching_configured_limit() {
+    for (script, signal, limits) in [
+        (
+            "kill -XCPU $$",
+            libc::SIGXCPU,
+            ExecLimitsConfig {
+                file_size: Some(1024),
+                ..Default::default()
+            },
+        ),
+        (
+            "kill -XFSZ $$",
+            libc::SIGXFSZ,
+            ExecLimitsConfig {
+                cpu_seconds: Some(1),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let f = fixture_with_limits(false, limits);
+        let r = limit_run(&f, script, 5.0).await;
+        assert_eq!(r["exit_signal"], signal, "{r}");
+        assert_eq!(r["timed_out"], false, "{r}");
+        check_limiting_resource(&f, &r, Value::Null).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_generic_sigkill_is_present_null() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, "kill -KILL $$", 5.0).await;
+    assert_eq!(r["exit_signal"], libc::SIGKILL, "{r}");
+    assert_eq!(r["timed_out"], false, "{r}");
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn limiting_resource_nonzero_exit_is_present_null() {
+    let f = fixture_with_limits(false, observable_limits());
+    let r = limit_run(&f, "exit 7", 5.0).await;
+    assert_eq!(r["exit_code"], 7, "{r}");
+    assert!(r["exit_signal"].is_null(), "{r}");
+    assert_eq!(r["success"], false, "{r}");
+    check_limiting_resource(&f, &r, Value::Null).await;
+}
+
+#[tokio::test]
+async fn limiting_resource_refusal_is_present_null() {
+    let f = fixture();
+    let tree = f.tree(&[]).await;
+    let error = f
+        .call_err(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "unregistered-limit-tool", "actor": "local"
+            }),
+        )
+        .await;
+    assert!(error.contains("receipt_id="), "{error}");
+    let runs = f.call("exec.runs", json!({"actor": "local"})).await;
+    assert_eq!(runs["count"], 1, "{runs}");
+    let listed = &runs["runs"][0];
+    assert_eq!(listed["denied"], true);
+    assert_eq!(listed.get("limiting_resource"), Some(&Value::Null));
+    let stored = f.call("exec.receipt", json!({"id": listed["id"]})).await;
+    assert_eq!(stored.get("limiting_resource"), Some(&Value::Null));
+    assert!(root_is_empty(&f));
 }

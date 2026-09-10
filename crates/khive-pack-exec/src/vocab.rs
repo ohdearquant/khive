@@ -94,7 +94,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.run",
-        description: "Run one registered tool over a materialized tree inside the seatbelt sandbox under tool.check; returns {receipt, changed}. Every refusal writes a receipt and names it in the error as receipt_id=<id>.",
+        description: "Run one registered tool over a materialized tree inside the seatbelt sandbox under tool.check; returns {receipt, changed}. Every refusal writes a receipt and names it in the error as receipt_id=<id>. New receipts always include limiting_resource: cpu_seconds | address_space | file_size | nproc | null. Only a directly waited SIGXCPU with cpu_seconds configured or SIGXFSZ with file_size configured names a resource; normal exits, other signals and timeout record null. Child ENOMEM/EAGAIN are not visible to the wrapper, so address_space and nproc remain null (and are refused at startup on macOS). Older stored receipts are unchanged.",
         visibility: Visibility::Verb,
         category: VerbCategory::Directive,
         params: &[
@@ -112,7 +112,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.receipt",
-        description: "Read one run receipt by id.",
+        description: "Read one run receipt by id. New receipts always include limiting_resource: cpu_seconds | address_space | file_size | nproc | null. Only a directly waited SIGXCPU with cpu_seconds configured or SIGXFSZ with file_size configured names a resource; normal exits, other signals and timeout record null. Child ENOMEM/EAGAIN are not visible to the wrapper, so address_space and nproc remain null (and are refused at startup on macOS). Older stored receipts are unchanged.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
