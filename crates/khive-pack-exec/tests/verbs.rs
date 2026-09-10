@@ -787,6 +787,130 @@ async fn run_refuses_symlink_cwd_escapes_and_cycles_before_materialization() {
     }
 }
 
+async fn cwd_preflight_refusal(f: &Fixture, tree: &str, cwd: &str) -> String {
+    let error = f
+        .call_err(
+            "exec.run",
+            json!({"tree":tree,"tool":"sh","args":["-c","true"],
+                "actor":"local","cwd":cwd}),
+        )
+        .await;
+    let id = error
+        .split("receipt_id=")
+        .nth(1)
+        .expect("refusal names its durable receipt")
+        .trim_end_matches(')');
+    let receipt = f.call("exec.receipt", json!({"id":id})).await;
+    assert_eq!(receipt["denied"], true, "{receipt}");
+    assert_eq!(receipt["success"], false);
+    assert_eq!(receipt["decision"]["decision"], "allow");
+    assert!(receipt["started_at"].is_null());
+    assert!(receipt["exit_code"].is_null());
+    assert!(receipt["tree_out"].is_null());
+    let reason = receipt["reason"]
+        .as_str()
+        .expect("preflight refusal reason");
+    assert!(
+        reason.contains("cwd") && reason.contains("symlink"),
+        "{reason}"
+    );
+    assert!(error.contains(reason), "{error}");
+    assert!(root_is_empty(f), "preflight must not materialize anything");
+    assert_eq!(
+        f.call("exec.events", json!({"run_id":id})).await["count"],
+        0
+    );
+    reason.to_string()
+}
+
+#[tokio::test]
+async fn run_refuses_oversized_symlink_cwd_target_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/".repeat(1024 * 1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(
+        reason.contains("target") && reason.contains("read"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("65536") && reason.contains("bytes"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cycle"), "{reason}");
+}
+
+#[tokio::test]
+async fn run_refuses_raw_cwd_path_budgets_before_materialization() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("dir/file", b"unchanged", 644)]).await;
+    for (cwd, unit) in [
+        ("x".repeat(64 * 1024 + 1), "bytes"),
+        (format!("dir{}", "/".repeat(1024)), "components"),
+    ] {
+        let reason = cwd_preflight_refusal(&f, &tree, &cwd).await;
+        assert!(
+            reason.contains("path exceeds") && reason.contains(unit),
+            "{reason}"
+        );
+        assert!(!reason.contains("cycle"), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn run_bounds_raw_symlink_components_and_skips_pending_noops() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/".repeat(1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(
+        reason.contains("path exceeds") && reason.contains("components"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cycle"), "{reason}");
+
+    for suffix in ["/", "/."] {
+        let target = format!("link{}", suffix.repeat(1023));
+        let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+        let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+        assert!(reason.contains("cycle"), "{reason}");
+        assert!(!reason.contains("budget"), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn run_refuses_symlink_cwd_pending_component_budget_before_cycle() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link{}", "/..".repeat(1023));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(reason.contains("pending component budget"), "{reason}");
+    assert!(reason.contains("4096"), "{reason}");
+    assert!(!reason.contains("cycle"), "{reason}");
+}
+
+#[tokio::test]
+async fn run_refuses_symlink_cwd_pending_byte_budget_before_cycle() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let target = format!("link/{}", "x".repeat(32 * 1024));
+    let tree = f.tree(&[("link", target.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, "link").await;
+    assert!(reason.contains("pending byte budget"), "{reason}");
+    assert!(reason.contains("262144"), "{reason}");
+    assert!(!reason.contains("cycle"), "{reason}");
+
+    let name = "x".repeat(32 * 1024);
+    let tree = f.tree(&[(name.as_str(), name.as_bytes(), 120000)]).await;
+    let reason = cwd_preflight_refusal(&f, &tree, &name).await;
+    assert!(reason.contains("cycle"), "{reason}");
+    assert!(!reason.contains("budget"), "{reason}");
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_resolves_relative_symlink_cwd_chains_inside_the_manifest() {

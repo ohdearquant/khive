@@ -17,6 +17,12 @@ use crate::vocab::TREE_SCHEMA;
 /// Largest manifest the pack will read back.
 pub const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
+// Preflight has no child timeout: bound both each expansion and retained work.
+const MAX_CWD_PATH_BYTES: usize = 64 * 1024;
+const MAX_CWD_PATH_COMPONENTS: usize = 1024;
+const MAX_CWD_PENDING_BYTES: usize = 256 * 1024;
+const MAX_CWD_PENDING_COMPONENTS: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
     pub path: String,
@@ -60,10 +66,66 @@ pub fn validate_relative_path(path: &str, what: &str) -> Result<String, RuntimeE
 /// Validate a working directory relative to the tree root. `.` and the empty
 /// string mean the root; anything else must be a normalized relative path.
 pub fn validate_cwd(cwd: &str) -> Result<String, RuntimeError> {
+    cwd_component_cost(cwd)?;
     if cwd.is_empty() || cwd == "." {
         return Ok(".".to_string());
     }
     validate_relative_path(cwd, "cwd")
+}
+
+fn cwd_component_cost(path: &str) -> Result<(usize, usize), RuntimeError> {
+    if path.len() > MAX_CWD_PATH_BYTES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "cwd symlink resolution path exceeds {MAX_CWD_PATH_BYTES} bytes"
+        )));
+    }
+    let mut queued_components = 0;
+    let mut queued_bytes = 0;
+    for (index, part) in path.split('/').enumerate() {
+        if index >= MAX_CWD_PATH_COMPONENTS {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cwd symlink resolution path exceeds {MAX_CWD_PATH_COMPONENTS} components"
+            )));
+        }
+        if !part.is_empty() && part != "." {
+            queued_components += 1;
+            queued_bytes += part.len();
+        }
+    }
+    Ok((queued_components, queued_bytes))
+}
+
+fn prepend_cwd_components(
+    pending: &mut VecDeque<String>,
+    pending_bytes: &mut usize,
+    path: &str,
+) -> Result<(), RuntimeError> {
+    let (components, bytes) = cwd_component_cost(path)?;
+    pending
+        .len()
+        .checked_add(components)
+        .filter(|count| *count <= MAX_CWD_PENDING_COMPONENTS)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "cwd symlink resolution pending component budget exceeds {MAX_CWD_PENDING_COMPONENTS}"
+            ))
+        })?;
+    let total_bytes = pending_bytes
+        .checked_add(bytes)
+        .filter(|count| *count <= MAX_CWD_PENDING_BYTES)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "cwd symlink resolution pending byte budget exceeds {MAX_CWD_PENDING_BYTES}"
+            ))
+        })?;
+    // Validate the entire expansion before allocating any owned components.
+    for part in path.split('/').rev() {
+        if !part.is_empty() && part != "." {
+            pending.push_front(part.to_string());
+        }
+    }
+    *pending_bytes = total_bytes;
+    Ok(())
 }
 
 /// Resolve cwd against the immutable manifest before materialization. Only
@@ -92,21 +154,20 @@ pub async fn resolve_cwd(
         })
         .collect();
     let store = blob_store(rt)?;
-    let mut pending: VecDeque<String> = cwd.split('/').map(str::to_string).collect();
+    let mut pending = VecDeque::new();
+    let mut pending_bytes = 0;
+    prepend_cwd_components(&mut pending, &mut pending_bytes, &cwd)?;
     let mut resolved: Vec<String> = Vec::new();
     let mut expansions = 0;
     while let Some(component) = pending.pop_front() {
-        match component.as_str() {
-            "" | "." => continue,
-            ".." => {
-                if resolved.pop().is_none() {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "cwd {cwd:?} symlink target escapes the tree root"
-                    )));
-                }
-                continue;
+        pending_bytes -= component.len();
+        if component == ".." {
+            if resolved.pop().is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cwd {cwd:?} symlink target escapes the tree root"
+                )));
             }
-            _ => {}
+            continue;
         }
         let path = if resolved.is_empty() {
             component.clone()
@@ -128,8 +189,13 @@ pub async fn resolve_cwd(
             let reference = ContentRef::from_hex(&entry.content_ref)
                 .map_err(|e| RuntimeError::InvalidInput(format!("cwd entry {path:?}: {e}")))?;
             let bytes = store
-                .get_bounded_verified(&reference, khive_storage::MAX_BLOB_WHOLE_BYTES)
-                .await?;
+                .get_bounded_verified(&reference, MAX_CWD_PATH_BYTES as u64)
+                .await
+                .map_err(|e| {
+                    RuntimeError::InvalidInput(format!(
+                        "cwd symlink target at {path:?} cannot be read within {MAX_CWD_PATH_BYTES} bytes: {e}"
+                    ))
+                })?;
             let target = std::str::from_utf8(&bytes).map_err(|_| {
                 RuntimeError::InvalidInput(format!(
                     "cwd entry {path:?} target cannot name a UTF-8 manifest directory"
@@ -146,9 +212,7 @@ pub async fn resolve_cwd(
                 )));
             }
             // A relative target starts in the link's parent, not at the link.
-            for part in target.split('/').rev() {
-                pending.push_front(part.to_string());
-            }
+            prepend_cwd_components(&mut pending, &mut pending_bytes, target)?;
         } else if directories.contains(path.as_str()) {
             resolved.push(component);
         } else {
@@ -379,6 +443,67 @@ mod tests {
         );
         assert_eq!(validate_cwd("").unwrap(), ".");
         assert!(validate_cwd("package/../package").is_err());
+    }
+
+    #[test]
+    fn cwd_component_cost_bounds_raw_paths_before_skipping_noops() {
+        let bytes = "a".repeat(MAX_CWD_PATH_BYTES);
+        assert_eq!(cwd_component_cost(&bytes).unwrap(), (1, bytes.len()));
+        assert!(cwd_component_cost(&(bytes + "a")).is_err());
+
+        let components = "/".repeat(MAX_CWD_PATH_COMPONENTS - 1);
+        assert_eq!(cwd_component_cost(&components).unwrap(), (0, 0));
+        assert!(cwd_component_cost(&(components + "/")).is_err());
+    }
+
+    #[test]
+    fn cwd_queue_bounds_components_before_mutation() {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        let path = vec!["a"; MAX_CWD_PATH_COMPONENTS].join("/");
+        for _ in 0..MAX_CWD_PENDING_COMPONENTS / MAX_CWD_PATH_COMPONENTS {
+            prepend_cwd_components(&mut pending, &mut bytes, &path).unwrap();
+        }
+        assert_eq!(pending.len(), MAX_CWD_PENDING_COMPONENTS);
+        assert_eq!(bytes, MAX_CWD_PENDING_COMPONENTS);
+        let before = pending.clone();
+        let error = prepend_cwd_components(&mut pending, &mut bytes, "a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pending component budget"), "{error}");
+        assert_eq!(pending, before);
+        assert_eq!(bytes, MAX_CWD_PENDING_COMPONENTS);
+    }
+
+    #[test]
+    fn cwd_queue_bounds_bytes_before_mutation() {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        let path = "a".repeat(MAX_CWD_PATH_BYTES);
+        for _ in 0..MAX_CWD_PENDING_BYTES / MAX_CWD_PATH_BYTES {
+            prepend_cwd_components(&mut pending, &mut bytes, &path).unwrap();
+        }
+        assert_eq!(bytes, MAX_CWD_PENDING_BYTES);
+        let before = pending.clone();
+        let error = prepend_cwd_components(&mut pending, &mut bytes, "a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pending byte budget"), "{error}");
+        assert_eq!(pending, before);
+        assert_eq!(bytes, MAX_CWD_PENDING_BYTES);
+    }
+
+    #[test]
+    fn cwd_queue_skips_noops_without_reordering_parent_components() {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        prepend_cwd_components(&mut pending, &mut bytes, "tail").unwrap();
+        prepend_cwd_components(&mut pending, &mut bytes, "first//./../second/.").unwrap();
+        assert_eq!(
+            pending,
+            VecDeque::from(["first", "..", "second", "tail"].map(str::to_string))
+        );
+        assert_eq!(bytes, 17);
     }
 
     #[test]
