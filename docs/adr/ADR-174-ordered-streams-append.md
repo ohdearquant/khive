@@ -679,3 +679,112 @@ acceptance 2.
    compiled as `version = 0`, arm 1 goes red. With the null check moved after the first insert, arm 2's
    statement-trace assertion goes red (Amendment 3 A3.3: the trace is the order control, the unchanged
    counts are the rollback control). Both runs quoted with exit codes.
+
+## Amendment 5 (2026-09-10): an `observed` entry may assert that a document's time field is still in the future, and write members return their write time
+
+**Status**: Proposed.
+
+### The gap
+
+Amendment 4 lets a caller pin what it read: an `observed` entry with a version holds only while the
+document it checked is still the document there, because a keyed note's version moves on every write
+to it. That closes every race in which the competing writer changes the document. It does not close
+the one in which nobody writes. A lease that merely runs out changes no document, so it bumps no
+version, so every observation still holds, and a batch composed under a lease that expired between the
+caller's read and the commit is written as if the lease were live. The consumer's own store evaluated
+the lease's expiry against the clock of the transaction doing the writing; the khive route evaluates
+it against the clock of the read that preceded the request, and the window is the request itself. Its
+suite has the arm: a lease written to expire in one second, the batch dispatched after that second
+with no writer touching the head, and the contract's stale-generation refusal expected. Today the
+batch commits.
+
+The caller cannot close this by reading again, because the read and the write would still be two
+transactions. The check has to run on the writer's clock inside the transaction that writes, which is
+where the other `observed` checks already run. The document's shape is the caller's, so the caller
+names the field.
+
+### A5.1 `live_until`
+
+An `observed` entry may carry `live_until`:
+
+```json
+{"key": K, "kind": <note kind>, "version": V, "live_until": "<field path>"}
+```
+
+- `live_until` names a field in the observed note's document (the keyed `doc` of ADR-172 §3, as
+  written) by a dotted path, `"expires_at"` or `"lease.expires_at"`. The entry holds when the live
+  note of that kind holding `K` in the caller's primary namespace is at exactly version `V` **and**
+  the named field holds an RFC 3339 timestamp strictly later than the transaction's clock.
+- The transaction's clock is one reading, taken by the writer transaction before the first `observed`
+  check and shared by every entry in the list. It is never the caller's clock and never the request's
+  arrival time.
+- A field that is absent, or whose value is not an RFC 3339 timestamp, refuses the batch with
+  `live_until_unreadable`, `details` naming the key, the field and the value found; nothing is
+  written. A liveness the entry cannot read is not a liveness it may assume.
+- A timestamp at or before the transaction's clock refuses the batch with `expired`, `details`
+  naming the key, the field, the value found and the clock reading (`now`) it was compared with, so
+  the caller can see the window it lost; nothing is written.
+- `live_until` requires a version. With `version: null` the entry is `invalid_input` before any
+  member writes: an absent document has no field to read.
+- Everything else about `observed` stands: atomic mode only, refused with `invalid_input` in
+  per-member mode, every entry checked inside the writer transaction before the first write, the
+  version half refusing exactly as Amendment 1 and Amendment 4 say.
+
+No predicate on the field's meaning is added. khive compares one timestamp with one clock; whether the
+field is a lease expiry, a handle deadline or anything else is the caller's convention, as the fence
+key's convention is (§2 alternatives, "the layer that owns the convention passes the fence").
+
+### A5.2 `updated_at` on write member results
+
+A `write` member's result is `{"id": <id>, "version": <v>, "updated_at": <timestamp>}`, for a create
+and for an update alike, where `updated_at` is the write's own time as the note row records it in that
+transaction (ISO 8601 with microseconds, the form `created_at` already takes on append results). The
+consumer's head record carries the write's own timestamp, and without this field the caller has to
+read the head back and may only trust the time while the version it finds is still the one it wrote.
+A result field is a value; a later writer moving the version does not change it.
+
+### A5.3 The `observed` help names its mode
+
+The `observed` parameter's own help states that it requires atomic mode and that supplying `observed`
+alone does not select it: `atomic` defaults to whether `fence` is present, and an `observed` list
+without `fence` and without `atomic=true` is refused with `invalid_input` naming the mode. The
+`atomic` help line says the same from its side. The behaviour is unchanged; the sentence was missing
+where the caller reads.
+
+### Acceptance
+
+Every arm names its command; atomic-mode counts are read as domain events only, as in Amendment 1
+acceptance 2.
+
+1. **Expired.** A keyed note holding `K` at version 1 whose document has `expires_at` one second in
+   the future; a batch carrying `{"key": K, "kind": <k>, "version": 1, "live_until": "expires_at"}`
+   dispatched after that second, with no writer touching the note, is refused with `expired`,
+   `details` naming `K`, `expires_at`, the value and `now` later than it; the note count, the ledger
+   count and every named stream's head are unchanged. The control is the same batch dispatched
+   before the second elapses, which commits every member.
+2. **Live and pinned.** With the field an hour in the future, the entry holds at version 1 and is
+   refused with `version_conflict` at version 2 after one intervening write; the version half is
+   unchanged by the presence of `live_until`.
+3. **Unreadable.** The same batch against a document with no `expires_at`, then against one whose
+   `expires_at` is the string `"soon"`, is refused with `live_until_unreadable` naming the field and
+   the value found, nothing written. The control is arm 2's live document.
+4. **Dotted path.** `live_until: "lease.expires_at"` reads a nested field; the control is the flat
+   path on the same document.
+5. **Null version.** `live_until` with `version: null` is `invalid_input` before any member writes.
+6. **Mixed list.** A version-only entry and a `live_until` entry in one list commit when both hold
+   and refuse naming the offending key when either does not, in both directions, nothing written.
+7. **The writer's clock.** Arm 1's refusal carries `now`; the statement trace (Amendment 3 A3.3)
+   shows the clock read inside the writer transaction, after the transaction opens and before the
+   first `observed` check, and the same reading serves every entry in the list.
+8. **`updated_at`.** A `write` member's result carries `updated_at`; a read of the note immediately
+   after shows the same value; a second writer moving the version does not change the first result.
+   Both create and update.
+9. **Help.** `stream.batch(help=true)` names the atomic-mode requirement under `observed` and the
+   `live_until` shape; `observed` without `fence` and without `atomic=true` is refused naming the
+   mode.
+10. **Cross-process.** Arms 1 and 2 through the socket, the expiry elapsing while a second OS
+    process holds the note, so the refusal is a real window and not a self-inflicted one.
+11. **Mutation.** With `live_until` treated as no check, arm 1 goes red. With the clock taken from
+    the request's arrival time instead of inside the transaction, arm 7's trace assertion goes red.
+    With an unreadable field treated as live, arm 3 goes red. With `updated_at` omitted, arm 8 goes
+    red. Each run quoted with its exit code.
