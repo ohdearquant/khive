@@ -860,6 +860,25 @@ Where the caller's own read already returns the identity, passing it costs nothi
 member's result carries `id` (§A5.2 adds `updated_at` beside it), and every read of a keyed note
 carries `id`. The recommended shape for a read-then-pin caller is therefore to pin both halves.
 
+### A6.3 Why the two halves of a batch differ, and where they stop differing
+
+The write path already settled this principle. A positive-version `write` member whose prepared
+target is deleted and recreated under the same `(kind, key)` before commit refuses with
+`version_conflict`, recorded in the correction above and served from the revision that carries it.
+So the position was never that a recreated key is an open question; it is that one half of a batch
+was fixed and the other half was not, and from that revision onward a batch can refuse a write
+against a replacement in the same transaction in which an observation validates against one.
+
+With `id` the halves agree: both refuse when the note they named is gone, each in the writer
+transaction, each naming the member or the entry that failed.
+
+One difference remains and it is deliberate. A `write` member always has a specific note as its
+target, so it has no unpinned form to offer. An `observed` entry does: `version: null` asserts that
+nobody holds the key, and a positive version without `id` asserts the key is at a version, which are
+both useful claims about a key rather than about a document. The write path cannot express them and
+does not need to. That is the whole of the asymmetry after this amendment: not a gap, a difference
+in what the two things are for.
+
 ### Alternatives considered
 
 **A generation that a create does not reset.** A per-key counter outliving the row would make the
