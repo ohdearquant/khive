@@ -1185,6 +1185,17 @@ attributed-event tests that exercise the event-count consumer, so a separate
 hard-coded consumer list cannot silently omit the new kind. Custom kinds outside
 that slice are not covered by this alias-separation guarantee.
 
+**Binding readback clarification (2026-09-10).** A successful binding write does
+not grant read visibility. For example, caller `service:writer` may bind an
+existing profile to `service:reader`, but its subsequent `brain.bindings()` still
+filters for `service:writer` and does not return that foreign binding.
+`brain.bindings(actor="service:reader")` fails with `InvalidInput` unless
+`service:reader` is in the caller's visible set. Even with that visibility, the
+explicit actor filter is required; default reads remain caller-scoped. Binding
+rows identify the target actor, not the writer, and there is no "created by me"
+read exception. A write/read check must therefore bind the caller's own actor,
+or explicitly read a foreign actor that is visible to the caller.
+
 ### Explicit aggregate event counts
 
 `brain.event_counts` accepts optional boolean `all_actors`, defaulting to false.
