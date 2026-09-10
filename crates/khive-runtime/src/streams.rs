@@ -4,7 +4,6 @@
 //! such transaction per member, in list order (per-member mode).
 use std::any::Any;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 
 use khive_storage::{
     AtomicUnitOp, Note, SqlAccess, SqlRow, SqlStatement, SqlValue, SqlWriter, StorageCapability,
@@ -18,8 +17,8 @@ use uuid::Uuid;
 use crate::atomic_message::{prepare_atomic_notes, AtomicNoteOptions, AtomicNoteSpec};
 use crate::atomic_plan::{PlanStatement, PostCommitEffect};
 use crate::atomic_runner::{
-    apply_plan, atomic_unit_error_allows_recorded_refusal, AtomicOpFailure, AtomicOpPlan,
-    CommittedPostCommitEffects,
+    apply_plan, run_prepared_atomic_unit, AtomicOpFailure, AtomicOpPlan,
+    CommittedPostCommitEffects, PreparedAtomicError, PreparedAtomicOp, PreparedAtomicOutcome,
 };
 use crate::note_write::{
     NoteFence, NoteFences, NoteWriteConflict, NoteWriteGuard, NoteWriteOptions,
@@ -288,9 +287,7 @@ async fn run_prepared_stream_batch(
     fence: Option<NoteFence>,
     observed: Vec<StreamObservation>,
 ) -> RuntimeResult<Result<(Vec<Value>, CommittedPostCommitEffects), StreamBatchRefusal>> {
-    let failure = Arc::new(Mutex::new(None::<BatchFailure>));
-    let recorded = Arc::clone(&failure);
-    let op: AtomicUnitOp = Box::new(move |writer| {
+    let op: PreparedAtomicOp<Vec<Value>, BatchFailure> = Box::new(move |writer| {
         Box::pin(async move {
             let guard = NoteWriteGuard {
                 namespace: namespace.clone(),
@@ -305,13 +302,13 @@ async fn run_prepared_stream_batch(
                 check_observed(writer, &namespace, &observed).await?
             };
             if let Some(error) = predicate_error {
-                *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
-                    member: None,
-                    error: error.into(),
+                return Err(PreparedAtomicError::Refused {
+                    failure: BatchFailure {
+                        member: None,
+                        error: error.into(),
+                    },
+                    message: "stream batch predicate refused".into(),
                 });
-                return Err(StorageError::Internal(
-                    "stream batch predicate refused".into(),
-                ));
             }
             let mut results = Vec::with_capacity(members.len());
             let mut effects = Vec::new();
@@ -327,11 +324,13 @@ async fn run_prepared_stream_batch(
                         create_key: None,
                     };
                     if let Some(conflict) = guard.check_fence(writer).await? {
-                        *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
-                            member: Some(member.index),
-                            error: conflict.into_error().into(),
+                        return Err(PreparedAtomicError::Refused {
+                            failure: BatchFailure {
+                                member: Some(member.index),
+                                error: conflict.into_error().into(),
+                            },
+                            message: "stream append fence refused".into(),
                         });
-                        return Err(StorageError::Internal("stream append fence refused".into()));
                     }
                 }
             }
@@ -345,42 +344,65 @@ async fn run_prepared_stream_batch(
                         }
                     }
                     Err(error) => {
-                        *recorded.lock().expect("stream failure slot") = Some(BatchFailure {
-                            member: Some(member.index),
-                            error,
+                        return Err(PreparedAtomicError::Refused {
+                            failure: BatchFailure {
+                                member: Some(member.index),
+                                error,
+                            },
+                            message: "stream batch member refused".into(),
                         });
-                        return Err(StorageError::Internal("stream batch member refused".into()));
                     }
                 }
             }
-            Ok(Box::new((results, effects)) as Box<dyn Any + Send>)
+            Ok((results, effects))
         })
     });
-    match access.atomic_unit(op).await {
-        Ok(payload) => {
-            let (results, effects) = *payload
-                .downcast::<(Vec<Value>, Vec<PostCommitEffect>)>()
-                .map_err(|_| RuntimeError::Internal("invalid stream batch outcome".into()))?;
-            Ok(Ok((results, CommittedPostCommitEffects::new(effects))))
-        }
-        Err(error) => {
-            if !atomic_unit_error_allows_recorded_refusal(&error) {
-                return Err(error.into());
-            }
-            let recorded = failure.lock().expect("stream failure slot").take();
-            match recorded {
-                Some(BatchFailure {
-                    member: Some(member),
-                    error: RuntimeError::Khive(error),
-                }) => Ok(Err(StreamBatchRefusal {
-                    member,
-                    error: place_member(error, Some(member))?,
-                })),
-                Some(BatchFailure { error, .. }) => Err(error),
-                None => Err(error.into()),
-            }
-        }
+    match run_prepared_atomic_unit(access, op).await? {
+        PreparedAtomicOutcome::Committed { value, post_commit } => Ok(Ok((value, post_commit))),
+        PreparedAtomicOutcome::RolledBack(BatchFailure {
+            member: Some(member),
+            error: RuntimeError::Khive(error),
+        }) => Ok(Err(StreamBatchRefusal {
+            member,
+            error: place_member(error, Some(member))?,
+        })),
+        PreparedAtomicOutcome::RolledBack(BatchFailure { error, .. }) => Err(error),
     }
+}
+
+enum SequenceRefusal {
+    Exhausted,
+    Conflict { expected: i64, next: i64 },
+}
+
+fn allocate_sequence(head: &mut i64, expected: Option<i64>) -> Result<i64, SequenceRefusal> {
+    let next = head.checked_add(1).ok_or(SequenceRefusal::Exhausted)?;
+    if let Some(expected) = expected.filter(|expected| *expected != next) {
+        return Err(SequenceRefusal::Conflict { expected, next });
+    }
+    *head = next;
+    Ok(next)
+}
+
+async fn insert_stream_entry(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    stream: String,
+    seq: i64,
+    note_id: String,
+) -> Result<(), StorageError> {
+    writer
+        .execute(statement(
+            "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
+            vec![
+                SqlValue::Text(namespace.into()),
+                SqlValue::Text(stream),
+                SqlValue::Integer(seq),
+                SqlValue::Text(note_id),
+            ],
+        ))
+        .await?;
+    Ok(())
 }
 
 async fn apply_stream_member(
@@ -401,29 +423,22 @@ async fn apply_stream_member(
                 "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
                 vec![SqlValue::Text(namespace.into()), SqlValue::Text(stream.clone())],
             )).await?;
-            let Some(SqlValue::Integer(head)) = head else {
+            let Some(SqlValue::Integer(mut head)) = head else {
                 return Err(RuntimeError::Internal("invalid stream head".into()));
             };
-            let next = head
-                .checked_add(1)
-                .ok_or_else(|| RuntimeError::InvalidInput("stream sequence exhausted".into()))?;
-            if let Some(expected) = expected_seq.filter(|expected| *expected != next) {
-                return Err(seq_conflict(&stream, expected, next, None).into());
-            }
+            let next =
+                allocate_sequence(&mut head, expected_seq).map_err(|refusal| match refusal {
+                    SequenceRefusal::Exhausted => {
+                        RuntimeError::InvalidInput("stream sequence exhausted".into())
+                    }
+                    SequenceRefusal::Conflict { expected, next } => {
+                        seq_conflict(&stream, expected, next, None).into()
+                    }
+                })?;
             let applied = apply_plan(writer, &plan, false).await.map_err(|error| {
                 RuntimeError::Internal(format!("stream append plan failed: {error:?}"))
             })?;
-            writer
-                .execute(statement(
-                    "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
-                    vec![
-                        SqlValue::Text(namespace.into()),
-                        SqlValue::Text(stream),
-                        SqlValue::Integer(next),
-                        SqlValue::Text(note.id.to_string()),
-                    ],
-                ))
-                .await?;
+            insert_stream_entry(writer, namespace, stream, next, note.id.to_string()).await?;
             Ok((
                 json!({"seq": next, "id": note.id, "created_at": micros_to_iso(note.created_at)}),
                 applied.effect,
@@ -570,13 +585,17 @@ impl KhiveRuntime {
                         .find(|(known, _)| known == stream)
                         .map(|(_, head)| head)
                         .ok_or_else(|| write_failure("stream head missing"))?;
-                    let next = head
-                        .checked_add(1)
-                        .ok_or_else(|| write_failure("stream sequence exhausted"))?;
-                    if expected_seq.is_some_and(|expected| expected != next) {
-                        return Ok(Box::new(BatchOutcome::Conflict { next }) as Box<dyn Any + Send>);
-                    }
-                    *head = next;
+                    let next = match allocate_sequence(head, *expected_seq) {
+                        Ok(next) => next,
+                        Err(SequenceRefusal::Exhausted) => {
+                            return Err(write_failure("stream sequence exhausted"));
+                        }
+                        Err(SequenceRefusal::Conflict { next, .. }) => {
+                            return Ok(
+                                Box::new(BatchOutcome::Conflict { next }) as Box<dyn Any + Send>
+                            );
+                        }
+                    };
                     assigned.push(next);
                 }
                 for ((stream, _, note_id, statements, _), seq) in
@@ -591,17 +610,7 @@ impl KhiveRuntime {
                             return Err(write_failure("prepared note write guard failed"));
                         }
                     }
-                    writer
-                        .execute(statement(
-                            "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
-                            vec![
-                                SqlValue::Text(ns.clone()),
-                                SqlValue::Text(stream),
-                                SqlValue::Integer(seq),
-                                SqlValue::Text(note_id),
-                            ],
-                        ))
-                        .await?;
+                    insert_stream_entry(writer, &ns, stream, seq, note_id).await?;
                 }
                 Ok(Box::new(BatchOutcome::Appended(assigned)) as Box<dyn Any + Send>)
             })

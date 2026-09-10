@@ -12,14 +12,14 @@
 //!
 //! # Safety: suspend-free invariant
 //!
-//! [`run_atomic_unit`] is the one place in this crate that builds an
-//! [`AtomicUnitOp`] closure for [`SqlAccess::atomic_unit`], whose contract
+//! [`run_prepared_atomic_unit`] owns the failure and commit protocol shared by
+//! the atomic-plan and stream-batch paths. It builds an [`AtomicUnitOp`]
+//! closure for [`SqlAccess::atomic_unit`], whose contract
 //! requires the closure's future to resolve on its first poll — synchronous
 //! DML against the provided `&mut dyn SqlWriter` only, never a suspending
-//! `.await`. Every statement driven here comes from
-//! `AtomicOpPlan::plan_statements`, which can only ever produce
-//! [`PlanStatement`]s (plain parameterized SQL), so no code path in this
-//! module can hand `atomic_unit` a suspending future. The paired
+//! `.await`. Prepared callbacks drive only parameterized statements, guards
+//! and stream-ledger reads through the provided writer. They must not perform
+//! asynchronous preparation or other I/O. The paired
 //! suspend-trap tests at the bottom of this file check both the happy-path
 //! (real commit pass resolves on first poll) and the misuse-is-caught case
 //! (a hand-built suspending closure fails loudly through the same seam). See
@@ -28,7 +28,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use khive_storage::{AtomicUnitOp, SqlAccess, SqlStatement, SqlWriter, StorageError};
+use khive_storage::{AtomicUnitOp, BoxFuture, SqlAccess, SqlStatement, SqlWriter, StorageError};
 
 use crate::atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernancePlan, GtdCompletePlan,
@@ -152,7 +152,7 @@ pub enum AtomicOpFailure {
 
 /// Deferred effects whose owning atomic unit has committed successfully.
 ///
-/// Only this crate's atomic and stream-batch commit owners construct this token.
+/// Only the shared prepared-unit commit owner constructs this token.
 /// Consumers may inspect
 /// its effects through [`CommittedPostCommitEffects::as_slice`], while the
 /// phase-3 executor takes the token by value; no public API exposes the owned
@@ -177,7 +177,7 @@ pub struct CommittedPostCommitEffects {
 }
 
 impl CommittedPostCommitEffects {
-    pub(crate) fn new(effects: Vec<PostCommitEffect>) -> Self {
+    fn new(effects: Vec<PostCommitEffect>) -> Self {
         Self { effects }
     }
 
@@ -441,10 +441,7 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
     plans: Vec<AtomicOpPlan>,
     capture_note_versions: bool,
 ) -> Result<(AtomicRunOutcome, Vec<i64>), AtomicRunnerError> {
-    let failure_slot: Arc<Mutex<Option<(usize, AtomicOpFailure)>>> = Arc::new(Mutex::new(None));
-    let failure_slot_for_closure = Arc::clone(&failure_slot);
-
-    let op: AtomicUnitOp = Box::new(move |writer| {
+    let op: PreparedAtomicOp<Vec<i64>, (usize, AtomicOpFailure)> = Box::new(move |writer| {
         Box::pin(async move {
             let mut post_commit = Vec::new();
             let mut note_versions = Vec::new();
@@ -471,50 +468,105 @@ pub(crate) async fn run_atomic_unit_with_note_versions(
                         // guarantee, only a diagnostic nicety.
                         let _ = rollback_to_savepoint(writer, &savepoint).await;
                         let _ = release_savepoint(writer, &savepoint).await;
-                        *failure_slot_for_closure
-                            .lock()
-                            .expect("atomic runner failure slot poisoned") =
-                            Some((op_index, failure));
-                        return Err(StorageError::Internal(format!(
-                            "ADR-099 atomic unit aborted at op {op_index}"
-                        )));
+                        return Err(PreparedAtomicError::Refused {
+                            failure: (op_index, failure),
+                            message: format!("ADR-099 atomic unit aborted at op {op_index}"),
+                        });
                     }
                 }
             }
-            Ok(Box::new((post_commit, note_versions)) as Box<dyn Any + Send>)
+            Ok((note_versions, post_commit))
         })
     });
 
+    match run_prepared_atomic_unit(access, op)
+        .await
+        .map_err(AtomicRunnerError)?
+    {
+        PreparedAtomicOutcome::Committed { value, post_commit } => {
+            Ok((AtomicRunOutcome::Committed { post_commit }, value))
+        }
+        PreparedAtomicOutcome::RolledBack((failed_op_index, failure)) => Ok((
+            AtomicRunOutcome::RolledBack {
+                failed_op_index,
+                failure,
+            },
+            Vec::new(),
+        )),
+    }
+}
+
+pub(crate) enum PreparedAtomicError<E> {
+    Refused { failure: E, message: String },
+    Storage(StorageError),
+}
+
+impl<E> From<StorageError> for PreparedAtomicError<E> {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+pub(crate) enum PreparedAtomicOutcome<T, E> {
+    Committed {
+        value: T,
+        post_commit: CommittedPostCommitEffects,
+    },
+    RolledBack(E),
+}
+
+pub(crate) type PreparedAtomicOp<T, E> = Box<
+    dyn for<'w> FnOnce(
+            &'w mut dyn SqlWriter,
+        )
+            -> BoxFuture<'w, Result<(T, Vec<PostCommitEffect>), PreparedAtomicError<E>>>
+        + Send,
+>;
+
+/// Recover a recorded refusal only after the storage owner proves rollback;
+/// effects become executable only after that same owner confirms commit.
+pub(crate) async fn run_prepared_atomic_unit<T: Send + 'static, E: Send + 'static>(
+    access: &dyn SqlAccess,
+    prepared: PreparedAtomicOp<T, E>,
+) -> Result<PreparedAtomicOutcome<T, E>, StorageError> {
+    let failure_slot = Arc::new(Mutex::new(None));
+    let recorded = Arc::clone(&failure_slot);
+    let op: AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            match prepared(writer).await {
+                Ok(value) => Ok(Box::new(value) as Box<dyn Any + Send>),
+                Err(PreparedAtomicError::Storage(error)) => Err(error),
+                Err(PreparedAtomicError::Refused { failure, message }) => {
+                    *recorded
+                        .lock()
+                        .expect("atomic runner failure slot poisoned") = Some(failure);
+                    Err(StorageError::Internal(message))
+                }
+            }
+        })
+    });
     match access.atomic_unit(op).await {
         Ok(boxed) => {
-            let (post_commit, note_versions) = *boxed
-                .downcast::<(Vec<PostCommitEffect>, Vec<i64>)>()
-                .expect("atomic runner closure returns committed effects and note versions");
-            Ok((
-                AtomicRunOutcome::Committed {
-                    post_commit: CommittedPostCommitEffects::new(post_commit),
-                },
-                note_versions,
-            ))
+            let (value, effects) = *boxed
+                .downcast::<(T, Vec<PostCommitEffect>)>()
+                .map_err(|_| StorageError::Internal("invalid prepared atomic outcome".into()))?;
+            Ok(PreparedAtomicOutcome::Committed {
+                value,
+                post_commit: CommittedPostCommitEffects::new(effects),
+            })
         }
         Err(storage_err) => {
             // A recorded op failure does not prove the outer transaction rolled back.
             if !atomic_unit_error_allows_recorded_refusal(&storage_err) {
-                return Err(AtomicRunnerError(storage_err));
+                return Err(storage_err);
             }
             let recorded = failure_slot
                 .lock()
                 .expect("atomic runner failure slot poisoned")
                 .take();
             match recorded {
-                Some((failed_op_index, failure)) => Ok((
-                    AtomicRunOutcome::RolledBack {
-                        failed_op_index,
-                        failure,
-                    },
-                    Vec::new(),
-                )),
-                None => Err(AtomicRunnerError(storage_err)),
+                Some(failure) => Ok(PreparedAtomicOutcome::RolledBack(failure)),
+                None => Err(storage_err),
             }
         }
     }
