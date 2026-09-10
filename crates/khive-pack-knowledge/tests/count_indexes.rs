@@ -1,5 +1,7 @@
-//! File-backed count/plan benchmark; no wall-clock comparison. Run with:
+//! File-backed COUNT timings and retained-reader plans. Run with:
 //! cargo test -p khive-pack-knowledge --test count_indexes -- --ignored --nocapture
+
+use std::time::Instant;
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
@@ -81,13 +83,15 @@ fn measure_counts(reader: &khive_db::ReaderGuard<'_>) -> Vec<Value> {
             // retain a stale schema after DDL on another connection, and the
             // SqlReader abstraction acquires a different lease per operation.
             // Keep COUNT and its plan on this one physical reader.
+            let started = Instant::now();
             let count: i64 = reader.query_row(sql, ["local"], |row| row.get(0)).unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
             let plan: String = reader
                 .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["local"], |row| {
                     row.get(3)
                 })
                 .unwrap();
-            json!({"sql": sql, "count": count, "plan": plan})
+            json!({"sql": sql, "count": count, "ms": ms, "plan": plan})
         })
         .collect()
 }
@@ -110,7 +114,7 @@ async fn measure(runtime: &KhiveRuntime, registry: &VerbRegistry) -> Value {
         (counts, sqlite, installed_indexes)
     };
     // Public dispatch remains on its normal pooled SQL path; no raw reader
-    // lease survives across this await. These observations make no latency claim.
+    // lease survives across this await. Public list dispatch is not timed.
     let listed = registry
         .dispatch("knowledge.list", json!({"limit": 1}))
         .await
@@ -205,7 +209,7 @@ async fn benchmark_count_indexes() {
     let mut pairs = Vec::new();
     for round in 0..4 {
         let mut pair = serde_json::Map::new();
-        // Exercise both DDL transition orders; report plans and counts only.
+        // Alternate arm order across the four rounds; caches are not reset.
         for indexed in if round % 2 == 0 {
             [false, true]
         } else {
@@ -231,9 +235,27 @@ async fn benchmark_count_indexes() {
         assert_eq!(pair["after"]["installed_count_indexes"], json!(2));
         pairs.push(pair);
     }
+    let count_medians_ms: Vec<_> = [EVENT_COUNT, ATOM_COUNT, LIST_COUNT]
+        .into_iter()
+        .enumerate()
+        .map(|(index, sql)| {
+            let median = |arm: &str| {
+                let mut times: Vec<f64> = pairs
+                    .iter()
+                    .map(|pair| pair[arm]["counts"][index]["ms"].as_f64().unwrap())
+                    .collect();
+                times.sort_by(f64::total_cmp);
+                // Each arm has four rounds: average the two middle samples.
+                (times[1] + times[2]) / 2.0
+            };
+            json!({"sql": sql, "before": median("before"), "after": median("after")})
+        })
+        .collect();
     eprintln!(
         "{}",
         json!({"events": 2000000, "atoms":154600,
-        "storage":"file-backed", "measurement":"counts and same-connection plans only; no timing comparison", "pairs":pairs})
+        "storage":"file-backed", "measurement":"COUNT-only wall-clock ms on retained reader; EXPLAIN and public list dispatch excluded",
+        "timing_conditions":"four rounds per arm; alternating order; caches not reset",
+        "count_medians_ms":count_medians_ms, "pairs":pairs})
     );
 }
