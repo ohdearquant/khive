@@ -957,8 +957,17 @@ acceptance 2.
     version and `index` and no `current_id` at all. The unauthorized arm supplies a guessed `id`, so
     it is the disclosure the filter exists to stop. The `key_conflict` case is the control: the same
     unauthorized caller already receives `key_conflict` without `existing_id`, and this arm asserts
-    the two refusals now behave the same way.
+    the two refusals now behave the same way. The filter exists at two sites, the transactional error
+    rewrite and the per-member result strip, so the arm covers both batch modes: the unauthorized
+    half above runs in atomic mode, where the refusal is produced, and the same identity-pinned
+    observation submitted in per-member mode is asserted to refuse `invalid_input`, because
+    `observed` requires atomic mode. That second half is not a duplicate of the first. It is what
+    makes a single-site filter sound, by asserting that the per-member result path cannot carry an
+    `identity_conflict` at all; if a later amendment admits `observed` in per-member mode, this arm
+    goes red and names the second site as the one that then needs the filter.
 11. **Mutation.** With the identity half skipped, arm 1 goes red. With the identity half reported as
     `version_conflict`, arm 1's reason assertion goes red. With `id` accepted beside a null version,
     arm 5 goes red. With `current_id` emitted unconditionally, arm 10's unauthorized half goes red.
-    Each run quoted with its exit code.
+    With `observed` admitted in per-member mode, arm 10's second half goes red, which is the arm that
+    proves the second filter site is unreachable rather than merely unused. Each run quoted with its
+    exit code.
