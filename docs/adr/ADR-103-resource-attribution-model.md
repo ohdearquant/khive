@@ -1173,3 +1173,18 @@ in `counts_by_actor`; alias collapse applies only to the omitted-actor default.
 All existing time-window, event-kind, pagination, truncation, and cost aggregation
 rules remain unchanged within the selected actor scope. No event rows are rewritten,
 and `brain.bind` and `brain.unbind` retain their write contracts.
+
+### Consequences
+
+Stage 1's windowed per-actor read, `brain.event_counts`, was minted to answer what
+the daemon was doing and on whose behalf. After this amendment it answers that
+question for the caller by default: a plain call returns the caller's own events
+and nothing else. The cross-actor answer, every actor at once, is no longer
+available to a caller by widening its own visibility; it requires `all_actors=true`
+and the caller's actor id in the serving daemon's `[brain] fleet_readers` list,
+which is empty by default and is set only in the serving configuration. An
+operator who wants the fleet-wide view therefore adds their actor id to that
+list and restarts or reconfigures the serving daemon; a client-side setting
+cannot grant it. The same narrowing applies to `brain.resolve` and
+`brain.bindings`: a caller sees its own profile and its own binding rows unless
+it names an actor it is allowed to see.
