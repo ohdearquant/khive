@@ -122,24 +122,26 @@ impl Fixture {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    async fn register_sh(&self, name: &str, decision: &str) {
-        self.call(
-            "tool.register",
-            json!({
-                "name": name,
-                "kind": "tool",
-                "description": "shell",
-                "source": "exec:/bin/sh",
-                "side_effect": "write",
-                "trust": "first_party",
-            }),
-        )
-        .await;
+    async fn register_sh(&self, name: &str, decision: &str) -> Value {
+        let registered = self
+            .call(
+                "tool.register",
+                json!({
+                    "name": name,
+                    "kind": "tool",
+                    "description": "shell",
+                    "source": "exec:/bin/sh",
+                    "side_effect": "write",
+                    "trust": "first_party",
+                }),
+            )
+            .await;
         self.call(
             "tool.policy",
             json!({ "actor": "*", "tool": name, "decision": decision }),
         )
         .await;
+        registered
     }
 }
 
@@ -1173,7 +1175,12 @@ async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
 #[tokio::test]
 async fn run_captures_output_changes_and_receipt() {
     let f = fixture();
-    f.register_sh("sh", "allow").await;
+    let registered = f.register_sh("sh", "allow").await;
+    let registry_id = registered["tool"]["full_id"].as_str().unwrap();
+    assert_eq!(
+        uuid::Uuid::parse_str(registry_id).unwrap().to_string(),
+        registry_id
+    );
     let tree = f
         .tree(&[
             ("modify", b"old", 644),
@@ -1232,12 +1239,15 @@ async fn run_captures_output_changes_and_receipt() {
     assert_eq!(receipt["stdout_capture"], "complete");
     assert!(receipt["stdout_produced_bytes"].as_u64().unwrap() > 0);
     assert_eq!(receipt["sandbox"]["profile_digest"], receipt["profile_ref"]);
+    assert_eq!(receipt["sandbox"]["tool_source"], "exec:/bin/sh");
+    assert_eq!(receipt["sandbox"]["tool_registry_id"], registry_id);
     let stored = f.call("exec.receipt", json!({ "id": receipt["id"] })).await;
     assert_eq!(&stored, receipt, "wire receipt equals the durable row");
     let runs = f
         .call("exec.runs", json!({ "actor": "local", "session_id": "s1" }))
         .await;
     assert_eq!(runs["count"], 1);
+    assert_eq!(&runs["runs"][0], receipt);
     let events = f
         .call("exec.events", json!({ "run_id": receipt["id"] }))
         .await;
@@ -1249,6 +1259,49 @@ async fn run_captures_output_changes_and_receipt() {
         .collect();
     assert_eq!(kinds, vec!["materialized", "launched", "exited"]);
     assert!(root_is_empty(&f));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_receipt_reports_first_registration_when_name_is_taken() {
+    let f = fixture();
+    let first = f.register_sh("occupied", "allow").await;
+    assert_eq!(first["created"], true);
+    let second = f
+        .call(
+            "tool.register",
+            json!({
+                "name": "occupied", "kind": "tool", "source": "exec:/bin/echo",
+                "side_effect": "write", "trust": "first_party"
+            }),
+        )
+        .await;
+    assert_eq!(second["created"], false);
+    assert_eq!(second["tool"]["full_id"], first["tool"]["full_id"]);
+    assert_eq!(second["tool"]["source"], "exec:/bin/sh");
+    let tree = f.tree(&[]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "occupied", "actor": "local",
+                "args": ["-c", "printf source-witness"]
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(f.blob_text(&receipt["stdout_ref"]).await, "source-witness");
+    assert_eq!(receipt["sandbox"]["tool_source"], "exec:/bin/sh");
+    assert_eq!(
+        receipt["sandbox"]["tool_registry_id"],
+        first["tool"]["full_id"]
+    );
+    let stored = f.call("exec.receipt", json!({"id": receipt["id"]})).await;
+    assert_eq!(&stored, receipt);
+    let runs = f.call("exec.runs", json!({"actor": "local"})).await;
+    assert_eq!(runs["count"], 1);
+    assert_eq!(&runs["runs"][0], receipt);
 }
 
 #[cfg(target_os = "macos")]

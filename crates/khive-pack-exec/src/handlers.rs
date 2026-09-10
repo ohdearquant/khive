@@ -580,6 +580,7 @@ pub async fn run(
 struct Ready {
     binary: PathBuf,
     registered: String,
+    registry_id: Uuid,
     entries: Vec<TreeEntry>,
 }
 
@@ -656,6 +657,7 @@ async fn preflight(
     Ok(Ready {
         binary,
         registered,
+        registry_id: entity.id,
         entries,
     })
 }
@@ -819,6 +821,8 @@ async fn execute(
     receipt.sandbox = Some(json!({
         "profile_digest": profile_ref.as_str(),
         "tool_binary_digest": digest_hex(&binary_bytes),
+        "tool_source": format!("exec:{}", ready.registered),
+        "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
     }));
     receipt.profile_ref = Some(profile_ref.as_str().to_string());
