@@ -935,11 +935,11 @@ impl SqlReader for TraceAccess {
         self.0.lock().unwrap().push(statement);
         Ok(Some(SqlRow {
             columns: vec![
-                khive_storage::SqlColumn {
+                khive_storage::types::SqlColumn {
                     name: "version".into(),
                     value: SqlValue::Integer(1),
                 },
-                khive_storage::SqlColumn {
+                khive_storage::types::SqlColumn {
                     name: "updated_at".into(),
                     value: SqlValue::Integer(1),
                 },
