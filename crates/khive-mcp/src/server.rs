@@ -7969,7 +7969,8 @@ mod tests {
             BackendSearchFailure::timeout("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic =
+            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(true));
         assert_eq!(diagnostic["retry_after_ms"], json!(2_000));
@@ -7994,7 +7995,8 @@ mod tests {
             BackendSearchFailure::backend("backend search timed out after 5000ms"),
         )]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic =
+            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -8017,7 +8019,8 @@ mod tests {
             ),
         ]);
 
-        let diagnostic = search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
+        let diagnostic =
+            search_diagnostic_value(&SearchDegradation::from_result(&result, &json!([])));
 
         assert_eq!(diagnostic["retryable"], json!(false));
         assert!(diagnostic.get("retry_after_ms").is_none());
@@ -8045,7 +8048,8 @@ mod tests {
             "zzzz-hidden-backend".to_string(),
             BackendSearchFailure::backend("storage unavailable"),
         ));
-        let degradation = SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation =
+            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
@@ -8067,7 +8071,8 @@ mod tests {
                 BackendSearchFailure::timeout("backend search timed out after 5000ms"),
             )
         });
-        let degradation = SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
+        let degradation =
+            SearchDegradation::from_result(&degraded_search_result(failures), &json!([]));
         let diagnostic = search_diagnostic_value(&degradation);
 
         assert!(degradation.backend_errors_omitted > 0);
