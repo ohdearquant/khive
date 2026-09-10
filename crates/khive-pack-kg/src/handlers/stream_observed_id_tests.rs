@@ -324,3 +324,155 @@ async fn observed_id_arm5b_absence_and_replacement_have_distinct_reasons() {
     assert_eq!(replaced["details"]["id"], original["id"]);
     assert_eq!(snapshot(&rt, &reg).await, before);
 }
+
+#[derive(Debug)]
+struct ObservedDisclosurePolicy {
+    allow_holder: bool,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+impl khive_gate::Gate for ObservedDisclosurePolicy {
+    fn check(
+        &self,
+        request: &khive_gate::GateRequest,
+    ) -> Result<khive_gate::GateDecision, khive_gate::GateError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.verb.clone(), request.args.clone()));
+        let holder_listing = request.verb == "list"
+            && request.args["note_kind"] == "head"
+            && request.args["key_prefix"] == "private/key";
+        Ok(
+            if request.verb == "get" || (holder_listing && !self.allow_holder) {
+                khive_gate::GateDecision::deny("holder reads denied by test policy")
+            } else {
+                // A lookup of the unrelated write target would wrongly allow disclosure.
+                khive_gate::GateDecision::allow()
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn observed_id_arm10_disclosure_uses_observation_key_and_existing_policy() {
+    use std::sync::{Arc, Mutex};
+
+    // Index 1 aliases a different write; index 4 is beyond the three members.
+    for observed_index in [1, 4] {
+        let (rt, setup) = surface();
+        lease(&setup, "target").await;
+        let (original, holder) = recreate(&setup, "private/key").await;
+        for allow_holder in [true, false] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_gate(Arc::new(ObservedDisclosurePolicy {
+                allow_holder,
+                seen: seen.clone(),
+            }));
+            builder.register(crate::KgPack::new(rt.clone()));
+            let reg = builder.build().unwrap();
+            let guessed = json!(uuid::Uuid::nil().to_string());
+            assert_ne!(guessed, holder["id"]);
+            let asserted = if allow_holder {
+                original["id"].clone()
+            } else {
+                guessed
+            };
+            let mut entries: Vec<Value> = (0..observed_index)
+                .map(|index| observation(&format!("absent-{index}"), Value::Null, None))
+                .collect();
+            entries.push(observation("private/key", json!(1), Some(&asserted)));
+            let args = publication(json!(entries));
+            let before = snapshot(&rt, &setup).await;
+            seen.lock().unwrap().clear();
+            let error = reason(
+                reg.dispatch("stream.batch", args.clone())
+                    .await
+                    .unwrap_err(),
+                "identity_conflict",
+            );
+            let mut expected = json!({"reason":"identity_conflict", "key":"private/key", "kind":"head", "version":"1", "id":asserted, "index":observed_index.to_string()});
+            if allow_holder {
+                expected["current_id"] = holder["id"].clone();
+            }
+            assert_eq!(
+                error["details"], expected,
+                "holder disclosure must follow scoped authorization"
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("stream.batch".to_owned(), args),
+                    (
+                        "list".to_owned(),
+                        json!({"kind":"note","note_kind":"head","key_prefix":"private/key"})
+                    ),
+                ]
+            );
+            assert_eq!(snapshot(&rt, &setup).await, before);
+
+            // The same caller's existing keyed-create refusal is the disclosure control.
+            let create_args = json!({"atomic":true,"ops":[
+                {"op":"append","stream":"identity/a","record":1},
+                {"op":"write","key":"private/key","kind":"head","doc":{}},
+                {"op":"append","stream":"identity/b","record":2}
+            ]});
+            seen.lock().unwrap().clear();
+            let control = reason(
+                reg.dispatch("stream.batch", create_args.clone())
+                    .await
+                    .unwrap_err(),
+                "key_conflict",
+            );
+            assert_eq!(
+                control["details"].get("existing_id"),
+                allow_holder.then_some(&holder["id"])
+            );
+            assert_eq!(control["details"]["key"], "private/key");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("stream.batch".to_owned(), create_args),
+                    (
+                        "list".to_owned(),
+                        json!({"kind":"note","note_kind":"head","key_prefix":"private/key"})
+                    ),
+                ]
+            );
+            assert_eq!(snapshot(&rt, &setup).await, before);
+
+            if !allow_holder {
+                // No new admission rule: a legitimate pin still commits for this caller.
+                let args = publication(json!([observation(
+                    "private/key",
+                    json!(1),
+                    Some(&holder["id"])
+                )]));
+                seen.lock().unwrap().clear();
+                let committed = reg.dispatch("stream.batch", args.clone()).await.unwrap();
+                assert_eq!(committed["committed"], true);
+                assert_eq!(committed["results"][0]["seq"], 1);
+                assert_eq!(committed["results"][1]["version"], 2);
+                assert_eq!(committed["results"][2]["seq"], 1);
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    vec![("stream.batch".to_owned(), args)]
+                );
+                assert_eq!(
+                    heads(&setup, &["identity/a", "identity/b"]).await,
+                    vec![1, 1]
+                );
+                let target = setup
+                    .dispatch("get", json!({"key":"target","kind":"head"}))
+                    .await
+                    .unwrap();
+                assert_eq!(target["version"], 2);
+                assert_eq!(
+                    serde_json::from_str::<Value>(target["content"].as_str().unwrap()).unwrap(),
+                    json!({"published":true})
+                );
+            }
+        }
+    }
+}
