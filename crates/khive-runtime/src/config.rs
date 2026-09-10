@@ -131,6 +131,7 @@ mod private {
 #[derive(Clone, Debug)]
 pub struct NamespaceToken {
     namespace: Namespace,
+    gate_namespace: Namespace,
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
@@ -156,6 +157,7 @@ impl NamespaceToken {
         }
         debug_assert!(!visible.is_empty(), "visible set must be non-empty");
         Self {
+            gate_namespace: namespace.clone(),
             namespace,
             visible,
             actor,
@@ -199,6 +201,18 @@ impl NamespaceToken {
         &self.namespace
     }
 
+    /// Return the namespace used by the originating dispatch's Gate check.
+    /// It can differ from the primary storage namespace on an implicit request.
+    /// Tokens minted directly, or reminted by `with_namespace`, use their primary.
+    pub fn gate_namespace(&self) -> &Namespace {
+        &self.gate_namespace
+    }
+
+    pub(crate) fn with_gate_namespace(mut self, namespace: Namespace) -> Self {
+        self.gate_namespace = namespace;
+        self
+    }
+
     /// Return the read-visibility set.
     ///
     /// List, search, and get operations must accept records whose namespace is
@@ -233,6 +247,7 @@ impl NamespaceToken {
     }
 
     /// Return a new token with the same actor but a different namespace.
+    /// The Gate namespace metadata is reset to the new primary namespace.
     ///
     /// The visible set is replaced with `[ns]`: this is a full read+write token
     /// for `ns`, not a type-enforced write-only or append-only capability. It is

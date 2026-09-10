@@ -15,8 +15,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::atomic_message::{
-    prepare_atomic_note_requests, prepare_atomic_notes, AtomicNoteOptions, AtomicNoteRequest,
-    AtomicNoteSpec,
+    prepare_atomic_note_requests, AtomicNoteOptions, AtomicNoteRequest, AtomicNoteSpec,
 };
 use crate::atomic_plan::{PlanStatement, PostCommitEffect};
 use crate::atomic_runner::{
@@ -80,9 +79,32 @@ pub struct StreamAppendSpec {
     pub stream: String,
     pub record: Value,
     pub expected_seq: Option<i64>,
+    pub embed: Option<bool>,
+    pub embedding_model: Option<String>,
     pub note_kind: String,
     pub tags: Option<Vec<String>>,
     pub fence: Option<NoteFences>,
+}
+
+impl StreamAppendSpec {
+    fn validate_embedding(&self, member: Option<usize>) -> RuntimeResult<()> {
+        if self.embedding_model.is_some() && self.embed != Some(true) {
+            let mut error = KhiveError::invalid_input("embedding_model requires embed=true");
+            if let Some(member) = member {
+                error = error.with_details(Details::new_owned([("member", member.to_string())]));
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn note_options(&self) -> AtomicNoteOptions<'_> {
+        AtomicNoteOptions {
+            embed: Some(self.embed.unwrap_or(false)),
+            embedding_model: self.embedding_model.as_deref(),
+            ..Default::default()
+        }
+    }
 }
 
 /// A keyed document write. Kinds are canonical note-kind names. A missing
@@ -635,6 +657,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<PreparedAppend>> {
         let mut contents = Vec::with_capacity(specs.len());
         for spec in specs {
+            spec.validate_embedding(None)?;
             validate_stream(&spec.stream)?;
             if let Some(fences) = &spec.fence {
                 fences.validate()?;
@@ -650,17 +673,19 @@ impl KhiveRuntime {
         let atomic_specs = specs
             .iter()
             .zip(&contents)
-            .map(|(spec, content)| AtomicNoteSpec {
-                token,
-                id: None,
-                kind: &spec.note_kind,
-                name: None,
-                content,
-                properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
+            .map(|(spec, content)| AtomicNoteRequest {
+                spec: AtomicNoteSpec {
+                    token,
+                    id: None,
+                    kind: &spec.note_kind,
+                    name: None,
+                    content,
+                    properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
+                },
+                options: spec.note_options(),
             })
             .collect();
-        let prepared =
-            prepare_atomic_notes(self, atomic_specs, AtomicNoteOptions::default()).await?;
+        let prepared = prepare_atomic_note_requests(self, atomic_specs).await?;
         let mut out = Vec::with_capacity(specs.len());
         for ((spec, note), plan) in specs.iter().zip(prepared.notes).zip(prepared.plans) {
             let AtomicOpPlan::AddNote(plan) = plan else {
@@ -785,6 +810,8 @@ impl KhiveRuntime {
         note_kind: &str,
         tags: Option<Vec<String>>,
         fence: Option<NoteFences>,
+        embed: Option<bool>,
+        embedding_model: Option<String>,
     ) -> RuntimeResult<Value> {
         let spec = StreamAppendSpec {
             stream: stream.to_string(),
@@ -793,6 +820,8 @@ impl KhiveRuntime {
             note_kind: note_kind.to_string(),
             tags,
             fence,
+            embed,
+            embedding_model,
         };
         let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
         match self.run_stream_appends(token, &prepared).await? {
@@ -808,16 +837,21 @@ impl KhiveRuntime {
         }
     }
 
-    fn validate_stream_batch(&self, members: &[StreamBatchMember]) -> RuntimeResult<()> {
+    fn validate_stream_batch(
+        &self,
+        members: &[StreamBatchMember],
+        atomic: bool,
+    ) -> RuntimeResult<()> {
         if members.is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "stream.batch requires at least one member".into(),
             ));
         }
         let mut keys = HashSet::new();
-        for member in members {
+        for (index, member) in members.iter().enumerate() {
             match member {
                 StreamBatchMember::Append(spec) => {
+                    spec.validate_embedding(atomic.then_some(index))?;
                     validate_stream(&spec.stream)?;
                     self.validate_note_kind(&spec.note_kind)?;
                     if let Some(fences) = &spec.fence {
@@ -1011,7 +1045,7 @@ impl KhiveRuntime {
                             content,
                             properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
                         },
-                        options: AtomicNoteOptions::default(),
+                        options: spec.note_options(),
                     })
                 }
                 StreamBatchPreparation::Create(create) => Some(AtomicNoteRequest {
@@ -1098,7 +1132,7 @@ impl KhiveRuntime {
         observed: Vec<StreamObservation>,
         registry: &VerbRegistry,
     ) -> RuntimeResult<Result<Vec<Value>, StreamBatchRefusal>> {
-        self.validate_stream_batch(&members)?;
+        self.validate_stream_batch(&members, true)?;
         if let Some(fence) = &fence {
             fence.validate()?;
             self.validate_note_kind(&fence.kind)?;
@@ -1156,7 +1190,7 @@ impl KhiveRuntime {
         members: Vec<StreamBatchMember>,
         registry: &VerbRegistry,
     ) -> RuntimeResult<Vec<Value>> {
-        self.validate_stream_batch(&members)?;
+        self.validate_stream_batch(&members, false)?;
         let mut results = Vec::with_capacity(members.len());
         let prepared = self.prepare_stream_batch(token, members, registry).await?;
         for member in prepared {
@@ -1298,6 +1332,8 @@ mod tests {
                 "observation",
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1368,6 +1404,8 @@ mod tests {
                     &json!(token.namespace().as_str()),
                     Some(1),
                     "observation",
+                    None,
+                    None,
                     None,
                     None
                 )

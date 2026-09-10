@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  128 public verbs (see the verb-catalog paragraph below       │
+│  129 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │

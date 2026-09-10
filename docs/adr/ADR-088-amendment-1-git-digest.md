@@ -18,8 +18,9 @@ The directive is to make digestion agent-facing, and to accept a remote URL dire
 agent can point the verb at any repository and ingest its history without a pre-existing
 local clone.
 
-This amendment supersedes ADR-088's "no new agent-facing verbs" clause for exactly one
-verb. Note kinds, edge usage, cursor semantics, secret masking, and the `gh` access path
+This amendment originally superseded ADR-088's "no new agent-facing verbs" clause for
+`git.digest`. The proposed 2026-09-10 operational rider below adds a read-only cursor
+inspection verb. Note kinds, edge usage, cursor semantics, secret masking, and the `gh` access path
 remain unchanged except where the accepted operational rider below narrows GitHub
 capability detection and successful-response durability.
 
@@ -315,6 +316,39 @@ returned `IngestReport`; the field is `0` for a pass with no over-cap commits.
 This reuses the pack-kg `create` verb's existing `embedding_content` parameter (a
 non-empty proper prefix of `content`, subject to the same secret-gate check as any other
 stored text) rather than adding pack-git-local truncation logic.
+
+## Proposed operational rider: persisted cursor inspection (2026-09-10)
+
+Add `git.ingest_cursor(project, source_kind)` as an `Assertive`, `AlwaysVerbose` read.
+Both arguments are required: a full live project UUID and one of `commits`, `issues`,
+or `pull_requests`. Canonical `get` authorization uses the caller's identity and
+resolved request namespace; full UUID access follows the existing namespace-agnostic
+by-ID contract. A checkpoint's namespace remains continuation metadata.
+
+`NamespaceToken` retains the originating Gate namespace separately from the storage
+primary. Dispatch stamps it from the resolved Gate request; direct minting and
+`with_namespace` reminting default it to the primary. This new read uses that metadata
+for nested `get`, so an implicit non-local Gate scope cannot become `local` merely
+because the default storage primary is local. Existing storage namespace, visibility,
+and `RequestIdentity::from_token` projection semantics remain unchanged.
+
+One SQL statement reads the cursor and its `_checkpoint` row from the existing
+`git_mirror_cursor` table (`pull_requests` maps to stored `prs`). Return the canonical
+`project_id`, public `source_kind`, and nullable `cursor` / `checkpoint` objects. Each
+object contains the opaque stored string `value`, integer microsecond `updated_at`,
+nullable UTF-8 `value_bytes`, and boolean `truncated`. Preserve absence separately from
+a present SQL NULL. Values over 256 KiB per row are wholly omitted with `truncated: true`
+and their actual byte count. The pair is one statement snapshot, not two separately
+timed reads. No new schema, ingestion, external process, cursor write, normalization,
+or repair is introduced; ordinary runtime authorization and audit still apply.
+
+This supplies persisted position after terminal ambiguity, including exact page-boundary
+membership that a timestamp alone cannot reveal. It does not identify a request, prove
+completion, establish resumability, or establish that a timed-out request stopped.
+Concurrent ingestion can advance after the snapshot. Receipt recovery above remains
+the way to recover a completed request's report. See the complete
+[API contract](../../crates/khive-pack-git/docs/api/ingest_cursor.md) for row shapes,
+bounds, and recovery guidance. This rider remains proposed pending review and merge.
 
 ## Consequences
 

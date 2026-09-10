@@ -59,6 +59,33 @@ async fn digest_resume_diamond_max_one_reopens_database_and_finishes() {
     let mut positions = BTreeSet::new();
     for pass in 0..5 {
         let (rt, _token, registry) = file_fixture(&db).await;
+        if pass > 0 {
+            let stored = registry
+                .dispatch(
+                    "git.ingest_cursor",
+                    json!({
+                        "project":project.to_string(),"source_kind":"commits",
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                stored["cursor"]["value"],
+                read_git_cursor(&rt, project, "commits").await.unwrap()
+            );
+            assert_eq!(
+                stored["checkpoint"]["value"],
+                read_git_cursor(&rt, project, "commits_checkpoint")
+                    .await
+                    .unwrap()
+            );
+            assert!(stored["checkpoint"]["updated_at"].as_i64().unwrap() > 0);
+            assert_eq!(
+                stored["cursor"]["updated_at"],
+                stored["checkpoint"]["updated_at"]
+            );
+            assert_eq!(stored["checkpoint"]["truncated"], false);
+        }
         let report = digest(&registry, &repo, project, 1).await;
         let visits = report["commits_ingested"].as_u64().unwrap()
             + report["commits_skipped_existing"].as_u64().unwrap();

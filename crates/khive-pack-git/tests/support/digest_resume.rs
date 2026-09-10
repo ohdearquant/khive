@@ -77,6 +77,40 @@ async fn digest_resume_one_item_handles_undated_ties_and_unseen_lower_numbers() 
                 !report.done,
                 "an exact-budget pass conservatively requests one more call: {report:?}"
             );
+            let source_kind = if prs { "pull_requests" } else { "issues" };
+            let stored_kind = if prs { "prs" } else { "issues" };
+            let stored = registry
+                .dispatch(
+                    "git.ingest_cursor",
+                    json!({
+                        "project":project.to_string(),"source_kind":source_kind,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                stored["cursor"]["value"],
+                json!(read_git_cursor(&rt, project, stored_kind).await)
+            );
+            let raw = read_git_cursor(&rt, project, &format!("{stored_kind}_checkpoint"))
+                .await
+                .unwrap();
+            assert_eq!(stored["checkpoint"]["value"], raw);
+            let page: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(page["undated"].as_object().unwrap().len(), 1);
+            assert_eq!(page["at_floor"].as_object().unwrap().len(), pass);
+            if pass == 0 {
+                assert!(
+                    stored["cursor"].is_null(),
+                    "undated-only progress has no timestamp row"
+                );
+            } else {
+                assert_eq!(
+                    stored["cursor"]["updated_at"],
+                    stored["checkpoint"]["updated_at"]
+                );
+            }
+            assert_eq!(stored["checkpoint"]["truncated"], false);
         }
         // Exact membership matters: a newly visible, smaller number at the same
         // timestamp must not be discarded by a numeric high-water predicate.

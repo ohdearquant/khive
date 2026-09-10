@@ -1129,7 +1129,7 @@ async fn stream_batch_atomic_refuses_before_it_prepares_a_good_member() {
         .dispatch(
             "stream.batch",
             json!({"ops": [
-                {"op": "append", "stream": "guard", "record": 1},
+                {"op": "append", "stream": "guard", "record": 1, "embed": true},
                 {"op": "nope"},
             ], "atomic": true}),
         )
@@ -1498,6 +1498,9 @@ mod fence_batches;
 
 #[path = "stream_mixed_fence_tests.rs"]
 mod mixed_fences;
+
+#[path = "stream_embedding_tests.rs"]
+mod embedding_tests;
 
 #[path = "stream_expiry_tests.rs"]
 mod expiry_tests;
