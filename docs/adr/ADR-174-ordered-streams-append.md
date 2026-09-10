@@ -843,6 +843,14 @@ An `observed` entry may carry `id`, the note identity it read:
 - The version half is unchanged, including its refusal shape. When both halves fail the identity
   half is reported, because a replacement explains the version difference and the version alone does
   not explain the replacement.
+- **An absent holder is not an identity conflict.** `identity_conflict` says a different note holds
+  the key. When no live note holds it at all, the version half has already failed and describes the
+  world exactly: the refusal is `version_conflict` with `current_version` omitted, as it is today for
+  a pinned version against an empty key. So a caller pinning `(key, version, id)` reads its two
+  failure worlds apart without a new shape: the key is empty (`version_conflict`, no
+  `current_version`), or a different note holds it (`identity_conflict`, `current_id` naming it).
+  `current_id` is therefore never absent and never the string `"null"` on an `identity_conflict`;
+  the reason that fires carries the distinction.
 - `id` requires a positive version: with `version: null` the entry asserts no live holder, which no
   identity can be pinned against, so `id` with a null version is `invalid_input` before any member
   writes.
@@ -915,6 +923,10 @@ acceptance 2.
 4. **Both halves wrong.** A recreated note at a different version refuses with `identity_conflict`,
    and the details still carry the version asserted.
 5. **Null version.** `id` with `version: null` is `invalid_input` before any member writes.
+   5b. **Absent holder.** The observed note deleted and not replaced: an entry carrying `id` and a
+   positive version refuses `version_conflict` with no `current_version` and no `current_id`, not
+   `identity_conflict`. The control is the same deletion followed by a recreation, which refuses
+   `identity_conflict`; the pair is what makes the two failure worlds distinguishable.
 6. **With `live_until`.** An entry carrying `id` and `live_until` together checks identity, version
    and the deadline; recreation refuses `identity_conflict` before the deadline is read, so a
    replacement is never reported as an expiry.
