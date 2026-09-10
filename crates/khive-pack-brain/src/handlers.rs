@@ -130,8 +130,10 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Defaults to the caller; a named foreign actor must be visible to the caller. \
-                    Bare actor labels also match their stored actor:-prefixed spelling; an explicitly \
-                    prefixed label is an exact event filter. Default-scoped counts collapse both spellings.",
+                    Ordinary actor ids match actor: plus the unchanged id; a historical bare alias also \
+                    matches only when the id does not begin actor:. An explicit actor:-prefixed value \
+                    matches exactly and authorizes the id after removing one prefix. Default-scoped \
+                    counts use one caller-label key.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -962,11 +964,7 @@ impl BrainPack {
         }
         let caller = Self::caller_actor_label(token);
         if let Some(actor) = p.actor.as_deref() {
-            let identity = if actor == caller {
-                actor
-            } else {
-                actor.strip_prefix("actor:").unwrap_or(actor)
-            };
+            let identity = actor.strip_prefix("actor:").unwrap_or(actor);
             Self::check_read_actor(token, identity)?;
         }
         let default_scope = !all_actors && p.actor.is_none();
@@ -993,12 +991,15 @@ impl BrainPack {
             None => None,
         };
 
-        // Preserve explicit event-filter spellings. Only the default scope coalesces
-        // the ordinary actor's bare and attributed forms into the caller's one key.
+        // A prefixed id has no bare alias: that spelling belongs to another
+        // principal's canonical events. Only default scope coalesces actor keys.
         let actor_filters: Vec<String> = match p.actor.as_deref() {
             Some(a) if a.starts_with("actor:") => vec![a.to_string()],
             Some(a) => vec![a.to_string(), format!("actor:{a}")],
             None if all_actors => Vec::new(),
+            None if token.actor().kind == "actor" && caller.starts_with("actor:") => {
+                vec![format!("actor:{caller}")]
+            }
             None if token.actor().kind == "actor" => {
                 vec![caller.clone(), format!("actor:{caller}")]
             }

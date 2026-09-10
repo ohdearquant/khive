@@ -1219,27 +1219,36 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 `truncated` is `true`, these sums are computed over the fetched page only, same as the other
 `counts_by_*` fields.
 
-| Param        | Type   | Required | Notes                                                                                                                                                                                                                                                       |
-| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since`      | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                                                                                                                        |
-| `until`      | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                                                                                                                         |
-| `actor`      | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. A bare filter (`service:indexer`) matches bare and `actor:`-prefixed event labels; a prefixed filter (`actor:service:indexer`) matches exactly. |
-| `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                             |
-| `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                      |
+| Param        | Type   | Required | Notes                                                                                                                                                                                                                                                                          |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `since`      | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                                                                                                                                           |
+| `until`      | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                                                                                                                                            |
+| `actor`      | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. An `actor:`-prefixed filter matches a stored label exactly and checks the actor identity after removing one prefix; other filters match bare and canonical labels. |
+| `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                                                |
+| `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                                         |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
 ```
 
-For an actor of kind `actor`, the default `counts_by_actor` combines the caller's
-historical bare and prefixed event aliases under one caller-label key, or has no
-keys when no events match. Other actor kinds match their exact caller label.
+For an actor of kind `actor`, the canonical stored label is `actor:` followed by
+the unmodified raw principal id, prepending the prefix exactly once. The default
+scope also matches a historical bare alias only when the raw id does not begin
+with `actor:`; prefixed ids match only their canonical stored label. The default
+`counts_by_actor` combines the permitted spellings under one caller-label key, or
+has no keys when no events match. Other actor kinds match their exact caller label.
 Explicit `actor` and `all_actors=true` reads preserve stored actor keys. The caller
 label is the actor id for kind `actor`, otherwise `kind:id`; an anonymous caller
 therefore defaults to `anonymous:local`. A visible foreign actor is readable only
 when explicitly requested. An allowlisted aggregate reader also defaults to its
 own events unless it supplies `all_actors=true`. Client-local configuration cannot
-grant aggregate access on a serving daemon. See
+grant aggregate access on a serving daemon.
+
+For example, principal id `actor:caller-a` writes `actor:actor:caller-a` and uses
+`actor="actor:actor:caller-a"` for an explicit self read. The filter
+`actor="actor:caller-a"` instead selects the canonical label for principal
+`caller-a`, requiring visibility of that identity even when the filter equals
+the caller's raw id. See
 [configuration](../configuration.md#brain-read-scope) and
 [ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
 

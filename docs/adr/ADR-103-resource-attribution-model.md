@@ -1126,8 +1126,11 @@ the registry or started the serving process. The caller label is the actor id
 when its kind is `actor`, and `kind:id` for other actor kinds.
 
 - With `actor` omitted, `brain.event_counts` counts only that caller's events.
-  For kind `actor`, historical bare and `actor:`-prefixed event spellings both
-  match. Only this default view combines those aliases into one
+  For kind `actor`, the canonical stored label is `actor:` followed by the
+  unmodified raw principal id, prepending that prefix exactly once even when the
+  id already begins with `actor:`. A historical bare alias also matches only when
+  the raw id does not begin with `actor:`; prefixed ids match only their canonical
+  stored label. Only this default view combines the permitted spellings into one
   `counts_by_actor` key, using the caller label; other kinds match their exact
   caller label. An empty result has no actor keys.
 - With `actor` omitted, `brain.bindings` returns only binding rows whose actor is
@@ -1144,13 +1147,20 @@ requested actor id is in the token's visible namespace set. That visibility test
 is exact string equality between the requested actor id and one entry of the
 token's `visible_namespaces` list: no prefix match, no pattern, and no
 derivation of a namespace from the actor id. Other actor reads
-fail with `InvalidInput` naming the refused actor. A bare event-count actor filter
-matches bare and `actor:`-prefixed stored labels; an explicitly prefixed filter
-matches that stored label exactly. An exact caller label is permitted before
-prefix interpretation; foreign-actor visibility is checked against the unprefixed
-actor identity. This is a query-scope rule using the
+fail with `InvalidInput` naming the refused actor. An event-count actor filter
+without an `actor:` prefix matches bare and canonical stored labels. Every filter
+beginning with `actor:` matches that stored label exactly, and authorization
+removes exactly one prefix to obtain the actor identity. There is no exception
+for a filter equal to the caller label. This is a query-scope rule using the
 already-authorized token, not a new storage-isolation boundary. Existing namespace
 and consumer-kind filters retain their meaning.
+
+**Stored-label clarification (2026-09-10).** The distinct ordinary principals
+`caller-a` and `actor:caller-a` write canonical labels `actor:caller-a` and
+`actor:actor:caller-a`, respectively. The second principal has no bare alias and
+uses `actor="actor:actor:caller-a"` for an explicit self read. Its query with
+`actor="actor:caller-a"` selects the first principal's canonical label instead
+and requires visibility of `caller-a`.
 
 ### Explicit aggregate event counts
 

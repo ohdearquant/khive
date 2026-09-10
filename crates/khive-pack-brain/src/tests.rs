@@ -10006,50 +10006,133 @@ mod read_scope_tests {
     }
 
     #[tokio::test]
-    async fn literal_prefixed_actor_id_can_read_its_own_event_counts() {
-        let (pack, rt) = make_pack_with_read_scope(Some("actor:caller-a"), &[], &[]);
-        let token = rt.authorize(Namespace::local()).expect("caller token");
-        let registry = empty_registry();
-        for actor in [
-            "actor:caller-a",
-            "actor:actor:caller-a",
-            "caller-a",
-            "actor:caller-b",
-        ] {
-            super::event_counts_tests::seed_event(
-                &rt,
-                &token,
-                "search",
-                EventKind::SearchExecuted,
-                actor,
-                1_000_000,
-                json!({}),
+    async fn attributed_prefixed_actor_ids_keep_event_counts_principal_scoped() {
+        let (pack, rt) = make_pack_with_read_scope(Some("serving-actor"), &[], &[]);
+        let (_, caller_a_rt) = make_pack_with_read_scope(Some("caller-a"), &[], &[]);
+        let (_, caller_b_rt) = make_pack_with_read_scope(Some("actor:caller-a"), &[], &[]);
+        let token_a = caller_a_rt
+            .authorize(Namespace::local())
+            .expect("caller A token");
+        let token_b = caller_b_rt
+            .authorize(Namespace::local())
+            .expect("caller B token");
+        let (_, visible_a_rt) =
+            make_pack_with_read_scope(Some("caller-a"), &["actor:caller-a"], &[]);
+        let (_, visible_b_rt) =
+            make_pack_with_read_scope(Some("actor:caller-a"), &["caller-a"], &[]);
+        let visible_a = visible_a_rt
+            .authorize_with_visibility(
+                Namespace::local(),
+                visible_a_rt.visible_namespaces().to_vec(),
             )
-            .await;
+            .expect("caller A token with caller B visible");
+        let visible_b = visible_b_rt
+            .authorize_with_visibility(
+                Namespace::local(),
+                visible_b_rt.visible_namespaces().to_vec(),
+            )
+            .expect("caller B token with caller A visible");
+        let registry = empty_registry();
+        for (token, canonical_actor, count) in [
+            (&token_a, "actor:caller-a", 1),
+            (&token_b, "actor:actor:caller-a", 2),
+        ] {
+            let events = rt.events(token).expect("attributed event store");
+            for _ in 0..count {
+                let mut event = khive_storage::event::Event::new(
+                    token.namespace().as_str(),
+                    "search",
+                    EventKind::SearchExecuted,
+                    khive_types::SubstrateKind::Note,
+                    "caller-supplied",
+                );
+                event.created_at = 1_000_000;
+                event.payload = json!({"result_kind": "note"});
+                let id = event.id;
+                events
+                    .append_event(event)
+                    .await
+                    .expect("append attributed event");
+                let stored = events.get_event(id).await.unwrap().unwrap();
+                assert_eq!(stored.actor, canonical_actor);
+            }
         }
 
-        let own = pack
-            .dispatch("brain.event_counts", event_params(), &registry, &token)
-            .await
-            .expect("default scope preserves the literal caller id");
-        assert_eq!(own["counts_by_actor"], json!({"actor:caller-a": 2}));
-        assert_eq!(own["window_event_total"], json!(2));
+        for exhaustive in [false, true] {
+            let mut params = event_params();
+            params["exhaustive"] = json!(exhaustive);
+            for (token, caller, canonical_actor, count) in [
+                (&token_a, "caller-a", "actor:caller-a", 1),
+                (&token_b, "actor:caller-a", "actor:actor:caller-a", 2),
+            ] {
+                let own = pack
+                    .dispatch("brain.event_counts", params.clone(), &registry, token)
+                    .await
+                    .expect("default scope reads only the attributed principal");
+                let mut expected = json!({});
+                expected[caller] = json!(count);
+                assert_eq!(own["counts_by_actor"], expected);
+                assert_eq!(own["total"], json!(count));
+                assert_eq!(own["window_event_total"], json!(count));
 
-        let mut params = event_params();
-        params["actor"] = json!("actor:caller-a");
-        let explicit = pack
-            .dispatch("brain.event_counts", params.clone(), &registry, &token)
-            .await
-            .expect("a literal prefixed actor id is an authorized self read");
-        assert_eq!(explicit["counts_by_actor"], json!({"actor:caller-a": 1}));
-        assert_eq!(explicit["window_event_total"], json!(1));
+                let mut explicit_params = params.clone();
+                explicit_params["actor"] = json!(canonical_actor);
+                let explicit = pack
+                    .dispatch("brain.event_counts", explicit_params, &registry, token)
+                    .await
+                    .expect("canonical self scope reads only the attributed principal");
+                let mut expected = json!({});
+                expected[canonical_actor] = json!(count);
+                assert_eq!(explicit["counts_by_actor"], expected);
+                assert_eq!(explicit["total"], json!(count));
+                assert_eq!(explicit["window_event_total"], json!(count));
+            }
 
-        params["actor"] = json!("actor:caller-b");
-        let denied = pack
-            .dispatch("brain.event_counts", params, &registry, &token)
-            .await
-            .expect_err("a literal prefixed caller cannot read a foreign actor");
-        assert_actor_refused(denied, "caller-b");
+            let mut bare_params = params.clone();
+            bare_params["actor"] = json!("caller-a");
+            let bare = pack
+                .dispatch("brain.event_counts", bare_params, &registry, &token_a)
+                .await
+                .expect("ordinary bare self filter still matches canonical events");
+            assert_eq!(bare["counts_by_actor"], json!({"actor:caller-a": 1}));
+            assert_eq!(bare["total"], json!(1));
+            assert_eq!(bare["window_event_total"], json!(1));
+
+            for (hidden, visible, other, canonical_actor, count) in [
+                (
+                    &token_a,
+                    &visible_a,
+                    "actor:caller-a",
+                    "actor:actor:caller-a",
+                    2,
+                ),
+                (&token_b, &visible_b, "caller-a", "actor:caller-a", 1),
+            ] {
+                let mut foreign_params = params.clone();
+                foreign_params["actor"] = json!(canonical_actor);
+                let denied = pack
+                    .dispatch(
+                        "brain.event_counts",
+                        foreign_params.clone(),
+                        &registry,
+                        hidden,
+                    )
+                    .await
+                    .expect_err(
+                        "canonical foreign scope requires the other principal to be visible",
+                    );
+                assert_actor_refused(denied, other);
+                let allowed = pack
+                    .dispatch("brain.event_counts", foreign_params, &registry, visible)
+                    .await
+                    .expect("explicit foreign scope is allowed with configured visibility");
+                let mut expected = json!({});
+                expected[canonical_actor] = json!(count);
+                assert_eq!(allowed["counts_by_actor"], expected);
+                assert_eq!(allowed["total"], json!(count));
+                assert_eq!(allowed["window_event_total"], json!(count));
+            }
+        }
     }
 
     #[tokio::test]
