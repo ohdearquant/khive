@@ -2752,6 +2752,9 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
             (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
                 Some("not_committed")
             }
+            (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
+                Some("not_committed")
+            }
             (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
                 Some("not_committed")
             }

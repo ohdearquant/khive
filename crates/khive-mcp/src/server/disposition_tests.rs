@@ -1731,3 +1731,22 @@ fn observed_id_arm1_named_identity_refusal_is_not_committed() {
     );
     assert_eq!(unknown["domain_disposition"], "unknown");
 }
+
+#[test]
+fn expiry_arm10_named_time_refusals_carry_rollback_proof() {
+    for reason in ["expired", "live_until_unreadable", "unrelated"] {
+        let error = khive_types::KhiveError::conflict("observation refused").with_details(
+            khive_types::Details::new_owned([("reason", reason.to_string())]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(
+            value["domain_disposition"],
+            if reason == "unrelated" {
+                "unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(value["details"]["reason"], reason);
+    }
+}

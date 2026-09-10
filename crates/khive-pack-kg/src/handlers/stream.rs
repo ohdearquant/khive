@@ -98,6 +98,7 @@ struct ObservedMember {
     kind: String,
     version: Option<i64>,
     id: Option<Uuid>,
+    live_until: Option<String>,
 }
 
 fn batch_fence(value: Value, registry: &VerbRegistry) -> Result<NoteFence, RuntimeError> {
@@ -128,9 +129,14 @@ fn batch_observed(
             }
             let entry: ObservedMember = deser(entry)?;
             if entry.id.is_some() && entry.version.is_none() {
-                return Err(RuntimeError::InvalidInput(
-                    "observed id requires a positive version".into(),
-                ));
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch observed entry {index}: id requires a positive version"
+                )));
+            }
+            if entry.live_until.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch observed entry {index}: live_until requires a positive version"
+                )));
             }
             NoteWriteOptions {
                 key: Some(entry.key.clone()),
@@ -143,6 +149,7 @@ fn batch_observed(
                 kind: canonical_note_kind(&entry.kind, registry)?,
                 version: entry.version,
                 id: entry.id,
+                live_until: entry.live_until,
             })
         })
         .collect()

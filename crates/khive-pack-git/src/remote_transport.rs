@@ -314,19 +314,28 @@ pub(crate) async fn push_native(
     }
     let alternate = serde_json::to_string(&objects.display().to_string())
         .map_err(|_| RemoteError::Unavailable)?;
+    let mut args = vec![
+        "push",
+        "--porcelain",
+        "--no-verify",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+    ];
+    if allow_file {
+        // Local transport runs the destination's receive-pack as this process, and the
+        // client-side hooks path above does not reach it: the destination's own hooks would
+        // run. The receive-pack invocation carries its own hooks path instead.
+        args.push("--receive-pack=git -c core.hooksPath=/dev/null receive-pack");
+    }
+    args.extend([
+        lease.as_str(),
+        "--",
+        request.remote.as_str(),
+        refspec.as_str(),
+    ]);
     command
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate)
-        .args([
-            "push",
-            "--porcelain",
-            "--no-verify",
-            "--no-follow-tags",
-            "--recurse-submodules=no",
-            &lease,
-            "--",
-            &request.remote,
-            &refspec,
-        ]);
+        .args(args);
     let (success, bytes) = run(command, None, true).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| RemoteError::Unknown)?;
     let status = text.lines().find_map(|line| {

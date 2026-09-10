@@ -836,6 +836,7 @@ async fn stream_batch_observation_rechecks_cross_connection_change_at_admission(
             key: "observed".into(),
             kind: "head".into(),
             version: Some(1),
+            live_until: None,
         }],
     )
     .await;
@@ -933,7 +934,16 @@ struct TraceAccess(Arc<Mutex<Vec<SqlStatement>>>);
 #[async_trait]
 impl SqlReader for TraceAccess {
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
-        assert_eq!(statement.label.as_deref(), Some("stream-batch-observed"));
+        // Both trace arms share this reader: the observed check reads the holder row, and the
+        // write member reads its own write time. Either label is expected; anything else is not.
+        assert!(
+            matches!(
+                statement.label.as_deref(),
+                Some("stream-batch-observed" | "stream-batch-write-time")
+            ),
+            "unexpected labelled row read: {:?}",
+            statement.label
+        );
         self.0.lock().unwrap().push(statement);
         Ok(Some(SqlRow {
             columns: vec![
@@ -945,6 +955,10 @@ impl SqlReader for TraceAccess {
                     name: "version".into(),
                     value: SqlValue::Integer(1),
                 },
+                khive_storage::types::SqlColumn {
+                    name: "updated_at".into(),
+                    value: SqlValue::Integer(1),
+                },
             ],
         }))
     }
@@ -952,6 +966,13 @@ impl SqlReader for TraceAccess {
         unreachable!()
     }
     async fn query_scalar(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlValue>> {
+        if statement.label.as_deref() == Some("stream-batch-live-until") {
+            let expired =
+                matches!(statement.params.last(), Some(SqlValue::Text(key)) if key == "expired");
+            let content = json!({"expires_at": if expired {"1970-01-01T00:00:00.000001Z"} else {"1970-01-01T00:00:00.000002Z"}}).to_string();
+            self.0.lock().unwrap().push(statement);
+            return Ok(Some(SqlValue::Text(content)));
+        }
         let value = if statement.sql.contains("MAX(seq)") {
             0
         } else {
@@ -1127,12 +1148,14 @@ async fn stream_batch_observed_statement_trace_precedes_first_member_insert() {
                 key: "first".into(),
                 kind: "head".into(),
                 version: Some(1),
+                live_until: None,
             },
             StreamObservation {
                 id: None,
                 key: "second".into(),
                 kind: "head".into(),
                 version: Some(if stale { 2 } else { 1 }),
+                live_until: None,
             },
         ];
         let result = run_prepared_stream_batch(
@@ -1573,3 +1596,6 @@ async fn observed_id_arm1_trace_one_row_read_inside_transaction_before_members()
         }
     }
 }
+
+#[path = "streams_expiry_tests.rs"]
+mod expiry_tests;

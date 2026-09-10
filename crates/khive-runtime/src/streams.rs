@@ -127,6 +127,8 @@ pub struct StreamObservation {
     pub kind: String,
     pub version: Option<i64>,
     pub id: Option<Uuid>,
+    /// Dotted document path whose RFC 3339 value must exceed the writer clock.
+    pub live_until: Option<String>,
 }
 
 /// A batch member or its already established refusal. The mode places it.
@@ -202,7 +204,6 @@ enum PreparedBatchAction {
         key: String,
         kind: String,
         id: Uuid,
-        version: i64,
         plan: AtomicOpPlan,
         after_create: Option<Value>,
     },
@@ -278,6 +279,7 @@ async fn check_observed(
     writer: &mut dyn SqlWriter,
     namespace: &str,
     observed: &[StreamObservation],
+    now: Option<i64>,
 ) -> Result<Option<KhiveError>, StorageError> {
     for (index, entry) in observed.iter().enumerate() {
         let current = writer.query_row(SqlStatement {
@@ -347,8 +349,89 @@ async fn check_observed(
                     .with_details(Details::new_owned(details)),
             ));
         }
+        if let Some(field) = &entry.live_until {
+            let content = writer.query_scalar(SqlStatement {
+                sql: "SELECT content FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
+                params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
+                label: Some("stream-batch-live-until".into()),
+            }).await?;
+            let doc: Value = match content {
+                Some(SqlValue::Text(content)) => {
+                    serde_json::from_str(&content).unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            };
+            let found = field
+                .split('.')
+                .try_fold(&doc, |value, part| value.get(part));
+            let value = found.unwrap_or(&Value::Null);
+            let deadline = value
+                .as_str()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+            let now = now
+                .ok_or_else(|| StorageError::Internal("missing stream observation clock".into()))?;
+            let clock = chrono::DateTime::from_timestamp_micros(now)
+                .ok_or_else(|| StorageError::Internal("invalid stream observation clock".into()))?;
+            let reason = match deadline {
+                None => Some("live_until_unreadable"),
+                Some(deadline) if deadline <= clock => Some("expired"),
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                let mut details = vec![
+                    ("reason", reason.into()),
+                    ("key", entry.key.clone()),
+                    ("kind", entry.kind.clone()),
+                    ("version", entry.version.unwrap().to_string()),
+                    ("field", field.clone()),
+                    ("index", index.to_string()),
+                ];
+                if reason == "expired" {
+                    // Only a value that parsed as RFC 3339 is echoed, because that value is
+                    // the deadline the caller pinned. The path is caller-chosen, so echoing
+                    // whatever it lands on would read any field of the document back out.
+                    details.push(("value", value.to_string()));
+                    details.push(("now", micros_to_iso(now)));
+                } else {
+                    details.push(("value_type", found.map_or("absent", json_type_name).into()));
+                }
+                return Ok(Some(
+                    KhiveError::conflict("stream observation time precondition failed")
+                        .with_details(Details::new_owned(details)),
+                ));
+            }
+        }
     }
     Ok(None)
+}
+
+/// The JSON type of a `live_until` field, which an unreadable refusal reports in
+/// place of the value itself.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+async fn observation_clock(writer: &mut dyn SqlWriter) -> Result<i64, StorageError> {
+    match writer
+        .query_scalar(SqlStatement {
+            sql: "SELECT khive_now_micros()".into(),
+            params: vec![],
+            label: Some("stream-batch-clock".into()),
+        })
+        .await?
+    {
+        Some(SqlValue::Integer(now)) => Ok(now),
+        _ => Err(StorageError::Internal(
+            "invalid stream observation clock".into(),
+        )),
+    }
 }
 
 struct BatchFailure {
@@ -365,6 +448,12 @@ async fn run_prepared_stream_batch(
 ) -> RuntimeResult<Result<(Vec<Value>, CommittedPostCommitEffects), StreamBatchRefusal>> {
     let op: PreparedAtomicOp<Vec<Value>, BatchFailure> = Box::new(move |writer| {
         Box::pin(async move {
+            // One SQL clock read after writer admission, shared by the list.
+            let now = if observed.iter().any(|entry| entry.live_until.is_some()) {
+                Some(observation_clock(writer).await?)
+            } else {
+                None
+            };
             let guard = NoteWriteGuard {
                 namespace: namespace.clone(),
                 target_id: Uuid::nil(),
@@ -375,7 +464,7 @@ async fn run_prepared_stream_batch(
             let predicate_error = if let Some(conflict) = guard.check_fence(writer).await? {
                 Some(conflict.into_error())
             } else {
-                check_observed(writer, &namespace, &observed).await?
+                check_observed(writer, &namespace, &observed, now).await?
             };
             if let Some(error) = predicate_error {
                 return Err(PreparedAtomicError::Refused {
@@ -532,14 +621,33 @@ async fn apply_stream_member(
             key,
             kind,
             id,
-            version,
             plan,
             ..
-        } => match apply_plan(writer, &plan, true).await {
-            Ok(applied) => Ok((
-                json!({"id": id, "version": applied.note_version.unwrap_or(version)}),
-                applied.effect,
-            )),
+        } => match apply_plan(writer, &plan, false).await {
+            Ok(applied) => {
+                // Read the row under this writer, before commit or any later
+                // writer. Preserve its existing timestamp/CAS semantics.
+                let stored = writer
+                    .query_row(SqlStatement {
+                        sql: "SELECT version, updated_at FROM notes WHERE namespace=?1 AND id=?2"
+                            .into(),
+                        params: vec![
+                            SqlValue::Text(namespace.into()),
+                            SqlValue::Text(id.to_string()),
+                        ],
+                        label: Some("stream-batch-write-time".into()),
+                    })
+                    .await?;
+                let Some(stored) = stored else {
+                    return Err(RuntimeError::Internal(
+                        "missing stream write timestamp".into(),
+                    ));
+                };
+                Ok((
+                    json!({"id": id, "version": integer(&stored, "version")?, "updated_at": micros_to_iso(integer(&stored, "updated_at")?)}),
+                    applied.effect,
+                ))
+            }
             Err(AtomicOpFailure::NoteConflict(conflict)) => Err(conflict.into_error().into()),
             Err(AtomicOpFailure::GuardFailed { .. }) => {
                 let holder = writer.query_row(statement(
@@ -853,7 +961,7 @@ impl KhiveRuntime {
                 Err(error) => return Err(error),
             };
             let id = snapshot.id;
-            let version = snapshot
+            snapshot
                 .version
                 .checked_add(1)
                 .ok_or_else(|| RuntimeError::InvalidInput("note version exhausted".into()))?;
@@ -880,7 +988,6 @@ impl KhiveRuntime {
                     key: spec.key,
                     kind: spec.kind,
                     id,
-                    version,
                     plan,
                     after_create: None,
                 },
@@ -1029,7 +1136,6 @@ impl KhiveRuntime {
                         key: create.key,
                         kind: create.kind,
                         id: note.id,
-                        version: note.version,
                         plan,
                         after_create: Some(create.args),
                     }
@@ -1073,6 +1179,11 @@ impl KhiveRuntime {
             if entry.id.is_some() && entry.version.is_none() {
                 return Err(RuntimeError::InvalidInput(
                     "observed id requires a positive version".into(),
+                ));
+            }
+            if entry.live_until.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "observed live_until requires a positive version".into(),
                 ));
             }
             crate::keyed_memory::validate_memory_key(&entry.key)?;
