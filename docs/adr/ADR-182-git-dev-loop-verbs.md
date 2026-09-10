@@ -544,3 +544,40 @@ credential read; gates distinguish local and HTTPS mappings in one configuration
 unknown schemes and local targets lacking the empty slug refuse; reconciliation
 requires the marker and exact remote SHA. Mutation expectation: restoring the
 HTTPS-only scheme check makes the successful local-file push arm fail.
+
+## Amendment 10 (2026-09-10): the order the remote path refuses in, and the table each refusal read
+
+Amends Amendment 2 item 3, which names `git.commit` and `git.push` in one sentence and says an actor
+without a row refuses `actor_unmapped`. The two verbs cannot answer identically, and issue #2549
+records a configuration where they do not.
+
+1. **The remote path resolves the repository mapping first.** `git.push`, `git.pr_open`,
+   `git.pr_review` and `git.pr_merge` resolve `[git_write.repositories."<absolute path>"]` before any
+   credential exists to resolve, so a call against a path with no row refuses `repository_unmapped`
+   whatever the actor's state. `git.commit` has no mapping to consult and reaches the actor check
+   first. Amendment 2 item 3 continues to govern what the actor check does; it does not govern which
+   check runs first, and this item states that order rather than leaving it to be read off the code.
+
+2. **A refusal names the table it read.** The wire values `repository_unmapped` and `actor_unmapped`
+   are unchanged, because callers key contract arms on them. The receipt gains
+   `refusal: {table, key}` on both: `git_write.repositories` with the absolute path that was not
+   found, and `git_write.actors` with the actor label that was not found. This is what separates
+   the two tables for a reader who has one of them configured correctly. `[[git_write.allowed]]` is
+   a third table, consulted by the gate, and a gate refusal already carries its own source.
+
+3. **Why this is worth a receipt field.** An arm written to prove that a missing actor credential
+   never falls back to the daemon's credential passes on the remote path without reaching credential
+   resolution at all, when the repositories row is absent. The refusal reason alone cannot tell that
+   arm's author what happened, because `repository_unmapped` reads as a statement about the
+   allowlist, which is the table such a configuration usually does have. Naming the table on the
+   receipt makes the difference visible from the artifact the caller already reads.
+
+Acceptance arms: with a repositories row present and the actor row removed, `git.push` refuses
+`actor_unmapped` carrying `refusal: {table: "git_write.actors", key: <label>}`, and `git.commit`
+refuses the same reason and table; with the repositories row absent and the actor row present,
+`git.push` refuses `repository_unmapped` carrying `refusal: {table: "git_write.repositories", key:
+<absolute path>}` while `git.commit` still succeeds; with both absent, `git.push` refuses
+`repository_unmapped` and names the repositories table, which is the ordering item 1 states. A local
+mapping under Amendment 9 resolves no actor row and is unaffected by items 1 and 2 beyond the
+repository lookup itself. Mutation expectation: swapping the two resolutions on the remote path
+turns the both-absent arm red without touching any other arm.
