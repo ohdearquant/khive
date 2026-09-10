@@ -8335,7 +8335,13 @@ pub(crate) mod tests {
     }
 
     fn serial_attribute_keys(attrs: &[syn::Attribute]) -> syn::Result<Vec<String>> {
-        use syn::ext::IdentExt;
+        fn parse_keys(
+            input: syn::parse::ParseStream<'_>,
+        ) -> syn::Result<syn::punctuated::Punctuated<syn::Ident, syn::Token![,]>> {
+            use syn::ext::IdentExt;
+
+            syn::punctuated::Punctuated::parse_terminated_with(input, syn::Ident::parse_any)
+        }
 
         let mut acquired = Vec::new();
         // Later serial attributes wrap the function produced by earlier ones,
@@ -8349,12 +8355,7 @@ pub(crate) mod tests {
             let mut keys = match &attr.meta {
                 syn::Meta::Path(_) => Vec::new(),
                 syn::Meta::List(_) => attr
-                    .parse_args_with(|input| {
-                        syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated_with(
-                            input,
-                            syn::Ident::parse_any,
-                        )
-                    })
+                    .parse_args_with(parse_keys)
                     .map_err(|error| {
                         syn::Error::new_spanned(
                             attr,
