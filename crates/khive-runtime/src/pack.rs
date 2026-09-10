@@ -1720,6 +1720,8 @@ impl VerbRegistry {
         ("git", "git.gates"),
         ("git", "git.status"),
         ("git", "git.log"),
+        // Canonical get project check plus bounded cursor SELECT; no domain writes.
+        ("git", "git.ingest_cursor"),
         // blob
         ("blob", "blob.get"),
         ("blob", "blob.stat"),
