@@ -30,7 +30,11 @@ def write(version, ttl):
     result = client.request(encode([op("stream.batch", ops=[{"op":"write", "key":key, "kind":"head", "doc":{"expires_at":deadline}, "embed":False, "expected_version":version}])]))[0]
     assert result["ok"], result
     print(json.dumps({"pid":os.getpid(), "deadline":deadline, "write":result["result"]["results"][0]}), flush=True)
-write(None, 1)
+# Long enough that the parent's control publish, which must land BEFORE this
+# deadline, is not racing the round trips it takes to get there on a loaded
+# host; the expiry phase below sleeps to the deadline rather than for a fixed
+# time, so widening this costs the test only the headroom it needs.
+write(None, 5)
 assert sys.stdin.readline().strip() == "renew"
 write(1, 3600)
 assert sys.stdin.readline().strip() == "done"
