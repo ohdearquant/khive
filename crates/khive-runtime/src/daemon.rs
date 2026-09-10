@@ -3156,6 +3156,7 @@ mod tests {
     struct CancellationAwareDispatch {
         started: Arc<tokio::sync::Notify>,
         cancellation_observed: Arc<std::sync::atomic::AtomicBool>,
+        count_sql: Option<Arc<dyn khive_storage::SqlAccess>>,
     }
 
     #[async_trait]
@@ -3175,6 +3176,24 @@ mod tests {
             _identity: Option<RequestIdentity>,
         ) -> Result<String, String> {
             self.started.notify_one();
+            if let Some(sql) = &self.count_sql {
+                let mut reader = sql.reader().await.map_err(|error| error.to_string())?;
+                let result = reader.query_scalar(khive_storage::SqlStatement {
+                    sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'".into(),
+                    params: vec![khive_storage::SqlValue::Text("local".into())],
+                    label: Some("knowledge.stats.event_count".into()),
+                }).await;
+                self.cancellation_observed.store(
+                    matches!(
+                        result,
+                        Err(khive_storage::error::StorageError::Timeout { .. })
+                    ),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                return result
+                    .map(|value| format!("{value:?}"))
+                    .map_err(|error| error.to_string());
+            }
             khive_storage::wait_for_request_read_cancellation().await;
             self.cancellation_observed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3480,6 +3499,7 @@ mod tests {
         let dispatcher = CancellationAwareDispatch {
             started: Arc::clone(&started),
             cancellation_observed: Arc::clone(&cancellation_observed),
+            count_sql: None,
         };
         let (mut client, server) = UnixStream::pair().expect("unix stream pair");
         let request = base_request_frame("disconnect-test");
@@ -3499,6 +3519,91 @@ mod tests {
             cancellation_observed.load(std::sync::atomic::Ordering::SeqCst),
             "peer loss did not reach the request-scoped read cancellation signal"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_disconnect_interrupts_pooled_stats_count() {
+        use khive_storage::{SqlAccess, SqlStatement, SqlValue};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(dir.path().join("disconnect-count.db")),
+                max_readers: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
+             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) \
+             INSERT INTO count_fixture SELECT x FROM n; \
+             CREATE VIEW events AS SELECT 'local' AS namespace, 'knowledge.learn' AS verb \
+             FROM count_fixture a CROSS JOIN count_fixture b CROSS JOIN count_fixture c;",
+            )
+            .unwrap();
+        let sql = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+        let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = CancellationAwareDispatch {
+            started: Arc::new(tokio::sync::Notify::new()),
+            cancellation_observed: Arc::clone(&cancellation_observed),
+            count_sql: Some(sql.clone()),
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = base_request_frame("disconnect-test");
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = tokio::spawn(khive_db::scope_test_read_progress(
+            Arc::clone(&progress),
+            async move { handle_conn(server, dispatcher).await },
+        ));
+        write_frame(&mut client, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while progress.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    !handler.is_finished(),
+                    "COUNT returned before its first SQLite progress callback"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !handler.is_finished(),
+            "COUNT must be outstanding at disconnect"
+        );
+        let started = std::time::Instant::now();
+        let grace = khive_db::sqlite_interrupt_grace_from_env();
+        drop(client);
+        tokio::time::timeout(grace, handler)
+            .await
+            .expect("disconnected COUNT did not settle within interrupt grace")
+            .unwrap();
+        assert!(cancellation_observed.load(std::sync::atomic::Ordering::SeqCst));
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.active_pooled_checkouts, 0);
+        assert_eq!(snapshot.available_reader_admission_slots, 1);
+        eprintln!(
+            "daemon_stats_count_disconnect_ms={} grace_ms={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            grace.as_millis()
+        );
+        let count = sql
+            .reader()
+            .await
+            .unwrap()
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM count_fixture".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(count, Some(SqlValue::Integer(1000))));
     }
 
     /// Protocol v4 makes `process_ref` part of dispatch semantics. A still-warm

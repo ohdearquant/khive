@@ -160,6 +160,7 @@ const V28_UP: &str = include_str!("../sql/028-notes-key.sql");
 const V29_UP: &str = include_str!("../sql/029-note-streams.sql");
 const V30_UP: &str = include_str!("../sql/030-tool-source-mounts.sql");
 const V31_UP: &str = include_str!("../sql/031-note-versions.sql");
+const V32_UP: &str = include_str!("../sql/032-knowledge-count-indexes.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -370,6 +371,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 31,
         name: "note_versions",
         up: V31_UP,
+    },
+    VersionedMigration {
+        version: 32,
+        name: "knowledge_count_indexes",
+        up: V32_UP,
     },
 ];
 

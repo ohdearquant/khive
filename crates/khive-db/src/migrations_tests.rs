@@ -4171,3 +4171,61 @@ fn stream_migration_empty_and_populated_previous_version() {
         run_migrations(&mut conn).unwrap();
     }
 }
+
+#[test]
+fn v31_reopen_installs_knowledge_count_covering_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("count-index-upgrade.db");
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        migrate_through(&mut conn, 31);
+        conn.execute("INSERT INTO events (id, namespace, verb, substrate, actor, outcome, created_at) VALUES ('event-a', 'local', 'Knowledge.learn', 'entity', 'test', 'ok', 0)", []).unwrap();
+    }
+    let mut conn = Connection::open(&path).unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    for (table, index) in [
+        ("events", "idx_events_ns_verb"),
+        ("knowledge_atoms", "idx_knowledge_atoms_ns_live_counts"),
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list(?1) WHERE name = ?2)",
+                rusqlite::params![table, index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing {index} after reopening V31");
+    }
+    let event_sql = "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'";
+    let count: i64 = conn
+        .query_row(event_sql, ["local"], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "index must preserve ASCII-insensitive LIKE");
+    for (sql, expected) in [
+        (event_sql, "idx_events_ns_verb"),
+        ("SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'", "idx_knowledge_atoms_ns_live_counts"),
+        ("SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%' AND status = 'reviewed'", "idx_knowledge_atoms_ns_live_counts"),
+        ("SELECT COUNT(*), SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'", "idx_knowledge_atoms_ns_live_counts"),
+    ] {
+        let detail: String = conn.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["local"], |row| row.get(3)).unwrap();
+        assert!(detail.contains(&format!("COVERING INDEX {expected}")), "{detail}");
+        if expected == "idx_events_ns_verb" {
+            assert!(detail.contains("verb>?") && detail.contains("verb<?"), "{detail}");
+        }
+    }
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
+fn event_store_ddl_upgrades_existing_event_indexes_idempotently() {
+    let conn = open_memory();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    conn.execute_batch("DROP INDEX idx_events_ns_verb").unwrap();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_index_list('events') WHERE name = 'idx_events_ns_verb')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(exists);
+}

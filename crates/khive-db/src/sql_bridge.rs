@@ -3932,6 +3932,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_stats_count_cancellation_stops_scan_and_releases_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("stats-count-cancel.db")),
+                max_readers: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        // Expand a small file-backed fixture into a long scan, preserving the
+        // handler's exact outer COUNT rather than substituting a SUM query.
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE count_fixture(n INTEGER PRIMARY KEY); \
+             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) \
+             INSERT INTO count_fixture SELECT x FROM n; \
+             CREATE VIEW events AS SELECT 'local' AS namespace, 'knowledge.learn' AS verb \
+             FROM count_fixture a CROSS JOIN count_fixture b CROSS JOIN count_fixture c;",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let query = tokio::spawn(crate::scope_test_read_progress(
+            Arc::clone(&progress),
+            crate::scope_request_read_cancellation(cancel_rx, async move {
+                let result = reader.query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'".into(),
+                    params: vec![SqlValue::Text("local".into())],
+                    label: Some("knowledge.stats.event_count".into()),
+                }).await;
+                (reader, result)
+            }),
+        ));
+        wait_for_progress(progress.as_ref()).await;
+        assert!(
+            !query.is_finished(),
+            "COUNT must still be scanning before cancellation"
+        );
+        let started = std::time::Instant::now();
+        let grace = crate::read_cancellation::sqlite_interrupt_grace_from_env();
+        cancel_tx.send(true).unwrap();
+        let (mut reader, result) = tokio::time::timeout(grace, query)
+            .await
+            .expect("COUNT did not settle within the interrupt grace")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(StorageError::Timeout { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            pool.available_readers(),
+            1,
+            "COUNT retained the sole pooled reader"
+        );
+        let stopped = progress.load(std::sync::atomic::Ordering::SeqCst);
+        let next = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM count_fixture".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(next, Some(SqlValue::Integer(1000))));
+        assert_eq!(
+            progress.load(std::sync::atomic::Ordering::SeqCst),
+            stopped,
+            "cancelled callback leaked into the next borrower"
+        );
+        eprintln!(
+            "stats_count_cancel_ms={} grace_ms={}",
+            elapsed.as_secs_f64() * 1000.0,
+            grace.as_millis()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_before_reader_checkout_is_prompt_and_executes_no_statement() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
