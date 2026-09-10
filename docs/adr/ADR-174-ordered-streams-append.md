@@ -715,15 +715,26 @@ An `observed` entry may carry `live_until`:
   written) by a dotted path, `"expires_at"` or `"lease.expires_at"`. The entry holds when the live
   note of that kind holding `K` in the caller's primary namespace is at exactly version `V` **and**
   the named field holds an RFC 3339 timestamp strictly later than the transaction's clock.
-- The transaction's clock is one reading, taken by the writer transaction before the first `observed`
-  check and shared by every entry in the list. It is never the caller's clock and never the request's
-  arrival time.
+- The transaction's clock is one reading, taken by one statement inside the writer transaction after
+  it opens and before the first `observed` check, and shared by every entry in the list. It is the
+  same source that stamps the row's `updated_at` (A5.2), so the reading appears in the statement trace
+  of Amendment 3 A3.3 and the `now` an `expired` refusal carries is on the clock khive itself writes.
+  It is never the caller's clock, never the request's arrival time and never a process clock read
+  outside the transaction.
 - A field that is absent, or whose value is not an RFC 3339 timestamp, refuses the batch with
-  `live_until_unreadable`, `details` naming the key, the field and the value found; nothing is
-  written. A liveness the entry cannot read is not a liveness it may assume.
-- A timestamp at or before the transaction's clock refuses the batch with `expired`, `details`
-  naming the key, the field, the value found and the clock reading (`now`) it was compared with, so
-  the caller can see the window it lost; nothing is written.
+  `live_until_unreadable`: kind `conflict` (§2, ADR-172 §2), `reason: "live_until_unreadable"`,
+  `details` naming the key, the kind, the version, the field and the value found; nothing is written.
+  A value without an offset is not RFC 3339 and is unreadable. A liveness the entry cannot read is not
+  a liveness it may assume.
+- A timestamp at or before the transaction's clock refuses the batch with `expired`: kind `conflict`,
+  `reason: "expired"`, `details` naming the key, the kind, the version, the field, the value found and
+  the clock reading (`now`) it was compared with, so the caller can see the window it lost; nothing is
+  written. The comparison is between instants, the value's offset honoured.
+- Both refusals are transaction-time precondition outcomes on store state, so they take the kind
+  Amendment 1's `version_conflict` takes, and every `details` value is a string as ADR-172 §2
+  requires: `key`, `kind` and `field` as given, `version` as its decimal string, `value` as the field's
+  JSON text (a found value may be a number, an object or `null`, and is rendered as JSON), `now` in
+  the form `updated_at` takes.
 - `live_until` requires a version. With `version: null` the entry is `invalid_input` before any
   member writes: an absent document has no field to read.
 - Everything else about `observed` stands: atomic mode only, refused with `invalid_input` in
