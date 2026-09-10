@@ -624,8 +624,10 @@ impl KhiveRuntime {
         let build_hash = crate::build_info::BUILD_INFO
             .is_stamped()
             .then_some(crate::build_info::BUILD_INFO.source_revision);
-        let build =
-            khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
+        let build = khive_db::diagnostics::BuildIdentity::from_env(
+            crate::build_info::PACKAGE_VERSION,
+            build_hash,
+        );
 
         khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,

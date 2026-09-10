@@ -836,9 +836,16 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 
 ### `whoami` — Assertive
 
-Report the caller identity and namespace scope the runtime already resolved for this request.
-It takes no parameters and returns only identity labels, never tokens or credentials:
-`{actor_id, actor_kind, unattributed, namespace, visible_namespaces}`.
+Report the caller identity and namespace scope the runtime already resolved for this request,
+plus the serving process's build identity. It takes no parameters and never returns tokens or
+credentials: `{actor_id, actor_kind, unattributed, namespace, visible_namespaces, build: {version, revision}}`.
+
+`build.version` is the package version; `build.revision` is the source revision shown by that
+process's `kkernel --version`, including any `-dirty` suffix or the explicit `unstamped` fallback.
+These compile-time values share the source used by `db_diagnostics().build`; diagnostics calls
+the optional revision field `build_hash` and reports it as null for an unstamped build.
+Use `whoami()` for a lightweight build-identity probe: its handler reads existing token state
+and immutable build metadata without invoking database diagnostics or a checkpoint probe.
 
 ```
 request(ops="whoami()")
