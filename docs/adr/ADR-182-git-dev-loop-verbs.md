@@ -565,6 +565,13 @@ records a configuration where they do not.
    the two tables for a reader who has one of them configured correctly. `[[git_write.allowed]]` is
    a third table, consulted by the gate, and a gate refusal already carries its own source.
 
+   `table` and `key` name what was **consulted**, not what was missing, because `actor_unmapped`
+   covers two different states: no row for the label, and a row whose `credential_resolver` failed.
+   A third field separates them, `cause: "absent" | "resolver"`, and both carry
+   `table: "git_write.actors"` with the label as `key`. The resolver case names the row it did find
+   and says the resolution failed; it never reads as "not found" about a label that was found. The
+   resolver's own output is not on the receipt, for the reason Amendment 2 item 3 already gives.
+
 3. **Why this is worth a receipt field.** An arm written to prove that a missing actor credential
    never falls back to the daemon's credential passes on the remote path without reaching credential
    resolution at all, when the repositories row is absent. The refusal reason alone cannot tell that
@@ -577,7 +584,10 @@ Acceptance arms: with a repositories row present and the actor row removed, `git
 refuses the same reason and table; with the repositories row absent and the actor row present,
 `git.push` refuses `repository_unmapped` carrying `refusal: {table: "git_write.repositories", key:
 <absolute path>}` while `git.commit` still succeeds; with both absent, `git.push` refuses
-`repository_unmapped` and names the repositories table, which is the ordering item 1 states. A local
+`repository_unmapped` and names the repositories table, which is the ordering item 1 states. With
+the actor row present and its `credential_resolver` failing, `git.push` refuses `actor_unmapped`
+carrying `refusal: {table: "git_write.actors", key: <label>, cause: "resolver"}`, and the
+row-absent arms above carry `cause: "absent"`, which is the arm that pins the two states apart. A local
 mapping under Amendment 9 resolves no actor row and is unaffected by items 1 and 2 beyond the
 repository lookup itself. Mutation expectation: swapping the two resolutions on the remote path
 turns the both-absent arm red without touching any other arm.
