@@ -1507,3 +1507,6 @@ mod expiry_tests;
 
 #[path = "stream_observed_id_tests.rs"]
 mod observed_id_tests;
+
+#[path = "stream_batch_cap_tests.rs"]
+mod batch_cap_tests;
