@@ -1128,11 +1128,12 @@ when its kind is `actor`, and `kind:id` for other actor kinds.
 - With `actor` omitted, `brain.event_counts` counts only that caller's events.
   For kind `actor`, the canonical stored label is `actor:` followed by the
   unmodified raw principal id, prepending that prefix exactly once even when the
-  id already begins with `actor:`. A historical bare alias also matches only when
-  the raw id does not begin with `actor:`; prefixed ids match only their canonical
-  stored label. Only this default view combines the permitted spellings into one
-  `counts_by_actor` key, using the caller label; other kinds match their exact
-  caller label. An empty result has no actor keys.
+  id already begins with a reserved stamped-kind prefix. A historical bare alias
+  also matches only when the raw id does not begin with `<kind>:` for any kind in
+  `RUNTIME_STAMPED_ACTOR_KINDS`: `actor`, `anonymous`, or `agent`. Such prefixed ids
+  match only their canonical stored label. Only this default view combines the
+  permitted spellings into one `counts_by_actor` key, using the caller label;
+  other kinds match their exact caller label. An empty result has no actor keys.
 - With `actor` omitted, `brain.bindings` returns only binding rows whose actor is
   the caller label. This is an exact row filter, not the wildcard fallback used
   during profile resolution.
@@ -1148,11 +1149,15 @@ is exact string equality between the requested actor id and one entry of the
 token's `visible_namespaces` list: no prefix match, no pattern, and no
 derivation of a namespace from the actor id. Other actor reads
 fail with `InvalidInput` naming the refused actor. An event-count actor filter
-without an `actor:` prefix matches bare and canonical stored labels. Every filter
-beginning with `actor:` matches that stored label exactly, and authorization
-removes exactly one prefix to obtain the actor identity. There is no exception
-for a filter equal to the caller label. This is a query-scope rule using the
-already-authorized token, not a new storage-isolation boundary. Existing namespace
+without a reserved stamped-kind prefix matches bare and canonical stored labels.
+Every filter beginning with a reserved stamped-kind prefix matches that stored
+label exactly. Authorization parses the prefix once: self access requires both
+the kind and the remaining id to match the token's kind and id. For foreign
+access, an `actor:` filter checks the remaining raw id against visibility;
+`anonymous:` and `agent:` filters check the full, unchanged label. There is no
+self-access exception for a filter equal to the caller's collapsed label. This
+is a query-scope rule using the already-authorized token, not a new
+storage-isolation boundary. Existing namespace
 and consumer-kind filters retain their meaning.
 
 **Stored-label clarification (2026-09-10).** The distinct ordinary principals
@@ -1161,6 +1166,24 @@ and consumer-kind filters retain their meaning.
 uses `actor="actor:actor:caller-a"` for an explicit self read. Its query with
 `actor="actor:caller-a"` selects the first principal's canonical label instead
 and requires visibility of `caller-a`.
+
+**Runtime-kind clarification (2026-09-10).** The shared
+`RUNTIME_STAMPED_ACTOR_KINDS` slice next to `ActorRef` in `khive-gate` reserves
+`actor:`, `anonymous:`, and `agent:` from historical bare aliases. A named
+principal with raw id `anonymous:local` therefore matches only its canonical
+`actor:anonymous:local` stamp by default and uses that same label for an explicit
+self filter. The filter `anonymous:local` instead selects the anonymous
+principal's canonical stamp; a named caller needs that full label in its visible
+set to read it. The same distinction applies to a named id such as `agent:worker`
+and the stamp of kind `agent`, id `worker`.
+
+This guarantee is limited to the reserved runtime-stamped kinds in the shared
+slice. The kind space remains open: `ActorRef::try_new` accepts any nonempty kind
+(and requires a nonempty id); the slice is not a closed validation enum. Adding
+a new runtime-stamped kind must extend the shared slice and include per-kind
+attributed-event tests that exercise the event-count consumer, so a separate
+hard-coded consumer list cannot silently omit the new kind. Custom kinds outside
+that slice are not covered by this alias-separation guarantee.
 
 ### Explicit aggregate event counts
 

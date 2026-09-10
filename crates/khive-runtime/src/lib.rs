@@ -112,7 +112,7 @@ pub use khive_db::{
 };
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
-    GateDecision, GateError, GateRef, GateRequest, Obligation,
+    GateDecision, GateError, GateRef, GateRequest, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};

@@ -10135,6 +10135,224 @@ mod read_scope_tests {
         }
     }
 
+    async fn append_attributed_actor_events(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        count: usize,
+    ) {
+        let events = rt.events(token).expect("attributed event store");
+        let canonical_actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        for _ in 0..count {
+            let mut event = khive_storage::event::Event::new(
+                token.namespace().as_str(),
+                "search",
+                EventKind::SearchExecuted,
+                khive_types::SubstrateKind::Note,
+                "caller-supplied",
+            );
+            event.created_at = 1_000_000;
+            event.payload = json!({"result_kind": "note"});
+            let id = event.id;
+            events
+                .append_event(event)
+                .await
+                .expect("append attributed event");
+            let stored = events.get_event(id).await.unwrap().unwrap();
+            assert_eq!(stored.actor, canonical_actor);
+        }
+    }
+
+    async fn assert_stamped_kind_raw_id_scope(kind: &str, raw_id: &str) {
+        let (pack, rt) = make_pack_with_read_scope(Some("serving-actor"), &[], &[]);
+        let (_, caller_rt) = make_pack_with_read_scope(Some(raw_id), &[], &[]);
+        let token = caller_rt
+            .authorize(Namespace::local())
+            .expect("named caller token");
+        assert_eq!(token.actor().kind, "actor");
+        assert_eq!(token.actor().id, raw_id);
+        append_attributed_actor_events(&rt, &token, 2).await;
+
+        let (_, unrelated_rt) = make_pack_with_read_scope(Some("unrelated-caller"), &[], &[]);
+        let unrelated = unrelated_rt
+            .authorize(Namespace::local())
+            .expect("unrelated token");
+        append_attributed_actor_events(&rt, &unrelated, 3).await;
+
+        let visible_identity = match kind {
+            "actor" => {
+                let (_, other_rt) = make_pack_with_read_scope(Some("x"), &[], &[]);
+                let other = other_rt
+                    .authorize(Namespace::local())
+                    .expect("other actor token");
+                append_attributed_actor_events(&rt, &other, 1).await;
+                "x"
+            }
+            "anonymous" => {
+                let (_, other_rt) = make_pack_with_read_scope(None, &[], &[]);
+                let other = other_rt
+                    .authorize(Namespace::local())
+                    .expect("anonymous token");
+                append_attributed_actor_events(&rt, &other, 1).await;
+                for exhaustive in [false, true] {
+                    let mut params = event_params();
+                    params["actor"] = json!(raw_id);
+                    params["exhaustive"] = json!(exhaustive);
+                    let own = pack
+                        .dispatch("brain.event_counts", params, &empty_registry(), &other)
+                        .await
+                        .expect("anonymous canonical self filter uses structural identity");
+                    assert_eq!(own["counts_by_actor"], json!({"anonymous:local": 1}));
+                    assert_eq!(own["total"], json!(1));
+                    assert_eq!(own["window_event_total"], json!(1));
+                }
+                raw_id
+            }
+            "agent" => {
+                // Agent-kind tokens have no public runtime minting path; use the
+                // trusted fixture for this reserved canonical stamp.
+                super::event_counts_tests::seed_event(
+                    &rt,
+                    &token,
+                    "search",
+                    EventKind::SearchExecuted,
+                    raw_id,
+                    1_000_000,
+                    json!({"result_kind": "note"}),
+                )
+                .await;
+                raw_id
+            }
+            _ => panic!("unexpected stamped actor kind {kind}"),
+        };
+        let (_, visible_rt) = make_pack_with_read_scope(Some(raw_id), &[visible_identity], &[]);
+        let visible = visible_rt
+            .authorize_with_visibility(Namespace::local(), visible_rt.visible_namespaces().to_vec())
+            .expect("named caller token with the other principal visible");
+        let canonical_self = format!("actor:{raw_id}");
+        let registry = empty_registry();
+        for exhaustive in [false, true] {
+            let mut params = event_params();
+            params["exhaustive"] = json!(exhaustive);
+            let own = pack
+                .dispatch("brain.event_counts", params.clone(), &registry, &token)
+                .await
+                .expect("default scope excludes the ambiguous raw alias");
+            let mut expected = json!({});
+            expected[raw_id] = json!(2);
+            assert_eq!(own["counts_by_actor"], expected);
+            assert_eq!(own["total"], json!(2));
+            assert_eq!(own["window_event_total"], json!(2));
+
+            params["actor"] = json!(canonical_self);
+            let explicit_self = pack
+                .dispatch("brain.event_counts", params.clone(), &registry, &token)
+                .await
+                .expect("canonical self filter identifies the named principal");
+            let mut expected = json!({});
+            expected[canonical_self.as_str()] = json!(2);
+            assert_eq!(explicit_self["counts_by_actor"], expected);
+            assert_eq!(explicit_self["total"], json!(2));
+            assert_eq!(explicit_self["window_event_total"], json!(2));
+
+            params["actor"] = json!(raw_id);
+            let denied = pack
+                .dispatch("brain.event_counts", params.clone(), &registry, &token)
+                .await
+                .expect_err(
+                    "a matching raw id cannot authorize another principal's canonical stamp",
+                );
+            assert_actor_refused(denied, visible_identity);
+            let other = pack
+                .dispatch("brain.event_counts", params, &registry, &visible)
+                .await
+                .expect("visible stamped-kind filter reads exactly the other principal");
+            let mut expected = json!({});
+            expected[raw_id] = json!(1);
+            assert_eq!(other["counts_by_actor"], expected);
+            assert_eq!(other["total"], json!(1));
+            assert_eq!(other["window_event_total"], json!(1));
+        }
+    }
+
+    #[test]
+    fn stamped_actor_kind_cases_cover_runtime_kinds() {
+        let mut kinds = khive_runtime::RUNTIME_STAMPED_ACTOR_KINDS.to_vec();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["actor", "agent", "anonymous"]);
+    }
+
+    #[tokio::test]
+    async fn default_actor_prefixed_raw_id_excludes_colliding_principal_events() {
+        assert_stamped_kind_raw_id_scope("actor", "actor:x").await;
+    }
+
+    #[tokio::test]
+    async fn default_anonymous_prefixed_raw_id_excludes_colliding_principal_events() {
+        assert_stamped_kind_raw_id_scope("anonymous", "anonymous:local").await;
+    }
+
+    #[tokio::test]
+    async fn default_agent_prefixed_raw_id_excludes_colliding_principal_events() {
+        assert_stamped_kind_raw_id_scope("agent", "agent:x").await;
+    }
+
+    #[tokio::test]
+    async fn default_ordinary_actor_preserves_bare_historical_alias() {
+        let (pack, rt) = make_pack_with_read_scope(Some("caller-a"), &[], &[]);
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("ordinary actor token");
+        append_attributed_actor_events(&rt, &token, 2).await;
+        super::event_counts_tests::seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "caller-a",
+            1_000_000,
+            json!({"result_kind": "note"}),
+        )
+        .await;
+        let (_, other_rt) = make_pack_with_read_scope(Some("unrelated-caller"), &[], &[]);
+        let other = other_rt
+            .authorize(Namespace::local())
+            .expect("unrelated token");
+        append_attributed_actor_events(&rt, &other, 3).await;
+        let registry = empty_registry();
+        for exhaustive in [false, true] {
+            let mut params = event_params();
+            params["exhaustive"] = json!(exhaustive);
+            let own = pack
+                .dispatch("brain.event_counts", params.clone(), &registry, &token)
+                .await
+                .expect("ordinary default scope includes its historical alias");
+            assert_eq!(own["counts_by_actor"], json!({"caller-a": 3}));
+            assert_eq!(own["total"], json!(3));
+            assert_eq!(own["window_event_total"], json!(3));
+
+            params["actor"] = json!("caller-a");
+            let bare = pack
+                .dispatch("brain.event_counts", params.clone(), &registry, &token)
+                .await
+                .expect("ordinary bare filter preserves both stored spellings");
+            assert_eq!(
+                bare["counts_by_actor"],
+                json!({"caller-a": 1, "actor:caller-a": 2})
+            );
+            assert_eq!(bare["total"], json!(3));
+            assert_eq!(bare["window_event_total"], json!(3));
+
+            params["actor"] = json!("actor:caller-a");
+            let canonical = pack
+                .dispatch("brain.event_counts", params, &registry, &token)
+                .await
+                .expect("ordinary canonical filter remains exact");
+            assert_eq!(canonical["counts_by_actor"], json!({"actor:caller-a": 2}));
+            assert_eq!(canonical["total"], json!(2));
+            assert_eq!(canonical["window_event_total"], json!(2));
+        }
+    }
+
     #[tokio::test]
     async fn all_actor_event_counts_require_serving_runtime_fleet_reader() {
         let (pack, rt) = make_pack_with_read_scope(Some("caller-a"), &[], &["caller-a"]);

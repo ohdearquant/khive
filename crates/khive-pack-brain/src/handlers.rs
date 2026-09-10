@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
     micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeError, VerbRegistry,
+    NamespaceToken, RuntimeError, VerbRegistry, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
@@ -131,8 +131,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: false,
                 description: "Defaults to the caller; a named foreign actor must be visible to the caller. \
                     Ordinary actor ids match actor: plus the unchanged id; a historical bare alias also \
-                    matches only when the id does not begin actor:. An explicit actor:-prefixed value \
-                    matches exactly and authorizes the id after removing one prefix. Default-scoped \
+                    matches only when the id has no reserved runtime kind prefix (actor:, anonymous:, agent:). \
+                    An explicit reserved-prefix value matches exactly and checks structural caller identity; \
+                    visibility uses the id after one actor: prefix, otherwise the unchanged label. Default-scoped \
                     counts use one caller-label key.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
@@ -905,6 +906,12 @@ impl BrainPack {
         }
     }
 
+    fn split_stamped_actor_label(label: &str) -> Option<(&str, &str)> {
+        label
+            .split_once(':')
+            .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
+    }
+
     fn check_read_actor(token: &NamespaceToken, actor: &str) -> Result<(), RuntimeError> {
         if actor != Self::caller_actor_label(token)
             && !token.visible_namespace_strs().contains(&actor)
@@ -964,8 +971,18 @@ impl BrainPack {
         }
         let caller = Self::caller_actor_label(token);
         if let Some(actor) = p.actor.as_deref() {
-            let identity = actor.strip_prefix("actor:").unwrap_or(actor);
-            Self::check_read_actor(token, identity)?;
+            let (identity, is_self) = match Self::split_stamped_actor_label(actor) {
+                Some((kind, id)) => (
+                    if kind == "actor" { id } else { actor },
+                    token.actor().kind == kind && token.actor().id == id,
+                ),
+                None => (actor, actor == caller),
+            };
+            if !is_self && !token.visible_namespace_strs().contains(&identity) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "actor {identity:?} is not visible to this caller"
+                )));
+            }
         }
         let default_scope = !all_actors && p.actor.is_none();
 
@@ -994,10 +1011,12 @@ impl BrainPack {
         // A prefixed id has no bare alias: that spelling belongs to another
         // principal's canonical events. Only default scope coalesces actor keys.
         let actor_filters: Vec<String> = match p.actor.as_deref() {
-            Some(a) if a.starts_with("actor:") => vec![a.to_string()],
+            Some(a) if Self::split_stamped_actor_label(a).is_some() => vec![a.to_string()],
             Some(a) => vec![a.to_string(), format!("actor:{a}")],
             None if all_actors => Vec::new(),
-            None if token.actor().kind == "actor" && caller.starts_with("actor:") => {
+            None if token.actor().kind == "actor"
+                && Self::split_stamped_actor_label(&caller).is_some() =>
+            {
                 vec![format!("actor:{caller}")]
             }
             None if token.actor().kind == "actor" => {
