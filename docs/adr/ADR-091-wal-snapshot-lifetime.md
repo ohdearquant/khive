@@ -1684,3 +1684,47 @@ The first-poll enforcement arm and the fault-injection arms for this caller have
 they run with the stream work's own gate. The row is entered under the same review guard it
 documents, and the guard's requirement is that the entry exists and the body respects the
 invariant, which is what was checked.
+
+### 2026-09-10 amendment (Amendment 18): stream-batch write scope, and its one open bound
+
+**What this adds.** Amendment 17 entered the single-append caller. The batch surface that landed
+after it adds a second caller under the same owner, `run_prepared_stream_batch` in
+`crates/khive-runtime/src/streams.rs`, and Amendment 11's review guard requires its own row. This
+amendment records it, again by appending rather than editing either earlier table.
+
+| Transaction owner                   | Production scopes/callers                     | Work inside the transaction                                                                                                                                                                                                                                                                                                           | Verdict  |
+| ----------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::run_prepared_stream_batch` | At most one `SELECT khive_now_micros()`, taken only when an observation carries a deadline; the batch fence check; one paired `SELECT id, version` per observed entry; then per member either a prepared note plan with its row guards and one ledger `INSERT`, or a keyed write's prepared plan and one `SELECT version, updated_at` | SQL-only |
+
+**Why the row holds.** Every member arrives as a prepared action: the note is serialized and its
+plan produced by the shared preparation path before the transaction opens, so the closure binds
+and executes statements and folds bounded results. It performs no filesystem, process or network
+work, calls into no other subsystem, computes no embedding, and awaits nothing but the writer it
+is handed. The stream head is read at most once per distinct stream in the batch and memoized for
+the rest of it. A refusal, whether from the fence, an observation, a sequence comparison or a
+member's own row guard, returns from the closure and rolls the transaction back through the normal
+path.
+
+**Why the predicates are inside.** The fence and the observation set are preconditions for the
+whole batch, so they are evaluated in the same transaction that installs the writes; checked
+outside the writer they would be advisory, which is the same reason Amendment 17 gives for the
+single append's sequence comparison. The deadline comparison reads the writer's own clock through
+SQLite rather than the process clock, so one transaction has one time.
+
+**The per-member mode is bounded by construction.** `stream_batch_per_member` runs the same
+closure with a one-element member list, once per member, so each writer hold covers exactly one
+member and admits no fence or observation set.
+
+**The open bound, stated rather than implied.** In atomic mode the statement count inside the
+writer hold grows with the number of members and observations the caller sends. The verb refuses
+an empty list, and it does not cap a large one: the only ceiling today is the daemon's 8 MiB frame,
+which is a transport limit rather than a decision about writer hold time, and it admits a member
+count on the order of a hundred thousand. Every comparable path in this document names its own
+number instead: web manifest ingest at 10,000 entities and 50,000 edges, blob GC at 128 rows per
+unit. This row is entered with that gap named, not resolved; the verb-level cap is a change to the
+stream contract and belongs to that contract's own amendment, not to this inventory.
+
+**Basis.** Read at `crates/khive-runtime/src/streams.rs` through the closure's commit and refusal
+edges and through both member kinds, and at `crates/khive-pack-kg/src/handlers/stream.rs` for what
+the verb admits. The frame constant is `crates/khive-runtime/src/daemon.rs`. No new arms were run
+for this row; the stream suites that cover these paths ran with the work that introduced them.
