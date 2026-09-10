@@ -1,7 +1,5 @@
-//! File-backed count benchmark. Run explicitly with:
+//! File-backed count/plan benchmark; no wall-clock comparison. Run with:
 //! cargo test -p khive-pack-knowledge --test count_indexes -- --ignored --nocapture
-
-use std::time::Instant;
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
@@ -62,73 +60,89 @@ async fn seed(runtime: &KhiveRuntime, events: i64, atoms: i64) {
     }
 }
 
-async fn set_indexes(runtime: &KhiveRuntime, indexed: bool) {
-    if indexed {
-        runtime
-            .backend()
-            .pool()
-            .writer()
-            .unwrap()
-            .conn()
-            .execute_batch(include_str!(
-                "../../khive-db/sql/032-knowledge-count-indexes.sql"
-            ))
-            .unwrap();
-    } else {
-        execute(runtime, "DROP INDEX IF EXISTS idx_events_ns_verb").await;
-        execute(
-            runtime,
-            "DROP INDEX IF EXISTS idx_knowledge_atoms_ns_live_counts",
-        )
-        .await;
-    }
-}
-
-async fn execute(runtime: &KhiveRuntime, sql: &str) {
-    runtime
-        .sql()
-        .writer()
-        .await
-        .unwrap()
-        .execute(SqlStatement {
-            sql: sql.into(),
-            params: vec![],
-            label: None,
+fn set_indexes(runtime: &KhiveRuntime, indexed: bool) {
+    let writer = runtime.backend().pool().writer().unwrap();
+    writer
+        .conn()
+        .execute_batch(if indexed {
+            include_str!("../../khive-db/sql/032-knowledge-count-indexes.sql")
+        } else {
+            "DROP INDEX IF EXISTS idx_events_ns_verb; \
+             DROP INDEX IF EXISTS idx_knowledge_atoms_ns_live_counts;"
         })
-        .await
         .unwrap();
 }
 
+fn measure_counts(reader: &khive_db::ReaderGuard<'_>) -> Vec<Value> {
+    [EVENT_COUNT, ATOM_COUNT, LIST_COUNT]
+        .into_iter()
+        .map(|sql| {
+            // A real query checks SQLite's schema cookie. EXPLAIN alone can
+            // retain a stale schema after DDL on another connection, and the
+            // SqlReader abstraction acquires a different lease per operation.
+            // Keep COUNT and its plan on this one physical reader.
+            let count: i64 = reader.query_row(sql, ["local"], |row| row.get(0)).unwrap();
+            let plan: String = reader
+                .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["local"], |row| {
+                    row.get(3)
+                })
+                .unwrap();
+            json!({"sql": sql, "count": count, "plan": plan})
+        })
+        .collect()
+}
+
 async fn measure(runtime: &KhiveRuntime, registry: &VerbRegistry) -> Value {
-    let mut reader = runtime.sql().reader().await.unwrap();
-    let mut counts = Vec::new();
-    for sql in [EVENT_COUNT, ATOM_COUNT, LIST_COUNT] {
-        let statement = SqlStatement {
-            sql: sql.into(),
-            params: vec![SqlValue::Text("local".into())],
-            label: None,
-        };
-        let started = Instant::now();
-        let value = reader.query_scalar(statement.clone()).await.unwrap();
-        let elapsed = started.elapsed();
-        let Some(SqlValue::Integer(count)) = value else {
-            panic!("COUNT did not return an integer: {value:?}");
-        };
-        let plan = reader.explain(statement).await.unwrap();
-        counts.push(json!({
-            "sql": sql, "count": count,
-            "ms": elapsed.as_secs_f64() * 1000.0, "plan": format!("{plan:?}")
-        }));
-    }
-    drop(reader);
-    let started = Instant::now();
+    let (counts, sqlite, installed_indexes) = {
+        let reader = runtime.backend().pool().reader().unwrap();
+        let counts = measure_counts(&reader);
+        let sqlite: String = reader
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let installed_indexes: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN \
+                 ('idx_events_ns_verb', 'idx_knowledge_atoms_ns_live_counts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (counts, sqlite, installed_indexes)
+    };
+    // Public dispatch remains on its normal pooled SQL path; no raw reader
+    // lease survives across this await. These observations make no latency claim.
     let listed = registry
         .dispatch("knowledge.list", json!({"limit": 1}))
         .await
         .unwrap();
-    json!({"counts": counts, "list_ms": started.elapsed().as_secs_f64() * 1000.0,
+    json!({"counts": counts, "sqlite": sqlite, "installed_count_indexes": installed_indexes,
         "list_total": listed["total"], "list_rows": listed["results"].as_array().unwrap().len(),
         "first_list_id": listed["results"][0]["id"]})
+}
+
+fn assert_plans(counts: &[Value], indexed: bool) {
+    assert_eq!(counts.len(), 3);
+    for (sample, expected) in counts.iter().zip([
+        "idx_events_ns_verb",
+        "idx_knowledge_atoms_ns_live_counts",
+        "idx_knowledge_atoms_ns_live_counts",
+    ]) {
+        let plan = sample["plan"].as_str().unwrap();
+        if indexed {
+            assert!(
+                plan.contains(&format!("COVERING INDEX {expected}")),
+                "{sample}"
+            );
+            if expected == "idx_events_ns_verb" {
+                assert!(
+                    plan.contains("verb>?") && plan.contains("verb<?"),
+                    "{sample}"
+                );
+            }
+        } else {
+            assert!(!plan.contains(expected), "stale indexed plan: {sample}");
+        }
+    }
 }
 
 fn assert_sample(sample: &Value, expected: [i64; 3], first_id: &str) {
@@ -147,12 +161,37 @@ async fn count_fixture_reaches_public_list_before_and_after_indexes() {
     let (runtime, registry) = fixture(&dir.path().join("counts.db"));
     seed(&runtime, 120, 156).await;
     for indexed in [false, true] {
-        set_indexes(&runtime, indexed).await;
+        set_indexes(&runtime, indexed);
+        let sample = measure(&runtime, &registry).await;
         assert_sample(
-            &measure(&runtime, &registry).await,
+            &sample,
             [20, 98, 65],
             "00000000-0000-4000-8000-000000000099",
         );
+        assert_plans(sample["counts"].as_array().unwrap(), indexed);
+        assert_eq!(
+            sample["installed_count_indexes"],
+            json!(if indexed { 2 } else { 0 })
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn retained_reader_count_plans_follow_index_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, _registry) = fixture(&dir.path().join("counts.db"));
+    seed(&runtime, 120, 156).await;
+    // Hold the same physical connection while a separate writer changes DDL.
+    // Repeated adds and drops exercise stale schemas in both directions.
+    let reader = runtime.backend().pool().reader().unwrap();
+    for indexed in [false, true, false, true] {
+        set_indexes(&runtime, indexed);
+        let counts = measure_counts(&reader);
+        for (sample, expected) in counts.iter().zip([20, 98, 65]) {
+            assert_eq!(sample["count"], json!(expected));
+        }
+        assert_plans(&counts, indexed);
     }
 }
 
@@ -166,13 +205,13 @@ async fn benchmark_count_indexes() {
     let mut pairs = Vec::new();
     for round in 0..4 {
         let mut pair = serde_json::Map::new();
-        // Adjacent paired arms reverse order to expose cache/order sensitivity.
+        // Exercise both DDL transition orders; report plans and counts only.
         for indexed in if round % 2 == 0 {
             [false, true]
         } else {
             [true, false]
         } {
-            set_indexes(&runtime, indexed).await;
+            set_indexes(&runtime, indexed);
             pair.insert(
                 if indexed { "after" } else { "before" }.into(),
                 measure(&runtime, &registry).await,
@@ -186,17 +225,15 @@ async fn benchmark_count_indexes() {
                 "00000000-0000-4000-8000-000000025be7",
             );
         }
-        for index in 0..3 {
-            assert!(pair["after"]["counts"][index]["plan"]
-                .as_str()
-                .unwrap()
-                .contains("COVERING INDEX"));
-        }
+        assert_plans(pair["before"]["counts"].as_array().unwrap(), false);
+        assert_plans(pair["after"]["counts"].as_array().unwrap(), true);
+        assert_eq!(pair["before"]["installed_count_indexes"], json!(0));
+        assert_eq!(pair["after"]["installed_count_indexes"], json!(2));
         pairs.push(pair);
     }
     eprintln!(
         "{}",
-        json!({"events": 2000000, "atoms":154600, "sqlite": "bundled",
-        "storage":"file-backed", "cache_control":"warm/order-reversed; no OS cache eviction", "pairs":pairs})
+        json!({"events": 2000000, "atoms":154600,
+        "storage":"file-backed", "measurement":"counts and same-connection plans only; no timing comparison", "pairs":pairs})
     );
 }
