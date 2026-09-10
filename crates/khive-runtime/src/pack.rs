@@ -8280,61 +8280,352 @@ pub(crate) mod tests {
         out
     }
 
-    /// `true` if `text` contains `dispatch(` (optional whitespace,
-    /// including newlines, before the `(`) whose first argument is the
-    /// exact string literal `"verb"` — the call shape every test in this
-    /// workspace uses to exercise a pack verb (`pack.dispatch("context",
-    /// ...)`, `registry.dispatch("memory.recall", ...)`).
-    fn calls_dispatch_with_verb(text: &str, verb: &str) -> bool {
-        fn is_ident_byte(b: u8) -> bool {
-            b.is_ascii_alphanumeric() || b == b'_'
-        }
-        let bytes = text.as_bytes();
-        let name = "dispatch";
-        let mut search_from = 0usize;
-        while let Some(rel) = text[search_from..].find(name) {
-            let idx = search_from + rel;
-            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
-            let after = idx + name.len();
-            let mut j = after;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if before_ok && j < bytes.len() && bytes[j] == b'(' {
-                let mut k = j + 1;
-                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                let quoted = format!("\"{verb}\"");
-                if text[k..].starts_with(&quoted) {
-                    return true;
-                }
-            }
-            search_from = idx + 1;
-        }
-        false
+    #[derive(Debug)]
+    struct CensusTest {
+        name: String,
+        calls: std::collections::BTreeSet<String>,
+        dispatch_verbs: std::collections::BTreeSet<String>,
+        serial_keys: Vec<String>,
     }
 
-    /// The exclusive end index (within `lines`) of the test function whose
-    /// `#[test]`/`#[tokio::test]` attribute starts at `lines[start]`,
-    /// bounded by `hard_limit` (the next test attribute, or EOF) as a
-    /// fallback if brace counting cannot find a close.
-    ///
-    /// A previous version bounded a test's span only by "next `#[test]`
-    /// attribute", which pulls a sibling helper function sitting between
-    /// two tests into the *first* test's span — a helper defined after one
-    /// test and before the next reads as part of the first test's body
-    /// even though it is a wholly separate top-level item. Ending the span
-    /// at the matching closing brace of the test's own `fn` instead means a
-    /// sibling helper's seam call is never misattributed.
-    fn test_body_end(lines: &[&str], start: usize, hard_limit: usize) -> usize {
-        let Some(sig_offset) = lines[start..hard_limit]
-            .iter()
-            .position(|line| is_fn_signature_line(line.trim_start()))
-        else {
-            return hard_limit;
-        };
-        brace_bounded_fn_end(lines, start + sig_offset, hard_limit)
+    fn census_call_sites(
+        tokens: proc_macro2::TokenStream,
+        calls: &mut std::collections::BTreeSet<String>,
+        dispatch_verbs: &mut std::collections::BTreeSet<String>,
+    ) {
+        use proc_macro2::{Delimiter, TokenTree};
+
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let TokenTree::Ident(name) = token {
+                let is_definition = index > 0
+                    && matches!(&tokens[index - 1], TokenTree::Ident(previous) if previous == "fn");
+                if let Some(TokenTree::Group(args)) = tokens.get(index + 1) {
+                    if !is_definition && args.delimiter() == Delimiter::Parenthesis {
+                        calls.insert(name.to_string());
+                        if name == "dispatch" {
+                            if let Some(TokenTree::Literal(literal)) =
+                                args.stream().into_iter().next()
+                            {
+                                let literal =
+                                    std::iter::once(TokenTree::Literal(literal)).collect();
+                                if let Ok(verb) = syn::parse2::<syn::LitStr>(literal) {
+                                    dispatch_verbs.insert(verb.value());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Macro arguments remain token groups even when syn cannot parse
+            // their syntax as expressions. Literal contents stay opaque.
+            if let TokenTree::Group(group) = token {
+                census_call_sites(group.stream(), calls, dispatch_verbs);
+            }
+        }
+    }
+
+    fn attribute_path_matches(path: &syn::Path, expected: &[&str]) -> bool {
+        path.segments.len() == expected.len()
+            && path
+                .segments
+                .iter()
+                .zip(expected)
+                .all(|(segment, expected)| segment.ident == *expected)
+    }
+
+    fn serial_attribute_keys(attrs: &[syn::Attribute]) -> syn::Result<Vec<String>> {
+        use syn::ext::IdentExt;
+
+        let mut acquired = Vec::new();
+        // Later serial attributes wrap the function produced by earlier ones,
+        // so they acquire first. Only the keys inside one attribute are sorted.
+        for attr in attrs.iter().rev() {
+            if !attribute_path_matches(attr.path(), &["serial"])
+                && !attribute_path_matches(attr.path(), &["serial_test", "serial"])
+            {
+                continue;
+            }
+            let mut keys = match &attr.meta {
+                syn::Meta::Path(_) => Vec::new(),
+                syn::Meta::List(_) => attr
+                    .parse_args_with(|input| {
+                        syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated_with(
+                            input,
+                            syn::Ident::parse_any,
+                        )
+                    })
+                    .map_err(|error| {
+                        syn::Error::new_spanned(
+                            attr,
+                            format!("unsupported serial attribute arguments in census: {error}"),
+                        )
+                    })?
+                    .into_iter()
+                    .map(|key| key.to_string())
+                    .collect(),
+                syn::Meta::NameValue(_) => {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "unsupported serial attribute arguments in census",
+                    ));
+                }
+            };
+            // serial_test 3.5 sorts only within an attribute and uses "" for
+            // an unkeyed lock. Reentrant acquisitions add no new order edge.
+            if keys.is_empty() {
+                keys.push(String::new());
+            }
+            keys.sort();
+            for key in keys {
+                if !acquired.contains(&key) {
+                    acquired.push(key);
+                }
+            }
+        }
+        Ok(acquired)
+    }
+
+    fn census_tests(text: &str) -> syn::Result<Vec<CensusTest>> {
+        use quote::ToTokens;
+        use syn::visit::Visit;
+
+        #[derive(Default)]
+        struct Collector {
+            scope: Vec<String>,
+            tests: Vec<syn::Result<CensusTest>>,
+        }
+        impl<'ast> Visit<'ast> for Collector {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                self.scope.push(item.ident.to_string());
+                syn::visit::visit_item_mod(self, item);
+                self.scope.pop();
+            }
+
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                self.scope.push(item.sig.ident.to_string());
+                if item.attrs.iter().any(|attr| {
+                    attribute_path_matches(attr.path(), &["test"])
+                        || attribute_path_matches(attr.path(), &["tokio", "test"])
+                }) {
+                    self.tests
+                        .push(serial_attribute_keys(&item.attrs).map(|serial_keys| {
+                            let mut calls = std::collections::BTreeSet::new();
+                            let mut dispatch_verbs = std::collections::BTreeSet::new();
+                            census_call_sites(
+                                item.block.to_token_stream(),
+                                &mut calls,
+                                &mut dispatch_verbs,
+                            );
+                            CensusTest {
+                                name: self.scope.join("::"),
+                                calls,
+                                dispatch_verbs,
+                                serial_keys,
+                            }
+                        }));
+                }
+                syn::visit::visit_item_fn(self, item);
+                self.scope.pop();
+            }
+        }
+
+        let file = syn::parse_file(text)?;
+        let mut collector = Collector::default();
+        collector.visit_file(&file);
+        collector.tests.into_iter().collect()
+    }
+
+    #[derive(Default)]
+    struct SerialLockOrders {
+        pairs: std::collections::BTreeMap<(String, String), (bool, String)>,
+        conflicts: Vec<String>,
+    }
+
+    impl SerialLockOrders {
+        fn record(&mut self, name: &str, keys: &[String]) {
+            for (index, first) in keys.iter().enumerate() {
+                for second in &keys[index + 1..] {
+                    let forward = first < second;
+                    let pair = if forward {
+                        (first.clone(), second.clone())
+                    } else {
+                        (second.clone(), first.clone())
+                    };
+                    if let Some((prior_forward, prior_name)) = self.pairs.get(&pair) {
+                        if *prior_forward != forward {
+                            self.conflicts.push(format!(
+                                "{name} acquires {first:?} before {second:?}, opposite to {prior_name}"
+                            ));
+                        }
+                    } else {
+                        self.pairs.insert(pair, (forward, name.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn serial_fixture_conflicts(source: &str) -> Vec<String> {
+        let mut orders = SerialLockOrders::default();
+        for test in census_tests(source).expect("valid fixture source") {
+            orders.record(&test.name, &test.serial_keys);
+        }
+        orders.conflicts
+    }
+
+    #[test]
+    fn serial_census_accepts_complete_attributes_and_per_attribute_sorting() {
+        let source = r#"
+            #[serial]
+            #[cfg(unix)]
+            #[serial_test::serial(
+                config_ledger,
+                other,
+            )]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn first() { with_event_store(store); }
+
+            #[test]
+            #[serial_test::serial()]
+            #[serial(other, config_ledger)]
+            fn second() { registry.dispatch("serial_fixture_verb", params); }
+
+            mod nested {
+                #[serial_test::serial]
+                #[test]
+                #[serial(other)]
+                #[serial(config_ledger)]
+                fn third() {}
+            }
+        "#;
+        let tests = census_tests(source).unwrap();
+        assert_eq!(tests.len(), 3);
+        for test in &tests {
+            assert_eq!(test.serial_keys, ["config_ledger", "other", ""]);
+        }
+        assert_eq!(tests[2].name, "nested::third");
+        assert!(tests[0].calls.contains("with_event_store"));
+        assert!(tests[1].dispatch_verbs.contains("serial_fixture_verb"));
+        assert!(serial_fixture_conflicts(source).is_empty());
+        let keyword_keys =
+            census_tests("#[test] #[serial(type, r#match)] fn keywords() {}").unwrap();
+        assert_eq!(keyword_keys[0].serial_keys, ["r#match", "type"]);
+    }
+
+    #[test]
+    fn serial_census_rejects_each_hidden_stacked_order_reversal() {
+        for (label, reverse_attrs) in [
+            ("one-line", "#[serial(config_ledger)] #[serial]"),
+            ("multi-key", "#[serial(config_ledger, other)] #[serial]"),
+            (
+                "multiline",
+                "#[serial_test::serial(\nconfig_ledger,\n)]\n#[serial_test::serial]",
+            ),
+            (
+                "before-test",
+                "#[serial(config_ledger)] #[serial] #[cfg(unix)]",
+            ),
+        ] {
+            let source = format!(
+                "#[test] #[serial] #[serial(config_ledger)] fn first() {{}}\n\
+                 {reverse_attrs} #[test] fn reversed() {{}}"
+            );
+            let conflicts = serial_fixture_conflicts(&source);
+            assert_eq!(conflicts.len(), 1, "{label}: {conflicts:?}");
+            assert!(conflicts[0].contains("first"), "{label}: {conflicts:?}");
+            assert!(conflicts[0].contains("reversed"), "{label}: {conflicts:?}");
+        }
+    }
+
+    #[test]
+    fn serial_census_compares_third_keys_and_multi_key_lock_order() {
+        let source = r#"
+            #[test]
+            #[serial(config_ledger)]
+            #[serial(audit_append_failures)]
+            #[serial(audit_obligation_append_failures)]
+            fn first() {}
+            #[test]
+            #[serial(config_ledger)]
+            #[serial(audit_obligation_append_failures)]
+            #[serial(audit_append_failures)]
+            fn reversed() {}
+        "#;
+        let conflicts = serial_fixture_conflicts(source);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].contains("audit_append_failures"));
+        assert!(conflicts[0].contains("audit_obligation_append_failures"));
+        assert_eq!(
+            serial_fixture_conflicts(
+                "#[test] #[serial(beta, alpha)] fn first() {}\n\
+                 #[test] #[serial(alpha)] #[serial(beta)] fn reversed() {}"
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn serial_census_ignores_attribute_text_and_does_not_absorb_sibling_helpers() {
+        let source = r##"
+            // #[test] #[serial(config_ledger)] #[serial] fn comment() {}
+            const TEXT: &str = r#"#[test] #[serial(config_ledger)] #[serial] fn string() {}"#;
+            #[test] #[serial] #[serial(config_ledger)] fn actual() {}
+            fn helper() { with_event_store(store); }
+        "##;
+        let tests = census_tests(source).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].name, "actual");
+        assert!(!tests[0].calls.contains("with_event_store"));
+        assert!(serial_fixture_conflicts(source).is_empty());
+    }
+
+    #[test]
+    fn serial_census_body_calls_ignore_literals_and_preserve_macro_tokens() {
+        let source = r###"
+            #[test]
+            fn literals() {
+                let ordinary = "with_event_store(fake); registry.dispatch(\"context\", fake)";
+                let raw = r#"with_event_store(fake); registry.dispatch("context", fake)"#;
+            }
+            #[test]
+            fn actual() {
+                assert!(with_event_store(store).is_ok());
+                assert_eq!(registry.dispatch("context", params).await.unwrap(), expected);
+                custom! { branch => registry.dispatch("memory.recall", params); with_event_store(store) }
+            }
+        "###;
+        let tests = census_tests(source).unwrap();
+        assert_eq!(tests.len(), 2);
+        assert!(!tests[0].calls.contains("with_event_store"));
+        assert!(!tests[0].calls.contains("dispatch"));
+        assert!(tests[0].dispatch_verbs.is_empty());
+        assert!(tests[1].calls.contains("with_event_store"));
+        assert!(tests[1].calls.contains("dispatch"));
+        assert_eq!(
+            tests[1].dispatch_verbs,
+            std::collections::BTreeSet::from(["context".into(), "memory.recall".into()])
+        );
+    }
+
+    #[test]
+    fn serial_census_uses_first_acquisitions_for_reentrant_keys() {
+        let source = "#[test] #[serial(alpha, beta)] #[serial(alpha)] fn first() {}\n\
+                      #[test] #[serial(beta)] #[serial(alpha)] fn second() {}";
+        let tests = census_tests(source).unwrap();
+        assert_eq!(tests[0].serial_keys, ["alpha", "beta"]);
+        assert!(serial_fixture_conflicts(source).is_empty());
+    }
+
+    #[test]
+    fn serial_census_surfaces_source_and_serial_argument_parse_failures() {
+        assert!(census_tests("#[test] fn broken(").is_err());
+        let error = census_tests("#[test] #[serial(config_ledger, crate = wrapper)] fn test() {}")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported serial attribute arguments"));
     }
 
     /// An event-backed registry can drain the process-wide config ledger at
@@ -8432,8 +8723,8 @@ pub(crate) mod tests {
         // verb's handler reaches a seam, which reads as "every verb reaches
         // the ledger" — the false-positive an ordinary wrapper closure
         // cannot produce, verb-routing is already resolved precisely by the
-        // separate `crate_ledger_verbs`/`calls_dispatch_with_verb` path
-        // above, keyed by which verb string was actually invoked.
+        // separate `crate_ledger_verbs`/`CensusTest::dispatch_verbs` path,
+        // keyed by which verb string was actually invoked.
         let mut crate_all_bodies: std::collections::HashMap<String, Vec<Vec<(String, String)>>> =
             std::collections::HashMap::new();
         for (path, text) in &sources {
@@ -8457,7 +8748,7 @@ pub(crate) mod tests {
 
         let mut candidate_count = 0usize;
         let mut offenders = Vec::new();
-        let mut order_offenders = Vec::new();
+        let mut serial_orders = SerialLockOrders::default();
 
         for (path, text) in &sources {
             let seam_names = file_seam_names(text, &base_seed);
@@ -8468,68 +8759,21 @@ pub(crate) mod tests {
             let crate_seams = crate_key_for_path
                 .as_deref()
                 .and_then(|key| crate_direct_seams.get(key));
-            let lines: Vec<&str> = text.lines().collect();
-            let test_starts: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| {
-                    let trimmed = line.trim();
-                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
-                })
-                .map(|(index, _)| index)
-                .collect();
-
-            for (index, start) in test_starts.iter().copied().enumerate() {
-                let hard_limit = test_starts.get(index + 1).copied().unwrap_or(lines.len());
-                let end = test_body_end(&lines, start, hard_limit);
-                let span = &lines[start..end];
-                let span_text = span.join("\n");
-
-                // `serial_test`'s derive sorts lock keys only *within* one
-                // `#[serial(...)]` attribute (`raw_args.sort()`), never
-                // across two attributes stacked on the same item. A test
-                // that takes the unkeyed group and `config_ledger` must
-                // therefore fix the acquisition order itself: two tests
-                // stacking the same pair of attributes in opposite textual
-                // order take the two locks in opposite order and deadlock
-                // each other, and every other serial test queues behind
-                // them. Checked unconditionally over every test span, not
-                // just config-ledger-reaching candidates below — the
-                // deadlock risk is about which attributes are stacked, not
-                // about whether this census's reachability heuristic can
-                // prove the seam call.
-                let unkeyed_attr_pos = span.iter().position(|line| {
-                    let trimmed = line.trim();
-                    trimmed == "#[serial]" || trimmed == "#[serial_test::serial]"
-                });
-                let config_ledger_attr_pos = span.iter().position(|line| {
-                    let trimmed = line.trim();
-                    trimmed == "#[serial(config_ledger)]"
-                        || trimmed == "#[serial_test::serial(config_ledger)]"
-                });
-                if let (Some(unkeyed_idx), Some(config_ledger_idx)) =
-                    (unkeyed_attr_pos, config_ledger_attr_pos)
-                {
-                    if config_ledger_idx < unkeyed_idx {
-                        let signature_offset = span
-                            .iter()
-                            .position(|line| is_fn_signature_line(line.trim_start()))
-                            .expect("test span has a function signature");
-                        let name = fn_name_from_signature(span[signature_offset].trim_start())
-                            .unwrap_or("<unknown>");
-                        order_offenders.push(format!("{}:{name}", path.display()));
-                    }
-                }
+            let tests = census_tests(text)
+                .unwrap_or_else(|error| panic!("{}: census parse failed: {error}", path.display()));
+            for test in tests {
+                let name = format!("{}:{}", path.display(), test.name);
+                serial_orders.record(&name, &test.serial_keys);
 
                 let matched_direct = seam_names
                     .iter()
                     .chain(crate_seams.into_iter().flatten())
-                    .find(|seam| calls_name(&span_text, seam));
+                    .find(|seam| test.calls.contains(*seam));
                 let matched: Option<String> = matched_direct.cloned().or_else(|| {
                     crate_verbs.and_then(|verbs| {
                         verbs
                             .iter()
-                            .find(|verb| calls_dispatch_with_verb(&span_text, verb))
+                            .find(|verb| test.dispatch_verbs.contains(*verb))
                             .map(|verb| format!("dispatch(\"{verb}\")"))
                     })
                 });
@@ -8538,21 +8782,10 @@ pub(crate) mod tests {
                 };
                 candidate_count += 1;
 
-                let has_group = span.iter().any(|line| {
-                    let trimmed = line.trim();
-                    trimmed == "#[serial(config_ledger)]"
-                        || trimmed == "#[serial_test::serial(config_ledger)]"
-                });
+                let has_group = test.serial_keys.iter().any(|key| key == "config_ledger");
                 if !has_group {
-                    let signature_offset = span
-                        .iter()
-                        .position(|line| is_fn_signature_line(line.trim_start()))
-                        .expect("test span has a function signature");
-                    let name = fn_name_from_signature(span[signature_offset].trim_start())
-                        .unwrap_or("<unknown>");
                     offenders.push(format!(
-                        "{}:{name} (reaches config-ledger seam via `{matched}`)",
-                        path.display()
+                        "{name} (reaches config-ledger seam via `{matched}`)"
                     ));
                 }
             }
@@ -8572,13 +8805,10 @@ pub(crate) mod tests {
              offenders: {offenders:?}"
         );
         assert!(
-            order_offenders.is_empty(),
-            "a test stacking the unkeyed #[serial] group with #[serial(config_ledger)] \
-             must take the unkeyed attribute first: serial_test's derive sorts lock \
-             keys only within one #[serial(...)] attribute, never across two \
-             attributes stacked on the same item, so a test taking these two locks in \
-             the opposite textual order deadlocks against every test that took them in \
-             the canonical order; offenders: {order_offenders:?}"
+            serial_orders.conflicts.is_empty(),
+            "serial_test lock pairs must have consistent acquisition order across tests; \
+             keys sort within each attribute, while later attributes acquire first: {:?}",
+            serial_orders.conflicts
         );
     }
 
