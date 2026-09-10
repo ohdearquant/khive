@@ -1807,6 +1807,9 @@ async fn read_verbs_never_execute_repository_configured_filters_or_signers() {
         &format!(
             r#"#!/bin/sh
 printf signer >> {}
+# Drain the payload git streams in before exiting, as gpg does; a signer that exits with the
+# payload unread leaves git's write racing the exit and failing with EPIPE.
+cat >/dev/null
 for a in "$@"; do
   if [ "$a" = --verify ]; then exit 0; fi
 done
