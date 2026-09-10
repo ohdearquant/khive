@@ -612,11 +612,10 @@ async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
     let error = f
         .err("git.checkout", json!({"repo":f.repo,"ref":sha}))
         .await;
-    assert!(
-        error.contains("unsupported_entry") && error.contains("symlinks"),
-        "{error}"
-    );
-    f.refusal_receipt(&error).await;
+    assert!(error.contains("unsupported_entry"), "{error}");
+    let receipt = f.refusal_receipt(&error).await;
+    assert_eq!(receipt["verb"], "git.checkout");
+    assert_eq!(receipt["reason"], "unsupported_entry");
 }
 
 #[tokio::test]
