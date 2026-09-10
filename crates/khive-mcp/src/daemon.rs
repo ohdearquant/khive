@@ -1340,7 +1340,8 @@ async fn kill_stale_daemon_inner(
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
 /// `expected_snapshot` was observed: the PID file must be unchanged or absent,
-/// and the socket path must not already have a live listener answering it.
+/// and connecting to the socket must report absence or connection refusal.
+/// Other connect errors leave ownership uncertain and refuse cleanup.
 /// Either signal changing means a replacement daemon claimed the rendezvous
 /// between the observation and this call, and unlinking would delete its live
 /// paths instead of the truly-stale ones (#645).
@@ -8711,13 +8712,20 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_removes_when_pid_unchanged() {
+        let _cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("khived.pid");
         let sock = dir.path().join("khived.sock");
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::fs::write(&pid_file, "4242").expect("write pid file");
-        std::fs::write(&sock, "stale socket placeholder").expect("write stale sock placeholder");
+        drop(std::os::unix::net::UnixListener::bind(&sock).expect("bind stale socket"));
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&sock)
+                .expect_err("closed listener must refuse connections")
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused,
+        );
 
         assert!(remove_daemon_paths_if_still_stale(
             &pid_file,
@@ -8727,6 +8735,34 @@ mod tests {
         assert!(!pid_file.exists(), "unchanged pid file must be removed");
         assert!(!sock.exists(), "stale socket must be removed");
         clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_skips_when_socket_probe_is_uncertain() {
+        let _cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let blocker = dir.path().join("not-a-directory");
+        let sock = blocker.join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::fs::write(&pid_file, "4242").expect("write pid file");
+        std::fs::write(&blocker, "not a socket directory").expect("write path blocker");
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&sock)
+                .expect_err("a non-directory parent makes the probe uncertain")
+                .kind(),
+            std::io::ErrorKind::NotADirectory,
+        );
+
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
+
+        assert_eq!(std::fs::read(&pid_file).unwrap(), b"4242");
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"not a socket directory");
     }
 
     #[test]

@@ -5414,6 +5414,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial(config_ledger)]
         async fn custom_same_name_pack_cannot_enable_replay_at_request_boundary() {
             let mut builder = VerbRegistryBuilder::new();
             builder.register(ImpostorCommPack);
