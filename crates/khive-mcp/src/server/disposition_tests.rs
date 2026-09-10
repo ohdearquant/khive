@@ -1507,7 +1507,12 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
             *FORWARD.lock().unwrap() = None;
         }
     }
-    fn native_forward(frame: DaemonRequestFrame, _packs: Option<Vec<String>>) -> ForwardFuture {
+    fn native_forward(
+        frame: DaemonRequestFrame,
+        _packs: Option<Vec<String>>,
+        replay_read_only: bool,
+    ) -> ForwardFuture {
+        assert!(!replay_read_only, "comm.send must not be replayed");
         let dispatcher = FORWARD.lock().unwrap().take().expect("one native forward");
         Box::pin(async move {
             let capture = Arc::clone(&dispatcher.capture);
