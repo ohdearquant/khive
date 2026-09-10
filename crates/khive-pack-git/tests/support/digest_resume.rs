@@ -313,17 +313,39 @@ async fn digest_resume_first_page_survives_second_fetch_failure() {
         let (dir, repo, logs, _path) = remote_fixture(&pr_rows, &issue_rows);
         let script_path = dir.path().join("bin/gh");
         let script = std::fs::read_to_string(&script_path).unwrap();
+        let outage_log = repo.join("second-fetch-outage.log");
         // First fetch has no floor. The next fetch fails only after that full
         // page has been walked, so an end-of-pass-only checkpoint loses it.
-        let sabotage =
-            "case \"$*\" in *'updated:>='*) echo 'second-page outage' >&2; exit 1 ;; esac\n";
+        // gh_json intentionally omits stderr on nonzero exits. Record the
+        // injected failure in this fixture's cwd, independently of the report.
+        let sabotage = r#"case "$*" in
+  *'updated:>='*)
+    printf '%s\n' "$*" >> second-fetch-outage.log
+    echo 'second-page outage' >&2
+    exit 1
+    ;;
+esac
+"#;
         std::fs::write(
             &script_path,
             script.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{sabotage}"), 1),
         )
         .unwrap();
+        assert!(!outage_log.exists());
         let opts = options(&repo, project, prs, 1001);
         let first = run_ingest(&rt, &token, &registry, opts).await.unwrap();
+        let outage = std::fs::read_to_string(&outage_log)
+            .expect("the second fetch must reach the injected nonzero exit");
+        let operation = if prs { "pr" } else { "issue" };
+        assert_eq!(outage.lines().count(), 1, "{outage}");
+        assert!(
+            outage.starts_with(&format!("{operation} list ")),
+            "{outage}"
+        );
+        assert!(
+            outage.contains(&format!("--search sort:updated-asc updated:>={TIE}")),
+            "{outage}"
+        );
         assert_eq!(
             first.prs_skipped_existing + first.issues_skipped_existing,
             1000,
@@ -337,7 +359,8 @@ async fn digest_resume_first_page_survives_second_fetch_failure() {
         };
         assert!(
             matches!(first_source,Some(IngestSourceState::StoppedEarly(reason))
-            if reason.contains("pass then failed after the walk") && reason.contains("second-page outage")),
+            if reason.contains("pass then failed after the walk")
+                && reason.contains(&format!("gh {operation} list failed"))),
             "the second fetch must actually fail during this pass: {first:?}"
         );
         assert_eq!(
