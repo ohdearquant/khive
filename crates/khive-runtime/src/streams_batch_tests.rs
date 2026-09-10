@@ -832,6 +832,7 @@ async fn stream_batch_observation_rechecks_cross_connection_change_at_admission(
         prepared,
         None,
         vec![StreamObservation {
+            id: None,
             key: "observed".into(),
             kind: "head".into(),
             version: Some(1),
@@ -933,10 +934,23 @@ struct TraceAccess(Arc<Mutex<Vec<SqlStatement>>>);
 #[async_trait]
 impl SqlReader for TraceAccess {
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
-        assert_eq!(statement.label.as_deref(), Some("stream-batch-write-time"));
+        // Both trace arms share this reader: the observed check reads the holder row, and the
+        // write member reads its own write time. Either label is expected; anything else is not.
+        assert!(
+            matches!(
+                statement.label.as_deref(),
+                Some("stream-batch-observed" | "stream-batch-write-time")
+            ),
+            "unexpected labelled row read: {:?}",
+            statement.label
+        );
         self.0.lock().unwrap().push(statement);
         Ok(Some(SqlRow {
             columns: vec![
+                khive_storage::types::SqlColumn {
+                    name: "id".into(),
+                    value: SqlValue::Text(Uuid::nil().to_string()),
+                },
                 khive_storage::types::SqlColumn {
                     name: "version".into(),
                     value: SqlValue::Integer(1),
@@ -1130,12 +1144,14 @@ async fn stream_batch_observed_statement_trace_precedes_first_member_insert() {
         let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
         let observed = vec![
             StreamObservation {
+                id: None,
                 key: "first".into(),
                 kind: "head".into(),
                 version: Some(1),
                 live_until: None,
             },
             StreamObservation {
+                id: None,
                 key: "second".into(),
                 kind: "head".into(),
                 version: Some(if stale { 2 } else { 1 }),
@@ -1488,5 +1504,181 @@ async fn stream_batch_create_hook_malformed_embed_refuses_before_any_write() {
     assert!(creates.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn observed_id_arm5_runtime_null_version_refused_before_preparation() {
+    let (runtime, token, registry) = fixture();
+    let before = stream_store_snapshot(&runtime).await;
+    for version in [None, Some(0), Some(-1)] {
+        let result = runtime
+            .stream_batch_atomic(
+                &token,
+                vec![append("identity-invalid", None)],
+                None,
+                vec![StreamObservation {
+                    key: "missing".into(),
+                    kind: "head".into(),
+                    version,
+                    id: Some(Uuid::new_v4()),
+                    live_until: None,
+                }],
+                &registry,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "{result:?}"
+        );
+        assert_eq!(stream_store_snapshot(&runtime).await, before);
+    }
+}
+
+#[tokio::test]
+async fn observed_id_arm1_trace_one_row_read_inside_transaction_before_members() {
+    let (runtime, token, registry) = fixture();
+    for replaced in [false, true] {
+        let prepared = runtime
+            .prepare_stream_batch(&token, vec![append("identity-trace", None)], &registry)
+            .await
+            .unwrap();
+        let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
+        let result = run_prepared_stream_batch(
+            &trace,
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![StreamObservation {
+                key: "lease".into(),
+                kind: "head".into(),
+                version: Some(1),
+                id: Some(if replaced {
+                    Uuid::new_v4()
+                } else {
+                    Uuid::nil()
+                }),
+                live_until: None,
+            }],
+        )
+        .await;
+        let statements = trace.0.lock().unwrap();
+        let reads: Vec<_> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.label.as_deref() == Some("stream-batch-observed"))
+            .collect();
+        assert_eq!(reads.len(), 1, "identity and version must share one read");
+        let (position, read) = reads[0];
+        assert_eq!(read.sql, "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL");
+        assert_eq!(read.params.len(), 3);
+        assert!(matches!(&read.params[0], SqlValue::Text(ns) if ns == token.namespace().as_str()));
+        assert!(matches!(&read.params[1], SqlValue::Text(kind) if kind == "head"));
+        assert!(matches!(&read.params[2], SqlValue::Text(key) if key == "lease"));
+        assert_eq!(statements[0].sql, "BEGIN");
+        let first_insert = statements.iter().position(|s| s.sql.starts_with("INSERT"));
+        if replaced {
+            assert!(
+                first_insert.is_none(),
+                "replacement must precede even rolled-back writes"
+            );
+            assert_eq!(statements.last().unwrap().sql, "ROLLBACK");
+        } else {
+            assert!(position < first_insert.unwrap());
+            assert_eq!(statements.last().unwrap().sql, "COMMIT");
+        }
+        drop(statements);
+        if replaced {
+            let Err(RuntimeError::Khive(error)) = result else {
+                panic!("expected structured identity conflict: {result:?}")
+            };
+            assert_eq!(
+                error.details().unwrap().get("reason"),
+                Some("identity_conflict")
+            );
+        } else {
+            assert!(result.unwrap().is_ok());
+        }
+    }
+}
+
 #[path = "streams_expiry_tests.rs"]
 mod expiry_tests;
+
+#[tokio::test]
+async fn observed_id_arm6_trace_replacement_precedes_deadline_read() {
+    let (runtime, token, registry) = fixture();
+    for (replaced, version, key, expected) in [
+        (true, 1, "expired", Some("identity_conflict")),
+        (false, 2, "expired", Some("version_conflict")),
+        (false, 1, "expired", Some("expired")),
+        (false, 1, "live", None),
+    ] {
+        let prepared = runtime
+            .prepare_stream_batch(&token, vec![append("identity-expiry", None)], &registry)
+            .await
+            .unwrap();
+        let trace = TraceAccess(Arc::new(Mutex::new(vec![])));
+        let result = run_prepared_stream_batch(
+            &trace,
+            token.namespace().as_str().into(),
+            prepared,
+            None,
+            vec![StreamObservation {
+                key: key.into(),
+                kind: "head".into(),
+                version: Some(version),
+                id: Some(if replaced {
+                    Uuid::new_v4()
+                } else {
+                    Uuid::nil()
+                }),
+                live_until: Some("expires_at".into()),
+            }],
+        )
+        .await;
+        let statements = trace.0.lock().unwrap();
+        let identities: Vec<_> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.label.as_deref() == Some("stream-batch-observed"))
+            .map(|(i, _)| i)
+            .collect();
+        let deadlines: Vec<_> = statements
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.label.as_deref() == Some("stream-batch-live-until"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(identities.len(), 1);
+        if replaced || version != 1 {
+            assert!(
+                deadlines.is_empty(),
+                "identity and version must refuse before reading replacement content"
+            );
+        } else {
+            assert_eq!(deadlines.len(), 1);
+            assert!(identities[0] < deadlines[0]);
+        }
+        assert_eq!(statements[0].sql, "BEGIN");
+        if expected.is_some() {
+            assert!(!statements.iter().any(|s| s.sql.starts_with("INSERT")));
+            assert_eq!(statements.last().unwrap().sql, "ROLLBACK");
+        } else {
+            assert!(
+                deadlines[0]
+                    < statements
+                        .iter()
+                        .position(|s| s.sql.starts_with("INSERT"))
+                        .unwrap()
+            );
+            assert_eq!(statements.last().unwrap().sql, "COMMIT");
+        }
+        drop(statements);
+        if let Some(expected) = expected {
+            let Err(RuntimeError::Khive(error)) = result else {
+                panic!("expected structured refusal: {result:?}")
+            };
+            assert_eq!(error.details().unwrap().get("reason"), Some(expected));
+        } else {
+            assert!(result.unwrap().is_ok());
+        }
+    }
+}

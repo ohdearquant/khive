@@ -836,6 +836,8 @@ acceptance 2.
 
 **Status**: Proposed.
 
+**Implementation (2026-09-10):** Observed entries may pin the live note UUID beside its version in one transactional read. Replacements refuse before version and deadline checks; absent holders retain version refusals. The replacement UUID follows the existing holder-disclosure policy, while identity pins remain usable by batch-only callers.
+
 ### The gap
 
 Amendment 4's `observed` entry pins `(kind, key, version)` and nothing else. A note's version is a

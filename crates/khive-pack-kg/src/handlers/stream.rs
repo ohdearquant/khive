@@ -8,6 +8,7 @@ use khive_types::{Details, KhiveError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 use super::common::{canonical_note_kind, deser};
 use crate::KgPack;
@@ -96,6 +97,7 @@ struct ObservedMember {
     key: String,
     kind: String,
     version: Option<i64>,
+    id: Option<Uuid>,
     live_until: Option<String>,
 }
 
@@ -126,6 +128,11 @@ fn batch_observed(
                 )));
             }
             let entry: ObservedMember = deser(entry)?;
+            if entry.id.is_some() && entry.version.is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stream.batch observed entry {index}: id requires a positive version"
+                )));
+            }
             if entry.live_until.is_some() && entry.version.is_none() {
                 return Err(RuntimeError::InvalidInput(format!(
                     "stream.batch observed entry {index}: live_until requires a positive version"
@@ -141,15 +148,17 @@ fn batch_observed(
                 key: entry.key,
                 kind: canonical_note_kind(&entry.kind, registry)?,
                 version: entry.version,
+                id: entry.id,
                 live_until: entry.live_until,
             })
         })
         .collect()
 }
 
-fn batch_key_error(
+fn batch_disclosure_error(
     error: RuntimeError,
     writes: &[Option<(String, String)>],
+    observed_keys: &[(String, String)],
     token: &NamespaceToken,
     registry: &VerbRegistry,
 ) -> RuntimeError {
@@ -159,6 +168,21 @@ fn batch_key_error(
     let Some(details) = error.details() else {
         return error.into();
     };
+    if details.get("reason") == Some("identity_conflict") {
+        // Observed indexes name the observation list, not the write members.
+        let holder = details
+            .get("index")
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| observed_keys.get(index));
+        if holder.is_some_and(|(kind, key)| registry.allows_note_key_disclosure(token, kind, key)) {
+            return error.into();
+        }
+        let pairs = ["reason", "key", "kind", "version", "id", "index"]
+            .into_iter()
+            .filter_map(|key| details.get(key).map(|value| (key, value.to_owned())))
+            .collect::<Vec<_>>();
+        return error.with_details(Details::new_owned(pairs)).into();
+    }
     if details.get("reason") != Some("key_conflict") {
         return error.into();
     }
@@ -365,18 +389,24 @@ impl KgPack {
                 ),
             });
         }
+        let observed_keys: Vec<_> = observed
+            .iter()
+            .map(|entry| (entry.kind.clone(), entry.key.clone()))
+            .collect();
         let results = if atomic {
             match self
                 .runtime
                 .stream_batch_atomic(token, members, fence, observed, registry)
                 .await
-                .map_err(|error| batch_key_error(error, &writes, token, registry))?
-            {
+                .map_err(|error| {
+                    batch_disclosure_error(error, &writes, &observed_keys, token, registry)
+                })? {
                 Ok(results) => results,
                 Err(refusal) => {
-                    return Err(batch_key_error(
+                    return Err(batch_disclosure_error(
                         refusal.error.into(),
                         &writes,
+                        &observed_keys,
                         token,
                         registry,
                     ));

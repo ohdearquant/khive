@@ -2749,7 +2749,9 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
             // that wrote nothing from one whose outcome is unestablished.
             (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
             (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
-            (khive_types::ErrorKind::Conflict, Some("version_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
+                Some("not_committed")
+            }
             (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
                 Some("not_committed")
             }

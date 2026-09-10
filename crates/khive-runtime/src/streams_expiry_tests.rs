@@ -15,12 +15,14 @@ async fn expiry_arm7_writer_clock_statement_trace_is_once_before_observations() 
                 kind: "head".into(),
                 version: Some(1),
                 live_until: Some("expires_at".into()),
+                id: None,
             },
             StreamObservation {
                 key: if expired { "expired" } else { "second" }.into(),
                 kind: "head".into(),
                 version: Some(1),
                 live_until: Some("expires_at".into()),
+                id: None,
             },
         ];
         let result = run_prepared_stream_batch(
@@ -99,6 +101,7 @@ async fn expiry_arm7_real_writer_clock_on_memory_and_file_connections() {
                     kind: "head".into(),
                     version: Some(1),
                     live_until: Some("expires_at".into()),
+                    id: None,
                 }],
                 registry,
             )
@@ -137,6 +140,7 @@ async fn expiry_arm5_runtime_null_version_before_preparation() {
                 kind: "head".into(),
                 version: None,
                 live_until: Some("expires_at".into()),
+                id: None,
             }],
             &registry,
         )
