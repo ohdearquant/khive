@@ -12,7 +12,7 @@
 //!
 //! # Safety: suspend-free invariant
 //!
-//! [`run_prepared_atomic_unit`] owns the failure and commit protocol shared by
+//! `run_prepared_atomic_unit` owns the failure and commit protocol shared by
 //! the atomic-plan and stream-batch paths. It builds an [`AtomicUnitOp`]
 //! closure for [`SqlAccess::atomic_unit`], whose contract
 //! requires the closure's future to resolve on its first poll — synchronous
