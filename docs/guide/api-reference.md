@@ -1387,7 +1387,7 @@ right after `memory.recall` instead of hand-building `brain.feedback`.
 | Param                  | Type   | Required    | Notes                                                                  |
 | ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
 | `query`                | string | yes         | The recall query that produced the results.                            |
-| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
+| `results`              | array  | yes         | Recall result objects retained as candidate context: objects with an `id` field (result UUID or compact id) and optionally `served_by_profile_id`; bare id strings are rejected. |
 | `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
 | `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
 | `served_by_profile_id` | string | no          | Profile that served the recall.                                        |

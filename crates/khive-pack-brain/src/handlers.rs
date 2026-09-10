@@ -354,7 +354,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects retained as candidate context. No result is credited by rank position.",
+                description: "Recall result objects retained as candidate context: an array of objects, each with an id field (the result UUID or compact id) and optionally served_by_profile_id; bare id strings are rejected. No result is credited by rank position.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
