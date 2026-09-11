@@ -327,6 +327,14 @@ asking operators to pick.
    are two different rules, not one overwriting the other, and an operator narrowing an existing
    broad rule writes a second row rather than losing the first.
 
+   The reason is the hazard on the other branch, and it is worth stating rather than leaving as a
+   rule. If identity stayed the triple, installing a scoped row would silently REPLACE the unscoped
+   row for that pair. That is a live authorization change arriving disguised as an insert: the
+   operator wrote something narrow, something broad disappeared, and nothing in the call gives them
+   a reason to look. Keying on the quadruple means every row stored before this amendment keeps its
+   identity and its meaning with `scope` null, so Amendment 3's triple becomes a strict subset of
+   this rule rather than something this amendment broke.
+
 7. **A grant's scope is unchanged and still decides nothing.** It remains what §Approval says: free
    text recorded with the request. This is deliberate and it is the one asymmetry this amendment
    leaves in the pack. The grant path is consulted before policy, so making a grant's scope binding
@@ -337,6 +345,20 @@ asking operators to pick.
 8. **A run names no scope.** `exec.run` evaluates policy without one, so a run is decided by the
    unscoped rows. A sandboxed run is not acting "in" a scope the pack can name today, and inventing
    one at the call site would make the same widening this amendment forbids.
+
+### The open question this amendment does not answer
+
+A scoped row only decides something if the CALL carries a scope. `tool.check` and `tool.request`
+take one because a caller can supply it, but most real traffic does not arrive that way: the git
+write verbs consult policy on the caller's behalf, holding a repository and a ref they never pass
+into the lookup. Until those verbs derive a scope from the arguments they already hold, a row scoped
+to a repository matches nothing on that path, the decision falls through to the unscoped rows and
+then to the default, and the scoped row is decoration.
+
+That derivation is a larger question than this column: it decides what a scope IS for a verb that
+was not asked for one, and getting it wrong silently widens or silently narrows a live decision. It
+is named here so that nobody reads this amendment as having made scoped rules effective everywhere.
+The column is a prerequisite for that work, not a substitute for it.
 
 ## Acceptance for Amendment 4
 
