@@ -415,6 +415,75 @@ matching on the wrong one.
     rows, as the control in the same test. An implementation that treats `coverage.ephemeral` as
     "empty by policy" passes the second and fails the first.
 
+## Amendment 2 (2026-09-11): the classification scope of `coverage`, and the third state
+
+**A2.1 — `coverage.ephemeral` is a statement about the kinds that were requested, so a request that
+names no kinds has no honest list to give.** Amendment 1 settled what `coverage.ephemeral` means
+when the caller enumerates kinds: exactly those requested kinds whose carrier is ephemeral in the
+configuration in force now. It did not say what the field holds when `kinds` is omitted, and the
+omitted case is not the same question. A read with no `kinds` filter asks about an open vocabulary.
+The set of kinds that could arrive is not finite and not known to the reader, so no list of strings
+enumerates it, and any list that gets returned is a list of something else.
+
+The tempting answer is an empty list, and it is the wrong one for a reason that outranks
+convenience: an empty list is also what an implementation writes when it classified nothing at all.
+The two states share a value, so the field cannot carry the difference, and the reader who most
+needs to know has no way to ask.
+
+The contract is therefore split by scope.
+
+- With `kinds` given, `coverage.ephemeral` is the exact sorted list of those requested kinds whose
+  current carrier is ephemeral, and `coverage.classification_scope` is `"requested_kinds"`. An empty
+  list keeps its Amendment 1 meaning here, and only here: none of the kinds you asked about is
+  ephemeral.
+- With `kinds` omitted, `coverage.ephemeral` is `null`, `coverage.classification_scope` is
+  `"all_kinds"`, and `coverage.current_policy` carries the default posture together with the channel
+  patterns in force. The caller gets the rule instead of a roster, which is the only thing that is
+  true at that scope.
+
+`null` here says the question was not answerable as a list, not that the answer was empty. That is
+the whole point of spending a field on it.
+
+**A2.2 — `null` must not quietly absorb a third state.** A2.1 gives `coverage.ephemeral` two
+readings, a list and a `null`, and the null belongs to scope. There is a third condition in the
+neighbourhood: the channel policy could not be read. An implementation that hits that path and
+writes `null` produces a response indistinguishable from the ordinary all-kinds read, and it does so
+on the path least likely to be exercised.
+
+So the failure path gets its own outcome rather than a shared value. Whenever
+`classification_scope` is `"all_kinds"`, `current_policy` is present and non-null. A policy that
+cannot be read **refuses the call**, naming the policy; there is no successful read carrying a null
+or absent `current_policy`. A degraded classification is not reported by omission.
+
+**A2.3 — the actor stamp is server-owned, and a caller-supplied actor is only ever an assertion to
+match against it.** The envelope rule earlier in this record says the stamp is a server-owned field
+and not a payload key. Stated in the form an implementation can be tested against: an `actor` value
+appearing anywhere in a caller's payload never reaches the stamp and never influences it. The read
+parameters `actor` and `all_actors` select which records a caller may see; they are compared against
+the stamp and are not a source for it. This is the property that closes cross-actor spoofing, and it
+is worth a named arm because an implementation that gets it wrong looks correct in every test that
+does not try.
+
+**Acceptance arms added, each naming its control in the same test.**
+
+21. One read with explicit `kinds` returns the exact sorted list with
+    `classification_scope: "requested_kinds"`; a second read over the same stream with `kinds`
+    omitted returns `coverage.ephemeral: null` with `classification_scope: "all_kinds"` and a
+    non-null `current_policy`. Both in one test. The pair is what shows the `null` is a scope
+    statement; either half alone reads as an emptiness.
+22. A read with explicit `kinds`, none of them ephemeral, returns `coverage.ephemeral: []`. The
+    control in the same test is the identical request with `kinds` omitted, which returns `null`. An
+    implementation that collapses the two spellings passes one half and fails the other.
+23. With the channel policy unreadable, a read with `kinds` omitted refuses, naming the policy, and
+    returns no `coverage` object at all. The control is the same read with the policy readable,
+    returning the all-kinds shape. An implementation that emits a successful read carrying
+    `current_policy: null` fails both halves.
+24. An append whose payload contains an `actor` key naming a different actor is stored with the
+    server-owned stamp of the caller, and a read scoped to the foreign actor named in that payload
+    does not return the record. The control in the same test is a genuine foreign-actor record,
+    reachable by the same read under the fleet-readers allowlist. Without the control the arm passes
+    on an implementation whose foreign-actor read is simply broken.
+
 ## References
 
 - Originating issue: telemetry pack, the channel table and the rollup (#2575)
