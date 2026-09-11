@@ -110,11 +110,6 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Document,
-        type_name: "adr",
-        aliases: &["architecture_decision_record"],
-    },
-    EntityTypeDef {
-        kind: EntityKind::Document,
         type_name: "research_report",
         aliases: &[],
     },
@@ -691,24 +686,16 @@ mod tests {
     // ── Basic happy-path resolution ──────────────────────────────────────────
 
     #[test]
-    fn document_genres_adr_and_research_report_resolve_in_their_stored_spellings() {
+    fn research_report_resolves_in_every_stored_spelling() {
         let r = reg();
-        for (raw, canonical) in [
-            ("adr", "adr"),
-            ("ADR", "adr"),
-            ("architecture-decision-record", "adr"),
-            ("research-report", "research_report"),
-            ("research_report", "research_report"),
-            ("Research Report", "research_report"),
-        ] {
+        for raw in ["research-report", "research_report", "Research Report"] {
             let res = r
                 .resolve(EntityKind::Document, Some(raw))
                 .unwrap_or_else(|e| panic!("{raw} must resolve as a Document subtype: {e}"));
-            assert_eq!(res.entity_type.as_deref(), Some(canonical), "raw {raw}");
+            assert_eq!(res.entity_type.as_deref(), Some("research_report"), "{raw}");
         }
-        // Both are Document genres, not Concept ones: the same spelling on
-        // another kind is still refused, so the registry stays kind-scoped.
-        assert!(r.resolve(EntityKind::Concept, Some("adr")).is_err());
+        // A Document genre, not a Concept one: the same spelling on another
+        // kind is still refused, so the registry stays kind-scoped.
         assert!(r
             .resolve(EntityKind::Concept, Some("research-report"))
             .is_err());
