@@ -268,6 +268,11 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
         builder.with_event_store(store.clone());
         builder.with_audit_batch_config(crate::audit_batch::AuditBatchConfig {
             admission_deadline: std::time::Duration::from_millis(30),
+            // A committed write now keeps waiting for its real outcome past the
+            // admission wait, bounded by `resolution_deadline`. Struct-update
+            // syntax would leave that at the default 30s, so the fixture sets
+            // it too: both deadlines must elapse while the store is held.
+            resolution_deadline: std::time::Duration::from_millis(60),
             ..Default::default()
         });
         let registry = Arc::new(builder.build().unwrap());
@@ -340,11 +345,11 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
             else {
                 panic!("expired receipt must retain the canonical domain result");
             };
-            assert_eq!(failure.wire_code(), "admission_deadline_expired");
+            assert_eq!(failure.wire_code(), "resolution_deadline_expired");
             assert_eq!(
                 failure.reason,
                 crate::AuditObligationReason::Terminal(
-                    crate::audit_batch::AuditTerminalReason::AdmissionDeadlineExpired
+                    crate::audit_batch::AuditTerminalReason::ResolutionDeadlineExpired
                 )
             );
             domain_result
