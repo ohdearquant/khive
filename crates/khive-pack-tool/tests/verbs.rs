@@ -495,3 +495,55 @@ async fn an_untagged_entity_still_updates_and_deletes() {
     let deleted = f.call("delete", json!({"id": id})).await;
     assert_eq!(deleted["deleted"], json!(true));
 }
+
+/// #2596: `tool_policy` is append-only, so a namespace's row count only grows.
+/// The decision used to read the newest 1,000 rows and rank them in Rust, which
+/// made an older matching `deny` invisible once the table passed the cap --
+/// fail-open on an authorization surface. The decision is resolved in SQL now,
+/// so the row count does not bound what it can see.
+#[tokio::test]
+async fn a_matching_deny_still_decides_after_a_thousand_later_rows() {
+    let f = fixture();
+    f.call(
+        "tool.register",
+        json!({"name": "read_file", "source": "builtin", "side_effect": "read"}),
+    )
+    .await;
+    let deny = f
+        .call(
+            "tool.policy",
+            json!({"actor": "agent:a", "tool": "read_file", "decision": "deny"}),
+        )
+        .await;
+
+    let before = f
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(before["decision"], json!("deny"));
+    assert_eq!(before["policy_id"], deny["policy"]["id"]);
+
+    for i in 0..1_050 {
+        f.call(
+            "tool.policy",
+            json!({"actor": format!("agent:filler{i}"), "tool": "other_tool", "decision": "allow"}),
+        )
+        .await;
+    }
+
+    let after = f
+        .call(
+            "tool.check",
+            json!({"tool": "read_file", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(
+        after["decision"],
+        json!("deny"),
+        "the deny must still decide with 1,050 newer rows in the table: {after}"
+    );
+    assert_eq!(after["source"], json!("policy"));
+    assert_eq!(after["policy_id"], deny["policy"]["id"]);
+}

@@ -74,24 +74,6 @@ pub(crate) fn pattern_matches(pattern: &str, value: &str) -> bool {
     pattern == value
 }
 
-fn specificity(pattern: &str) -> u8 {
-    if pattern == "*" {
-        0
-    } else if pattern.ends_with('*') {
-        1
-    } else {
-        2
-    }
-}
-
-fn decision_rank(decision: &str) -> u8 {
-    match decision {
-        "deny" => 2,
-        "ask" => 1,
-        _ => 0,
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyRow {
     pub id: String,
@@ -210,6 +192,55 @@ pub(crate) async fn list_policies(
         .filter_map(PolicyRow::from_row)
         .filter(|p| actor.is_none_or(|a| pattern_matches(&p.actor, a) || p.actor == a))
         .collect())
+}
+
+/// Resolve the single deciding policy row for `(actor, tool)` in SQL.
+///
+/// The match predicate and the ranking both live in the statement, so the
+/// query returns one row and needs no row cap. The previous form fetched the
+/// newest 1,000 rows and ranked them in Rust: `tool_policy` is append-only,
+/// correcting a policy means appending another row, and once the table passed
+/// the cap an older `deny` stopped being consulted with no error and no
+/// marker. On an authorization surface that direction is fail-open (#2596).
+///
+/// `pattern_matches` admits exactly three shapes -- `*`, `prefix*`, and an
+/// exact string -- so the SQL predicate is the same three cases. For a pattern
+/// ending in `*`, `substr(value, 1, length(pattern) - 1)` compared against the
+/// pattern's own prefix is the prefix test without any LIKE escaping; `*`
+/// itself has length 1 and both sides reduce to the empty string.
+pub(crate) async fn select_deciding_policy(
+    rt: &KhiveRuntime,
+    ns: &str,
+    actor: &str,
+    tool: &str,
+) -> Result<Option<PolicyRow>, RuntimeError> {
+    const MATCHES: &str = "(%COL% = ?%N% OR (%COL% LIKE '%*' \
+         AND substr(?%N%, 1, length(%COL%) - 1) = substr(%COL%, 1, length(%COL%) - 1)))";
+    let actor_match = MATCHES.replace("%COL%", "actor").replace("%N%", "2");
+    let tool_match = MATCHES.replace("%COL%", "tool").replace("%N%", "3");
+    let rank =
+        |col: &str| format!("CASE WHEN {col} = '*' THEN 0 WHEN {col} LIKE '%*' THEN 1 ELSE 2 END");
+    let mut reader = rt.sql().reader().await?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT {POLICY_COLUMNS} FROM tool_policy \
+                 WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
+                 ORDER BY ({} + {}) DESC, \
+                 CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC \
+                 LIMIT 1",
+                rank("actor"),
+                rank("tool"),
+            ),
+            params: vec![
+                SqlValue::Text(ns.to_string()),
+                SqlValue::Text(actor.to_string()),
+                SqlValue::Text(tool.to_string()),
+            ],
+            label: Some("tool_policy_decide".into()),
+        })
+        .await?;
+    Ok(rows.first().and_then(PolicyRow::from_row))
 }
 
 pub(crate) async fn insert_policy(
@@ -451,17 +482,8 @@ pub async fn decide(
             side_effect: side_effect.map(str::to_string),
         });
     }
-    let policies = list_policies(rt, ns, None, 1000).await?;
-    let best = policies
-        .iter()
-        .filter(|p| pattern_matches(&p.actor, actor) && pattern_matches(&p.tool, tool))
-        .max_by_key(|p| {
-            (
-                specificity(&p.actor) + specificity(&p.tool),
-                decision_rank(&p.decision),
-            )
-        });
-    if let Some(p) = best {
+    let best = select_deciding_policy(rt, ns, actor, tool).await?;
+    if let Some(p) = best.as_ref() {
         return Ok(Decision {
             decision: p.decision.clone(),
             source: "policy".into(),
