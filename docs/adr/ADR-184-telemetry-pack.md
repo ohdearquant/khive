@@ -309,6 +309,55 @@ against the pinned toolchain from `crates/`, with `--no-fail-fast`.
 
 Nothing merges before this record is accepted.
 
+## Amendment 1 (2026-09-11): configuration scope, coverage semantics, read reproducibility, disposition mapping
+
+Four questions the record above left answerable two ways. Each is settled here rather than in the
+implementation, because an implementation that answers them is making the decision.
+
+**A1.1 — the configuration requirement is pack-scoped.** D3 says a configuration omitting
+`telemetry.default_carrier` fails to load. Read globally that refuses a deployment which does not
+load the telemetry pack at all, for a key belonging to a pack it does not run. That is wrong and it
+is not what D3 decides. The requirement attaches to the pack's own configuration table: a
+deployment whose loaded pack set excludes telemetry needs no telemetry table and no key, and loads
+clean. A deployment that loads the pack and omits the key fails, naming the key. The absent-pack
+case and the present-but-incomplete case are different states and only the second is an error.
+
+**A1.2 — `coverage` describes what the read could see, never what history meant.** D5 replaces the
+ring's `gap` with a read-time `coverage`. It reports the window the read actually covered and where
+its visibility ended. It does not classify past absences: a window with no rows says there are no
+rows in it, and must not report them as dropped by policy. The current carrier table describes the
+configuration in force now, and inferring from it what happened to an event that was never recorded
+is a fabrication with a plausible shape. Where a past classification matters, it is readable only
+from events that were recorded.
+
+**A1.3 — the pinned head buys reproducibility, not atomicity.** D6 pins a head so that a count and a
+subsequent read agree. It does not make the read a snapshot. A concurrent hard delete removes rows
+beneath the pin, and no pin prevents that. The guarantee stated is therefore the one that holds: the
+same head with the same filters returns the same rows unless those rows were deleted, and deletion is
+outside the read's control. Nothing in this record may be read as promising a consistent view across
+a concurrent delete.
+
+**A1.4 — a refused dispatch is not a telemetry outcome.** The three-value `outcome` enum describes
+what happened to an append that was attempted. A dispatch-level refusal is a different event and
+propagates as an error result with no `outcome` at all, exactly as any other verb's refusal does. A
+hole in the durable log maps into the grid: refused with no effect is `dropped` carrying its reason,
+undetermined is `unknown` carrying the original structured error. That error is carried through as
+the structured value it already is. Serializing it a second time inside this pack would produce a
+second rendering of the same failure, and two renderings of one error is how a consumer ends up
+matching on the wrong one.
+
+**Acceptance arms added, each naming its control in the same test.**
+
+17. A configuration with the telemetry pack absent from the loaded pack set and no telemetry table
+    loads clean; the same binary with the pack loaded and the key omitted fails, naming the key.
+    Both in one test. A check written globally fails the first half, which is what makes this arm
+    separating rather than decorative.
+18. A dispatch refused before the pack is reached returns an error result carrying no `outcome`
+    field; an append refused inside the pack returns `outcome: "dropped"` with its reason. The two
+    in one test, because the shapes are easy to conflate and only the pair shows they differ.
+19. An `unknown` outcome's `error` is byte-identical to the structured error the append layer
+    produced, asserted by equality against the source value rather than by matching a message.
+
 ## References
 
 - Originating issue: telemetry pack, the channel table and the rollup (#2575)
