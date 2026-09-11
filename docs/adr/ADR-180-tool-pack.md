@@ -283,3 +283,85 @@ than a refusal**, because a refusal is information and this is not.
 25. Mutation control, stated before running: making the upsert insert a second row instead of
     replacing turns arms 17 through 20 red and leaves 21 through 24 green. That separation is what
     proves the single-live-row property is what those arms test, rather than the ordering.
+
+## Amendment 4 (2026-09-11): a policy row can name what it is about
+
+A policy row answers for every call an actor makes to a tool. There is no way to write "this actor
+may push in this repository" without also writing "this actor may push anywhere", because the row
+has nowhere to put the repository. The only place the word scope appears today is on
+`tool.request(tool, actor, scope, reason, notify)`, where §Approval defines it as free text stored
+with the request, so it records what was asked for and decides nothing.
+
+An operator installing rules for a bounded demonstration has two choices today, and both are wrong:
+write the unscoped allow and grant more than was intended, or write nothing and have the surface
+answer `ask` for work that was authorized. This amendment adds the missing column rather than
+asking operators to pick.
+
+1. **`tool_policy` gains a nullable `scope`**, in the same pattern language the row already uses for
+   `actor` and `tool`: `*`, a trailing-`*` prefix, or an exact string. The pack's own `CREATE TABLE`
+   carries it and migration 034 adds it to a database whose table predates this amendment.
+
+2. **A row without a scope means exactly what it means today.** It is consulted for every call. That
+   is the property that makes this amendment additive: a table with no scope anywhere decides every
+   question the way it did before the column existed, including the ordering of ties.
+
+3. **A row with a scope is consulted only when the call carries a scope its pattern matches.** A
+   call that names no scope is decided by the unscoped rows alone. Scope therefore narrows and can
+   never widen: there is no way to write a scoped row that grants something to a call which named
+   nothing, which is the failure mode that matters on an authorization surface.
+
+4. **The call carries it.** `tool.check(tool, actor, scope, namespace)` takes the scope the caller is
+   acting in and echoes it back in the answer, so a reader of a decision can see which question was
+   asked. `tool.request` already takes a scope and now uses it for the pre-check it performs before
+   recording a request. Nothing infers a scope from arguments the caller did not send.
+
+5. **Scope ranks below actor and tool in specificity**, as a fourth state added to the existing sum:
+   absent 0, `*` 1, a trailing-`*` prefix 2, exact 3. So a scoped row beats an unscoped one for the
+   same actor and tool, while a more specific actor or tool still outranks a more specific scope.
+   The closed decision ranking, deny over ask over allow, and the `created_at ASC, id ASC` tiebreak
+   are untouched.
+
+6. **Row identity is the quadruple.** Amendment 3 makes a policy correctable by upserting on the
+   triple `(namespace, actor, tool)`; with a scope in the table that identity is
+   `(namespace, actor, tool, scope)`. A scoped row and an unscoped row for the same actor and tool
+   are two different rules, not one overwriting the other, and an operator narrowing an existing
+   broad rule writes a second row rather than losing the first.
+
+7. **A grant's scope is unchanged and still decides nothing.** It remains what §Approval says: free
+   text recorded with the request. This is deliberate and it is the one asymmetry this amendment
+   leaves in the pack. The grant path is consulted before policy, so making a grant's scope binding
+   would change what rows already marked `granted` allow, which is a migration of live authorization
+   state rather than an addition to the surface. It is named here as the next question, not solved
+   here.
+
+8. **A run names no scope.** `exec.run` evaluates policy without one, so a run is decided by the
+   unscoped rows. A sandboxed run is not acting "in" a scope the pack can name today, and inventing
+   one at the call site would make the same widening this amendment forbids.
+
+## Acceptance for Amendment 4
+
+26. A table containing only unscoped rows answers every `tool.check` exactly as it did before the
+    column existed, including a tie between two equal-specificity rows. This is the no-change arm
+    and it runs first.
+27. Write `allow` for `(actor, tool)` with scope `repo:alpha`. `tool.check` for that actor and tool
+    with `scope="repo:alpha"` answers `allow` and names that row; the same check with
+    `scope="repo:beta"` does not reach it; the same check with no scope at all does not reach it.
+    Three calls, one row, and the last two must fall through to whatever else matches.
+28. With both an unscoped `deny` and a scoped `allow` for the same actor and tool, a call carrying
+    the matching scope answers `allow` and a call carrying no scope answers `deny`. This is item 5's
+    ranking and item 3's narrowing in one fixture, and it fails in opposite directions if either is
+    wrong.
+29. A scoped row whose pattern is `repo:*` is reached by `scope="repo:alpha"` and not by
+    `scope="other"`, and a row whose scope is `*` is reached by any scope the caller names but not
+    by a call that names none.
+30. `tool.check` echoes the scope it was given, and reports it as null when it was given none.
+31. Migration arm: a database whose `tool_policy` predates the column takes 034 and keeps every
+    stored row deciding what it decided, with `scope` null. A database with no `tool_policy` at all
+    takes 034 as a no-op and still records version 34 in the ledger, so the applied sequence stays
+    contiguous and the next boot validates.
+32. `exec.run` is decided by unscoped rows only: a scoped `allow` that would match nothing about the
+    run leaves the run's decision exactly what it was without the row.
+33. Mutation control, stated before running: change the match predicate so an unmatched scope falls
+    through to matching instead of excluding, which is the widening direction. Arms 27, 28 and 29 go
+    red and arms 26 and 31 stay green. That separation is what proves those arms test the narrowing
+    rule rather than the presence of the column.
