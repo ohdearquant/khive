@@ -55,15 +55,23 @@ A partial disposition is a successful op. Its result body is:
 
 ```json
 {
-  "status": "ok" | "partial",
+  "status": "ok" | "partial" | "incomplete",
   "committed": [ { "index": 0, "id": "..." } ],
   "refused":  [ { "index": 1, "field": "content", "reason": "..." } ]
 }
 ```
 
 - `status` is `ok` when every record in the request committed; `partial` when every record was
-  attempted and at least one refused; `incomplete` when the call stopped early and some records
-  were never attempted (§6). `incomplete` takes precedence over `partial`.
+  attempted and at least one refused; `incomplete` when the call **stopped on a storage failure**
+  (§6), whether or not any records remained after the one that failed. `incomplete` takes
+  precedence over `partial`.
+
+  The status is defined by the stop, not by the remainder, and the difference is load-bearing on
+  exactly one shape. A store failure on the LAST record leaves nothing unattempted, so a
+  remainder-based definition would call it `partial` while §6 calls it `incomplete`. That shape is
+  also where the indeterminate outcome lives: a caller keying on `incomplete` to know it must
+  re-read would skip the re-read on the one call whose `stopped.disposition` may be `unknown`.
+  `stopped` rides an `incomplete` result in both cases.
 - A record is identified by its **zero-based position in the request list**, never by a
   caller-supplied name. The slug is itself a scanned field, so echoing it would return the very
   text a secret-gate refusal exists to withhold; and two records in one payload may carry the same
@@ -219,3 +227,7 @@ Stated before implementation, per verb the census binds:
     (`status: "ok"`), which exits zero.
 11. The verbose presentation and the MCP summary line for a partial result carry the refused count
     beside the committed count; a fixture with two committed and one refused renders both numbers.
+12. A storage failure injected on the LAST record of a three-record call returns
+    `status: "incomplete"`, not `partial`, with `stopped.index` 2 and nothing left unattempted.
+    This is the arm the §2 definition exists for: a remainder-based reading returns `partial` here
+    and the caller skips the re-read that an indeterminate outcome requires.
