@@ -2,12 +2,17 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{
-    KhiveRuntime, NamespaceToken, RuntimeError, TelemetryCarrier, TelemetryFailurePosture,
+    runtime_error_value, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError,
+    StreamAppendDisposition, StreamAppendFailure, TelemetryCarrier, TelemetryFailurePosture,
     TelemetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+#[cfg(test)]
 use uuid::Uuid;
+
+mod actor_scope;
+use actor_scope::{caller_actor, is_caller, ActorScope};
 
 const PAGE_SIZE: i64 = 1_000;
 const MAX_SCANNED: usize = 50_000;
@@ -100,7 +105,7 @@ pub(crate) fn channels(runtime: &KhiveRuntime, params: Value) -> Result<Value, R
     Ok(json!({
         "stream": config.stream,
         "default_carrier": config.default_carrier,
-        "default_cursor_kind": cursor_kind(config.default_carrier),
+        "default_cursor_kind": cursor_kind(config.default_carrier.ok_or_else(|| invalid("telemetry.default_carrier is required"))?),
         "channels": channels,
         "ephemeral_retention": "none",
     }))
@@ -130,28 +135,30 @@ pub(crate) async fn emit(
     if let Some(run_id) = &params.run_id {
         label("run_id", run_id)?;
     }
-    let caller = token.actor();
-    let actor = if caller.kind == "actor" {
-        caller.id.clone()
-    } else {
-        format!("{}:{}", caller.kind, caller.id)
-    };
-    if params.actor.as_ref().is_some_and(|value| value != &actor) {
-        return Err(invalid("actor must match the authenticated caller actor"));
-    }
+    let actor = caller_actor(token);
+    let actor_argument_ignored = params
+        .actor
+        .as_deref()
+        .is_some_and(|value| !is_caller(token, value));
     let config = &runtime.config().telemetry;
-    let policy = config.policy_for_kind(&params.kind);
+    let policy = config
+        .policy_for_kind(&params.kind)
+        .map_err(|error| invalid(error.to_string()))?;
     if policy.carrier == TelemetryCarrier::Ephemeral {
-        return Ok(json!({
-            "accepted": true,
+        let mut result = json!({
             "carrier": policy.carrier,
+            "classified": policy.classified,
             "failure_posture": policy.failure_posture,
             "cursor_kind": "none",
-            "dropped": true,
-            "receipt_id": Uuid::new_v4(),
-            "receipt_persisted": false,
+            "outcome": "dropped",
+            "receipt_id": null,
+            "actor": actor,
             "ephemeral_retention": "none",
-        }));
+        });
+        if actor_argument_ignored {
+            result["actor_argument_ignored"] = true.into();
+        }
+        return Ok(result);
     }
 
     let mut record = json!({"kind": params.kind, "payload": params.payload, "actor": actor});
@@ -159,7 +166,7 @@ pub(crate) async fn emit(
         record["run_id"] = run_id.into();
     }
     let appended = runtime
-        .stream_append(
+        .stream_append_with_outcome(
             token,
             &config.stream,
             &record,
@@ -171,46 +178,48 @@ pub(crate) async fn emit(
             None,
         )
         .await;
-    append_response(&config.stream, policy, appended)
+    let mut result = append_response(&config.stream, policy, appended)?;
+    result["actor"] = actor.into();
+    if actor_argument_ignored {
+        result["actor_argument_ignored"] = true.into();
+    }
+    Ok(result)
 }
 
 fn append_response(
     stream: &str,
     policy: TelemetryPolicy,
-    appended: Result<Value, RuntimeError>,
+    appended: Result<Value, StreamAppendFailure>,
 ) -> Result<Value, RuntimeError> {
     let appended = match appended {
         Ok(appended) => appended,
-        Err(error)
-            if policy.failure_posture == TelemetryFailurePosture::Gap
-                && error.admission_failure_context().is_some() =>
-        {
+        Err(failure) if policy.failure_posture == TelemetryFailurePosture::Gap => {
+            let (source, disposition) = failure.into_parts();
+            let outcome = match disposition {
+                StreamAppendDisposition::NotCommitted => "dropped",
+                StreamAppendDisposition::Unknown => "unknown",
+            };
             return Ok(json!({
-                "accepted": false,
                 "carrier": policy.carrier,
+                "classified": policy.classified,
                 "failure_posture": policy.failure_posture,
                 "cursor_kind": "log",
                 "stream": stream,
-                "dropped": true,
-                "gap": true,
-                "domain_disposition": "not_committed",
-                "receipt_id": Uuid::new_v4(),
-                "receipt_persisted": false,
-                "reason": "write_admission_refused",
+                "outcome": outcome,
+                "receipt_id": null,
+                "error": runtime_error_value(source, DomainDisposition::Unknown),
             }));
         }
-        // Other failures can have unknown effects; never turn them into a claimed drop.
-        Err(error) => return Err(error),
+        Err(failure) => return Err(failure.into_source()),
     };
     Ok(json!({
-        "accepted": true,
         "carrier": policy.carrier,
+        "classified": policy.classified,
         "failure_posture": policy.failure_posture,
         "cursor_kind": "log",
         "stream": stream,
-        "dropped": false,
+        "outcome": "recorded",
         "receipt_id": appended["id"],
-        "receipt_persisted": true,
         "seq": appended["seq"],
         "created_at": appended["created_at"],
     }))
@@ -249,6 +258,8 @@ struct ReadParams {
     since: Option<i64>,
     limit: Option<i64>,
     kinds: Option<Vec<String>>,
+    actor: Option<String>,
+    all_actors: Option<bool>,
     #[serde(rename = "namespace")]
     _namespace: Option<String>,
 }
@@ -259,6 +270,12 @@ pub(crate) async fn read(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let params: ReadParams = parse(params)?;
+    // Coverage is meaningful only with a readable, complete current policy.
+    // Validate before touching the stream even when no kind filter was supplied.
+    let policy = &runtime.config().telemetry;
+    policy
+        .validate_activation()
+        .map_err(|error| invalid(error.to_string()))?;
     let since = params.since.unwrap_or(0);
     let limit = params.limit.unwrap_or(100);
     if since < 0 || !(1..=PAGE_SIZE).contains(&limit) {
@@ -267,21 +284,53 @@ pub(crate) async fn read(
         ));
     }
     let kinds = kind_filter(params.kinds)?;
+    let scope = ActorScope::resolve(
+        runtime,
+        token,
+        params.actor.as_deref(),
+        params.all_actors.unwrap_or(false),
+    )?;
     let page = stream_page(runtime, token, &params.stream, since, limit).await?;
     let next_cursor = page
         .entries
         .last()
         .map_or(since.max(page.head_seq), |entry| entry.seq);
+    let ephemeral = match &kinds {
+        Some(kinds) => {
+            let mut ephemeral = Vec::new();
+            for kind in kinds {
+                let policy = policy
+                    .policy_for_kind(kind)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if policy.carrier == TelemetryCarrier::Ephemeral {
+                    ephemeral.push(kind.clone());
+                }
+            }
+            ephemeral.sort();
+            json!(ephemeral)
+        }
+        None => Value::Null,
+    };
+    let coverage = json!({
+        "window": {"after": since, "through": next_cursor, "head_seq": page.head_seq},
+        "has_more": page.next_after.is_some(),
+        "visibility": scope.description(),
+        "classification_scope": if kinds.is_some() { "requested_kinds" } else { "all_kinds" },
+        "ephemeral": ephemeral,
+        "current_policy": policy,
+    });
     let events: Vec<_> = page
         .entries
         .into_iter()
         .filter(|entry| matches_kind(&entry.record, &kinds))
+        .filter(|entry| scope.matches(&entry.record))
         .collect();
     Ok(json!({
         "stream": params.stream,
         "carrier": "durable",
         "cursor_kind": "log",
         "events": events,
+        "coverage": coverage,
         "next_cursor": next_cursor,
         "head_seq": page.head_seq,
         "has_more": page.next_after.is_some(),
@@ -303,6 +352,8 @@ struct CountsParams {
     window: WindowParams,
     group_by: Option<Vec<String>>,
     kinds: Option<Vec<String>>,
+    actor: Option<String>,
+    all_actors: Option<bool>,
     #[serde(rename = "namespace")]
     _namespace: Option<String>,
 }
@@ -346,6 +397,7 @@ struct Rollup {
     until: DateTime<Utc>,
     group_by: Vec<String>,
     kinds: Option<HashSet<String>>,
+    scope: ActorScope,
     head: Option<i64>,
     after: i64,
     scanned: usize,
@@ -380,6 +432,7 @@ impl Rollup {
             if entry.created_at < self.since
                 || entry.created_at >= self.until
                 || !matches_kind(&entry.record, &self.kinds)
+                || !self.scope.matches(&entry.record)
             {
                 continue;
             }
@@ -438,6 +491,12 @@ pub(crate) async fn counts(
         until,
         group_by: dimensions(params.group_by)?,
         kinds: kind_filter(params.kinds)?,
+        scope: ActorScope::resolve(
+            runtime,
+            token,
+            params.actor.as_deref(),
+            params.all_actors.unwrap_or(false),
+        )?,
         head: None,
         after: 0,
         scanned: 0,

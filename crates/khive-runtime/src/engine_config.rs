@@ -2922,8 +2922,8 @@ grant_unattributed = false
     }
 
     #[test]
-    fn telemetry_defaults_resolve_with_or_without_engines() {
-        use crate::{TelemetryCarrier, TelemetryConfig, TelemetryFailurePosture};
+    fn telemetry_missing_default_stays_absent_with_or_without_engines() {
+        use crate::{TelemetryCarrier, TelemetryConfig};
 
         assert_eq!(KhiveConfig::default().telemetry, TelemetryConfig::default());
         assert_eq!(
@@ -2940,13 +2940,16 @@ grant_unattributed = false
                 let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
                 let mut base = in_memory_runtime_config();
                 base.telemetry.stream = "previous".to_string();
-                base.telemetry.default_carrier = TelemetryCarrier::Durable;
+                base.telemetry.default_carrier = Some(TelemetryCarrier::Durable);
                 let resolved = crate::runtime_config_from_khive_config(&config, base);
                 assert_eq!(resolved.telemetry, TelemetryConfig::default());
                 assert_eq!(resolved.telemetry.stream, "telemetry");
-                let policy = resolved.telemetry.policy_for_kind("unclassified");
-                assert_eq!(policy.carrier, TelemetryCarrier::Ephemeral);
-                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Gap);
+                assert_eq!(resolved.telemetry.default_carrier, None);
+                let error = resolved
+                    .telemetry
+                    .validate_activation()
+                    .expect_err("activating telemetry requires the declared default");
+                assert!(error.to_string().contains("telemetry.default_carrier"));
             }
         }
     }
@@ -2985,12 +2988,12 @@ failure_posture = "stop"
             assert_eq!(resolved.telemetry, config.telemetry);
             assert_eq!(resolved.telemetry.stream, "operations");
             for kind in ["run.started", "run.completed"] {
-                let policy = resolved.telemetry.policy_for_kind(kind);
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
                 assert_eq!(policy.carrier, TelemetryCarrier::Durable);
                 assert_eq!(policy.failure_posture, TelemetryFailurePosture::Gap);
             }
             for kind in ["turn.delta", "run.heartbeat", "turn.child.heartbeat"] {
-                let policy = resolved.telemetry.policy_for_kind(kind);
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
                 assert_eq!(policy.carrier, TelemetryCarrier::Ephemeral);
                 assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
             }
@@ -3000,7 +3003,7 @@ failure_posture = "stop"
                 "run.notheartbeat",
                 "run.heartbeat.extra",
             ] {
-                let policy = resolved.telemetry.policy_for_kind(kind);
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
                 assert_eq!(policy.carrier, TelemetryCarrier::Durable);
                 assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
             }

@@ -3737,7 +3737,7 @@ mod tests {
     fn first_config_mismatch_field_names_telemetry_policy_and_legacy_absence() {
         let config = RuntimeConfig::no_embeddings();
         let mut changed = config.clone();
-        changed.telemetry.default_carrier = khive_runtime::TelemetryCarrier::Durable;
+        changed.telemetry.default_carrier = Some(khive_runtime::TelemetryCarrier::Durable);
         let client =
             crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
         let daemon =

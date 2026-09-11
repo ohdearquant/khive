@@ -26,9 +26,12 @@ carrier = "ephemeral"
 failure_posture = "gap"
 ```
 
-Absent configuration uses stream `telemetry`, no channels, and the fail-cheap `ephemeral`
-default. An unlisted event therefore does not silently become durable. An explicitly configured
-`durable` default uses failure posture `stop`; the ephemeral default uses `gap`.
+Loading telemetry requires an explicit `telemetry.default_carrier` declaration. A deployment
+that does not load telemetry needs no telemetry configuration. The stream defaults to
+`telemetry` and the channel list defaults to empty. An unlisted event uses the declared default
+with `classified=false`; matching a channel returns `classified=true`. A `durable` default uses
+failure posture `stop`; an `ephemeral` default uses `gap`. Metadata inspection does not activate
+the pack and needs no carrier declaration.
 
 Kind matching is case-sensitive. Patterns are exact names or a leading `*.suffix` glob;
 the latter matches any name ending in that literal dotted suffix. Empty kind lists, unknown
@@ -51,25 +54,42 @@ telemetry.read(stream="telemetry", since=0, limit=100, kinds=["run.completed"])
 Durable carrier cursors are `log`; ephemeral drops have cursor kind `none`.
 
 `telemetry.emit` requires `kind` and an arbitrary JSON `payload`, including null. Optional
-`run_id` is opaque. The authenticated actor is stamped into durable records; supplying `actor`
-asserts that same identity and cannot impersonate another caller. The response names the chosen
-carrier, failure posture, and whether the event was dropped. Durable success includes the stream
-sequence, timestamp, and stored note identifier as `receipt_id`. On an ephemeral drop,
-`receipt_id` is only a generated correlation identifier, not a stored receipt.
-`receipt_persisted` distinguishes these cases explicitly.
+`run_id` is opaque. The runtime's canonical `kind:id` actor stamp is server-owned and appears
+in the response and durable record. A caller-supplied `actor` is only a matching assertion;
+it never supplies the stamp. A different assertion is ignored and returns
+`actor_argument_ignored=true`. Actor fields inside the generic payload remain payload data and
+cannot change the record's attribution.
+The response names the chosen carrier, failure posture, classification, and outcome.
 
-For a durable channel, `stop` propagates append failures. `gap` returns an explicit drop only
-when the typed storage-admission failure proves the write never started: `accepted=false`,
-`dropped=true`, `gap=true`, `domain_disposition="not_committed"`, and
-`receipt_persisted=false`. Other errors propagate unchanged under either posture because their
-commit outcome is not established; they must not be treated as a confirmed drop or blindly
-retried. A gap response does not create a durable gap record or reconnect history.
+| Outcome    | Meaning                                                                          | Receipt                                                                          |
+| ---------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `recorded` | The durable append succeeded.                                                    | `receipt_id` is the stored row ID; `seq` and `created_at` identify its position. |
+| `dropped`  | An ephemeral event was discarded, or the durable append is proven not committed. | `receipt_id=null`; no sequence is claimed.                                       |
+| `unknown`  | A durable append failed without proof whether it committed.                      | `receipt_id=null`; no sequence is claimed.                                       |
+
+For a durable channel, `stop` propagates the original append error. `gap` returns `dropped`
+only when the append path proves no commit, and otherwise returns `unknown`. Both gap outcomes
+include the original structured `error`, preserving its own disposition and details separately
+from the append outcome. Neither posture retries. Ephemeral drops have no error. A gap response
+does not create a durable gap record or reconnect history. Failures before the handler runs
+remain dispatch errors, regardless of the configured append posture.
 
 `telemetry.read` reads durable records from any named stream in the request namespace.
+Both `read` and `counts` default to the calling actor. An explicit `actor` must be visible
+to the caller. `all_actors=true` requires the calling actor in `brain.fleet_readers` and cannot
+be combined with `actor`. Legacy raw actor IDs remain readable when unambiguous.
 `since` is an exclusive integer log sequence, not a timestamp. It defaults to zero; reuse the
 returned `next_cursor` on the next call. `limit` is the number of rows scanned before optional
 kind filtering, from 1 to 1,000, default 100. An empty filtered page can advance the cursor.
-`has_more` identifies remaining rows at that read's head. No ephemeral gap history is fabricated.
+`has_more` identifies remaining rows at that read's head. Actor and kind filtering happen after
+the scan cursor advances. `coverage` reports the scanned sequence window, visibility, and current
+policy. With explicit `kinds`, `coverage.ephemeral` lists the requested kinds currently routed
+ephemerally, including when the returned page is empty. Without `kinds`, it is null and
+`classification_scope="all_kinds"`; `current_policy` describes the full routing table and default.
+That scope requires a present, non-null `current_policy`. An unavailable or incomplete policy
+refuses the call, producing no coverage object; it cannot masquerade as a successful unfiltered read.
+Coverage describes current configuration, not historical routing or a loss ledger. Historical
+durable rows remain visible after their kind becomes ephemeral.
 
 ## Windowed Counts
 

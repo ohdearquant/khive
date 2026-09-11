@@ -229,6 +229,16 @@ fn atomic_failure_error(
     anyhow::Error::new(AtomicExecFailure::new(ops, message, failures))
 }
 
+fn atomic_preparation_pack_names(cfg: &RuntimeConfig) -> Vec<String> {
+    PackRegistry::discovered_names()
+        .into_iter()
+        // Telemetry contributes no vocabulary or mutation hooks to atomic preparation.
+        // Loading it only when requested preserves all other discovered pack hooks.
+        .filter(|name| *name != "telemetry" || cfg.packs.iter().any(|pack| pack == "telemetry"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Build a metadata-only in-memory registry for exactly the configured pack
 /// set. Atomic admissibility must run before the target database is opened,
 /// but classifying `verb-refused` requires the same loaded-vs-known distinction
@@ -391,10 +401,7 @@ pub(crate) async fn execute_atomic_ops_file(
     // Dropped right after `KhiveRuntime::new` returns rather than held for the
     // whole atomic run: the race this closes is cold-boot schema init, not the
     // prepare/commit passes below.
-    let pack_names: Vec<String> = PackRegistry::discovered_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let pack_names = atomic_preparation_pack_names(&cfg);
     let boot_guard = crate::exec::acquire_local_construction_guard(&cfg)?;
     let namespace = cfg.default_namespace.clone();
     let runtime = KhiveRuntime::new(cfg).context("build in-process runtime for --atomic")?;
@@ -403,7 +410,8 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
-    // ADR-099 B3: a `VerbRegistry` built from the full discovered pack set,
+    // ADR-099 B3: all discovered vocabulary and hooks, excluding only unrequested
+    // telemetry (which contributes neither), remain in the executable registry,
     // reusing the REAL runtime just constructed above (via
     // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
     // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
@@ -1558,6 +1566,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn atomic_preparation_keeps_discovered_hooks_without_activating_unrequested_telemetry() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into()],
+            brain_profile: None,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        assert_eq!(runtime.config().telemetry.default_carrier, None);
+        let names = atomic_preparation_pack_names(runtime.config());
+        let discovered = PackRegistry::discovered_names();
+        assert!(discovered.contains(&"telemetry"));
+        for name in &discovered {
+            assert_eq!(
+                names.iter().any(|selected| selected == name),
+                *name != "telemetry"
+            );
+        }
+        let registry = full_registry(&runtime);
+        assert!(registry.all_note_kinds().contains(&"task"));
+        assert!(registry.all_note_kinds().contains(&"memory"));
+        assert!(!registry.has_verb("telemetry.emit"));
+        assert!(registry.has_verb("gtd.transition"));
+        let (preflight, _runtime) = build_atomic_preflight_registry(runtime.config())
+            .expect("unrequested telemetry needs no declaration");
+        assert!(preflight.has_verb("create"));
+
+        let mut configured = runtime.config().clone();
+        configured.packs.push("telemetry".into());
+        assert!(atomic_preparation_pack_names(&configured)
+            .iter()
+            .any(|name| name == "telemetry"));
+        let error = build_atomic_preflight_registry(&configured)
+            .err()
+            .expect("requested telemetry requires its declared default");
+        assert!(format!("{error:#}").contains("telemetry.default_carrier"));
+        configured.telemetry.default_carrier = Some(khive_runtime::TelemetryCarrier::Ephemeral);
+        let (preflight, _runtime) = build_atomic_preflight_registry(&configured)
+            .expect("requested telemetry has its declared default");
+        assert!(preflight.has_verb("telemetry.emit"));
+    }
+
+    #[test]
+    fn telemetry_atomic_exemption_has_no_vocabulary_hooks_or_admissible_verbs() {
+        use khive_types::Pack;
+        type Telemetry = khive_pack_telemetry::TelemetryPack;
+        assert!(Telemetry::ENTITY_KINDS.is_empty());
+        assert!(Telemetry::NOTE_KINDS.is_empty());
+        assert!(Telemetry::EDGE_RULES.is_empty());
+        assert!(Telemetry::ENTITY_TYPES.is_empty());
+        let implementation = include_str!("../../khive-pack-telemetry/src/pack.rs")
+            .split_once("impl PackRuntime for TelemetryPack {")
+            .expect("telemetry runtime implementation")
+            .1;
+        let implementation = implementation.split("\n}\n").next().unwrap();
+        let mut methods = Vec::new();
+        for line in implementation.lines() {
+            let method = line
+                .strip_prefix("    fn ")
+                .or_else(|| line.strip_prefix("    async fn "));
+            if let Some(method) = method {
+                methods.push(method.split('(').next().unwrap());
+            }
+        }
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            [
+                "dispatch",
+                "entity_kinds",
+                "handlers",
+                "name",
+                "note_kinds",
+                "requires",
+                "validate_config"
+            ],
+            "new runtime hooks require reconsidering the atomic telemetry exemption"
+        );
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into(), "telemetry".into()],
+            telemetry: khive_runtime::TelemetryConfig {
+                default_carrier: Some(khive_runtime::TelemetryCarrier::Ephemeral),
+                ..khive_runtime::TelemetryConfig::default()
+            },
+            ..RuntimeConfig::no_embeddings()
+        };
+        for handler in Telemetry::HANDLERS {
+            let ops = vec![OpsFileEntry {
+                tool: handler.name.into(),
+                args: json!({}),
+            }];
+            assert!(!classify_atomic_preflight(&ops, &cfg).unwrap().is_empty());
+        }
+    }
+
     /// Seed a live GTD task note directly (bypassing `gtd.assign`'s handler,
     /// which lives one crate over) with the flat properties shape
     /// `load_task`/`task_status` expect: `kind = "task"`,
@@ -1584,10 +1689,7 @@ mod tests {
 
     fn full_registry(runtime: &KhiveRuntime) -> VerbRegistry {
         let mut builder = VerbRegistryBuilder::new();
-        let pack_names: Vec<String> = PackRegistry::discovered_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let pack_names = atomic_preparation_pack_names(runtime.config());
         PackRegistry::register_packs(&pack_names, runtime.clone(), &mut builder)
             .expect("register packs");
         builder.build().expect("registry")

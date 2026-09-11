@@ -43,7 +43,7 @@ use khive_runtime::{
 };
 use khive_types::RefusalReason;
 
-use khive_storage::{EdgeRelation, StorageCapability};
+use khive_storage::EdgeRelation;
 
 use crate::coordinator::{BackendSearchFailureKind, CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
@@ -2781,144 +2781,15 @@ fn coordinator_search_visibility(
 /// Every runtime variant is explicitly covered. Dispatch provenance, not the
 /// variant, determines whether the domain handler ran successfully, except for
 /// the named write outcomes, which carry their own domain proof.
+/// Apply MCP transport limits after the shared typed projection. The boundary's
+/// original disposition decides whether an obligation result may be retained;
+/// named error overrides remain exactly as emitted by the shared projection.
 fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
-    // These named outcomes carry their own domain proof. Do not infer general
-    // write disposition from a conflict or unavailable variant.
-    let named_disposition = match &error {
-        RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
-            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
-            // ADR-174 A1.1: a stream member refusal carries
-            // `domain_disposition: not_committed` wherever it surfaces. In
-            // per-member mode it is the member's own value and the runtime
-            // writes the field itself; in atomic mode the refusal is raised
-            // as the call's error, where without these rows the boundary's
-            // `unknown` would stand and the caller could not tell a batch
-            // that wrote nothing from one whose outcome is unestablished.
-            (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
-            (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
-            (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
-                Some("not_committed")
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    // The refusal text is the same Display string every consumer already
-    // matches on; the receipt fields ride beside it.
-    let denial_message =
-        matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
-    let payload = match error {
-        RuntimeError::PermissionDenied {
-            verb,
-            reason,
-            receipt,
-        } => json!({
-            "kind": "runtime_error",
-            "code": "permission_denied",
-            "message": denial_message.unwrap_or_default(),
-            "verb": verb,
-            "reason": reason,
-            "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
-            "audit_outcome": receipt.audit_outcome.wire_code(),
-        }),
-        RuntimeError::AuditObligation {
-            failure,
-            domain_result,
-        } => {
-            let mut error = serde_json::Map::from_iter([
-                ("kind".into(), json!("obligation")),
-                ("code".into(), json!(failure.wire_code())),
-                ("message".into(), json!(failure.to_string())),
-            ]);
-            error.insert("domain_result".into(), domain_result);
-            Value::Object(error)
-        }
-        RuntimeError::Khive(k) => serde_json::to_value(&k)
-            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
-        RuntimeError::RemoteFetchError { remote, message } => json!({
-            "kind": "remote_fetch_error",
-            "remote": remote,
-            "message": message,
-        }),
-        other @ (RuntimeError::Storage(_)
-        | RuntimeError::Sqlite(_)
-        | RuntimeError::Query(_)
-        | RuntimeError::NotFound(_)
-        | RuntimeError::InvalidInput(_)
-        | RuntimeError::UnknownVerb(_)
-        | RuntimeError::Unconfigured(_)
-        | RuntimeError::UnknownModel(_)
-        | RuntimeError::Embedding(_)
-        | RuntimeError::Ambiguous(_)
-        | RuntimeError::Fusion(_)
-        | RuntimeError::UnknownFusionStrategy(_)
-        | RuntimeError::Internal(_)
-        | RuntimeError::IncompatibleEventStore(_)
-        | RuntimeError::GuardedWriteFailed(_)
-        | RuntimeError::MissingPackDependency(_)
-        | RuntimeError::MissingPackDependencies(_)
-        | RuntimeError::CircularPackDependency(_)
-        | RuntimeError::PackRedeclared { .. }
-        | RuntimeError::VerbCollision { .. }
-        | RuntimeError::ReservedEnvelopeParam { .. }
-        | RuntimeError::GateUnavailable { .. }
-        | RuntimeError::NamespaceMismatch { .. }
-        | RuntimeError::AmbiguousPrefix { .. }
-        | RuntimeError::CrossBackendMergeUnsupported { .. }
-        | RuntimeError::UnknownRemote { .. }
-        | RuntimeError::RemoteCacheMissing { .. }
-        | RuntimeError::AmbiguousId { .. }
-        | RuntimeError::CrossNamespaceWrite { .. }
-        | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::SecretDetected(_)
-        | RuntimeError::DeadlineExceeded { .. }) => {
-            if let Some(context) = other.writer_task_failure_context() {
-                json!({"kind":"storage", "code":context.stage, "stage":context.stage,
-                    "message":other.to_string(), "retryable":context.retryable,
-                    "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
-            } else if let Some(context) = other.retryable_failure_context() {
-                let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
-                    "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
-                    "capability":context.capability.map(storage_capability_wire_name),
-                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
-            } else {
-                json!({"kind":"runtime_error", "message":other.to_string()})
-            }
-        }
-    };
-    let mut value = error_with_disposition(payload, disposition);
-    if let Some(named) = named_disposition {
-        value["domain_disposition"] = json!(named);
-    }
+    let projected = khive_runtime::runtime_error_value(error, disposition);
+    let projected_disposition = error_disposition(&projected);
+    let mut value = error_with_disposition(projected, disposition);
+    value["domain_disposition"] = json!(projected_disposition.as_str());
     value
-}
-
-fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
-    match capability {
-        StorageCapability::Sql => "sql",
-        StorageCapability::Notes => "notes",
-        StorageCapability::Entities => "entities",
-        StorageCapability::Graph => "graph",
-        StorageCapability::Events => "events",
-        StorageCapability::Vectors => "vectors",
-        StorageCapability::Sparse => "sparse",
-        StorageCapability::Text => "text",
-        StorageCapability::Blob => "blob",
-        StorageCapability::Attachments => "attachments",
-    }
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
@@ -6480,7 +6351,9 @@ mod tests {
             let mut changed = base.clone();
             match field {
                 "stream" => changed.telemetry.stream.push('2'),
-                "default_carrier" => changed.telemetry.default_carrier = TelemetryCarrier::Durable,
+                "default_carrier" => {
+                    changed.telemetry.default_carrier = Some(TelemetryCarrier::Durable)
+                }
                 "kinds" => changed.telemetry.channels[0]
                     .kinds
                     .push("run.failed".into()),
@@ -8894,6 +8767,7 @@ mod tests {
         config.db_path = None;
         config.packs = vec!["kg".into(), "telemetry".into()];
         config.telemetry.stream = "configured-events".into();
+        config.telemetry.default_carrier = Some(TelemetryCarrier::Ephemeral);
         config.telemetry.channels.push(TelemetryChannelConfig {
             kinds: vec!["run.completed".into()],
             carrier: TelemetryCarrier::Durable,
@@ -8916,7 +8790,9 @@ mod tests {
             .await
             .expect("default ephemeral emit");
         assert_eq!(ephemeral["carrier"], "ephemeral");
-        assert_eq!(ephemeral["dropped"], true);
+        assert_eq!(ephemeral["outcome"], "dropped");
+        assert_eq!(ephemeral["classified"], false);
+        assert!(ephemeral["receipt_id"].is_null());
         let page = server
             .registry
             .dispatch("stream.read", json!({"stream":"configured-events"}))

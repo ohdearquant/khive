@@ -64,7 +64,7 @@ pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
         .collect();
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
-    let registry = builder.build().context("building VerbRegistry")?;
+    let registry = builder.build_metadata().context("building pack metadata")?;
 
     let entity_kinds = registry
         .all_entity_kinds()
@@ -108,7 +108,7 @@ fn build_pack_edge_rules() -> Result<Vec<EdgeEndpointRule>> {
         .collect();
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
-    let registry = builder.build().context("building VerbRegistry")?;
+    let registry = builder.build_metadata().context("building pack metadata")?;
     Ok(registry.all_edge_rules())
 }
 

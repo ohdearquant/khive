@@ -2,11 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine_config::ConfigError;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TelemetryCarrier {
     Durable,
-    #[default]
     Ephemeral,
 }
 
@@ -37,6 +36,7 @@ impl TelemetryFailurePosture {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TelemetryPolicy {
+    pub classified: bool,
     pub carrier: TelemetryCarrier,
     pub failure_posture: TelemetryFailurePosture,
 }
@@ -52,7 +52,7 @@ pub struct TelemetryChannelConfig {
 #[serde(try_from = "RawTelemetryConfig")]
 pub struct TelemetryConfig {
     pub stream: String,
-    pub default_carrier: TelemetryCarrier,
+    pub default_carrier: Option<TelemetryCarrier>,
     pub channels: Vec<TelemetryChannelConfig>,
 }
 
@@ -60,7 +60,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             stream: default_stream(),
-            default_carrier: TelemetryCarrier::Ephemeral,
+            default_carrier: None,
             channels: Vec::new(),
         }
     }
@@ -110,26 +110,43 @@ impl TelemetryConfig {
         Ok(())
     }
 
-    pub fn policy_for_kind(&self, kind: &str) -> TelemetryPolicy {
+    pub fn validate_activation(&self) -> Result<(), ConfigError> {
+        self.declared_default()?;
+        self.validate()
+    }
+
+    fn declared_default(&self) -> Result<TelemetryCarrier, ConfigError> {
+        self.default_carrier.ok_or_else(|| {
+            invalid(
+                "telemetry.default_carrier",
+                "must be explicitly declared when the telemetry pack is loaded",
+            )
+        })
+    }
+
+    pub fn policy_for_kind(&self, kind: &str) -> Result<TelemetryPolicy, ConfigError> {
+        let default_carrier = self.declared_default()?;
         for channel in &self.channels {
             if channel
                 .kinds
                 .iter()
                 .any(|pattern| pattern_matches(pattern, kind))
             {
-                return TelemetryPolicy {
+                return Ok(TelemetryPolicy {
+                    classified: true,
                     carrier: channel.carrier,
                     failure_posture: channel.failure_posture,
-                };
+                });
             }
         }
-        TelemetryPolicy {
-            carrier: self.default_carrier,
-            failure_posture: match self.default_carrier {
+        Ok(TelemetryPolicy {
+            classified: false,
+            carrier: default_carrier,
+            failure_posture: match default_carrier {
                 TelemetryCarrier::Durable => TelemetryFailurePosture::Stop,
                 TelemetryCarrier::Ephemeral => TelemetryFailurePosture::Gap,
             },
-        }
+        })
     }
 }
 
@@ -160,18 +177,14 @@ fn default_stream() -> String {
     "telemetry".to_string()
 }
 
-fn default_carrier() -> String {
-    "ephemeral".to_string()
-}
-
 // Decode policy values with the enclosing channel index available for diagnostics.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTelemetryConfig {
     #[serde(default = "default_stream")]
     stream: String,
-    #[serde(default = "default_carrier")]
-    default_carrier: String,
+    #[serde(default)]
+    default_carrier: Option<String>,
     #[serde(default)]
     channels: Vec<RawTelemetryChannelConfig>,
 }
@@ -199,7 +212,11 @@ impl TryFrom<RawTelemetryConfig> for TelemetryConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawTelemetryConfig) -> Result<Self, Self::Error> {
-        let default_carrier = parse_carrier(&raw.default_carrier, "telemetry.default_carrier")?;
+        let default_carrier = raw
+            .default_carrier
+            .as_deref()
+            .map(|value| parse_carrier(value, "telemetry.default_carrier"))
+            .transpose()?;
         let mut channels = Vec::with_capacity(raw.channels.len());
         for (index, channel) in raw.channels.into_iter().enumerate() {
             let entry = format!("telemetry.channels[{index}]");
@@ -233,6 +250,55 @@ impl TryFrom<RawTelemetryConfig> for TelemetryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_default_is_structurally_valid_but_cannot_activate() {
+        for text in ["", "stream = \"events\"\n"] {
+            let missing: TelemetryConfig = toml::from_str(text).unwrap();
+            assert_eq!(missing.default_carrier, None);
+            missing.validate().unwrap();
+            assert!(missing
+                .validate_activation()
+                .unwrap_err()
+                .to_string()
+                .contains("telemetry.default_carrier"));
+            assert!(missing.policy_for_kind("unclassified").is_err());
+            assert_eq!(
+                serde_json::from_value::<TelemetryConfig>(serde_json::to_value(&missing).unwrap())
+                    .unwrap(),
+                missing
+            );
+        }
+        for carrier in ["durable", "ephemeral"] {
+            let declared: TelemetryConfig =
+                toml::from_str(&format!("default_carrier = {carrier:?}")).unwrap();
+            declared.validate_activation().unwrap();
+            assert!(!declared.policy_for_kind("unclassified").unwrap().classified);
+        }
+    }
+
+    #[test]
+    fn classification_tracks_matching_even_when_the_carrier_equals_the_default() {
+        for carrier in [TelemetryCarrier::Durable, TelemetryCarrier::Ephemeral] {
+            let config = TelemetryConfig {
+                default_carrier: Some(carrier),
+                channels: vec![TelemetryChannelConfig {
+                    kinds: vec!["*.heartbeat".into(), "run.started".into()],
+                    carrier,
+                    failure_posture: TelemetryFailurePosture::Stop,
+                }],
+                ..TelemetryConfig::default()
+            };
+            let round_trip: TelemetryConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            for kind in ["run.heartbeat", "run.started", "unclassified"] {
+                let policy = config.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, carrier);
+                assert_eq!(policy.classified, kind != "unclassified");
+                assert_eq!(round_trip.policy_for_kind(kind).unwrap(), policy);
+            }
+        }
+    }
 
     #[test]
     fn directly_constructed_config_rejects_ambiguous_channels() {
@@ -270,6 +336,7 @@ mod tests {
     fn disjoint_suffixes_and_same_channel_patterns_remain_valid() {
         let config: TelemetryConfig = toml::from_str(
             r#"
+default_carrier = "durable"
 [[channels]]
 kinds = ["*.heartbeat", "run.heartbeat"]
 carrier = "ephemeral"
@@ -282,15 +349,15 @@ failure_posture = "stop"
         )
         .expect("distinct suffixes have no common kind");
         assert_eq!(
-            config.policy_for_kind("run.heartbeat").carrier,
+            config.policy_for_kind("run.heartbeat").unwrap().carrier,
             TelemetryCarrier::Ephemeral
         );
         assert_eq!(
-            config.policy_for_kind("run.notheartbeat").carrier,
+            config.policy_for_kind("run.notheartbeat").unwrap().carrier,
             TelemetryCarrier::Durable
         );
         assert_eq!(
-            config.policy_for_kind("heartbeat").carrier,
+            config.policy_for_kind("heartbeat").unwrap().carrier,
             TelemetryCarrier::Durable
         );
     }
@@ -298,6 +365,7 @@ failure_posture = "stop"
     #[test]
     fn config_serializes_effective_policy_and_round_trips() {
         let config = TelemetryConfig {
+            default_carrier: Some(TelemetryCarrier::Ephemeral),
             channels: vec![TelemetryChannelConfig {
                 kinds: vec!["run.started".to_string()],
                 carrier: TelemetryCarrier::Durable,

@@ -21,5 +21,5 @@ impl Pack for TelemetryPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &pack::TELEMETRY_HANDLERS;
-    const REQUIRES: &'static [&'static str] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
 }

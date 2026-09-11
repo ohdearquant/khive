@@ -8,8 +8,8 @@ use crate::{handlers, TelemetryPack};
 pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
         name: "telemetry.channels",
-        description: "Return the effective telemetry stream and carrier policies. Unlisted kinds \
-                      default to ephemeral unless configured otherwise. Ephemeral events are \
+        description: "Return the effective telemetry stream and carrier policies, including the \
+                      required operator-declared default. Ephemeral events are \
                       accepted and dropped; no ring or reconnect gap history is retained.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -19,12 +19,12 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
         name: "telemetry.emit",
         description: "Route a generic JSON payload through the configured channel table. Durable \
                       events append to the stream; ephemeral events are accepted and dropped. \
-                      Returns the chosen carrier and receipt_id: a durable note ID, or an unretained \
-                      correlation ID for a drop. Gap posture converts proven write-admission \
-                      refusals into dropped responses; all other append errors propagate, preserving \
-                      unknown commit outcomes. No gap history is retained. Payloads have no per-kind schema.",
+                      Returns carrier, classified, actor and outcome (recorded/dropped/unknown). \
+                      receipt_id names the stored stream row only for recorded outcomes and is null \
+                      otherwise. Gap posture preserves the original structured append error; stop \
+                      propagates it. Neither posture retries. Payloads have no per-kind schema.",
         visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
+        category: VerbCategory::Assertive,
         params: &[
             ParamDef {
                 name: "kind",
@@ -51,16 +51,18 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Optional assertion of the caller actor; a different actor is refused.",
+                description: "Optional caller attribution; a different identity is ignored and \
+                              reported by actor_argument_ignored=true. The resolved caller is stamped.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "telemetry.read",
-        description: "Read one bounded durable stream page. Kind filtering follows cursor \
+        description: "Read one bounded durable stream page, scoped to the caller by default. Actor and kind filtering follow cursor \
                       advancement, so an empty filtered page can still advance next_cursor. \
-                      Ephemeral events and reconnect gap history are not retained.",
+                      Coverage labels the scanned window and current ephemeral-kind policy separately; \
+                      historical durable rows remain readable after policy changes.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -83,6 +85,20 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
                 param_type: "integer",
                 required: false,
                 description: "Maximum stream rows scanned before filtering, 1..1000; default 100.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Optional visible actor to read; defaults to the calling actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "all_actors",
+                param_type: "boolean",
+                required: false,
+                description: "Read all actors only for a configured brain.fleet_readers caller; cannot combine with actor.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -129,6 +145,20 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Optional visible actor to read; defaults to the calling actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "all_actors",
+                param_type: "boolean",
+                required: false,
+                description: "Read all actors only for a configured brain.fleet_readers caller; cannot combine with actor.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "kinds",
                 param_type: "array",
                 required: false,
@@ -159,6 +189,13 @@ inventory::submit! { khive_runtime::PackRegistration(&TelemetryPackFactory) }
 
 #[async_trait]
 impl PackRuntime for TelemetryPack {
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        self.runtime
+            .config()
+            .telemetry
+            .validate_activation()
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+    }
     fn name(&self) -> &str {
         <Self as Pack>::NAME
     }
@@ -189,7 +226,7 @@ impl PackRuntime for TelemetryPack {
         self.runtime
             .config()
             .telemetry
-            .validate()
+            .validate_activation()
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         match verb {
             "telemetry.channels" => handlers::channels(&self.runtime, params),

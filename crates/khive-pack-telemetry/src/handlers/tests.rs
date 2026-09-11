@@ -1,74 +1,148 @@
 use super::*;
+use khive_runtime::RuntimeConfig;
 use khive_storage::{StorageError, WriterTaskRequestState};
 
-#[test]
-fn gap_only_converts_typed_pre_execution_refusals_and_stop_preserves_them() {
-    let stopped = append_response(
-        "events",
-        TelemetryPolicy {
-            carrier: TelemetryCarrier::Durable,
-            failure_posture: TelemetryFailurePosture::Stop,
-        },
-        Err(RuntimeError::Storage(StorageError::WriteQueueFull {
-            timeout_ms: 10,
-        })),
-    )
-    .unwrap_err();
-    assert!(matches!(
-        stopped,
-        RuntimeError::Storage(StorageError::WriteQueueFull { timeout_ms: 10 })
-    ));
-    let dropped = append_response(
-        "events",
-        TelemetryPolicy {
-            carrier: TelemetryCarrier::Durable,
-            failure_posture: TelemetryFailurePosture::Gap,
-        },
-        Err(RuntimeError::Storage(StorageError::WriteQueueFull {
-            timeout_ms: 10,
-        })),
-    )
+#[tokio::test]
+async fn all_kinds_read_requires_a_resolvable_non_null_current_policy() {
+    for declared in [false, true] {
+        // Policy is immutable in-memory configuration, not an I/O service.
+        // An absent declaration makes the policy unavailable to the read.
+        // Exercise this boundary directly as well as registry activation tests.
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            actor_id: None,
+            brain_profile: None,
+            telemetry: khive_runtime::TelemetryConfig {
+                default_carrier: declared.then_some(TelemetryCarrier::Ephemeral),
+                ..Default::default()
+            },
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let token = runtime
+            .authorize(khive_runtime::Namespace::local())
+            .unwrap();
+        let result = read(&runtime, &token, json!({"stream":"events"})).await;
+        if declared {
+            let value = result.unwrap();
+            assert_eq!(value["coverage"]["classification_scope"], "all_kinds");
+            assert!(value["coverage"]["ephemeral"].is_null());
+            let policy = value["coverage"].get("current_policy").unwrap();
+            assert!(policy.is_object());
+            assert_eq!(policy["default_carrier"], "ephemeral");
+            assert_eq!(policy["channels"], json!([]));
+        } else {
+            let error = runtime_error_value(result.unwrap_err(), DomainDisposition::Unknown);
+            assert!(error["message"]
+                .as_str()
+                .unwrap()
+                .contains("telemetry.default_carrier"));
+            assert!(error.get("coverage").is_none());
+            assert!(error.get("current_policy").is_none());
+        }
+    }
+}
+
+fn policy(failure_posture: TelemetryFailurePosture) -> TelemetryPolicy {
+    TelemetryPolicy {
+        carrier: TelemetryCarrier::Durable,
+        failure_posture,
+        classified: true,
+    }
+}
+
+#[tokio::test]
+async fn proven_append_refusal_drops_in_gap_and_propagates_in_stop() {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        actor_id: None,
+        brain_profile: None,
+        ..RuntimeConfig::no_embeddings()
+    })
     .unwrap();
-    assert_eq!(dropped["carrier"], "durable");
-    assert_eq!(dropped["accepted"], false);
-    assert_eq!(dropped["dropped"], true);
-    assert_eq!(dropped["gap"], true);
-    assert_eq!(dropped["domain_disposition"], "not_committed");
-    assert_eq!(dropped["receipt_persisted"], false);
-    assert!(dropped.get("seq").is_none());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    for posture in [TelemetryFailurePosture::Stop, TelemetryFailurePosture::Gap] {
+        let failure = runtime
+            .stream_append_with_outcome(
+                &token,
+                "events",
+                &json!({"kind":"run.started"}),
+                Some(99),
+                "observation",
+                None,
+                None,
+                Some(false),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.disposition(), StreamAppendDisposition::NotCommitted);
+        let result = append_response("events", policy(posture), Err(failure));
+        match posture {
+            TelemetryFailurePosture::Stop => {
+                let source = runtime_error_value(result.unwrap_err(), DomainDisposition::Unknown);
+                assert!(source.to_string().contains("sequence"), "{source}");
+            }
+            TelemetryFailurePosture::Gap => {
+                let value = result.unwrap();
+                assert_eq!(value["outcome"], "dropped");
+                assert_eq!(value["carrier"], "durable");
+                assert!(value["receipt_id"].is_null());
+                assert!(value.get("error").is_some());
+                assert!(value.get("seq").is_none());
+                assert!(value.get("dropped").is_none());
+            }
+        }
+        assert_eq!(
+            runtime.stream_stat(&token, "events").await.unwrap()["count"],
+            0
+        );
+    }
 }
 
 #[test]
-fn unknown_outcomes_propagate_unchanged_under_both_failure_postures() {
-    for failure_posture in [TelemetryFailurePosture::Stop, TelemetryFailurePosture::Gap] {
-        let unknown = append_response(
-            "events",
-            TelemetryPolicy {
-                carrier: TelemetryCarrier::Durable,
-                failure_posture,
-            },
-            Err(RuntimeError::Storage(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown,
-            })),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            unknown,
-            RuntimeError::Storage(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown
-            })
-        ));
-        let untyped = append_response(
-            "events",
-            TelemetryPolicy {
-                carrier: TelemetryCarrier::Durable,
-                failure_posture,
-            },
-            Err(RuntimeError::Internal("write queue full".into())),
-        )
-        .unwrap_err();
-        assert!(matches!(untyped, RuntimeError::Internal(_)));
+fn unknown_append_outcome_preserves_exact_error_and_stop_propagates() {
+    fn source() -> RuntimeError {
+        RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        })
     }
+    let expected = runtime_error_value(source(), DomainDisposition::Unknown);
+    let value = append_response(
+        "events",
+        policy(TelemetryFailurePosture::Gap),
+        Err(StreamAppendFailure::unknown(source())),
+    )
+    .unwrap();
+    assert_eq!(value["outcome"], "unknown");
+    assert!(value["receipt_id"].is_null());
+    assert!(value.get("seq").is_none());
+    assert_eq!(value["error"], expected);
+    assert_eq!(
+        serde_json::to_vec(&value["error"]).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    let stopped = append_response(
+        "events",
+        policy(TelemetryFailurePosture::Stop),
+        Err(StreamAppendFailure::unknown(source())),
+    )
+    .unwrap_err();
+    assert_eq!(
+        runtime_error_value(stopped, DomainDisposition::Unknown),
+        expected
+    );
+    let lookalike = append_response(
+        "events",
+        policy(TelemetryFailurePosture::Gap),
+        Err(StreamAppendFailure::unknown(RuntimeError::Internal(
+            "write queue full".into(),
+        ))),
+    )
+    .unwrap();
+    assert_eq!(lookalike["outcome"], "unknown");
 }
 
 fn rollup(max_scanned: usize) -> Rollup {
@@ -77,6 +151,7 @@ fn rollup(max_scanned: usize) -> Rollup {
         until: timestamp("until", "2026-01-03T00:00:00Z").unwrap(),
         group_by: vec!["kind".into()],
         kinds: None,
+        scope: ActorScope::all(),
         head: None,
         after: 0,
         scanned: 0,
