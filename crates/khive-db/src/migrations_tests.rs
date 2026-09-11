@@ -1291,6 +1291,58 @@ fn latest_schema_version_matches_the_newest_migrations_entry() {
 }
 
 #[test]
+fn v33_recipient_indexes_match_fresh_schema_and_preserve_notes() {
+    const NOTES_DDL: &str = include_str!("../sql/notes-ddl.sql");
+    let fresh = open_memory();
+    fresh.execute_batch(NOTES_DDL).unwrap();
+    let upgraded = open_memory();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    upgraded
+        .execute_batch("DROP INDEX idx_notes_message_recipient_direction")
+        .unwrap();
+    upgraded.execute("INSERT INTO notes (id, namespace, kind, properties, created_at, updated_at) VALUES ('kept', 'default', 'message', '{\"read\":true}', 1, 1)", []).unwrap();
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 33)
+        .unwrap();
+    assert_eq!(migration.name, "notes_message_recipient_direction");
+    upgraded.execute_batch(migration.up).unwrap();
+    upgraded.execute_batch(migration.up).unwrap();
+    for name in [
+        "idx_notes_message_recipient_direction",
+        "idx_notes_unread_probe_recipient_direction",
+    ] {
+        let definition = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(definition(&upgraded), definition(&fresh), "{name}");
+    }
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT properties FROM notes WHERE id = 'kept'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "{\"read\":true}"
+    );
+    let before: i64 = upgraded
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    let after: i64 = upgraded
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, after, "normal bootstrap must not rebuild indexes");
+}
+
+#[test]
 fn migration_versions_advance_by_exactly_one() {
     for pair in MIGRATIONS.windows(2) {
         assert_eq!(
