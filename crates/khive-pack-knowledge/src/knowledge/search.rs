@@ -5959,8 +5959,12 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_embedding_rerank_preserves_scores_and_provenance() {
-        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig::no_embeddings())
-            .expect("runtime without embeddings");
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime without embeddings");
+        assert!(runtime.config().db_path.is_none());
         let mut hits = vec![
             make_hit("lexical", None, 3.0),
             make_ann_hit("ann", None, 0.8),
