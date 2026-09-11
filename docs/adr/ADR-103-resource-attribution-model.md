@@ -1113,3 +1113,122 @@ amendment signed before that branch lands. The census equality assertion enforce
 mechanically: a wider list fails the test until its amendment exists.
 
 ADR-133 Amendment 2 carries the corresponding qualification of D4/INV-1 scope.
+
+## Amendment 5 (2026-09-10): Caller-Scoped Brain Reads
+
+**Status**: Accepted.
+
+### Default and explicit actor scope
+
+`brain.event_counts`, `brain.resolve`, and `brain.bindings` derive their default
+actor scope from the authorized request token, not the identity that constructed
+the registry or started the serving process. The caller label is the actor id
+when its kind is `actor`, and `kind:id` for other actor kinds.
+
+- With `actor` omitted, `brain.event_counts` counts only that caller's events.
+  For kind `actor`, the canonical stored label is `actor:` followed by the
+  unmodified raw principal id, prepending that prefix exactly once even when the
+  id already begins with a reserved stamped-kind prefix. A historical bare alias
+  also matches only when the raw id does not begin with `<kind>:` for any kind in
+  `RUNTIME_STAMPED_ACTOR_KINDS`: `actor`, `anonymous`, or `agent`. Such prefixed ids
+  match only their canonical stored label. Only this default view combines the
+  permitted spellings into one `counts_by_actor` key, using the caller label;
+  other kinds match their exact caller label. An empty result has no actor keys.
+- With `actor` omitted, `brain.bindings` returns only binding rows whose actor is
+  the caller label. This is an exact row filter, not the wildcard fallback used
+  during profile resolution.
+- With `actor` omitted, `brain.resolve` resolves the caller's profile, retaining
+  the existing wildcard binding fallback. Anonymous callers remain the exception:
+  their absent actor resolves only wildcard bindings, never an explicit `local`
+  or `anonymous:local` binding. Anonymous event-count and binding-list reads still
+  default to their own `anonymous:local` label, not all actors.
+
+An explicit `actor` is allowed when it names the caller itself or when the
+requested actor id is in the token's visible namespace set. That visibility test
+is exact string equality between the requested actor id and one entry of the
+token's `visible_namespaces` list: no prefix match, no pattern, and no
+derivation of a namespace from the actor id. Other actor reads
+fail with `InvalidInput` naming the refused actor. An event-count actor filter
+without a reserved stamped-kind prefix matches bare and canonical stored labels.
+Every filter beginning with a reserved stamped-kind prefix matches that stored
+label exactly. Authorization parses the prefix once: self access requires both
+the kind and the remaining id to match the token's kind and id. For foreign
+access, an `actor:` filter checks the remaining raw id against visibility;
+`anonymous:` and `agent:` filters check the full, unchanged label. There is no
+self-access exception for a filter equal to the caller's collapsed label. This
+is a query-scope rule using the already-authorized token, not a new
+storage-isolation boundary. Existing namespace
+and consumer-kind filters retain their meaning.
+
+**Stored-label clarification (2026-09-10).** The distinct ordinary principals
+`caller-a` and `actor:caller-a` write canonical labels `actor:caller-a` and
+`actor:actor:caller-a`, respectively. The second principal has no bare alias and
+uses `actor="actor:actor:caller-a"` for an explicit self read. Its query with
+`actor="actor:caller-a"` selects the first principal's canonical label instead
+and requires visibility of `caller-a`.
+
+**Runtime-kind clarification (2026-09-10).** The shared
+`RUNTIME_STAMPED_ACTOR_KINDS` slice next to `ActorRef` in `khive-gate` reserves
+`actor:`, `anonymous:`, and `agent:` from historical bare aliases. A named
+principal with raw id `anonymous:local` therefore matches only its canonical
+`actor:anonymous:local` stamp by default and uses that same label for an explicit
+self filter. The filter `anonymous:local` instead selects the anonymous
+principal's canonical stamp; a named caller needs that full label in its visible
+set to read it. The same distinction applies to a named id such as `agent:worker`
+and the stamp of kind `agent`, id `worker`.
+
+This guarantee is limited to the reserved runtime-stamped kinds in the shared
+slice. The kind space remains open: `ActorRef::try_new` accepts any nonempty kind
+(and requires a nonempty id); the slice is not a closed validation enum. Adding
+a new runtime-stamped kind must extend the shared slice and include per-kind
+attributed-event tests that exercise the event-count consumer, so a separate
+hard-coded consumer list cannot silently omit the new kind. Custom kinds outside
+that slice are not covered by this alias-separation guarantee.
+
+**Binding readback clarification (2026-09-10).** A successful binding write does
+not grant read visibility. For example, caller `service:writer` may bind an
+existing profile to `service:reader`, but its subsequent `brain.bindings()` still
+filters for `service:writer` and does not return that foreign binding.
+`brain.bindings(actor="service:reader")` fails with `InvalidInput` unless
+`service:reader` is in the caller's visible set. Even with that visibility, the
+explicit actor filter is required; default reads remain caller-scoped. Binding
+rows identify the target actor, not the writer, and there is no "created by me"
+read exception. A write/read check must therefore bind the caller's own actor,
+or explicitly read a foreign actor that is visible to the caller.
+
+### Explicit aggregate event counts
+
+`brain.event_counts` accepts optional boolean `all_actors`, defaulting to false.
+`all_actors=true` removes the actor filter only when the serving runtime's
+`brain.fleet_readers` contains the caller's exact actor id. The corresponding
+`[brain] fleet_readers` configuration is a list of strings (`Vec<String>`) and
+defaults to empty. The serving process's resolved configuration is authoritative;
+neither a client's local configuration nor a wider visible namespace set grants
+aggregate access. Allowlisted callers still receive only their own events unless
+they explicitly request `all_actors=true`.
+
+`all_actors=true` and an explicit `actor` are mutually exclusive and fail with
+`InvalidInput`. False or omitted `all_actors` permits an authorized explicit actor
+filter. `all_actors` does not add an aggregate mode to profile resolution or
+binding listing.
+
+Explicit actor filters and aggregate reads preserve historical stored actor keys
+in `counts_by_actor`; alias collapse applies only to the omitted-actor default.
+All existing time-window, event-kind, pagination, truncation, and cost aggregation
+rules remain unchanged within the selected actor scope. No event rows are rewritten,
+and `brain.bind` and `brain.unbind` retain their write contracts.
+
+### Consequences
+
+Stage 1's windowed per-actor read, `brain.event_counts`, was minted to answer what
+the daemon was doing and on whose behalf. After this amendment it answers that
+question for the caller by default: a plain call returns the caller's own events
+and nothing else. The cross-actor answer, every actor at once, is no longer
+available to a caller by widening its own visibility; it requires `all_actors=true`
+and the caller's actor id in the serving daemon's `[brain] fleet_readers` list,
+which is empty by default and is set only in the serving configuration. An
+operator who wants the fleet-wide view therefore adds their actor id to that
+list and restarts or reconfigures the serving daemon; a client-side setting
+cannot grant it. The same narrowing applies to `brain.resolve` and
+`brain.bindings`: a caller sees its own profile and its own binding rows unless
+it names an actor it is allowed to see.

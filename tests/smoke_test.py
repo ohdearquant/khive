@@ -21,31 +21,35 @@ import json
 import subprocess
 import sys
 import os
+import re
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
-from kkernel_binary import resolve_binary_path
+from kkernel_binary import REPO_ROOT, resolve_binary_path
 
 BINARY = resolve_binary_path()
 
-DEFAULT_PACKS = frozenset(
-    {
-        "kg",
-        "gtd",
-        "memory",
-        "brain",
-        "comm",
-        "schedule",
-        "knowledge",
-        "session",
-        "git",
-        "code",
-        "workspace",
-        "blob",
-    }
-)
+def shipped_pack_set() -> frozenset[str]:
+    """The pack set the binary ships when nothing selects packs, read from its
+    declaration (`RuntimeConfig::built_in_packs` in
+    crates/khive-runtime/src/config.rs) rather than from a list typed here.
+    A typed copy drifted from the declaration by two packs and reddened this
+    check a day after the packs landed; reading the declaration keeps the pin
+    on what the registry is compared against, and a declaration that fails to
+    parse fails this test instead of passing an empty set."""
+    source = (REPO_ROOT / "crates" / "khive-runtime" / "src" / "config.rs").read_text()
+    match = re.search(r"pub fn built_in_packs\(\) -> Vec<String> \{\s*\[(.*?)\]", source, re.S)
+    assert match, "RuntimeConfig::built_in_packs declaration not found in config.rs"
+    packs = frozenset(re.findall(r'"([a-z_]+)"', match.group(1)))
+    assert {"kg", "workspace"} <= packs, (
+        f"built_in_packs parse produced an implausible set: {sorted(packs)}"
+    )
+    return packs
+
+
+DEFAULT_PACKS = shipped_pack_set()
 _SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-smoke-home-")
 
 
@@ -286,10 +290,18 @@ def main():
         # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
         # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
+        # The kg pack also carries its one documented sub-namespace,
+        # stream.append / stream.batch / stream.read / stream.stat (ADR-174
+        # §2); git grew from four verbs to sixteen with the dev-loop surface
+        # (checkout, diff, gates, receipts, reconcile, status, log, init,
+        # pr_open, pr_review, pr_merge; ADR-182) plus git.ingest_cursor
+        # (ADR-088 Amendment 1, the persisted ingest cursor read);
+        # tool contributes thirteen verbs and exec nine (the tool registry
+        # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 91, (
-            f"expected 91 user-facing verbs from the 12 default packs "
+        assert verbs_result["total"] == 129, (
+            f"expected 129 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -306,6 +318,11 @@ def main():
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
             f"the internal inbound sibling after an ambiguous atomic write), "
+            f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
+            f"(ADR-174); "
+            f"git contributes sixteen verbs with the ADR-182 dev-loop surface "
+            f"and git.ingest_cursor; "
+            f"tool contributes thirteen verbs and exec nine; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -1033,6 +1050,8 @@ def epistemic_smoke():
             f"got ok=True: {neg_result}"
         )
         err_msg = neg_result.get("error", "")
+        if isinstance(err_msg, dict):  # structured per-op error: read its message text
+            err_msg = str(err_msg.get("message") or err_msg)
         assert "allowlist" in err_msg or "concept" in err_msg, (
             f"rejection error must mention 'allowlist' or 'concept'; got: {err_msg!r}"
         )
@@ -1141,10 +1160,22 @@ def brain_smoke():
 
         # brain.bind / brain.bindings / brain.unbind: use the always-present
         # balanced-recall-v1 profile (Active by default) for binding coverage
+        identity = call_verb(proc, "whoami", {})
+        binding_actor = identity["actor_id"] if identity["actor_kind"] == "actor" else (
+            f"{identity['actor_kind']}:{identity['actor_id']}"
+        )
+        foreign_actor = "smoke-foreign-actor"
+        assert foreign_actor != binding_actor
+        foreign_bound = call_verb(proc, "brain.bind", {
+            "profile_id": "balanced-recall-v1",
+            "consumer_kind": "recall",
+            "actor": foreign_actor,
+        })
+        assert foreign_bound.get("bound") is True, foreign_bound
         bound = call_verb(proc, "brain.bind", {
             "profile_id": "balanced-recall-v1",
             "consumer_kind": "recall",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         assert bound.get("bound") is True, (
             f"brain.bind must return bound=true: {bound}"
@@ -1153,14 +1184,25 @@ def brain_smoke():
 
         bindings = call_verb(proc, "brain.bindings", {"profile_id": "balanced-recall-v1"})
         binding_actors = [b.get("actor") for b in bindings.get("bindings", [])]
-        assert "smoke-actor" in binding_actors, (
-            f"smoke-actor must appear in bindings after brain.bind: {binding_actors}"
+        assert binding_actor in binding_actors, (
+            f"caller {binding_actor} must appear in bindings after brain.bind: {binding_actors}"
         )
+        assert foreign_actor not in binding_actors, (
+            f"writing a foreign binding must not grant readback: {binding_actors}"
+        )
+        foreign_read = _call_request_raw(proc, json.dumps([{
+            "tool": "brain.bindings", "args": {"actor": foreign_actor},
+        }]))["results"][0]
+        assert foreign_read.get("ok") is False, foreign_read
+        foreign_error = foreign_read.get("error", "")
+        if isinstance(foreign_error, dict):
+            foreign_error = foreign_error.get("message", "")
+        assert foreign_actor in foreign_error and "not visible" in foreign_error, foreign_read
         print(f"  [brain] brain.bindings -- {bindings['count']} binding(s)")
 
         unbound = call_verb(proc, "brain.unbind", {
             "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         assert unbound.get("unbound", 0) >= 1, (
             f"brain.unbind must remove at least one binding: {unbound}"
@@ -1170,13 +1212,18 @@ def brain_smoke():
         # Confirm the binding is gone
         after = call_verb(proc, "brain.bindings", {
             "profile_id": "balanced-recall-v1",
-            "actor": "smoke-actor",
+            "actor": binding_actor,
         })
         remaining_actors = [b.get("actor") for b in after.get("bindings", [])]
-        assert "smoke-actor" not in remaining_actors, (
-            f"smoke-actor must be absent after unbind: {remaining_actors}"
+        assert binding_actor not in remaining_actors, (
+            f"caller {binding_actor} must be absent after unbind: {remaining_actors}"
         )
-        print(f"  [brain] brain.bindings post-unbind -- smoke-actor removed")
+        foreign_unbound = call_verb(proc, "brain.unbind", {
+            "profile_id": "balanced-recall-v1",
+            "actor": foreign_actor,
+        })
+        assert foreign_unbound.get("unbound", 0) == 1, foreign_unbound
+        print(f"  [brain] brain.bindings post-unbind -- caller binding removed")
 
         print(f"\n  BRAIN PACK SMOKE TESTS PASSED")
     finally:

@@ -209,7 +209,8 @@ pub trait DispatchHook: Send + Sync {
 }
 
 use crate::error::{
-    CircularPackDependency, MissingPackDependencies, MissingPackDependency, RuntimeError,
+    AuditObligationFailure, CircularPackDependency, DispatchError, MissingPackDependencies,
+    MissingPackDependency, RuntimeError,
 };
 use crate::KhiveRuntime;
 
@@ -240,6 +241,11 @@ pub trait PackRuntime: Send + Sync {
 
     /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
     fn handlers(&self) -> &'static [HandlerDef];
+
+    /// Optional canonical input schema owned by the pack; ParamDefs remain available.
+    fn input_schema(&self, _verb: &str) -> Option<Value> {
+        None
+    }
 
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
@@ -385,6 +391,30 @@ pub trait PackRuntime: Send + Sync {
     /// See `docs/api/pack.md#registered_embedding_model_names` for the ADR-103 consumer.
     fn registered_embedding_model_names(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    fn mounted_namespace(&self) -> Option<&str> {
+        None
+    }
+
+    /// Advisory owned catalog only: no storage, process, gate, or audit work.
+    fn mounted_catalog_snapshot(&self) -> Vec<crate::mounted_verb::MountedVerb> {
+        Vec::new()
+    }
+
+    async fn mounted_catalog(&self) -> Result<Vec<crate::mounted_verb::MountedVerb>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn dispatch_mounted(
+        &self,
+        _definition: &crate::mounted_verb::MountedVerb,
+        verb: &str,
+        params: Value,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.dispatch(verb, params, registry, token).await
     }
 
     /// Dispatch a verb call. Returns serialized JSON response.
@@ -668,6 +698,21 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Register an owned mounted namespace without native-pack trust privileges.
+    pub fn register_mounted(
+        &mut self,
+        pack: Box<dyn PackRuntime>,
+    ) -> Result<&mut Self, RuntimeError> {
+        if pack.mounted_namespace() != Some(pack.name()) || !pack.handlers().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "invalid mounted namespace registration".into(),
+            ));
+        }
+        self.packs.push(pack);
+        self.pack_trusted.push(false);
+        Ok(self)
+    }
+
     /// Test-only trusted registration, mirroring `register_boxed`'s trust
     /// grant for external test binaries (e.g.
     /// `tests/read_verb_admission_exhaustion.rs`) that cannot reach a
@@ -804,6 +849,22 @@ impl VerbRegistryBuilder {
                     first_idx: prev_idx,
                     second_idx: idx,
                 });
+            }
+        }
+
+        for mounted in packs
+            .iter()
+            .filter(|pack| pack.mounted_namespace().is_some())
+        {
+            let prefix = format!("{}.", mounted.name());
+            if packs
+                .iter()
+                .flat_map(|pack| pack.handlers())
+                .any(|handler| handler.name.starts_with(&prefix))
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "mounted namespace collides with a native verb".into(),
+                ));
             }
         }
 
@@ -1606,6 +1667,9 @@ impl VerbRegistry {
     /// - `knowledge.search`, `knowledge.suggest`, and auto
     ///   `knowledge.compose` may start persistent ANN consumer/checkpoint
     ///   maintenance from their nominal read path.
+    /// - `git.checkout`, `git.diff` and `git.reconcile` persist a durable
+    ///   receipt on every dispatch (checkout and diff also write a manifest
+    ///   or diff blob), so their accounting row is not droppable.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -1641,6 +1705,23 @@ impl VerbRegistry {
     const ADMISSION_DEGRADE_SAFE_VERBS: &'static [(&'static str, &'static str)] = &[
         // agent
         ("agent", "agent.observe"),
+        // exec (reads of the blob store, the run receipt and event tables, or
+        // the resolved configuration; the writers are exec.tree and
+        // exec.tree_put, Declarations, and exec.run, a Directive)
+        ("exec", "exec.tree_get"),
+        ("exec", "exec.tree_diff"),
+        ("exec", "exec.receipt"),
+        ("exec", "exec.runs"),
+        ("exec", "exec.events"),
+        ("exec", "exec.identity"),
+        // git (receipt list, allowlist, working-tree and history reads;
+        // checkout, diff and reconcile persist receipts and are excluded)
+        ("git", "git.receipts"),
+        ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
+        // Canonical get project check plus bounded cursor SELECT; no domain writes.
+        ("git", "git.ingest_cursor"),
         // blob
         ("blob", "blob.get"),
         ("blob", "blob.stat"),
@@ -1672,6 +1753,8 @@ impl VerbRegistry {
         ("kg", "resolve"),
         ("kg", "whoami"),
         ("kg", "verbs"),
+        ("kg", "stream.read"),
+        ("kg", "stream.stat"),
         // knowledge (ANN-maintaining search/suggest/compose are excluded)
         ("knowledge", "knowledge.get"),
         ("knowledge", "knowledge.list"),
@@ -1688,6 +1771,14 @@ impl VerbRegistry {
         ("session", "session.list"),
         ("session", "session.resume"),
         ("session", "session.export"),
+        // tool (registry, grant and policy reads; tool.suggest runs the same
+        // hybrid search as the kg search and context verbs above)
+        ("tool", "tool.suggest"),
+        ("tool", "tool.describe"),
+        ("tool", "tool.list"),
+        ("tool", "tool.check"),
+        ("tool", "tool.requests"),
+        ("tool", "tool.policies"),
     ];
 
     /// Sorted copy of [`Self::ADMISSION_DEGRADE_SAFE_VERBS`], built once, so
@@ -1748,6 +1839,18 @@ impl VerbRegistry {
     /// routing, or return-shape selection.
     fn admission_degrade_safe(&self, verb: &str) -> bool {
         self.degrade_safe_verbs.contains(verb)
+    }
+
+    /// Narrow transport replay opt-in. These trusted built-in handlers have no
+    /// domain mutations for any arguments. A repeated dispatch may append a new
+    /// ordinary audit row; its request id remains correlation, not deduplication.
+    /// Unknown and custom handlers cannot inherit safety from a name/category.
+    pub fn is_read_replay_safe(&self, verb: &str) -> bool {
+        self.degrade_safe_verbs.contains(verb)
+            && matches!(
+                verb,
+                "stats" | "comm.thread" | "comm.inbox" | "comm.unread" | "comm.delivered"
+            )
     }
 
     /// White-box accessor for [`Self::admission_degrade_safe`], needed
@@ -1827,6 +1930,9 @@ impl VerbRegistry {
                         "params": params_arr,
                         "identifier_resolution": identifier_resolution_help(),
                     });
+                    if let Some(schema) = pack.input_schema(verb) {
+                        envelope["input_schema"] = schema;
+                    }
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
                     }
@@ -1857,14 +1963,10 @@ impl VerbRegistry {
         let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
         match self.gate.check(&req) {
             Ok(decision) if decision.is_allow() => Ok(()),
-            Ok(GateDecision::Deny { reason }) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason,
-            }),
-            Ok(_) => Err(RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(GateDecision::Deny { reason }) => {
+                Err(RuntimeError::permission_denied("authorize", reason))
+            }
+            Ok(_) => Err(RuntimeError::permission_denied("authorize", "gate denied")),
             Err(e) => {
                 tracing::warn!(
                     error = %crate::secret_gate::bounded_masked_log_text(&e.to_string()),
@@ -1929,8 +2031,58 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_metadata_and_disposition(verb, params, identity, dispatch)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Append the `GateDenied` row of a refused dispatch and report what the
+    /// caller may cite: the row's id when it committed, otherwise why not.
+    async fn append_gate_denied_row(
+        &self,
+        store: &Arc<dyn EventStore>,
+        event: Event,
+        verb: &str,
+    ) -> crate::error::DenialReceipt {
+        let audit_event_id = event.id;
+        match append_audit_event_best_effort(
+            self.audit_batch.as_ref(),
+            store,
+            event,
+            verb,
+            crate::audit_batch::AuditProducer::GateDenied,
+            false,
+        )
+        .await
+        {
+            Ok(()) => crate::error::DenialReceipt {
+                audit_event_id: Some(audit_event_id),
+                audit_outcome: crate::error::DenialAuditOutcome::Committed,
+            },
+            Err(failure) => crate::error::DenialReceipt {
+                audit_event_id: None,
+                audit_outcome: crate::error::DenialAuditOutcome::NotCommitted(failure.wire_code()),
+            },
+        }
+    }
+
+    /// Execute an intercepted operation while retaining this boundary's failure provenance.
+    /// Successful canonical results and typed metadata are returned unchanged.
+    pub async fn dispatch_intercepted_with_metadata_and_disposition<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, DispatchError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
-        let gate_req = self.gate_request_with_identity(verb, params, identity)?;
+        let gate_req = self
+            .gate_request_with_identity(verb, params, identity)
+            .map_err(DispatchError::before_dispatch)?;
         let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
@@ -1940,45 +2092,45 @@ impl VerbRegistry {
                     "gate.check"
                 );
                 if let GateDecision::Deny { reason } = decision {
-                    if let Some(store) = &self.event_store {
-                        let event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // The dispatch already returns `PermissionDenied`
-                        // below regardless of whether this row commits — a
-                        // deny never reports success — so a persistent
-                        // commit failure here has no caller-visible outcome
-                        // to fold into; it is still logged and counted by
-                        // the helper.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                            false,
-                        )
-                        .await;
-                    }
-                    return Err(RuntimeError::PermissionDenied {
-                        verb: verb.to_string(),
-                        reason,
-                    });
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            let event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // The dispatch returns `PermissionDenied` below
+                            // whether or not this row commits — a deny never
+                            // reports success — so a commit failure has no
+                            // caller-visible outcome to fold into; the receipt
+                            // on the refusal says whether the row the caller
+                            // could cite exists.
+                            self.append_gate_denied_row(store, event, verb).await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
+                    return Err(DispatchError::before_dispatch(
+                        RuntimeError::PermissionDenied {
+                            verb: verb.to_string(),
+                            reason,
+                            receipt: Box::new(receipt),
+                        },
+                    ));
                 }
                 Some(audit)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         let started = Instant::now();
         let mut result = dispatch(gate_req.namespace.clone()).await;
+        let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
             let resource = result.as_ref().ok().map(|outcome| {
@@ -2034,10 +2186,10 @@ impl VerbRegistry {
                         request_id,
                     )
                     .await;
-                result = fold_audit_obligation(result, audit_outcome);
+                result = fold_audit_obligation(result, audit_outcome, |outcome| outcome.result);
             }
         }
-        result
+        result.map_err(|error| DispatchError::after_handler(error, domain_succeeded))
     }
 
     async fn persist_intercepted_audit(
@@ -2048,7 +2200,7 @@ impl VerbRegistry {
         result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), AuditObligationFailure> {
         let Some(store) = &self.event_store else {
             return Ok(());
         };
@@ -2123,6 +2275,24 @@ impl VerbRegistry {
             self.admission_degrade_safe(verb),
         )
         .await
+    }
+
+    /// A create refusal may reveal its key holder only when the same caller can list it.
+    pub fn allows_note_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        key: &str,
+    ) -> bool {
+        let request = GateRequest::new(
+            token.actor().clone(),
+            token.namespace().clone(),
+            "list",
+            serde_json::json!({"kind":"note", "note_kind":kind, "key_prefix":key}),
+        );
+        self.gate
+            .check(&request)
+            .is_ok_and(|decision| decision.is_allow())
     }
 
     fn gate_request_with_identity(
@@ -2217,9 +2387,32 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, RuntimeError> {
+        self.dispatch_with_disposition(verb, params, identity)
+            .await
+            .map_err(DispatchError::into_source)
+    }
+
+    /// Dispatch with provenance for this operation's own domain result.
+    /// Errors returned by a nested dispatch remain handler errors at this boundary.
+    pub async fn dispatch_with_disposition(
+        &self,
+        verb: &str,
+        params: Value,
+        identity: Option<RequestIdentity>,
+    ) -> Result<Value, DispatchError> {
         // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
-            return self.describe_verb(verb);
+            let result = match self.describe_verb(verb) {
+                Ok(value) => Ok(value),
+                Err(error) => match self.mounted_verb_catalog().await {
+                    Ok(catalog) => catalog
+                        .into_iter()
+                        .find(|entry| entry["verb"] == verb)
+                        .ok_or(error),
+                    Err(error) => Err(error),
+                },
+            };
+            return result.map_err(DispatchError::before_dispatch);
         }
         // Resolve namespace before `params` is moved into pack.dispatch, so the
         // post-dispatch hook can reference it.
@@ -2241,7 +2434,9 @@ impl VerbRegistry {
         // Resolved once via the shared actor-identity policy and reused for
         // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
-        let gate_req = self.gate_request_with_identity(verb, &params, identity.as_ref())?;
+        let gate_req = self
+            .gate_request_with_identity(verb, &params, identity.as_ref())
+            .map_err(DispatchError::before_dispatch)?;
         let ns = gate_req.namespace.clone();
         let resolved_actor = gate_req.actor.clone();
 
@@ -2323,41 +2518,37 @@ impl VerbRegistry {
                 // ingest writes with no response and no completed receipt.
                 let defer_audit = !is_deny;
 
-                // Persist to EventStore immediately only for denied calls.
-                if !defer_audit {
-                    if let Some(store) = &self.event_store {
-                        // ADR-103 Decision (a): the closed `work_class` enum
-                        // is stamped on every event, denial included -- only
-                        // `resource.cost_unit` is scoped to a successful
-                        // dispatch by Amendment 1. `base_resource_payload()`
-                        // carries `work_class` alone, no `cost_unit` key.
-                        let storage_event = build_audit_storage_event(
-                            &gate_req,
-                            &audit,
-                            EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload(request_id)),
-                        );
-                        // As above (line ~1513): this path always returns
-                        // `PermissionDenied` below regardless, so there is no
-                        // success outcome to fold a commit failure into.
-                        let _ = append_audit_event_best_effort(
-                            self.audit_batch.as_ref(),
-                            store,
-                            storage_event,
-                            verb,
-                            crate::audit_batch::AuditProducer::GateDenied,
-                            false,
-                        )
-                        .await;
-                    }
-                }
-
+                // Persist to EventStore immediately only for denied calls;
+                // the receipt rides on the refusal so the caller can cite
+                // the row.
                 let reason = if is_deny {
                     let reason = match decision {
                         GateDecision::Deny { reason } => reason,
                         _ => String::new(),
                     };
-                    Some(reason)
+                    let receipt = match &self.event_store {
+                        Some(store) => {
+                            // ADR-103 Decision (a): the closed `work_class` enum
+                            // is stamped on every event, denial included -- only
+                            // `resource.cost_unit` is scoped to a successful
+                            // dispatch by Amendment 1. `base_resource_payload()`
+                            // carries `work_class` alone, no `cost_unit` key.
+                            let storage_event = build_audit_storage_event(
+                                &gate_req,
+                                &audit,
+                                EventOutcome::Denied,
+                                Some(crate::cost_unit::base_resource_payload(request_id)),
+                            );
+                            // This path always returns `PermissionDenied`
+                            // below, so there is no success outcome to fold a
+                            // commit failure into; the receipt says whether
+                            // the row exists.
+                            self.append_gate_denied_row(store, storage_event, verb)
+                                .await
+                        }
+                        None => crate::error::DenialReceipt::no_store(),
+                    };
+                    Some((reason, receipt))
                 } else {
                     None
                 };
@@ -2365,18 +2556,22 @@ impl VerbRegistry {
                 (reason, deferred)
             }
             Err(err) => {
-                return Err(self
-                    .gate_unavailable_error(&gate_req, &err, request_id)
-                    .await);
+                return Err(DispatchError::before_dispatch(
+                    self.gate_unavailable_error(&gate_req, &err, request_id)
+                        .await,
+                ));
             }
         };
 
         // Hard enforcement: Deny is authoritative.
-        if let Some(reason) = gate_blocked {
-            return Err(RuntimeError::PermissionDenied {
-                verb: verb.to_string(),
-                reason,
-            });
+        if let Some((reason, receipt)) = gate_blocked {
+            return Err(DispatchError::before_dispatch(
+                RuntimeError::PermissionDenied {
+                    verb: verb.to_string(),
+                    reason,
+                    receipt: Box::new(receipt),
+                },
+            ));
         }
 
         // Mint the authorized storage token at the dispatch boundary.
@@ -2429,16 +2624,45 @@ impl VerbRegistry {
                     .collect(),
                 None => self.visible_namespaces.clone(),
             };
+            // ADR-007 Rev 4 Rule 3b, applied once at the seam every identity
+            // path shares: a non-`local` actor reads its own namespace by
+            // default (its episodic memories land there), whether the identity
+            // came from the config loader, a daemon frame, a scheduled replay
+            // or an embedding host. Writes stay pinned to `local` (Rule 0).
+            if let Some(actor_namespace) = resolved_actor
+                .binding_id()
+                .filter(|id| *id != Namespace::LOCAL)
+                .and_then(|id| Namespace::parse(id).ok())
+            {
+                extra_visible.push(actor_namespace);
+            }
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
         }
+        .with_gate_namespace(ns.clone())
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
             None => crate::config::process_ref_from_env(),
         });
 
         for pack in self.packs.iter() {
-            if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
+            let handler_def = pack.handlers().iter().find(|v| v.name == verb);
+            let mounted_name = pack.mounted_namespace().and_then(|prefix| {
+                verb.strip_prefix(prefix)
+                    .and_then(|suffix| suffix.strip_prefix('.'))
+            });
+            if handler_def.is_some() || mounted_name.is_some() {
+                let definition = if let Some(name) = mounted_name {
+                    pack.mounted_catalog().await.and_then(|catalog| {
+                        catalog
+                            .into_iter()
+                            .find(|definition| definition.name == name)
+                            .map(Some)
+                            .ok_or_else(|| RuntimeError::UnknownVerb(verb.to_owned()))
+                    })
+                } else {
+                    Ok(None)
+                };
                 // Strip `namespace` from params before forwarding to packs.
                 // The registry has already consumed it to mint the NamespaceToken.
                 //
@@ -2448,8 +2672,18 @@ impl VerbRegistry {
                 // — not a transport routing key — and must be passed through
                 // unchanged. Stripping it would silently default the binding to the
                 // "*" wildcard, broadening profile scope across namespaces.
-                let handler_accepts_namespace =
-                    handler_def.params.iter().any(|p| p.name == "namespace");
+                let handler_accepts_namespace = handler_def
+                    .is_some_and(|h| h.params.iter().any(|p| p.name == "namespace"))
+                    || definition
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.as_ref())
+                        .is_some_and(|definition| {
+                            definition
+                                .input_schema
+                                .get("properties")
+                                .is_some_and(|properties| properties.get("namespace").is_some())
+                        });
                 let params = if !handler_accepts_namespace {
                     if let Value::Object(mut map) = params {
                         map.remove("namespace");
@@ -2461,7 +2695,18 @@ impl VerbRegistry {
                     params
                 };
                 let dispatch_start = Instant::now();
-                let mut result = pack.dispatch(verb, params, self, &token).await;
+                let mounted_audit = definition.as_ref().ok().and_then(|v| v.as_ref()).map(|v| {
+                    serde_json::json!({"mount": pack.name(), "effect": v.effect, "generation": v.generation})
+                });
+                let mut result = match definition {
+                    Ok(Some(definition)) => {
+                        pack.dispatch_mounted(&definition, verb, params, self, &token)
+                            .await
+                    }
+                    Ok(None) => pack.dispatch(verb, params, self, &token).await,
+                    Err(error) => Err(error),
+                };
+                let domain_succeeded = result.is_ok();
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
                 // Unlike ordinary audit rows, a successful `git.digest`
@@ -2514,7 +2759,7 @@ impl VerbRegistry {
                         // only needs `audit_outcome` afterward, and folding a
                         // failure into `result` requires a mutable borrow
                         // that cannot coexist with the `&result` match below.
-                        let audit_outcome: Result<(), RuntimeError> = match &result {
+                        let audit_outcome: Result<(), AuditObligationFailure> = match &result {
                             Ok(ok_val) if is_link_singleton => {
                                 // ADR-103 Amendment 1: `link` (singleton or
                                 // bulk) has no embedding-bearing path — edges
@@ -2626,9 +2871,12 @@ impl VerbRegistry {
                                 } else {
                                     crate::audit_batch::AuditProducer::DispatchFailed
                                 };
-                                let storage_event =
+                                let mut storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
+                                if let Some(metadata) = &mounted_audit {
+                                    storage_event.payload["mounted_tool"] = metadata.clone();
+                                }
                                 append_audit_event_best_effort(
                                     self.audit_batch.as_ref(),
                                     store,
@@ -2645,7 +2893,8 @@ impl VerbRegistry {
                         // already-erroring dispatch (DispatchFailed producer)
                         // keeps its original error, matching
                         // `fold_audit_obligation`'s contract.
-                        result = fold_audit_obligation(result, audit_outcome);
+                        result =
+                            fold_audit_obligation(result, audit_outcome, std::convert::identity);
                     }
                 }
 
@@ -2743,7 +2992,8 @@ impl VerbRegistry {
                     }
                 }
 
-                return result;
+                return result
+                    .map_err(|error| DispatchError::after_handler(error, domain_succeeded));
             }
         }
 
@@ -2783,9 +3033,11 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::UnknownVerb(format!(
-            "unknown verb {verb:?}; available: {}",
-            self.available_verbs.join(", ")
+        Err(DispatchError::before_dispatch(RuntimeError::UnknownVerb(
+            format!(
+                "unknown verb {verb:?}; available: {}",
+                self.available_verbs.join(", ")
+            ),
         )))
     }
 
@@ -2941,6 +3193,28 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.handlers().iter())
             .any(|h| h.name == verb)
+    }
+
+    /// Advisory metadata for synchronous planning and MCP initialization.
+    pub fn mounted_verb_snapshot(&self) -> Vec<Value> {
+        self.packs
+            .iter()
+            .flat_map(|pack| {
+                pack.mounted_catalog_snapshot()
+                    .into_iter()
+                    .map(|verb| verb.describe(pack.name()))
+            })
+            .collect()
+    }
+
+    pub async fn mounted_verb_catalog(&self) -> Result<Vec<Value>, RuntimeError> {
+        let mut catalog = Vec::new();
+        for pack in self.packs.iter() {
+            for definition in pack.mounted_catalog().await? {
+                catalog.push(definition.describe(pack.name()));
+            }
+        }
+        Ok(catalog)
     }
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
@@ -3918,8 +4192,10 @@ pub fn audit_admission_refused_obligation_count() -> u64 {
 
 /// Process-wide count of `DispatchObligation` rows that were **already
 /// enqueued but had not resolved by the time the caller's admission wait
-/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for an
-/// [`VerbRegistry::admission_degrade_safe`] verb (#2147/#2217).
+/// deadline elapsed** (`AuditTerminalReason::AdmissionDeadlineExpired`) for a
+/// succeeded dispatch of any verb (#2147/#2217 introduced the count for
+/// [`VerbRegistry::admission_degrade_safe`] reads; writes joined it once a
+/// committed write stopped reporting failure over a row that still commits).
 /// Unlike [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`], a row counted here is not
 /// a confirmed loss: per `AuditTerminalReason::AdmissionDeadlineExpired`'s own
 /// doc, the row may still be committed (or terminally failed) by the
@@ -3957,6 +4233,20 @@ enum GitDigestReceiptOutcome {
     PersistenceUnavailable,
 }
 
+fn fail_git_digest_receipt(
+    result: &mut Result<Value, RuntimeError>,
+    failure: AuditObligationFailure,
+) {
+    let Ok(value) = result else {
+        return;
+    };
+    let domain_result = std::mem::take(value);
+    *result = Err(RuntimeError::AuditObligation {
+        failure: Box::new(failure),
+        domain_result,
+    });
+}
+
 /// Persist the complete successful `git.digest` report as a schema-v2 audit
 /// event and add that event's UUID to the returned report as `receipt_id`.
 ///
@@ -3984,7 +4274,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt store is not configured"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("event store is not configured"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
     let Some(audit) = audit else {
@@ -3992,7 +4285,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "durable receipt cannot be built because the gate produced no audit decision"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit decision is absent"),
+        );
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     };
 
@@ -4001,7 +4297,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler returned a non-object report"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     let Some(project_id) = report_object
@@ -4013,7 +4312,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "digest handler report omitted a valid project_id"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("handler report has no valid project_id"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
 
@@ -4049,7 +4351,10 @@ async fn persist_git_digest_receipt(
             verb = "git.digest",
             "gate audit serialization did not produce an object"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        fail_git_digest_receipt(
+            result,
+            AuditObligationFailure::git_digest_receipt("gate audit payload is not an object"),
+        );
         return GitDigestReceiptOutcome::BuildRejected;
     };
     if let Some(resource) = resource {
@@ -4073,11 +4378,14 @@ async fn persist_git_digest_receipt(
             })
             .await
             .map(|_outcome| ())
-            .map_err(|reason| format!("{reason:?}"))
+            .map_err(|reason| AuditObligationFailure::new("git.digest", reason))
     } else {
-        store.append_event(event).await.map_err(|e| e.to_string())
+        store
+            .append_event(event)
+            .await
+            .map_err(|error| AuditObligationFailure::from_store("git.digest", error))
     };
-    if let Err(store_err) = submit_result {
+    if let Err(mut failure) = submit_result {
         // `GitDigestReceipt` is always `DispatchObligation` (see
         // `crate::audit_batch::classify`) and this failure always
         // propagates below, so it belongs on the obligation counter, not
@@ -4085,11 +4393,15 @@ async fn persist_git_digest_receipt(
         AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             verb = "git.digest",
-            error = %store_err,
+            error = %failure,
             receipt_id = %receipt_id,
             "durable digest receipt append failed"
         );
-        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        failure.message = format!(
+            "{GIT_DIGEST_RECEIPT_FAILURE}; audit submission failed ({})",
+            failure.wire_code()
+        );
+        fail_git_digest_receipt(result, failure);
         return GitDigestReceiptOutcome::PersistenceUnavailable;
     }
     GitDigestReceiptOutcome::Persisted
@@ -4130,8 +4442,13 @@ async fn persist_git_digest_receipt(
 /// derives eligibility from `producer` itself rather than trusting the
 /// caller's `degrade_allowlisted` answer in isolation, so a `DispatchFailed`
 /// row can never take the degrade path no matter what a caller passes: every
-/// failed dispatch, every write verb, every gate-denial/unknown-verb/git.digest
-/// row stays strictly obligation-bearing.
+/// failed dispatch and every gate-denial/unknown-verb/git.digest row stays
+/// strictly obligation-bearing. A succeeded write degrades on exactly one
+/// reason, `AdmissionDeadlineExpired`: its row is already enqueued and its
+/// generation commits it independently of the caller's wait, so failing the
+/// dispatch would report a committed domain write as failed while changing
+/// nothing about the row. `QueueAdmissionExhausted` (refused before enqueue,
+/// a confirmed loss) still fails a write's dispatch.
 ///
 /// When the registry has an audit-batch seam configured (it is whenever
 /// `store` is), the row routes through
@@ -4147,7 +4464,7 @@ async fn append_audit_event_best_effort(
     verb: &str,
     producer: crate::audit_batch::AuditProducer,
     degrade_allowlisted: bool,
-) -> Result<(), RuntimeError> {
+) -> Result<(), AuditObligationFailure> {
     use crate::audit_batch::{
         classify, AuditBatchControl, AuditProducer, AuditProductionClass, AuditTerminalReason,
     };
@@ -4155,6 +4472,13 @@ async fn append_audit_event_best_effort(
     let is_obligation = classify(producer) == AuditProductionClass::DispatchObligation;
     let admission_degrade_eligible =
         degrade_allowlisted && producer == AuditProducer::DispatchSucceeded;
+    // A row that was enqueued before the caller's admission wait elapsed is
+    // committed by its generation independently of this response, so the
+    // only thing failing the dispatch would do is report a committed domain
+    // write as failed. That holds for every succeeded dispatch, allowlisted
+    // read or not; the refused-before-enqueue arm below stays strict for
+    // writes because that one is a confirmed audit loss.
+    let enqueued_row_outlives_deadline = producer == AuditProducer::DispatchSucceeded;
 
     if let Some(audit_batch) = audit_batch {
         if let Err(reason) = audit_batch
@@ -4177,35 +4501,35 @@ async fn append_audit_event_best_effort(
                 // `AdmissionDeadlineExpired` was already enqueued and may still
                 // commit later — see `AuditTerminalReason::AdmissionDeadlineExpired`'s
                 // own doc.
-                if admission_degrade_eligible {
-                    match reason {
-                        AuditTerminalReason::QueueAdmissionExhausted => {
-                            AUDIT_ADMISSION_REFUSED_OBLIGATIONS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                verb,
-                                reason = ?reason,
-                                "read verb's audit obligation row was refused before \
-                                 enqueue under audit-lane admission pressure; dispatch \
-                                 still reports its own result (non-fatal)"
-                            );
-                            return Ok(());
-                        }
-                        AuditTerminalReason::AdmissionDeadlineExpired => {
-                            AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                verb,
-                                reason = ?reason,
-                                "read verb's audit obligation row was still enqueued and \
-                                 unresolved when the caller's admission wait deadline \
-                                 elapsed; it may still commit. Dispatch still reports its \
-                                 own result (non-fatal)"
-                            );
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
+                if enqueued_row_outlives_deadline
+                    && reason == AuditTerminalReason::AdmissionDeadlineExpired
+                {
+                    AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        degrade_allowlisted,
+                        "audit obligation row was still enqueued and unresolved when \
+                         the caller's admission wait deadline elapsed; its generation \
+                         commits it independently of this response. Dispatch reports \
+                         its own committed result (non-fatal)"
+                    );
+                    return Ok(());
+                }
+                if admission_degrade_eligible
+                    && reason == AuditTerminalReason::QueueAdmissionExhausted
+                {
+                    AUDIT_ADMISSION_REFUSED_OBLIGATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        verb,
+                        reason = ?reason,
+                        "read verb's audit obligation row was refused before \
+                         enqueue under audit-lane admission pressure; dispatch \
+                         still reports its own result (non-fatal)"
+                    );
+                    return Ok(());
                 }
                 AUDIT_OBLIGATION_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
@@ -4213,9 +4537,7 @@ async fn append_audit_event_best_effort(
                     reason = ?reason,
                     "audit obligation batch submission failed; failing dispatch"
                 );
-                return Err(RuntimeError::Internal(format!(
-                    "audit obligation commit failed for verb {verb:?}: {reason:?}"
-                )));
+                return Err(AuditObligationFailure::new(verb, reason));
             }
             AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
@@ -4235,9 +4557,7 @@ async fn append_audit_event_best_effort(
                 error = %store_err,
                 "audit obligation store write failed; failing dispatch"
             );
-            return Err(RuntimeError::Internal(format!(
-                "audit obligation commit failed for verb {verb:?}: {store_err}"
-            )));
+            return Err(AuditObligationFailure::from_store(verb, store_err));
         }
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
@@ -4258,11 +4578,15 @@ async fn append_audit_event_best_effort(
 /// not on replacing one error with another.
 fn fold_audit_obligation<T>(
     result: Result<T, RuntimeError>,
-    audit_outcome: Result<(), RuntimeError>,
+    audit_outcome: Result<(), AuditObligationFailure>,
+    domain_value: impl FnOnce(T) -> Value,
 ) -> Result<T, RuntimeError> {
     match (result, audit_outcome) {
         (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(audit_err)) => Err(audit_err),
+        (Ok(value), Err(failure)) => Err(RuntimeError::AuditObligation {
+            failure: Box::new(failure),
+            domain_result: domain_value(value),
+        }),
         (Err(err), _) => Err(err),
     }
 }
@@ -4364,6 +4688,10 @@ pub(crate) mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
+    mod disposition {
+        include!("pack_disposition_tests.rs");
+    }
+
     /// Verbs known, by cross-pack source review (#2147/#2217), to have
     /// their own durable or accounting-bearing side effect despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
@@ -4375,6 +4703,9 @@ pub(crate) mod tests {
     /// any name were re-added to the allowlist.
     const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
         "db_diagnostics",
+        "git.checkout",
+        "git.diff",
+        "git.reconcile",
         "knowledge.compose",
         "knowledge.search",
         "knowledge.suggest",
@@ -4857,6 +5188,96 @@ pub(crate) mod tests {
             after_build,
             "a miss must not re-scan any pack's handlers() either"
         );
+    }
+
+    #[test]
+    fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
+        static HANDLERS: [HandlerDef; 5] = [
+            HandlerDef {
+                name: "stats",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.thread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.inbox",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.unread",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.delivered",
+                description: "replay eligibility fixture",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+
+        for (owner, handlers) in [("kg", &HANDLERS[..1]), ("comm", &HANDLERS[1..])] {
+            for (name, trusted, expected) in [
+                (owner, true, true),
+                (owner, false, false),
+                ("custom-impostor", true, false),
+            ] {
+                let mut builder = VerbRegistryBuilder::new();
+                let pack = CountingHandlersPack {
+                    name,
+                    handlers,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                };
+                if trusted {
+                    builder.register_trusted(pack);
+                } else {
+                    builder.register(pack);
+                }
+                let registry = builder.build().expect("replay fixture registry");
+                for handler in handlers {
+                    assert_eq!(
+                        registry.is_read_replay_safe(handler.name),
+                        expected,
+                        "verb={}, owner={name}, trusted={trusted}",
+                        handler.name,
+                    );
+                }
+                assert!(!registry.is_read_replay_safe("unknown.read"));
+            }
+        }
+    }
+
+    #[test]
+    fn read_replay_rejects_a_trusted_opted_in_name_with_mutating_category() {
+        static HANDLERS: [HandlerDef; 1] = [HandlerDef {
+            name: "stats",
+            description: "same name with a state-changing contract",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CountingHandlersPack {
+            name: "kg",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = builder.build().expect("mutating fixture registry");
+        assert!(!registry.is_read_replay_safe("stats"));
     }
 
     /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
@@ -5964,6 +6385,99 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn denied_dispatch_returns_the_id_of_its_committed_gate_denied_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed
+        );
+        let audit_event_id = receipt
+            .audit_event_id
+            .expect("a committed row carries its id");
+        let events = store.events.lock().unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.id == audit_event_id)
+            .expect("the receipt names a row the store holds");
+        assert_eq!(row.outcome, EventOutcome::Denied);
+        assert_eq!(row.kind, EventKind::Audit);
+        assert_eq!(row.verb, "create");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn denied_dispatch_without_an_event_store_reports_no_store() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::PermissionDenied { ref receipt, .. }
+                    if **receipt == crate::error::DenialReceipt::no_store()
+            ),
+            "expected a no-store receipt, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    #[serial_test::serial(audit_append_failures)]
+    #[serial_test::serial(audit_obligation_append_failures)]
+    async fn denied_dispatch_whose_row_fails_to_commit_still_refuses_and_names_no_row() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        let RuntimeError::PermissionDenied { verb, receipt, .. } = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "create");
+        assert_eq!(
+            receipt.audit_event_id, None,
+            "a row that did not commit is not cited"
+        );
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::NotCommitted("store_failure")
+        );
+        assert!(store.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_allow_verb_succeeds_even_with_deny_gate_for_other_verb() {
         // Deny only "create" — "list" must still work.
         let gate = Arc::new(CountingGate {
@@ -6345,6 +6859,126 @@ pub(crate) mod tests {
         assert_eq!(gate_actor.id, "actor-alpha");
     }
 
+    struct VisibilityCapturingPack {
+        visible: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Pack for VisibilityCapturingPack {
+        const NAME: &'static str = "alpha";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
+    }
+
+    #[async_trait]
+    impl PackRuntime for VisibilityCapturingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.visible.lock().unwrap().push(
+                token
+                    .visible_namespace_strs()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            );
+            Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        }
+    }
+
+    /// ADR-007 Rev 4 Rule 3b at the token seam: a per-request identity that
+    /// names a non-`local` actor reads that actor's namespace by default even
+    /// when its `visible_namespaces` list is empty, the actor appears once when
+    /// the list already names it, an anonymous identity keeps exactly `local`,
+    /// and an explicit `namespace=` stays a precise single-namespace scope.
+    #[tokio::test]
+    async fn dispatch_with_identity_folds_the_actor_namespace_into_default_reads() {
+        let visible = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(VisibilityCapturingPack {
+            visible: visible.clone(),
+        });
+        let reg = builder.build().expect("registry builds");
+        let identity = |actor: Option<&str>, listed: &[&str]| RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: actor.map(str::to_string),
+            visible_namespaces: listed.iter().map(|ns| ns.to_string()).collect(),
+            ..Default::default()
+        };
+
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            Value::Null,
+            Some(identity(Some("lambda:probe"), &["lambda:probe"])),
+        )
+        .await
+        .unwrap();
+        reg.dispatch_with_identity("list", Value::Null, Some(identity(None, &[])))
+            .await
+            .unwrap();
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "lambda:probe"}),
+            Some(identity(Some("lambda:probe"), &[])),
+        )
+        .await
+        .unwrap();
+
+        let captured = visible.lock().unwrap();
+        let count = |set: &Vec<String>, ns: &str| set.iter().filter(|s| s.as_str() == ns).count();
+        assert_eq!(
+            count(&captured[0], "lambda:probe"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[0], "local"),
+            1,
+            "empty list: {:?}",
+            captured[0]
+        );
+        assert_eq!(
+            count(&captured[1], "lambda:probe"),
+            1,
+            "listed once: {:?}",
+            captured[1]
+        );
+        assert_eq!(
+            captured[2],
+            vec!["local".to_string()],
+            "anonymous keeps exactly local"
+        );
+        assert_eq!(
+            captured[3],
+            vec!["lambda:probe".to_string()],
+            "explicit namespace is a precise scope, never widened"
+        );
+    }
+
     /// Same identity check with no configured `actor_id`: both the gate and
     /// the storage token must independently land on `ActorRef::anonymous()`.
     #[tokio::test]
@@ -6542,7 +7176,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason }
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. }
                 if verb == "create" && reason == "policy evaluation failed"),
             "expected PermissionDenied with the static classified reason for a missing rego entrypoint, got {err:?}"
         );
@@ -7017,6 +7651,9 @@ pub(crate) mod tests {
         /// the audit submission, which is the only way to observe that the
         /// audit row is written after the handler rather than before it.
         trace: Option<Arc<std::sync::Mutex<Vec<TraceEntry>>>>,
+        /// Hold a real batch append across the caller's audit deadline.
+        append_started: Option<Arc<tokio::sync::Notify>>,
+        append_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl MemoryEventStore {
@@ -7119,6 +7756,12 @@ pub(crate) mod tests {
             events: Vec<Event>,
         ) -> khive_storage::StorageResult<khive_storage::event::IdempotentEventBatchResult>
         {
+            if let Some(started) = &self.append_started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.append_release {
+                release.notified().await;
+            }
             self.trace_submission(&events);
             if self.fail_appends
                 || self
@@ -8017,8 +8660,8 @@ pub(crate) mod tests {
             .expect_err("malformed receipt identity must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -8057,9 +8700,9 @@ pub(crate) mod tests {
             .await
             .expect_err("receipt persistence failure must fail the response");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
-                    && message.contains("writes may have committed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
+                    && failure.message.contains("writes may have committed")),
             "error is stable, safe, and retry-aware: {err}"
         );
         // The git.digest receipt is obligation-bearing (`GitDigestReceipt`
@@ -8087,8 +8730,8 @@ pub(crate) mod tests {
             .expect_err("a successful digest needs a durable store");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
     }
 
@@ -8233,15 +8876,30 @@ pub(crate) mod tests {
             .await
             .expect_err("explicit gate denial must refuse intercepted dispatch");
 
-        assert!(matches!(
-            err,
-            RuntimeError::PermissionDenied { ref verb, ref reason }
-                if verb == "list" && reason == "intercepted policy denied"
-        ));
+        let RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } = err
+        else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert_eq!(verb, "list");
+        assert_eq!(reason, "intercepted policy denied");
+        assert_eq!(
+            receipt.audit_outcome,
+            crate::error::DenialAuditOutcome::Committed,
+            "the intercepted path commits its denial row before refusing"
+        );
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
 
         let events = store.events.lock().unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(
+            Some(events[0].id),
+            receipt.audit_event_id,
+            "the receipt names the committed row"
+        );
         assert_eq!(events[0].outcome, EventOutcome::Denied);
         assert_eq!(events[0].payload["decision"], "deny");
         assert_eq!(
@@ -8343,8 +9001,8 @@ pub(crate) mod tests {
             .expect_err("malformed intercepted receipt must fail the response");
         assert!(matches!(
             err,
-            RuntimeError::Internal(ref message)
-                if message.starts_with("git_digest_receipt_persist_failed:")
+            RuntimeError::AuditObligation { ref failure, .. }
+                if failure.message.starts_with("git_digest_receipt_persist_failed:")
         ));
 
         let event = only_git_digest_event(&store);
@@ -8438,7 +9096,7 @@ pub(crate) mod tests {
 
         let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason } if verb == "guarded" && reason.contains("always deny")),
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "guarded" && reason.contains("always deny")),
             "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
         );
         assert_eq!(
@@ -8551,7 +9209,7 @@ pub(crate) mod tests {
             .expect_err("denied absent-id update must not resolve the id");
 
         let denial = |error: RuntimeError| match error {
-            RuntimeError::PermissionDenied { verb, reason } => (verb, reason),
+            RuntimeError::PermissionDenied { verb, reason, .. } => (verb, reason),
             other => panic!("expected gate refusal, got {other:?}"),
         };
         let present_denial = denial(present_error);
@@ -8652,8 +9310,8 @@ pub(crate) mod tests {
                 "a persistent obligation-bearing audit commit failure must fail the dispatch",
             );
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "error names the obligation failure so it is distinguishable from a handler error: {err}"
         );
 
@@ -8799,8 +9457,8 @@ pub(crate) mod tests {
             .await
             .expect_err("an obligation commit failure must fail the dispatch");
         assert!(
-            matches!(&err, RuntimeError::Internal(message)
-                if message.contains("audit obligation commit failed")),
+            matches!(&err, RuntimeError::AuditObligation { failure, .. }
+                if failure.message.contains("audit obligation commit failed")),
             "the error must name the obligation failure, since that string is what tells a \
              caller the effect landed: {err}"
         );

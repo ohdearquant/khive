@@ -17,6 +17,7 @@ members = [
     "khive-hnsw",
     "khive-vamana",
     "khive-runtime",
+    "khive-mounts",
     "khive-wire-protocol",
     "khive-request",
     "khive-pack-kg",
@@ -28,12 +29,15 @@ members = [
     "khive-pack-schedule",
     "khive-pack-formal",
     "khive-pack-code",
+    "khive-pack-web",
     "khive-pack-blob",
     "khive-pack-moodboard",
     "khive-pack-template",
     "khive-pack-agent",
     "khive-pack-knowledge",
     "khive-pack-session",
+    "khive-pack-tool",
+    "khive-pack-exec",
     "khive-pack-git",
     "khive-pack-workspace",
     "khive-mcp",
@@ -87,6 +91,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 chrono-tz = "0.10"
+croner = { version = "4.0", default-features = false, features = ["chrono"] }
 iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }

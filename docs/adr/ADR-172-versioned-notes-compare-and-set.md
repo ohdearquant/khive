@@ -338,3 +338,157 @@ Acceptance, added to the list above:
     `create(key=K)` answers `key_conflict` with `key` and no `existing_id`; under a policy that admits
     both, `existing_id` is present. Mutation: with the second gate question removed, the deny arm
     carries `existing_id` (red).
+
+## Amendment 2 (2026-09-08): a `head` note kind for keyed documents, the document kind as a tag, `embed`, and the in-transaction arm
+
+**Status**: Proposed.
+
+### The gap
+
+The consumer whose state layer this record serves writes keyed documents under fourteen document
+kinds of its own (`job`, `lease`, `admission`, `fleet/epoch` among them), none of which is a registered
+note kind and two of which carry a slash, and it lists by that kind first and pages by key. §3 keys a
+note within a registered note kind, so the consumer has no place for its kind except the key string,
+which would turn its kind filter into a prefix convention and break a read that knows only the key.
+Separately, §1's version and §2's compare-and-set are silent on embedding, and a lease document
+rewritten on every renewal would be re-embedded on every renewal.
+
+### A2.1 `head`
+
+The kg pack registers the note kind `head` for keyed documents. Any note kind may still carry a key
+(ADR-179 keys memories); `head` is the kind a consumer uses when the note is a document it addresses by
+key and nothing else. A `head` note's document is its content as JSON text, as a stream record is
+(ADR-174 §2); `properties.tags` carries its tags. `get(kind="note", key=K, note_kind="head")` is the
+read and a keyed listing with `note_kind="head"` is the walk. A `head` has no `name`.
+
+### A2.2 The document kind is a tag
+
+The consumer's document kind is the tag `kind:<value>` in `properties.tags`: an open string of at most
+64 bytes, no U+0000, slashes allowed. `list(kind="note", note_kind="head", key_prefix=P,
+tags=["kind:job"], tag_mode="all", updated_after=T)` is the consumer's list-by-kind. The tag predicate
+is evaluated per row inside the keyed index range (namespace, note kind, key prefix), so its cost is
+bounded by that range; a deployment whose head population outgrows it gets a column and an index by a
+further amendment, with the tag kept. Nothing about the key changes: a key identifies one live `head`
+per namespace whatever its document kind, which is what a read by key alone requires.
+
+### A2.3 `embed`
+
+`create(kind="note", ...)` and `update(...)` accept `embed` (boolean). On `create` the default is
+scoped by the note kind: `false` for `head`, because a head is the document addressed by key and nothing
+else and the gap above names the lease re-embedded on every renewal; `true` for every other kind,
+today's behaviour. With `false` the write produces no embedding rows and no vector-index work and the
+note is not a similarity candidate, while lexical indexing and listing are unchanged. On
+`update` the default keeps the note's current state: a note with embedding rows is re-embedded, a note
+without them stays unembedded; `embed=true` or `false` on an update overrides that once. ADR-174
+Amendment 3 gives stream entries the same field with `false` as the default.
+
+Clarification (2026-09-09): `update(embed=false)` on an embedded note performs no inference or new
+embedding insertion and deletes existing embedding and vector rows in the same writer transaction
+as the note update. The no-vector-index-work clause excludes synchronous ANN work: stale segment
+entries are removed at the next rebuild, without delaying the write, and cannot make the note a
+similarity candidate meanwhile. Acceptance covers embedded-to-off (zero vector rows, absent from
+similarity results, still present in lexical search and listing), unembedded-to-on (vector rows and
+similarity candidacy restored), and a deletion-removal mutation that makes the off-transition
+control fail.
+
+### A2.4 The check is inside the transaction, proven by mutation
+
+`expected_version` (§2) and `fence` (§2b) are evaluated inside the writer transaction, as one
+conditional statement or as a check under `BEGIN IMMEDIATE`, never as a read followed by a separate
+write. Mutation arm: move the check outside the transaction (read the version, then begin, then write)
+and the stale-version and stale-fence arms must go red; restore, and they go green. Both runs are
+quoted with exit codes.
+
+### Acceptance
+
+1. `create(kind="note", note_kind="head", key="run/1/lease", content="{}", tags=["kind:lease"])`
+   returns version 1; `get(key="run/1/lease", note_kind="head")` returns it at version 1;
+   `update(id, content=..., expected_version=1)` returns version 2; `expected_version=1` again is
+   `version_conflict` with `current_version "2"` and the content unchanged.
+2. Three heads of kinds `job`, `job`, `lease` under one prefix: `tags=["kind:job"]` returns two,
+   `tags=["kind:fleet/epoch"]` returns none, the prefix alone returns three, order and cursor per §4.
+3. A key held by a `head` and the same key held by a `memory` coexist; `get(key=K)` without
+   `note_kind` is `key_ambiguous` naming both kinds.
+4. A `head` created without `embed`: no embedding rows, not returned for its own content by similarity
+   search, returned by `list` and lexical search; the `embed=true` control has one row per registered
+   model, and an `observation` created without `embed` has one row per model too (the default is
+   kind-scoped); an `update` without `embed` on the unembedded head leaves it unembedded, and on the
+   embedded control re-embeds it.
+5. A2.4's mutation arm, both runs quoted.
+
+## Amendment 3 (2026-09-09): ordered fence lists
+
+**Status**: Proposed.
+
+A write may depend on several keyed notes at once. Singleton note `create`, note `update`, and
+`stream.append` accept either the existing fence object or a non-empty list of fence objects:
+
+```json
+{
+  "fence": [
+    { "kind": "head", "key": "run/lease", "expected_version": 3 },
+    { "kind": "head", "key": "fleet/epoch", "expected_version": 8 }
+  ]
+}
+```
+
+Each entry follows §2b: resolve a live keyed note in the caller's primary namespace and compare its
+version. All entries are checked in supplied order inside the same writer transaction as the guarded
+write, before its statements. The first missing or stale entry refuses the whole write. A fence entry may name any keyed note of any kind; fence checks only read the fenced
+notes. The target's own `expected_version` or stream `expected_seq` still applies.
+A prior write inside an atomic unit is visible to its later fence checks; a later refusal rolls back
+that entire unit.
+
+The object form's message and details remain unchanged. The list form always adds `details.index`,
+a zero-based decimal string, including for a one-element list. This is the only difference between
+an object refusal and the equivalent one-element-list refusal. For example:
+
+```json
+{
+  "reason": "fence_conflict",
+  "key": "fleet/epoch",
+  "expected_version": "8",
+  "current_version": "9",
+  "index": "1"
+}
+```
+
+`current_version` is omitted when the row is missing. The message remains `note fence precondition
+failed`; `domain_disposition` is `not_committed` for a confirmed fence refusal. Storage failures with
+unknown outcomes retain their existing disposition; a fence parameter alone proves no outcome.
+
+An explicit null, an empty list, a malformed entry, an unknown entry field, an invalid key or note kind,
+or a non-positive expected version is `invalid_input` before opening the write transaction. A list
+cannot name the same `(kind, key)` twice, even with different versions; the error names both zero-based
+indices. This whole class is an `invalid_input` error carried in the message text, with no
+`details.reason` discriminator: the base ADR promises `reason` only for `conflict` and `not_found`, and a
+client must not look for one here. Identical keys in different note kinds remain distinct. Omitting `fence` keeps today's
+unfenced behaviour. A list never changes the successful response or adds writes to a lease.
+
+Clarification (2026-09-10): the once-per-`(kind, key)` target rule applies independently to each ordered
+fence list and to the keyed-write members of [ADR-174 A1.1](ADR-174-ordered-streams-append.md); it does
+not expand the batch-wide `fence`, which deliberately remains object-only.
+
+The Python client accepts a dictionary or list of dictionaries and preserves entry order. Its generic
+`stream.append` builder preserves explicitly supplied null so the server can reject it.
+
+Acceptance extends the existing object-form controls with one-element and two-element lists, valid,
+stale and missing entries, first-failure ordering, unchanged target content/version and stream head on
+refusal, unchanged lease rows, and malformed-input domain-population controls. Transaction controls
+must distinguish a check before transaction admission from one inside the admitted writer transaction,
+including another process renewing a lease at that boundary. Checking only the first entry or omitting
+`index` must each fail their corresponding list control.
+
+Append members of `stream.batch` accept the same optional object or non-empty
+list in their own `fence` field. In atomic mode, every member fence is checked in
+member order, then fence order, inside the batch writer transaction before any
+member writes. A stale or missing fence refuses the entire batch. Its error adds
+`member`, the member position as a string, alongside `index` when the supplied
+fence was a list. In per-member mode, the failed member carries the same fence
+error and `domain_disposition: not_committed`; successful sibling appends remain
+committed. The result's list position identifies the member. All members' fence
+shapes and kinds are validated before any member transaction starts.
+
+This amendment enables append-member fences only. The batch-wide `fence` and
+`observed` fields, their mode defaults, and the `write` member retain their
+existing availability rules.

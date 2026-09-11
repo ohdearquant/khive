@@ -36,9 +36,10 @@ use khive_request::{
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
 use khive_runtime::{
-    prepare_format_value, present, render_format, InterceptedDispatchResult, KhiveRuntime,
-    OutputFormat, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig, RuntimeError,
-    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    prepare_format_value, present, render_format, DispatchError, DomainDisposition,
+    InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -46,6 +47,10 @@ use khive_storage::{EdgeRelation, StorageCapability};
 
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
+
+const _: () = assert!(
+    khive_runtime::daemon::ERROR_DETAIL_NESTING_DEPTH_LIMIT == khive_request::NESTING_DEPTH_LIMIT
+);
 
 const MAX_BACKEND_ERROR_ENTRIES: usize = 16;
 const MAX_BACKEND_ERROR_KEY_CHARS: usize = 256;
@@ -548,37 +553,116 @@ struct DispatchFailure {
 }
 
 impl DispatchFailure {
-    fn unclassified(tool: impl Into<String>, error: Value) -> Self {
+    fn before_dispatch(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::NotCommitted)
+    }
+
+    fn committed(tool: impl Into<String>, error: Value) -> Self {
+        Self::with_disposition(tool, error, DomainDisposition::Committed)
+    }
+
+    fn with_disposition(
+        tool: impl Into<String>,
+        error: Value,
+        disposition: DomainDisposition,
+    ) -> Self {
         Self {
             tool: tool.into(),
-            error,
+            error: error_with_disposition(error, disposition),
             reason: None,
         }
     }
 
-    fn from_runtime(tool: &str, error: RuntimeError) -> Self {
+    fn from_dispatch(tool: &str, error: DispatchError) -> Self {
+        let (error, disposition) = error.into_parts();
         let reason = match &error {
-            // `gate-refusal` is deliberately limited to the write-time secret
-            // gate. Authorization denials and gate infrastructure errors keep
-            // their established, unclassified shapes.
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             _ => None,
         };
         Self {
-            tool: tool.to_string(),
-            error: runtime_error_value(error),
+            tool: tool.into(),
+            error: runtime_error_value(error, disposition),
             reason,
         }
     }
 
     fn into_entry(self) -> Value {
-        let mut entry = json!({ "ok": false, "tool": self.tool, "error": self.error });
+        let disposition = error_disposition(&self.error);
+        let mut entry = failure_entry(self.tool, self.error, disposition);
         if let Some(reason) = self.reason {
             entry["reason"] = json!(reason.as_str());
         }
         entry
     }
+}
+
+/// One constructor for per-op failures. Moving values avoids recursively
+/// serializing a canonical result before its depth has been checked.
+fn failure_entry(tool: impl Into<String>, error: Value, disposition: DomainDisposition) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("error".into(), error_with_disposition(error, disposition));
+    Value::Object(entry)
+}
+
+fn aborted_entry(tool: impl Into<String>, message: Option<String>) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("ok".into(), Value::Bool(false));
+    entry.insert("tool".into(), Value::String(tool.into()));
+    entry.insert("aborted".into(), Value::Bool(true));
+    entry.insert(
+        "domain_disposition".into(),
+        json!(DomainDisposition::NotCommitted.as_str()),
+    );
+    if let Some(message) = message {
+        entry.insert("message".into(), Value::String(message));
+    }
+    Value::Object(entry)
+}
+
+/// Missing/foreign disposition is uncertainty, never permission to replay.
+fn error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value {
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_value_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    if let Some(result) = error.remove("domain_result") {
+        if disposition != DomainDisposition::Committed {
+            // A nested operation's result is not proof of the outer result.
+            drop_value_iteratively(result);
+        } else if !result_within_depth_limit(&result) {
+            drop_value_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    Value::Object(error)
 }
 
 /// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
@@ -730,18 +814,25 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .map(|fingerprint| format!(";gate={fingerprint}"))
         .unwrap_or_default();
     let mut git_write_hasher = Sha256::new();
-    git_write_hasher.update(b"khive.git-write-policy.v1");
-    git_write_hasher.update((config.git_write.allowed.len() as u64).to_be_bytes());
-    for entry in &config.git_write.allowed {
-        git_write_hasher.update((entry.repo.len() as u64).to_be_bytes());
-        git_write_hasher.update(entry.repo.as_bytes());
-        git_write_hasher.update((entry.branches.len() as u64).to_be_bytes());
-        for branch in &entry.branches {
-            git_write_hasher.update((branch.len() as u64).to_be_bytes());
-            git_write_hasher.update(branch.as_bytes());
-        }
-    }
+    git_write_hasher.update(b"khive.git-write-policy.v2");
+    git_write_hasher.update(
+        serde_json::to_vec(&config.mounts).expect("mount configuration is JSON serializable"),
+    );
+    git_write_hasher.update(
+        serde_json::to_vec(&config.git_write)
+            .expect("git-write configuration is JSON serializable"),
+    );
     let git_write = format!("{:x}", git_write_hasher.finalize());
+
+    let mut fleet_readers = config.brain.fleet_readers.clone();
+    fleet_readers.sort();
+    fleet_readers.dedup();
+    let mut brain_hasher = Sha256::new();
+    brain_hasher.update(b"khive.brain-read-policy.v1");
+    brain_hasher.update(
+        serde_json::to_vec(&fleet_readers).expect("brain read policy is JSON serializable"),
+    );
+    let brain = format!("{:x}", brain_hasher.finalize());
 
     let backend = if storage_read_only {
         format!("{:?}:read_only", config.backend_id)
@@ -777,7 +868,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -788,6 +879,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         outbound.join(","),
         gate,
         git_write,
+        brain,
         config.display_timezone.name(),
     );
 
@@ -1053,6 +1145,8 @@ impl ChannelLoopAdmission {
 #[derive(Clone)]
 pub struct KhiveMcpServer {
     registry: VerbRegistry,
+    #[cfg(unix)]
+    bridge_executable: Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
@@ -1363,6 +1457,31 @@ impl KhiveMcpServer {
     // deref for no real benefit.
     #[allow(clippy::result_large_err)]
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
+        if !runtime.config().mounts.is_empty() {
+            return Err(PackRegError {
+                failure: PackRegFailure::Registry(RuntimeError::InvalidInput(
+                    "configured mounts require the async server constructor".into(),
+                )),
+                runtime,
+            });
+        }
+        Self::with_mounted_packs(runtime, packs, Vec::new())
+    }
+
+    /// Build a prepared runtime's native registry and start its configured sources.
+    #[allow(clippy::result_large_err)]
+    pub async fn new_with_mounts(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
+        let packs = runtime.config().packs.clone();
+        let mounted = khive_mounts::start_mounts(&runtime).await;
+        Self::with_mounted_packs(runtime, &packs, mounted)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn with_mounted_packs(
+        runtime: KhiveRuntime,
+        packs: &[String],
+        mounted: Vec<khive_mounts::MountedPack>,
+    ) -> Result<Self, PackRegError> {
         #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
         let channel_loop_admission = ChannelLoopAdmission::for_single_runtime(&runtime, packs);
         let gate = runtime.config().gate.clone();
@@ -1396,6 +1515,14 @@ impl KhiveMcpServer {
                 PackLoadError::NoPublicVerbs { pack } => PackRegFailure::NoPublicVerbs { pack },
             };
             return Err(PackRegError { failure, runtime });
+        }
+        for mount in mounted {
+            builder
+                .register_mounted(Box::new(mount))
+                .map_err(|source| PackRegError {
+                    failure: PackRegFailure::Registry(source),
+                    runtime: runtime.clone(),
+                })?;
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
@@ -1449,6 +1576,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
             runtime: Some(runtime),
@@ -1476,6 +1605,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1502,6 +1633,8 @@ impl KhiveMcpServer {
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
+            #[cfg(unix)]
+            bridge_executable: None,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
@@ -1747,9 +1880,11 @@ impl KhiveMcpServer {
     /// shares rmcp's root cancellation token so disconnect cancels every
     /// per-request child before rmcp starts its graceful drain.
     #[cfg(unix)]
-    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+    pub async fn serve_stdio(mut self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
+        self.bridge_executable = crate::daemon::executable::BridgeExecutable::current()
+            .map(|executable| Arc::new(std::sync::Mutex::new(executable)));
         let root = tokio_util::sync::CancellationToken::new();
         let idle_timeout = stdio_bridge_idle_timeout_from_env();
         let response_deadline = stdio_bridge_response_deadline_from_env()?;
@@ -1828,7 +1963,18 @@ impl KhiveMcpServer {
             .all_verbs_with_names()
             .into_iter()
             .map(|(pack, v)| (pack.to_owned(), v.name.to_owned(), v.description.to_owned()));
-        build_verb_catalog(verbs)
+        let mounted = self
+            .registry
+            .mounted_verb_snapshot()
+            .into_iter()
+            .map(|verb| {
+                (
+                    verb["pack"].as_str().unwrap_or_default().to_owned(),
+                    verb["verb"].as_str().unwrap_or_default().to_owned(),
+                    verb["description"].as_str().unwrap_or_default().to_owned(),
+                )
+            });
+        build_verb_catalog(verbs.chain(mounted))
     }
 
     /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
@@ -1856,7 +2002,7 @@ impl KhiveMcpServer {
                 // exactly when this is the chain's first op, so there is no
                 // preceding result to substitute from at all.
                 let prev = prev_result.ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
@@ -1873,7 +2019,7 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    DispatchFailure::unclassified(
+                    DispatchFailure::before_dispatch(
                         tool.clone(),
                         substitution_error_payload(&name, &arg_val, prev),
                     )
@@ -1885,7 +2031,7 @@ impl KhiveMcpServer {
                     match &resolved_val {
                         Value::Object(map) => {
                             let fields: Vec<&str> = map.keys().map(String::as_str).collect();
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1900,7 +2046,7 @@ impl KhiveMcpServer {
                             ));
                         }
                         Value::Array(_) => {
-                            return Err(DispatchFailure::unclassified(
+                            return Err(DispatchFailure::before_dispatch(
                                 tool.clone(),
                                 json!({
                                     "kind": "substitution_error",
@@ -1937,7 +2083,7 @@ impl KhiveMcpServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if from_wire && !is_help && self.registry.is_subhandler_verb(&tool) {
-            return Err(DispatchFailure::unclassified(
+            return Err(DispatchFailure::before_dispatch(
                 tool.clone(),
                 json!(format!(
                     "permission denied for verb {tool:?}: verb '{tool}' is an internal \
@@ -1957,7 +2103,7 @@ impl KhiveMcpServer {
 
         match self
             .registry
-            .dispatch_with_identity(&tool, args_value, identity.cloned())
+            .dispatch_with_disposition(&tool, args_value, identity.cloned())
             .await
         {
             Ok(result) => {
@@ -1975,7 +2121,7 @@ impl KhiveMcpServer {
                     op_success_from_registry_result(&tool, is_help, result, vector_selected);
                 chain_ok_envelope_or_depth_error(tool, success)
             }
-            Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
+            Err(error) => Err(DispatchFailure::from_dispatch(&tool, error)),
         }
     }
 
@@ -2121,7 +2267,7 @@ impl KhiveMcpServer {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
-                            return json!({ "ok": false, "tool": tool, "error": msg });
+                            return failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
                         }
                         // AlwaysVerbose verbs override the caller's presentation mode.
                         let effective_mode =
@@ -2143,13 +2289,9 @@ impl KhiveMcpServer {
                                     resolved.insert(name.clone(), v.clone());
                                 }
                             } else {
-                                prev_error = Some(json!({
-                                    "ok": false,
-                                    "tool": tool,
-                                    "error": format!(
-                                        "argument {name:?}: $prev reference is only valid in chain (|) mode"
-                                    )
-                                }));
+                                prev_error = Some(failure_entry(&tool, json!(format!(
+                                    "argument {name:?}: $prev reference is only valid in chain (|) mode"
+                                )), DomainDisposition::NotCommitted));
                                 break;
                             }
                         }
@@ -2168,15 +2310,10 @@ impl KhiveMcpServer {
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
                         if from_wire && !is_help && registry.is_subhandler_verb(&tool) {
-                            return json!({
-                                "ok": false,
-                                "tool": tool,
-                                "error": format!(
-                                    "permission denied for verb {tool:?}: verb '{tool}' is an \
-                                     internal subhandler and cannot be invoked via the MCP \
-                                     request surface"
-                                )
-                            });
+                            return failure_entry(tool.clone(), json!(format!(
+                                "permission denied for verb {tool:?}: verb '{tool}' is an \
+                                 internal subhandler and cannot be invoked via the MCP request surface"
+                            )), DomainDisposition::NotCommitted);
                         }
 
                         // Multi-backend interception: route link/search through the coordinator
@@ -2207,7 +2344,7 @@ impl KhiveMcpServer {
                         }
 
                         match registry
-                            .dispatch_with_identity(&tool, args_value, op_identity)
+                            .dispatch_with_disposition(&tool, args_value, op_identity)
                             .await
                         {
                             Ok(result) => {
@@ -2232,7 +2369,7 @@ impl KhiveMcpServer {
                                 )
                             }
                             Err(error) => {
-                                DispatchFailure::from_runtime(&tool, error).into_entry()
+                                DispatchFailure::from_dispatch(&tool, error).into_entry()
                             }
                         }
                         })
@@ -2268,17 +2405,11 @@ impl KhiveMcpServer {
                             .and_then(|r| r.get("tool"))
                             .and_then(Value::as_str)
                             .unwrap_or("<unknown>");
-                        results.push(json!({
-                            "ok": false,
-                            "tool": op.tool,
-                            "aborted": true,
-                            "message": format!(
-                                "not executed: op #{failed_index} ({failed_tool:?}) failed \
-                                 earlier in this chain, so the chain aborted before reaching \
-                                 this op. Fix op #{failed_index} — this op's own arguments, \
-                                 including any $prev reference, were never evaluated."
-                            ),
-                        }));
+                        results.push(aborted_entry(op.tool, Some(format!(
+                            "not executed: op #{failed_index} ({failed_tool:?}) failed earlier in this chain, \
+                             so the chain aborted before reaching this op. Fix op #{failed_index} — this \
+                             op's own arguments, including any $prev reference, were never evaluated."
+                        ))));
                         continue;
                     }
                     let op_mode = mode_for_op(i);
@@ -2398,7 +2529,7 @@ async fn dispatch_via_coordinator_inner(
             let metadata = args_value.get("metadata").cloned();
 
             let result = registry
-                .dispatch_intercepted_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2415,14 +2546,14 @@ async fn dispatch_via_coordinator_inner(
                                 obj.insert("target_id".to_string(), json!(target_id.to_string()));
                             }
                         }
-                        Ok(raw)
+                        Ok(InterceptedDispatchResult::new(raw, ()))
                     },
                 )
                 .await;
             Some(
                 result
-                    .map(OpSuccess::complete)
-                    .map_err(|error| DispatchFailure::from_runtime(tool, error)),
+                    .map(|outcome| OpSuccess::complete(outcome.result))
+                    .map_err(|error| DispatchFailure::from_dispatch(tool, error)),
             )
         }
         "search" => {
@@ -2437,7 +2568,7 @@ async fn dispatch_via_coordinator_inner(
             // normal registry dispatch path — see `coordinator_search_visibility`.
             let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
-                .dispatch_intercepted_with_metadata_with_identity(
+                .dispatch_intercepted_with_metadata_and_disposition(
                     tool,
                     args_value,
                     identity,
@@ -2461,7 +2592,8 @@ async fn dispatch_via_coordinator_inner(
                                 .note_hits
                                 .iter()
                                 .filter(|h| h.score.to_f64() >= request.min_score())
-                                .map(|h| {
+                                .filter_map(|h| {
+                                    let version = coord_result.note_versions.get(&h.note_id)?;
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
                                     let name =
                                         coord_result.note_names.get(&h.note_id).cloned().flatten();
@@ -2469,7 +2601,7 @@ async fn dispatch_via_coordinator_inner(
                                         .note_created_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
-                                    json!({
+                                    Some(json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
                                         "note_kind": note_kind,
@@ -2479,7 +2611,8 @@ async fn dispatch_via_coordinator_inner(
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
-                                    })
+                                        "version": version,
+                                    }))
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
@@ -2529,10 +2662,12 @@ async fn dispatch_via_coordinator_inner(
                     // "no match" reading is not established when the answer
                     // may be sitting on the backend that never responded.
                     if outcome.metadata.is_partial() && is_empty {
-                        Err(DispatchFailure::unclassified(
-                            tool,
-                            search_incomplete_error(outcome.metadata),
-                        ))
+                        let mut error = search_incomplete_error(outcome.metadata);
+                        error
+                            .as_object_mut()
+                            .expect("structured search error")
+                            .insert("domain_result".into(), outcome.result);
+                        Err(DispatchFailure::committed(tool, error))
                     } else {
                         Ok(OpSuccess {
                             result: outcome.result,
@@ -2540,7 +2675,7 @@ async fn dispatch_via_coordinator_inner(
                         })
                     }
                 }
-                Err(error) => Err(DispatchFailure::from_runtime(tool, error)),
+                Err(error) => Err(DispatchFailure::from_dispatch(tool, error)),
             })
         }
         _ => None,
@@ -2593,47 +2728,128 @@ fn coordinator_search_visibility(
     extra_visible
 }
 
-/// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying typed write admission and writer-request finality through
-/// every MCP execution mode. Finality is independent of retryability: a proven
-/// rollback makes duplicate effects impossible but retains the source error's
-/// transient policy, while an unverified rollback remains terminal and
-/// ambiguous.
-fn runtime_error_value(error: RuntimeError) -> Value {
-    match error {
+/// Every runtime variant is explicitly covered. Dispatch provenance, not the
+/// variant, determines whether the domain handler ran successfully, except for
+/// the named write outcomes, which carry their own domain proof.
+fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    // These named outcomes carry their own domain proof. Do not infer general
+    // write disposition from a conflict or unavailable variant.
+    let named_disposition = match &error {
+        RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
+            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
+            // ADR-174 A1.1: a stream member refusal carries
+            // `domain_disposition: not_committed` wherever it surfaces. In
+            // per-member mode it is the member's own value and the runtime
+            // writes the field itself; in atomic mode the refusal is raised
+            // as the call's error, where without these rows the boundary's
+            // `unknown` would stand and the caller could not tell a batch
+            // that wrote nothing from one whose outcome is unestablished.
+            (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
+            (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
+                Some("not_committed")
+            }
+            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
+                Some("not_committed")
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // The refusal text is the same Display string every consumer already
+    // matches on; the receipt fields ride beside it.
+    let denial_message =
+        matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
+    let payload = match error {
+        RuntimeError::PermissionDenied {
+            verb,
+            reason,
+            receipt,
+        } => json!({
+            "kind": "runtime_error",
+            "code": "permission_denied",
+            "message": denial_message.unwrap_or_default(),
+            "verb": verb,
+            "reason": reason,
+            "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
+            "audit_outcome": receipt.audit_outcome.wire_code(),
+        }),
+        RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } => {
+            let mut error = serde_json::Map::from_iter([
+                ("kind".into(), json!("obligation")),
+                ("code".into(), json!(failure.wire_code())),
+                ("message".into(), json!(failure.to_string())),
+            ]);
+            error.insert("domain_result".into(), domain_result);
+            Value::Object(error)
+        }
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
-        other => {
+        other @ (RuntimeError::Storage(_)
+        | RuntimeError::Sqlite(_)
+        | RuntimeError::Query(_)
+        | RuntimeError::NotFound(_)
+        | RuntimeError::InvalidInput(_)
+        | RuntimeError::UnknownVerb(_)
+        | RuntimeError::Unconfigured(_)
+        | RuntimeError::UnknownModel(_)
+        | RuntimeError::Embedding(_)
+        | RuntimeError::Ambiguous(_)
+        | RuntimeError::Fusion(_)
+        | RuntimeError::UnknownFusionStrategy(_)
+        | RuntimeError::Internal(_)
+        | RuntimeError::IncompatibleEventStore(_)
+        | RuntimeError::GuardedWriteFailed(_)
+        | RuntimeError::MissingPackDependency(_)
+        | RuntimeError::MissingPackDependencies(_)
+        | RuntimeError::CircularPackDependency(_)
+        | RuntimeError::PackRedeclared { .. }
+        | RuntimeError::VerbCollision { .. }
+        | RuntimeError::ReservedEnvelopeParam { .. }
+        | RuntimeError::GateUnavailable { .. }
+        | RuntimeError::NamespaceMismatch { .. }
+        | RuntimeError::AmbiguousPrefix { .. }
+        | RuntimeError::CrossBackendMergeUnsupported { .. }
+        | RuntimeError::UnknownRemote { .. }
+        | RuntimeError::RemoteCacheMissing { .. }
+        | RuntimeError::AmbiguousId { .. }
+        | RuntimeError::CrossNamespaceWrite { .. }
+        | RuntimeError::RemoteFetchError { .. }
+        | RuntimeError::WriteBudgetExceeded { .. }
+        | RuntimeError::SecretDetected(_)
+        | RuntimeError::DeadlineExceeded { .. }) => {
             if let Some(context) = other.writer_task_failure_context() {
-                return json!({
-                    "kind": "storage",
-                    "code": context.stage,
-                    "stage": context.stage,
-                    "message": other.to_string(),
-                    "retryable": context.retryable,
-                    "request_state": context.request_state.to_string(),
-                    "task_terminated": context.task_terminated,
-                });
+                json!({"kind":"storage", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":context.retryable,
+                    "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
+            } else if let Some(context) = other.retryable_failure_context() {
+                let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
+                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
+                    "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
+                    "capability":context.capability.map(storage_capability_wire_name),
+                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
+            } else {
+                json!({"kind":"runtime_error", "message":other.to_string()})
             }
-            let Some(context) = other.retryable_failure_context() else {
-                return json!(other.to_string());
-            };
-            let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-            let capability = context.capability.map(storage_capability_wire_name);
-            json!({
-                "kind": "unavailable",
-                "code": context.stage,
-                "stage": context.stage,
-                "message": other.to_string(),
-                "retryable": true,
-                "timeout_ms": timeout_ms,
-                "capability": capability,
-                "operation": context.operation,
-                "scope": context.scope,
-                "retry_after_ms": context.retry_after_ms,
-            })
         }
+    };
+    let mut value = error_with_disposition(payload, disposition);
+    if let Some(named) = named_disposition {
+        value["domain_disposition"] = json!(named);
     }
+    value
 }
 
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
@@ -2666,6 +2882,7 @@ fn result_within_depth_limit(result: &Value) -> bool {
 fn depth_error_payload(context: &str) -> Value {
     json!({
         "kind": "result_too_deep",
+        "code": "result_too_deep",
         "message": format!(
             "op result nesting depth exceeds max {}{context}",
             khive_request::NESTING_DEPTH_LIMIT
@@ -2843,7 +3060,7 @@ fn chain_ok_envelope_or_depth_error(
 ) -> Result<Value, DispatchFailure> {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return Err(DispatchFailure::unclassified(
+        return Err(DispatchFailure::committed(
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
@@ -2865,7 +3082,7 @@ fn present_ok_envelope_or_depth_error(
 ) -> Value {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
-        return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
+        return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
     success.result = present(success.result, mode, now_unix);
     ok_envelope(tool, success)
@@ -2899,18 +3116,11 @@ fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let error_entry = json!({
-            "ok": false,
-            "tool": tool_name,
-            "error": {
-                "kind": "result_too_deep",
-                "message": format!(
-                    "op result nesting depth exceeds max {}; \
-                     cannot be used as $prev chain context",
-                    khive_request::NESTING_DEPTH_LIMIT
-                ),
-            },
-        });
+        let error_entry = failure_entry(
+            tool_name,
+            depth_error_payload("; cannot be used as $prev chain context"),
+            DomainDisposition::Committed,
+        );
         drop_value_iteratively(result_obj);
         return Err(error_entry);
     }
@@ -3023,6 +3233,12 @@ where
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
 
+Set plan=true with ops alone to check syntax without execution. The result has
+parsed, mode, stage_count, stages (verb, pack, known, args, prev_refs), and parser
+limits. A syntax error returns parsed=false and error, with no stages. Planning
+does not check permission or resolve references. presentation, presentation_per_op,
+format, format_per_op, save_to, and request_id cannot accompany plan=true.
+
 ops syntax:
 
   Single op   : verb(name=value, name=value)
@@ -3117,9 +3333,10 @@ type ForwardFuture = std::pin::Pin<
 /// the real function would receive. `config`/`db` are always `None` at this
 /// call site.
 #[cfg(unix)]
-type ForwardFnPtr = fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -> ForwardFuture;
+type ForwardFnPtr =
+    fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>, bool) -> ForwardFuture;
 
-/// Adapts the real `forward_or_spawn_with_config_and_packs` to the `ForwardFnPtr`
+/// Adapts the real `forward_or_spawn_with_replay_policy` to the `ForwardFnPtr`
 /// signature. A pure pass-through — the `Some`/`None` decision already
 /// happened at the call site — so this boundary carries no logic a test
 /// spy could fail to observe.
@@ -3127,15 +3344,61 @@ type ForwardFnPtr = fn(khive_runtime::DaemonRequestFrame, Option<Vec<String>>) -
 fn forward_or_spawn_boxed(
     frame: khive_runtime::DaemonRequestFrame,
     packs: Option<Vec<String>>,
+    replay_read_only: bool,
 ) -> ForwardFuture {
     Box::pin(async move {
-        crate::daemon::forward_or_spawn_with_config_and_packs(&frame, None, None, packs.as_deref())
-            .await
+        crate::daemon::forward_or_spawn_with_replay_policy(
+            &frame,
+            None,
+            None,
+            packs.as_deref(),
+            replay_read_only,
+        )
+        .await
     })
 }
 
 impl KhiveMcpServer {
+    pub(crate) fn plan_ops(&self, ops: &str) -> String {
+        let catalog = self
+            .registry
+            .all_verbs_with_names()
+            .into_iter()
+            .map(|(pack, handler)| (handler.name.to_string(), pack.to_string()))
+            .chain(
+                self.registry
+                    .mounted_verb_snapshot()
+                    .into_iter()
+                    .map(|verb| {
+                        (
+                            verb["verb"].as_str().unwrap_or_default().to_owned(),
+                            verb["pack"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    }),
+            )
+            .collect();
+        khive_request::plan_request(ops, &catalog).to_string()
+    }
+
+    fn plan_response(&self, p: &RequestParams) -> Result<Option<String>, McpError> {
+        if p.plan != Some(true) {
+            return Ok(None);
+        }
+        p.validate_plan_envelope()?;
+        Ok(Some(self.plan_ops(&p.ops)))
+    }
+
     async fn request_with_cancellation(&self, p: RequestParams) -> Result<String, McpError> {
+        #[cfg(unix)]
+        if let Some(executable) = &self.bridge_executable {
+            executable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .check()?;
+        }
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         let mut p = p;
         let request_id = ensure_bridge_request_id(&mut p);
         tracing::debug!(
@@ -3158,6 +3421,9 @@ impl KhiveMcpServer {
         p: RequestParams,
         #[cfg(unix)] forward_fn: ForwardFnPtr,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
         // `invalid_params` plus its structured `parse-error` reason into an
@@ -3165,9 +3431,15 @@ impl KhiveMcpServer {
         // side-effect-free preflight keeps the local and warm-daemon surfaces on
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
-        if let Err(error) = parse_request(&p.ops) {
-            return Err(dsl_err_to_mcp(error));
-        }
+        let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        #[cfg(unix)]
+        let replay_read_only = !parsed.ops.is_empty()
+            && parsed
+                .ops
+                .iter()
+                .all(|op| self.registry.is_read_replay_safe(&op.tool));
+        #[cfg(not(unix))]
+        let _ = parsed;
 
         // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. An ordinary no-socket condition, a namespace
@@ -3193,7 +3465,10 @@ impl KhiveMcpServer {
         if khive_storage::request_read_is_cancelled() {
             return Err(McpError::internal_error(
                 "request cancelled before daemon dispatch",
-                None,
+                Some(error_with_disposition(
+                    json!({"kind":"cancelled", "message":"request cancelled before daemon dispatch"}),
+                    DomainDisposition::NotCommitted,
+                )),
             ));
         }
         #[cfg(unix)]
@@ -3225,7 +3500,7 @@ impl KhiveMcpServer {
                 .map(khive_storage::RequestReadDeadline::async_at);
             let mut forward_task =
                 tokio::spawn(khive_storage::inherit_request_read_context(async move {
-                    let outcome = forward_fn(frame, Some(resolved_packs)).await;
+                    let outcome = forward_fn(frame, Some(resolved_packs), replay_read_only).await;
                     tracing::debug!(
                         request_id,
                         daemon_outcome_present = outcome.is_some(),
@@ -3284,14 +3559,7 @@ impl KhiveMcpServer {
                                  post-cancellation wait bound; reporting an unknown \
                                  outcome and leaving the forward to finish on its own"
                             );
-                            return Err(McpError::internal_error(
-                                "daemon forward outcome unknown after cancellation",
-                                Some(json!({
-                                    "outcome": "unknown",
-                                    "retryable": false,
-                                    "request_id": request_id,
-                                })),
-                            ));
+                            return Err(cancelled_forward_error(request_id));
                         }
                     }
                 }
@@ -3304,6 +3572,9 @@ impl KhiveMcpServer {
                     ),
                     Some(json!({
                         "outcome": "unknown",
+                        "kind": "transport",
+                        "message": format!("daemon forwarding task failed after admission ({error}); outcome is unknown and the request must not be retried blindly"),
+                                    "domain_disposition": "unknown",
                         "retryable": false,
                         "request_id": request_id,
                     })),
@@ -3338,6 +3609,9 @@ impl KhiveMcpServer {
                     "request cancelled before local fallback dispatch",
                     Some(json!({
                         "outcome": "not_dispatched",
+                        "kind": "cancelled",
+                        "message": "request cancelled before local fallback dispatch",
+                        "domain_disposition": "not_committed",
                         "retryable": true,
                         "request_id": request_id,
                     })),
@@ -3391,13 +3665,12 @@ fn attach_strict_refusal_reasons(result: &mut Value) {
 }
 
 fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
-    json!({
-        "ok": false,
-        "tool": tool,
-        "error": format!(
-            "batch response budget of {response_budget} serialized bytes exceeded"
-        ),
-    })
+    failure_entry(
+        tool,
+        json!({"kind":"response_budget_exceeded", "code":"response_budget_exceeded",
+        "message":format!("batch response budget of {response_budget} serialized bytes exceeded")}),
+        DomainDisposition::NotCommitted,
+    )
 }
 
 async fn execute_bounded_batch<I, F>(
@@ -3516,16 +3789,26 @@ fn strict_fallback_envelope_response(
             .enumerate()
             .map(|(i, op)| {
                 if i == 0 {
-                    json!({ "ok": false, "tool": op.tool, "error": error_msg })
+                    failure_entry(
+                        op.tool.clone(),
+                        json!(error_msg),
+                        DomainDisposition::NotCommitted,
+                    )
                 } else {
-                    json!({ "ok": false, "tool": op.tool, "aborted": true })
+                    aborted_entry(op.tool.clone(), None)
                 }
             })
             .collect(),
         ExecutionMode::Single | ExecutionMode::Parallel => parsed
             .ops
             .iter()
-            .map(|op| json!({ "ok": false, "tool": op.tool, "error": error_msg }))
+            .map(|op| {
+                failure_entry(
+                    op.tool.clone(),
+                    json!(error_msg),
+                    DomainDisposition::NotCommitted,
+                )
+            })
             .collect(),
     };
 
@@ -3554,6 +3837,7 @@ impl KhiveMcpServer {
     #[cfg(unix)]
     pub(crate) fn wire_daemon_frame(&self, p: &RequestParams) -> khive_runtime::DaemonRequestFrame {
         khive_runtime::DaemonRequestFrame {
+            plan: false,
             ops: p.ops.clone(),
             presentation: p.presentation.clone(),
             presentation_per_op: p.presentation_per_op.clone(),
@@ -3676,6 +3960,7 @@ impl KhiveMcpServer {
         debug_assert!(policy.max_batch_concurrency > 0);
         let parsed = parse_typed_json_batch(ops).map_err(dsl_err_to_mcp)?;
         let p = RequestParams {
+            plan: None,
             ops: String::new(),
             presentation,
             presentation_per_op: None,
@@ -3772,6 +4057,9 @@ impl KhiveMcpServer {
         origin: DispatchOrigin,
         strict_refusals: bool,
     ) -> Result<String, McpError> {
+        if let Some(plan) = self.plan_response(&p)? {
+            return Ok(plan);
+        }
         // `dispatch_request_inner_scoped` is the complete parse/dispatch/render
         // pipeline. Keep that large generator behind one pointer before handing
         // it to the generic task-local scope: otherwise the scope embeds the
@@ -3838,18 +4126,17 @@ impl KhiveMcpServer {
         });
 
         // Parse presentation strings → PresentationMode.
-        let presentation = parse_presentation_mode(p.presentation.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        let presentation =
+            parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
             if let Some(per_op_strs) = p.presentation_per_op {
                 let mut modes = Vec::with_capacity(per_op_strs.len());
                 for s in per_op_strs {
                     let mode = match s.as_deref() {
                         None => None,
-                        Some(v) => Some(
-                            parse_presentation_mode(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?,
-                        ),
+                        Some(v) => {
+                            Some(parse_presentation_mode(Some(v)).map_err(invalid_request_error)?)
+                        }
                     };
                     modes.push(mode);
                 }
@@ -3862,7 +4149,7 @@ impl KhiveMcpServer {
         // per-request `format` field → server default (already resolved from
         // env + toml + builtin by `serve.rs`).
         let batch_format = parse_output_format(p.format.as_deref())
-            .map_err(|e| McpError::invalid_params(e, None))?
+            .map_err(invalid_request_error)?
             .unwrap_or(self.default_output_format);
 
         // Per-op format overrides (ADR-078 §8.4).
@@ -3874,7 +4161,7 @@ impl KhiveMcpServer {
                         None => None,
                         Some(v) => Some(
                             parse_output_format(Some(v))
-                                .map_err(|e| McpError::invalid_params(e, None))?
+                                .map_err(invalid_request_error)?
                                 .unwrap_or(batch_format),
                         ),
                     };
@@ -3914,10 +4201,10 @@ impl KhiveMcpServer {
             // (`kkernel exec --save-file`, `from_wire = false`) is unrestricted,
             // matching its documented "write anywhere" behavior.
             let manifest = crate::save_sink::write_and_manifest(&result, path, from_wire)
-                .map_err(|e| McpError::internal_error(format!("save_to: {e}"), None))?;
+                .map_err(|e| request_internal_error(format!("save_to: {e}")))?;
             // Manifests are always compact JSON regardless of format (lossless metadata).
             return serde_json::to_string(&manifest)
-                .map_err(|e| McpError::internal_error(format!("serialize manifest: {e}"), None));
+                .map_err(|e| request_internal_error(format!("serialize manifest: {e}")));
         }
 
         // Apply per-op format rendering (ADR-078 §8.4 and §9).
@@ -3989,10 +4276,56 @@ fn attach_audit_persistence_advisories(response: &mut Value, registry: &VerbRegi
     }
 }
 
+fn invalid_request_error(message: String) -> McpError {
+    McpError::invalid_params(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"invalid_input", "message":message,
+            }),
+            DomainDisposition::NotCommitted,
+        )),
+    )
+}
+
+#[cfg(unix)]
+fn cancelled_forward_error(request_id: Option<u64>) -> McpError {
+    McpError::internal_error(
+        "daemon forward outcome unknown after cancellation",
+        Some(error_with_disposition(
+            json!({
+                "outcome": "unknown",
+                "kind": "transport",
+                "message": "daemon forward outcome unknown after cancellation",
+                "retryable": false,
+                "request_id": request_id,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
+fn request_internal_error(message: String) -> McpError {
+    // Rendering/saving can follow a mixture of per-op outcomes.
+    McpError::internal_error(
+        message.clone(),
+        Some(error_with_disposition(
+            json!({
+                "kind":"internal", "message":message,
+            }),
+            DomainDisposition::Unknown,
+        )),
+    )
+}
+
 fn dsl_err_to_mcp(e: DslError) -> McpError {
     McpError::invalid_params(
         e.to_string(),
-        Some(json!({ "reason": RefusalReason::ParseError.as_str() })),
+        Some(error_with_disposition(
+            json!({ "reason": RefusalReason::ParseError.as_str(),
+            "kind":"parse_error", "message":e.to_string() }),
+            DomainDisposition::NotCommitted,
+        )),
     )
 }
 
@@ -4103,10 +4436,14 @@ fn render_result(
     if rendered_response_fits_daemon_frame(&compact, config_id) {
         return compact;
     }
-    serde_json::to_string(&json!({
-        "ok": false,
-        "error": "response payload omitted because it exceeds the daemon frame budget",
-    }))
+    serde_json::to_string(&failure_entry(
+        "request",
+        frame_budget_error(
+            "response payload omitted because it exceeds the daemon frame budget",
+            DomainDisposition::Unknown,
+        ),
+        DomainDisposition::Unknown,
+    ))
     .expect("static frame-budget error is serializable")
 }
 
@@ -4314,9 +4651,40 @@ fn empty_rendered_daemon_frame_len(served_config_id: &str) -> usize {
     rendered_response_daemon_frame_len("", served_config_id)
 }
 
+fn frame_budget_error(message: &str, disposition: DomainDisposition) -> Value {
+    error_with_disposition(
+        json!({"kind":"response_frame_budget_exceeded", "code":"response_frame_budget_exceeded",
+        "message":message, "retryable":false,
+        "max_frame_bytes":khive_runtime::daemon::MAX_FRAME_BYTES}),
+        disposition,
+    )
+}
+
 fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
     let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let mut omitted = serde_json::Map::new();
+    if entry.get("aborted").and_then(Value::as_bool) == Some(true) {
+        let mut aborted = aborted_entry(
+            entry
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None,
+        );
+        for key in ["usage", "reason", "advisories"] {
+            if let Some(value) = entry.get(key) {
+                aborted[key] = value.clone();
+            }
+        }
+        return aborted;
+    }
+    let disposition = if ok {
+        DomainDisposition::Committed
+    } else {
+        error_disposition(&entry["error"])
+    };
+    let mut omitted = failure_entry(entry.get("tool").and_then(Value::as_str).unwrap_or_default(),
+        frame_budget_error("operation failed; error details omitted because the response frame budget was exceeded", disposition),
+        disposition).as_object().expect("error envelope").clone();
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
@@ -4399,7 +4767,10 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
         if !search_fields.is_empty() {
             error.insert("search".to_string(), Value::Object(search_fields));
         }
-        omitted.insert("error".to_string(), Value::Object(error));
+        omitted.insert(
+            "error".to_string(),
+            error_with_disposition(Value::Object(error), disposition),
+        );
     } else {
         // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
         // is small and typed — it must survive omission untransformed rather
@@ -4414,11 +4785,6 @@ fn frame_budget_omission(entry: &Value, registry: &VerbRegistry) -> Value {
             if let Some(error) = entry.get("error") {
                 omitted.insert("error".to_string(), error.clone());
             }
-        } else {
-            omitted.insert(
-                "error".to_string(),
-                json!("operation failed; error details omitted because the response frame budget was exceeded"),
-            );
         }
     }
     Value::Object(omitted)
@@ -4472,6 +4838,7 @@ fn rendered_response_daemon_frame_len(rendered: &str, served_config_id: &str) ->
         ok: true,
         result: Some(rendered.to_string()),
         error: None,
+        error_detail: None,
         namespace_mismatch: false,
         config_mismatch: false,
         served_config_id: Some(served_config_id.to_string()),
@@ -4493,7 +4860,10 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
     format!(
         "khive — request-only MCP surface. One tool, `request`, \
          dispatches verbs through the loaded pack registry. Configure packs via \
-         KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
+         KHIVE_PACKS or --pack (built-ins: {builtins}). The kg pack's verbs are \
+         unprefixed (create, get, list, search, link, neighbors, ...); every other pack's \
+         verbs are written pack.verb. Read verbs return their record or hits directly \
+         unless the verb's help says it wraps them in an envelope. Verbs registered on this \
          server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
          plugin's SKILL.md files.\n\
          Docs: https://ohdearquant.github.io/khive/ (hosted) or docs/*.md in the repo \
@@ -4505,6 +4875,30 @@ fn build_instructions(catalog: &str, builtins: &str) -> String {
 
 #[tool_handler]
 impl ServerHandler for KhiveMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        // The router turns parameter-deserialization failures into tool errors.
+        // Plan isolation requires the JSON-RPC invalid_params response instead.
+        if request.name == "request" {
+            if let Some(args) = request.arguments.as_ref() {
+                if args.get("plan") == Some(&Value::Bool(true)) {
+                    for field in crate::tools::request::PLAN_COMPANIONS {
+                        if args.contains_key(field) {
+                            return Err(invalid_request_error(format!(
+                                "plan=true cannot be combined with {field}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(context).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
@@ -4527,6 +4921,19 @@ impl ServerHandler for KhiveMcpServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         let mut tools = Self::tool_router().list_all();
+        self.registry.mounted_verb_catalog().await.map_err(|_| {
+            McpError::internal_error(
+                "mounted catalog unavailable",
+                Some(error_with_disposition(
+                    json!({
+                        "kind": "unavailable",
+                        "message": "mounted catalog unavailable",
+                        "details": {"class": "tool_error", "reason": "catalog_drift"},
+                    }),
+                    DomainDisposition::NotCommitted,
+                )),
+            )
+        })?;
         let catalog = self.verb_catalog();
         for t in &mut tools {
             if t.name == "request" {
@@ -4547,9 +4954,51 @@ impl ServerHandler for KhiveMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("server/plan_tests.rs");
     use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
+
+    #[test]
+    fn remember_key_named_disposition_preserves_details_and_other_errors() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = "k".repeat(512);
+        let error = khive_types::KhiveError::conflict("held").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_conflict".to_owned()),
+                ("key", key.clone()),
+                ("existing_id", id.clone()),
+            ]),
+        );
+        let value = runtime_error_value(error.into(), DomainDisposition::Committed);
+        assert_eq!(value["kind"], "conflict");
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"]["key"], key);
+        assert_eq!(value["details"]["existing_id"], id);
+
+        let unresolved = khive_types::KhiveError::unavailable("holder missing").with_details(
+            khive_types::Details::new_owned([
+                ("reason", "key_holder_unresolved".to_owned()),
+                ("key", String::new()),
+            ]),
+        );
+        assert_eq!(
+            runtime_error_value(unresolved.into(), DomainDisposition::Committed)
+                ["domain_disposition"],
+            "unknown"
+        );
+        for error in [
+            khive_types::KhiveError::conflict("unrelated"),
+            khive_types::KhiveError::unavailable("unrelated"),
+        ] {
+            let mut expected = serde_json::to_value(&error).unwrap();
+            expected["domain_disposition"] = json!("unknown");
+            assert_eq!(
+                runtime_error_value(error.into(), DomainDisposition::Unknown),
+                expected
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SearchCapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -4604,6 +5053,47 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
+    async fn bridge_executable_replacement_refuses_at_request_boundary() {
+        use crate::daemon::{
+            fire_pending_self_heal, reset_self_heal_counters, REEXEC_INVOKED_COUNT,
+        };
+
+        reset_self_heal_counters();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge");
+        std::fs::write(&path, b"binary image").unwrap();
+        let executable = crate::daemon::executable::BridgeExecutable::at(path.clone()).unwrap();
+        let mut server = KhiveMcpServer::from_registry(VerbRegistryBuilder::new().build().unwrap());
+        server.bridge_executable = Some(Arc::new(std::sync::Mutex::new(executable)));
+        std::fs::copy(&path, dir.path().join("next")).unwrap();
+        std::fs::rename(dir.path().join("next"), path).unwrap();
+
+        for params in [
+            RequestParams {
+                ops: "stats()".to_string(),
+                plan: Some(true),
+                ..Default::default()
+            },
+            RequestParams {
+                ops: "stats(".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let error = server.request_with_cancellation(params).await.expect_err(
+                "the stale stdio bridge must refuse before planning, parsing or dispatch",
+            );
+            assert_eq!(error.data.unwrap()["reason"], "executable_replaced");
+        }
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 0);
+        fire_pending_self_heal();
+        fire_pending_self_heal();
+        assert_eq!(REEXEC_INVOKED_COUNT.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn bridge_request_id_is_unconditional_and_preserves_caller_value() {
         let mut generated = RequestParams {
@@ -4641,6 +5131,7 @@ mod tests {
         .expect("in-memory runtime");
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
         let params = RequestParams {
+            plan: None,
             ops: json!({
                 "tool": "stats",
                 "args": {"payload": "x".repeat(khive_request::MAX_OPS_INPUT_LEN + 1)},
@@ -4697,6 +5188,7 @@ mod tests {
         fn spy_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = Some(packs));
             Box::pin(async {
@@ -4721,6 +5213,7 @@ mod tests {
         SPY_CAPTURED_PACKS.with(|c| *c.borrow_mut() = None);
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4745,6 +5238,309 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    mod read_replay_tests {
+        use super::*;
+
+        thread_local! {
+            static CAPTURED_FORWARD: std::cell::RefCell<Option<(String, bool)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn capture_forward_policy(
+            frame: khive_runtime::DaemonRequestFrame,
+            _packs: Option<Vec<String>>,
+            replay_read_only: bool,
+        ) -> ForwardFuture {
+            CAPTURED_FORWARD.with(|capture| {
+                *capture.borrow_mut() = Some((frame.ops, replay_read_only));
+            });
+            Box::pin(async { Some(Ok("forwarded-policy-fixture".to_string())) })
+        }
+
+        fn live_server() -> KhiveMcpServer {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string(), "comm".to_string(), "memory".to_string()],
+                ..RuntimeConfig::default()
+            })
+            .expect("in-memory replay registry");
+            KhiveMcpServer::new(runtime).expect("live kg, comm and memory handlers")
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn request_forward_policy_requires_every_operation_to_be_an_opted_in_read() {
+            let server = live_server();
+            let cases = [
+                ("stats()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("comm.inbox(wait_ms=30000, box=\"sent\", limit=1)", true),
+                ("comm.unread()", true),
+                (
+                    "comm.delivered(id=\"00000000-0000-0000-0000-000000000001\")",
+                    true,
+                ),
+                ("[stats(), comm.unread(), comm.inbox(limit=1)]", true),
+                ("stats() | comm.unread()", true),
+                (
+                    "comm.thread(id=\"00000000-0000-0000-0000-000000000001\") | \
+                     comm.thread(id=$prev.thread_id) | comm.thread(id=$prev.thread_id)",
+                    true,
+                ),
+                (
+                    r#"[{"tool":"stats"},{"tool":"comm.unread","args":{}}]"#,
+                    true,
+                ),
+                ("stats(help=true)", true),
+                ("comm.send(to=\"bob\", content=\"policy-fixture\")", false),
+                (
+                    "[comm.unread(), comm.send(to=\"bob\", content=\"policy-fixture\")]",
+                    false,
+                ),
+                (
+                    "comm.send(to=\"bob\", content=\"policy-fixture\") | comm.thread(id=$prev.id)",
+                    false,
+                ),
+                ("[stats(), unknown.read()]", false),
+                ("unknown.read()", false),
+                ("unknown.read(help=true)", false),
+                ("comm.send(help=true)", false),
+                ("stats() | comm.send(help=$prev.help)", false),
+                ("memory.prune(dry_run=true)", false),
+                ("merge(dry_run=true)", false),
+                (
+                    "comm.mark_read(ids=[\"00000000-0000-0000-0000-000000000001\"], atomic=true)",
+                    false,
+                ),
+                ("search(kind=\"entity\", query=\"policy-fixture\")", false),
+                ("memory.recall(query=\"policy-fixture\")", false),
+                ("get(id=\"00000000-0000-0000-0000-000000000001\")", false),
+            ];
+
+            for (ops, expected) in cases {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let response = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("forward preflight rejected {ops}: {error}"));
+                assert_eq!(response, "forwarded-policy-fixture");
+                assert_eq!(
+                    CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                    Some((ops.to_string(), expected)),
+                    "forwarded replay policy for {ops}",
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn malformed_and_atomic_wrapper_requests_never_reach_forwarding() {
+            let server = live_server();
+            for ops in [
+                "",
+                "stats(",
+                "[stats(), comm.unread()",
+                r#"{"atomic":true,"ops":[{"tool":"stats"}]}"#,
+            ] {
+                CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+                let error = server
+                    .request_with_forward(
+                        RequestParams {
+                            ops: ops.to_string(),
+                            ..Default::default()
+                        },
+                        capture_forward_policy,
+                    )
+                    .await
+                    .expect_err("invalid DSL must fail before forwarding");
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data["reason"].as_str()),
+                    Some("parse-error"),
+                );
+                assert!(CAPTURED_FORWARD.with(|capture| capture.borrow().is_none()));
+            }
+        }
+
+        struct ImpostorCommPack;
+
+        impl khive_types::Pack for ImpostorCommPack {
+            const NAME: &'static str = "comm";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+                name: "comm.thread",
+                description: "untrusted same-name replay fixture",
+                visibility: khive_runtime::Visibility::Verb,
+                category: khive_runtime::VerbCategory::Assertive,
+                params: &[],
+            }];
+        }
+
+        #[async_trait::async_trait]
+        impl khive_runtime::PackRuntime for ImpostorCommPack {
+            fn name(&self) -> &str {
+                <Self as khive_types::Pack>::NAME
+            }
+
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+
+            fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+                <Self as khive_types::Pack>::HANDLERS
+            }
+
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &khive_runtime::NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                panic!("the forwarding policy fixture must not dispatch locally")
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(config_ledger)]
+        async fn custom_same_name_pack_cannot_enable_replay_at_request_boundary() {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(ImpostorCommPack);
+            let registry = builder.build().expect("custom comm fixture registry");
+            assert_eq!(
+                registry.verb_category("comm.thread"),
+                Some(khive_runtime::VerbCategory::Assertive),
+            );
+            let server = KhiveMcpServer::from_registry(registry);
+            let ops = "comm.thread(id=\"00000000-0000-0000-0000-000000000001\")";
+            CAPTURED_FORWARD.with(|capture| *capture.borrow_mut() = None);
+            server
+                .request_with_forward(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    capture_forward_policy,
+                )
+                .await
+                .expect("custom call reaches forwarding without replay permission");
+            assert_eq!(
+                CAPTURED_FORWARD.with(|capture| capture.borrow_mut().take()),
+                Some((ops.to_string(), false)),
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[serial_test::serial(config_ledger)]
+        async fn mixed_comm_batch_commits_once_when_its_daemon_response_is_lost() {
+            clear_daemon_env();
+            let dir = tempfile::tempdir().expect("mixed batch socket directory");
+            let socket = dir.path().join("khived.sock");
+            std::env::set_var("KHIVE_SOCKET", &socket);
+            std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+            let client = live_server();
+            let daemon = live_server();
+            let baseline = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client baseline");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon");
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let observed_mutations = Arc::clone(&mutations);
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon_task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        incoming = listener.accept() => incoming.expect("accept mixed batch"),
+                    };
+                    let payload = khive_runtime::daemon::read_frame(&mut stream)
+                        .await
+                        .expect("receive full mixed batch");
+                    let frame: khive_runtime::DaemonRequestFrame =
+                        serde_json::from_slice(&payload).expect("decode mixed batch frame");
+                    assert!(
+                        !frame.probe_only,
+                        "mixed response loss must not trigger recovery"
+                    );
+                    let response = daemon
+                        .dispatch_request_local(RequestParams {
+                            ops: frame.ops,
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("execute mixed batch before losing the response");
+                    let envelope: Value = serde_json::from_str(&response).expect("batch response");
+                    assert_eq!(envelope["summary"]["succeeded"], 2, "{envelope}");
+                    let committed = envelope["results"]
+                        .as_array()
+                        .expect("batch entries")
+                        .iter()
+                        .filter(|entry| entry["tool"] == "comm.send" && entry["ok"] == true)
+                        .count();
+                    observed_mutations.fetch_add(committed, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+
+            let result = client
+                .request(
+                    Parameters(RequestParams {
+                        ops: "[comm.unread(), comm.send(to=\"bob\", content=\"mixed-replay-fixture\")]"
+                            .to_string(),
+                        ..Default::default()
+                    }),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let _ = stop_tx.send(());
+            let stopped = daemon_task.await;
+            clear_daemon_env();
+            stopped.expect("fake daemon exits cleanly");
+
+            let error = result.expect_err("the mixed batch must preserve its ambiguous outcome");
+            assert!(error.message.contains("not retrying"), "{error}");
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                1,
+                "comm.send committed more than once"
+            );
+            let after = client
+                .dispatch_request_local(RequestParams {
+                    ops: "stats()".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("client state after remote response loss");
+            assert_eq!(
+                stats_without_request_local_usage(&after),
+                stats_without_request_local_usage(&baseline),
+                "a lost mixed response must not dispatch comm.send locally",
+            );
+        }
+    }
+
     /// A cancellation notification after daemon admission must not replace the
     /// daemon's actual per-op outcome with a bare RPC-level error. The daemon
     /// response is the only source that can say which independent operations
@@ -4767,6 +5563,7 @@ mod tests {
         fn delayed_partial_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -4850,6 +5647,7 @@ mod tests {
         fn unreachable_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             panic!("save_to must bypass daemon forwarding regardless of cancellation");
         }
@@ -4924,6 +5722,7 @@ mod tests {
         fn cancel_then_none_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             Box::pin(async move {
                 CANCEL_TX.with(|c| {
@@ -5015,6 +5814,7 @@ mod tests {
         fn slow_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5104,6 +5904,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5188,6 +5989,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5284,6 +6086,7 @@ mod tests {
         fn never_resolves_forward(
             _frame: khive_runtime::DaemonRequestFrame,
             _packs: Option<Vec<String>>,
+            _replay_read_only: bool,
         ) -> ForwardFuture {
             let started = FORWARD_STARTED
                 .with(|c| c.borrow().clone())
@@ -5378,6 +6181,7 @@ mod tests {
         crate::daemon::test_forward_seam::arm();
 
         let params = RequestParams {
+            plan: None,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5476,6 +6280,109 @@ mod tests {
             compute_config_id_with_ann_fresh_tail(&config, None, false),
             "opposite fresh-tail policies must not share one warm daemon"
         );
+    }
+
+    #[test]
+    fn config_id_separates_git_actor_resolver_and_fault_configuration() {
+        use khive_runtime::engine_config::GitWriteActorConfig;
+
+        let mut base = RuntimeConfig::no_embeddings();
+        base.git_write.actors.insert(
+            "example".to_string(),
+            GitWriteActorConfig {
+                name: "Example".to_string(),
+                email: "example@example.invalid".to_string(),
+                credential_ref: "example-reference".to_string(),
+                platform_identity: "example-login".to_string(),
+            },
+        );
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let original = fingerprint(&base);
+        for field in [
+            "name",
+            "email",
+            "credential_ref",
+            "platform_identity",
+            "actor",
+            "resolver",
+            "contract_faults",
+            "fault",
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "name" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .name
+                    .push('x'),
+                "email" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .email
+                    .push('x'),
+                "credential_ref" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .credential_ref
+                    .push('x'),
+                "platform_identity" => changed
+                    .git_write
+                    .actors
+                    .get_mut("example")
+                    .unwrap()
+                    .platform_identity
+                    .push('x'),
+                "actor" => {
+                    changed.git_write.actors.clear();
+                }
+                "resolver" => changed.git_write.credential_resolver[0].push('x'),
+                "contract_faults" => changed.git_write.contract_faults = true,
+                "fault" => {
+                    changed.git_write.fault = Some("git.push:reply-lost-after-effect".to_string())
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(original, fingerprint(&changed), "changed {field}");
+        }
+        assert!(!original.contains("example-reference"));
+        assert_eq!(original, fingerprint(&base.clone()));
+    }
+
+    #[test]
+    fn config_id_separates_brain_read_policy_and_normalizes_reader_sets() {
+        let base = RuntimeConfig::no_embeddings();
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let mut configured = base.clone();
+        configured.brain.fleet_readers =
+            vec!["lambda:reader".to_string(), "lambda:auditor".to_string()];
+        let configured_id = fingerprint(&configured);
+        assert_ne!(configured_id, fingerprint(&base));
+        assert!(!configured_id.contains("lambda:reader"));
+        assert!(!configured_id.contains("lambda:auditor"));
+
+        let mut reordered = configured.clone();
+        reordered.brain.fleet_readers.reverse();
+        reordered
+            .brain
+            .fleet_readers
+            .push("lambda:reader".to_string());
+        assert_eq!(configured_id, fingerprint(&reordered));
+
+        let mut revoked = configured;
+        revoked.brain.fleet_readers.pop();
+        assert_ne!(configured_id, fingerprint(&revoked));
+        revoked.brain.fleet_readers.clear();
+        assert_eq!(fingerprint(&revoked), fingerprint(&base));
     }
 
     #[test]
@@ -6199,7 +7106,7 @@ mod tests {
             assert_eq!(serial_row["ok"], false);
             assert_eq!(serial_row["tool"], parallel_row["tool"]);
             assert_eq!(serial_row["error"], parallel_row["error"]);
-            assert!(serial_row["error"]
+            assert!(serial_row["error"]["message"]
                 .as_str()
                 .expect("conflict error")
                 .contains("writes overlap"));
@@ -6243,7 +7150,7 @@ mod tests {
         let first_serial_budget_error = serial_rows
             .iter()
             .position(|row| {
-                row["error"]
+                row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains("batch response budget"))
             })
@@ -6257,7 +7164,7 @@ mod tests {
             .all(|row| row["ok"] == json!(true)));
         assert!(serial_rows[first_serial_budget_error..].iter().all(|row| {
             row["ok"] == json!(false)
-                && row["error"]
+                && row["error"]["message"]
                     .as_str()
                     .is_some_and(|error| error.contains(&BATCH_RESPONSE_BUDGET_BYTES.to_string()))
         }));
@@ -6266,10 +7173,10 @@ mod tests {
             .as_array()
             .expect("parallel rows")
             .iter()
-            .find_map(|row| row["error"].as_str())
+            .find_map(|row| row["error"]["message"].as_str())
             .expect("parallel undispatched tail must use the same budget error");
         assert_eq!(
-            serial_rows[first_serial_budget_error]["error"],
+            serial_rows[first_serial_budget_error]["error"]["message"],
             json!(parallel_budget_error),
             "serial and default typed scheduling must single-source the budget/error contract"
         );
@@ -6377,7 +7284,9 @@ mod tests {
             .skip(10)
         {
             assert_eq!(entry["ok"], false);
-            let error = entry["error"].as_str().expect("budget error string");
+            let error = entry["error"]["message"]
+                .as_str()
+                .expect("budget error message");
             assert!(error.contains("batch response budget"));
             assert!(error.contains(&budget.to_string()));
         }
@@ -6395,6 +7304,7 @@ mod tests {
         let response = server
             .dispatch_request_inner(
                 RequestParams {
+                    plan: None,
                     ops: format!(
                         "[large_result(bytes={result_bytes}), large_result(bytes={result_bytes})]"
                     ),
@@ -6437,6 +7347,7 @@ mod tests {
         let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
         let response = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!("large_result(bytes={result_bytes})"),
                 presentation: None,
                 presentation_per_op: None,
@@ -6831,6 +7742,7 @@ mod tests {
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
+                note_versions: std::collections::HashMap::new(),
                 note_names: std::collections::HashMap::new(),
             }
         }
@@ -6904,6 +7816,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
 
@@ -6940,6 +7853,7 @@ mod tests {
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
         let captured = SearchCapturedLog::default();
@@ -7058,9 +7972,14 @@ mod tests {
         assert_eq!(omitted["ok"], json!(false));
         assert_eq!(
             omitted["error"],
-            json!(
-                "operation failed; error details omitted because the response frame budget was exceeded"
-            )
+            json!({
+                "kind": "response_frame_budget_exceeded",
+                "code": "response_frame_budget_exceeded",
+                "message": "operation failed; error details omitted because the response frame budget was exceeded",
+                "domain_disposition": "unknown",
+                "max_frame_bytes": khive_runtime::daemon::MAX_FRAME_BYTES,
+                "retryable": false
+            })
         );
     }
 
@@ -7151,7 +8070,7 @@ mod tests {
 
         assert_eq!(fitted["results"][0]["ok"], false);
         assert_eq!(fitted["results"][0]["reason"], "gate-refusal");
-        assert!(fitted["results"][0]["error"]
+        assert!(fitted["results"][0]["error"]["message"]
             .as_str()
             .is_some_and(|error| error.contains("frame budget was exceeded")));
         assert!(rendered_response_fits_daemon_frame(
@@ -7331,7 +8250,16 @@ mod tests {
             json!({"total": 3, "succeeded": 2, "failed": 1, "aborted": 0})
         );
         assert_eq!(fitted["status"], "partial");
-        assert_eq!(serialized_response_len(&fitted), 2_900_530);
+        assert_eq!(
+            fitted["results"][0]["error"]["domain_disposition"],
+            "committed"
+        );
+        // A3 adds this one field to the historic byte snapshot; omission
+        // selection, remaining payloads, and aggregate counts stay identical.
+        assert_eq!(
+            serialized_response_len(&fitted),
+            2_900_530 + r#","domain_disposition":"committed""#.len()
+        );
     }
 
     #[test]
@@ -7397,6 +8325,7 @@ mod tests {
             ok: true,
             result: Some(rendered),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some("test".to_string()),
@@ -8778,6 +9707,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "stats()".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -8922,6 +9852,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -8936,6 +9867,7 @@ mod tests {
         let resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -8966,6 +9898,7 @@ mod tests {
 
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9032,6 +9965,7 @@ mod tests {
 
         let baseline = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9046,7 +9980,9 @@ mod tests {
         fn assert_fallback_error(entry: &Value, tool: &str) {
             assert_eq!(entry["ok"], json!(false), "entry: {entry}");
             assert_eq!(entry["tool"], json!(tool), "entry: {entry}");
-            let msg = entry["error"].as_str().expect("error must be a string");
+            let msg = entry["error"]["message"]
+                .as_str()
+                .expect("error must carry its message");
             assert!(
                 msg.contains("KHIVE_DAEMON_STRICT"),
                 "error must name the strict mode that rejected the fallback: {msg}"
@@ -9065,6 +10001,7 @@ mod tests {
         let single_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
                     presentation: None,
                     presentation_per_op: None,
@@ -9093,6 +10030,7 @@ mod tests {
         let batch_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
                        comm.send(to=\"bob\", content=\"strict-batch-2\")]"
                         .to_string(),
@@ -9123,6 +10061,7 @@ mod tests {
         let chain_resp = server
             .request(
                 Parameters(RequestParams {
+                    plan: None,
                     ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
                       comm.send(to=\"bob\", content=\"strict-chain-2\")"
                         .to_string(),
@@ -9144,7 +10083,7 @@ mod tests {
         assert_fallback_error(&chain_results[0], "comm.send");
         assert_eq!(
             chain_results[1],
-            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+            json!({ "ok": false, "tool": "comm.send", "aborted": true, "domain_disposition":"not_committed" })
         );
         assert_eq!(
             chain["summary"],
@@ -9154,6 +10093,7 @@ mod tests {
         // ── no local dispatch ever happened for any of the three calls ─────
         let after = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9201,6 +10141,7 @@ mod tests {
 
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"search(kind="entity", query="a deliberately long keyword dense query whose terms cannot all match any entity in this empty corpus")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -9231,6 +10172,7 @@ mod tests {
         // guarantee (bounded-concurrency ops have no relative ordering).
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"kg-search-status\") \
                        | search(kind=\"entity\", query=\"kg-search-status\")"
                     .to_string(),
@@ -9284,6 +10226,158 @@ mod tests {
             visible_namespaces: ns.into_iter().map(str::to_string).collect(),
             process_ref: None,
             request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn scheduled_replay_reads_its_own_actor_namespace_and_never_the_daemons_visibility() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory replay runtime");
+        let server = KhiveMcpServer::new(runtime).expect("replay server");
+
+        for actor_id in [Some("lambda:scheduled-replay"), None] {
+            let verified_actor = actor_id
+                .map(|actor| khive_runtime::VerifiedActor::new(actor).expect("verified creator"));
+            let raw = server
+                .dispatch_request_replay_as(
+                    RequestParams {
+                        ops: "whoami()".to_string(),
+                        presentation: Some("verbose".to_string()),
+                        format: Some("json".to_string()),
+                        ..Default::default()
+                    },
+                    "local",
+                    verified_actor,
+                )
+                .await
+                .expect("scheduled replay dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("replay JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            let identity = &envelope["results"][0]["result"];
+            assert_eq!(identity["actor_id"], actor_id.unwrap_or("local"));
+            assert_eq!(
+                identity["actor_kind"],
+                if actor_id.is_some() {
+                    "actor"
+                } else {
+                    "anonymous"
+                }
+            );
+            assert_eq!(identity["unattributed"], actor_id.is_none());
+            assert_eq!(identity["namespace"], "local");
+            // A replay reads exactly what its verified actor reads on every
+            // other path: `local` plus the actor's own namespace (ADR-007 Rev 4
+            // Rule 3b, folded where the token is minted), and nothing from the
+            // daemon's configured visibility. An anonymous replay keeps `local`.
+            let expected = match actor_id {
+                Some(actor) => json!(["local", actor]),
+                None => json!(["local"]),
+            };
+            assert_eq!(
+                identity["visible_namespaces"],
+                expected,
+                "replay inherits its own actor namespace and never the daemon's visibility: {identity}"
+            );
+            assert!(
+                !identity["visible_namespaces"]
+                    .as_array()
+                    .map(|v| v.iter().any(|ns| ns == "daemon-visible"))
+                    .unwrap_or(true),
+                "daemon visibility leaked into a scheduled replay: {identity}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue_2427_coordinator_search_consumes_normalized_identity_visibility() {
+        use crate::coordinator::tests::MockCoordinator;
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            actor_id: Some("lambda:daemon".to_string()),
+            visible_namespaces: vec![Namespace::parse("daemon-visible").unwrap()],
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .expect("in-memory coordinator runtime");
+        let coordinator = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::new(runtime)
+            .expect("coordinator server")
+            .with_coordinator(Arc::clone(&coordinator) as Arc<dyn CoordinatorService>);
+
+        // Supply the boundary's normalized output directly; daemon-frame parsing
+        // and transport coverage belong to the daemon tests, not this fixture.
+        for (visible, explicit_namespace, mut expected) in [
+            (
+                vec!["lambda:request-actor", "client-visible"],
+                false,
+                vec!["lambda:request-actor", "client-visible", "local"],
+            ),
+            (vec![], false, vec!["local"]),
+            // A reconstructed token carrying an explicit list is consumed as
+            // given: the coordinator adds `local` and nothing else, so neither
+            // the request actor's own namespace nor the daemon's configured
+            // visibility is folded in behind the caller's back.
+            (
+                vec!["client-visible"],
+                false,
+                vec!["client-visible", "local"],
+            ),
+            (vec!["lambda:request-actor", "client-visible"], true, vec![]),
+        ] {
+            let mut identity = request_identity_with_visible_namespaces(visible);
+            identity.actor_id = Some("lambda:request-actor".to_string());
+            let ops = if explicit_namespace {
+                r#"search(kind="entity", query="visibility", namespace="chosen")"#
+            } else {
+                r#"search(kind="entity", query="visibility")"#
+            };
+            coordinator.search_called.store(false, Ordering::SeqCst);
+            let raw = server
+                .dispatch_request_inner(
+                    RequestParams {
+                        ops: ops.to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                    Some(identity),
+                    DispatchOrigin::Local,
+                )
+                .await
+                .expect("coordinator dispatch");
+            let envelope: Value = serde_json::from_str(&raw).expect("coordinator JSON envelope");
+            assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+            assert!(
+                coordinator.search_called.load(Ordering::SeqCst),
+                "search must reach the coordinator, not the single-backend registry"
+            );
+            let mut actual: Vec<String> = coordinator
+                .last_extra_visible
+                .lock()
+                .expect("captured coordinator visibility")
+                .iter()
+                .map(|namespace| namespace.as_str().to_string())
+                .collect();
+            actual.sort();
+            expected.sort();
+            assert_eq!(
+                actual, expected,
+                "coordinator must consume supplied visibility without widening internal identities"
+            );
         }
     }
 
@@ -9376,7 +10470,7 @@ mod tests {
             .expect("dispatch failures remain in the per-operation envelope");
         let response: Value = serde_json::from_str(&response).expect("response envelope");
         assert!(
-            response["results"][0]["error"]
+            response["results"][0]["error"]["message"]
                 .as_str()
                 .is_some_and(|error| error.contains("invalid namespace")),
             "unexpected error: {response}"
@@ -9393,6 +10487,7 @@ mod tests {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-1\"), \
                        create(kind=\"entity\", entity_kind=\"concept\", name=\"status-ok-2\")]"
                     .to_string(),
@@ -9420,6 +10515,7 @@ mod tests {
         // The second op targets an unknown kind and fails; the first succeeds.
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops:
                     "[create(kind=\"entity\", entity_kind=\"concept\", name=\"status-partial-1\"), \
                        search(kind=\"not_a_real_kind\", query=\"x\")]"
@@ -9450,6 +10546,7 @@ mod tests {
         let server = in_memory_kg_server();
         let resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "search(kind=\"not_a_real_kind\", query=\"x\") | \
                       create(kind=\"entity\", entity_kind=\"concept\", name=\"status-chain-aborted\")"
                     .to_string(),
@@ -10570,3 +11667,6 @@ mod request_read_cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod disposition_tests;

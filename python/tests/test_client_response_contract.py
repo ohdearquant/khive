@@ -10,6 +10,7 @@ import pytest
 from khive import BatchError, Khive, OperationError, Transport, op
 from khive.envelope import _validate_envelope_results
 from khive.errors import TransportError
+from khive.models import OpError
 
 NOTE_ID = "00000000-0000-4000-8000-000000000001"
 NEXT_ID = "00000000-0000-4000-8000-000000000002"
@@ -18,10 +19,12 @@ NEXT_ID = "00000000-0000-4000-8000-000000000002"
 class ResponseTransport(Transport):
     def __init__(self, results):
         self.results = results
+        self.dispatches = []
 
     def round_trip(self, frame, timeout):
         response = {"ok": True, "served_config_id": "test-config"}
         if not frame.get("metrics_only"):
+            self.dispatches.append(copy.deepcopy(frame))
             response["result"] = json.dumps({"results": self.results})
         return response
 
@@ -96,6 +99,84 @@ def test_explicit_offset_metadata_is_preserved(container):
     page = client_for([{"ok": True, "tool": "list", "result": payload}]).notes.list()
     assert page.total == 10 and page.next_offset == 7
     assert [item.id for item in page.items] == [NOTE_ID]
+
+
+def test_typed_note_create_forwards_key_but_never_assigns_version():
+    payload = {"id": NOTE_ID, "kind": "head", "key": "run/lease", "version": 1, "content": "{}"}
+    transport = ResponseTransport([{"ok": True, "tool": "create", "result": payload}])
+    db = Khive(transport=transport, actor_id="test-client")
+    note = db.notes.create(kind="head", subject="", content="{}", key="run/lease")
+    assert (note.key, note.version) == ("run/lease", 1)
+    assert len(transport.dispatches) == 1
+    args = json.loads(transport.dispatches[0]["ops"])[0]["args"]
+    assert args["key"] == "run/lease"
+    assert "version" not in args and "expected_version" not in args
+
+
+def test_typed_keyed_page_preserves_revision_and_opaque_cursor():
+    cursor = 'nk1:{"updated_at":42,"key":"run/lease","id":"' + NOTE_ID + '"}'
+    payload = {
+        "notes": [{**ROWS["notes"], "key": "run/lease", "version": 7}],
+        "next_after": cursor,
+    }
+    page = client_for([{"ok": True, "tool": "list", "result": payload}]).notes.list(
+        after="", key_prefix="run/"
+    )
+    assert page.items[0].key == "run/lease"
+    assert page.items[0].version == 7
+    assert page.next_after == cursor
+
+
+@pytest.mark.parametrize("embed", [False, True])
+def test_typed_note_create_preserves_fence_and_embedding_options(embed):
+    payload = {"id": NOTE_ID, "kind": "head", "content": "{}", "version": 1}
+    transport = ResponseTransport([{"ok": True, "tool": "create", "result": payload}])
+    db = Khive(transport=transport, actor_id="test-client")
+    fence = {"key": "run/lease", "kind": "head", "expected_version": 3}
+    db.notes.create(kind="head", subject="", content="{}", fence=fence, embed=embed)
+    args = json.loads(transport.dispatches[0]["ops"])[0]["args"]
+    assert args["fence"] == fence
+    assert args["embed"] is embed
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_typed_note_create_preserves_ordered_fence_list(count):
+    payload = {"id": NOTE_ID, "kind": "head", "content": "{}", "version": 1}
+    transport = ResponseTransport([{"ok": True, "tool": "create", "result": payload}])
+    db = Khive(transport=transport, actor_id="test-client")
+    fences = [{"key": f"lease/{i}", "kind": "head", "expected_version": i + 1}
+              for i in range(count)]
+    db.notes.create(kind="head", subject="", content="{}", fence=fences)
+    args = json.loads(transport.dispatches[0]["ops"])[0]["args"]
+    assert args["fence"] == fences
+    assert op("stream.append", stream="s", record=None, fence=fences)["args"]["fence"] == fences
+
+
+def test_indexed_fence_conflict_preserves_string_details():
+    details = {"reason": "fence_conflict", "key": "lease/second", "expected_version": "1",
+               "current_version": "2", "index": "1"}
+    db = client_for([{"ok": False, "tool": "stream.append", "error": {
+        "kind": "conflict", "message": "note fence precondition failed",
+        "domain_disposition": "not_committed", "details": details}}])
+    result = db.raw([op("stream.append", stream="s", record=None)])[0]
+    assert result.error.details == details
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"reason": "version_conflict", "expected_version": "1", "current_version": "2"},
+        {"reason": "fence_conflict", "key": "run/lease", "expected_version": "2"},
+        {"reason": "key_conflict", "key": "run/lease", "existing_id": NOTE_ID},
+        {"reason": "key_ambiguous", "key": "run/lease"},
+    ],
+)
+def test_note_conflict_details_remain_typed_strings(details):
+    error = {"kind": "conflict", "message": "note precondition failed", "details": details}
+    db = client_for([{"ok": False, "tool": "update", "error": error}])
+    result = db.raw([op("update", id=NOTE_ID, expected_version=1, content="{}")])[0]
+    assert isinstance(result.error, OpError)
+    assert result.error.details == details
 
 
 ERRORS = [
@@ -226,10 +307,14 @@ def test_live_three_note_cursor_walk(scratch_daemon):
     assert set(seen) == {note.id for note in created}
 
 
-def test_live_missing_id_keeps_string_error_and_index(scratch_daemon):
+def test_live_missing_id_keeps_structured_error_and_index(scratch_daemon):
     db = Khive(socket_path=str(scratch_daemon["socket"]), actor_id="test-client")
     with pytest.raises(BatchError) as raised:
         db.batch([op("stats"), op("get", id="00000000-0000-0000-0000-000000000000")])
     index, tool, error = raised.value.failures[0]
     assert (index, tool) == (1, "get")
-    assert isinstance(error, str) and error
+    assert isinstance(error, OpError)
+    assert "not found" in error.message
+    assert "00000000-0000-0000-0000-000000000000" in error.message
+    assert error.domain_disposition == "unknown"
+    assert "domain_result" not in error.model_fields_set

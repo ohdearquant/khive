@@ -164,6 +164,21 @@ fn warn_scan_fallback_once(table: &str) {
     });
 }
 
+fn validate_vector_model_key(model_key: &str) -> Result<(), SqliteError> {
+    if model_key.is_empty()
+        || !model_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(SqliteError::InvalidData(format!(
+            "invalid model_key '{}': must be non-empty and contain only \
+             alphanumeric/underscore characters",
+            model_key
+        )));
+    }
+    Ok(())
+}
+
 fn validate_vector_table_columns(
     conn: &rusqlite::Connection,
     table: &str,
@@ -562,6 +577,20 @@ impl StorageBackend {
         )))
     }
 
+    fn constructor_writer(&self) -> Result<crate::pool::WriterGuard<'_>, SqliteError> {
+        let context = khive_storage::capture_request_read_context();
+        let Some(operation) = context.store_acquisition_operation() else {
+            return self.pool.try_writer();
+        };
+        self.pool
+            .writer_until(|| context.blocking_stop_reason().is_some())?
+            .ok_or_else(|| {
+                SqliteError::RequestReadStopped(khive_storage::StorageError::Timeout {
+                    operation: operation.into(),
+                })
+            })
+    }
+
     /// Get a NoteStore. Applies the notes DDL if not already present.
     ///
     /// Idempotent — safe to call multiple times.
@@ -582,7 +611,7 @@ impl StorageBackend {
             ));
         }
         if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
+            let writer = self.constructor_writer()?;
             note::ensure_notes_schema(writer.conn())?;
 
             // The anti-join repair is a full `notes` scan -- gate it to run at
@@ -630,7 +659,7 @@ impl StorageBackend {
             ));
         }
         if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
+            let writer = self.constructor_writer()?;
             event::ensure_events_schema(writer.conn())?;
         }
 
@@ -687,68 +716,69 @@ impl StorageBackend {
         dimensions: usize,
         namespace: &str,
     ) -> Result<Arc<dyn khive_storage::VectorStore>, SqliteError> {
-        if model_key.is_empty()
-            || !model_key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(SqliteError::InvalidData(format!(
-                "invalid model_key '{}': must be non-empty and contain only \
-                 alphanumeric/underscore characters",
-                model_key
-            )));
-        }
+        validate_vector_model_key(model_key)?;
         if namespace.trim().is_empty() {
             return Err(SqliteError::InvalidData(
                 "vector store namespace must be non-empty".to_string(),
             ));
         }
+        self.ensure_vector_tables(&[(model_key, dimensions)])?;
+        Ok(Arc::new(vectors::SqliteVecStore::new(
+            Arc::clone(&self.pool),
+            self.is_file_backed,
+            model_key.to_string(),
+            embedding_model.to_string(),
+            dimensions,
+            namespace.trim().to_string(),
+        )?))
+    }
+
+    /// Ensure all requested vector tables with one schema-writer acquisition.
+    /// Read-only backends inspect the same tables using one reader instead.
+    pub fn ensure_vector_tables(&self, models: &[(&str, usize)]) -> Result<(), SqliteError> {
+        for (model_key, _) in models {
+            validate_vector_model_key(model_key)?;
+        }
+        if models.is_empty() {
+            return Ok(());
+        }
 
         // Ensure sqlite-vec is registered before creating vec0 tables.
         crate::extension::ensure_extensions_loaded();
-
-        let table = format!("vec_{}", model_key);
 
         if self.is_read_only() {
             // Snapshot inspection must not check schema through the pool's
             // query-only writer slot: even a SELECT there is a writer-class
             // acquisition and violates ADR-028 A2's write-free lifecycle.
             let reader = self.pool.reader()?;
-            if !sqlite_table_exists(reader.conn(), &table)? {
-                return Err(SqliteError::InvalidData(format!(
-                    "read-only database has no vector table '{table}'; create and populate it in \
-                     a writable copy before opening the snapshot"
-                )));
+            for (model_key, _) in models {
+                let table = format!("vec_{model_key}");
+                if !sqlite_table_exists(reader.conn(), &table)? {
+                    return Err(SqliteError::InvalidData(format!(
+                        "read-only database has no vector table '{table}'; create and populate it in \
+                         a writable copy before opening the snapshot"
+                    )));
+                }
+                validate_vector_table_columns(reader.conn(), &table)?;
             }
-            validate_vector_table_columns(reader.conn(), &table)?;
-            drop(reader);
-            return Ok(Arc::new(vectors::SqliteVecStore::new(
-                Arc::clone(&self.pool),
-                self.is_file_backed,
-                model_key.to_string(),
-                embedding_model.to_string(),
-                dimensions,
-                namespace.trim().to_string(),
-            )?));
+            return Ok(());
         }
 
-        let writer = self.pool.try_writer()?;
+        let writer = self.constructor_writer()?;
 
         // Detect old-schema vec0 tables that predate the `field` column.
-        // vec0 virtual tables do not support ALTER TABLE, so we must drop and recreate
-        // the table if it exists without the `field` column. Vector data is a cache —
-        // callers can re-embed from the source record after the table is rebuilt.
         // Use pragma_table_info to check columns directly; substring matching on the
         // CREATE DDL is fragile (a model_key containing "field" would false-match).
-        let table_exists = sqlite_table_exists(writer.conn(), &table)?;
-
-        if table_exists {
+        for (model_key, _) in models {
+            let table = format!("vec_{model_key}");
             // V17 migration (vector_embedding_model_tag_preserving_rebuild) adds
             // `field` and `embedding_model` to all pre-existing vec0 tables at
             // migration time.  If this table still lacks either column post-migration
             // that indicates the database was not migrated — return a hard error
             // rather than silently dropping data.
-            validate_vector_table_columns(writer.conn(), &table)?;
+            if sqlite_table_exists(writer.conn(), &table)? {
+                validate_vector_table_columns(writer.conn(), &table)?;
+            }
         }
 
         // Ensure the _embedding_models registry table exists.
@@ -776,29 +806,22 @@ impl StorageBackend {
             .conn()
             .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
 
-        // Create the vec0 virtual table. Idempotent on fresh databases and after the
-        // old-schema rebuild above.
-        let ddl = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
-             subject_id TEXT PRIMARY KEY, \
-             namespace TEXT NOT NULL, \
-             kind TEXT NOT NULL, \
-             field TEXT NOT NULL, \
-             embedding_model TEXT NOT NULL, \
-             embedding float[{}] distance_metric=cosine\
-             )",
-            model_key, dimensions
-        );
-        writer.conn().execute_batch(&ddl)?;
-
-        Ok(Arc::new(vectors::SqliteVecStore::new(
-            Arc::clone(&self.pool),
-            self.is_file_backed,
-            model_key.to_string(),
-            embedding_model.to_string(),
-            dimensions,
-            namespace.trim().to_string(),
-        )?))
+        // Create missing vec0 tables without changing existing vector data.
+        for (model_key, dimensions) in models {
+            let ddl = format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+                 subject_id TEXT PRIMARY KEY, \
+                 namespace TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 field TEXT NOT NULL, \
+                 embedding_model TEXT NOT NULL, \
+                 embedding float[{}] distance_metric=cosine\
+                 )",
+                model_key, dimensions
+            );
+            writer.conn().execute_batch(&ddl)?;
+        }
+        Ok(())
     }
 
     /// Register an embedding model in the `_embedding_models` registry table.
@@ -1122,6 +1145,63 @@ mod tests {
     use super::*;
     use khive_storage::types::{EdgeFilter, SqlStatement, SqlValue};
     use khive_storage::{EntityFilter, EventFilter};
+
+    #[tokio::test]
+    async fn ordinary_store_accessors_ignore_request_read_cancellation() {
+        let backend = StorageBackend::memory().unwrap();
+        let (_sender, receiver) = tokio::sync::watch::channel(true);
+        khive_storage::scope_request_read_cancellation(receiver, async {
+            backend.notes().expect("ordinary notes accessor");
+            backend.events().expect("ordinary events accessor");
+            #[cfg(feature = "vectors")]
+            backend
+                .vectors("ordinary_store", "ordinary-store", 8)
+                .expect("ordinary vectors accessor");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admitted_store_constructor_finishes_ddl_after_cancellation() {
+        let backend = StorageBackend::memory().unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let writer = backend.pool.writer().unwrap();
+            let fired = fired.clone();
+            writer
+                .conn()
+                .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
+                    fired.store(true, Ordering::SeqCst);
+                    sender.send_replace(true);
+                    rusqlite::hooks::Authorization::Allow
+                }))
+                .unwrap();
+        }
+        let result = khive_storage::scope_request_read_cancellation(receiver, async {
+            khive_storage::capture_request_read_context()
+                .scope_store_acquisition("admitted_notes_store", || backend.notes())
+        })
+        .await;
+        let writer = backend.pool.writer().unwrap();
+        writer
+            .conn()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        result.expect("request cancellation must not interrupt admitted constructor DDL");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "cancellation must fire inside actual SQLite work"
+        );
+        assert_eq!(
+            backend.notes_seq_repair_run_count(),
+            1,
+            "constructor must finish schema repair"
+        );
+        assert!(sqlite_table_exists(writer.conn(), "notes_seq").unwrap());
+    }
 
     #[cfg(unix)]
     use khive_storage::test_support::freeze_snapshot_sidecars;

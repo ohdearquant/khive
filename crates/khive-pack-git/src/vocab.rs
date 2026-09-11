@@ -39,7 +39,10 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
 
 /// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
 /// crates/khive-pack-git/docs/api/vocab.md#git_schema_plan_stmts.
-pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
+pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 5] = [
+    crate::receipts::RECEIPTS_TABLE_SQL,
+    crate::receipts::RECEIPTS_ACTOR_INDEX_SQL,
+    crate::receipts::RECEIPTS_SESSION_INDEX_SQL,
     "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
         project_id   TEXT NOT NULL,\
         kind         TEXT NOT NULL,\
@@ -74,7 +77,37 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 16] = [
+    crate::local_vocab::INIT,
+    crate::local_vocab::CHECKOUT,
+    crate::local_vocab::DIFF,
+    crate::local_vocab::RECEIPTS,
+    crate::local_vocab::GATES,
+    crate::local_vocab::RECONCILE,
+    crate::local_vocab::STATUS,
+    crate::local_vocab::LOG,
+    HandlerDef {
+        name: "git.ingest_cursor",
+        description: "Read the stored ingest cursor and checkpoint for a project and source kind in one snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor writes.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "project",
+                param_type: "uuid",
+                required: true,
+                description: "Full UUID of the live project anchor. Canonical get authorization applies with the caller's identity; by-ID reads are namespace-agnostic.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
+            },
+            ParamDef {
+                name: "source_kind",
+                param_type: "string",
+                required: true,
+                description: "One of commits, issues, pull_requests. Commits use a SHA cursor; issues and pull_requests use timestamp cursors with page checkpoints.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     HandlerDef {
         name: "git.digest",
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
@@ -128,12 +161,14 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "git.commit",
-        description: "Stage and commit against a local git repo (ADR-108). Shells to system git \
-                       with hardened, allowlisted argv construction — no shell interpolation. \
-                       Returns the resulting commit SHA.",
+        description: "Commit a complete tree manifest with actor identity and an atomic expected-head compare, or use the legacy paths form. Tree commits require the tool pack and actor mapping, preserve the index/worktree, and return receipt_id with the SHA. Paths retain their legacy behavior.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            crate::local_vocab::BRANCH,
+            crate::local_vocab::TREE,
+            crate::local_vocab::EXPECTED_HEAD,
+            crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",
                 param_type: "string",
@@ -169,11 +204,12 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "git.branch",
-        description: "Create a branch in a local git repo, optionally from a named ref or SHA \
-                       (ADR-108).",
+        description: "Create a branch from a ref or SHA (default HEAD) using a create-only atomic ref compare. Existing and symbolic target refs refuse. Requires the tool pack; returns legacy keys plus ref, sha and receipt_id.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
+            crate::local_vocab::EXPECTED,
+            crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",
                 param_type: "string",
@@ -198,45 +234,8 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
             },
         ],
     },
-    HandlerDef {
-        name: "git.push",
-        description: "Push a branch to a remote (ADR-108). Force-push is always denied — no \
-                       policy or argument combination can authorize it through this verb.",
-        visibility: Visibility::Verb,
-        category: VerbCategory::Commissive,
-        params: &[
-            ParamDef {
-                name: "repo",
-                param_type: "string",
-                required: true,
-                description: "Absolute local path to a git repository (must contain a .git \
-                               entry).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "branch",
-                param_type: "string",
-                required: true,
-                description: "Branch to push.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "remote",
-                param_type: "string",
-                required: false,
-                description: "Remote to push to (default: origin).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "force",
-                param_type: "bool",
-                required: false,
-                description: "Always rejected when true — force-push is never permitted through \
-                               this verb (ADR-108 hard rule 1). Present only so a caller's \
-                               explicit force=true request fails loudly rather than being \
-                               silently ignored.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-        ],
-    },
+    crate::remote_vocab::PUSH,
+    crate::remote_vocab::PR_OPEN,
+    crate::remote_vocab::PR_REVIEW,
+    crate::remote_vocab::PR_MERGE,
 ];

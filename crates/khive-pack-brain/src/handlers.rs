@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
     micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeError, VerbRegistry,
+    NamespaceToken, RuntimeError, VerbRegistry, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
@@ -106,7 +106,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             the live event plane: rows appended while the call paginates may be excluded; \
             bound `until` in the past for a closed population. Exhaustive windows matching more than \
             2,000,000 events are rejected rather than returned as partial aggregates; narrow \
-            since/until or add actor/kind filters.",
+            since/until or add actor/kind filters. Scope defaults to the caller; named foreign \
+            actors must be visible, and all_actors=true requires the serving brain.fleet_readers allowlist.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -128,10 +129,19 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Filter to a single actor. Stored actor strings are prefixed \
-                    (e.g. \"actor:lambda:khive\"); pass either the bare seat form \
-                    (\"lambda:khive\") or the stored prefixed form — both match. Omit for all \
-                    actors.",
+                description: "Defaults to the caller; a named foreign actor must be visible to the caller. \
+                    Ordinary actor ids match actor: plus the unchanged id; a historical bare alias also \
+                    matches only when the id has no reserved runtime kind prefix (actor:, anonymous:, agent:). \
+                    An explicit reserved-prefix value matches exactly and checks structural caller identity; \
+                    visibility uses the id after one actor: prefix, otherwise the unchanged label. Default-scoped \
+                    counts use one caller-label key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "all_actors",
+                param_type: "boolean",
+                required: false,
+                description: "Default false; true reads all actors only when the caller's actor id is in the serving brain.fleet_readers config and cannot be combined with actor.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -185,7 +195,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.resolve",
-        description: "Show which profile would serve a caller context",
+        description: "Show which profile would serve the caller; a named foreign actor must be visible to the caller.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -200,7 +210,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Caller actor identifier. Defaults to the caller's dispatch identity; anonymous callers match only wildcard bindings. Pass explicitly to query another identity.",
+                description: "Defaults to the caller's dispatch identity; a named foreign actor must be visible to the caller, and omitted anonymous actors match only wildcard bindings.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -344,7 +354,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects retained as candidate context. No result is credited by rank position.",
+                description: "Recall result objects retained as candidate context: an array of objects, each with an id field (the result UUID or compact id) and optionally served_by_profile_id; bare id strings are rejected. No result is credited by rank position.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -547,7 +557,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.bindings",
-        description: "List rows in the profile resolution table, optionally filtered",
+        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -562,7 +572,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by actor.",
+                description: "Defaults to the caller's actor label; a named foreign actor must be visible to the caller.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -887,6 +897,32 @@ impl BrainPack {
         }
     }
 
+    fn caller_actor_label(token: &NamespaceToken) -> String {
+        let actor = token.actor();
+        if actor.kind == "actor" {
+            actor.id.clone()
+        } else {
+            format!("{}:{}", actor.kind, actor.id)
+        }
+    }
+
+    fn split_stamped_actor_label(label: &str) -> Option<(&str, &str)> {
+        label
+            .split_once(':')
+            .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
+    }
+
+    fn check_read_actor(token: &NamespaceToken, actor: &str) -> Result<(), RuntimeError> {
+        if actor != Self::caller_actor_label(token)
+            && !token.visible_namespace_strs().contains(&actor)
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "actor {actor:?} is not visible to this caller"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_event_counts(
         &self,
         token: &NamespaceToken,
@@ -896,6 +932,7 @@ impl BrainPack {
         #[serde(deny_unknown_fields)]
         struct EventCountsParams {
             actor: Option<String>,
+            all_actors: Option<bool>,
             kind: Option<String>,
             // `Option`, not a required `String`: a bare-missing `since` must go through
             // the same named-field-plus-example-format error as a malformed one, not
@@ -912,6 +949,42 @@ impl BrainPack {
         }
         let p: EventCountsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let all_actors = p.all_actors.unwrap_or(false);
+        if all_actors && p.actor.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "all_actors=true cannot be combined with actor".into(),
+            ));
+        }
+        if all_actors
+            && !self
+                .runtime
+                .config()
+                .brain
+                .fleet_readers
+                .contains(&token.actor().id)
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "actor {:?} is not a configured fleet reader",
+                token.actor().id
+            )));
+        }
+        let caller = Self::caller_actor_label(token);
+        if let Some(actor) = p.actor.as_deref() {
+            let (identity, is_self) = match Self::split_stamped_actor_label(actor) {
+                Some((kind, id)) => (
+                    if kind == "actor" { id } else { actor },
+                    token.actor().kind == kind && token.actor().id == id,
+                ),
+                None => (actor, actor == caller),
+            };
+            if !is_self && !token.visible_namespace_strs().contains(&identity) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "actor {identity:?} is not visible to this caller"
+                )));
+            }
+        }
+        let default_scope = !all_actors && p.actor.is_none();
 
         let since_raw = p.since.as_deref().ok_or_else(|| {
             RuntimeError::InvalidInput(
@@ -935,15 +1008,21 @@ impl BrainPack {
             None => None,
         };
 
-        // Stored actor strings are prefixed (`actor:<kind>:<id>`). Callers naturally pass the
-        // bare seat form (e.g. "lambda:khive"), which would silently match nothing against an
-        // exact-match filter. Match either spelling by expanding the filter to both forms —
-        // `EventFilter.actors` is an IN-list, so this is a pure OR, never a guess. A caller who
-        // already passes the stored `actor:`-prefixed form keeps exact-match behavior.
+        // A prefixed id has no bare alias: that spelling belongs to another
+        // principal's canonical events. Only default scope coalesces actor keys.
         let actor_filters: Vec<String> = match p.actor.as_deref() {
-            Some(a) if a.starts_with("actor:") => vec![a.to_string()],
+            Some(a) if Self::split_stamped_actor_label(a).is_some() => vec![a.to_string()],
             Some(a) => vec![a.to_string(), format!("actor:{a}")],
-            None => Vec::new(),
+            None if all_actors => Vec::new(),
+            None if token.actor().kind == "actor"
+                && Self::split_stamped_actor_label(&caller).is_some() =>
+            {
+                vec![format!("actor:{caller}")]
+            }
+            None if token.actor().kind == "actor" => {
+                vec![caller.clone(), format!("actor:{caller}")]
+            }
+            None => vec![caller.clone()],
         };
 
         let store = self.runtime.events(token)?;
@@ -1009,7 +1088,8 @@ impl BrainPack {
             *counts_by_kind
                 .entry(event.kind.name().to_string())
                 .or_insert(0) += 1;
-            *counts_by_actor.entry(event.actor.clone()).or_insert(0) += 1;
+            let actor_key = if default_scope { &caller } else { &event.actor };
+            *counts_by_actor.entry(actor_key.clone()).or_insert(0) += 1;
             *counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
             if event.kind == khive_types::EventKind::FeedbackExplicit {
                 let originating_verb = event
@@ -1222,14 +1302,15 @@ impl BrainPack {
         let p: ResolveParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        // #741: an omitted `actor` defaults to the caller's dispatch identity so
-        // this introspection verb reports what the serve path (#708) actually
-        // does. Anonymous callers stay `None` and match only wildcard bindings;
-        // an explicit `actor` param wins so evaluation tooling can query other
-        // identities.
+        let caller = Self::caller_actor_label(token);
+        // Anonymous omission must retain the serve path's wildcard-only resolution.
         let actor = match p.actor.as_deref() {
-            Some(a) => Some(a),
-            None => token.actor().binding_id(),
+            Some(a) => {
+                Self::check_read_actor(token, a)?;
+                Some(a)
+            }
+            None if token.actor().is_anonymous() => None,
+            None => Some(caller.as_str()),
         };
 
         let state = self.state.lock().unwrap();
@@ -2510,7 +2591,11 @@ impl BrainPack {
 
     // ── brain.bindings ────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_bindings(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_bindings(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Inspection verb — list binding rows, optionally filtered.
         #[derive(Deserialize)]
         struct BindingsParams {
@@ -2522,13 +2607,17 @@ impl BrainPack {
         let p: BindingsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
+        let caller = Self::caller_actor_label(token);
+        let actor = p.actor.as_deref().unwrap_or(&caller);
+        Self::check_read_actor(token, actor)?;
+
         let state = self.state.lock().unwrap();
         let rows: Vec<Value> = state
             .bindings
             .iter()
             .filter(|b| {
                 p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id)
-                    && p.actor.as_ref().is_none_or(|a| &b.actor == a)
+                    && b.actor == actor
                     && p.namespace.as_ref().is_none_or(|n| &b.namespace == n)
                     && p.consumer_kind
                         .as_ref()
@@ -3403,7 +3492,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,
             "brain.resolve" => self.handle_resolve(token, params).await,
-            "brain.bindings" => self.handle_bindings(params).await,
+            "brain.bindings" => self.handle_bindings(token, params).await,
             // Commissive
             "brain.activate" => self.handle_activate(token, params).await,
             "brain.deactivate" => self.handle_deactivate(token, params).await,

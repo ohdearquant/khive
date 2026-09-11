@@ -5093,6 +5093,8 @@ mod tests {
 
         let texts = Arc::new(Mutex::new(Vec::new()));
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -5108,6 +5110,7 @@ mod tests {
             visible_namespaces: Vec::new(),
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         runtime.register_embedder(RecordingProvider {
@@ -5268,6 +5271,8 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(RoleAwareRecordingCalls::default()));
         let fail_query = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -5283,6 +5288,7 @@ mod tests {
             visible_namespaces: Vec::new(),
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         runtime.register_embedder(RoleAwareRecordingProvider {

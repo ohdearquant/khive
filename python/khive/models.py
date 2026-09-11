@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -85,6 +85,8 @@ class Note(_Record):
     kind: str = "observation"
     subject: str
     content: str
+    key: str | None = None
+    version: int = Field(default=1, ge=1)
 
     @field_validator("kind", mode="before")
     def _validate_kind(cls, v: Any) -> str:
@@ -196,6 +198,15 @@ class OpError(BaseModel):
     scope: str | None = None
     retry_after_ms: int | None = None
     details: dict[str, str] | None = None
+    domain_disposition: Literal["committed", "not_committed", "unknown"] | None = None
+    domain_result: Any = None
+
+    @field_validator("domain_disposition", mode="before")
+    @classmethod
+    def _non_null_disposition(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("domain_disposition must name a domain outcome when present")
+        return value
 
     def __str__(self) -> str:
         return f"{self.code}: {self.message}" if self.code else self.message
@@ -210,3 +221,115 @@ class OpResult(BaseModel):
     tool: str
     result: Any = None
     error: OpError | str | None = None
+    domain_disposition: Literal["committed", "not_committed", "unknown"] | None = None
+
+    @field_validator("domain_disposition", mode="before")
+    @classmethod
+    def _non_null_disposition(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("domain_disposition must name a domain outcome when present")
+        return value
+
+
+class RecallHit(BaseModel):
+    """One `memory.recall` row, as the server stamps it.
+
+    `degraded` is the server's per-row marker (`"ann_unavailable"`) on a
+    non-empty degraded response; `truncated` is the per-row marker on a
+    non-empty budget-capped response. Both stay optional so a clean row
+    decodes to a different value from a stamped one.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    score: float
+    rank_score: float | None = None
+    raw_score: float | None = None
+    content: str | None = None
+    salience: float | None = None
+    decay_factor: float | None = None
+    memory_type: str | None = None
+    created_at: datetime | None = None
+    source_id: str | None = None
+    degraded: str | None = None
+    degraded_reason: str | None = None
+    truncated: bool | None = None
+    served_by_profile_id: str | None = None
+    serve_attribution: Any = None
+    breakdown: Any = None
+
+    @property
+    def is_degraded(self) -> bool:
+        return self.degraded is not None
+
+    @property
+    def is_truncated(self) -> bool:
+        return self.truncated is True
+
+
+class RecallOutcome(BaseModel):
+    """The typed outcome of one `memory.recall`, preserving its envelope class.
+
+    The server answers a non-empty recall with a bare array of rows and
+    stamps degradation and truncation on each row. It changes shape only
+    when the response is empty for a reason a bare `[]` could not carry:
+    `{"results": [], "degraded": true, "degraded_reason": ...}`,
+    `{"results": [], "truncated": true}`, or both. `from_result` reads either
+    shape into one value: `hits` are the typed rows, `degraded` and
+    `truncated` are true when either the envelope or any row says so, and
+    `enveloped` records whether the server used the object shape. A clean
+    empty recall is `hits=[]`, both flags false, `enveloped=False`.
+    """
+
+    hits: list[RecallHit] = Field(default_factory=list)
+    degraded: bool = False
+    truncated: bool = False
+    degraded_reason: str | None = None
+    enveloped: bool = False
+
+    @property
+    def envelope_class(self) -> str:
+        """One of the response classes the server distinguishes, as a label."""
+        flags = []
+        if self.degraded:
+            flags.append("degraded")
+        if self.truncated:
+            flags.append("truncated")
+        base = "empty" if not self.hits else "rows"
+        return "_".join([*flags, base]) if flags else f"clean_{base}"
+
+    @classmethod
+    def from_result(cls, result: Any) -> RecallOutcome:
+        """Build from an `OpResult.result` of `memory.recall` without dropping its shape."""
+        if isinstance(result, list):
+            rows = result
+            enveloped = False
+            envelope: dict[str, Any] = {}
+        elif isinstance(result, dict) and isinstance(result.get("results"), list):
+            rows = result["results"]
+            enveloped = True
+            envelope = result
+        else:
+            raise TypeError(
+                "memory.recall result is neither a row array nor a results envelope: "
+                f"{str(result)[:200]}"
+            )
+        for key in ("degraded", "truncated"):
+            if key in envelope and type(envelope[key]) is not bool:
+                raise ValueError(f"memory.recall envelope field {key!r} must be a boolean")
+        hits = [RecallHit.model_validate(row) for row in rows]
+        degraded = envelope.get("degraded") is True or any(hit.is_degraded for hit in hits)
+        truncated = envelope.get("truncated") is True or any(hit.is_truncated for hit in hits)
+        reason = envelope.get("degraded_reason")
+        if reason is None:
+            reason = next((hit.degraded_reason for hit in hits if hit.degraded_reason), None)
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("memory.recall degraded_reason must be a string")
+        return cls(
+            hits=hits,
+            degraded=degraded,
+            truncated=truncated,
+            degraded_reason=reason,
+            enveloped=enveloped,
+        )

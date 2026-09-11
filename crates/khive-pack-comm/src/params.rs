@@ -12,6 +12,8 @@ pub(crate) struct SendParams {
     pub to: String,
     pub content: String,
     #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
@@ -35,6 +37,12 @@ pub(crate) struct DeliveredParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
     /// `"inbox"` (default) or `"sent"`.
@@ -104,6 +112,8 @@ pub(crate) struct UnreadParams {}
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Structured provenance tags, persisted verbatim to `properties["tags"]` on
     /// both the outbound and inbound copies of the reply (issue #495).
     #[serde(default)]

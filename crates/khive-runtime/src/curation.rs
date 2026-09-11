@@ -490,6 +490,7 @@ pub struct NotePatch {
     pub decay_factor: Option<Option<f64>>,
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
+    pub write_options: crate::note_write::NoteWriteOptions,
 }
 
 impl NotePatch {
@@ -509,7 +510,13 @@ impl NotePatch {
             decay_factor,
             properties,
             kind_status: None,
+            write_options: Default::default(),
         }
+    }
+
+    pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
+        self.write_options = options;
+        self
     }
 }
 
@@ -1419,11 +1426,20 @@ impl KhiveRuntime {
         note: &khive_storage::note::Note,
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
-        self.text_for_notes(token)?
-            .upsert_document(note_fts_document(note))
-            .await?;
-
-        let ns = note.namespace.clone();
+        let statements = khive_db::stores::text::delete_document_statements(
+            "fts_notes",
+            &note.namespace,
+            note.id,
+        )
+        .into_iter()
+        .chain(khive_db::stores::text::insert_document_statements(
+            "fts_notes",
+            &note_fts_document(note),
+        ))
+        .collect();
+        if !self.apply_note_index_revision(note, statements).await? {
+            return Ok(crate::retrieval::EmbeddingTruncationReport::default());
+        }
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
             match self
@@ -1437,17 +1453,25 @@ impl KhiveRuntime {
                 Ok(outcome) => {
                     report.observe(&outcome);
                     match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => {
-                            if let Err(e) = vs
-                                .insert(
-                                    note.id,
-                                    SubstrateKind::Note,
-                                    &ns,
-                                    "note.content",
-                                    vec![outcome.vector],
-                                )
-                                .await
-                            {
+                        Ok(_) => {
+                            if outcome.vector.iter().any(|value| !value.is_finite()) {
+                                tracing::warn!(model = model_name, id = %note.id, "reindex_note: non-finite vector, skipping model");
+                                continue;
+                            }
+                            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
+                            let statements = crate::atomic_message::vector_insert_statements(
+                                &table,
+                                &note.namespace,
+                                note.id,
+                                "note.content",
+                                model_name,
+                                &outcome.vector,
+                                "note-reindex",
+                            )
+                            .into_iter()
+                            .map(|planned| planned.statement)
+                            .collect();
+                            if let Err(e) = self.apply_note_index_revision(note, statements).await {
                                 tracing::warn!(
                                     model = model_name,
                                     id = %note.id,
@@ -1486,6 +1510,11 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+        if patch.content.is_some() || patch.properties.is_some() {
+            if let Some(error) = self.stream_member_error(&note).await? {
+                return Err(error);
+            }
+        }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
@@ -1671,40 +1700,41 @@ impl KhiveRuntime {
         khive_storage::note::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
-        let expected_updated_at = snapshot.updated_at;
-        let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
-        let store = self.notes(token)?;
-        let current = store
-            .get_note(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
-        if current != snapshot {
-            return Err(stale_note_snapshot_error(id));
-        }
-        let (note, text_changed) = self
-            .prepare_update_note_from_snapshot(token, snapshot, patch)
+        let (note, plan) = self
+            .prepare_versioned_note_update(token, snapshot, patch)
             .await?;
-
-        let persisted = store
-            .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
-        if !persisted {
-            return Err(stale_note_snapshot_error(id));
-        }
-
-        let embedding_report = if text_changed {
-            let report = self.reindex_note(token, &note).await?;
-            // Notify any pack-owned vector cache (e.g. a warm ANN index) that this
-            // note's embedding changed, via a generic hook so khive-runtime/pack-kg
-            // never take a dependency on the consuming pack. No-op if unregistered.
-            self.fire_note_mutation_hook(&note.kind, note.id).await;
-            report
-        } else {
-            crate::retrieval::EmbeddingTruncationReport::default()
+        use crate::atomic_runner::{
+            run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
         };
-
-        Ok((note, embedding_report))
+        match run_atomic_unit(self.sql().as_ref(), vec![AtomicOpPlan::Update(plan)]).await {
+            Ok(AtomicRunOutcome::Committed { post_commit }) => {
+                let outcomes = crate::atomic_prepare::apply_post_commit_effects_with_report(
+                    self,
+                    token,
+                    post_commit,
+                )
+                .await?;
+                let report = outcomes
+                    .into_iter()
+                    .next()
+                    .map(|outcome| outcome.truncation)
+                    .unwrap_or_default();
+                Ok((note, report))
+            }
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::NoteConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::GuardFailed { .. },
+                ..
+            }) => Err(stale_note_snapshot_error(id)),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                format!("note update rolled back: {failure:?}"),
+            )),
+            Err(error) => Err(RuntimeError::Storage(error.0)),
+        }
     }
 
     /// Claim `external_id` on an outbound `message` note through the
@@ -2179,6 +2209,13 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
         Self::ensure_namespace(&from_note.namespace, &ns)?;
 
+        if !dry_run {
+            for note in [&into_note, &from_note] {
+                if let Some(error) = self.stream_member_error(note).await? {
+                    return Err(error);
+                }
+            }
+        }
         reject_pack_managed_schedule_mutation(&into_note, "merge")?;
         reject_pack_managed_schedule_mutation(&from_note, "merge")?;
 
@@ -3124,7 +3161,7 @@ fn read_merge_note(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-         expires_at, properties, created_at, updated_at, deleted_at \
+         expires_at, properties, created_at, updated_at, deleted_at, key, version \
          FROM notes WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -3145,6 +3182,8 @@ fn read_merge_note(
     let created_at: i64 = row.get(10)?;
     let updated_at: i64 = row.get(11)?;
     let deleted_at: Option<i64> = row.get(12)?;
+    let key: Option<String> = row.get(13)?;
+    let version: i64 = row.get(14)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -3171,6 +3210,8 @@ fn read_merge_note(
         created_at,
         updated_at,
         deleted_at,
+        key,
+        version,
     })
 }
 
@@ -3599,6 +3640,7 @@ fn merge_note_sql(
                 into_note.created_at,
                 now,
                 into_note.deleted_at,
+                &into_note.key,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -3695,6 +3737,12 @@ fn merge_note_sql(
         created_at: into_note.created_at,
         updated_at: now,
         deleted_at: into_note.deleted_at,
+        key: into_note.key.clone(),
+        version: conn.query_row(
+            "SELECT version FROM notes WHERE id = ?1",
+            [&into_str],
+            |row| row.get(0),
+        )?,
     };
 
     Ok((
@@ -7986,6 +8034,63 @@ mod tests {
             from_store.get_note(from_id).await.unwrap().is_none(),
             "merged-from note should be soft-deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn merge_note_preserves_the_kept_memory_key() {
+        use crate::keyed_memory::{create_keyed_memory, KeyedMemorySpec};
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let (into, _) = create_keyed_memory(
+            &rt,
+            &tok,
+            KeyedMemorySpec {
+                content: "Into keyed memory",
+                key: "kept-memory-key",
+                salience: 0.7,
+                decay_factor: 0.0,
+                properties: serde_json::json!({}),
+                source_id: None,
+                embedding_model: None,
+            },
+        )
+        .await
+        .unwrap();
+        let from = rt
+            .create_note(&tok, "memory", None, "From memory", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .expect("merge binds every stored note field");
+        assert_eq!(summary.kept_id, into.id);
+        let stored = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(into.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.key.as_deref(), Some("kept-memory-key"));
+        assert!(stored.content.contains("Into keyed memory"));
+        assert!(stored.content.contains("From memory"));
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(from.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // Note merge must absorb a conflicting edge natural key exactly like entity

@@ -3674,20 +3674,21 @@ impl KhiveRuntime {
             let fts_result: RuntimeResult<()> = if fts_inject {
                 Err(RuntimeError::Internal("injected FTS failure".to_string()))
             } else {
-                match self.text_for_notes(token) {
-                    Ok(fts) => fts
-                        .upsert_document(note_fts_document(&note))
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                }
+                let statements =
+                    khive_db::stores::text::delete_document_statements("fts_notes", ns, note.id)
+                        .into_iter()
+                        .chain(khive_db::stores::text::insert_document_statements(
+                            "fts_notes",
+                            &note_fts_document(&note),
+                        ))
+                        .collect();
+                self.apply_note_index_revision(&note, statements)
+                    .await
+                    .map(|_| ())
             };
 
             if let Err(e) = fts_result {
-                // Best-effort compensation — ignore cleanup errors.
-                if let Ok(store) = self.notes(token) {
-                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                }
+                self.compensate_note_creation(&note).await;
                 return Err(e);
             }
         }
@@ -3751,37 +3752,14 @@ impl KhiveRuntime {
             let single_model_result: RuntimeResult<()> = match vec_result {
                 Ok(outcome) => {
                     embedding_report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                ns,
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                            .map_err(RuntimeError::from),
-                        Err(e) => Err(e),
-                    }
+                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                        .await
+                        .map(|_| ())
                 }
                 Err(e) => Err(e),
             };
             if let Err(e) = single_model_result {
-                // Compensate note row + FTS.
-                if let Ok(store) = self.notes(token) {
-                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                }
-                if let Ok(fts) = self.text_for_notes(token) {
-                    if let Err(fts_err) = fts.delete_document(ns, note.id).await {
-                        tracing::warn!(
-                            note_id = %note.id,
-                            error = %fts_err,
-                            "compensating FTS delete failed after single-model embed failure; \
-                             the note row was already removed, but its FTS document may remain"
-                        );
-                    }
-                }
+                self.compensate_note_creation(&note).await;
                 return Err(e);
             }
         } else if !embed_model_names.is_empty() {
@@ -3818,65 +3796,20 @@ impl KhiveRuntime {
             let outcomes = match drain_embed_join_set(join_set, embed_model_names.len()).await {
                 Ok(outcomes) => outcomes,
                 Err(e) => {
-                    // Compensate note row + FTS (no vectors inserted yet).
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                error = %fts_err,
-                                "compensating FTS delete failed after multi-model embed \
-                                 failure; the note row was already removed, but its FTS \
-                                 document may remain"
-                            );
-                        }
-                    }
+                    self.compensate_note_creation(&note).await;
                     return Err(e);
                 }
             };
             // TODO(P2): parallelize vector inserts
-            let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
                 embedding_report.observe(&outcome);
-                let insert_result = match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => vs
-                        .insert(
-                            note.id,
-                            SubstrateKind::Note,
-                            ns,
-                            "note.content",
-                            vec![outcome.vector],
-                        )
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                };
+                let insert_result = self
+                    .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                    .await;
                 if let Err(e) = insert_result {
-                    // Compensate note row + FTS + already-inserted vectors.
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                error = %fts_err,
-                                "compensating FTS delete failed after a vector insert \
-                                 failure; the note row was already removed, but its FTS \
-                                 document may remain"
-                            );
-                        }
-                    }
-                    for m in &inserted_models {
-                        if let Ok(vs) = self.vectors_for_model(token, m) {
-                            let _ = vs.delete(note.id).await;
-                        }
-                    }
+                    self.compensate_note_creation(&note).await;
                     return Err(e);
                 }
-                inserted_models.push(model_name.clone());
             }
         }
 
@@ -3947,27 +3880,11 @@ impl KhiveRuntime {
             match link_result {
                 Ok(edge) => created_edges.push(edge.id.into()),
                 Err(e) => {
-                    // Best-effort compensation — ignore cleanup errors.
-                    for edge_id in created_edges {
-                        let _ = self.delete_edge(token, edge_id, true).await;
-                    }
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        if let Err(fts_err) = fts.delete_document(ns, note.id).await {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                error = %fts_err,
-                                "compensating FTS delete failed after an annotates-link \
-                                 failure; the note row was already removed, but its FTS \
-                                 document may remain"
-                            );
-                        }
-                    }
-                    for model_name in &embed_model_names {
-                        if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                            let _ = vs.delete(note.id).await;
+                    // Preserve newer revisions and their edges. Successful
+                    // removal still uses canonical edge cleanup and its audits.
+                    if self.compensate_note_creation(&note).await {
+                        for edge_id in created_edges {
+                            let _ = self.delete_edge(token, edge_id, true).await;
                         }
                     }
                     return Err(e);
@@ -4819,6 +4736,10 @@ impl KhiveRuntime {
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(true),
             Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::NoteConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
                 ..
             }) => Ok(false),
@@ -4863,6 +4784,9 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
+        if let Some(error) = self.stream_member_error(&note).await? {
+            return Err(error);
+        }
         let mode = if hard {
             DeleteMode::Hard
         } else {

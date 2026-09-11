@@ -191,8 +191,14 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-172](ADR-172-versioned-notes-compare-and-set.md)                   | Versioned notes — compare-and-set updates, keyed create-if-absent, and a durability option                 |
 | [ADR-173](ADR-173-blob-chunked-upload.md)                               | Chunked blob upload — objects larger than one wire frame                                                   |
 | [ADR-174](ADR-174-ordered-streams-append.md)                            | Ordered streams — dense per-stream append with `expected_seq` and a lease fence                            |
+| [ADR-175](ADR-175-web-pack.md)                                          | Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins                                |
 | [ADR-176](ADR-176-server-owned-config-thin-clients.md)                  | Server-owned storage config — client processes stop carrying engines                                       |
 | [ADR-177](ADR-177-weighted-incidence-topology.md)                       | Weighted incidence as the graph's storage primitive                                                        |
+| [ADR-178](ADR-178-plan-only-request.md)                                 | Plan-Only Request — Grammar Check Without Dispatch                                                         |
+| [ADR-179](ADR-179-operation-identity-memory-remember.md)                | Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder                           |
+| [ADR-180](ADR-180-tool-pack.md)                                         | Tool Pack: Capability Registry, Ontological Discovery and Use Policy                                       |
+| [ADR-181](ADR-181-exec-verb-sandboxed-run.md)                           | Exec Verb: One Declared Command in a Sandbox over a Materialized Tree                                      |
+| [ADR-182](ADR-182-git-dev-loop-verbs.md)                                | Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests            |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -217,3 +223,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 - **No stubs**: every ADR claim must be implementable; stubs and placeholders are not acceptable.
 - **Closed taxonomies**: entity kinds, edge relations, note kinds are closed enums. Extension requires ADR amendment.
 - **ADRs are desired-state specs**: ADRs describe the intended v1 design, not the state of any specific deployment context.
+
+## Proposed amendments
+
+- [ADR-179 Amendment 1: Message-pair identity](ADR-179-operation-identity-memory-remember.md#amendment-1-message-pair-identity-proposed-2026-09-09).

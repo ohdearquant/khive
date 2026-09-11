@@ -26,7 +26,7 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
 
-fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
+pub(super) fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
     serde_json::json!({
         "items": items,
         "requested_limit": requested,
@@ -35,7 +35,7 @@ fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
     })
 }
 
-fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
+pub(super) fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
     response["requested_limit"] = serde_json::json!(requested);
     response["effective_limit"] = serde_json::json!(effective);
     response["limit_clamped"] = serde_json::json!(requested > effective);
@@ -58,6 +58,7 @@ async fn resolve_message_thread_filter(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     raw: &str,
+    primary_only: bool,
 ) -> Result<String, RuntimeError> {
     // Message-scope invariant: this resolver ONLY serves the message thread
     // filter, so the DISTINCT scan binds kind='message' unconditionally. The
@@ -80,7 +81,11 @@ async fn resolve_message_thread_filter(
     // reads (`['local'] ∪ visible_namespaces`): resolving against only the
     // primary namespace rejects prefixes of threads the list itself would
     // return, and silently hides a cross-namespace prefix collision.
-    let visible = token.visible_namespace_strs();
+    let visible = if primary_only {
+        vec![token.namespace().as_str()]
+    } else {
+        token.visible_namespace_strs()
+    };
     let placeholders = (1..=visible.len())
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
@@ -171,7 +176,7 @@ async fn resolve_message_thread_filter(
     )))
 }
 
-fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
+pub(super) fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
     let properties = note.properties.as_ref();
     if let Some(wanted) = params.tags.as_deref().filter(|tags| !tags.is_empty()) {
         let stored = properties
@@ -184,7 +189,15 @@ fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !tags_match_any(&stored, wanted) {
+        let matches = match params.tag_mode.unwrap_or_default() {
+            khive_storage::note::NoteTagMode::Any => tags_match_any(&stored, wanted),
+            khive_storage::note::NoteTagMode::All => wanted.iter().all(|wanted| {
+                stored
+                    .iter()
+                    .any(|stored| stored.eq_ignore_ascii_case(wanted))
+            }),
+        };
+        if !matches {
             return false;
         }
     }
@@ -282,6 +295,22 @@ impl KgPack {
             ));
         }
         let spec = resolve_kind_spec(&p.kind, registry)?;
+        if !matches!(&spec, KindSpec::Note { .. })
+            && (p.key_prefix.is_some()
+                || p.after_key.is_some()
+                || p.created_after.is_some()
+                || p.updated_after.is_some()
+                || p.tag_mode.is_some())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "key, timestamp and tag_mode filters require notes".into(),
+            ));
+        }
+        if p.after_key.is_some() && p.key_prefix.is_none() {
+            return Err(RuntimeError::InvalidInput(
+                "after_key requires key_prefix".into(),
+            ));
+        }
         match spec {
             KindSpec::Entity { specific } => {
                 if p.note_kind.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -452,11 +481,29 @@ impl KgPack {
                 )?;
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
-                        resolve_message_thread_filter(&self.runtime, token, &raw_thread_id).await?,
+                        resolve_message_thread_filter(
+                            &self.runtime,
+                            token,
+                            &raw_thread_id,
+                            p.key_prefix.is_some(),
+                        )
+                        .await?,
                     );
                 }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
+                let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                if p.key_prefix.is_some() {
+                    return super::note_list::list_keyed_notes(
+                        &self.runtime,
+                        token,
+                        &p,
+                        &filter,
+                        requested,
+                        limit,
+                    )
+                    .await;
+                }
                 let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
                     || p.thread_id.is_some()
                     || p.direction.is_some()
@@ -483,9 +530,9 @@ impl KgPack {
                             let scan_limit = MAX_SCAN_TOTAL.saturating_sub(scanned).min(PAGE_SIZE);
                             let (page, next_raw_after) = self
                                 .runtime
-                                .list_notes_after(
+                                .list_notes_filtered_after(
                                     token,
-                                    kind_filter.as_deref(),
+                                    filter.clone(),
                                     raw_after,
                                     scan_limit,
                                 )
@@ -534,7 +581,7 @@ impl KgPack {
                     } else {
                         let (notes, next_after) = self
                             .runtime
-                            .list_notes_after(token, kind_filter.as_deref(), after, limit)
+                            .list_notes_filtered_after(token, filter.clone(), after, limit)
                             .await?;
                         (notes, next_after, false)
                     };
@@ -574,7 +621,7 @@ impl KgPack {
                         }
                         let page = self
                             .runtime
-                            .list_notes(token, kind_filter.as_deref(), remaining_scan, db_offset)
+                            .list_notes_filtered(token, filter.clone(), remaining_scan, db_offset)
                             .await?;
                         let fetched = page.len() as u32;
                         for note in page {
@@ -596,7 +643,7 @@ impl KgPack {
                     collected
                 } else {
                     self.runtime
-                        .list_notes(token, kind_filter.as_deref(), limit, offset)
+                        .list_notes_filtered(token, filter.clone(), limit, offset)
                         .await?
                 };
 

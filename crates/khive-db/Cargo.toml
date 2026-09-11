@@ -26,7 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks"] }
+rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "functions"] }
 crossbeam-queue = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
@@ -70,5 +70,7 @@ path = "benches/db_hot_path.rs"
 required-features = ["vectors"]
 
 [features]
+# Exposes the task-scoped SQLite progress probe for dependent-crate tests.
+test-support = []
 default = []
 vectors = ["dep:sqlite-vec"]

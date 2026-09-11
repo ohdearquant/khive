@@ -20,6 +20,8 @@ use tempfile::TempDir;
 
 fn file_rt(db_path: std::path::PathBuf) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -35,6 +37,7 @@ fn file_rt(db_path: std::path::PathBuf) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("file-backed runtime")
 }

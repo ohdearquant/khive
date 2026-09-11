@@ -116,17 +116,20 @@ describe("ontology legend", () => {
   });
 
   it("keeps every distinction legible without hue", () => {
+    // One mark per member, stated as "as many distinct icons as there are
+    // members" rather than as a number that has to be edited beside every new
+    // member. Two kinds sharing an icon still fails: the set shrinks.
     expect(
       new Set(Object.values(ENTITY_KIND_LEGEND).map((entry) => entry.icon))
         .size,
-    ).toBe(9);
+    ).toBe(ENTITY_KINDS.length);
     expect(
       new Set(Object.values(NOTE_KIND_LEGEND).map((entry) => entry.icon)).size,
-    ).toBe(5);
+    ).toBe(NOTE_KINDS.length);
     expect(
       new Set(Object.values(EDGE_RELATION_LEGEND).map((entry) => entry.glyph))
         .size,
-    ).toBe(17);
+    ).toBe(EDGE_RELATIONS.length);
     expect(DERIVED_EDGE_MARK).toMatchObject({
       geometry: "diamond",
       glyph: "◇",

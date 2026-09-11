@@ -106,16 +106,18 @@ pub enum NoteKind {
     Decision,
     /// A pointer to an external source or citation.
     Reference,
+    Head,
 }
 
 impl NoteKind {
-    /// All 5 canonical note kinds in declaration order.
-    pub const ALL: [Self; 5] = [
+    /// All canonical note kinds in declaration order.
+    pub const ALL: [Self; 6] = [
         Self::Observation,
         Self::Insight,
         Self::Question,
         Self::Decision,
         Self::Reference,
+        Self::Head,
     ];
 
     /// Canonical lowercase name strings for all note kinds.
@@ -125,6 +127,7 @@ impl NoteKind {
         "question",
         "decision",
         "reference",
+        "head",
     ];
 
     /// Return the canonical lowercase wire string for this note kind.
@@ -135,6 +138,7 @@ impl NoteKind {
             Self::Question => "question",
             Self::Decision => "decision",
             Self::Reference => "reference",
+            Self::Head => "head",
         }
     }
 }
@@ -161,6 +165,7 @@ impl std::str::FromStr for NoteKind {
             "question" => Ok(Self::Question),
             "decision" => Ok(Self::Decision),
             "reference" => Ok(Self::Reference),
+            "head" => Ok(Self::Head),
             other => Err(UnknownVariant::new("note_kind", other, Self::NAMES)),
         }
     }

@@ -30,6 +30,7 @@ phase_lint() {
 
     echo "=== SQL Lint ==="
     sh "$SCRIPT_DIR/lint-sql.sh"
+    python3 "$SCRIPT_DIR/tests/test_lint_sql.py"
 
     echo "=== ADR Reference Lint ==="
     sh "$SCRIPT_DIR/lint-adr-refs.sh"
@@ -211,7 +212,9 @@ phase_tests() {
     # (the default, including every local/non-sharded invocation) keeps the
     # plain `cargo test --workspace` path unchanged.
     if [ -n "${NEXTEST_PARTITION:-}" ]; then
-        run_with_store_sentinel cargo nextest run --workspace --partition "count:${NEXTEST_PARTITION}"
+        # --no-fail-fast: one red test must not cancel the rest of the shard, so a
+        # head reports every failure it has.
+        run_with_store_sentinel cargo nextest run --workspace --no-fail-fast --partition "count:${NEXTEST_PARTITION}"
     else
         run_with_store_sentinel cargo test --workspace
     fi

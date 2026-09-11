@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession
+from khive_contract.client import KhiveMcpSession, error_text
 from khive_contract.fixtures import NOTE_KINDS
 
 VERBS_UNDER_TEST = {"create", "list", "get", "search", "link"}
@@ -104,7 +104,7 @@ def test_invalid_note_kind_reports_registered_set(
     assert results, "Expected results in envelope"
     first = results[0]
     assert not first.get("ok", False), "Expected per-op error for invalid note_kind"
-    err = first.get("error", "")
+    err = error_text(first)
     assert err, "Error message must be non-empty"
     assert "scribble" in err, f"Error must name offending note_kind 'scribble': {err!r}"
 

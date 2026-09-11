@@ -65,6 +65,7 @@ impl Drop for EnvGuard {
 
 fn base_args(db: &str, actor: Option<&str>) -> ExecArgs {
     ExecArgs {
+        plan: false,
         ops: Some("stats()".to_string()),
         pending_events: false,
         db: Some(db.to_string()),
@@ -107,6 +108,7 @@ async fn accept_and_reply(listener: &UnixListener) -> DaemonRequestFrame {
         ok: true,
         result: Some("{}".to_string()),
         error: None,
+        error_detail: None,
         namespace_mismatch: false,
         config_mismatch: false,
         served_config_id: Some(frame.config_id.clone()),

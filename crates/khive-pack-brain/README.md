@@ -39,10 +39,17 @@ verbs through the MCP `request` DSL, not called directly as a Rust API:
 
 ```text
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
+request(ops="brain.resolve(consumer_kind=\"recall\")")
 request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 request(ops="brain.auto_feedback(query=\"why\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
+
+Event counts, profile resolution, and binding listing default to the authorized
+caller's actor scope. An explicit foreign actor requires visibility; aggregate
+event counts additionally require `all_actors=true` and a serving-runtime
+`[brain] fleet_readers` entry. See the
+[API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
+for the exact actor filters and anonymous-caller behavior.
 
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:

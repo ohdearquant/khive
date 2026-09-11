@@ -127,6 +127,25 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
+/// Insert a new edge only while both endpoints still exist.
+/// Competing IDs and natural keys, including tombstones, cause a constraint
+/// error rather than replacing or restoring the competing row. Callers must
+/// require one affected row to reject an endpoint removed after prepare.
+pub fn edge_insert_only_guarded_by_endpoints_statement(edge: &Edge) -> SqlStatement {
+    let mut statement = edge_upsert_statement(edge);
+    let src_exists = endpoint_exists_clause("?3");
+    let tgt_exists = endpoint_exists_clause("?4");
+    statement.sql = format!(
+        "INSERT INTO graph_edges \
+          (namespace, id, source_id, target_id, relation, weight, \
+           created_at, updated_at, deleted_at, metadata, target_backend) \
+          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
+          WHERE ({src_exists}) AND ({tgt_exists})"
+    );
+    statement.label = Some("edge-insert-only-where-endpoints-exist".to_string());
+    statement
+}
+
 /// Full-edge compare-and-swap update used after caller-side normalization
 /// was derived from a read snapshot. Unlike [`edge_upsert_statement`], this
 /// never inserts and cannot overwrite a row whose revision or deletion

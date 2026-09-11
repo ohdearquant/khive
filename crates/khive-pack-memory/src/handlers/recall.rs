@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::EdgeFilter;
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
@@ -27,11 +27,11 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
-    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
-    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID,
-    RECALL_SLOW_THRESHOLD_MS,
+    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
+    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    RecallParams, RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
+    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
+    RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -219,13 +219,16 @@ impl MemoryPack {
             normalize_min_score(raw).map_err(RuntimeError::from)?
         };
 
+        // `limit` and `top_k` agree on zero: both mean no hits. A caller that
+        // computes a limit which reaches zero gets an empty page, never a
+        // single result smuggled in by a lower clamp.
         let limit = if let Some(k) = p.top_k {
             k.min(crate::scoring::MAX_RECALL_LIMIT)
         } else {
             p.limit
                 .map(|v| v as usize)
                 .unwrap_or(10)
-                .clamp(1, crate::scoring::MAX_RECALL_LIMIT)
+                .min(crate::scoring::MAX_RECALL_LIMIT)
         };
         let limit_u32 = u32::try_from(limit).unwrap_or(u32::MAX);
 
@@ -637,6 +640,11 @@ impl MemoryPack {
                     continue;
                 }
             }
+            if let Some(excluded) = p.exclude_tags.as_ref().filter(|tags| !tags.is_empty()) {
+                if note_has_any_tag(note.properties.as_ref(), excluded) {
+                    continue;
+                }
+            }
             // Same predicate the widening loop counts with; one definition so
             // a boundary change cannot drift between the two paths.
             if !in_window(&note) {
@@ -884,6 +892,31 @@ impl MemoryPack {
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
+        // Source provenance is the memory's `annotates` edge (never a property);
+        // read it only when asked, one edge query per returned hit.
+        let mut source_ids: HashMap<Uuid, Option<String>> = HashMap::new();
+        if p.include_source_id.unwrap_or(false) {
+            for id in ranked.iter().map(|sn| sn.id) {
+                let source = self
+                    .runtime
+                    .neighbors_with_query(
+                        &effective_token,
+                        id,
+                        NeighborQuery {
+                            direction: Direction::Out,
+                            relations: Some(vec![EdgeRelation::Annotates]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .map(|hit| hit.node_id.to_string());
+                source_ids.insert(id, source);
+            }
+        }
+
         let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
@@ -906,6 +939,9 @@ impl MemoryPack {
                     "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
                 });
+                if let Some(source) = source_ids.get(&sn.id) {
+                    result["source_id"] = json!(source);
+                }
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }
@@ -1356,6 +1392,67 @@ mod tests {
         fn enter(&self, _: &tracing::span::Id) {}
 
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `limit=0` returns no hits, the same as `top_k=0`; a lower clamp of one
+    /// used to turn it into a single hit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_limit_zero_returns_no_hits_like_top_k_zero() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+        for i in 0..3 {
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                &format!("limit zero probe note {i}"),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let hits_for = |params: serde_json::Value| {
+            let registry = &registry;
+            async move {
+                let out = registry
+                    .dispatch("memory.recall", params)
+                    .await
+                    .expect("recall dispatch");
+                match out {
+                    serde_json::Value::Array(items) => items.len(),
+                    serde_json::Value::Object(map) => map
+                        .get("results")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    _ => panic!("unexpected recall shape"),
+                }
+            }
+        };
+
+        let control =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 2})).await;
+        assert_eq!(
+            control, 2,
+            "limit=2 is the control and must return two hits"
+        );
+        let by_top_k =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "top_k": 0})).await;
+        assert_eq!(by_top_k, 0, "top_k=0 returns no hits");
+        let by_limit =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 0})).await;
+        assert_eq!(by_limit, 0, "limit=0 returns no hits, the same as top_k=0");
     }
 
     /// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
@@ -4776,6 +4873,90 @@ mod tests {
         let bench_id = remember(&registry, "ns733 probe term bench arm alpha", "bench-a").await;
 
         (registry, local_id_1, local_id_2, bench_id)
+    }
+
+    /// A bound actor that remembers an episodic memory recalls it on the same
+    /// identity without naming a namespace: the actor namespace joins the
+    /// default read set where the token is minted (ADR-007 Rev 4 Rule 3b), so
+    /// the write scope of `memory.remember` and the read scope of
+    /// `memory.recall` agree for one identity. An anonymous caller keeps
+    /// exactly `local`, and an explicit `namespace=local` stays precise.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn bound_actor_recalls_its_episodic_memory_without_a_namespace_param() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+        let identity = || khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: Some("lambda:probe".to_string()),
+            visible_namespaces: vec![],
+            ..Default::default()
+        };
+        let remembered = registry
+            .dispatch_with_identity(
+                "memory.remember",
+                json!({
+                    "content": "bound actor probe term episodic arm",
+                    "memory_type": "episodic",
+                    "tags": ["bound-actor-run"],
+                }),
+                Some(identity()),
+            )
+            .await
+            .expect("memory.remember as the bound actor");
+        let id = remembered["id"].as_str().expect("id").to_string();
+        let recall = json!({
+            "query": "bound actor probe term",
+            "tags": ["bound-actor-run"],
+            "limit": 10,
+        });
+        let has = |result: &Value| {
+            result
+                .as_array()
+                .map(|hits| hits.iter().any(|h| h["id"].as_str() == Some(id.as_str())))
+                .unwrap_or(false)
+        };
+
+        let mut result = Value::Null;
+        for _ in 0..300 {
+            result = registry
+                .dispatch_with_identity("memory.recall", recall.clone(), Some(identity()))
+                .await
+                .expect("memory.recall as the bound actor");
+            if has(&result) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            has(&result),
+            "the bound actor must recall its own episodic memory with no namespace param: {result:?}"
+        );
+
+        // Controls run after the positive arm so the index is warm: an absence
+        // below is scope, not consistency.
+        let anonymous = registry
+            .dispatch("memory.recall", recall.clone())
+            .await
+            .expect("memory.recall anonymous");
+        assert!(
+            !has(&anonymous),
+            "an anonymous caller keeps exactly the local read set: {anonymous:?}"
+        );
+        let mut precise = recall.clone();
+        precise["namespace"] = json!("local");
+        let scoped = registry
+            .dispatch_with_identity("memory.recall", precise, Some(identity()))
+            .await
+            .expect("memory.recall namespace=local as the bound actor");
+        assert!(
+            !has(&scoped),
+            "an explicit namespace=local is a precise scope, never widened: {scoped:?}"
+        );
     }
 
     /// With no override, recall uses exactly the caller token's visible namespaces.
