@@ -192,6 +192,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-173](ADR-173-blob-chunked-upload.md)                               | Chunked blob upload — objects larger than one wire frame                                                   |
 | [ADR-174](ADR-174-ordered-streams-append.md)                            | Ordered streams — dense per-stream append with `expected_seq` and a lease fence                            |
 | [ADR-175](ADR-175-web-pack.md)                                          | Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins                                |
+| [ADR-176](ADR-176-server-owned-config-thin-clients.md)                  | Server-owned storage config — client processes stop carrying engines                                       |
+| [ADR-177](ADR-177-weighted-incidence-topology.md)                       | Weighted incidence as the graph's storage primitive                                                        |
 | [ADR-178](ADR-178-plan-only-request.md)                                 | Plan-Only Request — Grammar Check Without Dispatch                                                         |
 | [ADR-179](ADR-179-operation-identity-memory-remember.md)                | Operation Identity on `memory.remember`: Keyed Create, Conflict Names the Holder                           |
 | [ADR-180](ADR-180-tool-pack.md)                                         | Tool Pack: Capability Registry, Ontological Discovery and Use Policy                                       |
