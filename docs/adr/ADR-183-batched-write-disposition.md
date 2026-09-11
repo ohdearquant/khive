@@ -57,9 +57,15 @@ A partial disposition is a successful op. Its result body is:
 {
   "status": "ok" | "partial" | "incomplete",
   "committed": [ { "index": 0, "id": "..." } ],
-  "refused":  [ { "index": 1, "field": "content", "reason": "..." } ]
+  "refused":  [ { "index": 1, "field": "content", "reason": "..." } ],
+  "stopped":  { "index": 2, "reason": "...", "disposition": "not_written" | "unknown" }
 }
 ```
+
+`stopped` is present if and only if `status` is `incomplete`, and is absent from an `ok` or a
+`partial` result. Its shape is the one section 6 defines, and it is repeated here because this
+block is what an implementer reads: a schema that named the status without the object the status
+requires would leave the one field a caller keys on to be discovered from prose.
 
 - `status` is `ok` when every record in the request committed; `partial` when every record was
   attempted and at least one refused; `incomplete` when the call **stopped on a storage failure**
@@ -181,8 +187,12 @@ edits to existing callers:
   count for a partial result, never the ids alone; an `incomplete` result additionally prints the
   stopped index and its disposition.
 - The request-level `summary` counts a partial or incomplete op in a field of its own rather than
-  silently inside `succeeded`: `summary` gains `partial`, and the request `status` is not `ok` while
-  it is non-zero. This binding is the one that reaches agents. A partial op carries `ok: true`, so
+  silently inside `succeeded`: `summary` gains `partial`, and the request `status` reports it.
+  The request level has its own vocabulary, `success` | `partial` | `aborted`, and `ok` is not a
+  value in it; `ok` is the op result body's field, defined above. Today the request status is
+  derived as `success` unless some op failed or aborted, so a request whose every op succeeded
+  partially reports `success`. This binding extends that derivation by one clause: a non-zero
+  `summary.partial` makes the request status `partial` as well. This binding is the one that reaches agents. A partial op carries `ok: true`, so
   without it a reader of `summary: {total: 1, succeeded: 1, failed: 0}` sees an unqualified success
   for a call that refused seven records, and `summary` is the field agents read first.
 
@@ -237,7 +247,9 @@ Stated before implementation, per verb the census binds:
     This is the arm the §2 definition exists for: a remainder-based reading returns `partial` here
     and the caller skips the re-read that an indeterminate outcome requires.
 13. A one-op request whose result carries `status: "partial"` returns a request-level `summary`
-    with `partial: 1` and a request `status` that is not `"ok"`; the control is the same call with
-    every record committing, which returns `partial: 0` and `status: "ok"`. The arm additionally
+    with `partial: 1` and a request `status` of `"partial"`; the control is the same call with
+    every record committing, which returns `partial: 0` and a request `status` of `"success"`.
+    Both values are read at the request envelope, not at the op body, and `"ok"` appears at
+    neither point of this arm. The arm additionally
     asserts that `succeeded` and `failed` are IDENTICAL across the two calls, because that is the
     reading which cannot tell them apart today and the reason this binding exists.
