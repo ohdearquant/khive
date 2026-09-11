@@ -319,3 +319,46 @@ and retains null; 41 each resource signal without its matching configured limit
 retains null. The arms read back the durable receipt and its listing as well as
 the run reply. Replacing observation with a nonzero-exit heuristic must fail the
 unrelated-signal arm; omitting null must fail the exit-zero arm.
+
+## Amendment 7 (2026-09-11): the sandbox object is open, and the descendant case gets an arm
+
+Amendment 1 item 7 named the receipt's `sandbox` object as exactly three digests. It is not
+exhaustive and it was never meant to be read as a closed set. A run prepared today carries five
+keys, and the two that are not digests were added after that sentence was written:
+
+```json
+"sandbox": {
+  "profile_digest": "...",
+  "tool_binary_digest": "...",
+  "read_roots_digest": "...",
+  "tool_source": "exec:/absolute/path/to/the/registered/binary",
+  "tool_registry_id": "..."
+}
+```
+
+`tool_source` and `tool_registry_id` report the registration the run actually resolved, which is
+not the same fact as the binary's hash: two registry rows can name one binary, and a caller
+auditing what was approved needs the row. Neither is a check against a caller's expectation. The
+rule this amendment states is the general one: **`sandbox` is open to additive fields, and a
+consumer that treats its key set as closed will break on the next addition.** Read the keys you
+need by name.
+
+`sandbox` is `null`, not a partial object, when the run is refused before the sandbox is prepared.
+A reader distinguishing "no sandbox" from "sandbox without a tool source" is reading a state that
+does not occur.
+
+The second half of this amendment is an acceptance arm, not a change. Amendment 6 already says the
+`limiting_resource` observation is limited to the directly waited child, and that a descendant
+whose parent converts a signal into an ordinary exit code supplies no observation. That sentence is
+correct and it is now the only thing holding the property: arms 37 through 41 all bound the DIRECT
+child, so nothing fails if a later change starts inferring the cause from the exit code in exactly
+the case the prose excludes. A harness exercising the surface from outside met this and had to read
+the prose to tell a documented limit from a defect.
+
+Acceptance arm added: 42 a run whose direct child spawns a descendant that exceeds a configured
+resource limit, where the parent reaps the descendant's signal and exits with an ordinary nonzero
+code, records `limiting_resource: null` while the enforcement itself still holds (the descendant
+is killed and its output truncated at the limit). The control is arm 37's shape, the same limit
+exceeded by the direct child, which records `cpu_seconds`. The pair is what separates "observation
+is limited to the waited child" from "observation is broken", and an implementation that derives
+the resource from a nonzero exit code passes 37 and must fail 42.
