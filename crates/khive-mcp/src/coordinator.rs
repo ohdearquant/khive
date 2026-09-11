@@ -62,6 +62,47 @@ impl From<CoordError> for khive_runtime::RuntimeError {
     }
 }
 
+/// Stable classification for a failed fan-out backend leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSearchFailureKind {
+    /// The backend operation failed for a non-timeout reason.
+    BackendError,
+    /// The backend exceeded the coordinator's per-request deadline.
+    Timeout,
+}
+
+impl BackendSearchFailureKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendError => "backend_error",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Typed failure for one fan-out backend leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSearchFailure {
+    pub kind: BackendSearchFailureKind,
+    pub message: String,
+}
+
+impl BackendSearchFailure {
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::BackendError,
+            message: message.into(),
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::Timeout,
+            message: message.into(),
+        }
+    }
+}
+
 /// Per-backend contribution to a fan-out search.
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
@@ -71,8 +112,9 @@ pub struct BackendSearchResult {
     pub vector_selected: bool,
     /// Populated when this backend errored during the fan-out. A whole-backend
     /// failure (e.g. the text arm, or a fatal error before either arm ran) —
-    /// this backend contributed no hits at all.
-    pub error: Option<String>,
+    /// this backend contributed no hits at all. The typed cause is what the
+    /// classifier reads; it never parses a rendered message.
+    pub error: Option<BackendSearchFailure>,
     /// Populated when only the vector arm failed and the text arm still ran:
     /// `entity_hits` still carries the text arm's results, and `error` above
     /// stays `None`.
@@ -379,7 +421,7 @@ pub(crate) mod tests {
                             entity_hits: vec![],
                             note_hits: vec![],
                             vector_selected: true,
-                            error: Some("injected search failure".to_string()),
+                            error: Some(BackendSearchFailure::backend("injected search failure")),
                             vector_error: None,
                         }),
                 )
