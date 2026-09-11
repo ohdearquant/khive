@@ -171,7 +171,7 @@ sent, by their own identity, before deciding.
 ### 7. A partial result is a success the caller must not mistake for a full one
 
 A partial disposition is a successful op, so the hazard moves: a caller that checks only `ok`
-after a 97-record upsert now believes 97 landed when 90 did. Two bindings close that gap without
+after a 97-record upsert now believes 97 landed when 90 did. Three bindings close that gap without
 edits to existing callers:
 
 - `kkernel exec --strict` treats a result whose `status` is `partial` or `incomplete` as a failed
@@ -180,6 +180,11 @@ edits to existing callers:
 - The verbose presentation and the MCP summary line print the refused count beside the committed
   count for a partial result, never the ids alone; an `incomplete` result additionally prints the
   stopped index and its disposition.
+- The request-level `summary` counts a partial or incomplete op in a field of its own rather than
+  silently inside `succeeded`: `summary` gains `partial`, and the request `status` is not `ok` while
+  it is non-zero. This binding is the one that reaches agents. A partial op carries `ok: true`, so
+  without it a reader of `summary: {total: 1, succeeded: 1, failed: 0}` sees an unqualified success
+  for a call that refused seven records, and `summary` is the field agents read first.
 
 ## Consequences
 
@@ -231,3 +236,8 @@ Stated before implementation, per verb the census binds:
     `status: "incomplete"`, not `partial`, with `stopped.index` 2 and nothing left unattempted.
     This is the arm the §2 definition exists for: a remainder-based reading returns `partial` here
     and the caller skips the re-read that an indeterminate outcome requires.
+13. A one-op request whose result carries `status: "partial"` returns a request-level `summary`
+    with `partial: 1` and a request `status` that is not `"ok"`; the control is the same call with
+    every record committing, which returns `partial: 0` and `status: "ok"`. The arm additionally
+    asserts that `succeeded` and `failed` are IDENTICAL across the two calls, because that is the
+    reading which cannot tell them apart today and the reason this binding exists.
