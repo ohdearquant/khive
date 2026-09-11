@@ -1863,6 +1863,7 @@ impl KhiveRuntime {
     }
 
     /// List entities visible to the token, optionally filtered by kind and entity_type.
+    /// A null entity_type falls back to a string properties.type for filtering only.
     ///
     /// When the token carries a multi-namespace visible set, entities from all
     /// visible namespaces are returned. When the visible set is `[primary]`
@@ -1889,6 +1890,7 @@ impl KhiveRuntime {
                 Some(t) => vec![t.to_string()],
                 None => vec![],
             },
+            legacy_entity_type_fallback: true,
             namespaces: ns_strs,
             ..Default::default()
         };
@@ -1945,6 +1947,7 @@ impl KhiveRuntime {
             entity_types: entity_type
                 .map(|value| vec![value.to_string()])
                 .unwrap_or_default(),
+            legacy_entity_type_fallback: true,
             tags_any: tags_any.to_vec(),
             namespaces: token
                 .visible_namespaces()

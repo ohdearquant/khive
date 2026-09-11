@@ -96,6 +96,11 @@ pub struct EntityFilter {
     pub kinds: Vec<String>,
     /// Filter by exact `entity_type` value. Multiple values are ORed.
     pub entity_types: Vec<String>,
+    /// For entity listing, fall back to a string `properties.type` only when
+    /// `entity_type` is null. Does not change the returned entity or apply when
+    /// `entity_types` is empty. Other query callers retain exact-column filtering.
+    #[serde(default)]
+    pub legacy_entity_type_fallback: bool,
     pub name_prefix: Option<String>,
     /// Deterministic, case-sensitive equality on `entities.name` (binary
     /// comparison — SQLite's default collation for `=` on a `TEXT` column

@@ -4260,8 +4260,122 @@ async fn update_entity_without_kind_resolves_from_uuid() {
     );
 }
 
-/// A property-only historical type can be promoted into the indexed
-/// `entity_type` column without replacing any unrelated entity fields.
+#[tokio::test]
+async fn list_entity_type_legacy_fallback_covers_tagged_offset_and_cursor_pages() {
+    let pack = pack();
+    let mut created = Vec::new();
+    for (name, entity_type, tags) in [
+        ("LegacyListedType", None, json!(["visible"])),
+        ("ColumnListedType", Some("algorithm"), json!(["visible"])),
+        ("UntaggedLegacyType", None, json!([])),
+        (
+            "ColumnOverridesLegacyType",
+            Some("technique"),
+            json!(["visible"]),
+        ),
+    ] {
+        let row = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": name, "entity_type": entity_type,
+                    "properties": {"type": "algorithm"}, "tags": tags,
+                    "skip_dedup_check": true
+                }),
+            )
+            .await
+            .expect("create type fixture");
+        created.push(row["id"].as_str().expect("entity id").to_string());
+    }
+
+    for tags in [None, Some(json!([])), Some(json!(["visible"]))] {
+        let mut expected = vec![created[0].clone(), created[1].clone()];
+        if tags != Some(json!(["visible"])) {
+            expected.push(created[2].clone());
+        }
+        expected.sort_unstable();
+        let mut params = json!({"kind": "entity", "entity_type": "algorithm", "limit": 1});
+        if let Some(tags) = tags {
+            params["tags"] = tags;
+        }
+        let mut offset_ids = Vec::new();
+        for offset in 0..expected.len() {
+            let mut page_params = params.clone();
+            page_params["offset"] = json!(offset);
+            let page = pack
+                .dispatch("list", page_params)
+                .await
+                .expect("offset page");
+            let items = list_items(&page);
+            assert_eq!(items.len(), 1, "{page}");
+            assert_eq!(page["limit_clamped"], false);
+            offset_ids.push(items[0]["id"].as_str().unwrap().to_string());
+        }
+        offset_ids.sort_unstable();
+        assert_eq!(offset_ids, expected);
+
+        let mut cursor_ids = Vec::new();
+        let mut after = json!("");
+        for index in 0..expected.len() {
+            let mut page_params = params.clone();
+            page_params["after"] = after;
+            let page = pack
+                .dispatch("list", page_params)
+                .await
+                .expect("cursor page");
+            let items = page["entities"].as_array().expect("cursor entities");
+            assert_eq!(items.len(), 1, "{page}");
+            cursor_ids.push(items[0]["id"].as_str().unwrap().to_string());
+            after = page["next_after"].clone();
+            assert_eq!(after.is_null(), index + 1 == expected.len(), "{page}");
+        }
+        cursor_ids.sort_unstable();
+        assert_eq!(cursor_ids, expected);
+    }
+    let legacy = pack
+        .dispatch("get", json!({"id": created[0]}))
+        .await
+        .expect("get historical entity");
+    assert!(legacy["entity_type"].is_null());
+    assert_eq!(legacy["properties"], json!({"type": "algorithm"}));
+}
+
+#[tokio::test]
+async fn search_entity_type_remains_exact_column_filter() {
+    let pack = pack();
+    let mut typed_id = Value::Null;
+    for (name, entity_type) in [
+        ("TypedFilterWitness legacy", None),
+        ("TypedFilterWitness column", Some("algorithm")),
+    ] {
+        let created = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": name, "entity_type": entity_type,
+                    "properties": {"type": "algorithm"}, "skip_dedup_check": true
+                }),
+            )
+            .await
+            .expect("create search control");
+        if entity_type.is_some() {
+            typed_id = created["id"].clone();
+        }
+    }
+    let found = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "TypedFilterWitness", "entity_type": "algorithm"}),
+        )
+        .await
+        .expect("search with exact type filter");
+    let hits = found.as_array().expect("search hits");
+    assert_eq!(hits.len(), 1, "{found}");
+    assert_eq!(hits[0]["id"], typed_id);
+}
+
+/// Promoting a historical property type keeps its listing membership and
+/// preserves unrelated fields while populating the canonical column.
 #[tokio::test]
 async fn update_entity_type_promotes_property_type_into_typed_listing() {
     let pack = pack();
@@ -4296,10 +4410,13 @@ async fn update_entity_type_promotes_property_type_into_typed_listing() {
         )
         .await
         .expect("typed list before backfill must succeed");
-    assert!(
-        list_items(&before).iter().all(|item| item["id"] != id),
-        "a property-only historical type must not satisfy the column-backed filter"
-    );
+    let before_items = list_items(&before);
+    assert_eq!(before_items.len(), 1);
+    assert_eq!(before_items[0]["id"], id);
+    assert!(before_items[0]["entity_type"].is_null());
+    let stored_before = pack.dispatch("get", json!({"id": id})).await.unwrap();
+    assert!(stored_before["entity_type"].is_null());
+    assert_eq!(stored_before["properties"], created["properties"]);
 
     let updated = pack
         .dispatch("update", json!({"id": id, "entity_type": "algorithm"}))
