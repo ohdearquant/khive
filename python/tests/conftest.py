@@ -308,7 +308,10 @@ def scratch_daemon():
     # ~/.khive/config.toml, whose declared backends both reject `--db`
     # overrides and would otherwise aim the scratch daemon at real stores.
     config = root / "khive.toml"
-    config.write_text("")
+    # The blob store refuses writes when free space is under its 100GB floor,
+    # which a CI runner routinely is; the scratch store holds a few bytes, so
+    # the floor is set out of the way rather than skipping the blob coverage.
+    config.write_text("[storage.blob]\nbackend = \"fs\"\nfloor_bytes = 1000000\n")
     env = os.environ.copy()
     env["KHIVE_SOCKET"] = str(sock)
     env["KHIVE_PID"] = str(root / "khived.pid")
