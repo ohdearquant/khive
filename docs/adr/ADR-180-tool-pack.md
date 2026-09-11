@@ -194,3 +194,92 @@ unexpired, and `tool.check` falls through to policy for a reason nothing in the 
     the value would satisfy the first alone.
 16. A round trip on the shared function: parse, serialize, re-parse, serialize, and require byte
     equality.
+
+## Amendment 3 (2026-09-11): a policy is correctable, and a correction that changes nothing is refused
+
+The Decision says `tool.policy(actor, tool, decision, note)` "stores a rule" and leaves the table's
+lifecycle unstated. Implemented, it is append-only with no inverse: every call mints a fresh row,
+`tool.revoke` takes a grant id rather than a policy id, and the base `delete` verb does not resolve
+a policy id. Two rows for one `(namespace, actor, tool)` triple therefore coexist, and the ranking
+in `tool.check` is by specificity then decision, so the correcting row loses to the row it was
+written to correct whenever the two are equally specific (#2597).
+
+The cost is that a `deny` is permanent through the served surface. A mistyped actor pattern on a
+real verb is unrecoverable without direct database access, which is the thing this pack exists to
+stop anyone needing.
+
+The failure worth naming separately is not the ranking, it is the silence: writing the correcting
+row returns `ok` and a fresh row id, and the decision does not move. Nothing in that response says
+the append had no effect. **A write verb whose success is indistinguishable from a no-op is worse
+than a refusal**, because a refusal is information and this is not.
+
+1. **`tool.policy` is an upsert on `(namespace, actor, tool)`.** A triple has at most one live row.
+   A second call for the same triple replaces the earlier row's `decision` and `note` and refreshes
+   `updated_at`, keeping the row's `id` and its original `created_at`. This is how an operator
+   already thinks about a policy table, and it removes the unbounded growth that made the
+   resolution behaviour in #2596 worth fixing in the first place.
+
+   The `id` is stable on purpose: `tool.check` names the row it decided from, and an audit that
+   re-reads that id later must find the rule that is in force, not a tombstone beside a newer row
+   carrying the same meaning.
+
+2. **Superseded rows are kept, not overwritten in place.** The replaced `decision`, `note` and the
+   actor that wrote them are appended to a `history` array on the row, newest last, each entry
+   carrying its own timestamp and author. The table stays a record of what was decided while the
+   live row stays single. Nothing in the decision path reads `history`; it exists for the reader
+   who asks why a rule says what it says.
+
+3. **`tool.policy_delete(actor, tool)` retires a rule.** Exact labels only, matching the stored
+   `actor` and `tool` strings rather than pattern-matching against them, because a delete that
+   matched by pattern could retire rules the caller did not name. Deleting a triple with no live
+   row refuses and says so rather than reporting success over an empty effect.
+
+   This is a separate verb rather than an overload of the base `delete`, which does not resolve a
+   policy id and would have to learn a pack's table to do so.
+
+4. **Ties still break `deny` over `ask` over `allow`.** Recency is deliberately NOT the tiebreak.
+   Choosing `deny` on a tie is right for an _ambiguous_ pair, and the defect this amendment fixes
+   is that a correction was never ambiguity: the operator stated a newer intention for the same
+   triple, and the surface had no way to express it. Item 1 gives them that way. Reversing the tie
+   for the ambiguous case as well would trade a known safe default for one nobody asked for.
+
+   The equal-specificity tiebreak between two _different_ patterns is unchanged and is
+   `created_at ASC, id ASC`, so a decision is reproducible from the data (#2596).
+
+5. **A write that changes nothing refuses.** If an upsert would leave the live row's `decision`
+   **and** its `note` exactly as they were, the verb refuses with `policy_unchanged`, naming the row
+   id and the decision already in force. This is the arm that closes the silent no-op, and it holds
+   even after item 1 makes the ordinary correction work, because an operator can still write a rule
+   that is already in force and believe they changed something.
+
+   The test is both fields, not the decision alone. A note is how an operator records why a rule
+   says what it says, and keying the refusal on the decision would make a note-only correction
+   impossible to write without first flipping the decision to something untrue and back. So a
+   changed note is a change: the row's `note` is replaced and `updated_at` moves. The superseded
+   note joins `history` under item 2 like any other superseded value, carrying the decision that was
+   in force beside it, so the record still reads as one sequence rather than two.
+
+## Acceptance for Amendment 3
+
+17. Write `deny` for a triple, then `ask` for the identical triple: `tool.policies` lists ONE row,
+    `tool.check` answers `ask`, and the `policy_id` it names is the id the first write returned.
+18. That row's `history` has one entry carrying the earlier `deny`, its note and its author.
+19. Write `deny` with a note for a triple, then the identical `deny` and the identical note again:
+    refused with `policy_unchanged` naming the live row id, `tool.policies` still lists one row, and
+    no `updated_at` movement. This is the anti-no-op arm and it is the reason item 5 exists.
+20. Write `deny` with a note, then the same `deny` with a DIFFERENT note: accepted, not refused. The
+    row keeps its id and its `decision`, its `note` is the new one, `updated_at` moves, and `history`
+    gains one entry carrying the superseded note beside the decision in force at the time. This is
+    the arm that separates "nothing changed" from "the decision did not change", and without it item
+    5 would make a note-only correction unwritable.
+21. `tool.policy_delete` on a live triple removes it, `tool.check` falls through to the next
+    matching rule or to the default, and the source it names changes accordingly.
+22. `tool.policy_delete` on a triple with no live row refuses; it does not report success.
+23. `tool.policy_delete` with a pattern that would match several stored rules retires only an exact
+    stored match, and refuses when none exists. Control: two rules, `svc:*`/`t.x` and
+    `svc:a`/`t.x`, and deleting `svc:*`/`t.x` leaves the second untouched.
+24. Two rules of equal specificity but different patterns still resolve by `created_at ASC, id ASC`,
+    unchanged by this amendment, and the tie still carries `deny` over `ask` over `allow`.
+25. Mutation control, stated before running: making the upsert insert a second row instead of
+    replacing turns arms 17 through 20 red and leaves 21 through 24 green. That separation is what
+    proves the single-live-row property is what those arms test, rather than the ordering.
