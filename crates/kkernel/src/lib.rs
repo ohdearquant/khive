@@ -7,6 +7,7 @@ pub mod code_ingest;
 pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
+pub mod entity_type_backfill;
 pub mod exec;
 pub mod git_ingest;
 pub mod kg;

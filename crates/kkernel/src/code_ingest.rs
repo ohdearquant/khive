@@ -676,7 +676,9 @@ async fn dry_run_report(
 /// returned `TempDir` alive for as long as the backend is used; dropping it
 /// deletes the snapshot. Any `-shm` maintenance the read-only open performs
 /// lands on this disposable copy, never on `db_path`'s own sidecar.
-fn open_read_only_snapshot(db_path: &Path) -> Result<(StorageBackend, tempfile::TempDir)> {
+pub(crate) fn open_read_only_snapshot(
+    db_path: &Path,
+) -> Result<(StorageBackend, tempfile::TempDir)> {
     let snapshot_dir = tempfile::TempDir::new()
         .context("failed to create a scratch directory for the dry-run db snapshot")?;
     let file_name = db_path

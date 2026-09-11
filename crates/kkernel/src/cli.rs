@@ -90,6 +90,9 @@ enum Command {
     /// every configured embedding engine (resolved like `kkernel mcp`).
     Reindex(reindex::ReindexArgs),
 
+    /// Promote registered legacy entity subtypes and remove redundant kind echoes.
+    EntityTypeBackfill(crate::entity_type_backfill::EntityTypeBackfillArgs),
+
     /// Execute a verb DSL expression (same syntax as MCP `request` tool).
     Exec(exec::ExecArgs),
 
@@ -303,6 +306,9 @@ pub async fn cli_main() -> Result<()> {
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
+        Command::EntityTypeBackfill(args) => {
+            crate::entity_type_backfill::run_entity_type_backfill(args).await
+        }
         Command::Exec(e) => {
             let result = exec::run_exec(e).await;
             if let Err(error) = &result {
