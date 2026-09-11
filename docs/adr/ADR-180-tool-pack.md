@@ -141,3 +141,56 @@ amendment closes the remaining gap on the decision side.
 13. A `granted` row whose pinned id points at a different registered object is inactive: the check
     answers from policy or default, and restoring the correct id on that same row answers `allow`
     from `grant` again.
+
+## Amendment 2 (2026-09-11): the grant digest and the exec receipt canonicalize by the same function
+
+**Status**: Proposed.
+
+Amendment 1 item 1 says the digest covers `source`, `side_effect`, `trust` and `schema`
+"canonically serialized", and stops there. That phrase names a property, not a function, and
+`schema` is a caller-supplied JSON object whose serialization has more than one defensible form.
+The tree already carries four implementations of this property and none is shared. A grep at one ref,
+which is a reading and not a census: a recursive key-sorting `canonical` in `khive-mounts`
+(`src/catalog.rs`) feeding a `blake3` digest over a four-field tool definition including both
+schemas, `pub(crate)` and so unreachable from anywhere else; a recursive canonical writer private to
+the moodboard pack, serving checkpoint digests; an exec-side convention stated in prose ("entries
+sorted by path, compact JSON") with the bytes assembled by hand at the point of hashing; and a
+public `canonical_json` in `khive-vcs` that is specific to archives.
+
+A grant and an exec receipt therefore describe the same registry row through two independent
+serializers. If they differ by key order, by whitespace, or by how they render a number that has
+more than one representation, the two digests over one unchanged row disagree, and the disagreement
+presents as a pin mismatch that cannot be reproduced from the data: the row is intact, the grant is
+unexpired, and `tool.check` falls through to policy for a reason nothing in the record explains.
+
+1. **One function, named.** The canonical serialization used by the grant digest is the same
+   function the exec receipt uses. It lives in a crate both sides already depend on, is public, and
+   states its rules as a contract rather than by example: object keys sorted, no insignificant
+   whitespace, and a stated position on non-finite numbers and on duplicate keys, since both are
+   reachable from a caller-supplied `schema`.
+
+   The catalog implementation named above is the nearest existing answer and the first thing to
+   read: it already digests a four-field definition carrying caller-supplied schemas, order
+   insensitively, and its own test pins that property. Promoting it is a real move rather than a
+   restatement, because `pub(crate)` is exactly what makes it unreachable from the exec side. A new
+   function is written only if promotion cannot serve both callers, and the reason is stated when it
+   is. Whether the catalog pin then calls the promoted function is an implementation detail, on the
+   one condition that its digest bytes do not move.
+
+2. **Why Amendment 1's acceptance cannot catch this.** Arms 10 through 13 each vary the registry row
+   and compare a digest against a digest computed the same way, so they hold whatever the function
+   is, including two different functions on the two sides. Every one of them stays green under the
+   defect this amendment exists to prevent. That is the reason the constraint needs an arm of its
+   own rather than a sentence.
+
+### Acceptance
+
+14. A grant and an exec receipt taken over one registry row agree on the `schema` bytes, compared as
+    bytes and not as parsed values. Mutation control, stated before running: pointing either side at
+    its own serializer turns this arm red and leaves arms 10 through 13 green, which is the whole
+    claim of item 2.
+15. Two `schema` objects differing only in key order produce the same digest; two differing in any
+    value produce different digests. Both arms named before running, since a serializer that dropped
+    the value would satisfy the first alone.
+16. A round trip on the shared function: parse, serialize, re-parse, serialize, and require byte
+    equality.
