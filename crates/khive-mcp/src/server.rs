@@ -2797,6 +2797,11 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
         }
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
+        RuntimeError::RemoteFetchError { remote, message } => json!({
+            "kind": "remote_fetch_error",
+            "remote": remote,
+            "message": message,
+        }),
         other @ (RuntimeError::Storage(_)
         | RuntimeError::Sqlite(_)
         | RuntimeError::Query(_)
@@ -2826,7 +2831,6 @@ fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> V
         | RuntimeError::RemoteCacheMissing { .. }
         | RuntimeError::AmbiguousId { .. }
         | RuntimeError::CrossNamespaceWrite { .. }
-        | RuntimeError::RemoteFetchError { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
         | RuntimeError::SecretDetected(_)
         | RuntimeError::DeadlineExceeded { .. }) => {
@@ -6537,6 +6541,87 @@ mod tests {
             tool: "probe".to_string(),
             future,
         }
+    }
+
+    struct RemoteFetchErrorPack;
+
+    impl khive_types::Pack for RemoteFetchErrorPack {
+        const NAME: &'static str = "remote-fetch-error-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "remote_fetch_failure",
+            description: "returns a typed remote fetch failure",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for RemoteFetchErrorPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::RemoteFetchError {
+                remote: "broken-origin".to_string(),
+                message: "injected fetch failure".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn request_remote_fetch_error_retains_structured_fields() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RemoteFetchErrorPack);
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "remote_fetch_failure()".to_string(),
+                presentation: Some("verbose".to_string()),
+                format: Some("json".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("remote fetch failure must remain a per-op error");
+        let envelope: Value = serde_json::from_str(&response).expect("request envelope");
+        assert_eq!(envelope["summary"]["failed"], 1, "{envelope}");
+        assert_eq!(envelope["summary"]["succeeded"], 0, "{envelope}");
+        let results = envelope["results"].as_array().expect("per-op results");
+        assert_eq!(results.len(), 1, "{envelope}");
+        assert_eq!(results[0]["ok"], false);
+        assert_eq!(results[0]["tool"], "remote_fetch_failure");
+        assert_eq!(
+            results[0]["error"],
+            json!({
+                "kind": "remote_fetch_error",
+                "remote": "broken-origin",
+                "message": "injected fetch failure",
+                "domain_disposition": "unknown",
+            }),
+            "{envelope}"
+        );
     }
 
     struct LargeResultPack;

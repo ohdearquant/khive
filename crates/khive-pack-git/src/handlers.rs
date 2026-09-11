@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use anyhow::anyhow;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -26,19 +25,27 @@ use crate::source::{
 use crate::GitPack;
 
 /// Recover the typed error when a digest ingest/resolution failure chain
-/// carries a storage-class failure (for example a reader admission timeout
-/// under concurrent load), so resource exhaustion is not reported as the
-/// caller's invalid input. Every other failure keeps the established
-/// invalid-input shape.
+/// carries a storage or remote-cache failure, rather than blaming the
+/// caller's input for an infrastructure failure.
 fn digest_failure_to_runtime(e: anyhow::Error) -> RuntimeError {
     let e = match e.downcast::<RuntimeError>() {
-        Ok(rte @ RuntimeError::Storage(_)) => return rte,
+        Ok(rte @ (RuntimeError::Storage(_) | RuntimeError::RemoteFetchError { .. })) => return rte,
         Ok(other) => return RuntimeError::InvalidInput(other.to_string()),
         Err(e) => e,
     };
     match e.downcast::<khive_storage::StorageError>() {
         Ok(se) => RuntimeError::Storage(se),
         Err(e) => RuntimeError::InvalidInput(e.to_string()),
+    }
+}
+
+fn remote_cache_error(remote: &str, stage: &str, error: CacheError) -> RuntimeError {
+    RuntimeError::RemoteFetchError {
+        remote: redact_repo_url(remote),
+        message: format!(
+            "{stage}: {}",
+            cache::sanitize_diagnostic(&error.to_string())
+        ),
     }
 }
 
@@ -87,18 +94,26 @@ impl RemoteCommitRecovery {
                 // ownership-guard failure is terminal: it is not a signal
                 // that a fresh clone would fare any differently, and is
                 // never worth risking a second destructive operation for.
-                Err(CacheError::Git(_)) => {
+                Err(error @ CacheError::Git(_)) => {
                     self.stage = RemoteRecoveryStage::Refetched;
-                    self.reclone()
+                    self.reclone(Some(error))
                 }
-                Err(e) => Err(anyhow!("cache repair (refetch) failed: {e}")),
+                Err(error) => Err(remote_cache_error(
+                    &self.canonical_url,
+                    "cache repair (refetch) failed",
+                    error,
+                )
+                .into()),
             },
-            RemoteRecoveryStage::Refetched => self.reclone(),
+            RemoteRecoveryStage::Refetched => self.reclone(None),
             RemoteRecoveryStage::Recloned => Ok(None),
         }
     }
 
-    fn reclone(&mut self) -> anyhow::Result<Option<RecoveredRepo>> {
+    fn reclone(
+        &mut self,
+        refetch_error: Option<CacheError>,
+    ) -> anyhow::Result<Option<RecoveredRepo>> {
         match cache::reclone(&self.canonical_url) {
             Ok(repo) => {
                 self.stage = RemoteRecoveryStage::Recloned;
@@ -107,7 +122,16 @@ impl RemoteCommitRecovery {
                     strategy: CacheRepairStrategy::Reclone,
                 }))
             }
-            Err(e) => Err(anyhow!("cache repair (reclone) failed: {e}")),
+            Err(error) => {
+                let stage = match refetch_error {
+                    Some(refetch) => format!(
+                        "cache repair (reclone) failed after refetch failed ({})",
+                        cache::sanitize_diagnostic(&refetch.to_string())
+                    ),
+                    None => "cache repair (reclone) failed".into(),
+                };
+                Err(remote_cache_error(&self.canonical_url, &stage, error).into())
+            }
         }
     }
 }
@@ -169,13 +193,13 @@ impl GitPack {
                     let canonical = canonical.clone();
                     tokio::task::spawn_blocking(move || cache::ensure_clone(&canonical))
                         .await
-                        .map_err(|e| RuntimeError::RemoteFetchError {
+                        .map_err(|_| RuntimeError::RemoteFetchError {
                             remote: redacted.clone(),
-                            message: format!("clone task panicked or was cancelled: {e}"),
+                            message: "initial cache setup: clone task panicked or was cancelled"
+                                .into(),
                         })?
-                        .map_err(|e| RuntimeError::RemoteFetchError {
-                            remote: redacted,
-                            message: e.to_string(),
+                        .map_err(|e| {
+                            remote_cache_error(&redacted, "initial cache setup failed", e)
                         })?
                 } else {
                     std::env::current_dir().map_err(|e| {
@@ -2196,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_failure_preserves_storage_class_and_flattens_the_rest() {
+    fn digest_failure_preserves_storage_and_remote_types() {
         // A storage-class failure inside the ingest chain (here: a
         // writer-handle admission timeout under load) must surface typed,
         // not as the caller's invalid input.
@@ -2227,7 +2251,21 @@ mod tests {
             RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
         ));
 
-        // Non-storage runtime failures keep the established invalid-input
+        let remote = anyhow::Error::new(remote_cache_error(
+            "https://user:tok3n@example.com/repo?token=SECRET",
+            "cache repair (refetch) failed",
+            CacheError::Io(std::io::Error::other("cache directory unavailable")),
+        ))
+        .context("preparing commit snapshot");
+        assert!(matches!(
+            digest_failure_to_runtime(remote),
+            RuntimeError::RemoteFetchError { remote, message }
+                if remote == "https://example.com/repo"
+                    && message.contains("cache repair (refetch) failed")
+                    && message.contains("scratch-cache I/O error")
+        ));
+
+        // Other runtime failures keep the established invalid-input
         // shape, message intact.
         let not_found = anyhow::Error::new(RuntimeError::NotFound("proj-x".to_string()));
         match digest_failure_to_runtime(not_found) {
@@ -2236,7 +2274,7 @@ mod tests {
         }
 
         // Plain anyhow context errors keep the established shape as well.
-        match digest_failure_to_runtime(anyhow!("gh probe failed")) {
+        match digest_failure_to_runtime(anyhow::anyhow!("gh probe failed")) {
             RuntimeError::InvalidInput(msg) => assert_eq!(msg, "gh probe failed"),
             other => panic!("untyped failure must flatten to InvalidInput, got {other:?}"),
         }

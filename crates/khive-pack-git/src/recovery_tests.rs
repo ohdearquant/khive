@@ -254,6 +254,19 @@ LOCAL_ORIGIN="{local_origin}"
 printf '%s\n' "$*" >> "$LOG_DIR/git_args.log"
 
 case " $* " in
+  *" clone "*)
+    COUNT_FILE="$LOG_DIR/clone.count"
+    n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$COUNT_FILE"
+    if [ "$n" -gt 1 ] && [ -f "$LOG_DIR/fail-reclone" ]; then
+      echo "fatal: simulated authentication failure for '$FAKE_URL'" 1>&2
+      exit 1
+    fi
+    ;;
+esac
+
+case " $* " in
   *" --name-only "*)
     COUNT_FILE="$LOG_DIR/name_only.count"
     n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
@@ -261,6 +274,9 @@ case " $* " in
     echo "$n" > "$COUNT_FILE"
     limit="${{KHIVE_TEST_GIT_FAIL_NAME_ONLY_UNTIL:-0}}"
     if [ "$n" -le "$limit" ]; then
+      if [ -f "$LOG_DIR/remove-marker" ]; then
+        rm -- "$(cat "$LOG_DIR/remove-marker")"
+      fi
       echo "fatal: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef is in the commit graph file, but not in the object database" 1>&2
       echo "fatal: could not fetch from promisor remote" 1>&2
       exit 1
@@ -367,6 +383,86 @@ fn add_commit(repo: &Path, rel: &str, contents: &str, message: &str) {
     std::fs::write(repo.join(rel), contents).unwrap();
     git(repo, &["add", rel]);
     git(repo, &["commit", "-q", "-m", message]);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn public_digest_recovery_cache_failures_keep_remote_type_and_stage() {
+    let _env = env_guard().await;
+    for unsafe_refetch in [true, false] {
+        let bin_dir = tempfile::tempdir().expect("bin dir");
+        let log_dir = tempfile::tempdir().expect("log dir");
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let origin = tempfile::tempdir().expect("origin dir");
+        init_origin_with_one_commit(origin.path());
+        let remote = "https://user:tok3n@github.com/khive-fixture/recovery-type?token=SECRET";
+        write_fake_git_redirecting_clone(bin_dir.path(), log_dir.path(), remote, origin.path());
+        if unsafe_refetch {
+            std::fs::write(
+                log_dir.path().join("remove-marker"),
+                scratch
+                    .path()
+                    .join(crate::source::cache_key(remote))
+                    .join(".khive-last-used")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(log_dir.path().join("fail-reclone"), b"").unwrap();
+        }
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+        std::env::set_var("KHIVE_TEST_GIT_FAIL_NAME_ONLY_UNTIL", "1");
+        std::env::set_var("KHIVE_TEST_GIT_FAIL_REFETCH_UNTIL", "1");
+        let path_guard = PathGuard::install(bin_dir.path());
+        let (_rt, _token, registry) = fixture().await;
+        let project = create(&registry, json!({"kind":"project", "name":"recovery-type"})).await;
+        let result = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source":remote, "project":project.to_string(), "include":["commits"]
+                }),
+            )
+            .await;
+        drop(path_guard);
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+        std::env::remove_var("KHIVE_TEST_GIT_FAIL_NAME_ONLY_UNTIL");
+        std::env::remove_var("KHIVE_TEST_GIT_FAIL_REFETCH_UNTIL");
+
+        let error = result.expect_err("cache repair must fail");
+        let khive_runtime::RuntimeError::RemoteFetchError { remote, message } = error else {
+            panic!("recovery cache failure must remain typed: {error:?}");
+        };
+        assert_eq!(remote, "https://github.com/khive-fixture/recovery-type");
+        assert!(
+            !message.contains("tok3n") && !message.contains("SECRET"),
+            "{message}"
+        );
+        let args_log = log_dir.path().join("git_args.log");
+        assert_eq!(count_lines(&args_log, "--name-only"), 1);
+        if unsafe_refetch {
+            assert!(
+                message.contains("cache repair (refetch) failed"),
+                "{message}"
+            );
+            assert!(message.contains("owned cache slot"), "{message}");
+            assert_eq!(count_lines(&args_log, "--refetch"), 0);
+            assert_eq!(count_lines(&args_log, " clone "), 1);
+        } else {
+            assert!(
+                message.contains("cache repair (reclone) failed"),
+                "{message}"
+            );
+            assert!(message.contains("simulated refetch failure"), "{message}");
+            assert!(
+                message.contains("simulated authentication failure"),
+                "{message}"
+            );
+            assert_eq!(count_lines(&args_log, "--refetch"), 1);
+            assert_eq!(count_lines(&args_log, " clone "), 2);
+        }
+    }
 }
 
 /// The literal #765 acceptance criterion: a corrupt promisor cache digests
