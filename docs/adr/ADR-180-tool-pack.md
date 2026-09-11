@@ -315,11 +315,18 @@ asking operators to pick.
    asked. `tool.request` already takes a scope and now uses it for the pre-check it performs before
    recording a request. Nothing infers a scope from arguments the caller did not send.
 
-5. **Scope ranks below actor and tool in specificity**, as a fourth state added to the existing sum:
-   absent 0, `*` 1, a trailing-`*` prefix 2, exact 3. So a scoped row beats an unscoped one for the
-   same actor and tool, while a more specific actor or tool still outranks a more specific scope.
-   The closed decision ranking, deny over ask over allow, and the `created_at ASC, id ASC` tiebreak
-   are untouched.
+5. **Scope is a fourth addend in the existing specificity sum**: absent 0, `*` 1, a trailing-`*`
+   prefix 2, exact 3. So a scoped row beats an unscoped one for the same actor and tool. It does
+   NOT rank below actor and tool, and saying it did would describe a precedence the ordering does
+   not have: `select_deciding_policy` orders by the SUM of the ranks, and a sum of comparable
+   weights has no dimension precedence. A row with `actor *` and an exact scope sums higher than a
+   row with an exact actor and no scope, so the broader-actor row wins. That is a real consequence
+   and it is accepted here rather than described away, because the alternative is a lexicographic
+   ordering over actor then tool then scope, which would also stop `lambda:*` with an exact tool
+   from tying an exact actor with `tool.*`, and that is a change to today's behaviour for unscoped
+   rows that does not belong in this amendment. Acceptance arm 34 pins the crossing case so the
+   behaviour is asserted rather than assumed. The closed decision ranking, deny over ask over
+   allow, and the `created_at ASC, id ASC` tiebreak are untouched.
 
 6. **Row identity is the quadruple.** Amendment 3 makes a policy correctable by upserting on the
    triple `(namespace, actor, tool)`; with a scope in the table that identity is
@@ -387,3 +394,11 @@ The column is a prerequisite for that work, not a substitute for it.
     through to matching instead of excluding, which is the widening direction. Arms 27, 28 and 29 go
     red and arms 26 and 31 stay green. That separation is what proves those arms test the narrowing
     rule rather than the presence of the column.
+34. **The crossing arm, and the one the rest of this set does not cover.** Two rows: A denies, with
+    an exact actor, an exact tool and no scope, summing to 4. B allows, with `actor *`, the same
+    exact tool and an exact scope, summing to 5. A call by that actor on that tool carrying that
+    scope matches both, and the arm asserts which one decides. B does, because the ordering is a
+    sum; the arm exists so that this is a pinned behaviour rather than a surprise read off a
+    ranking. Arm 28 crosses a scoped allow against an unscoped deny for the SAME actor and tool,
+    which is the safe case; nothing before this arm crosses scope specificity against actor
+    specificity, which is the case where the sum lets a broader actor win.
