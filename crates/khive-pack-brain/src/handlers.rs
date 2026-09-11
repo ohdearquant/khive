@@ -107,7 +107,11 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             bound `until` in the past for a closed population. Exhaustive windows matching more than \
             2,000,000 events are rejected rather than returned as partial aggregates; narrow \
             since/until or add actor/kind filters. Scope defaults to the caller; named foreign \
-            actors must be visible, and all_actors=true requires the serving brain.fleet_readers allowlist.",
+            actors must be visible, and all_actors=true requires the serving brain.fleet_readers \
+            allowlist. The window covers exactly one namespace: the caller's own, or the one named \
+            by an explicit `namespace=` argument. The result's `scope` states which namespace the \
+            answer covered and which others this caller may ask for the same way; rows written to \
+            any other namespace are absent from these counts rather than counted as zero.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -1025,6 +1029,22 @@ impl BrainPack {
             None => vec![caller.clone()],
         };
 
+        // The event plane is read through a store scoped to exactly one
+        // namespace (`Runtime::events` opens `token.namespace()` and the SQL
+        // pins `namespace = ?`), so a visibility set does not widen this
+        // window the way it widens a note read. Name the namespace the answer
+        // covers, and name the others this caller may ask for by passing
+        // `namespace=`, so an undercount is legible from the result itself.
+        let scope_namespace = token.namespace().as_str().to_string();
+        let mut scope_other: Vec<String> = token
+            .visible_namespace_strs()
+            .iter()
+            .map(|n| n.to_string())
+            .filter(|n| n != &scope_namespace)
+            .collect();
+        scope_other.sort();
+        scope_other.dedup();
+
         let store = self.runtime.events(token)?;
         let base_filter = EventFilter {
             actors: actor_filters,
@@ -1144,6 +1164,16 @@ impl BrainPack {
             "truncated": truncated,
             "window_event_total": window_event_total,
             "exhaustive": exhaustive,
+            // The scope the answer was computed under, stated rather than
+            // implied. `namespace` is the single namespace this window covers;
+            // `other_namespaces` are the ones this caller may read by asking
+            // for them explicitly, and whose rows are absent here. A caller can
+            // therefore tell a real zero from an out-of-scope population, and
+            // knows what to pass to reach the rest.
+            "scope": {
+                "namespace": scope_namespace,
+                "other_namespaces": scope_other,
+            },
         });
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
         if !by_profile.is_empty() {
