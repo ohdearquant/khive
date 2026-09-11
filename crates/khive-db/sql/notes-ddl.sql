@@ -17,12 +17,26 @@ CREATE TABLE IF NOT EXISTS notes (
     properties   TEXT,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
-    deleted_at   INTEGER
+    deleted_at   INTEGER,
+    key          TEXT,
+    version      INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TRIGGER IF NOT EXISTS bump_note_version
+AFTER UPDATE ON notes
+WHEN NEW.version = OLD.version
+BEGIN
+    UPDATE notes SET version = OLD.version + 1 WHERE id = NEW.id;
+END;
 
 CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
+
+-- Fresh/direct-store counterpart of migration 028 (ADR-179).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
+    ON notes(namespace, kind, key)
+    WHERE key IS NOT NULL AND deleted_at IS NULL;
 
 -- Partial index for the unread-message probe (comm unread badge + inbox
 -- unread listing/count projection). Its WHERE clause is the exact predicate the

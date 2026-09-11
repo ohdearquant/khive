@@ -1050,3 +1050,86 @@ handler's admitted work correlatable in the audit substrate.
   forwarding future from reaching completion.
 - An omitted request id is replaced with a nonzero bridge id exactly once per
   admitted attempt; an explicit caller value is unchanged.
+
+## Amendment 9 (2026-09-10): bounded reconnect and classified read replay
+
+This amendment chooses client-side reconnect rather than simultaneous live-socket
+replacement. Binding a temporary socket and renaming it over the public path is
+not sufficient under the current live-incumbent refusal, exclusive PID claim,
+and boot serialization contract. It would require a separate ownership protocol
+for overlapping daemon lifetimes. The socket path can still be absent or refused
+during a stop/start; there is no atomic-publication or zero-failure guarantee.
+
+### Shutdown and recovery ordering
+
+When the accept loop stops, the daemon closes its listener before draining
+admitted connections and tracked background work. An unaccepted kernel backlog
+is not admitted work and must not accept new frames without a handler. Startup
+preserves an eligible live incumbent PID even when its socket is absent or
+refuses connections: a closed listener does not mean draining work has finished.
+This check protects serving ownership, not bootstrap work performed before the
+dispatcher reaches this check. A recycled live PID can conservatively defer
+direct startup; client recovery retains its separate process-identity check.
+
+Recovery retains its recoverer-only lock across confirmation, signaling, exit
+waiting, and the launch decision. It signals the observed incumbent under the
+boot lock, releases that lock during bounded exit waiting so incumbent shutdown
+can acquire it, then reacquires it and re-probes before cleanup or launch. A
+changed PID or newly answering listener suppresses both unlink and launch.
+The predecessor's shutdown still requires matching PID and socket device/inode
+before unlinking; a same-directory rename by a successor therefore cannot make
+old cleanup remove the successor's socket.
+
+### Retry boundary
+
+For `ENOENT` or `ECONNREFUSED` with a recorded live PID, clients poll at 100 ms
+intervals for at most ten seconds, bounded further by the caller's original
+request deadline. These attempts do not initiate lifecycle recovery. If the
+window ends while the caller remains active, the existing recovery path decides
+whether the daemon is genuinely absent. An expired or cancelled caller does not
+start fresh recovery. Policy/access errors remain terminal, as in Amendment 4.
+
+The MCP bridge additionally classifies the entire parsed request using trusted
+built-in registry membership. Only these five handlers qualify for replay:
+`stats`, `comm.thread`, `comm.inbox`, `comm.unread`, and `comm.delivered`. Each is
+read-only with respect to domain state for every argument combination. Singles,
+parallel batches, and chains qualify only when every operation qualifies,
+including a chain of three `comm.thread` calls. References to previous results
+do not widen this set. Empty, malformed, mixed, mutating, unknown, custom, and
+mounted requests do not qualify. `help=true` and `dry_run=true` do not grant
+exceptions for other verbs. Unclassified forwarding entry points, including CLI
+callers, retain the default no-replay policy. The policy is local to the bridge;
+the wire protocol is unchanged.
+
+Only EOF/reset after a complete request write enables this read-only replay.
+The bridge can make at most two additional completed attempts, with 100 ms
+spacing and a single replay window of at most ten seconds, capped by the
+original caller deadline and any active reconnect deadline. Missing-socket
+polls consume time but not completed-attempt allowance. Cancellation prevents
+another replay but does not abandon an already-admitted exchange. Malformed
+frames/JSON, response timeouts, protocol mismatches, and explicit errors are
+not replayed. An identity rejection after a lost response remains terminal;
+exhaustion or later missing sockets never permit lifecycle recovery or local
+fallback after the original complete write.
+
+Ordinary audit accounting can repeat for a replayed read; no domain mutation
+is repeated. The same request-group id remains correlation, not deduplication.
+Read results can reflect a later snapshot. Every fully written request outside
+this closed opt-in set retains Amendment 3's terminal ambiguity rule. A lost
+response alone establishes neither daemon death nor a socket handover, so this
+policy does not attribute unexplained server-side disconnects to restarts.
+
+### Verification obligations
+
+Tests cover absent/refused live-owner reconnect, listener closure before drain,
+live-owner preservation, graceful exit without boot-lock inversion, changed
+ownership during exit, rename-safe cleanup, trusted whole-request classification,
+read replay limits, deadline/cancellation, terminal framing/protocol failures,
+and a lost mixed batch whose mutation must commit only once.
+
+The performance harness `scripts/perf/socket_handover_bench.py` offers actual MCP
+`stats()` requests every 50 ms during ten isolated stop/start cycles. Run the
+same harness against base and candidate binaries and report both failure counts
+per restart and the longest failure gap in milliseconds, even when the target
+of zero failures is missed. Compilation, tests, and these measurements are
+separate gates; source inspection does not establish their results.

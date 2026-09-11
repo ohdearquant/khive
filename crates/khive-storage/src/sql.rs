@@ -16,7 +16,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// [`SqlAccess::atomic_unit`] (ADR-067 Component A, Fork C slice 2).
 ///
 /// `op` receives a live `&mut dyn SqlWriter` already inside an open write
-/// transaction — it must issue DML only (no bare `BEGIN`/`COMMIT`/
+/// transaction — it may issue DML and synchronous read assertions (no bare `BEGIN`/`COMMIT`/
 /// `ROLLBACK`; the caller-visible transaction boundary is owned entirely by
 /// `atomic_unit`, exactly like the existing `execute_batch` contract) — and
 /// returns its result type-erased via `Box<dyn Any + Send>` so this trait
@@ -140,8 +140,9 @@ pub trait SqlAccess: Send + Sync + 'static {
     /// `KHIVE_WRITE_QUEUE=1`), `op` runs inside that task's one write
     /// transaction for this request — no separate connection is opened, so
     /// this call cannot compete with the writer task for SQLite's write
-    /// lock. Where no writer task applies (flag off, no runtime, or an
-    /// in-memory pool), `op` runs under a manual
+    /// lock. For an in-memory pool, one pool connection guard is retained
+    /// throughout the transaction. Where no writer task applies to a
+    /// file-backed pool, `op` runs under a manual
     /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on a writer handle exactly like
     /// calling [`Self::writer`] and driving the statements by hand — the
     /// pre-ADR-067 behavior, preserved byte-for-byte on this path.
@@ -157,11 +158,11 @@ pub trait SqlAccess: Send + Sync + 'static {
     /// `COMMIT`. First-poll enforcement alone cannot detect those operations;
     /// ADR-091's write-transaction audit table is the review-time guard, and a
     /// new owner or caller must update that table before merge. On the
-    /// single-writer path this is enforced at runtime: the writer task drives
+    /// single-writer and in-memory paths this is enforced at runtime: the backend drives
     /// `op` through a single-poll driver and
     /// returns a typed error the instant the future is `Pending`, so a
-    /// violation fails loudly rather than corrupting state. On the flag-off
-    /// path (no writer task active) a suspending `op` would currently
+    /// violation fails loudly rather than corrupting state. On the file-backed
+    /// flag-off path (no writer task active) a suspending `op` would currently
     /// *succeed* — that path drives `op` as an ordinary `.await` under a
     /// manual transaction — so the invariant is a correctness contract this
     /// trait asks every caller to uphold, not something the type system or

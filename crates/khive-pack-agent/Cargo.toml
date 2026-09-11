@@ -12,6 +12,8 @@ categories.workspace = true
 description = "Agent verb pack — spawn/resume/kill/suspend/observe wire surface over the runtime-owned agent process table (ADR-142 §1)"
 
 [dependencies]
+inventory.workspace = true
+tokio.workspace = true
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde", "blake3"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }

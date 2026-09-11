@@ -70,6 +70,9 @@ impl KgPack {
             "salience",
             "annotates",
             "embedding_content",
+            "key",
+            "embed",
+            "fence",
             "skip_dedup_check",
             "edges",
             "title",
@@ -106,6 +109,14 @@ impl KgPack {
         // a bulk item contained an unknown field.
         {
             let maybe_items = if params.get("items").is_some() {
+                if ["key", "embed", "fence"]
+                    .iter()
+                    .any(|field| params.get(*field).is_some())
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "key, embed and fence apply only to singleton notes".into(),
+                    ));
+                }
                 let raw = params["items"].clone();
                 match serde_json::from_value::<Vec<super::params::BulkCreateEntry>>(raw) {
                     Ok(entries) => Some(entries),
@@ -367,6 +378,11 @@ impl KgPack {
         }
 
         let p: CreateParams = deser(params.clone())?;
+        if p.kind != "note" && (p.key.is_some() || p.embed.is_some() || p.fence.is_some()) {
+            return Err(RuntimeError::InvalidInput(
+                "key, embed and fence apply only to notes".into(),
+            ));
+        }
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 
         let dedup_name: Option<String> = if !skip_dedup && p.kind == "entity" {
@@ -434,19 +450,64 @@ impl KgPack {
                     annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
                 }
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
-                let (note, embedding_report) = self
-                    .runtime
-                    .create_note_with_embedding_content_and_report(
-                        token,
-                        &canonical,
-                        p.name.as_deref(),
-                        &content,
-                        p.embedding_content.as_deref(),
-                        p.salience,
-                        properties,
-                        annotates,
-                    )
-                    .await?;
+                let result = if canonical == "head"
+                    || p.key.is_some()
+                    || p.embed.is_some()
+                    || p.fence.is_some()
+                {
+                    self.runtime
+                        .create_note_with_options(
+                            token,
+                            &canonical,
+                            p.name.as_deref(),
+                            &content,
+                            p.embedding_content.as_deref(),
+                            p.salience,
+                            None,
+                            properties,
+                            annotates,
+                            None,
+                            khive_runtime::note_write::NoteWriteOptions {
+                                key: p.key.clone(),
+                                embed: p.embed,
+                                fence: p.fence,
+                                expected_version: None,
+                            },
+                        )
+                        .await
+                } else {
+                    self.runtime
+                        .create_note_with_embedding_content_and_report(
+                            token,
+                            &canonical,
+                            p.name.as_deref(),
+                            &content,
+                            p.embedding_content.as_deref(),
+                            p.salience,
+                            properties,
+                            annotates,
+                        )
+                        .await
+                };
+                let (note, embedding_report) = result.map_err(|error| match error {
+                    RuntimeError::Khive(error)
+                        if error.details().and_then(|details| details.get("reason"))
+                            == Some("key_conflict") =>
+                    {
+                        let key = p.key.as_deref().unwrap_or("");
+                        if registry.allows_note_key_disclosure(token, &canonical, key) {
+                            RuntimeError::Khive(error)
+                        } else {
+                            RuntimeError::Khive(error.with_details(
+                                khive_types::Details::new_owned([
+                                    ("reason", "key_conflict".into()),
+                                    ("key", key.into()),
+                                ]),
+                            ))
+                        }
+                    }
+                    other => other,
+                })?;
                 let id = note.id;
                 (
                     remap_note_status(normalize_entity_timestamps(to_json(&note)?)),

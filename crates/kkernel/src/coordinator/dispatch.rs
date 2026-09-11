@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_runtime::{
-    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit, SearchSource,
+    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, RuntimeError, SearchHit,
+    SearchSource,
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
@@ -81,20 +82,60 @@ pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
     result.text
 }
 
+/// Stable classification for a failed fan-out backend leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSearchFailureKind {
+    BackendError,
+    Timeout,
+}
+
+/// Typed failure for one fan-out backend leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSearchFailure {
+    pub kind: BackendSearchFailureKind,
+    pub message: String,
+}
+
+impl BackendSearchFailure {
+    fn timeout(timeout_ms: u64) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::Timeout,
+            message: format!("backend search timed out after {timeout_ms}ms"),
+        }
+    }
+
+    pub(super) fn from_runtime_error(error: RuntimeError) -> Self {
+        let kind = if matches!(
+            &error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
+                | RuntimeError::DeadlineExceeded { .. }
+        ) {
+            BackendSearchFailureKind::Timeout
+        } else {
+            BackendSearchFailureKind::BackendError
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Result of a single backend's entity-search contribution to a fan-out.
 ///
 /// `hits` may be empty when the backend returned no results.
-/// `error` carries a whole-backend failure message (text arm, or a fatal
-/// error before either arm ran); a backend that reported one is treated as
-/// having contributed no hits at all. `vector_error` instead carries a
-/// vector-arm-only failure: the text arm still ran and `hits` still carries
-/// its results, so this backend is NOT `error`-failed.
+/// `error` carries the backend-specific typed failure for a whole-backend
+/// failure (text arm, or a fatal error before either arm ran); a backend that
+/// reported one is treated as having contributed no hits at all.
+/// `vector_error` instead carries a vector-arm-only failure: the text arm
+/// still ran and `hits` still carries its results, so this backend is NOT
+/// `error`-failed.
 #[derive(Debug)]
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
-    pub error: Option<String>,
+    pub error: Option<BackendSearchFailure>,
     pub vector_error: Option<String>,
 }
 
@@ -625,7 +666,7 @@ impl SubstrateCoordinator {
                         backend_id: backend_id.clone(),
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(e.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(e)),
                         vector_error: None,
                     };
                     return (vec![], vec![], vec![backend_result]);
@@ -692,7 +733,7 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(e.to_string()),
+                            error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
@@ -712,7 +753,7 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
@@ -766,7 +807,7 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(e.to_string()),
+                            error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
@@ -786,7 +827,7 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
@@ -1002,7 +1043,7 @@ impl SubstrateCoordinator {
                         backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(e.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(e)),
                         vector_error: None,
                     });
                 }
@@ -1019,7 +1060,7 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(error.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(error)),
                         vector_error: None,
                     });
                 }
@@ -1033,7 +1074,7 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        error: Some(BackendSearchFailure::timeout(timeout_ms)),
                         vector_error: None,
                     });
                 }
@@ -1047,7 +1088,7 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        error: Some(BackendSearchFailure::timeout(timeout_ms)),
                         vector_error: None,
                     });
                 }

@@ -78,7 +78,53 @@ state machine.
 
 If the entire MCP response is lost, the caller receives neither the result nor
 the structured error and therefore does not know the server-generated UUID.
-`comm.delivered` cannot resolve that wider response-loss case.
+Use a caller-chosen key for that wider response-loss case.
+
+### Recover a send or reply by key
+
+`comm.send` and `comm.reply` accept an optional `idempotency_key`. Pin the
+same sending actor, write namespace, key and request across attempts:
+
+```python
+first = session.send("actor:recipient", "Ready for review", subject="Update",
+                     idempotency_key="update-42", namespace="project")
+recovery = session.send("actor:recipient", "Ready for review", subject="Update",
+                        idempotency_key="update-42", namespace="project")
+```
+
+A successful first call returns `replayed: false`; a matching replay returns
+`replayed: true` with the original `full_id`, `recipient_id`, `thread_id` and
+`sent_at`. It creates no message copies, sends no new inbox signal, and does
+not repeat a reply's parent mark-read. Python `Session.send` and `Session.reply`
+return the raw per-operation outcome, including errors; they do not retry an
+operation error or a lost response automatically.
+
+Keys are exact strings of at most 512 UTF-8 bytes and cannot contain U+0000.
+Empty keys and other control characters are allowed. Different sending actors
+or explicit write namespaces have independent keys. Matching requests preserve
+the operation kind, trimmed recipient, exact body, optional subject, optional
+caller-supplied thread UUID, and tags. Omitted tags equal an empty list; order
+and duplicates otherwise matter. For replies, the resolved original message
+UUID also matters: a prefix and full spelling of that same UUID match, while
+two distinct parent notes do not. Omitted send thread IDs remain distinct from
+explicitly supplying the generated root UUID on a later call.
+
+Reusing a live key for different mail, or finding a missing or inconsistent
+recipient copy, returns a structured conflict with `details.reason=key_conflict`,
+the logical key, `existing_id`, and `domain_disposition=not_committed` for that
+attempt. No repair is performed. If a competing claim's holder disappears
+during reconciliation, the outcome is unknown; the server does not silently
+start a fresh insert.
+
+Both copies expose `properties.idempotency_key` through inbox and thread
+readback; `fields=["full_id", "idempotency_key"]` projects it directly.
+Marking an inbound message read retains the property. Outbound messages keep
+their existing mark-read refusal. Deleting the outbound claim releases the
+key: reuse can create a new pair even if the old inbound copy remains. This
+is recovery while the live claim exists, not permanent deduplication. Calls
+without a key keep their existing behavior and create a new pair each time.
+Older servers reject the unsupported `idempotency_key` argument instead of
+silently sending unkeyed mail. The client preserves that error without fallback.
 
 ### Inbox
 

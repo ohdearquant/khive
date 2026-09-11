@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, KhiveRpcError
+from khive_contract.client import KhiveMcpSession, KhiveRpcError, error_text
 from khive_contract.schema import assert_envelope
 
 VERBS_UNDER_TEST = {"create", "get", "link", "update"}
@@ -120,14 +120,14 @@ def test_short_uuid_prefix_resolution_rules(
                                                                          "namespace": temp_namespace}}])
     first_7 = envelope_7["results"][0]
     assert not first_7.get("ok", False), "7-char prefix should fail"
-    assert first_7.get("error"), f"7-char prefix error message must be non-empty"
+    assert error_text(first_7), f"7-char prefix error message must be non-empty"
 
     # Non-hex 8-char must fail
     envelope_bad = khive_session.request_batch([{"tool": "get", "args": {"id": prefix_bad,
                                                                            "namespace": temp_namespace}}])
     first_bad = envelope_bad["results"][0]
     assert not first_bad.get("ok", False), "Non-hex prefix should fail"
-    assert first_bad.get("error"), f"Non-hex prefix error message must be non-empty"
+    assert error_text(first_bad), f"Non-hex prefix error message must be non-empty"
 
 
 @pytest.mark.adr_016
@@ -179,7 +179,7 @@ def test_request_response_envelope_matches_schema(
     assert_envelope(error_envelope)
     first = error_envelope["results"][0]
     assert first.get("ok") is False
-    assert first.get("error"), "Per-op error must have an error string"
+    assert error_text(first), "Per-op error must carry a non-empty message"
 
 
 @pytest.mark.adr_016

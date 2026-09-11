@@ -797,8 +797,8 @@ expires before invocation is recorded `not_invoked`, returned to `pending`, and 
 an action failure. Recovery isolates each expired-row write failure so one poisoned row is counted
 and logged without blocking later rows or newly due work. Legacy pre-receipt claims retain the
 historical five-minute reclaim path.
-Repeat creation accepts only `daily`/`weekly`/`monthly`; five-field cron is rejected because it
-cannot be advanced safely.
+Repeat creation accepts `daily`/`weekly`/`monthly`, `every:<N><s|m|h|d>` intervals, and five-field
+cron in UTC, the forms the executor advances; anything else is rejected at creation.
 
 There is no `--limit`/batch-size flag for the drain (pagination is a hardcoded internal constant)
 and no dry-run mode. **Exit code caveat**: per-event failures accumulate into the printed JSON

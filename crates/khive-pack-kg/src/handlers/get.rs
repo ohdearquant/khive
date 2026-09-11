@@ -31,6 +31,46 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
+        if let Some(key) = &p.key {
+            if p.id.is_some() || p.include_deleted == Some(true) {
+                return Err(RuntimeError::InvalidInput(
+                    "key lookup excludes id and include_deleted=true".into(),
+                ));
+            }
+            let specific = match p.kind.as_deref() {
+                None => None,
+                Some(kind) => match super::common::resolve_kind_spec(kind, registry)? {
+                    super::common::KindSpec::Note { specific } => specific,
+                    _ => {
+                        return Err(RuntimeError::InvalidInput(
+                            "key lookup applies only to notes".into(),
+                        ))
+                    }
+                },
+            };
+            let kind = super::common::reconcile_specific(
+                specific,
+                p.note_kind.as_deref(),
+                |kind| super::common::canonical_note_kind(kind, registry),
+                "note_kind",
+            )?;
+            let note = self
+                .runtime
+                .get_note_by_key(token, key, kind.as_deref(), false)
+                .await?;
+            return flatten_get_result(
+                "note",
+                remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
+            );
+        }
+        if p.kind.is_some() || p.note_kind.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "kind and note_kind require key lookup".into(),
+            ));
+        }
+        let id_ref = p.id.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidInput("get requires exactly one of id or key".into())
+        })?;
 
         // By-ID resolution (including the hex-prefix form) is namespace-agnostic
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
@@ -39,13 +79,13 @@ impl KgPack {
         // rows — required both for `include_deleted=true` and for the
         // merged_into disclosure below (absorbed entities are soft-deleted, so
         // a live-only prefix scan would miss them before the hint could fire).
-        let id = match resolve_id_through_arms(&p.id, &self.runtime, graph_token, token).await? {
+        let id = match resolve_id_through_arms(id_ref, &self.runtime, graph_token, token).await? {
             Some(id) => id,
             None => {
-                if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
+                if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
                     return Ok(payload_val);
                 }
-                return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+                return Err(RuntimeError::NotFound(format!("not found: {id_ref}")));
             }
         };
 
@@ -155,7 +195,7 @@ impl KgPack {
             }
         }
 
-        if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
+        if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
             return Ok(payload_val);
         }
 
@@ -163,7 +203,7 @@ impl KgPack {
             return Err(RuntimeError::NotFound(hint));
         }
 
-        Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
+        Err(RuntimeError::NotFound(format!("not found: {id_ref}")))
     }
 
     /// Annotating notes for an edge (#803): the `annotates` convention only

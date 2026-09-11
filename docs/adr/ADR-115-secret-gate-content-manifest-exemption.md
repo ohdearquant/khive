@@ -1031,3 +1031,22 @@ replaced by the canonical redaction marker" — holds only for content the maske
 Content dropped whole for exceeding the window is never detected, matched, or marked; it is simply
 never echoed. Both outcomes satisfy the same goal (no credential fragment survives to the caller),
 by different means.
+
+## Amendment: bare revision context and refusal diagnostics (2026-09-10)
+
+The ordinary detector treats a standalone, delimiter-stripped token of exactly 40 ASCII hex
+digits as line-local within the
+existing 120-byte context radius. A delimited credential-label line immediately preceding the
+value remains trigger context; blank intervening lines break that association. Other hex
+lengths, inline assignments, reconstruction and provider/entropy rules retain their contracts.
+Multi-fragment bridge anchors and `0x`/`0X`-prefixed values retain full-window context.
+This is an explicit heuristic ambiguity tradeoff: unmarked revisions and real 40-hex values
+without local credential syntax cannot be distinguished by content alone. It does not confer
+provenance or alter manifest authorization. The precise CR/LF, radius and label rules are in
+[the algorithm specification](../../crates/khive-runtime/docs/api/secret_gate.md#bare-git-length-hex-context-and-refusal-diagnostics-2026-09-10).
+
+`SecretMatch` gains an optional canonical trigger name. Its display includes the detector and
+trigger when applicable, with no candidate excerpt. The existing masked field remains available
+in the structured value. Known-prefix detections need no trigger; typed permanent-failure
+classification does not depend on the display string. This amendment changes neither storage
+schema nor exemption-manifest identity.

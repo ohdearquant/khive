@@ -120,6 +120,284 @@ fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
     Note::new(namespace, kind, content)
 }
 
+fn keyed_note(namespace: &str, kind: &str, key: &str) -> Note {
+    let mut note = make_note(namespace, kind, key);
+    note.key = Some(key.to_string());
+    note
+}
+
+fn assert_note_keys(notes: &[Note], expected_len: usize) {
+    assert_eq!(notes.len(), expected_len);
+    for note in notes {
+        assert_eq!(note.key.as_deref(), Some(note.content.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn note_key_round_trips_through_every_note_read_projection() {
+    let store = setup_memory_store();
+    let mut notes = vec![
+        keyed_note("local", "memory", "first"),
+        keyed_note("local", "memory", "second"),
+        keyed_note("local", "memory", "third"),
+    ];
+    for (index, note) in notes.iter_mut().enumerate() {
+        note.id = Uuid::from_u128(index as u128 + 1);
+        note.created_at = if index < 2 { 100 } else { 90 };
+    }
+    assert_eq!(store.upsert_notes(notes.clone()).await.unwrap().affected, 3);
+    let page = PageRequest {
+        offset: 0,
+        limit: 10,
+    };
+    let filter = NoteFilter {
+        kind: Some("memory".into()),
+        ..Default::default()
+    };
+    let first = store.get_note(notes[0].id).await.unwrap().unwrap();
+    assert_eq!(first, notes[0]);
+    assert_eq!(
+        store.get_note_including_deleted(first.id).await.unwrap(),
+        Some(first.clone())
+    );
+    assert_note_keys(
+        &store
+            .get_notes_batch(&[notes[0].id, notes[1].id])
+            .await
+            .unwrap(),
+        2,
+    );
+    assert_note_keys(
+        &store
+            .query_notes("local", Some("memory"), page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_count_free("local", Some("memory"), page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered("local", &filter, page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered_count_free("local", &filter, page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered_bounded("local", &filter, 10)
+            .await
+            .unwrap(),
+        3,
+    );
+
+    let seek_filter = NoteFilter {
+        after: Some(NoteSeekAfter {
+            created_at: first.created_at,
+            id: first.id,
+        }),
+        ..filter.clone()
+    };
+    let after = store
+        .query_notes_filtered_count_free("local", &seek_filter, page)
+        .await
+        .unwrap();
+    assert_note_keys(&after.items, 2);
+    assert_eq!(after.items[0].id, notes[1].id);
+    assert_eq!(after.items[1].id, notes[2].id);
+
+    let first_page = store
+        .query_notes_filtered_after("local", &filter, None, 1)
+        .await
+        .unwrap();
+    assert_note_keys(&first_page.items, 1);
+    assert_eq!(first_page.items[0].id, notes[0].id);
+    let second_page = store
+        .query_notes_filtered_after("local", &filter, first_page.next_after, 10)
+        .await
+        .unwrap();
+    assert_note_keys(&second_page.items, 2);
+    assert_eq!(second_page.items[0].id, notes[1].id);
+}
+
+#[tokio::test]
+async fn note_key_is_scoped_by_namespace_and_kind_and_released_by_delete() {
+    let store = setup_memory_store();
+    let first = keyed_note("local", "memory", "shared");
+    store.upsert_note(first.clone()).await.unwrap();
+    assert!(store
+        .upsert_note(keyed_note("local", "memory", "shared"))
+        .await
+        .is_err());
+    store
+        .upsert_note(keyed_note("other", "memory", "shared"))
+        .await
+        .unwrap();
+    store
+        .upsert_note(keyed_note("local", "reference", "shared"))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .upsert_note(make_note("local", "memory", "unkeyed"))
+            .await
+            .unwrap();
+    }
+
+    assert!(store.delete_note(first.id, DeleteMode::Soft).await.unwrap());
+    let deleted = store
+        .get_note_including_deleted(first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.key.as_deref(), Some("shared"));
+    assert!(deleted.deleted_at.is_some());
+    let second = keyed_note("local", "memory", "shared");
+    store.upsert_note(second.clone()).await.unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(store
+        .delete_note(second.id, DeleteMode::Hard)
+        .await
+        .unwrap());
+    assert!(store
+        .get_note_including_deleted(second.id)
+        .await
+        .unwrap()
+        .is_none());
+    let third = keyed_note("local", "memory", "shared");
+    store.upsert_note(third.clone()).await.unwrap();
+    assert_ne!(second.id, third.id);
+    assert_eq!(store.count_notes("local", Some("memory")).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn note_key_round_trips_through_insert_paths_without_changing_external_id_dedup() {
+    let store = setup_memory_store();
+    let first = keyed_note("local", "memory", "insert-only");
+    assert!(store.insert_note_if_absent(first.clone()).await.unwrap());
+    assert_eq!(store.get_note(first.id).await.unwrap(), Some(first.clone()));
+    assert!(!store.insert_note_if_absent(first).await.unwrap());
+    assert!(store
+        .insert_note_if_absent(keyed_note("local", "memory", "insert-only"))
+        .await
+        .is_err());
+
+    let second = keyed_note("local", "memory", "try-insert");
+    assert!(store.try_insert_note(second.clone()).await.unwrap());
+    assert_eq!(store.get_note(second.id).await.unwrap(), Some(second));
+    let error = store
+        .try_insert_note(keyed_note("local", "memory", "try-insert"))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("constraint other than external_id dedup"));
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(crate::migrations::MIGRATIONS[4].up)
+            .unwrap();
+    }
+    let props = serde_json::json!({"external_id": "external-1"});
+    assert!(store
+        .try_insert_note(make_note("local", "message", "first").with_properties(props.clone()))
+        .await
+        .unwrap());
+    assert!(!store
+        .try_insert_note(make_note("local", "message", "second").with_properties(props))
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn note_key_survives_existing_full_and_property_updates() {
+    let store = setup_memory_store();
+    let original = keyed_note("local", "memory", "immutable");
+    let id = original.id;
+    store.upsert_note(original.clone()).await.unwrap();
+    let sequence = store.note_sequence(id).await.unwrap();
+
+    for candidate_key in [None, Some("replacement".to_string())] {
+        let mut update = store.get_note(id).await.unwrap().unwrap();
+        update.key = candidate_key;
+        update.content = "updated".to_string();
+        update.updated_at += 1;
+        store.upsert_note(update).await.unwrap();
+        assert_eq!(store.get_note(id).await.unwrap().unwrap().key, original.key);
+    }
+
+    let mut batch_update = store.get_note(id).await.unwrap().unwrap();
+    batch_update.key = Some("batch-replacement".to_string());
+    batch_update.updated_at += 1;
+    assert_eq!(
+        store
+            .upsert_notes(vec![batch_update])
+            .await
+            .unwrap()
+            .affected,
+        1
+    );
+    let snapshot = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(snapshot.key, original.key);
+    let mut replacement = snapshot.clone();
+    replacement.key = None;
+    replacement.updated_at += 1;
+    assert!(store
+        .replace_note_if_unchanged(replacement, snapshot.updated_at, snapshot.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(store.get_note(id).await.unwrap().unwrap().key, original.key);
+
+    assert!(store
+        .update_note_properties(
+            id,
+            Some(serde_json::json!({"tags": ["one"]})),
+            snapshot.updated_at + 2
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .set_note_property(
+            id,
+            "tags",
+            serde_json::json!(["two"]),
+            snapshot.updated_at + 3
+        )
+        .await
+        .unwrap());
+    let final_note = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(final_note.key, original.key);
+    assert_eq!(
+        final_note.properties.unwrap()["tags"],
+        serde_json::json!(["two"])
+    );
+    assert_eq!(store.note_sequence(id).await.unwrap(), sequence);
+
+    let mut unkeyed = make_note("local", "memory", "no identity");
+    store.upsert_note(unkeyed.clone()).await.unwrap();
+    unkeyed.key = Some("late identity".to_string());
+    store.upsert_note(unkeyed.clone()).await.unwrap();
+    assert_eq!(store.get_note(unkeyed.id).await.unwrap().unwrap().key, None);
+}
+
 #[tokio::test]
 async fn test_upsert_and_get_note() {
     let store = setup_memory_store();

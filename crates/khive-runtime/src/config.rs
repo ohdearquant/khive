@@ -131,6 +131,7 @@ mod private {
 #[derive(Clone, Debug)]
 pub struct NamespaceToken {
     namespace: Namespace,
+    gate_namespace: Namespace,
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
@@ -156,6 +157,7 @@ impl NamespaceToken {
         }
         debug_assert!(!visible.is_empty(), "visible set must be non-empty");
         Self {
+            gate_namespace: namespace.clone(),
             namespace,
             visible,
             actor,
@@ -199,6 +201,18 @@ impl NamespaceToken {
         &self.namespace
     }
 
+    /// Return the namespace used by the originating dispatch's Gate check.
+    /// It can differ from the primary storage namespace on an implicit request.
+    /// Tokens minted directly, or reminted by `with_namespace`, use their primary.
+    pub fn gate_namespace(&self) -> &Namespace {
+        &self.gate_namespace
+    }
+
+    pub(crate) fn with_gate_namespace(mut self, namespace: Namespace) -> Self {
+        self.gate_namespace = namespace;
+        self
+    }
+
     /// Return the read-visibility set.
     ///
     /// List, search, and get operations must accept records whose namespace is
@@ -233,6 +247,7 @@ impl NamespaceToken {
     }
 
     /// Return a new token with the same actor but a different namespace.
+    /// The Gate namespace metadata is reset to the new primary namespace.
     ///
     /// The visible set is replaced with `[ns]`: this is a full read+write token
     /// for `ns`, not a type-enforced write-only or append-only capability. It is
@@ -275,6 +290,8 @@ pub fn process_ref_from_env() -> Option<String> {
 /// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Production boot passes this value to the async khive-mcp/kkernel host
@@ -361,6 +378,8 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Resolved `[brain]` policy from the serving process's configuration.
+    pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
@@ -368,6 +387,9 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
+    /// `git_write` so the exec pack reads an already-resolved config.
+    pub exec: crate::engine_config::ExecSectionConfig,
     /// Resolved rendering timezone (ADR-169), consumed today by date-only
     /// `parse_due` anchoring. Populated from `[display] timezone` in
     /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
@@ -464,7 +486,10 @@ impl Default for RuntimeConfig {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            exec: crate::engine_config::ExecSectionConfig::default(),
+            mounts: Vec::new(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
         }
@@ -484,6 +509,8 @@ impl RuntimeConfig {
             "schedule",
             "knowledge",
             "session",
+            "tool",
+            "exec",
             "git",
             "code",
             "workspace",
@@ -726,6 +753,7 @@ pub fn runtime_config_from_khive_config(
     // `[actor] id` never becomes the storage namespace (writes always pin to
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
+    let mounts = khive_cfg.mounts.clone();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -809,7 +837,9 @@ pub fn runtime_config_from_khive_config(
         })
         .unwrap_or_else(|| base.gate.clone());
 
+    let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();
+    let exec = khive_cfg.exec.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -834,7 +864,10 @@ pub fn runtime_config_from_khive_config(
             allowed_outbound_namespaces,
             actor_id,
             gate,
+            brain,
             git_write,
+            exec,
+            mounts,
             blob_hydration_bytes,
             display_timezone,
             ..base
@@ -872,7 +905,10 @@ pub fn runtime_config_from_khive_config(
         allowed_outbound_namespaces,
         actor_id,
         gate,
+        brain,
         git_write,
+        exec,
+        mounts,
         blob_hydration_bytes,
         display_timezone,
         ..base

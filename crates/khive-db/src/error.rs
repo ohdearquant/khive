@@ -7,6 +7,10 @@ use thiserror::Error;
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
+    /// A request stopped before a store constructor acquired its writer.
+    #[error(transparent)]
+    RequestReadStopped(khive_storage::StorageError),
+
     /// Underlying rusqlite driver error.
     #[error("sqlite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),

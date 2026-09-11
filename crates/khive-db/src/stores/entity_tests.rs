@@ -874,6 +874,127 @@ async fn test_query_by_kind_and_entity_type() {
     assert_eq!(result.items[0].entity_type, Some("researcher".to_string()));
 }
 
+#[tokio::test]
+async fn test_legacy_entity_type_filter_is_opt_in_and_preserves_column_precedence() {
+    let store = setup_memory_store();
+    let legacy = Entity::new("local", "concept", "Legacy")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    let typed = Entity::new("local", "concept", "Typed")
+        .with_entity_type(Some("algorithm"))
+        .with_properties(serde_json::json!({"type": "technique"}));
+    let overridden = Entity::new("local", "concept", "Overridden")
+        .with_entity_type(Some("technique"))
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    for entity in [&legacy, &typed, &overridden] {
+        store.upsert_entity(entity.clone()).await.unwrap();
+    }
+    for properties in [
+        serde_json::json!({}),
+        serde_json::json!({"type": null}),
+        serde_json::json!({"type": 7}),
+        serde_json::json!({"type": true}),
+        serde_json::json!({"type": ["algorithm"]}),
+        serde_json::json!({"type": {"name": "algorithm"}}),
+        serde_json::json!({"type": "Algorithm"}),
+    ] {
+        store
+            .upsert_entity(Entity::new("local", "concept", "Unmatched").with_properties(properties))
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_entity(Entity::new("local", "concept", "NoProperties"))
+        .await
+        .unwrap();
+    store
+        .upsert_entity(
+            Entity::new("foreign", "concept", "Foreign")
+                .with_properties(serde_json::json!({"type": "algorithm"})),
+        )
+        .await
+        .unwrap();
+    let mut deleted = Entity::new("local", "concept", "Deleted")
+        .with_properties(serde_json::json!({"type": "algorithm"}));
+    deleted.deleted_at = Some(deleted.created_at);
+    store.upsert_entity(deleted).await.unwrap();
+
+    let exact = EntityFilter {
+        entity_types: vec!["algorithm".into()],
+        ..Default::default()
+    };
+    let control = store
+        .query_entities("local", exact.clone(), PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(control.items.len(), 1);
+    assert_eq!(control.items[0].id, typed.id);
+    assert_eq!(control.total, Some(1));
+
+    let fallback = EntityFilter {
+        legacy_entity_type_fallback: true,
+        ..exact
+    };
+    let non_string_filter = EntityFilter {
+        entity_types: vec![
+            "7".into(),
+            "1".into(),
+            "[\"algorithm\"]".into(),
+            "{\"name\":\"algorithm\"}".into(),
+        ],
+        ..fallback.clone()
+    };
+    assert_eq!(
+        store
+            .count_entities("local", non_string_filter)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .count_entities("local", fallback.clone())
+            .await
+            .unwrap(),
+        2
+    );
+    let mut page_ids = Vec::new();
+    for offset in 0..2 {
+        let page = store
+            .query_entities("local", fallback.clone(), PageRequest { offset, limit: 1 })
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(2));
+        assert_eq!(page.items.len(), 1);
+        page_ids.push(page.items[0].id);
+    }
+    page_ids.sort_unstable();
+    let mut expected = vec![legacy.id, typed.id];
+    expected.sort_unstable();
+    assert_eq!(page_ids, expected);
+
+    let first = store
+        .query_entities_after("local", fallback.clone(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].id, legacy.id);
+    let second = store
+        .query_entities_after("local", fallback.clone(), first.next_after, 1)
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].id, typed.id);
+    assert!(second.next_after.is_none());
+    let unchanged = store.get_entity(legacy.id).await.unwrap().unwrap();
+    assert!(unchanged.entity_type.is_none());
+    assert_eq!(unchanged.properties, legacy.properties);
+
+    let mut cleared = overridden;
+    cleared.entity_type = None;
+    store.upsert_entity(cleared).await.unwrap();
+    assert_eq!(store.count_entities("local", fallback).await.unwrap(), 3);
+}
+
 /// UUID is globally unique (id TEXT PRIMARY KEY). Upserting the same UUID in a
 /// different namespace overwrites the row (INSERT OR REPLACE). get_entity by ID
 /// returns whichever namespace currently owns that UUID.
