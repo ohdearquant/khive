@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [features]
+contract-faults = []
 fault-injection = []
 test-internals = []
 
@@ -46,6 +47,8 @@ unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }
+khive-request = { version = "0.8.0", path = "../khive-request" }
 # Self dev-dependency: requests this crate's own `fault-injection` and
 # `test-internals` features for its `tests/` integration binaries. Cargo's
 # feature unification means plain `cargo test -p khive-runtime` already
@@ -59,6 +62,9 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = "1"
 
 [build-dependencies]
 chrono = { workspace = true }

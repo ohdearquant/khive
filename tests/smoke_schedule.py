@@ -101,7 +101,13 @@ def call_verb_expect_error(proc, name, args):
         raise AssertionError(
             f"expected {name} to fail but it succeeded: {first.get('result')}"
         )
-    return first.get("error", "<no error string>")
+    err = first.get("error", "")
+    # Since the runtime started preserving domain outcomes, a per-op error is a
+    # structured object ({"kind", "message", "domain_disposition", ...}); the
+    # assertions below read its message text.
+    if isinstance(err, dict):
+        err = str(err.get("message") or err)
+    return err
 
 
 # Issue #779: 8 (then 14, then 42, accelerating) year-2099 schedule-pack
@@ -338,16 +344,17 @@ def main():
         run_test("repeat=invalid-cron → error", test_repeat_invalid_cron, proc)
 
         def test_repeat_5field_cron(proc):
-            err = call_verb_expect_error(proc, "schedule.remind", {
+            # Five-field cron recurrence is accepted since the schedule pack grew
+            # one recurrence parser shared by creation and the executor (#2484).
+            ev = call_verb(proc, "schedule.remind", {
                 "content": "cron reminder",
                 "at": FAR_FUTURE_B,
                 "repeat": "0 9 * * 1",
             })
-            assert "cron" in err.lower() and "not executable" in err.lower(), (
-                f"expected explicit non-executable cron error; got: {err!r}"
-            )
+            assert ev.get("status") == "pending", f"5-field cron repeat should be accepted: {ev}"
+            assert ev.get("repeat") == "0 9 * * 1", f"repeat must echo the cron expression: {ev}"
 
-        run_test("repeat=5-field cron → rejected", test_repeat_5field_cron, proc)
+        run_test("repeat=5-field cron → accepted", test_repeat_5field_cron, proc)
 
         # 10. Agenda time window: only events in [from, to] range returned
         def test_agenda_time_window(proc):

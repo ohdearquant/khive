@@ -356,7 +356,7 @@ test("alpha-equivalent contrast requires opaque surface and primary tokens", () 
   );
 });
 
-test("Tailwind theme mappings cover all 78 public tokens from source", () => {
+test("Tailwind theme mappings cover all 79 public tokens from source", () => {
   const publicTokens = new Set(
     Array.from(
       tokenCss.matchAll(
@@ -375,7 +375,7 @@ test("Tailwind theme mappings cover all 78 public tokens from source", () => {
     ),
   );
 
-  assert.equal(publicTokens.size, 78);
+  assert.equal(publicTokens.size, 79);
   assert.deepEqual([...mappedTokens].sort(), [...publicTokens].sort());
 });
 

@@ -86,9 +86,12 @@ jobs:
           grep -A1 '^name = "chrono-tz"' Cargo.lock
 
       - name: Run the all-zone sweep
+        shell: bash
         run: |
           set -euo pipefail
           # --ignored, not --include-ignored: this job exists to run exactly the
           # sweep, and including the ordinary tests here would let a failure in
           # one be reported as a failure of the other.
-          cargo test -p khive-runtime --lib --release tz_database_audit -- --ignored --nocapture
+          # Floor 1 detects empty selection without pinning the suite size.
+          cargo test -p khive-runtime --lib --release tz_database_audit -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/tz_database_audit.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/tz_database_audit.log" 1

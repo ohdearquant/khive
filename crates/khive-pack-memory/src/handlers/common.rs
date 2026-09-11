@@ -346,6 +346,7 @@ pub(super) fn balanced_recall_state_from_profile_response(
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
     pub(super) content: String,
+    pub(super) key: Option<String>,
     pub(super) memory_type: Option<String>,
     pub(super) salience: Option<f64>,
     #[serde(alias = "decay")]
@@ -383,6 +384,19 @@ pub(super) fn note_matches_tags(props: Option<&Value>, expected: &[String], mode
     }
 }
 
+/// True when the note's stored tags include any of `excluded`. A note without
+/// tags is never excluded.
+pub(super) fn note_has_any_tag(props: Option<&Value>, excluded: &[String]) -> bool {
+    let Some(stored) = props
+        .and_then(|p| p.get("tags"))
+        .and_then(|tags| tags.as_array())
+    else {
+        return false;
+    };
+    let stored: HashSet<&str> = stored.iter().filter_map(Value::as_str).collect();
+    excluded.iter().any(|tag| stored.contains(tag.as_str()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RecallParams {
@@ -403,6 +417,15 @@ pub(super) struct RecallParams {
     pub(super) tags: Option<Vec<String>>,
     #[serde(default)]
     pub(super) tag_mode: TagMode,
+    /// Drop memories whose stored tags include any of these values. Applied
+    /// after `tags`/`tag_mode` and before ranking and `limit`, so a run can
+    /// recall everything except its own writes.
+    #[serde(default)]
+    pub(super) exclude_tags: Option<Vec<String>>,
+    /// When true every hit carries `source_id`: the target of the memory's
+    /// `annotates` edge, or null when the memory has none.
+    #[serde(default)]
+    pub(super) include_source_id: Option<bool>,
     /// Entity names to boost in scoring.
     #[serde(default)]
     pub(super) entity_names: Option<Vec<String>>,
@@ -1727,7 +1750,17 @@ async fn collect_model_ann_hits_inner(
         }
 
         // Widen until enough visible hits survive or ANN reports corpus exhaustion.
-        let note_store = runtime.notes(token)?;
+        let operation = "memory.recall.note_store";
+        let note_result = khive_storage::await_request_read_phase(
+            operation,
+            crate::store_access::acquire_store(operation, {
+                let runtime = runtime.clone();
+                let token = token.clone();
+                move || runtime.notes(&token)
+            }),
+        )
+        .await??;
+        let note_store = note_result?;
         let visible_set: HashSet<&str> = visible_namespaces.iter().map(String::as_str).collect();
 
         // Empty namespace metadata is conservative; a visible-only set skips retry.

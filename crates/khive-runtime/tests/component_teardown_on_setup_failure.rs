@@ -22,6 +22,10 @@ struct NeverDispatch;
 
 #[async_trait]
 impl DaemonDispatch for NeverDispatch {
+    fn plan(&self, _ops: &str) -> String {
+        panic!("setup failure must not plan a request")
+    }
+
     async fn dispatch(
         &self,
         _ops: String,

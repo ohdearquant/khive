@@ -975,11 +975,10 @@ pub fn gtd_transition_statement(
 /// Atomic prepare classifies `current == target` from a read snapshot, but a
 /// preceding op in the same atomic file may transition, update, or delete the
 /// task before this op reaches the commit pass. An empty plan would silently
-/// discard the snapshot hypothesis. This statement deliberately assigns
-/// `updated_at` to itself (so the persisted row is byte-for-byte unchanged)
-/// while re-validating the exact revision, deletion marker, and semantic GTD
-/// status under the transaction. Its affected-row guard therefore turns any
-/// stale no-op into a whole-unit rollback.
+/// discard the snapshot hypothesis. The runner executes this SELECT on the
+/// transaction's writer and guards its result-row count, without invoking note
+/// UPDATE triggers. It revalidates the revision, deletion marker, and semantic
+/// status; a stale no-op therefore rolls back the whole unit.
 pub fn gtd_noop_assertion_statement(
     snapshot: &khive_storage::note::Note,
     expected_current: &str,
@@ -991,7 +990,7 @@ pub fn gtd_noop_assertion_statement(
         )));
     }
     Ok(SqlStatement {
-        sql: "UPDATE notes SET updated_at = updated_at \
+        sql: "SELECT 1 FROM notes \
               WHERE id = ?1 \
               AND updated_at = ?2 \
               AND deleted_at IS ?3 \
@@ -999,7 +998,8 @@ pub fn gtd_noop_assertion_statement(
                     WHEN json_type(properties, '$.status') = 'text' \
                     THEN json_extract(properties, '$.status') \
                     ELSE 'inbox' \
-                  END = ?4"
+                  END = ?4 \
+              AND version = ?5"
             .to_string(),
         params: vec![
             SqlValue::Text(snapshot.id.as_hyphenated().to_string()),
@@ -1009,6 +1009,7 @@ pub fn gtd_noop_assertion_statement(
                 None => SqlValue::Null,
             },
             SqlValue::Text(expected_current.to_string()),
+            SqlValue::Integer(snapshot.version),
         ],
         label: Some("gtd_atomic_noop_assertion".to_string()),
     })

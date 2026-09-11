@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, KhiveOperationError
+from khive_contract.client import KhiveMcpSession, KhiveOperationError, error_text
 from khive_contract.fixtures import ENTITY_KINDS
 
 VERBS_UNDER_TEST = {"create", "list", "get"}
@@ -96,7 +96,7 @@ def test_invalid_entity_kind_reports_closed_set(
     assert results, "Expected results in envelope"
     first = results[0]
     assert not first.get("ok", False), "Expected per-op error for invalid entity_kind"
-    err = first.get("error", "")
+    err = error_text(first)
     assert err, "Error message must be non-empty"
     assert "galaxy" in err.lower(), f"Error must name the offending kind 'galaxy': {err!r}"
 

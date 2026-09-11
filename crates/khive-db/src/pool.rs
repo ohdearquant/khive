@@ -1458,6 +1458,67 @@ impl ConnectionPool {
         self.writer()
     }
 
+    pub(crate) fn writer_until<C>(
+        &self,
+        should_stop: C,
+    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        self.ensure_pooled_writer_active()?;
+        let started = Instant::now();
+        loop {
+            if should_stop() {
+                return Ok(None);
+            }
+            let remaining = self
+                .config
+                .checkout_timeout
+                .saturating_sub(started.elapsed());
+            if let Some(guard) = self
+                .writer
+                .try_lock_for(remaining.min(Duration::from_millis(2)))
+            {
+                // Cancellation may have arrived during the final wait slice.
+                // Once this guard is returned, constructor DDL is not interrupted.
+                if should_stop() {
+                    return Ok(None);
+                }
+                self.ensure_pooled_writer_active()?;
+                self.writer_acquisition_counters
+                    .pooled_acquisitions
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(WriterGuard {
+                    guard,
+                    origin: self.origin(),
+                }));
+            }
+            if started.elapsed() >= self.config.checkout_timeout {
+                self.writer_acquisition_counters
+                    .pooled_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                let message = format!(
+                    "timed out after {:?} waiting for sqlite writer connection",
+                    self.config.checkout_timeout
+                );
+                crate::timeout_sink::emit_timeout(
+                    &crate::timeout_sink::db_label(self),
+                    crate::timeout_sink::Site::PoolAdmission,
+                    &message,
+                    Some(
+                        self.config
+                            .checkout_timeout
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    ),
+                );
+                return Err(SqliteError::WriterPoolCheckoutTimeout {
+                    timeout: self.config.checkout_timeout,
+                });
+            }
+        }
+    }
+
     /// Zero-wait writer checkout for background tasks.
     ///
     /// Uses `try_lock()` (no timeout, no spin) — returns `Err` immediately when
@@ -1901,6 +1962,7 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        register_writer_clock(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
             .configure_wal_autocheckpoint(&conn)?;
@@ -2403,10 +2465,23 @@ fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
+fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
+    // Evaluated by SQLite at statement execution, never deterministic: stream
+    // observation deadlines use the same UTC microsecond source as note stamps.
+    conn.create_scalar_function(
+        "khive_now_micros",
+        0,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |_| Ok(chrono::Utc::now().timestamp_micros()),
+    )?;
+    Ok(())
+}
+
 fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    register_writer_clock(conn)?;
     if config.read_only {
         // Read-only writer slot: skip write-intent PRAGMAs (journal_mode,
         // wal_autocheckpoint, journal_size_limit all require write access to
@@ -2709,6 +2784,79 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let held = pool.writer().unwrap();
+        let before = pool.writer_acquisition_snapshot();
+        let checks = Cell::new(0);
+        let stopped = pool
+            .writer_until(|| {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            })
+            .unwrap();
+        assert!(
+            stopped.is_none(),
+            "second predicate check must stop an in-flight wait"
+        );
+        assert_eq!(checks.get(), 2);
+        assert_eq!(pool.writer_acquisition_snapshot(), before);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn constructor_writer_observes_absolute_blocking_deadline() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            checkout_timeout: Duration::from_secs(5),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let held = pool.writer().unwrap();
+        let context =
+            khive_storage::scope_request_read_deadline(Duration::from_millis(20), async {
+                khive_storage::capture_request_read_context()
+            })
+            .await;
+        let before = pool.writer_acquisition_snapshot();
+        let started = Instant::now();
+        let stopped = pool
+            .writer_until(|| context.blocking_stop_reason().is_some())
+            .unwrap();
+        assert!(stopped.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "request deadline must beat pool timeout"
+        );
+        assert_eq!(pool.writer_acquisition_snapshot(), before);
+        drop(held);
+    }
+
+    #[test]
+    fn constructor_writer_preserves_uncancelled_checkout_timeout() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            checkout_timeout: Duration::from_millis(5),
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        let held = pool.writer().unwrap();
+        let before = pool.writer_acquisition_snapshot();
+        let result = pool.writer_until(|| false);
+        assert!(
+            matches!(result, Err(SqliteError::WriterPoolCheckoutTimeout { timeout }) if timeout == Duration::from_millis(5))
+        );
+        let after = pool.writer_acquisition_snapshot();
+        assert_eq!(after.timeouts, before.timeouts + 1);
+        assert_eq!(after.pooled_acquisitions, before.pooled_acquisitions);
+        drop(held);
+    }
 
     struct WarningCapture {
         messages: Arc<std::sync::Mutex<Vec<String>>>,

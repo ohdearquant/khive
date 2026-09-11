@@ -1042,7 +1042,7 @@ async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]
-async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
+async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion_disposition() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
     // `register_trusted` stands in for the real composition root
@@ -1112,7 +1112,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion() {
     let before_refused = audit_admission_refused_obligation_count();
     let before_unresolved = audit_admission_unresolved_obligation_count();
     let result = registry
-        .dispatch("list", Value::Null)
+        .dispatch_with_disposition("list", Value::Null, None)
         .await
         .expect("a read verb must not fail on audit-lane admission exhaustion");
     assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));
@@ -1395,7 +1395,7 @@ async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlis
 #[serial]
 #[tokio::test]
 #[serial(config_ledger)]
-async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
+async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry_disposition() {
     let store = Arc::new(MemoryEventStore::default());
     let mut builder = VerbRegistryBuilder::new();
     builder.register_trusted(AlphaPack);
@@ -1443,7 +1443,7 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry() {
     let before_refused = audit_admission_refused_obligation_count();
     let before_unresolved = audit_admission_unresolved_obligation_count();
     let result = registry
-        .dispatch("list", Value::Null)
+        .dispatch_with_disposition("list", Value::Null, None)
         .await
         .expect("a read verb must not fail when its own audit row's admission deadline elapses");
     assert_eq!(result, serde_json::json!({ "pack": "kg", "verb": "list" }));

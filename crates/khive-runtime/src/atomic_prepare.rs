@@ -51,8 +51,7 @@ use khive_db::stores::graph::{
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
-    note_hard_delete_statement, note_replace_if_unchanged_statement, note_soft_delete_statement,
-    note_upsert_statement,
+    note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
 };
 use khive_db::stores::text::{delete_document_statements, insert_document_statements};
 
@@ -623,9 +622,13 @@ pub async fn prepare_add_note(
     }
 
     Ok(AtomicOpPlan::AddNote(AddNotePlan {
+        note_guard: None,
         note_id: note.id,
         statements,
-        post_commit: PostCommitEffect::ReindexNote { note_id: note.id },
+        post_commit: PostCommitEffect::ReindexNote {
+            note_id: note.id,
+            version: note.version,
+        },
     }))
 }
 
@@ -645,6 +648,15 @@ pub async fn prepare_add_note(
 /// semantics.
 fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeResult<()> {
     let o = obj(args)?;
+    if substrate != "note"
+        && ["expected_version", "embed", "fence"]
+            .iter()
+            .any(|field| o.contains_key(*field))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "expected_version, embed and fence apply only to notes".into(),
+        ));
+    }
     let present = |k: &str| o.get(k).is_some_and(|v| !v.is_null());
     let (bad_field, valid): (Option<&str>, &str) = match substrate {
         "entity" => {
@@ -780,35 +792,42 @@ async fn prepare_note_update_plan_from_snapshot(
     let properties = optional_properties(args, "properties")?;
     let salience = optional_f64_patch(args, "salience")?;
     let decay_factor = optional_f64_patch(args, "decay_factor")?;
-    let expected_updated_at = note.updated_at;
-    let expected_deleted_at = note.deleted_at;
-
-    let (note, text_changed) = runtime
-        .prepare_update_note_from_snapshot(
+    let options = crate::note_write::NoteWriteOptions {
+        expected_version: obj(args)?
+            .get("expected_version")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_i64().ok_or_else(|| {
+                    RuntimeError::InvalidInput("expected_version must be an integer".into())
+                })
+            })
+            .transpose()?,
+        fence: obj(args)?
+            .get("fence")
+            .map(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|error| RuntimeError::InvalidInput(format!("invalid fence: {error}")))
+            })
+            .transpose()?,
+        embed: obj(args)?
+            .get("embed")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_bool()
+                    .ok_or_else(|| RuntimeError::InvalidInput("embed must be boolean".into()))
+            })
+            .transpose()?,
+        key: None,
+    };
+    let (_, plan) = runtime
+        .prepare_versioned_note_update(
             token,
             note,
-            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties),
+            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
+                .with_write_options(options),
         )
         .await?;
-
-    let post_commit = if text_changed {
-        PostCommitEffect::ReindexNote { note_id: id }
-    } else {
-        PostCommitEffect::None
-    };
-    Ok(AtomicOpPlan::Update(UpdatePlan {
-        target_id: id,
-        statements: vec![PlanStatement {
-            statement: note_replace_if_unchanged_statement(
-                &note,
-                expected_updated_at,
-                expected_deleted_at,
-            ),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }],
-        post_commit,
-        edge_natural_key: None,
-    }))
+    Ok(AtomicOpPlan::Update(plan))
 }
 
 /// Build an atomic update plan from the exact note snapshot already supplied
@@ -827,14 +846,6 @@ pub async fn prepare_update_from_note_snapshot(
              or use merge() if this is a deduplication correction"
                 .into(),
         ));
-    }
-    let current = runtime
-        .notes(token)?
-        .get_note(note.id)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(format!("note {}", note.id)))?;
-    if current != note {
-        return Err(crate::curation::stale_note_snapshot_error(note.id));
     }
     prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
 }
@@ -979,6 +990,9 @@ pub async fn prepare_update_entity_plan(
         PostCommitEffect::None
     };
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        note_vector_purge: None,
+        note_embedding_inheritance: None,
+        note_guard: None,
         target_id: id,
         statements,
         post_commit,
@@ -1184,6 +1198,9 @@ async fn prepare_update_edge(
     )?);
 
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        note_vector_purge: None,
+        note_embedding_inheritance: None,
+        note_guard: None,
         target_id: id,
         statements,
         post_commit: PostCommitEffect::None,
@@ -1354,6 +1371,9 @@ pub async fn prepare_delete(
                 Some(AtomicDeleteKind::Edge) => {
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
+            }
+            if let Some(error) = runtime.stream_member_error(&note).await? {
+                return Err(error);
             }
             let namespace = note.namespace.clone();
             // Storage parity: `note_soft_delete_statement`/
@@ -1754,6 +1774,9 @@ pub async fn apply_post_commit_effects_with_report(
     for effect in effects.into_effects() {
         match effect {
             PostCommitEffect::None => {}
+            PostCommitEffect::NoteChanged { note_id, kind } => {
+                runtime.fire_note_mutation_hook(&kind, note_id).await;
+            }
             PostCommitEffect::ReindexEntity { entity_id } => {
                 if let Some(entity) = runtime.entities(token)?.get_entity(entity_id).await? {
                     let truncation = runtime.reindex_entity(token, &entity).await?;
@@ -1763,11 +1786,22 @@ pub async fn apply_post_commit_effects_with_report(
                     });
                 }
             }
-            PostCommitEffect::ReindexNote { note_id } => {
+            PostCommitEffect::ReindexNote { note_id, version } => {
                 if let Some(note) = runtime.notes(token)?.get_note(note_id).await? {
+                    if note.version != version {
+                        continue;
+                    }
                     let truncation = runtime.reindex_note(token, &note).await?;
+                    if runtime
+                        .notes(token)?
+                        .get_note(note_id)
+                        .await?
+                        .is_none_or(|current| current.version != version)
+                    {
+                        continue;
+                    }
                     embedding_outcomes.push(PostCommitEmbeddingOutcome {
-                        effect: PostCommitEffect::ReindexNote { note_id },
+                        effect: PostCommitEffect::ReindexNote { note_id, version },
                         truncation,
                     });
                     // This handler calls `reindex_note` directly, bypassing
@@ -2136,7 +2170,7 @@ mod tests {
         let plan = prepare_update(
             &runtime,
             &token,
-            &json!({"id": note_id.to_string(), "content": updated_content}),
+            &json!({"id": note_id.to_string(), "content": updated_content, "embed": true}),
             None,
         )
         .await
@@ -2151,7 +2185,10 @@ mod tests {
         };
         assert_eq!(
             post_commit.as_slice(),
-            &[PostCommitEffect::ReindexNote { note_id }],
+            &[PostCommitEffect::ReindexNote {
+                note_id,
+                version: 2
+            }],
             "content change must schedule exactly one ReindexNote post-commit effect"
         );
 
@@ -2162,7 +2199,10 @@ mod tests {
         assert_eq!(embedding_outcomes.len(), 1);
         assert_eq!(
             embedding_outcomes[0].effect,
-            PostCommitEffect::ReindexNote { note_id }
+            PostCommitEffect::ReindexNote {
+                note_id,
+                version: 2
+            }
         );
         assert_eq!(embedding_outcomes[0].truncation.truncated, 1);
         assert!(embedding_outcomes[0].truncation.discarded_bytes > 0);
@@ -4916,7 +4956,10 @@ mod tests {
             post_commit.as_slice(),
             &[
                 PostCommitEffect::ReindexEntity { entity_id },
-                PostCommitEffect::ReindexNote { note_id },
+                PostCommitEffect::ReindexNote {
+                    note_id,
+                    version: 1
+                },
             ],
             "prepare-derived effects must reach the committed token unchanged"
         );

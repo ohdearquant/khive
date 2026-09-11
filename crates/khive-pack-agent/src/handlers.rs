@@ -2,17 +2,16 @@
 //!
 //! Every handler here is a thin wire-surface layer over the `AgentStore`
 //! trait object the pack was constructed with: parameter validation,
-//! `spawn_fingerprint` computation, and the lifecycle transition table live
+//! and the lifecycle transition table live
 //! here; the durable table itself is entirely the store's concern.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
-use khive_runtime::agent_lifecycle::{apply_transition, spawn_fingerprint, Trigger};
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::agent_lifecycle::{apply_transition, Trigger};
+use khive_runtime::RuntimeError;
 use khive_storage::AgentStore;
 use khive_types::{AgentRecord, AgentState, TerminalReason};
 
@@ -26,13 +25,6 @@ fn require_str<'a>(params: &'a Value, name: &str, verb: &str) -> Result<&'a str,
                 "{verb} requires a non-empty string field \"{name}\""
             ))
         })
-}
-
-fn optional_str<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
-    params
-        .get(name)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 fn state_str(state: AgentState) -> &'static str {
@@ -85,92 +77,16 @@ async fn load(
         .ok_or_else(|| RuntimeError::NotFound(format!("{verb}: unknown agent_id {id:?}")))
 }
 
-/// `agent.spawn` — required `provider`, `task`; optional `idempotency_key`,
-/// `provider_session_id`, `checkpoint_session_id`. Success: `{ agent_id, state }`.
-pub(crate) async fn handle_spawn(
-    store: &Arc<dyn AgentStore>,
-    token: &NamespaceToken,
-    params: Value,
-) -> Result<Value, RuntimeError> {
-    let provider = require_str(&params, "provider", "agent.spawn")?.to_string();
-    let task = require_str(&params, "task", "agent.spawn")?.to_string();
-    let idempotency_key = optional_str(&params, "idempotency_key").map(str::to_string);
-    let provider_session_id = optional_str(&params, "provider_session_id").map(str::to_string);
-    let checkpoint_session_id = optional_str(&params, "checkpoint_session_id").map(str::to_string);
-
-    let owner_actor = token
-        .actor()
-        .binding_id()
-        .unwrap_or("anonymous")
-        .to_string();
-
-    let fingerprint = spawn_fingerprint(
-        &provider,
-        &task,
-        provider_session_id.as_deref(),
-        checkpoint_session_id.as_deref(),
-    );
-
-    if let Some(key) = &idempotency_key {
-        if let Some(existing) = store.find_by_idempotency(&owner_actor, key).await? {
-            if existing.spawn_fingerprint == fingerprint {
-                return Ok(json!({
-                    "agent_id": existing.agent_id,
-                    "state": state_str(existing.state),
-                }));
-            }
-            return Err(RuntimeError::InvalidInput(format!(
-                "agent.spawn: idempotency_key {key:?} was already used with different arguments"
-            )));
-        }
-    }
-
-    if let Some(psid) = &provider_session_id {
-        if let Some(existing) = store
-            .find_non_terminal_by_provider_session(&provider, psid)
-            .await?
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "agent.spawn: provider_session_id {psid:?} for provider {provider:?} is \
-                 already bound to non-terminal record {}",
-                existing.agent_id
-            )));
-        }
-    }
-
-    let now = Utc::now().timestamp_micros();
-    let record = AgentRecord {
-        agent_id: Uuid::new_v4().to_string(),
-        state: AgentState::Spawned,
-        terminal_reason: None,
-        provider,
-        provider_session_id,
-        checkpoint_session_id,
-        checkpoint_cursor: None,
-        owner_actor,
-        // This pack is only reached through in-process registry dispatch — no
-        // ADR-137-mapped connection is wired in here — so every record
-        // carries the distinguished `native` context marker (ADR-142 §1,
-        // "Persistent process record").
-        owner_peer_class: "native".to_string(),
-        owner_write_namespace: token.namespace().as_str().to_string(),
-        owner_visible_namespaces: token
-            .visible_namespaces()
-            .iter()
-            .map(|ns| ns.as_str().to_string())
-            .collect(),
-        spawn_fingerprint: fingerprint,
-        spawned_at: now,
-        state_changed_at: now,
-        idempotency_key,
-    };
-
-    store.insert(&record).await?;
-
-    Ok(json!({
-        "agent_id": record.agent_id,
-        "state": state_str(record.state),
-    }))
+/// Refuse providers until a runtime adapter can actually start the process.
+pub(crate) fn handle_spawn(params: Value) -> Result<Value, RuntimeError> {
+    require_str(&params, "provider", "agent.spawn")?;
+    require_str(&params, "task", "agent.spawn")?;
+    Err(khive_types::KhiveError::unavailable("provider_unavailable")
+        .with_details(khive_types::Details::new([(
+            "reason",
+            "provider_unavailable",
+        )]))
+        .into())
 }
 
 /// `agent.observe` — required `id`. Success: the full process-record field set.

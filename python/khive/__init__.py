@@ -16,7 +16,18 @@ from .errors import (
     RequestRejected,
     TransportError,
 )
-from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
+from .models import (
+    Edge,
+    EdgeRelation,
+    Entity,
+    Incidence,
+    Note,
+    OpError,
+    OpResult,
+    Page,
+    RecallHit,
+    RecallOutcome,
+)
 from .ops import encode, op
 from .transport import Session, SocketTransport, Transport
 
@@ -31,10 +42,13 @@ __all__ = [
     "Khive",
     "KhiveError",
     "Note",
+    "OpError",
     "OpResult",
     "OperationError",
     "Page",
     "ProtocolMismatch",
+    "RecallHit",
+    "RecallOutcome",
     "RequestRejected",
     "Session",
     "SocketTransport",
@@ -44,4 +58,4 @@ __all__ = [
     "op",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

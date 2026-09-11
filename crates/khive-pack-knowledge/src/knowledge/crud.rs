@@ -1089,7 +1089,7 @@ impl KnowledgeHandlers {
                         .query_scalar(SqlStatement {
                             sql: count_sql,
                             params: count_params,
-                            label: None,
+                            label: Some("knowledge.list.atom_count".into()),
                         })
                         .await
                         .map_err(|e| sql_err("list atoms count", e))?;
@@ -1245,7 +1245,7 @@ impl KnowledgeHandlers {
                 sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'"
                     .into(),
                 params: vec![SqlValue::Text(ns.clone())],
-                label: None,
+                label: Some("knowledge.stats.event_count".into()),
             })
             .await
             .map_err(|e| sql_err("stats events", e))?;

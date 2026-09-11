@@ -66,6 +66,14 @@ pub(crate) struct AnnBridge {
 
 /// Shared model-index cache with single-flight and freshness coordination.
 pub(crate) struct AnnState {
+    /// Whether this process may build the memory index from the full corpus and
+    /// publish the result. A corpus build is minutes of CPU and a segment
+    /// rewrite every other reader on the index root must then absorb, and it
+    /// pays for itself only in a process that outlives the request. Serving
+    /// processes set this from the daemon role at construction; the admin
+    /// reindex path sets it unconditionally, because building is what it was
+    /// invoked to do.
+    pub(crate) builds_corpus_indexes: bool,
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     /// Synchronous so `WarmingGuard::drop` can release it on every exit path.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
@@ -110,8 +118,19 @@ pub(crate) struct AnnState {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
+/// Shared ANN state for a process that builds corpus indexes. Test-only here:
+/// production reaches this through `MemoryPack::new_with_index_role`, which
+/// states the role rather than assuming it.
+#[cfg(test)]
 pub(crate) fn new_shared() -> SharedAnn {
+    new_shared_for_role(true)
+}
+
+/// Shared ANN state whose corpus-build authority is stated explicitly. The
+/// serving pack passes the daemon role; see `AnnState::builds_corpus_indexes`.
+pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
     Arc::new(AnnState {
+        builds_corpus_indexes,
         indexes: RwLock::new(HashMap::new()),
         warming: std::sync::Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
@@ -183,10 +202,40 @@ const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
 
 /// Delay between chained rebuild tasks so continuous writes coalesce.
+///
+/// One second coalesces nothing against a fleet that writes continuously: the
+/// chain re-enqueues before the next write arrives, so it never idles and the
+/// index is rebuilt and republished on a cadence set by nothing in particular.
+/// The chain exists so a write converges without a reader, not to keep readers
+/// fresh — a recall warms on demand at request time — so the window it should
+/// use is the one that batches a burst of writes into one build. Override with
+/// `KHIVE_ANN_REBUILD_DEBOUNCE_MS`; a malformed value falls back to the default.
 #[cfg(not(test))]
-const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+const REBUILD_CHAIN_DEBOUNCE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
-const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(5);
+const REBUILD_CHAIN_DEBOUNCE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn rebuild_chain_debounce() -> std::time::Duration {
+    resolve_rebuild_chain_debounce(
+        std::env::var("KHIVE_ANN_REBUILD_DEBOUNCE_MS")
+            .ok()
+            .as_deref(),
+        REBUILD_CHAIN_DEBOUNCE_DEFAULT,
+    )
+}
+
+/// Pure half of [`rebuild_chain_debounce`], so the policy is testable without
+/// mutating process environment. Zero is a legal override: it means the caller
+/// asked for no coalescing at all.
+fn resolve_rebuild_chain_debounce(
+    override_value: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    match override_value.and_then(|raw| raw.trim().parse::<u64>().ok()) {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => default,
+    }
+}
 
 /// File-generation polling cadence for mmap bridges. Only the tiny commit
 /// record is read on an unchanged tick; vector/graph files are reopened only
@@ -579,9 +628,15 @@ pub(crate) fn snapshot_key(_namespace: &str, model: &str) -> String {
 pub(crate) enum AnnEnsureStatus {
     AlreadyLoaded,
     LoadedSnapshot,
-    Built { vectors: usize },
+    Built {
+        vectors: usize,
+    },
     EmptyCorpus,
     DiscardedStaleBuild,
+    /// Nothing on disk was adoptable and this process does not build corpus
+    /// indexes. The caller serves its exact/lexical path for this request; the
+    /// daemon builds and publishes, and the next attempt adopts that segment.
+    DeclinedNotWarmHost,
 }
 
 // ── state operations ──────────────────────────────────────────────────────────
@@ -747,7 +802,7 @@ fn spawn_rebuild_task_inner(
     };
     khive_runtime::track_background_task(async move {
         if chained {
-            tokio::time::sleep(REBUILD_CHAIN_DEBOUNCE).await;
+            tokio::time::sleep(rebuild_chain_debounce()).await;
         }
         // Recheck after each build because writes that found this guard occupied were not queued.
         // Bound attempts so continuous writes cannot retain the guard indefinitely; daemon drain
@@ -1127,7 +1182,19 @@ pub(crate) async fn ensure_ann_for_model(
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
     let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
-    match &result {
+    emit_ann_warm_terminal_phase(rt, token, model, &result, wall_us, cpu_us).await;
+    result
+}
+
+async fn emit_ann_warm_terminal_phase(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+    result: &Result<AnnEnsureStatus, RuntimeError>,
+    wall_us: i64,
+    cpu_us: Option<i64>,
+) {
+    match result {
         Err(e) if is_benign_shutdown_cancellation(e) => {
             emit_ann_warm_phase_event(
                 rt,
@@ -1159,7 +1226,6 @@ pub(crate) async fn ensure_ann_for_model(
             .await;
         }
     }
-    result
 }
 
 /// Append a best-effort ANN warm phase event without changing the warm result.
@@ -1171,7 +1237,13 @@ async fn emit_ann_warm_phase_event<P: serde::Serialize>(
     payload: P,
 ) {
     // A missing event store means auditing is unconfigured, not that warming failed.
-    let Ok(store) = rt.events(token) else {
+    let result = crate::store_access::acquire_store("memory.ann.event_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        move || runtime.events(&token)
+    })
+    .await;
+    let Ok(Ok(store)) = result else {
         return;
     };
     let payload_value = match serde_json::to_value(&payload) {
@@ -1250,6 +1322,13 @@ async fn ensure_ann_for_model_inner(
         }
     }
 
+    if !ann.builds_corpus_indexes {
+        tracing::info!(namespace = %ns, model = %model,
+            "no adoptable memory ANN segment and this process does not build corpus \
+             indexes; serving degraded and leaving the build to the daemon");
+        return Ok(AnnEnsureStatus::DeclinedNotWarmHost);
+    }
+
     // The fingerprint sandwich bounds scan races; generation ordering closes the
     // later persistence/install window and prevents an older build from winning.
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
@@ -1311,7 +1390,14 @@ async fn compute_memory_fingerprint(
     token: &NamespaceToken,
     model: &str,
 ) -> Option<CorpusFingerprint> {
-    let store = rt.vectors_for_model(token, model).ok()?;
+    let result = crate::store_access::acquire_store("memory.ann.fingerprint_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        let model = model.to_owned();
+        move || runtime.vectors_for_model(&token, &model)
+    })
+    .await;
+    let store = result.ok()?.ok()?;
     let info = store.info().await.ok()?;
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let sql = rt.sql();
@@ -1349,7 +1435,14 @@ async fn load_and_build_from_vector_store(
     token: &NamespaceToken,
     model: &str,
 ) -> Result<Option<AnnBridge>, RuntimeError> {
-    let store = match rt.vectors_for_model(token, model) {
+    let result = crate::store_access::acquire_store("memory.ann.vector_store", {
+        let runtime = rt.clone();
+        let token = token.clone();
+        let model = model.to_owned();
+        move || runtime.vectors_for_model(&token, &model)
+    })
+    .await?;
+    let store = match result {
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
@@ -2786,6 +2879,23 @@ async fn classify_and_adopt_segment(
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
+        // Replay is cheap and in memory; the checkpoint that follows it is a full
+        // segment publication. A process that is not the warm index host serves the
+        // replayed bridge and publishes nothing, so a client warming after a write
+        // does not rewrite the segment for every other reader on the root.
+        if !ann.builds_corpus_indexes {
+            install_replacing(
+                ann,
+                key,
+                bridge
+                    .with_generation(target_generation)
+                    .with_epoch_baseline(target_epoch),
+            )
+            .await;
+            tracing::debug!(model = %model, tail,
+                "memory ANN served from Stale-tail replay without checkpoint; not the warm index host");
+            return SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot);
+        }
         let installed = checkpoint_raise_compact_readopt(
             rt,
             ann,
@@ -3318,6 +3428,189 @@ mod tests {
              empty set to keep over-fetching for eligible visible memories",
             bridge.namespace_set
         );
+    }
+
+    /// A process without corpus-build authority declines instead of scanning and
+    /// publishing. The second half is the control: the same corpus, the same
+    /// runtime, with the authority, builds — so the decline is caused by the role
+    /// and not by a fixture that could not have built anyway.
+    #[tokio::test]
+    async fn a_process_that_does_not_build_declines_instead_of_scanning_the_corpus() {
+        const MODEL: &str = "memory-non-building-process-declines-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "a note the daemon will index",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create note");
+
+        let key = AnnKey::new(MODEL);
+        let client = new_shared_for_role(false);
+        let declined = ensure_ann_for_model(&rt, &token, &client, MODEL)
+            .await
+            .expect("ensure must not error, it must decline");
+        assert!(
+            matches!(declined, AnnEnsureStatus::DeclinedNotWarmHost),
+            "a process without corpus-build authority must decline, got {declined:?}"
+        );
+        assert!(
+            !client.indexes.read().await.contains_key(&key),
+            "a decline must install nothing"
+        );
+        if let Some(seg_dir) = ann_segment_dir(&rt, MODEL) {
+            assert!(
+                !seg_dir.join("metadata.bin").exists(),
+                "a decline must publish no segment"
+            );
+        }
+
+        let host = new_shared();
+        let built = ensure_ann_for_model(&rt, &token, &host, MODEL)
+            .await
+            .expect("control build");
+        assert!(
+            matches!(built, AnnEnsureStatus::Built { vectors: 1 }),
+            "control: with the authority the same corpus builds, got {built:?}"
+        );
+    }
+
+    /// The Stale-tail path replays in memory and then checkpoints, and the
+    /// checkpoint is a full segment publication. A process without corpus-build
+    /// authority must serve the replayed bridge and publish nothing, or every
+    /// client warming after any write republishes the segment. The search for
+    /// the tail note is the witness that the replay path ran rather than a Hot
+    /// load of the seeded segment. The control is the same state warmed with
+    /// the authority, which does checkpoint.
+    #[tokio::test]
+    async fn a_process_that_does_not_build_replays_the_tail_without_publishing() {
+        const MODEL: &str = "memory-non-building-process-stale-tail-test-model";
+        const DIMS: usize = 4;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..4 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("seeded note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seeded note");
+        }
+        let seed = new_shared();
+        let built = ensure_ann_for_model(&rt, &token, &seed, MODEL)
+            .await
+            .expect("seed build");
+        assert!(
+            matches!(built, AnnEnsureStatus::Built { vectors: 4 }),
+            "seed: expected a build over 4 vectors, got {built:?}"
+        );
+        let seg_dir = ann_segment_dir(&rt, MODEL).expect("segment dir");
+        let metadata = seg_dir.join("metadata.bin");
+        let vectors = seg_dir.join("vectors.bin");
+        let before_metadata = std::fs::read(&metadata).expect("seeded metadata.bin");
+        let before_vectors = std::fs::read(&vectors).expect("seeded vectors.bin");
+
+        // One more note: live = 5, tail = 1 ≤ ceil(0.20 × 5) → Stale-tail.
+        let tail_note = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "the note only a tail replay can find",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create tail note");
+
+        let key = AnnKey::new(MODEL);
+        let client = new_shared_for_role(false);
+        let status = ensure_ann_for_model(&rt, &token, &client, MODEL)
+            .await
+            .expect("client warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::LoadedSnapshot),
+            "a client must adopt the segment through Stale-tail replay, got {status:?}"
+        );
+        let query = fnv_to_vec("the note only a tail replay can find", DIMS);
+        let hits = search_loaded(&client, &key, &query, 5)
+            .await
+            .expect("search must succeed")
+            .expect("the replayed bridge must be installed");
+        assert!(
+            hits.iter()
+                .any(|(id, score)| *id == tail_note.id && *score > 0.99),
+            "the tail note must be served from the replayed bridge, got {hits:?}"
+        );
+        assert_eq!(
+            std::fs::read(&metadata).expect("metadata.bin after client warm"),
+            before_metadata,
+            "a client must not checkpoint: metadata.bin changed"
+        );
+        assert_eq!(
+            std::fs::read(&vectors).expect("vectors.bin after client warm"),
+            before_vectors,
+            "a client must not checkpoint: vectors.bin changed"
+        );
+
+        let host = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &host, MODEL)
+            .await
+            .expect("host warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::LoadedSnapshot),
+            "control: the host adopts the same segment, got {status:?}"
+        );
+        assert_ne!(
+            std::fs::read(&metadata).expect("metadata.bin after host warm"),
+            before_metadata,
+            "control: the host checkpoints after replay, so metadata.bin must change"
+        );
+    }
+
+    /// The chain debounce is what decides how many writes one rebuild absorbs.
+    /// One second absorbed nothing against a fleet writing continuously, which is
+    /// how a coalescing window became a rebuild cadence.
+    #[test]
+    fn rebuild_chain_debounce_policy() {
+        let default = std::time::Duration::from_secs(30);
+        assert_eq!(resolve_rebuild_chain_debounce(None, default), default);
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some(" 2500 "), default),
+            std::time::Duration::from_millis(2500)
+        );
+        // Zero is a real answer: it means no coalescing was asked for.
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some("0"), default),
+            std::time::Duration::ZERO
+        );
+        // A malformed value must not silently become zero, which would restore
+        // the behaviour this default exists to fix.
+        assert_eq!(
+            resolve_rebuild_chain_debounce(Some("soon"), default),
+            default
+        );
+        assert_eq!(resolve_rebuild_chain_debounce(Some("-1"), default), default);
+        assert_eq!(resolve_rebuild_chain_debounce(Some(""), default), default);
     }
 
     /// Mirrors the knowledge-pack invalid-rotation tests (issue #2340): a
@@ -4150,6 +4443,40 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn cancelled_store_join_emits_phase_cancelled() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-worker runtime");
+        executor.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("worker started");
+                release_rx.recv().expect("release blocker");
+            });
+            started_rx.await.expect("blocking slot is occupied");
+            let queued = tokio::task::spawn_blocking(|| Ok(AnnEnsureStatus::EmptyCorpus));
+            queued.abort();
+            release_tx.send(()).expect("release blocking slot");
+            blocker.await.expect("blocker joined");
+            let result = crate::store_access::join_store_task("memory.ann.vector_store", queued).await;
+
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            let token = rt.authorize(Namespace::local()).expect("authorize local");
+            emit_ann_warm_terminal_phase(&rt, &token, "cancelled-store-join", &result, 1, None).await;
+            let page = rt.events(&token).expect("event store").query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest { limit: 10, offset: 0 },
+            ).await.expect("terminal events");
+            assert_eq!(page.items.len(), 1, "exactly one terminal event: {page:?}");
+            assert_eq!(page.items[0].kind, khive_types::EventKind::PhaseCancelled,
+                "a cancelled acquisition join must emit PhaseCancelled, not PhaseCompleted: {result:?}");
+        });
     }
 
     #[tokio::test]

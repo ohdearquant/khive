@@ -2661,6 +2661,8 @@ mod cursor_retry_tests {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2676,6 +2678,7 @@ mod cursor_retry_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("file-backed runtime");
         (rt, dir)

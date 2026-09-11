@@ -155,6 +155,12 @@ const V25_UP: &str = include_str!("../sql/025-notes-unread-probe-recipient-direc
 const V26_UP: &str = include_str!("../sql/026-knowledge-fts-repair.sql");
 
 const V27_UP: &str = include_str!("../sql/027-notes-hot-property-indexes.sql");
+const V28_UP: &str = include_str!("../sql/028-notes-key.sql");
+
+const V29_UP: &str = include_str!("../sql/029-note-streams.sql");
+const V30_UP: &str = include_str!("../sql/030-tool-source-mounts.sql");
+const V31_UP: &str = include_str!("../sql/031-note-versions.sql");
+const V32_UP: &str = include_str!("../sql/032-knowledge-count-indexes.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -345,6 +351,31 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 27,
         name: "notes_hot_property_indexes",
         up: V27_UP,
+    },
+    VersionedMigration {
+        version: 28,
+        name: "notes_key",
+        up: V28_UP,
+    },
+    VersionedMigration {
+        version: 29,
+        name: "note_streams",
+        up: V29_UP,
+    },
+    VersionedMigration {
+        version: 30,
+        name: "tool_source_mounts",
+        up: V30_UP,
+    },
+    VersionedMigration {
+        version: 31,
+        name: "note_versions",
+        up: V31_UP,
+    },
+    VersionedMigration {
+        version: 32,
+        name: "knowledge_count_indexes",
+        up: V32_UP,
     },
 ];
 

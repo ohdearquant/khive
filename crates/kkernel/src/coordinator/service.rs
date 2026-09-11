@@ -8,15 +8,16 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use khive_mcp::coordinator::{
-    BackendSearchResult as CoordBackendResult, CoordError, CoordLinkResult, CoordSearchResult,
-    CoordinatorService,
+    BackendSearchFailure as CoordBackendFailure,
+    BackendSearchFailureKind as CoordBackendFailureKind, BackendSearchResult as CoordBackendResult,
+    CoordError, CoordLinkResult, CoordSearchResult, CoordinatorService,
 };
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::BackendId;
 use khive_runtime::Namespace;
 use khive_storage::EdgeRelation;
 
-use super::dispatch::SubstrateCoordinator;
+use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
 
 /// `CoordinatorService` wrapper around a [`SubstrateCoordinator`].
 ///
@@ -139,6 +140,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         // Batch-fetch note kind + name + created_at for each merged note hit.
         let mut note_kinds: HashMap<Uuid, String> = HashMap::new();
         let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_versions: HashMap<Uuid, i64> = HashMap::new();
         let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
         for hit in &note_hits {
             if khive_storage::request_read_is_cancelled() {
@@ -151,6 +153,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
                     if let Ok(token) = rt.authorize(namespace.clone()) {
                         if let Ok(store) = rt.notes(&token) {
                             if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                                note_versions.insert(hit.note_id, note.version);
                                 note_created_at.insert(hit.note_id, note.created_at);
                                 note_names.insert(hit.note_id, note.name.clone());
                                 note_kinds.insert(hit.note_id, note.kind);
@@ -174,7 +177,15 @@ impl CoordinatorService for SubstrateCoordinatorService {
                     entity_hits: r.hits,
                     note_hits: r.note_hits,
                     vector_selected,
-                    error: r.error,
+                    error: r.error.map(|failure| CoordBackendFailure {
+                        kind: match failure.kind {
+                            BackendSearchFailureKind::BackendError => {
+                                CoordBackendFailureKind::BackendError
+                            }
+                            BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
+                        },
+                        message: failure.message,
+                    }),
                     vector_error: r.vector_error,
                 }
             })
@@ -189,6 +200,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
             note_kinds,
             entity_created_at,
             note_created_at,
+            note_versions,
             note_names,
         }
     }

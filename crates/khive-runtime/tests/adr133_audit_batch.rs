@@ -449,6 +449,36 @@ async fn d1_supervisor_panic_fails_waiters_before_background_baseline() {
     assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
     let metrics = batch.metrics_snapshot();
     assert_eq!(metrics.flush_failures, 1);
+    assert!(
+        metrics.degraded,
+        "a flush failure leaves rows out of the audit trail, so the lifetime flag must read true"
+    );
+    assert_eq!(metrics.degraded_rows, 0);
+}
+
+#[serial]
+#[tokio::test]
+async fn d8_exhausted_commit_retries_set_the_lifetime_degraded_flag() {
+    let store = FakeStore::new();
+    store.fail_next.store(8, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::StoreFailure));
+    let metrics = batch.metrics_snapshot();
+    assert_eq!(metrics.flush_failures, 1);
+    assert!(
+        metrics.degraded,
+        "a generation that failed to flush leaves its rows out of the audit trail"
+    );
+    assert_eq!(
+        metrics.degraded_rows, 0,
+        "an obligation row released with an error is not a degraded pure-observability row"
+    );
 }
 
 #[serial]

@@ -123,6 +123,27 @@ The canonical ledger of database schema migration versions. Migration versions a
 
 ### Post-consolidation migration ledger (live)
 
+#### Knowledge count indexes (2026-09-10)
+
+V32, `knowledge_count_indexes`, adds `idx_events_ns_verb` on
+`events(namespace, verb COLLATE NOCASE)` and `idx_knowledge_atoms_ns_live_counts`
+on `knowledge_atoms(namespace, deleted_at, status, tags, finalized)`.
+V1 remains immutable; both new and existing main databases receive V32 through
+the migration chain. The idempotent events-store DDL also declares the event
+index for separately opened event stores.
+
+`knowledge.stats` uses the main backend's raw SQL capability and counts that
+backend's events table, including when an events sidecar is configured. This
+change preserves that population. `NOCASE` matches the existing ASCII-insensitive
+`LIKE 'knowledge.%'`, allowing a namespace and verb-prefix index range without
+changing mixed-case results. The atom index covers the existing live/non-domain
+predicate, optional status filters, and finalized aggregate. It preserves tag
+substring semantics and avoids a new materialized classifier or counter that
+every writer would need to maintain. Costs are one-time index construction,
+index space proportional to indexed text, and index maintenance on writes.
+The atom predicate still scans qualifying index entries; neither count becomes
+constant-time. No request deadline, interrupt grace, or pool policy changes.
+
 The live sequence starts from the consolidated V1 baseline. This table is the
 canonical allocation ledger for databases created at or after v0.2.8; the table
 above remains the historical pre-consolidation record.
