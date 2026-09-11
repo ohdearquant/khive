@@ -145,6 +145,7 @@ impl AuditObligationFailure {
                 AuditTerminalReason::AdmissionClosed => "admission_closed",
                 AuditTerminalReason::QueueAdmissionExhausted => "queue_admission_exhausted",
                 AuditTerminalReason::AdmissionDeadlineExpired => "admission_deadline_expired",
+                AuditTerminalReason::ResolutionDeadlineExpired => "resolution_deadline_expired",
                 AuditTerminalReason::IdentityConflict => "identity_conflict",
                 AuditTerminalReason::StoreFailure => "store_failure",
                 AuditTerminalReason::IdempotencyUnsupported => "idempotency_unsupported",
@@ -152,6 +153,8 @@ impl AuditObligationFailure {
                 AuditTerminalReason::DriverCancelled => "driver_cancelled",
                 AuditTerminalReason::DriverJoinLost => "driver_join_lost",
                 AuditTerminalReason::DriverExitedInconsistent => "driver_exited_inconsistent",
+                AuditTerminalReason::DriverAppendAbandoned => "driver_append_abandoned",
+                AuditTerminalReason::StoreWedged => "store_wedged",
             },
             AuditObligationReason::GitDigestReceiptFailure => "git_digest_receipt_failure",
         }
