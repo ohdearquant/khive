@@ -137,8 +137,11 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
   present an authorized token whose namespace matches the parameter; the handler validates that
   equality and never treats the business parameter itself as authority (issue #1505).
 - `brain.auto_feedback` never infers utility from rank. An omitted `signal` returns a no-emit
-  abstention. A supplied signal requires `target_id` to equal exactly one result's `full_id`,
-  falling back to `id` when `full_id` is absent. This accepts Agent JSON recall results without
-  rewriting their compact display IDs (#2434). Raw `candidate_ids` audit context retains `id`, and
+  abstention. A supplied signal requires `target_id` to equal `id` or `full_id` on exactly one
+  result object. Equal aliases on that object count once; matches across objects are rejected.
+  The selected object's supplied `full_id` must be a full UUID and determines canonical
+  attribution, with no fallback on malformed values; absent or null `full_id`, the existing `id`
+  resolver applies. This accepts either alias from Agent JSON recall results without rewriting
+  their compact display IDs (#2434). Raw `candidate_ids` audit context retains `id`, and
   result-level serve attribution is copied from that selected result rather than the first hit
   (issue #1588).

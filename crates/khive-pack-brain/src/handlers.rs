@@ -354,14 +354,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects retained as candidate context: each object has id (UUID or compact id), optionally full_id and served_by_profile_id. When supplied, full_id is the matching and resolution identity; otherwise id is used. Bare id strings are rejected. No result is credited by rank position.",
+                description: "Recall result objects retained as candidate context: each object has id (UUID or compact id), optionally full_id and served_by_profile_id. Match target_id by id or full_id on exactly one result object; equal aliases on that object count once. Supplied full_id must be a full UUID and determines canonical attribution; otherwise id is resolved. Bare id strings are rejected. No result is credited by rank position.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "target_id",
                 param_type: "string",
                 required: false,
-                description: "Exact full_id of the one result being judged, falling back to its id (full UUID or compact id) when full_id is absent. Required when signal is supplied and must match exactly once in results.",
+                description: "Exact id (full UUID or compact id) or full_id of the result being judged. Required when signal is supplied and must match exactly one result object across both aliases; equal aliases on that object count once. Supplied full_id determines canonical attribution and must be a full UUID; otherwise id is resolved.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -2185,17 +2185,16 @@ impl BrainPack {
 
         let selected_id = p.target_id.as_deref().ok_or_else(|| {
             RuntimeError::InvalidInput(
-                "auto_feedback: `target_id` is required when `signal` is supplied; it must exactly match one results[].full_id (falling back to id)"
+                "auto_feedback: `target_id` is required when `signal` is supplied; it must exactly match one result object's id or full_id"
                     .to_string(),
             )
         })?;
-        let mut matching_results = p
-            .results
-            .iter()
-            .filter(|result| result.full_id.as_deref().unwrap_or(&result.id) == selected_id);
+        let mut matching_results = p.results.iter().filter(|result| {
+            result.id == selected_id || result.full_id.as_deref() == Some(selected_id)
+        });
         let selected = matching_results.next().ok_or_else(|| {
             RuntimeError::InvalidInput(format!(
-                "auto_feedback: target_id {selected_id:?} does not match any results[].full_id (falling back to id)"
+                "auto_feedback: target_id {selected_id:?} does not match any results[].id or results[].full_id"
             ))
         })?;
         if matching_results.next().is_some() {
@@ -2204,11 +2203,14 @@ impl BrainPack {
             )));
         }
 
-        let target = resolve_auto_feedback_target(
-            &self.runtime,
-            selected.full_id.as_deref().unwrap_or(&selected.id),
-        )
-        .await?;
+        let target = match selected.full_id.as_deref() {
+            Some(full_id) => full_id.parse::<uuid::Uuid>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "auto_feedback: invalid full_id {full_id:?}; expected full UUID"
+                ))
+            })?,
+            None => resolve_auto_feedback_target(&self.runtime, &selected.id).await?,
+        };
 
         let mut feedback_params = json!({
             "target_id": target.to_string(),
