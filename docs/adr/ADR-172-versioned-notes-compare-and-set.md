@@ -506,3 +506,53 @@ shapes and kinds are validated before any member transaction starts.
 This amendment enables append-member fences only. The batch-wide `fence` and
 `observed` fields, their mode defaults, and the `write` member retain their
 existing availability rules.
+
+## Amendment 4 (2026-09-11): absence as a fence predicate
+
+**Status**: Proposed.
+
+A fence may assert that no live note holds a key. `expected_version: null` on any fence entry, on
+singleton note `create`, note `update` and `stream.append`, alike in the object form and in
+Amendment 3's list form, succeeds when the resolved `(kind, key)` has no live row and refuses when
+one exists:
+
+```json
+{ "fence": [{ "kind": "head", "key": "run/lease", "expected_version": null }] }
+```
+
+This supersedes the sentence in Amendment 3 that made an explicit null `invalid_input`. The rest of
+that paragraph stands: an empty list, a malformed entry, an unknown entry field, an invalid key or
+note kind, a non-positive version, and a repeated `(kind, key)` remain `invalid_input` before the
+write transaction opens.
+
+**Why it is a correction and not a new capability.** The predicate already exists in the system.
+[ADR-174](ADR-174-ordered-streams-append.md)'s `stream.batch` reads a null `version` in its
+`observed` set as exactly this assertion, and the fence evaluation on the single-write path already
+resolves the current version into an optional value: the absent case was representable where the
+comparison happens and rejected where the parameter was parsed. A client whose contract is "fenced
+on an ownership head whenever one exists" could express the "whenever one exists" half on one route
+out of four, and the workaround was to send a single append as a `stream.batch`, which turns one
+write into a transaction with a different result shape.
+
+**The field is required and only its value may be null.** A fence entry that omits
+`expected_version` is refused, exactly as an `observed` member that omits `version` is refused.
+Absence is asserted deliberately or not at all: a field that defaults to "assert absent" when a
+caller forgets it would be a worse failure than the refusal it replaces.
+
+**One member shape across the routes.** The fence object additionally accepts `version` as a
+deserialization alias for `expected_version`, so the member a caller builds for `observed` is
+accepted by a fence unchanged. `expected_version` remains the canonical name: it is what this ADR
+documents, what a fence refusal carries in its details, and what serialization emits. No alias is
+added in the other direction, and `observed`'s own field name does not change.
+
+**Refusal.** A violated absence fence keeps `reason: "fence_conflict"` and the message `note fence
+precondition failed`. Its `details.expected_version` is the string `absent`, and `current_version`
+carries the live version that violated it. `details.index` follows Amendment 3's list rule. A
+satisfied absence fence adds nothing to the response.
+
+**Soft deletes.** A soft-deleted row satisfies absence, because the fence read already filters on
+`deleted_at IS NULL`. This is the same rule the keyed create-if-absent path applies, and it is
+stated here because a caller reasoning about a tombstone should not have to derive it from the SQL.
+
+Out of scope, both on the same object: a deadline or expiry on the fence, and any fence on entities
+or edges.
