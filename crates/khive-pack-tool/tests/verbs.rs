@@ -547,3 +547,41 @@ async fn a_matching_deny_still_decides_after_a_thousand_later_rows() {
     assert_eq!(after["source"], json!("policy"));
     assert_eq!(after["policy_id"], deny["policy"]["id"]);
 }
+
+/// Two different patterns can sum to the same specificity, and `DECISIONS` is
+/// closed and strictly ranked, so such a tie always carries the same decision:
+/// only the reported `policy_id` can vary. It must not. Oldest-first is the
+/// stated rule, and it is what the previous Rust path did by accident.
+#[tokio::test]
+async fn an_exact_specificity_tie_resolves_to_the_older_row() {
+    let f = fixture();
+    f.call(
+        "tool.register",
+        json!({"name": "t.x", "source": "builtin", "side_effect": "write"}),
+    )
+    .await;
+    let first = f
+        .call(
+            "tool.policy",
+            json!({"actor": "lambda:*", "tool": "t.x", "decision": "deny"}),
+        )
+        .await;
+    let second = f
+        .call(
+            "tool.policy",
+            json!({"actor": "lambda:a", "tool": "t.*", "decision": "deny"}),
+        )
+        .await;
+    assert_ne!(first["policy"]["id"], second["policy"]["id"]);
+
+    for _ in 0..5 {
+        let checked = f
+            .call("tool.check", json!({"tool": "t.x", "actor": "lambda:a"}))
+            .await;
+        assert_eq!(checked["decision"], json!("deny"));
+        assert_eq!(
+            checked["policy_id"], first["policy"]["id"],
+            "an equal-specificity tie must cite the older row every time: {checked}"
+        );
+    }
+}

@@ -208,6 +208,16 @@ pub(crate) async fn list_policies(
 /// ending in `*`, `substr(value, 1, length(pattern) - 1)` compared against the
 /// pattern's own prefix is the prefix test without any LIKE escaping; `*`
 /// itself has length 1 and both sides reduce to the empty string.
+///
+/// The trailing `created_at ASC, id ASC` is not decoration. Two different
+/// patterns can sum to the same specificity (`lambda:*` with `t.x` against
+/// `lambda:a` with `t.*`), and `DECISIONS` is closed and strictly ranked, so
+/// such a tie always carries the same decision and only the reported
+/// `policy_id` varies. Without a third key SQLite's choice among equals is
+/// unspecified and moves with the plan, so one question answered twice can
+/// cite different rows and an audit cannot reproduce itself. Oldest-first is
+/// also what the previous Rust path did: `max_by_key` returns the LAST
+/// maximal element and its input arrived `created_at DESC`.
 pub(crate) async fn select_deciding_policy(
     rt: &KhiveRuntime,
     ns: &str,
@@ -227,7 +237,8 @@ pub(crate) async fn select_deciding_policy(
                 "SELECT {POLICY_COLUMNS} FROM tool_policy \
                  WHERE namespace = ?1 AND {actor_match} AND {tool_match} \
                  ORDER BY ({} + {}) DESC, \
-                 CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC \
+                 CASE decision WHEN 'deny' THEN 2 WHEN 'ask' THEN 1 ELSE 0 END DESC, \
+                 created_at ASC, id ASC \
                  LIMIT 1",
                 rank("actor"),
                 rank("tool"),
