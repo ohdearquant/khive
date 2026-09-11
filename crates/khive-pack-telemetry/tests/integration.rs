@@ -59,6 +59,24 @@ async fn existing_read(registry: &VerbRegistry, stream: &str) -> Value {
 }
 
 #[tokio::test]
+async fn telemetry_retry_policy_distinguishes_reads_from_emit() {
+    let (registry, _) = registry(config());
+    for (verb, retry_safe) in [
+        ("telemetry.channels", true),
+        ("telemetry.counts", true),
+        ("telemetry.read", true),
+        ("telemetry.emit", false),
+    ] {
+        assert_eq!(
+            registry.is_retry_safe_after_frame_omission(verb),
+            retry_safe,
+            "{verb}"
+        );
+        assert!(!registry.is_read_replay_safe(verb), "{verb}");
+    }
+}
+
+#[tokio::test]
 async fn durable_kind_is_visible_through_existing_stream_read() {
     let (registry, _) = registry(config());
     let emitted = registry

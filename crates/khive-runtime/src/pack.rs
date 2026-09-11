@@ -1771,6 +1771,10 @@ impl VerbRegistry {
         ("session", "session.list"),
         ("session", "session.resume"),
         ("session", "session.export"),
+        // telemetry (resolved configuration and durable stream reads)
+        ("telemetry", "telemetry.channels"),
+        ("telemetry", "telemetry.counts"),
+        ("telemetry", "telemetry.read"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
