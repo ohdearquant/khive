@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -159,6 +160,88 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_component_phases_bound_children_and_report_raw_exit_codes(self):
+        workflow = workflow_text("bench-component.yml")
+        for phase, name, limit in [
+            ("compile", "Compile-check this component's bench targets", "1500"),
+            (
+                "criterion",
+                "Run Criterion benches (quick profile, bounded to 10 minutes)",
+                "600",
+            ),
+        ]:
+            step = workflow.split(f"      - name: {name}\n", 1)[1].split(
+                "      - name:", 1
+            )[0]
+            script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+            for rc in (0, 124, 137):
+                with (
+                    self.subTest(phase=phase, rc=rc),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = pathlib.Path(tmp)
+                    work = root / "crates"
+                    work.mkdir()
+                    bins = root / "bin"
+                    bins.mkdir()
+                    timeout = bins / "timeout"
+                    timeout.write_text(
+                        '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_LOG"\nexit "$FAKE_RC"\n'
+                    )
+                    timeout.chmod(0o755)
+                    output = root / "outputs"
+                    args = root / "args"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{bins}:{os.environ['PATH']}",
+                        "COMPONENT_CRATES": "khive-pack-gtd khive-pack-kg",
+                        "COMPONENT_JOB_MINUTES": "40",
+                        "GITHUB_OUTPUT": str(output),
+                        "ARGV_LOG": str(args),
+                        "FAKE_RC": str(rc),
+                    }
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=work,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        rc if phase == "compile" else 0,
+                        result.stderr,
+                    )
+                    argv = args.read_text().splitlines()
+                    self.assertEqual(
+                        argv[:4], ["--kill-after=30s", limit, "cargo", "bench"]
+                    )
+                    self.assertIn("--benches", argv)
+                    self.assertNotIn("--all-targets", argv)
+                    log = (root / "component-phases.log").read_text()
+                    self.assertIn(f"phase={phase} start=", log)
+                    self.assertRegex(
+                        log, rf"phase={phase} elapsed_seconds=\d+ exit_code={rc}"
+                    )
+                    if rc:
+                        self.assertIn("::warning::", result.stdout)
+                    if phase == "compile":
+                        self.assertEqual(output.read_text(), f"exit_code={rc}\n")
+
+    def test_component_compile_failure_still_reaches_diagnostics(self):
+        workflow = workflow_text("bench-component.yml")
+        compile_step = workflow.split("      - name: Compile-check", 1)[1].split(
+            "      - name:", 1
+        )[0]
+        self.assertIn("id: compile", compile_step)
+        self.assertIn("continue-on-error: true", compile_step)
+        self.assertIn("if: steps.compile.outcome == 'success'", workflow)
+        self.assertIn("cat component-phases.log", workflow)
+        self.assertIn("            component-phases.log", workflow)
+        self.assertIn("default: 30", workflow)
+
     def test_component_runner_limits_quick_flag_to_bench_targets(self):
         workflow = workflow_text("bench-component.yml")
         bench_commands = [
