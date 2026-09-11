@@ -1007,6 +1007,42 @@ async fn remote_lost_ack_without_marker_stays_unknown_and_never_retries() {
         .await;
 }
 
+/// Every push case in this crate reaches `push_marker_support`, so on a host whose `git` does not
+/// advertise `git reflog write ` each of them fails on the `unsupported_toolchain` refusal and the
+/// run reads as nineteen defects rather than one fact about the host. This case states the fact
+/// once. It holds `ENV_MUTEX` because the case below installs a git that answers `reflog -h` for
+/// every caller while it runs.
+#[tokio::test]
+async fn push_cases_require_a_git_that_advertises_reflog_write() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let repo = dir.path().join("probe");
+    let init = Command::new("git")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .args(["init", "--quiet"])
+        .arg(&repo)
+        .output()
+        .expect("spawn git init");
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let (version, supported) = crate::local_git::push_marker_support(&repo)
+        .await
+        .expect("capability probe");
+    assert!(
+        supported,
+        "the git on PATH is {version}, which does not advertise `git reflog write `. \
+         git.push writes its receipt marker with that subcommand, so every push case in \
+         remote_tests and local_remote_tests refuses unsupported_toolchain on this host, and \
+         those failures are about the host and not about the pack. The capability first shipped \
+         in Git 2.51; the pack reads the capability and never the version number. Put a git that \
+         advertises it first on PATH."
+    );
+}
+
 #[tokio::test]
 async fn remote_unsupported_git_is_receipted_before_credentials_or_network() {
     struct RestorePath(std::ffi::OsString);

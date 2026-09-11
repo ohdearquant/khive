@@ -32,7 +32,7 @@ const SESSION: ParamDef = crate::local_vocab::SESSION;
 
 pub(crate) const PUSH: HandlerDef = HandlerDef {
     name: "git.push",
-    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. All caller force/remote/refspec overrides refuse. HTTPS uses actor-only credentials. An absolute path or file:/// remote configured with slug=\"\" uses no credential or actor row and records credential.source=none. Durable receipt, no retries.",
+    description: "Push an exact local SHA with a server-side expected-remote compare after fast-forward proof. Expected remote null means must not exist. All caller force/remote/refspec overrides refuse. HTTPS uses actor-only credentials. An absolute path or file:/// remote configured with slug=\"\" uses no credential or actor row and records credential.source=none. Durable receipt, no retries. Requires a git that advertises the `git reflog write ` subcommand, which first shipped in Git 2.51: the receipt marker is written with it, and without it the verb refuses unsupported_toolchain before any credential or network use, recording the version found and the missing capability. The check reads the capability, never the version number.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
