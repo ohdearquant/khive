@@ -3751,6 +3751,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 // ---- MIN-1: SubstrateCoordinatorService hydration seam ----
 
 #[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
 async fn coordinator_service_preserves_timeout_failure_kind() {
     use khive_mcp::coordinator::{
         BackendSearchFailureKind as CoordFailureKind, CoordinatorService,
