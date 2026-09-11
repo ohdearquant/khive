@@ -105,6 +105,19 @@ def test_batch_partial_failure_reported(db: Khive):
     assert err.failures[0][0] == 1, "the failing op must be identified by index"
 
 
+def test_blob_and_attachment(db: Khive):
+    payload = b"attachment payload: a small PDF stand-in"
+    ref = db.blobs.put(payload)
+    assert len(ref) == 64, "ContentRef is a BLAKE3 hex digest"
+    assert db.blobs.put(payload) == ref, "identical bytes must be idempotent"
+    assert db.blobs.get(ref) == payload
+
+    host = db.entities.create(kind="document", name="attach-host")
+    att = db.blobs.attach(host.id, payload, role="original", media_type="application/pdf")
+    assert att.content_ref == ref
+    assert db.blobs.attachment(host.id, "original") == payload
+
+
 def test_invalid_kind_is_op_error(db: Khive):
     with pytest.raises(OperationError):
         db.entities.create(kind="not-a-kind", name="x")
