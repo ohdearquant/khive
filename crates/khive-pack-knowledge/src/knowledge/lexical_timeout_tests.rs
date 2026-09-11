@@ -134,9 +134,9 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "zzoraclezz",
         ),
         (
-            LexicalPhase::RecentFallback,
-            "recent_fallback",
-            "zzabsentzz",
+            LexicalPhase::NamespaceExistence,
+            "namespace_existence",
+            "zzoraclezz",
         ),
     ] {
         let events = TimeoutEvents::default();
@@ -161,6 +161,7 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             outcome.atoms.is_empty(),
             "base drops the unfinished term: {label}"
         );
+        assert_eq!(outcome.state, LexicalCandidateState::TimedOut, "{label}");
         tokio::time::advance(Duration::from_millis(123)).await;
         assert_eq!(
             detail.stage_elapsed_ms, 7,
@@ -219,11 +220,16 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
                 .remove("lexical_timeout_instrumented"),
             Some(json!(true))
         );
-        assert_eq!(
-            response,
-            json!({"results": [], "total": 0, "degraded": {"lexical_timeout": true}}),
-            "legacy empty-timeout response must be unchanged: {verb}"
-        );
+        let expected = if verb == "knowledge.search" {
+            json!({
+                "results": [], "total": 0,
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "degraded": {"lexical_timeout": true}
+            })
+        } else {
+            json!({"results": [], "total": 0, "degraded": {"lexical_timeout": true}})
+        };
+        assert_eq!(response, expected, "empty-timeout response: {verb}");
     }
 }
 
@@ -255,6 +261,21 @@ async fn healthy_dispatch_omits_timeout_details() {
             response["total"],
             if verb == "knowledge.search" { 1 } else { 0 }
         );
+        if verb == "knowledge.search" {
+            assert_eq!(
+                response["candidate_provenance"],
+                json!({"lexical": "matched", "fallback": "none"})
+            );
+            assert_eq!(
+                response["results"][0]["score_provenance"],
+                json!({
+                    "sources": ["lexical"], "embedding_rerank": false,
+                    "normalization": "s_over_s_plus_1", "calibrated": false,
+                })
+            );
+        } else {
+            assert!(response.get("candidate_provenance").is_none());
+        }
     }
 }
 
@@ -266,31 +287,43 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
         let runtime = fixture(foreign).await;
         let registry = registry(&runtime);
         let healthy = fetch(&runtime, "zzoraclezz").await;
-        assert_eq!(
-            healthy
-                .atoms
-                .iter()
-                .map(|atom| atom.slug.as_str())
-                .collect::<Vec<_>>(),
-            ["local-control"]
-        );
+        assert!(healthy.atoms.is_empty());
+        assert_eq!(healthy.state, LexicalCandidateState::NoMatch);
         assert!(healthy.timeout.is_none());
-        let events = TimeoutEvents::default();
-        // At the first corpus-dependent read, both arms fail at the same fake time.
-        // The foreign row changes the phase, not the local results or elapsed time.
-        let response = with_timeout(
-            vec![LexicalPhase::PhaseARowids, LexicalPhase::RecentFallback],
-            Duration::from_millis(11),
-            registry.dispatch(
+        let healthy = registry
+            .dispatch(
                 "knowledge.search",
                 json!({"query": "zzoraclezz", "rerank": false}),
-            ),
-        )
-        .with_subscriber(events.clone())
-        .await
-        .expect("public dispatch");
-        observed.push(events.0.lock().unwrap()[0]["phase"].clone());
-        responses.push(response);
+            )
+            .await
+            .expect("healthy public miss");
+        assert_eq!(
+            healthy,
+            json!({
+                "results": [], "total": 0,
+                "candidate_provenance": {"lexical": "no_match", "fallback": "none"},
+            }),
+            "a healthy miss must not reveal a foreign match: {foreign}"
+        );
+        // Both hidden phases are reachable through the same local matching row.
+        for phase in [LexicalPhase::PhaseARowids, LexicalPhase::PhaseBHydration] {
+            let events = TimeoutEvents::default();
+            let response = with_timeout(
+                vec![phase],
+                Duration::from_millis(11),
+                registry.dispatch(
+                    "knowledge.search",
+                    json!({"query": "unrelated", "rerank": false}),
+                ),
+            )
+            .with_subscriber(events.clone())
+            .await
+            .expect("public dispatch");
+            let events = events.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            observed.push(events[0]["phase"].clone());
+            responses.push(response);
+        }
         for phase in [LexicalPhase::ReaderOpen, LexicalPhase::TermFrequency] {
             let response = with_timeout(
                 vec![phase],
@@ -304,7 +337,9 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             .expect("public timing-only phase");
             assert_eq!(
                 response,
-                json!({"results": [], "total": 0, "degraded": {
+                json!({"results": [], "total": 0,
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "degraded": {
                     "lexical_timeout": true, "lexical_timeout_instrumented": true,
                     "lexical_timeout_details": [{
                         "pass": "full", "phase": phase.label(), "stage_elapsed_ms": 11,
@@ -317,18 +352,31 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
     }
     assert_eq!(
         observed,
-        vec![json!("recent_fallback"), json!("phase_a_rowids")],
-        "positive control: foreign corpus actually changed the internal phase"
+        vec![
+            json!("phase_a_rowids"),
+            json!("phase_b_hydration"),
+            json!("phase_a_rowids"),
+            json!("phase_b_hydration"),
+        ],
+        "positive control: both hidden phases ran against both corpora"
     );
-    assert_eq!(
-        responses[0], responses[1],
-        "the public response must not disclose that difference"
-    );
-    assert_eq!(
-        responses[0],
-        json!({"results": [], "total": 0, "degraded": {
-            "lexical_timeout": true, "lexical_timeout_instrumented": true
-        }})
+    for response in &responses {
+        assert_eq!(
+            *response,
+            json!({"results": [], "total": 0,
+            "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+            "degraded": {
+                "lexical_timeout": true, "lexical_timeout_instrumented": true
+            }})
+        );
+    }
+    let serialized: Vec<_> = responses
+        .iter()
+        .map(|response| serde_json::to_vec(response).expect("serialize public JSON"))
+        .collect();
+    assert!(
+        serialized.windows(2).all(|pair| pair[0] == pair[1]),
+        "public JSON must not reveal the foreign corpus or the hidden timeout phase"
     );
 }
 
@@ -390,7 +438,9 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
         );
         assert_eq!(
             response,
-            json!({"results": [], "total": 0, "degraded": {
+            json!({"results": [], "total": 0,
+            "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none"},
+            "degraded": {
                 "lexical_timeout": true, "lexical_timeout_instrumented": true,
                 "lexical_timeout_details": [{
                     "pass": "full", "phase": "term_frequency",
@@ -410,7 +460,9 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
 
 #[test]
 fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases() {
-    let base = json!({"results": [], "degraded": {
+    let base = json!({"results": [],
+    "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+    "degraded": {
         "lexical_timeout": true, "reason": "ann_unavailable", "mode": "no_match", "cache_safe": false,
         "body_lines_timeout": true, "hydration_failures": 2, "member_sizing_timeout": ["domain"]
     }});
@@ -419,7 +471,7 @@ fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases(
         LexicalPhase::PhaseBHydration,
         LexicalPhase::EligibilityFallback,
         LexicalPhase::NamespaceMembership,
-        LexicalPhase::RecentFallback,
+        LexicalPhase::NamespaceExistence,
     ] {
         let mut response = base.clone();
         attach_lexical_timeout_degradation(
@@ -569,6 +621,7 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
         )
         .await
         .expect("partial scored results");
+        assert_eq!(outcome.lexical_state, LexicalCandidateState::PartialTimeout);
         assert_eq!(
             outcome.lexical_timeouts.len(),
             1,
@@ -620,6 +673,10 @@ async fn configured_budget_uses_the_stage_override() {
     )
     .await
     .expect("public dispatch");
+    assert_eq!(
+        response["candidate_provenance"],
+        json!({"lexical": "timed_out", "fallback": "none"})
+    );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["configured_budget_ms"],
         137
