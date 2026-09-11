@@ -1,0 +1,135 @@
+# ADR-183: Batched Write Disposition: Commit What Passes, Name What Refuses
+
+- **Status**: Proposed
+- **Date**: 2026-09-11
+- **Relates to**: [ADR-017](ADR-017-pack-standard.md) (pack verbs and handler return shape),
+  [ADR-045](ADR-045-verb-response-presentation.md) (envelope-owned names),
+  [ADR-174](ADR-174-ordered-streams-append.md) (`stream.batch`, whose `atomic` flag this generalizes),
+  [ADR-016](ADR-016-request-dsl.md) (per-op batching at the DSL layer, which this is not)
+
+## Context
+
+A verb that takes a list of records and validates each one in a loop returns on the first
+refusal. Every other record in the call is refused with it, nothing is written, and the single
+error describes only the offending value. The caller holds N records and one error about text
+that lives in whichever record failed, with no way to tell which.
+
+This was measured on `knowledge.upsert_atoms`. A run parked 97 atoms on a secret-gate refusal.
+Re-sent one atom per call, 90 of the 97 committed; 7 refuse on their own. Of the 97, 57 do not
+contain the reported trigger word anywhere in their own fields: the word was in a sibling record
+of the same call. The scan is correct and per-record; the coupling is the control flow.
+
+Two consequences follow, and the second is the reason this is an ADR rather than a bug fix.
+
+A refused record and a bystander are **indistinguishable in the response**, so the caller cannot
+separate "this contains a credential" from "this shared a call with something that did". The
+available workaround is to stop batching, which trades away the verb's purpose for the ability to
+tell the two apart.
+
+And the verb is **making a durability decision the caller did not ask for**. Discarding valid
+records because an invalid one arrived in the same call is a policy, not a mechanism, and today it
+is a policy no document states and no caller can opt out of.
+
+The tree already contains the answer in one place. `stream.batch` takes an `atomic` flag, defaults
+it by whether the call carries a fence, and refuses the contradiction outright: _"atomic=false
+cannot carry a fence: a fence admits no partial commit"_. That is the contract below, already
+written, in one pack.
+
+This is **not** the DSL's op-level batching. ADR-016 gives each op in a request its own
+`{ok, tool, result}` and one failing op does not abort the others. That rule stops at the verb
+boundary; inside a verb, a record list has no such disposition. This ADR gives it one.
+
+## Decision
+
+### 1. A batched write commits the records that pass
+
+A verb that accepts a list of caller-supplied records writes every record that passes validation
+and refuses the ones that do not. Success means, precisely: **everything named in `committed` is
+durable.** It does not mean every record in the request was accepted.
+
+### 2. The response names both sides
+
+```json
+{
+  "status": "ok" | "partial",
+  "committed": [ { "slug": "...", "id": "..." } ],
+  "refused":  [ { "slug": "...", "field": "content", "reason": "..." } ]
+}
+```
+
+- `status` is `partial` exactly when `refused` is non-empty, and `ok` otherwise.
+- Each refusal names the **record** (its caller-supplied identity: `slug` for atoms) and the
+  **field** that refused, so the caller can locate it in the payload it still holds.
+- A refusal reason **never carries the matched value**. A secret-gate refusal already renders a
+  masked form; the disposition adds identity, it does not widen disclosure.
+- `committed` and `refused` are envelope-owned names under ADR-045 Amendment 2: a record's own
+  properties cannot shadow them.
+
+### 3. `atomic=true` is how a caller asks for all-or-nothing
+
+`atomic` is an optional boolean parameter, default `false`, on every verb this ADR binds. With
+`atomic=true` the call behaves as today: the first refusal aborts and nothing is written. The
+response still carries `refused`, so the caller learns which record stopped it, and `committed` is
+empty.
+
+A verb whose own contract already forbids partial commit keeps that contract and refuses
+`atomic=false` with a stated reason rather than silently ignoring it. `stream.batch` carrying a
+fence is the existing case.
+
+### 4. Which verbs this binds
+
+The rule is on the SHAPE — a verb taking a caller-supplied list of records it writes — not on a
+fixed list. The census below is what that shape selects today, produced by reading the pack
+parameter structs for caller-supplied record lists (`grep -rn --include='*.rs' 'pub [a-z_]*:
+Vec<' crates/khive-pack-*/src`) and checking each against the registered verb table; it is a
+census at one revision, not part of the rule.
+
+| Verb                       | Record list           | Today                       | Under this ADR                 |
+| -------------------------- | --------------------- | --------------------------- | ------------------------------ |
+| `knowledge.upsert_atoms`   | `atoms`               | aborts on the first refusal | partial, `atomic` opt-in       |
+| `knowledge.upsert_domains` | `domains`             | aborts on the first refusal | partial, `atomic` opt-in       |
+| `knowledge.import`         | `atoms` (import path) | aborts on the first refusal | partial, `atomic` opt-in       |
+| `kg.stream.batch`          | `members`             | already `atomic`-flagged    | unchanged; it is the precedent |
+
+A verb added later that takes a record list adopts this contract at the point it is written. A
+verb whose list is of _identifiers to read or delete_ rather than records to write is out of
+scope: this is about durability of caller-supplied content.
+
+### 5. The refusal names its record even under `atomic=true`
+
+Independent of the disposition, a per-record validation failure inside a batch loop carries the
+record's identity. This is the half that is true regardless of which way §1 had been decided, and
+it lands first: an all-or-nothing batch whose single error cannot be located is unusable whether
+or not partial commit exists.
+
+## Consequences
+
+A caller that today treats any error from a batched write as "nothing was written" becomes wrong
+the moment §1 ships, which is why `atomic` exists and why `status` is explicit rather than
+inferred from the presence of an error. Callers wanting the old guarantee name it.
+
+The verbs in §4 grow a parameter and a response shape. Their existing tests assert the
+all-or-nothing behaviour, so each adopting change carries both arms: the same input under
+`atomic=true` must still refuse everything, and under the default must commit the passing records
+and name the rest.
+
+The partial path writes records after a refusal has already been found, so the writer is held
+across records that the atomic path would never have reached. The existing per-verb list bounds
+(5000 atoms, 1000 batch members) are what keep that bounded; this ADR adds no new bound and
+changes none.
+
+## Acceptance
+
+Stated before implementation, per verb the census binds:
+
+1. A two-record batch whose second record refuses commits the first, returns `status: "partial"`,
+   `committed` naming the first and `refused` naming the second with its field.
+2. The same call with `atomic=true` writes nothing, returns `committed: []`, and still names the
+   refusing record in `refused`.
+3. A refusal reason contains no substring of the matched value, asserted against a fixture whose
+   value is known.
+4. A batch in which every record passes returns `status: "ok"` and an empty `refused`.
+5. A batch in which every record refuses returns `status: "partial"`, empty `committed`, and one
+   refusal entry per record — not one entry for the first.
+6. Mutation control: restoring the `?` that returns on the first refusal must fail arm 1 and arm 5
+   and leave arm 2 green, since arm 2 is the behaviour being restored.
