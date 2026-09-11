@@ -188,7 +188,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
