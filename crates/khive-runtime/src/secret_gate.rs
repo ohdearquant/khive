@@ -5158,7 +5158,7 @@ mod tests {
         // trigger word sits AFTER the last fragment ("... is the api key
         // for ..."), never inside the truncated window. Expected arm
         // (pre-fix): `trailing_bridge_fragment_cut` gated its backward walk
-        // on `contains_trigger(window)`, and the window here carries no
+        // on a trigger word in the window, and the window here carries no
         // trigger at all — the walk never ran, so frag1 and frag2 (both
         // read whole into the window) survived the partial-token drop and
         // leaked.
@@ -5187,7 +5187,7 @@ mod tests {
             "fixture must exceed the window"
         );
         assert!(
-            !contains_trigger(&message[..window_chars]),
+            find_trigger(&message[..window_chars], false).is_none(),
             "fixture must carry no trigger word inside the window"
         );
 
@@ -5217,7 +5217,7 @@ mod tests {
         let prefix = "benign status update about the lazy owls and cats over ";
         let message = format!("{prefix}here while more prose keeps going past the window");
         assert!(
-            !contains_trigger(&message),
+            find_trigger(&message, false).is_none(),
             "fixture must carry no trigger word"
         );
         let window_chars = prefix.chars().count() + 2;
@@ -5245,7 +5245,7 @@ mod tests {
         let identifier = "deadbeefcafefeed01234567";
         let message = format!("{prefix}{identifier} zzzzzzzzzz");
         assert!(
-            !contains_trigger(&message),
+            find_trigger(&message, false).is_none(),
             "fixture must carry no trigger word"
         );
         assert!(identifier.len() >= MIN_BRIDGE_FRAGMENT_LEN);
@@ -5279,7 +5279,7 @@ mod tests {
         let prefix = "the quick brown fox jumps over the lazy ";
         let message = format!("{prefix}dogs while writing documentation");
         assert!(
-            !contains_trigger(&message),
+            find_trigger(&message, false).is_none(),
             "fixture must carry no trigger word"
         );
         let window_chars = prefix.chars().count() + 2;
