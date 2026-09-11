@@ -275,15 +275,7 @@ fn comm_filter_query_plan_candidates_record_foreign_mailbox_growth() {
 }
 
 fn full_then_unread_ddl() -> String {
-    let schema = include_str!("../../sql/notes-ddl.sql");
-    let start = schema
-        .find("CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction")
-        .unwrap();
-    let end = schema[start..].find(';').unwrap() + start + 1;
-    format!(
-        "{FULL_RECIPIENT}; DROP INDEX idx_notes_unread_probe_recipient_direction; {}",
-        &schema[start..end]
-    )
+    include_str!("../../sql/033-notes-message-recipient-direction.sql").to_owned()
 }
 
 fn assert_actor_seek(result: &Value, status: &str) {
@@ -304,6 +296,28 @@ fn assert_actor_seek(result: &Value, status: &str) {
         plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?"),
         "actor and direction must both constrain the {status} search: {plan}"
     );
+}
+
+#[test]
+fn comm_filter_fresh_bootstrap_preserves_recipient_plans_without_rebuilds() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ddl = include_str!("../../sql/notes-ddl.sql");
+    conn.execute_batch(ddl).unwrap();
+    register_comm_indexes(&conn);
+    let version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    for _ in 0..2 {
+        for status in ["unread", "read", "all"] {
+            assert_actor_seek(&measure(&conn, &inbox_filter(status, false)), status);
+        }
+        conn.execute_batch(ddl).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+    }
 }
 
 #[test]
@@ -378,7 +392,88 @@ fn comm_filter_recreated_unread_index_preserves_fresh_reopen_and_analyzed_plans(
 }
 
 #[test]
-#[ignore = "planner proof for the recreated unread-probe index; the production index and its migration are a follow-up"]
+fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
+    fn comm_catalog(conn: &Connection) -> Vec<(String, i64, i64, String)> {
+        conn.prepare(
+            "SELECT name, rowid, rootpage, sql FROM sqlite_schema \
+             WHERE type = 'index' AND name GLOB 'idx_comm_message_*' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    fn comm_stats(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT idx, stat FROM sqlite_stat1 WHERE idx GLOB 'idx_comm_message_*' ORDER BY idx",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("preanalyzed-mailbox.sqlite");
+    let mut conn = fixture_with_connection(Connection::open(&path).unwrap(), 6000, 10_000, None);
+    conn.execute_batch("ANALYZE").unwrap();
+    let catalog_before = comm_catalog(&conn);
+    let stats_before = comm_stats(&conn);
+    assert_eq!(catalog_before.len(), 4);
+    assert_eq!(stats_before.len(), 4);
+    let filters: Vec<_> = ["unread", "read", "all", "sent"]
+        .iter()
+        .map(|status| {
+            if *status == "sent" {
+                sent_filter()
+            } else {
+                inbox_filter(status, false)
+            }
+        })
+        .collect();
+    let baseline: Vec<_> = filters
+        .iter()
+        .map(|filter| measure(&conn, filter))
+        .collect();
+
+    // Existing pack indexes survive CREATE IF NOT EXISTS registration during
+    // a real upgrade, including their catalog positions and ANALYZE statistics.
+    conn.execute_batch(&full_then_unread_ddl()).unwrap();
+    let mut measurements = Vec::new();
+    for stage in ["upgraded", "reopened"] {
+        if stage == "reopened" {
+            drop(conn);
+            conn = Connection::open(&path).unwrap();
+        }
+        assert_eq!(comm_catalog(&conn), catalog_before, "{stage}");
+        assert_eq!(comm_stats(&conn), stats_before, "{stage}");
+        for (index, status) in ["unread", "read", "all", "sent"].iter().enumerate() {
+            let result = measure(&conn, &filters[index]);
+            assert_actor_seek(&result, status);
+            assert_eq!(result["ids"], baseline[index]["ids"]);
+            if *status == "unread" {
+                let before = baseline[index]["vm_steps"].as_u64().unwrap();
+                let after = result["vm_steps"].as_u64().unwrap();
+                assert!(
+                    after <= before + 128,
+                    "{stage}: unread work regressed ({before} -> {after})"
+                );
+            }
+            measurements.push(json!({"stage":stage,"status":status,"result":result}));
+        }
+    }
+    println!(
+        "{}",
+        json!({"sqlite_version":rusqlite::version(),"preanalyzed_upgrade":measurements})
+    );
+}
+
+#[test]
 fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
     let migration = full_then_unread_ddl();
     let mut measurements = Vec::new();
@@ -387,6 +482,15 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
         for foreign_count in [0, 6000] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("mailbox.sqlite");
+            // Sent already changes plans after ANALYZE as the population grows.
+            // Compare this inbox migration to an identical no-full-index cell.
+            let baseline_path = temp.path().join("baseline.sqlite");
+            let mut baseline_conn = fixture_with_connection(
+                Connection::open(&baseline_path).unwrap(),
+                foreign_count,
+                0,
+                None,
+            );
             let mut conn = fixture_with_connection(
                 Connection::open(&path).unwrap(),
                 foreign_count,
@@ -396,7 +500,16 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
             if !fresh_schema {
                 conn.execute_batch(&migration).unwrap();
                 register_comm_indexes(&conn);
+                register_comm_indexes(&baseline_conn);
             }
+            let full_exists: bool = baseline_conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'idx_notes_message_recipient_direction')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!full_exists, "sent baseline must exclude the full index");
             for (stage_index, stage) in [
                 "fresh_connection",
                 "reopened",
@@ -409,9 +522,12 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                 if stage.ends_with("reopened") {
                     drop(conn);
                     conn = Connection::open(&path).unwrap();
+                    drop(baseline_conn);
+                    baseline_conn = Connection::open(&baseline_path).unwrap();
                 }
                 if *stage == "analyzed" {
                     conn.execute_batch("ANALYZE").unwrap();
+                    baseline_conn.execute_batch("ANALYZE").unwrap();
                 }
                 for (index, status) in ["unread", "read", "all", "sent"].iter().enumerate() {
                     let filter = if *status == "sent" {
@@ -420,18 +536,31 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                         inbox_filter(status, false)
                     };
                     let result = measure(&conn, &filter);
-                    assert_actor_seek(&result, status);
+                    let sent_baseline =
+                        (*status == "sent").then(|| measure(&baseline_conn, &filter));
+                    if let Some(before) = &sent_baseline {
+                        assert_eq!(result["sql"], before["sql"]);
+                        assert_eq!(result["ids"], before["ids"]);
+                        let before_steps = before["vm_steps"].as_u64().unwrap();
+                        let after_steps = result["vm_steps"].as_u64().unwrap();
+                        assert!(after_steps <= before_steps,
+                            "{fresh_schema}/{foreign_count}/{stage}: sent work regressed ({before} -> {result})");
+                    } else {
+                        assert_actor_seek(&result, status);
+                    }
                     if foreign_count == 0 {
                         small_results.push(result.clone());
                     } else {
                         let baseline: &Value = &small_results[stage_index * 4 + index];
                         assert_eq!(result["ids"], baseline["ids"]);
-                        let steps = result["vm_steps"].as_u64().unwrap();
-                        let baseline_steps = baseline["vm_steps"].as_u64().unwrap();
-                        assert!(steps <= baseline_steps + 128,
-                            "{fresh_schema}/{stage}/{status}: foreign mailbox growth must not add row-proportional work ({baseline_steps} -> {steps})");
+                        if *status != "sent" {
+                            let steps = result["vm_steps"].as_u64().unwrap();
+                            let baseline_steps = baseline["vm_steps"].as_u64().unwrap();
+                            assert!(steps <= baseline_steps + 128,
+                                "{fresh_schema}/{stage}/{status}: foreign mailbox growth must not add row-proportional work ({baseline_steps} -> {steps})");
+                        }
                     }
-                    measurements.push(json!({"fresh_schema":fresh_schema,"stage":stage,"foreign_count":foreign_count,"status":status,"result":result}));
+                    measurements.push(json!({"fresh_schema":fresh_schema,"stage":stage,"foreign_count":foreign_count,"status":status,"result":result,"sent_baseline":sent_baseline}));
                 }
             }
         }

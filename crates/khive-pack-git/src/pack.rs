@@ -160,7 +160,7 @@ impl PackRuntime for GitPack {
             "git.commit" if params.get("tree").is_some() => {
                 self.handle_local(token, registry, verb, params).await
             }
-            "git.commit" => self.handle_commit(token, params).await,
+            "git.commit" => self.handle_commit(token, registry, params).await,
             "git.branch" => self.handle_local(token, registry, verb, params).await,
             "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
                 self.handle_remote(token, registry, verb, params).await

@@ -38,6 +38,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
     ON notes(namespace, kind, key)
     WHERE key IS NOT NULL AND deleted_at IS NULL;
 
+-- Full recipient index for read/all inbox listings (migration V33). Create it
+-- before the same-key unread partial index to preserve unread plan selection.
+CREATE INDEX IF NOT EXISTS idx_notes_message_recipient_direction
+    ON notes(namespace, kind,
+             ifnull(json_extract(properties, '$.to_actor'), ''),
+             json_extract(properties, '$.direction'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
 -- Partial index for the unread-message probe (comm unread badge + inbox
 -- unread listing/count projection). Its WHERE clause is the exact predicate the
 -- JsonTypeNeMissing filter op generates (with the json_type value inlined

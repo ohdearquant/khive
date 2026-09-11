@@ -327,13 +327,17 @@ fn run_git_output(
             // when a later HEAD reflog write fails. Only known CAS refusals settle.
             return Err(LocalGitError::after_start(operation, true));
         }
+        // #2539: the exit status is the only bounded, non-sensitive fact that
+        // separates a lock contention from a usage error, and without it a
+        // classified refusal teaches nothing on the run that produced it. stderr
+        // stays where it is: retained for classification, never exposed.
         return Err(LocalGitError::new(
             if ref_effect {
                 "not_committed"
             } else {
                 "git_failed"
             },
-            format!("git {operation} refused the operation"),
+            format!("git {operation} refused the operation with exit status {exit_code}"),
         ));
     }
     let (bytes, exceeded) = out

@@ -48,6 +48,7 @@ struct Fixture {
     dir: tempfile::TempDir,
     repo: PathBuf,
     platform_repo: PathBuf,
+    unmapped_repo: PathBuf,
     bare: PathBuf,
     base: String,
     head: String,
@@ -63,10 +64,18 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let platform_repo = dir.path().join("platform");
+        // Allowlisted, and deliberately absent from [git_write.repositories].
+        let unmapped_repo = dir.path().join("unmapped");
         std::fs::create_dir(&repo).unwrap();
         std::fs::create_dir(&platform_repo).unwrap();
+        std::fs::create_dir(&unmapped_repo).unwrap();
         let repo = std::fs::canonicalize(repo).unwrap();
         let platform_repo = std::fs::canonicalize(platform_repo).unwrap();
+        let unmapped_repo = std::fs::canonicalize(unmapped_repo).unwrap();
+        for repo in [&platform_repo, &unmapped_repo] {
+            git(repo, &["init", "-q", "--template=", "-b", "work"]);
+            git(repo, &["commit", "--allow-empty", "-qm", "base"]);
+        }
         git(&repo, &["init", "-q", "--template=", "-b", "work"]);
         git(&repo, &["commit", "--allow-empty", "-qm", "base"]);
         let base = git(&repo, &["rev-parse", "HEAD"]);
@@ -103,7 +112,7 @@ impl Fixture {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             git_write: GitWriteSectionConfig {
-                allowed: [&repo, &platform_repo]
+                allowed: [&repo, &platform_repo, &unmapped_repo]
                     .into_iter()
                     .map(|repo| GitWriteEntryConfig {
                         repo: repo.display().to_string(),
@@ -177,6 +186,7 @@ impl Fixture {
             dir,
             repo,
             platform_repo,
+            unmapped_repo,
             bare,
             base,
             head,
@@ -375,6 +385,69 @@ async fn local_pr_verbs_refuse_remote_scheme_before_credentials() {
         let receipt = f.refusal(verb, params, "remote_scheme").await;
         assert_eq!(receipt.credential, json!({"source":"none"}));
     }
+}
+
+#[tokio::test]
+async fn remote_refusals_name_the_config_table_they_read() {
+    let f = Fixture::file().await;
+    let unmapped_actor = format!("{}:unmapped", f.actor);
+    let head = git(&f.unmapped_repo, &["rev-parse", "HEAD"]);
+    let repositories = json!({
+        "table": "git_write.repositories",
+        "key": f.unmapped_repo.display().to_string(),
+    });
+
+    // The repository mapping resolves before any credential exists to resolve, so
+    // an allowlisted path with no row refuses on the repositories table whatever
+    // the actor's state (ADR-182 Amendment 10 item 1). The second caller has no
+    // actor row at all, which is the arm that pins the order.
+    for caller in [&f.actor, &unmapped_actor] {
+        let error = f
+            .call(
+                caller,
+                "git.push",
+                json!({"repo":f.unmapped_repo,"branch":"work","expected_local":head,"expected_remote":head}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repository_unmapped"), "{error}");
+        let receipt = f.last(caller).await;
+        assert_eq!(receipt.reason.as_deref(), Some("repository_unmapped"));
+        assert_eq!(receipt.disposition, Disposition::NotCommitted);
+        assert_eq!(receipt.result["refusal"], repositories);
+        f.no_credential_read();
+    }
+
+    // The actors table answers for two different states and the reason covers both,
+    // so the receipt separates them. This caller has a row; its resolver exits
+    // non-zero, so the row was found and the resolution failed.
+    let pr = json!({"repo":f.platform_repo,"head":"work","base":"main","title":"Fixture","body":"","expected_head":f.head});
+    let error = f
+        .call(&f.actor, "git.pr_open", pr.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("actor_unmapped"), "{error}");
+    let receipt = f.last(&f.actor).await;
+    assert_eq!(
+        receipt.result["refusal"],
+        json!({"table":"git_write.actors","key":f.actor,"cause":"resolver"})
+    );
+    assert!(f.dir.path().join("credential-read").exists());
+
+    // Same reason, same table, the other state: no row for the label.
+    let error = f
+        .call(&unmapped_actor, "git.pr_open", pr)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("actor_unmapped"), "{error}");
+    let receipt = f.last(&unmapped_actor).await;
+    assert_eq!(
+        receipt.result["refusal"],
+        json!({"table":"git_write.actors","key":unmapped_actor,"cause":"absent"})
+    );
 }
 
 #[tokio::test]

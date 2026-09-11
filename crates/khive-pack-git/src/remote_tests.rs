@@ -1228,8 +1228,15 @@ async fn remote_push_non_fast_forward_and_unmapped_actor_refuse() {
     let f = Fixture::new(true, None).await;
     let unmapped = format!("{}:unmapped", f.actor);
     f.policy(&unmapped, "git.push", "allow").await;
-    f.refusal(&unmapped, "git.push", f.push(), "actor_unmapped")
+    let receipt = f
+        .refusal(&unmapped, "git.push", f.push(), "actor_unmapped")
         .await;
+    // The reason names neither the table it read nor which of the two states it
+    // found there (ADR-182 Amendment 10 item 2).
+    assert_eq!(
+        receipt.result["refusal"],
+        json!({"table":"git_write.actors","key":unmapped,"cause":"absent"})
+    );
     assert!(f.remote.state.lock().unwrap().calls.is_empty());
     git(&f.remote.bare, &["update-ref", "refs/heads/work", &f.head]);
     git(&f.repo, &["update-ref", "refs/heads/work", &f.base]);

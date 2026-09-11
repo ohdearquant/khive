@@ -3382,6 +3382,270 @@ async fn brain_auto_feedback_credits_only_the_selected_result() {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn brain_auto_feedback_accepts_presented_recall_results() {
+    use khive_runtime::presentation::{
+        prepare_format_value, present, OutputFormat, PresentationMode,
+    };
+
+    let (pack, rt) = make_pack();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(khive_pack_memory::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("memory registry");
+    let remembered = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "Cobalt recall forwarding preserves feedback identity",
+                "memory_type": "semantic",
+                "salience": 0.9
+            }),
+        )
+        .await
+        .expect("remember fixture");
+    let canonical = registry
+        .dispatch(
+            "memory.recall",
+            json!({"query": "Cobalt recall forwarding", "limit": 1, "min_score": 0.0}),
+        )
+        .await
+        .expect("recall fixture");
+    let results = prepare_format_value(
+        present(canonical, PresentationMode::Agent, 0),
+        OutputFormat::Json,
+        PresentationMode::Agent,
+    );
+    assert_eq!(results.as_array().expect("recall array").len(), 1);
+    assert_eq!(results[0]["full_id"], remembered["id"]);
+    assert_eq!(results[0]["id"].as_str().unwrap().len(), 8);
+    let compact_id = results[0]["id"].clone();
+    for target_id in [&compact_id, &remembered["id"]] {
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "Cobalt recall forwarding",
+                    "results": results,
+                    "target_id": target_id,
+                    "signal": "implicit_positive"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("either presented recall alias selects the unchanged result");
+        assert_eq!(result["emitted"], true);
+        assert_eq!(result["target_id"], remembered["id"]);
+        let event_id = result["event_id"].as_str().unwrap().parse().unwrap();
+        let event = rt
+            .events(&token)
+            .expect("event store")
+            .get_event(event_id)
+            .await
+            .unwrap()
+            .expect("feedback event");
+        assert_eq!(event.payload["candidate_ids"], json!([compact_id]));
+    }
+}
+
+#[tokio::test]
+async fn brain_auto_feedback_aliases_resolve_full_id_and_retain_selected_attribution() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let first = create_test_entity(&rt, &token).await;
+    let selected = create_test_entity(&rt, &token).await;
+    let alias_record = create_test_entity(&rt, &token).await;
+    let compact_alias = &alias_record[..8];
+    let results = json!([
+        {"id": first, "full_id": first},
+        {"id": compact_alias, "full_id": selected, "serve_attribution": "unattributed"}
+    ]);
+    for target_id in [compact_alias, selected.as_str()] {
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "full identity attribution",
+                    "results": results,
+                    "target_id": target_id,
+                    "signal": "implicit_positive"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("either alias selects the second result and resolves its full_id");
+        assert_eq!(result["target_id"], selected);
+        assert_eq!(result["serve_attribution"], "unattributed");
+        let event_id = result["event_id"].as_str().unwrap().parse().unwrap();
+        let event = rt
+            .events(&token)
+            .expect("event store")
+            .get_event(event_id)
+            .await
+            .unwrap()
+            .expect("feedback event");
+        assert_eq!(
+            event.payload["candidate_ids"],
+            json!([first, compact_alias])
+        );
+    }
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
+}
+
+#[tokio::test]
+async fn brain_auto_feedback_equal_aliases_on_one_result_count_once() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let selected = create_test_entity(&rt, &token).await;
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "equal aliases on one result",
+                "results": [{"id": selected, "full_id": selected}],
+                "target_id": selected,
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("equal aliases identify one result, not two matches");
+    assert_eq!(result["emitted"], true);
+    assert_eq!(result["target_id"], selected);
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 1);
+}
+
+#[tokio::test]
+async fn brain_auto_feedback_full_id_rejects_conflicts_duplicates_and_malformed_values() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+    let other = create_test_entity(&rt, &token).await;
+    // The default profile is rebuilt with a fresh `created_at` the first time a
+    // dispatch loads state, so that one field moves for reasons unrelated to
+    // feedback. Everything else in the snapshot must stay byte-identical.
+    let snapshot_without_profile_creation_times = |pack: &BrainPack| {
+        let mut value = json!(pack.snapshot());
+        if let Some(profiles) = value.get_mut("profiles").and_then(Value::as_object_mut) {
+            for profile in profiles.values_mut() {
+                if let Some(fields) = profile.as_object_mut() {
+                    fields.remove("created_at");
+                }
+            }
+        }
+        value
+    };
+    let before = snapshot_without_profile_creation_times(&pack);
+    for (results, selected, message) in [
+        (
+            json!([{"id": &other[..8], "full_id": other}]),
+            target.as_str(),
+            "does not match any results[].id or results[].full_id",
+        ),
+        (
+            json!([{"id": target, "full_id": other}, {"id": other, "full_id": target}]),
+            target.as_str(),
+            "matches more than one result",
+        ),
+        (
+            json!([{"id": other, "full_id": target}, {"id": target}]),
+            target.as_str(),
+            "matches more than one result",
+        ),
+        (
+            json!([{"id": &target[..8], "full_id": target}, {"id": &target[..8], "full_id": other}]),
+            &target[..8],
+            "matches more than one result",
+        ),
+        (
+            json!([{"id": &target[..8], "full_id": target}, {"id": other, "full_id": target}]),
+            target.as_str(),
+            "matches more than one result",
+        ),
+        (
+            json!([{"id": target, "full_id": target}, {"id": target, "full_id": target}]),
+            target.as_str(),
+            "matches more than one result",
+        ),
+        (
+            json!([{"id": target, "full_id": "not-an-id"}]),
+            "not-an-id",
+            "invalid full_id",
+        ),
+        (
+            json!([{"id": target, "full_id": "not-an-id"}]),
+            target.as_str(),
+            "invalid full_id",
+        ),
+        (
+            json!([{"id": &target[..8], "full_id": "not-an-id"}]),
+            &target[..8],
+            "invalid full_id",
+        ),
+        (
+            json!([{"id": target, "full_id": &target[..8]}]),
+            target.as_str(),
+            "invalid full_id",
+        ),
+        (
+            json!([{"id": target, "full_id": ""}]),
+            target.as_str(),
+            "invalid full_id",
+        ),
+        (
+            json!([{"id": target, "full_id": 42}]),
+            target.as_str(),
+            "invalid type",
+        ),
+    ] {
+        let error = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "invalid full identity",
+                    "results": results,
+                    "target_id": selected,
+                    "signal": "implicit_positive"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("invalid canonical identity or ambiguous aliases must refuse");
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            snapshot_without_profile_creation_times(&pack),
+            before,
+            "{error}"
+        );
+    }
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
+    let events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::FeedbackExplicit],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(events.items.is_empty());
+}
+
+#[tokio::test]
 async fn brain_auto_feedback_without_signal_abstains_without_writing() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
@@ -3484,7 +3748,7 @@ async fn brain_auto_feedback_signal_requires_a_unique_result_target() {
         .expect_err("a target outside results must be rejected");
     assert!(outside
         .to_string()
-        .contains("does not match any results[].id"));
+        .contains("does not match any results[].id or results[].full_id"));
 
     let duplicate = pack
         .dispatch(
@@ -3798,7 +4062,7 @@ async fn brain_auto_feedback_empty_results_returns_no_emit() {
         .expect_err("an empty result set cannot contain the named target");
     assert!(out_of_set
         .to_string()
-        .contains("does not match any results[].id"));
+        .contains("does not match any results[].id or results[].full_id"));
     assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
 }
 
@@ -3811,23 +4075,28 @@ async fn brain_auto_feedback_accepts_short_note_id_prefix() {
     // Use 8-char prefix as Agent mode would return from memory.recall.
     let prefix = &target[..8];
 
-    let result = pack
-        .dispatch(
-            "brain.auto_feedback",
-            json!({
-                "query": "prefix resolution test",
-                "results": [{ "id": prefix }],
-                "target_id": prefix,
-                "signal": "implicit_positive"
-            }),
-            &registry,
-            &token,
-        )
-        .await
-        .expect("auto_feedback with 8-char prefix succeeds");
+    for candidate in [
+        json!({"id": prefix}),
+        json!({"id": prefix, "full_id": null}),
+    ] {
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "prefix resolution test",
+                    "results": [candidate],
+                    "target_id": prefix,
+                    "signal": "implicit_positive"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("absent or null full_id preserves 8-char prefix resolution");
 
-    assert_eq!(result["emitted"], json!(true));
-    assert_eq!(result["target_id"].as_str().unwrap_or("").len(), 36);
+        assert_eq!(result["emitted"], json!(true));
+        assert_eq!(result["target_id"], target);
+    }
 }
 
 /// #1505 direct-call defense: PackRuntime callers must provide a token for the
@@ -4136,9 +4405,19 @@ mod help_tests {
             h.params.iter().any(|p| p.name == "query" && p.required),
             "brain.auto_feedback must have required query param"
         );
+        let results = h
+            .params
+            .iter()
+            .find(|p| p.name == "results")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare results"));
+        assert!(results.required, "results must be required");
         assert!(
-            h.params.iter().any(|p| p.name == "results" && p.required),
-            "brain.auto_feedback must have required results param"
+            results.description.contains("id or full_id")
+                && results.description.contains("exactly one result object")
+                && results.description.contains("count once")
+                && results.description.contains("full_id must be a full UUID"),
+            "results help must describe alias uniqueness and canonical identity: {:?}",
+            results.description
         );
         let target_id = h
             .params
@@ -4152,8 +4431,11 @@ mod help_tests {
         );
         assert!(
             target_id.description.contains("compact id")
+                && target_id.description.contains("full_id")
                 && target_id.description.contains("Required when signal")
-                && target_id.description.contains("exactly once"),
+                && target_id.description.contains("exactly one result object")
+                && target_id.description.contains("count once")
+                && target_id.description.contains("must be a full UUID"),
             "target_id help must describe conditional uniqueness: {:?}",
             target_id.description
         );

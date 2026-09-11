@@ -39,6 +39,16 @@ impl Failure {
     }
 }
 
+/// #2539: the read verbs used to surface the classification code alone, so a
+/// `git_failed` from a real `git` non-zero exit and one from an unparseable
+/// record were the same four words and neither named an exit status. Every
+/// `LocalGitError` message is an authored literal — `git`'s stderr is retained
+/// for classification and never reaches one — so rendering the whole error is
+/// bounded and carries nothing the caller did not cause.
+fn read_refusal(error: LocalGitError) -> RuntimeError {
+    RuntimeError::InvalidInput(error.to_string())
+}
+
 impl From<LocalGitError> for Failure {
     fn from(error: LocalGitError) -> Self {
         Self {
@@ -462,9 +472,13 @@ impl GitPack {
                     return Err(Failure::refused("expected_head_mismatch"));
                 }
                 let config = &self.runtime().config().git_write;
-                let actor = credentials::resolve_actor(config, &receipt.actor)
-                    .await
-                    .map_err(|_| Failure::refused("actor_unmapped"))?;
+                let actor = match credentials::resolve_actor(config, &receipt.actor).await {
+                    Ok(actor) => actor,
+                    Err(_) => {
+                        receipt.result = credentials::actor_refusal(config, &receipt.actor);
+                        return Err(Failure::refused("actor_unmapped"));
+                    }
+                };
                 receipt.credential = json!({"source":"actor", "ref":actor.credential_ref, "platform_identity":actor.platform_identity});
                 receipts::persist(self.runtime(), receipt).await?;
                 let tree = required(params, "tree")?;
@@ -712,7 +726,7 @@ impl GitPack {
         let (canonical, index) = self.read_gate(token, registry, "git.status", repo).await?;
         let result = local_git::status(&canonical, untracked, limit)
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.code().into()))?;
+            .map_err(read_refusal)?;
         let entries = serde_json::to_value(&result.entries)
             .map_err(|_| RuntimeError::Internal("status entries did not serialize".into()))?;
         let branch = serde_json::to_value(&result.branch)
@@ -751,7 +765,7 @@ impl GitPack {
         let (canonical, index) = self.read_gate(token, registry, "git.log", repo).await?;
         let commits = local_git::log(&canonical, reference, limit, path)
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.code().into()))?;
+            .map_err(read_refusal)?;
         let truncated = commits.len() == limit;
         let commits = serde_json::to_value(&commits)
             .map_err(|_| RuntimeError::Internal("log entries did not serialize".into()))?;

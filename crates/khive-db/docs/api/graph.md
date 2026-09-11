@@ -97,3 +97,33 @@ every edge has been confirmed does it fall through to the plain
 refusing entry's index and its `MissingEndpoints` are captured by this same
 pre-check pass and returned as `GuardedBatchOutcome::refused` — the runtime
 layer no longer re-probes endpoints after the fact.
+
+### Enumerating Refused Writes Beyond the Sample (#2375)
+
+Storage callers can retain the original ordered `Vec<Edge>` and use
+`GuardedBatchOutcome::refusal_page(&original, class, PageRequest { offset, limit })`
+after one guarded batch call. No write is resubmitted and no endpoint is re-read.
+The default `BatchWriteSummary`, its 128-detail sample, and legacy `first_error`
+remain unchanged. Pages use that same 128-detail cap and message bound.
+
+`class=None` enumerates every refused write in original input order. Only the
+first guard-refused entry is `InvalidInput/Permanent`; all siblings are
+`BatchAborted/Unknown`. Later siblings were not necessarily examined, and paging
+does not claim they all have missing endpoints. The initial summary and pages
+share the same classification and detail formatter.
+
+An optional class filter is applied before offset and limit, and `Page.total`
+is the complete matching population. Add `items.len()` to the offset to continue
+until that total is reached. A requested limit above 128 is clamped to 128; zero
+returns count metadata only and is not a progressing enumeration request.
+Success, an empty successful batch, and offsets at/beyond the filtered population
+return empty pages. Skipped/filtered entries are never formatted.
+
+The supplied slice length must equal `summary.attempted`, and a refusal index
+must be within that slice. The caller must retain the exact batch contents and
+order: length validation cannot detect a substituted same-length batch. The
+original `first_error` supplies the refusing entry's diagnostic unchanged.
+
+This is a synchronous, in-memory storage API, not a new MCP/runtime endpoint or
+durable cursor. Runtime `link_many` currently discards the summary in favor of
+its first guarded-write failure; this change does not expand that wire response.

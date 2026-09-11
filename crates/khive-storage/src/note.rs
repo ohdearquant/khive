@@ -508,6 +508,10 @@ pub enum FilterOp {
     /// value END = value`, mirroring callers whose read model assigns one
     /// textual default to absent, JSON-null, and malformed legacy values.
     TextEqOrNonText,
+    /// Matches a JSON text field against the supplied set, or any missing or
+    /// non-text value. The non-text branch still matches when the set is empty.
+    /// `PropertyFilter.value` is unused; the set lives in this variant.
+    TextInOrNonText(Vec<SqlValue>),
     Ne,
     Lt,
     Lte,
@@ -525,15 +529,13 @@ pub enum FilterOp {
     JsonTypeNeMissing,
     /// Matches rows where `json_extract(properties, path)` equals any value in
     /// the set. A row with a missing/NULL property does not match — use
-    /// `NotInOrMissing` with the complementary set when "absent" should count
-    /// as included. `PropertyFilter.value` is unused for this op; the set
+    /// `TextInOrNonText` when a textual read model includes missing/non-text
+    /// legacy values. `PropertyFilter.value` is unused for this op; the set
     /// lives in the variant itself.
     In(Vec<SqlValue>),
     /// Matches rows where the property is missing/NULL OR its value is not in
-    /// the set. Used for "exclude a small closed set of terminal values, but
-    /// treat a still-unset property as included" (e.g. GTD default task
-    /// listing excludes `done`/`cancelled` while a task with no `status` yet
-    /// still counts as `inbox`, i.e. included). `PropertyFilter.value` is
+    /// the set. Used to exclude a closed set while treating an unset property
+    /// as included (e.g. comm inbox excludes `outbound`). `PropertyFilter.value` is
     /// unused for this op; the set lives in the variant itself.
     NotInOrMissing(Vec<SqlValue>),
 }

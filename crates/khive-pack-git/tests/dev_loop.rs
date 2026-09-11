@@ -698,7 +698,14 @@ async fn arm15_overrides_and_unmapped_actor_refuse_before_resolver() {
         }
         if !mapped {
             let error = f.err("git.commit", f.commit_params(&manifest)).await;
-            assert_eq!(f.refusal_receipt(&error).await["reason"], "actor_unmapped");
+            let row = f.refusal_receipt(&error).await;
+            assert_eq!(row["reason"], "actor_unmapped");
+            // The reason alone does not say which table was read, and this verb reads
+            // only the actors one (ADR-182 Amendment 10 item 2).
+            assert_eq!(
+                row["result"]["refusal"],
+                json!({"table":"git_write.actors","key":ACTOR,"cause":"absent"})
+            );
         }
         assert_eq!(f.resolver_count(), 0);
         assert_eq!(f.git_bytes(&["show-ref"]), refs);
@@ -1696,6 +1703,22 @@ async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
         ),
         None,
     );
+    // #2539: the verb call used to follow `checkout --detach` with nothing
+    // between them and intermittently refused `git_failed` on the macOS runner.
+    // These two reads are a barrier as well as an assertion: they prove the
+    // detach landed, so a failure below is about `git.status` reading a settled
+    // repository rather than one still being written.
+    assert_eq!(
+        f.git_text(&["rev-parse", "--verify", "HEAD"]),
+        f.base,
+        "the detached HEAD must resolve to the same commit before status reads it"
+    );
+    assert_eq!(
+        f.git_text(&["branch", "--show-current"]),
+        "",
+        "the fixture must be detached before the verb is called"
+    );
+
     let detached = f.call("git.status", json!({"repo": f.repo})).await;
     assert_eq!(
         detached["branch"]["head"],
@@ -1706,6 +1729,36 @@ async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
         detached["branch"]["oid"],
         json!(f.base),
         "the sha is still readable while detached: {detached}"
+    );
+}
+
+/// #2539: a refusal from a real non-zero `git` exit used to be the same four
+/// words as one from an unparseable record, so a flake on a runner taught
+/// nothing. The classification still leads; the exit status follows it.
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn log_refusal_names_the_git_exit_status() {
+    let f = Fixture::new(true, true).await;
+    f.policy("git.log", "allow").await;
+    let control = f.call("git.log", json!({"repo": f.repo, "limit": 1})).await;
+    assert!(
+        control["commits"].as_array().is_some_and(|c| !c.is_empty()),
+        "control: the same verb reads the repository fine: {control}"
+    );
+
+    let error = f
+        .err(
+            "git.log",
+            json!({"repo": f.repo, "ref": "refs/heads/absent-on-purpose"}),
+        )
+        .await;
+    assert!(
+        error.contains("git_failed"),
+        "#2539: the classification still leads the message; got {error}"
+    );
+    assert!(
+        error.contains("exit status"),
+        "#2539: the refusal must name git's exit status; got {error}"
     );
 }
 

@@ -1255,8 +1255,11 @@ async fn validate_read_target(
         .and_then(Value::as_str)
     {
         if to_actor != caller_actor {
+            // The resolved uuid stays out of this message: a caller who asked by
+            // 8-char prefix would otherwise learn both that a message exists and
+            // its full id from a refusal (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "read: message {id} is not addressed to caller actor {caller_actor:?}"
+                "read: that message is not addressed to caller actor {caller_actor:?}"
             )));
         }
     } else {
@@ -1538,8 +1541,11 @@ pub(crate) async fn handle_reply(
         let is_participant = original_from_actor.as_deref() == Some(caller_actor)
             || original_to_actor.as_deref() == Some(caller_actor);
         if !is_participant {
+            // Same non-disclosure rule as `read` above: the refusal names the
+            // caller's own actor and nothing the caller did not already supply
+            // (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "reply: message {id} is not addressed to or from caller actor {caller_actor:?}"
+                "reply: that message is not addressed to or from caller actor {caller_actor:?}"
             )));
         }
     } else {
@@ -2948,6 +2954,12 @@ pub(crate) struct ProbeResponse {
     pub cursor_us: i64,
     pub new_messages: Vec<ProbeMessage>,
     pub stale_unread_count: i64,
+    /// Present and `true` only when the caller's `since_us` was discarded and
+    /// the page was taken from the baseline instead (#2400). A poller that
+    /// cannot see this reads a full baseline page as arrivals, which is
+    /// indistinguishable from real mail and repeats on every pass.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_reset: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -3086,6 +3098,10 @@ async fn query_probe(
 
     let effective_since = match since_us {
         Some(v) if v > high_water_mark => {
+            // #2400: this reset also travels back to the caller as
+            // `cursor_reset`. A log line the poller cannot read leaves it
+            // deduplicating a baseline page against its own inbox, which is the
+            // cost this warning was silently imposing.
             tracing::warn!(
                 actor,
                 since_us = v,
@@ -3168,6 +3184,7 @@ async fn query_probe(
         cursor_us,
         new_messages,
         stale_unread_count,
+        cursor_reset: since_us.is_some() && effective_since.is_none(),
     })
 }
 

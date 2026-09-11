@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, DeleteMode,
-    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
-    GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome, MissingEndpoints, NeighborHit,
-    NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder,
-    SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
+    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
+    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
+    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
+    TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -143,6 +143,21 @@ pub fn edge_insert_only_guarded_by_endpoints_statement(edge: &Edge) -> SqlStatem
           WHERE ({src_exists}) AND ({tgt_exists})"
     );
     statement.label = Some("edge-insert-only-where-endpoints-exist".to_string());
+    statement
+}
+
+/// Conditional-insert companion to [`edge_upsert_statement`]. Conflicts on
+/// either the id or natural key leave the existing edge untouched so callers
+/// can read the winner and explicitly reapply their intended delta.
+pub fn edge_insert_if_absent_statement(edge: &Edge) -> SqlStatement {
+    let mut statement = edge_upsert_statement(edge);
+    statement.sql = "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              ON CONFLICT DO NOTHING"
+        .to_string();
+    statement.label = Some("edge-insert-if-absent".to_string());
     statement
 }
 
@@ -1204,37 +1219,16 @@ fn batch_upsert_edges_guarded(
             // is not first in input order. The details themselves remain in
             // input order below.
             summary.first_error = message.clone();
+            let refusal = GuardedBatchRefusal {
+                entry_index: index,
+                missing,
+            };
             for (failed_index, failed_edge) in edges.iter().enumerate() {
-                let (class, retryability, detail) = if failed_index == index {
-                    (
-                        BatchWriteErrorClass::InvalidInput,
-                        BatchWriteRetryability::Permanent,
-                        message.clone(),
-                    )
-                } else {
-                    (
-                        BatchWriteErrorClass::BatchAborted,
-                        BatchWriteRetryability::Unknown,
-                        format!(
-                            "batch entry {failed_index} was not written because guarded batch \
-                             entry {index} was refused"
-                        ),
-                    )
-                };
-                summary.record_failure(
-                    failed_index,
-                    Some(failed_edge.id.to_string()),
-                    class,
-                    retryability,
-                    detail,
-                );
+                refusal.record_failure(&mut summary, failed_index, failed_edge, &message);
             }
             return Ok(GuardedBatchOutcome {
                 summary,
-                refused: Some(GuardedBatchRefusal {
-                    entry_index: index,
-                    missing,
-                }),
+                refused: Some(refusal),
             });
         }
     }
@@ -1512,6 +1506,16 @@ impl GraphStore for SqlGraphStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn insert_edge_if_absent(&self, edge: Edge) -> Result<bool, StorageError> {
+        let statement = edge_insert_if_absent_statement(&edge);
+        self.with_writer("insert_edge_if_absent", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

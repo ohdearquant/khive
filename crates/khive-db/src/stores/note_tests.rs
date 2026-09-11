@@ -1199,7 +1199,7 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
 
     let (reached_rx, proceed_tx) =
         page_snapshot_seam::install(query.operation(), namespace.clone());
-    let query_task = {
+    let mut query_task = {
         let store = Arc::clone(&store);
         let namespace = namespace.clone();
         let filters = filters.clone();
@@ -1208,10 +1208,45 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
         )
     };
 
-    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
-        .await
-        .expect("waiting for the count snapshot seam must not panic")
-        .expect("count query must reach the seam after its first partition");
+    // Hang protection only: query outcomes, not expected scheduling latency,
+    // determine whether the seam precondition succeeds.
+    let mut seam_task = tokio::task::spawn_blocking(move || {
+        reached_rx.recv_timeout(std::time::Duration::from_secs(60))
+    });
+    tokio::select! {
+        reached = &mut seam_task => {
+            if !matches!(&reached, Ok(Ok(()))) {
+                page_snapshot_seam::uninstall();
+                drop(proceed_tx);
+                query_task.abort();
+                let query_outcome = query_task.await;
+                if matches!(
+                    &reached,
+                    Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout))
+                ) {
+                    panic!(
+                        "precondition timeout: {query:?} count snapshot seam exceeded its 60s hang watchdog; \
+                         query outcome after cleanup: {query_outcome:?}"
+                    );
+                }
+                panic!(
+                    "precondition: {query:?} count snapshot seam waiter failed; \
+                     seam outcome: {reached:?}; query outcome after cleanup: {query_outcome:?}"
+                );
+            }
+        }
+        outcome = &mut query_task => {
+            page_snapshot_seam::uninstall();
+            drop(proceed_tx);
+            // Uninstall drops the sender if the query never entered the hook,
+            // so the blocking waiter must also finish before this test exits.
+            let seam_outcome = seam_task.await;
+            panic!(
+                "precondition: {query:?} count query completed while waiting for its snapshot seam; \
+                 query outcome: {outcome:?}; seam outcome: {seam_outcome:?}"
+            );
+        }
+    }
 
     let writer = pool.writer().unwrap();
     writer
@@ -3485,13 +3520,15 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 
     // -- Control: reproduce the pre-fix (direction-blind) index shape and
     // show the same assertion fails, proving the bound above is real and not
-    // an artifact of small numbers or an unrelated planner choice. --
+    // an artifact of small numbers or an unrelated planner choice. V33's
+    // full index also supplies direction, so remove it only in this control. --
     let control_pool = setup_pool();
     {
         let writer = control_pool.writer().unwrap();
         let conn = writer.conn();
         conn.execute_batch(
             "DROP INDEX idx_notes_unread_probe_recipient_direction;
+             DROP INDEX idx_notes_message_recipient_direction;
              CREATE INDEX idx_notes_unread_probe_recipient_control
                  ON notes(namespace, kind,
                           ifnull(json_extract(properties, '$.to_actor'), ''),
@@ -4452,18 +4489,11 @@ async fn json_type_ne_missing_rejects_non_vocabulary_value() {
 }
 
 /// khive#2392: `fetch_notes_after`'s `status="all"`/`status="read"` inbox
-/// listings (no `$.read` filter, or `JsonTypeEq` rather than the tuned
-/// `JsonTypeNeMissing` probe) have no index ending in `(created_at DESC, id
-/// ASC)` for their `(namespace, kind, direction, to_actor[, read])`
-/// partition, so the lt-branch (`created_at < ? ORDER BY created_at DESC, id
-/// ASC`) still costs a full partition scan plus a temp-b-tree sort on every
-/// internal page — pins the expected-arm SCAN-plus-sort plan so a future
-/// index addition is a deliberate, measured change rather than a silent
-/// drift. See `candidate_created_at_id_seek_index_flips_unread_probe_plan`
-/// for why the natural fix (a general `(namespace, kind, created_at DESC, id
-/// ASC)` index) was measured and rejected rather than shipped.
+/// listings now seek recipient, direction and timestamp through V33. The
+/// caller and legacy-recipient partitions still require a merged sort; the
+/// regression forbids falling back to a namespace-wide scan before that sort.
 #[tokio::test]
-async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
+async fn comm_inbox_status_all_lt_branch_seeks_recipient_index() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
     use khive_storage::types::SqlValue;
 
@@ -4539,18 +4569,17 @@ async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
     let plan = plan_details(reader.conn(), &lt_sql, &lt_params);
     assert!(
         plan.contains("USE TEMP B-TREE FOR ORDER BY"),
-        "expected arm: the lt-branch still sorts because no index ends in \
-         (created_at DESC, id ASC) for this partition, got:\n{plan}"
+        "the two recipient partitions still require a merged ordering, got:\n{plan}"
     );
     assert!(
-        !plan.contains("idx_notes_kind_created_seek"),
-        "no such index exists in production schema; a name match here would mean \
-         this test started reading stale state"
+        plan.contains("idx_notes_message_recipient_direction")
+            && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=? AND created_at<?"),
+        "the lt-branch must seek recipient, direction, and timestamp: {plan}"
     );
 }
 
 /// khive#2392: the natural seekable fix for the gap pinned by
-/// `comm_inbox_status_all_lt_branch_has_no_seek_index` — a general
+/// the pre-V33 inbox schema — a general
 /// `(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL`
 /// index — was measured, not just assumed, before deciding not to ship it.
 /// Standalone it cuts the lt-branch scan from 57,473 to 7,223 VM steps for a
@@ -4697,25 +4726,18 @@ async fn narrowing_hot_property_index_to_kind_task_is_not_chosen() {
     );
 }
 
-/// khive#2392: `gtd.tasks()` with no `status=` filter compiles
+/// Historical khive#2392 control: the former default GTD filter compiled
 /// `FilterOp::NotInOrMissing(["done", "cancelled"])` on `$.status`
-/// (`handle_tasks` in `crates/khive-pack-gtd/src/handlers.rs`), which
-/// `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
+/// which `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
 /// (...))` -- an open exclusion, not a bounded set, so `idx_notes_task_status`
 /// cannot narrow it to an index range seek; the planner can only walk the
 /// `(namespace, kind)` partition.
 ///
-/// No seekable rewrite preserves the documented semantics either: the
-/// listing must keep a task whose `$.status` is missing *or* any unrecognized
-/// legacy value (see `handle_tasks`'s comment on why `NotInOrMissing` was
-/// chosen over `Ne`), so the exclusion set is open-ended and cannot be
-/// rewritten as `status IN (<the 5 known non-terminal statuses>)` -- that
-/// would silently drop a task carrying a status string outside
-/// `TASK_STATUSES`, which is exactly the case this predicate exists to keep.
-/// This test measures and pins the current (unindexed) plan rather than
-/// leaving the claim unverified.
+/// Issue #2394 replaces GTD's open-ended exclusion with a canonical text
+/// allowlist plus non-text fallback. This test retains the old predicate's
+/// measured plan as a control; it does not claim the new predicate is seekable.
 #[tokio::test]
-async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
+async fn legacy_gtd_tasks_not_in_or_missing_has_no_seek_index() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
     use khive_storage::types::SqlValue;
 
@@ -4753,4 +4775,75 @@ async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
          keyed index seek, so idx_notes_task_status must not appear in the plan, \
          got:\n{plan}"
     );
+}
+
+#[tokio::test]
+async fn text_in_or_non_text_filters_before_pagination_with_count_parity() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    let properties = [
+        serde_json::json!({}),
+        serde_json::json!({"status": null}),
+        serde_json::json!({"status": false}),
+        serde_json::json!({"status": 4}),
+        serde_json::json!({"status": []}),
+        serde_json::json!({"status": {}}),
+        serde_json::json!({"status": "inbox"}),
+        serde_json::json!({"status": "next"}),
+        serde_json::json!({"status": "archived"}),
+        serde_json::json!({"status": "done"}),
+        serde_json::json!({"status": ""}),
+    ];
+    let mut ids = Vec::new();
+    for (index, properties) in properties.into_iter().enumerate() {
+        let mut note = make_note_with_props("default", "task", "predicate fixture", properties);
+        note.created_at = index as i64 + 1;
+        ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    for (values, matching) in [
+        (
+            vec![
+                SqlValue::Text("inbox".into()),
+                SqlValue::Text("next".into()),
+            ],
+            8,
+        ),
+        (vec![], 6),
+    ] {
+        let filter = NoteFilter {
+            kind: Some("task".into()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.status".into(),
+                op: FilterOp::TextInOrNonText(values),
+                value: SqlValue::Null,
+            }],
+            ..Default::default()
+        };
+        for offset in 0..=matching {
+            let page = PageRequest {
+                limit: 1,
+                offset: offset as u64,
+            };
+            let counted = store
+                .query_notes_filtered("default", &filter, page.clone())
+                .await
+                .unwrap();
+            let count_free = store
+                .query_notes_filtered_count_free("default", &filter, page)
+                .await
+                .unwrap();
+            assert_eq!(counted.total, Some(matching as u64));
+            assert_eq!(count_free.total, None);
+            assert_eq!(counted.items, count_free.items);
+            if offset == matching {
+                assert!(count_free.items.is_empty());
+            } else {
+                assert_eq!(count_free.items.len(), 1);
+                assert_eq!(count_free.items[0].id, ids[matching - offset - 1]);
+            }
+        }
+    }
 }
