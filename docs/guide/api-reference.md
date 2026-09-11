@@ -2621,6 +2621,21 @@ is loaded, mails it.
 `requested` or `granted`; `tool.revoke(id, note)` from `granted`. Any other transition is refused with the
 current status. A requester cannot grant its own request.
 
+Approval of a registered name stores `registry_id` and `definition_digest`, pinning
+the current `source`, `side_effect`, `trust`, and `schema`. An active grant must
+match both the current registry object and those policy inputs; a stale or partial
+pin falls through to policy/default without changing the row's `granted` status.
+Description and capabilities are outside the pin. Requests themselves are unpinned.
+
+An unregistered-name grant has null pins. First matching registration records
+`invalidated_by_registry_id` and `invalidated_at` on that grant; deleting the
+registration does not reactivate it. This also covers existing matching wildcard
+registrations when an unpinned approval is made. Deny/revoke retain those markers;
+only an explicit approval bound to a live registry object clears them. Schema
+upgrades preserve legacy decisions and may add invalidation evidence, never
+unapproved pins; deleted registration history unavailable at upgrade cannot be
+reconstructed.
+
 ### `tool.requests` / `tool.policy` / `tool.policies`
 
 `tool.requests(status, actor, tool, limit=50)` lists grant rows; `tool.policy(actor, tool, decision, note)`

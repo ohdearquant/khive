@@ -10,7 +10,8 @@
 #                   it, so they are replayed cumulatively in version order on one
 #                   database. Other directories each load their fragments in sorted
 #                   filename order into one fresh database, so indexes see tables
-#                   declared by earlier fragments. One-file directories stand alone.
+#                   declared by earlier fragments. The tool pack's registry trigger
+#                   additionally uses the core migration chain as its schema fixture.
 #   2. hygiene    — no trailing whitespace, no tabs.
 #   3. format     — multi-column CREATE TABLE must be one column per line
 #                   (catches comma-jammed single-line tables).
@@ -90,14 +91,22 @@ finally:
 
 # Related fragments share a database only within their own directory. A pack's
 # sorted table/index fragments see prior DDL; unrelated packs never see each other.
-# A directory with one file preserves standalone validation.
+# The tool-pack trigger requires the core entities and migrated grants tables.
 fragment_groups = {}
 for path in others:
     fragment_groups.setdefault(os.path.dirname(path), []).append(path)
 for directory in sorted(fragment_groups):
     con = sqlite3.connect(":memory:")
     try:
-        for path in sorted(fragment_groups[directory]):
+        fixtures = []
+        if directory.replace(os.sep, "/").endswith("/khive-pack-tool/sql"):
+            # Exclude the core copy so CREATE TRIGGER IF NOT EXISTS must execute
+            # the pack's trigger body instead of finding an installed trigger.
+            fixtures = [
+                path for path in chain
+                if os.path.basename(path) != "tool-grant-invalidation.sql"
+            ]
+        for path in fixtures + sorted(fragment_groups[directory]):
             with open(path) as fh:
                 sql = fh.read()
             try:

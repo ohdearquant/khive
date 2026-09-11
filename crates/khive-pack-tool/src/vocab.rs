@@ -62,7 +62,7 @@ pub static ENTITY_TYPES: [EntityTypeDef; 4] = [
 ];
 
 /// Pack-owned tables, applied idempotently at boot.
-pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 4] = [
+pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 5] = [
     "CREATE TABLE IF NOT EXISTS tool_policy (\
         id         TEXT PRIMARY KEY,\
         namespace  TEXT NOT NULL,\
@@ -86,9 +86,14 @@ pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 4] = [
         decided_at    INTEGER,\
         decided_by    TEXT,\
         expires_at    INTEGER,\
-        decision_note TEXT\
+        decision_note TEXT,\
+        registry_id TEXT,\
+        definition_digest TEXT,\
+        invalidated_by_registry_id TEXT,\
+        invalidated_at INTEGER\
     )",
     "CREATE INDEX IF NOT EXISTS idx_tool_grants_lookup ON tool_grants(namespace, actor, tool, status)",
+    include_str!("../sql/grant-invalidation.sql"),
 ];
 
 const P_NAMESPACE: ParamDef = ParamDef {

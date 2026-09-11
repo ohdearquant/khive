@@ -1728,3 +1728,28 @@ stream contract and belongs to that contract's own amendment, not to this invent
 edges and through both member kinds, and at `crates/khive-pack-kg/src/handlers/stream.rs` for what
 the verb admits. The frame constant is `crates/khive-runtime/src/daemon.rs`. No new arms were run
 for this row; the stream suites that cover these paths ran with the work that introduced them.
+
+### 2026-09-11 amendment (Amendment 19): tool-grant decision write scope
+
+This inventory entry records `khive-pack-tool::policy::set_grant_status` under
+Amendment 11's review guard. It does not change that guard or the tool policy contract.
+
+| Transaction owner                   | Production scopes/callers                   | Work inside the transaction                                                                                                                                                                                                                                                 | Verdict  |
+| ----------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Runtime/pack `AtomicUnitOp` callers | `khive-pack-tool::policy::set_grant_status` | Re-read one grant, validate its current transition and requester, re-read the selected registry identity and raw properties, optionally read one first matching registration for invalidation evidence, then update status/pins/markers together and read the resulting row | SQL-only |
+
+The registry snapshot and its four policy inputs are parsed, canonically serialized
+and hashed before writer admission. The transaction compares the prepared snapshot;
+it does not serialize a schema or compute a digest. A failed snapshot or transition
+check returns a refusal before any write. All awaits inside the closure target the
+provided SQL writer. There is no process, filesystem, network, embedding or other
+subsystem work inside the transaction.
+
+The registration-insert invalidation trigger runs as SQL inside the existing entity
+write owner. V34 and the pack bootstrap install it and perform marker-only legacy
+backfill inside their existing migration/auxiliary-DDL owners. Those statements may
+scan matching registry/grant rows; this entry claims SQL-only work, not a population-
+independent bound on SQLite execution time.
+
+Basis: source review through the commit/refusal edges. Native compilation, first-poll
+and behavioral Rust gates remain unverified under the owner's source-only hold.

@@ -162,6 +162,8 @@ const V30_UP: &str = include_str!("../sql/030-tool-source-mounts.sql");
 const V31_UP: &str = include_str!("../sql/031-note-versions.sql");
 const V32_UP: &str = include_str!("../sql/032-knowledge-count-indexes.sql");
 const V33_UP: &str = include_str!("../sql/033-notes-message-recipient-direction.sql");
+const V34_UP: &str = include_str!("../sql/034-tool-grant-pins.sql");
+const TOOL_GRANT_INVALIDATION_UP: &str = include_str!("../sql/tool-grant-invalidation.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -383,6 +385,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "notes_message_recipient_direction",
         up: V33_UP,
     },
+    VersionedMigration {
+        version: 34,
+        name: "tool_grant_pins",
+        up: V34_UP,
+    },
 ];
 
 /// Durable state of ADR-121's boot-gated, two-stage attachment cutover.
@@ -416,6 +423,35 @@ fn schema_column_exists(conn: &Connection, table: &str, column: &str) -> Result<
         |row| row.get(0),
     )
     .map_err(Into::into)
+}
+
+fn tool_grant_pins_are_bootstrapped(conn: &Connection) -> Result<bool, SqliteError> {
+    let (present, compatible): (u32, u32) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(CASE WHEN \
+             ((name != 'invalidated_at' AND upper(type) = 'TEXT') \
+              OR (name = 'invalidated_at' AND upper(type) = 'INTEGER')) \
+             AND \"notnull\" = 0 AND dflt_value IS NULL AND pk = 0 THEN 1 END) \
+             FROM pragma_table_info('tool_grants') \
+             WHERE name IN ('registry_id', 'definition_digest', \
+                            'invalidated_by_registry_id', 'invalidated_at')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| SqliteError::Migration {
+            version: 34,
+            error: error.to_string(),
+        })?;
+    match (present, compatible) {
+        (0, 0) => Ok(false),
+        (4, 4) => Ok(true),
+        _ => Err(SqliteError::Migration {
+            version: 34,
+            error: "tool_grants pin and invalidation columns must either all be absent or all \
+                    have their nullable TEXT/INTEGER types without defaults or primary-key constraints"
+                .into(),
+        }),
+    }
 }
 
 fn require_attachment_schema_objects(
@@ -1432,11 +1468,24 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 }
             })?;
         } else {
-            tx.execute_batch(migration.up)
-                .map_err(|e| SqliteError::Migration {
-                    version: migration.version,
-                    error: e.to_string(),
-                })?;
+            // Direct backend callers may install the current tool pack schema
+            // before core migrations; normal host boot applies the core first.
+            let already_bootstrapped =
+                migration.version == 34 && tool_grant_pins_are_bootstrapped(&tx)?;
+            if !already_bootstrapped {
+                tx.execute_batch(migration.up)
+                    .map_err(|e| SqliteError::Migration {
+                        version: migration.version,
+                        error: e.to_string(),
+                    })?;
+            }
+            if migration.version == 34 {
+                tx.execute_batch(TOOL_GRANT_INVALIDATION_UP)
+                    .map_err(|error| SqliteError::Migration {
+                        version: migration.version,
+                        error: error.to_string(),
+                    })?;
+            }
         }
 
         // V19's repair contract includes normalizing the two known-divergent
