@@ -38,15 +38,17 @@ append fails with an outcome nobody can determine.
 ### D1: Scope — four verbs, one config table, no new store
 
 Crate `khive-pack-telemetry`, `NAME = "telemetry"`, `REQUIRES = ["kg"]`, opt-in and **not** in the
-default pack set, loaded with `KHIVE_PACKS=kg,telemetry` or `--pack telemetry`. It contributes four
+default pack set, loaded with `KHIVE_PACKS=kg,telemetry` or `--pack kg --pack telemetry`. ADR-027
+requires every `REQUIRES` entry to be explicitly present in the selected list and makes a missing
+one a boot error rather than auto-adding it, so `--pack telemetry` on its own does not boot. It contributes four
 verbs and nothing else: no entity kind, no note kind, no edge relation, no new backend, no new
 external dependency, no background service.
 
 ```
 telemetry.channels()                                    -> the effective table, as resolved from config
 telemetry.emit(kind, payload, run_id?, actor?)          -> the emit outcome (D4)
-telemetry.read(stream, since?, limit?, kinds?)          -> {events, next_cursor, coverage}
-telemetry.counts(stream, window, group_by?, kinds?)     -> {rows, window, total}
+telemetry.read(stream, after?, limit?, kinds?, actor?, all_actors?)     -> {events, next_after, coverage}
+telemetry.counts(stream, window, group_by?, kinds?, actor?, all_actors?) -> {rows, window, total}
 ```
 
 `telemetry.emit` is `Assertive` and writes. `channels`, `read` and `counts` are reads. None of the
@@ -144,6 +146,12 @@ outcome = "recorded"   the event is in the log; seq is present and is its dense 
 - `gap` — the verb returns, with `outcome` set to `dropped` or `unknown` as the facts allow, and the
   error preserved in `error` when the outcome is `unknown`.
 
+`failure_posture` sits on the channel table beside the carrier, one value per row. An event that
+falls through to `telemetry.default_carrier` takes the posture on the default row, and the
+configuration fails to load when that row omits it, exactly as it fails when the table omits the
+default carrier itself. There is no compiled default and no inheritance from a neighbouring kind:
+the operator states the deployment's answer once, for the default as well.
+
 **Neither posture retries.** A retry of an append whose effect is undetermined is a second write
 with the first one's disposition still open, which is how one ambiguous event becomes two recorded
 ones.
@@ -165,7 +173,10 @@ list means every requested kind is durable under the current table.
 The reader learns the shape of what it cannot see, which is the property the original `gap` flag was
 reaching for.
 
-`next_cursor` follows `stream.read`'s existing cursor contract unchanged.
+The cursor is `stream.read`'s existing contract under `stream.read`'s existing names: `after` going
+in, `next_after` coming back, both exclusive sequences read from one snapshot. This record invents
+no cursor of its own, so a client that knows how to resume a `stream.read` resumes a
+`telemetry.read` the same way and no mapping is needed.
 
 ### D6: `telemetry.counts` is computed at read time
 
@@ -191,12 +202,22 @@ makes its fallback visible: the result carries the `actor` that was stamped, and
 `actor_argument_ignored: true` when the call named a different one. An emitter that believes it is
 attributing to someone else learns otherwise from its own result.
 
+**The stamp is a server-owned field, not a payload key.** The resolved actor is written by the verb
+onto the stream record's envelope, beside its sequence, from the identity the request authenticated
+as. `payload` is stored exactly as given and is read by nothing: a payload that happens to carry its
+own `actor` key is data, and grouping and scoping never consult it. Without that split the stamping
+rule buys nothing, because a per-actor figure filtered on caller-controlled JSON is once again a
+number the measured party wrote about itself, and a caller could read another actor's events by
+naming them in a field it controls.
+
 This matters beyond tidiness. `telemetry.counts` groups by actor, so without a stamping rule a
 per-actor utilization figure is a number the measured party wrote about itself.
 
 Reads scope to the caller. `telemetry.read` and `telemetry.counts` return only the calling actor's
-events by default. A read naming a foreign actor requires that actor to be visible to the caller,
-and an all-actors read requires the caller to be in the configured fleet-readers allowlist. This is
+events when neither optional parameter is sent. `actor` names one foreign actor and requires that
+actor to be visible to the caller; `all_actors` requires the caller to be in the configured
+fleet-readers allowlist; sending both is refused rather than resolved by precedence. Both filter on
+the envelope field above, never on payload contents. This is
 deliberately the same model `brain.event_counts` already enforces rather than a second one invented
 here; a stream name is not an authorization, so naming an arbitrary stream grants nothing on its own.
 
@@ -231,10 +252,14 @@ is not a finding.
     kinds whose carrier is ephemeral in the configuration in force at read time, and an all-durable
     request returns an empty `coverage.ephemeral` as the control. Arm 20 carries the half that
     separates this from "the kinds that came back empty", and both are required.
-11. `telemetry.counts` over a stream being appended to concurrently returns a total consistent with a
-    single pinned head: the same window counted twice across an append returns the pinned total, and
-    a re-read after the pin is released reflects the new row.
-12. The pack is absent from a default-pack boot and present under `--pack telemetry`, verified by the
+11. `telemetry.counts` over a stream being appended to concurrently returns a total consistent with the
+    head that call pinned: a row appended after the count starts is absent from that call's total,
+    and the next call, which pins its own head, returns it. The control is the same pair of calls
+    with no concurrent appender, which must return the same total twice. Reuse of one pin ACROSS
+    calls is not asserted, because each call pins its own head and no cursor input exists; that is
+    open question 1, not an arm.
+12. The pack is absent from a default-pack boot and present under `--pack kg --pack telemetry`, with a
+    bare `--pack telemetry` refused at boot naming the missing `kg`, verified by the
     verb list in both, not by a config read.
 13. **The policy-versus-incident pair.** An ephemeral drop and a durable append refused before any
     domain effect are emitted in one test. Both return `outcome: "dropped"`; the results must differ
