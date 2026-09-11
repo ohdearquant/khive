@@ -252,7 +252,7 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let now = now_us();
 
-        for atom_in in &p.atoms {
+        for (index, atom_in) in p.atoms.iter().enumerate() {
             let slug = atom_in.slug.trim().to_string();
             if slug.is_empty() {
                 return Err(RuntimeError::InvalidInput(
@@ -269,25 +269,26 @@ impl KnowledgeHandlers {
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
             // before any reader/writer is acquired. Every refusal is located to the
-            // atom that produced it: this loop returns ONE error for the whole batch,
-            // and the matched text is by construction text the caller cannot place
-            // without being told which atom it came from (#2605).
+            // atom that produced it by POSITION, never by slug: this loop returns ONE
+            // error for the whole batch, the slug is itself a scanned field, and two
+            // atoms may share a slug within one payload (#2605).
             use khive_runtime::secret_gate::{self, locate};
-            locate(secret_gate::check(&slug), &slug, "slug")?;
-            locate(secret_gate::check(&atom_in.name), &slug, "name")?;
-            locate(secret_gate::check(&content), &slug, "content")?;
+            let record = format!("atoms[{index}]");
+            locate(secret_gate::check(&slug), &record, "slug")?;
+            locate(secret_gate::check(&atom_in.name), &record, "name")?;
+            locate(secret_gate::check(&content), &record, "content")?;
             if let Some(ref tags_vec) = atom_in.tags {
-                locate(secret_gate::check_tags(tags_vec), &slug, "tags")?;
+                locate(secret_gate::check_tags(tags_vec), &record, "tags")?;
             }
             if let Some(ref props) = atom_in.properties {
-                locate(secret_gate::check_json(props), &slug, "properties")?;
+                locate(secret_gate::check_json(props), &record, "properties")?;
             }
             secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
             if let Some(Some(uri)) = &atom_in.source_uri {
-                locate(secret_gate::check(uri), &slug, "source_uri")?;
+                locate(secret_gate::check(uri), &record, "source_uri")?;
             }
             if let Some(Some(st)) = &atom_in.source_type {
-                locate(secret_gate::check(st), &slug, "source_type")?;
+                locate(secret_gate::check(st), &record, "source_type")?;
             }
         }
 

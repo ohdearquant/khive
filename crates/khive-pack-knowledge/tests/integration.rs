@@ -4035,10 +4035,11 @@ fn is_secret_detected(err: &RuntimeError) -> bool {
     matches!(err, RuntimeError::SecretDetected(_))
 }
 
-/// A batch refusal names the atom it came from. Without this the caller holds N
-/// atoms and one error describing text that lives in whichever sibling refused,
-/// so a clean atom and a refusing one are indistinguishable in the response
-/// (#2605).
+/// A batch refusal names the atom it came from, by position. Without this the
+/// caller holds N atoms and one error describing text that lives in whichever
+/// sibling refused, so a clean atom and a refusing one are indistinguishable in
+/// the response (#2605). The location is positional because the slug is itself a
+/// scanned field: echoing it would return the very text the gate refused.
 #[tokio::test]
 async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
     let f = pack(rt());
@@ -4068,12 +4069,17 @@ async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
     );
     let rendered = err.to_string();
     assert!(
-        rendered.contains("atom-carrying-the-credential"),
-        "the refusal must name the atom that produced it; got: {rendered}"
+        rendered.contains("in atoms[1].content"),
+        "the refusal must locate the atom and field that produced it; got: {rendered}"
     );
     assert!(
-        !rendered.contains("clean-sibling-atom"),
-        "the refusal must not name a bystander atom; got: {rendered}"
+        !rendered.contains("atoms[0]"),
+        "the refusal must not point at a bystander atom; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("atom-carrying-the-credential")
+            && !rendered.contains("clean-sibling-atom"),
+        "the location is positional: a slug is itself a scanned field and never echoed; got: {rendered}"
     );
 }
 
