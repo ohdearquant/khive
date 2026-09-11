@@ -436,11 +436,21 @@ class Session:
         self,
         transport: Transport | None = None,
         *,
-        namespace: str = "local",
+        namespace: str | None = None,
         actor_id: str | None = None,
         visible_namespaces: list[str] | None = None,
         timeout: float = 30.0,
     ) -> None:
+        """`namespace` is this session's DEFAULT namespace for every op it sends.
+
+        It used to default to `"local"` and reach only the request frame, which
+        the registry does not read as an op argument, so a session constructed
+        with a namespace sent every op unscoped and silently answered about the
+        caller's own namespace instead. The value now falls through to each op
+        that does not name one of its own, which is what the argument reads as.
+        An explicit per-op `namespace=` still wins. `None` means "send no
+        namespace argument", the behaviour of a session that names none.
+        """
         self.transport = transport or SocketTransport()
         self.namespace = namespace
         self.actor_id = actor_id
@@ -536,7 +546,7 @@ class Session:
                         source_id=source_id,
                         tags=tags,
                         embedding_model=embedding_model,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -577,7 +587,7 @@ class Session:
                         thread_id=thread_id,
                         tags=tags,
                         self_send=self_send,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -611,7 +621,7 @@ class Session:
                         content=content,
                         idempotency_key=idempotency_key,
                         tags=tags,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -671,7 +681,7 @@ class Session:
                         full_content=full_content,
                         profile_id=profile_id,
                         embedding_model=embedding_model,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -726,6 +736,11 @@ class Session:
             "protocol_version": PROTOCOL_VERSION,
         }
 
+    def _op_namespace(self, namespace: str | None) -> str | None:
+        """Resolve one op's namespace: the op's own if it named one, else the
+        session's default, else None so no argument is sent at all."""
+        return namespace if namespace is not None else self.namespace
+
     def _base_frame(self) -> dict[str, Any]:
         return {
             "ops": "",
@@ -735,7 +750,10 @@ class Session:
             # agents reading text; a typed client needs the machine contract.
             "presentation": "verbose",
             "format": "json",
-            "namespace": self.namespace,
+            # The frame's namespace is an identity field, not a scope: it has
+            # always been a string here, so an unset session keeps sending
+            # "local" and the wire contract is unchanged by the default move.
+            "namespace": self.namespace or "local",
             "actor_id": self.actor_id,
             "visible_namespaces": self.visible_namespaces,
             "config_id": self._config_id or "",

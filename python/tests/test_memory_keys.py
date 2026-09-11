@@ -85,7 +85,11 @@ def test_remember_forwards_arguments_and_transport_timeout():
 @pytest.mark.parametrize("key", [None, ""])
 def test_remember_omits_none_but_preserves_empty_key_without_inferred_namespace(memory_type, key):
     transport = ScriptedTransport([[SUCCESS]])
-    session = Session(transport, namespace="frame-only", actor_id="test-client", timeout=9.0)
+    # No namespace on the session: this arm's subject is that nothing is
+    # INFERRED from key or memory_type, and a session that names a namespace
+    # now sends it as an op argument (test_session_namespace_default.py), so
+    # naming one here would be asserting a different contract in passing.
+    session = Session(transport, actor_id="test-client", timeout=9.0)
 
     assert session.remember("memory", key=key, memory_type=memory_type) == SUCCESS
 
