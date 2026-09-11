@@ -246,28 +246,40 @@ than a refusal**, because a refusal is information and this is not.
    The equal-specificity tiebreak between two _different_ patterns is unchanged and is
    `created_at ASC, id ASC`, so a decision is reproducible from the data (#2596).
 
-5. **A write that cannot change the decision refuses.** If an upsert would leave the live row's
-   `decision` exactly as it was, the verb refuses with `policy_unchanged`, naming the row id and
-   the decision already in force. This is the arm that closes the silent no-op, and it holds even
-   after item 1 makes the ordinary correction work, because an operator can still write a rule that
-   is already in force and believe they changed something.
+5. **A write that changes nothing refuses.** If an upsert would leave the live row's `decision`
+   **and** its `note` exactly as they were, the verb refuses with `policy_unchanged`, naming the row
+   id and the decision already in force. This is the arm that closes the silent no-op, and it holds
+   even after item 1 makes the ordinary correction work, because an operator can still write a rule
+   that is already in force and believe they changed something.
+
+   The test is both fields, not the decision alone. A note is how an operator records why a rule
+   says what it says, and keying the refusal on the decision would make a note-only correction
+   impossible to write without first flipping the decision to something untrue and back. So a
+   changed note is a change: the row's `note` is replaced and `updated_at` moves. The superseded
+   note joins `history` under item 2 like any other superseded value, carrying the decision that was
+   in force beside it, so the record still reads as one sequence rather than two.
 
 ## Acceptance for Amendment 3
 
-1. Write `deny` for a triple, then `ask` for the identical triple: `tool.policies` lists ONE row,
-   `tool.check` answers `ask`, and the `policy_id` it names is the id the first write returned.
-2. That row's `history` has one entry carrying the earlier `deny`, its note and its author.
-3. Write `deny` for a triple, then `deny` again for the identical triple: refused with
-   `policy_unchanged` naming the live row id, `tool.policies` still lists one row, and no
-   `updated_at` movement. This is the anti-no-op arm and it is the reason item 5 exists.
-4. `tool.policy_delete` on a live triple removes it, `tool.check` falls through to the next
-   matching rule or to the default, and the source it names changes accordingly.
-5. `tool.policy_delete` on a triple with no live row refuses; it does not report success.
-6. `tool.policy_delete` with a pattern that would match several stored rules retires only an exact
-   stored match, and refuses when none exists. Control: two rules, `svc:*`/`t.x` and
-   `svc:a`/`t.x`, and deleting `svc:*`/`t.x` leaves the second untouched.
-7. Two rules of equal specificity but different patterns still resolve by `created_at ASC, id ASC`,
-   unchanged by this amendment, and the tie still carries `deny` over `ask` over `allow`.
-8. Mutation control, stated before running: making the upsert insert a second row instead of
-   replacing turns arms 1, 2 and 3 red and leaves 4 through 7 green. That separation is what proves
-   the single-live-row property is what arms 1 to 3 test, rather than the ordering.
+17. Write `deny` for a triple, then `ask` for the identical triple: `tool.policies` lists ONE row,
+    `tool.check` answers `ask`, and the `policy_id` it names is the id the first write returned.
+18. That row's `history` has one entry carrying the earlier `deny`, its note and its author.
+19. Write `deny` with a note for a triple, then the identical `deny` and the identical note again:
+    refused with `policy_unchanged` naming the live row id, `tool.policies` still lists one row, and
+    no `updated_at` movement. This is the anti-no-op arm and it is the reason item 5 exists.
+20. Write `deny` with a note, then the same `deny` with a DIFFERENT note: accepted, not refused. The
+    row keeps its id and its `decision`, its `note` is the new one, `updated_at` moves, and `history`
+    gains one entry carrying the superseded note beside the decision in force at the time. This is
+    the arm that separates "nothing changed" from "the decision did not change", and without it item
+    5 would make a note-only correction unwritable.
+21. `tool.policy_delete` on a live triple removes it, `tool.check` falls through to the next
+    matching rule or to the default, and the source it names changes accordingly.
+22. `tool.policy_delete` on a triple with no live row refuses; it does not report success.
+23. `tool.policy_delete` with a pattern that would match several stored rules retires only an exact
+    stored match, and refuses when none exists. Control: two rules, `svc:*`/`t.x` and
+    `svc:a`/`t.x`, and deleting `svc:*`/`t.x` leaves the second untouched.
+24. Two rules of equal specificity but different patterns still resolve by `created_at ASC, id ASC`,
+    unchanged by this amendment, and the tie still carries `deny` over `ask` over `allow`.
+25. Mutation control, stated before running: making the upsert insert a second row instead of
+    replacing turns arms 17 through 20 red and leaves 21 through 24 green. That separation is what
+    proves the single-live-row property is what those arms test, rather than the ordering.
