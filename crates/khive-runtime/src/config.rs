@@ -18,19 +18,31 @@ use crate::error::RuntimeResult;
 /// `SubstrateCoordinator` in `kkernel`
 /// uses `BackendId` for node-to-backend resolution and cross-backend edge routing.
 ///
-/// A single-backend `KhiveRuntime` always has `BackendId("main")` by default.
+/// A single-backend `KhiveRuntime` always has the `main` backend id by default.
 /// The boot path in `kkernel` or `khive-mcp` sets the id via `RuntimeConfig::backend_id`
 /// when constructing per-pack runtimes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BackendId(pub String);
+pub struct BackendId(String);
+
+/// Validation error returned when a backend identifier is rejected.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BackendIdError {
+    /// The supplied identifier was empty or contained only whitespace.
+    #[error("backend id must not be empty or whitespace-only")]
+    Empty,
+}
 
 impl BackendId {
     /// The default single-backend name.
     pub const MAIN: &'static str = "main";
 
-    /// Construct from a string name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    /// Parse a nonempty backend identifier.
+    pub fn parse(name: impl Into<String>) -> Result<Self, BackendIdError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(BackendIdError::Empty);
+        }
+        Ok(Self(name))
     }
 
     /// The default `main` backend id.
@@ -44,9 +56,55 @@ impl BackendId {
     }
 }
 
+impl TryFrom<String> for BackendId {
+    type Error = BackendIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<&str> for BackendId {
+    type Error = BackendIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl std::str::FromStr for BackendId {
+    type Err = BackendIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 impl std::fmt::Display for BackendId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod backend_id_tests {
+    use super::BackendId;
+
+    #[test]
+    fn empty_and_whitespace_only_backend_ids_are_rejected() {
+        for invalid in ["", " ", "\t\n"] {
+            assert!(
+                BackendId::parse(invalid).is_err(),
+                "backend id {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_backend_id_round_trips() {
+        let id = BackendId::parse("archive").expect("valid backend id");
+        assert_eq!(id.as_str(), "archive");
+        assert_eq!(id.to_string(), "archive");
     }
 }
 
@@ -73,6 +131,7 @@ mod private {
 #[derive(Clone, Debug)]
 pub struct NamespaceToken {
     namespace: Namespace,
+    gate_namespace: Namespace,
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
@@ -98,6 +157,7 @@ impl NamespaceToken {
         }
         debug_assert!(!visible.is_empty(), "visible set must be non-empty");
         Self {
+            gate_namespace: namespace.clone(),
             namespace,
             visible,
             actor,
@@ -141,6 +201,18 @@ impl NamespaceToken {
         &self.namespace
     }
 
+    /// Return the namespace used by the originating dispatch's Gate check.
+    /// It can differ from the primary storage namespace on an implicit request.
+    /// Tokens minted directly, or reminted by `with_namespace`, use their primary.
+    pub fn gate_namespace(&self) -> &Namespace {
+        &self.gate_namespace
+    }
+
+    pub(crate) fn with_gate_namespace(mut self, namespace: Namespace) -> Self {
+        self.gate_namespace = namespace;
+        self
+    }
+
     /// Return the read-visibility set.
     ///
     /// List, search, and get operations must accept records whose namespace is
@@ -175,6 +247,7 @@ impl NamespaceToken {
     }
 
     /// Return a new token with the same actor but a different namespace.
+    /// The Gate namespace metadata is reset to the new primary namespace.
     ///
     /// The visible set is replaced with `[ns]`: this is a full read+write token
     /// for `ns`, not a type-enforced write-only or append-only capability. It is
@@ -217,6 +290,8 @@ pub fn process_ref_from_env() -> Option<String> {
 /// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Production boot passes this value to the async khive-mcp/kkernel host
@@ -303,6 +378,8 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Resolved `[brain]` policy from the serving process's configuration.
+    pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
     /// from `khive.toml`'s `[[git_write.allowed]]` entries by
     /// [`runtime_config_from_khive_config`]. Threaded through so
@@ -310,6 +387,9 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
+    /// `git_write` so the exec pack reads an already-resolved config.
+    pub exec: crate::engine_config::ExecSectionConfig,
     /// Resolved rendering timezone (ADR-169), consumed today by date-only
     /// `parse_due` anchoring. Populated from `[display] timezone` in
     /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
@@ -406,7 +486,10 @@ impl Default for RuntimeConfig {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            exec: crate::engine_config::ExecSectionConfig::default(),
+            mounts: Vec::new(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
         }
@@ -426,6 +509,8 @@ impl RuntimeConfig {
             "schedule",
             "knowledge",
             "session",
+            "tool",
+            "exec",
             "git",
             "code",
             "workspace",
@@ -668,6 +753,7 @@ pub fn runtime_config_from_khive_config(
     // `[actor] id` never becomes the storage namespace (writes always pin to
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
+    let mounts = khive_cfg.mounts.clone();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -740,7 +826,20 @@ pub fn runtime_config_from_khive_config(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
 
+    let gate = khive_cfg
+        .gate
+        .as_ref()
+        .map(|gate| {
+            Arc::new(khive_gate::CallerEnrollmentGate::new(
+                gate.granted_actors.clone(),
+                gate.grant_unattributed,
+            )) as GateRef
+        })
+        .unwrap_or_else(|| base.gate.clone());
+
+    let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();
+    let exec = khive_cfg.exec.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -764,7 +863,11 @@ pub fn runtime_config_from_khive_config(
             visible_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            gate,
+            brain,
             git_write,
+            exec,
+            mounts,
             blob_hydration_bytes,
             display_timezone,
             ..base
@@ -801,7 +904,11 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        gate,
+        brain,
         git_write,
+        exec,
+        mounts,
         blob_hydration_bytes,
         display_timezone,
         ..base

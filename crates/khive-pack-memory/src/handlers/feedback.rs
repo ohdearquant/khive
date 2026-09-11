@@ -115,15 +115,28 @@ mod tests {
     use khive_pack_kg::KgPack;
     use khive_runtime::{Namespace, RuntimeConfig, RuntimeError, VerbRegistryBuilder};
 
-    fn build_memory_rt(brain_profile: Option<String>) -> khive_runtime::KhiveRuntime {
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: khive_runtime::KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = khive_runtime::KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
+    fn build_memory_rt(brain_profile: Option<String>) -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-mem-feedback-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
-        khive_runtime::KhiveRuntime::new(RuntimeConfig {
+        let runtime = khive_runtime::KhiveRuntime::new(RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -131,7 +144,11 @@ mod tests {
             brain_profile,
             ..RuntimeConfig::default()
         })
-        .expect("runtime")
+        .expect("runtime");
+        TestRuntime {
+            runtime,
+            _temp_dir: tmp,
+        }
     }
 
     #[tokio::test]
@@ -139,7 +156,7 @@ mod tests {
         let rt = build_memory_rt(None);
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt));
+        builder.register(crate::MemoryPack::new(rt.clone()));
         let registry = builder.build().expect("registry");
 
         let error = registry
@@ -226,7 +243,7 @@ mod tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt));
+        builder.register(crate::MemoryPack::new(rt.clone()));
         let registry = builder.build().expect("registry");
 
         let result = registry
@@ -395,15 +412,14 @@ mod tests {
     // Each test builds a registry with ALL THREE packs registered and inspects
     // `brain.profile` (total_events) to confirm which profile received credit.
 
-    fn build_full_rt(brain_profile: Option<String>) -> khive_runtime::KhiveRuntime {
+    fn build_full_rt(brain_profile: Option<String>) -> TestRuntime {
         let tmp = tempfile::Builder::new()
             .prefix("khive-mem-3tier-")
             .tempdir_in(std::env::temp_dir())
             .expect("temp dir");
         let db_path = tmp.path().join("khive.db");
-        std::mem::forget(tmp);
 
-        khive_runtime::KhiveRuntime::new(RuntimeConfig {
+        let runtime = khive_runtime::KhiveRuntime::new(RuntimeConfig {
             db_path: Some(db_path),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -411,7 +427,11 @@ mod tests {
             brain_profile,
             ..RuntimeConfig::default()
         })
-        .expect("runtime")
+        .expect("runtime");
+        TestRuntime {
+            runtime,
+            _temp_dir: tmp,
+        }
     }
 
     /// Tier-1 wins over tier-2: when an explicit profile is configured AND a

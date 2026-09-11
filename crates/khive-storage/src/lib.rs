@@ -58,9 +58,10 @@ pub use types::StorageResult;
 pub use vectors::VectorStore;
 
 pub use types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
-    GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
+    BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,
+    BatchWriteSummary, BoundedCount, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter,
+    EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest,
+    EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
     GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome,
     IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
     OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SeekCursor,
@@ -70,8 +71,9 @@ pub use types::{
     TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget, TraversalOptions,
     TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit,
     VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
-    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
+    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
+    MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

@@ -52,6 +52,7 @@ describe("preferred showcase source", () => {
     const result = await loadPreferredShowcaseBundle(
       configuredStaticEntry,
       fetchBundle,
+      { accessToken: "operator-secret" },
     );
 
     expect(result.source).toBe("khive-db-snapshot");
@@ -62,6 +63,7 @@ describe("preferred showcase source", () => {
       credentials: "same-origin",
       redirect: "error",
       signal: expect.any(AbortSignal),
+      headers: { authorization: "Bearer operator-secret" },
     });
   });
 
@@ -89,24 +91,25 @@ describe("preferred showcase source", () => {
     });
   });
 
-  it("sends no Authorization header when the operator token is blank", async () => {
-    const fetchBundle = vi.fn(async () =>
-      response(golden, 200, {
-        "x-khive-analysis-id": "khive",
-        "x-khive-analysis-source": "khive-db-snapshot",
-      })
+  it("loads the curated asset directly when the operator token is blank", async () => {
+    const fetchBundle = vi.fn(async () => response(golden, 200));
+
+    const result = await loadPreferredShowcaseBundle(
+      configuredStaticEntry,
+      fetchBundle,
+      { accessToken: "   " },
     );
 
-    await loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle, {
-      accessToken: "   ",
-    });
-
-    expect(fetchBundle).toHaveBeenCalledWith("/api/showcase/analyses/khive", {
-      cache: "no-store",
-      credentials: "same-origin",
-      redirect: "error",
-      signal: expect.any(AbortSignal),
-    });
+    expect(result.source).toBe("curated-static-fallback");
+    expect(fetchBundle).toHaveBeenCalledOnce();
+    expect(fetchBundle).toHaveBeenCalledWith(
+      "/showcase/khive-repo-v1-khive.json",
+      {
+        cache: "force-cache",
+        credentials: "same-origin",
+        redirect: "error",
+      },
+    );
   });
 
   it("reads the operator token from browser session storage", () => {
@@ -122,7 +125,23 @@ describe("preferred showcase source", () => {
     expect(readOperatorShowcaseAccessToken()).toBeNull();
   });
 
-  it("uses the curated asset only when the DB snapshot route is not configured", async () => {
+  it("does not probe the protected DB route when no token is configured", async () => {
+    const fetchBundle = vi.fn(async () => response(golden, 200));
+
+    const result = await loadPreferredShowcaseBundle(
+      configuredStaticEntry,
+      fetchBundle,
+    );
+
+    expect(result.source).toBe("curated-static-fallback");
+    expect(fetchBundle).toHaveBeenCalledOnce();
+    expect(fetchBundle).toHaveBeenCalledWith(
+      "/showcase/khive-repo-v1-khive.json",
+      expect.any(Object),
+    );
+  });
+
+  it("falls back to the curated asset when an authenticated snapshot is absent", async () => {
     const fetchBundle = vi.fn(async (input: string) =>
       input.startsWith("/api/")
         ? response(new Uint8Array(), 404)
@@ -132,6 +151,7 @@ describe("preferred showcase source", () => {
     const result = await loadPreferredShowcaseBundle(
       configuredStaticEntry,
       fetchBundle,
+      { accessToken: "operator-secret" },
     );
 
     expect(result.source).toBe("curated-static-fallback");
@@ -145,7 +165,9 @@ describe("preferred showcase source", () => {
     const fetchBundle = vi.fn(async () => response(new Uint8Array(), 503));
 
     await expect(
-      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle, {
+        accessToken: "operator-secret",
+      }),
     ).rejects.toThrow(/database snapshot.*503/i);
     expect(fetchBundle).toHaveBeenCalledOnce();
   });
@@ -159,7 +181,9 @@ describe("preferred showcase source", () => {
     );
 
     await expect(
-      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle, {
+        accessToken: "operator-secret",
+      }),
     ).rejects.toThrow(/provenance/i);
   });
 
@@ -175,7 +199,9 @@ describe("preferred showcase source", () => {
     );
 
     await expect(
-      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
+      loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle, {
+        accessToken: "operator-secret",
+      }),
     ).rejects.toThrow(/repository identity/i);
     expect(fetchBundle).toHaveBeenCalledOnce();
   });
@@ -225,6 +251,7 @@ describe("preferred showcase source", () => {
       const resultPromise = loadPreferredShowcaseBundle(
         configuredStaticEntry,
         fetchBundle,
+        { accessToken: "operator-secret" },
       );
       const assertion = expect(resultPromise).rejects.toThrow(
         /did not settle/i,
@@ -254,6 +281,7 @@ describe("preferred showcase source", () => {
       const resultPromise = loadPreferredShowcaseBundle(
         configuredStaticEntry,
         fetchBundle,
+        { accessToken: "operator-secret" },
       );
       const assertion = expect(resultPromise).rejects.toThrow(
         /did not settle/i,
@@ -284,7 +312,9 @@ describe("preferred showcase source", () => {
       );
 
       await expect(
-        loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle),
+        loadPreferredShowcaseBundle(configuredStaticEntry, fetchBundle, {
+          accessToken: "operator-secret",
+        }),
       ).rejects.toThrow();
       expect(fetchBundle).toHaveBeenCalledOnce();
     }

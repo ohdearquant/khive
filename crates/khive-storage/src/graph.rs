@@ -20,6 +20,20 @@ use crate::types::{
 pub trait GraphStore: Send + Sync + 'static {
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
+    /// Insert an edge only when neither its id nor natural key already
+    /// exists. Returns `true` when this call inserted the row and `false`
+    /// when an existing row won the race. The existing row is never updated.
+    ///
+    /// The default returns `Unsupported` rather than falling back to
+    /// [`GraphStore::upsert_edge`], because an upsert would overwrite the
+    /// winning row and violate this method's conditional-insert contract.
+    async fn insert_edge_if_absent(&self, _edge: Edge) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "insert_edge_if_absent".into(),
+            message: "this backend does not implement conditional edge insert".into(),
+        })
+    }
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
     /// Insert or replace one edge and return the transaction-observed
@@ -104,6 +118,8 @@ pub trait GraphStore: Send + Sync + 'static {
     /// `GuardedBatchOutcome::refused` names the first failing batch entry and
     /// its missing endpoint(s) — determined by the same in-transaction
     /// pre-check that aborted the batch, not a post-hoc re-read.
+    /// Retain the original ordered input to enumerate every aborted write via
+    /// [`GuardedBatchOutcome::refusal_page`] beyond the default bounded sample.
     ///
     /// Default returns `StorageError::Unsupported`, for the same reason as
     /// [`GraphStore::upsert_edge_guarded`]'s default.
@@ -154,7 +170,9 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Option<Edge>>;
     /// Delete an edge by link ID using the specified delete mode.
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> StorageResult<bool>;
-    /// Query edges with filter, sort, and pagination.
+    /// Query edges with filter, sort, and pagination without an implicit
+    /// exact count. Implementations should return `total: None`; callers that
+    /// need a count use [`Self::count_edges`] explicitly.
     async fn query_edges(
         &self,
         filter: EdgeFilter,
@@ -168,7 +186,9 @@ pub trait GraphStore: Send + Sync + 'static {
     /// prefixes and slicing a client-side merge floats the window between
     /// calls (silent duplicate/skip enumeration). Backends without batched
     /// namespace support retain the single-namespace path and reject
-    /// multi-namespace requests explicitly.
+    /// multi-namespace requests explicitly. Implementations should return
+    /// `total: None`; callers that need a count use
+    /// [`Self::count_edges_in_namespaces`] explicitly.
     async fn query_edges_in_namespaces(
         &self,
         namespaces: &[String],
@@ -179,7 +199,7 @@ pub trait GraphStore: Send + Sync + 'static {
         match namespaces.len() {
             0 => Ok(Page {
                 items: Vec::new(),
-                total: Some(0),
+                total: None,
             }),
             1 => self.query_edges(filter, sort, page).await,
             _ => Err(StorageError::Unsupported {

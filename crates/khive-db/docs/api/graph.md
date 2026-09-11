@@ -55,3 +55,56 @@ The atomic plan uses two guarded shapes instead of a blind upsert:
 Both statements carry an affected-row guard. This closes the endpoint race and
 also guarantees that the prepare-time `created`/`updated`/`resurrected`
 disposition used by the response and event payload is still true at commit.
+
+## Shared Batch Writes and Endpoint Pre-check (#769)
+
+`observed_edge_batch_upsert` pre-checks every endpoint and tombstone policy on
+the write connection before issuing any write. `observed_edge_upsert` uses the
+same `edge_endpoints_exist` probe for guarded singleton requests. Missing endpoints
+are therefore transaction-local facts, not reconstructions from a later reader.
+Both WriterTask and compatibility routing retain one transaction for the preflight
+and writes; an `Ok(refusal)` can commit safely because no row was changed.
+
+After preflight, batch and singleton DML share `observed_edge_upsert` and
+`edge_upsert_statement_with_resurrection`. The compatibility
+`edge_upsert_statement` selects the same builder with resurrection disabled.
+The natural-key conflict arms and `bind_params` conversion are shared, not copied
+into a separate batch SQL loop (ADR-099 §B3).
+
+The legacy `upsert_edges_guarded` adapter preserves the original ordered batch,
+the refusing entry's index and `MissingEndpoints`, and returns
+`GuardedBatchOutcome::refused` with `affected: 0`. Its `record_failure` path
+classifies the culprit as `InvalidInput/Permanent` and every sibling as
+`BatchAborted/Unknown`, with the full original first-error diagnostic. A legacy
+tombstone refusal remains `StorageError::Conflict`; observed APIs retain the
+explicit `ResurrectionRequired` result.
+
+### Enumerating Refused Writes Beyond the Sample (#2375)
+
+Storage callers can retain the original ordered `Vec<Edge>` and use
+`GuardedBatchOutcome::refusal_page(&original, class, PageRequest { offset, limit })`
+after one guarded batch call. No write is resubmitted and no endpoint is re-read.
+The default `BatchWriteSummary`, its 128-detail sample, and legacy `first_error`
+remain unchanged. Pages use that same 128-detail cap and message bound.
+
+`class=None` enumerates every refused write in original input order. Only the
+first guard-refused entry is `InvalidInput/Permanent`; all siblings are
+`BatchAborted/Unknown`. Later siblings were not necessarily examined, and paging
+does not claim they all have missing endpoints. The initial summary and pages
+share the same classification and detail formatter.
+
+An optional class filter is applied before offset and limit, and `Page.total`
+is the complete matching population. Add `items.len()` to the offset to continue
+until that total is reached. A requested limit above 128 is clamped to 128; zero
+returns count metadata only and is not a progressing enumeration request.
+Success, an empty successful batch, and offsets at/beyond the filtered population
+return empty pages. Skipped/filtered entries are never formatted.
+
+The supplied slice length must equal `summary.attempted`, and a refusal index
+must be within that slice. The caller must retain the exact batch contents and
+order: length validation cannot detect a substituted same-length batch. The
+original `first_error` supplies the refusing entry's diagnostic unchanged.
+
+This is a synchronous, in-memory storage API, not a new MCP/runtime endpoint or
+durable cursor. Runtime `link_many` currently discards the summary in favor of
+its first guarded-write failure; this change does not expand that wire response.

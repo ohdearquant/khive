@@ -14,7 +14,9 @@
     "git",
     "code",
     "workspace",
-    "blob"
+    "blob",
+    "tool",
+    "exec"
   ],
   "positive_control": "comm.read",
   "entries": [

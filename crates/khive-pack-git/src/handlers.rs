@@ -1,13 +1,12 @@
 //! `git.digest` verb handler (ADR-088 Amendment 1).
 //!
 //! Resolves the `source` argument (local path or `https://` URL, cloning/
-//! fetching remote sources into the scratch cache), resolves or auto-creates
-//! the repo-anchor `project` entity, then drives the shared
+//! fetching a remote only when commits need a repository), resolves or
+//! auto-creates the repo-anchor `project` entity, then drives the shared
 //! `ingest::run_ingest` core with a bounded, cursor-resumable pass.
 
 use std::path::Path;
 
-use anyhow::anyhow;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -16,8 +15,8 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::cache::{self, CacheError};
 use crate::ingest::{
-    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
-    GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
+    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, run_remote_api_ingest,
+    CacheRepairStrategy, GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
     canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
@@ -26,19 +25,27 @@ use crate::source::{
 use crate::GitPack;
 
 /// Recover the typed error when a digest ingest/resolution failure chain
-/// carries a storage-class failure (for example a reader admission timeout
-/// under concurrent load), so resource exhaustion is not reported as the
-/// caller's invalid input. Every other failure keeps the established
-/// invalid-input shape.
+/// carries a storage or remote-cache failure, rather than blaming the
+/// caller's input for an infrastructure failure.
 fn digest_failure_to_runtime(e: anyhow::Error) -> RuntimeError {
     let e = match e.downcast::<RuntimeError>() {
-        Ok(rte @ RuntimeError::Storage(_)) => return rte,
+        Ok(rte @ (RuntimeError::Storage(_) | RuntimeError::RemoteFetchError { .. })) => return rte,
         Ok(other) => return RuntimeError::InvalidInput(other.to_string()),
         Err(e) => e,
     };
     match e.downcast::<khive_storage::StorageError>() {
         Ok(se) => RuntimeError::Storage(se),
         Err(e) => RuntimeError::InvalidInput(e.to_string()),
+    }
+}
+
+fn remote_cache_error(remote: &str, stage: &str, error: CacheError) -> RuntimeError {
+    RuntimeError::RemoteFetchError {
+        remote: redact_repo_url(remote),
+        message: format!(
+            "{stage}: {}",
+            cache::sanitize_diagnostic(&error.to_string())
+        ),
     }
 }
 
@@ -87,18 +94,26 @@ impl RemoteCommitRecovery {
                 // ownership-guard failure is terminal: it is not a signal
                 // that a fresh clone would fare any differently, and is
                 // never worth risking a second destructive operation for.
-                Err(CacheError::Git(_)) => {
+                Err(error @ CacheError::Git(_)) => {
                     self.stage = RemoteRecoveryStage::Refetched;
-                    self.reclone()
+                    self.reclone(Some(error))
                 }
-                Err(e) => Err(anyhow!("cache repair (refetch) failed: {e}")),
+                Err(error) => Err(remote_cache_error(
+                    &self.canonical_url,
+                    "cache repair (refetch) failed",
+                    error,
+                )
+                .into()),
             },
-            RemoteRecoveryStage::Refetched => self.reclone(),
+            RemoteRecoveryStage::Refetched => self.reclone(None),
             RemoteRecoveryStage::Recloned => Ok(None),
         }
     }
 
-    fn reclone(&mut self) -> anyhow::Result<Option<RecoveredRepo>> {
+    fn reclone(
+        &mut self,
+        refetch_error: Option<CacheError>,
+    ) -> anyhow::Result<Option<RecoveredRepo>> {
         match cache::reclone(&self.canonical_url) {
             Ok(repo) => {
                 self.stage = RemoteRecoveryStage::Recloned;
@@ -107,7 +122,16 @@ impl RemoteCommitRecovery {
                     strategy: CacheRepairStrategy::Reclone,
                 }))
             }
-            Err(e) => Err(anyhow!("cache repair (reclone) failed: {e}")),
+            Err(error) => {
+                let stage = match refetch_error {
+                    Some(refetch) => format!(
+                        "cache repair (reclone) failed after refetch failed ({})",
+                        cache::sanitize_diagnostic(&refetch.to_string())
+                    ),
+                    None => "cache repair (reclone) failed".into(),
+                };
+                Err(remote_cache_error(&self.canonical_url, &stage, error).into())
+            }
         }
     }
 }
@@ -151,19 +175,41 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
-        // Resolve a local repo path -- remote sources clone/fetch into the
-        // scratch cache first (ADR-088 Amendment 1 §Remote-URL mode).
+        // Commits need a repository to walk. Issues and pull requests are
+        // source-bound `gh` API reads, so a remote API-only request uses a
+        // neutral working directory and never clones unused git history.
         let (repo_path, expected_github_repo) = match &source {
             DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
-                let cloned = cache::ensure_clone(canonical).map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "remote clone/fetch of {:?} failed: {e}",
-                        redact_repo_url(canonical)
-                    ))
-                })?;
+                let repo = if include.commits {
+                    // `ensure_clone` shells out to `git clone`/`git fetch` and
+                    // blocks the calling thread on the clone-size monitor
+                    // loop (`cache::clone`) for as long as the transfer runs
+                    // -- on a Tokio worker thread that starves every other
+                    // task scheduled there, so the blocking span moves to a
+                    // dedicated thread (same pattern as
+                    // `source::local_origin_remote_url`).
+                    let redacted = redact_repo_url(canonical);
+                    let canonical = canonical.clone();
+                    tokio::task::spawn_blocking(move || cache::ensure_clone(&canonical))
+                        .await
+                        .map_err(|_| RuntimeError::RemoteFetchError {
+                            remote: redacted.clone(),
+                            message: "initial cache setup: clone task panicked or was cancelled"
+                                .into(),
+                        })?
+                        .map_err(|e| {
+                            remote_cache_error(&redacted, "initial cache setup failed", e)
+                        })?
+                } else {
+                    std::env::current_dir().map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "resolving a working directory for remote GitHub ingest: {e}"
+                        ))
+                    })?
+                };
                 (
-                    cloned,
+                    repo,
                     gh_slug
                         .as_ref()
                         .map(|(owner, repo)| format!("{owner}/{repo}")),
@@ -212,12 +258,15 @@ impl GitPack {
         // is never a candidate for self-heal (issue #765).
         let mut report = match &source {
             DigestSource::Local(_) => run_ingest(self.runtime(), token, registry, opts).await,
-            DigestSource::Remote { canonical, .. } => {
+            DigestSource::Remote { canonical, .. } if include.commits => {
                 let mut recovery = RemoteCommitRecovery::new(canonical.clone());
                 run_ingest_with_commit_recovery(self.runtime(), token, registry, opts, {
                     move |repo, err| recovery.repair(repo, err)
                 })
                 .await
+            }
+            DigestSource::Remote { .. } => {
+                run_remote_api_ingest(self.runtime(), token, registry, opts).await
             }
         }
         .map_err(digest_failure_to_runtime)?;
@@ -826,7 +875,9 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(khive_pack_kg::KgPack::new(rt.clone()));
         builder.register(GitPack::new(rt.clone()));
-        builder.with_event_store(rt.events(&token).expect("event store"));
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("configure trusted runtime audit store");
         let registry = builder.build().expect("registry builds");
         rt.install_edge_rules(registry.all_edge_rules());
         registry.apply_schema_plans(rt.backend());
@@ -867,6 +918,7 @@ mod tests {
     /// URL must converge on ONE anchor, not mint a second one that then
     /// re-ingests the whole corpus from an empty start.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn same_repo_via_local_and_remote_spelling_resolves_to_one_anchor() {
         let (rt, token, registry) = fixture().await;
 
@@ -913,6 +965,7 @@ mod tests {
     /// basename must NOT capture the ingest (issue #1173 item 1 -- the
     /// basename fallback is dropped entirely).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn basename_collision_with_unrelated_project_is_not_captured() {
         let (rt, token, registry) = fixture().await;
 
@@ -948,6 +1001,7 @@ mod tests {
     /// with `repo_slug`, so subsequent calls converge on the slug match
     /// without a migration (issue #1173 item 1).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_anchor_without_slug_is_matched_and_backfilled() {
         let (rt, token, registry) = fixture().await;
 
@@ -999,6 +1053,7 @@ mod tests {
     /// to one of them with the rest surfaced as duplicates, never an
     /// arbitrary or silent pick (ADR-088 Amendment 2 step-1 multi-match).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn duplicate_slug_anchors_resolve_deterministically_with_signal() {
         let (rt, token, registry) = fixture().await;
 
@@ -1057,6 +1112,7 @@ mod tests {
     /// quietly minting a fresh anchor over an orphaned corpus (issue #1173
     /// items 2/3).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn orphaned_anchor_is_flagged_not_silently_reminted() {
         let (rt, token, registry) = fixture().await;
 
@@ -1109,6 +1165,7 @@ mod tests {
     /// delete of an already-empty anchor, not an orphaned corpus -- it must
     /// not raise the signal (issue #1185 finding 3).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn tombstone_with_zero_live_notes_is_not_flagged_as_orphan() {
         let (rt, token, registry) = fixture().await;
 
@@ -1155,6 +1212,7 @@ mod tests {
     /// annotating corpus -- not merely the most-recently-deleted one (issue
     /// #1185 finding 3).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn orphan_signal_selects_tombstone_with_live_corpus_among_several() {
         let (rt, token, registry) = fixture().await;
 
@@ -1223,6 +1281,7 @@ mod tests {
     /// token (ADR-088 Amendment 2) -- the in-memory canonical (used only
     /// for the identity slug and any clone/gh operation) is unaffected.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn persisted_repo_url_is_credential_and_query_redacted() {
         let (rt, token, registry) = fixture().await;
 
@@ -1343,6 +1402,7 @@ mod tests {
     /// no `repo_slug`), is reconciled by a later remote-URL digest of the
     /// same repository via step-2 normalization (ADR-088 Amendment 2).
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_local_path_anchor_reconciled_by_later_remote_digest() {
         let (rt, token, registry) = fixture().await;
 
@@ -1399,6 +1459,7 @@ mod tests {
     /// value. Driven through `registry.dispatch("git.digest", ...)` over a
     /// LOCAL (no-network) source so it needs no real remote clone.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_public_surface_reports_duplicate_and_selects_oldest_no_third_anchor() {
         let (rt, token, registry) = fixture().await;
 
@@ -1486,6 +1547,7 @@ mod tests {
     /// in the report warning, and mint no third anchor -- observed on the
     /// public `git.digest` wire shape, not the private helper.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_exact_legacy_multi_match_selects_oldest_and_warns() {
         let (rt, token, registry) = fixture().await;
 
@@ -1574,6 +1636,7 @@ mod tests {
     /// same repository must still be detected by the orphan scan -- the
     /// exact-match tombstone query alone would miss it.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn orphaned_anchor_with_alternate_spelling_repo_url_is_still_flagged() {
         let (rt, token, registry) = fixture().await;
 
@@ -1624,6 +1687,7 @@ mod tests {
     /// from the canonical identity. The wire report must identify its live
     /// corpus rather than silently creating a replacement anchor beside it.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_reports_noncanonical_slug_tombstone_orphan() {
         let (rt, token, registry) = fixture().await;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1677,6 +1741,7 @@ mod tests {
     /// repository must still surface in `slug_duplicates` -- previously,
     /// resolution returned at step 1 without ever consulting legacy anchors.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn slug_tier_match_surfaces_cross_tier_legacy_duplicate() {
         let (rt, token, registry) = fixture().await;
 
@@ -1737,6 +1802,7 @@ mod tests {
     /// evidence must repair and reuse that anchor, including same-patch
     /// redaction of its stored display URL.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn noncanonical_slug_anchor_is_repaired_reused_and_redacted() {
         let (rt, token, registry) = fixture().await;
         let source = DigestSource::Remote {
@@ -1801,6 +1867,7 @@ mod tests {
     /// a conflicting slug must not displace the canonical slug winner, but it
     /// must be named in the `git.digest` warning rather than silently hidden.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_warns_for_noncanonical_slug_conflict_with_canonical_winner() {
         let (rt, token, registry) = fixture().await;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1900,6 +1967,7 @@ mod tests {
     /// canonical identity, not a failed normalization. A noncanonical slug on
     /// the same stored path must be repaired and reused through `git.digest`.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_repairs_noncanonical_slug_for_remote_less_local_repo() {
         let (rt, token, registry) = fixture().await;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1952,6 +2020,7 @@ mod tests {
     /// winner keeps precedence, while an older same-path anchor with a
     /// conflicting slug reaches the public warning and remains unchanged.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn git_digest_warns_for_remote_less_local_noncanonical_slug_conflict() {
         let (rt, token, registry) = fixture().await;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2031,6 +2100,7 @@ mod tests {
     /// normalization must reproduce that identity and repair a present but
     /// noncanonical slug rather than minting another anchor.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unsluggable_https_noncanonical_slug_anchor_is_repaired_and_reused() {
         let (rt, token, registry) = fixture().await;
         let source =
@@ -2110,8 +2180,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn remote_setup_failure_is_typed_without_reclassifying_bad_input() {
+        let _guard = crate::cache::ENV_MUTEX.lock().await;
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+        let (_rt, _token, registry) = fixture().await;
+
+        let remote_result = registry
+            .dispatch(
+                "git.digest",
+                json!({
+                    "source": "https://user:tok3n@127.0.0.1:1/org/repo?token=SECRET"
+                }),
+            )
+            .await;
+        let malformed_result = registry
+            .dispatch("git.digest", json!({"source": "relative/repo"}))
+            .await;
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+
+        let remote_error = remote_result.expect_err("closed-port clone must fail");
+        let rendered = remote_error.to_string();
+        match remote_error {
+            RuntimeError::RemoteFetchError { remote, message } => {
+                assert_eq!(remote, "https://127.0.0.1:1/org/repo");
+                assert!(message.contains("git clone"), "{message}");
+            }
+            other => panic!("remote clone failure must stay typed, got {other:?}"),
+        }
+        assert!(
+            !rendered.contains("tok3n") && !rendered.contains("SECRET"),
+            "remote fetch error must redact credentials and query tokens: {rendered}"
+        );
+        assert!(
+            matches!(malformed_result, Err(RuntimeError::InvalidInput(ref message)) if message.contains("absolute")),
+            "malformed caller source must stay InvalidInput, got {malformed_result:?}"
+        );
+    }
+
     #[test]
-    fn digest_failure_preserves_storage_class_and_flattens_the_rest() {
+    fn digest_failure_preserves_storage_and_remote_types() {
         // A storage-class failure inside the ingest chain (here: a
         // writer-handle admission timeout under load) must surface typed,
         // not as the caller's invalid input.
@@ -2142,7 +2251,21 @@ mod tests {
             RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
         ));
 
-        // Non-storage runtime failures keep the established invalid-input
+        let remote = anyhow::Error::new(remote_cache_error(
+            "https://user:tok3n@example.com/repo?token=SECRET",
+            "cache repair (refetch) failed",
+            CacheError::Io(std::io::Error::other("cache directory unavailable")),
+        ))
+        .context("preparing commit snapshot");
+        assert!(matches!(
+            digest_failure_to_runtime(remote),
+            RuntimeError::RemoteFetchError { remote, message }
+                if remote == "https://example.com/repo"
+                    && message.contains("cache repair (refetch) failed")
+                    && message.contains("scratch-cache I/O error")
+        ));
+
+        // Other runtime failures keep the established invalid-input
         // shape, message intact.
         let not_found = anyhow::Error::new(RuntimeError::NotFound("proj-x".to_string()));
         match digest_failure_to_runtime(not_found) {
@@ -2151,7 +2274,7 @@ mod tests {
         }
 
         // Plain anyhow context errors keep the established shape as well.
-        match digest_failure_to_runtime(anyhow!("gh probe failed")) {
+        match digest_failure_to_runtime(anyhow::anyhow!("gh probe failed")) {
             RuntimeError::InvalidInput(msg) => assert_eq!(msg, "gh probe failed"),
             other => panic!("untyped failure must flatten to InvalidInput, got {other:?}"),
         }

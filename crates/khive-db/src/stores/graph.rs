@@ -156,6 +156,40 @@ pub fn edge_upsert_statement_with_resurrection(edge: &Edge, resurrect: bool) -> 
     }
 }
 
+/// Insert a new edge only while both endpoints still exist.
+/// Competing IDs and natural keys, including tombstones, cause a constraint
+/// error rather than replacing or restoring the competing row. Callers must
+/// require one affected row to reject an endpoint removed after prepare.
+pub fn edge_insert_only_guarded_by_endpoints_statement(edge: &Edge) -> SqlStatement {
+    let mut statement = edge_upsert_statement(edge);
+    let src_exists = endpoint_exists_clause("?3");
+    let tgt_exists = endpoint_exists_clause("?4");
+    statement.sql = format!(
+        "INSERT INTO graph_edges \
+          (namespace, id, source_id, target_id, relation, weight, \
+           created_at, updated_at, deleted_at, metadata, target_backend) \
+          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
+          WHERE ({src_exists}) AND ({tgt_exists})"
+    );
+    statement.label = Some("edge-insert-only-where-endpoints-exist".to_string());
+    statement
+}
+
+/// Conditional-insert companion to [`edge_upsert_statement`]. Conflicts on
+/// either the id or natural key leave the existing edge untouched so callers
+/// can read the winner and explicitly reapply their intended delta.
+pub fn edge_insert_if_absent_statement(edge: &Edge) -> SqlStatement {
+    let mut statement = edge_upsert_statement(edge);
+    statement.sql = "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              ON CONFLICT DO NOTHING"
+        .to_string();
+    statement.label = Some("edge-insert-if-absent".to_string());
+    statement
+}
+
 /// Full-edge compare-and-swap update used after caller-side normalization
 /// was derived from a read snapshot. Unlike [`edge_upsert_statement`], this
 /// never inserts and cannot overwrite a row whose revision or deletion
@@ -907,36 +941,13 @@ impl SqlGraphStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Graph,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Graph,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Graph,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Graph,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -1403,6 +1414,8 @@ fn observed_edge_upsert(
     }))
 }
 
+/// Shared DML-only batch engine for observed and legacy upserts on both writer
+/// routes. The caller owns the transaction and rolls back SQL failures.
 fn observed_edge_batch_upsert(
     conn: &rusqlite::Connection,
     requests: &[EdgeUpsertRequest],
@@ -1735,6 +1748,16 @@ impl GraphStore for SqlGraphStore {
         }
     }
 
+    async fn insert_edge_if_absent(&self, edge: Edge) -> Result<bool, StorageError> {
+        let statement = edge_insert_if_absent_statement(&edge);
+        self.with_writer("insert_edge_if_absent", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
     async fn replace_edge_if_unchanged(
         &self,
         edge: Edge,
@@ -1778,8 +1801,7 @@ impl GraphStore for SqlGraphStore {
         Ok(BatchWriteSummary {
             attempted,
             affected: outcome.rows.len() as u64,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
 
@@ -1815,7 +1837,8 @@ impl GraphStore for SqlGraphStore {
     ) -> Result<GuardedBatchOutcome, StorageError> {
         let attempted = edges.len() as u64;
         let requests = edges
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|edge| EdgeUpsertRequest {
                 edge,
                 resurrect: false,
@@ -1827,27 +1850,39 @@ impl GraphStore for SqlGraphStore {
                 summary: BatchWriteSummary {
                     attempted,
                     affected: outcome.rows.len() as u64,
-                    failed: 0,
-                    first_error: String::new(),
+                    ..BatchWriteSummary::default()
                 },
                 refused: None,
             }),
             Some(refusal) => match refusal.reason {
-                EdgeUpsertRefusal::MissingEndpoints(missing) => Ok(GuardedBatchOutcome {
-                    summary: BatchWriteSummary {
+                EdgeUpsertRefusal::MissingEndpoints(missing) => {
+                    let index = refusal.entry_index;
+                    let edge = &edges[index];
+                    let (source_id, target_id) =
+                        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+                    let message = format!(
+                        "batch entry {index}: edge endpoint no longer exists at write time: source \
+                         {source_id} or target {target_id}"
+                    );
+                    let mut summary = BatchWriteSummary {
                         attempted,
-                        affected: 0,
-                        failed: attempted,
-                        first_error: format!(
-                            "batch entry {}: edge endpoint no longer exists at write time",
-                            refusal.entry_index
-                        ),
-                    },
-                    refused: Some(GuardedBatchRefusal {
-                        entry_index: refusal.entry_index,
+                        ..BatchWriteSummary::default()
+                    };
+                    // Keep the culprit's legacy first_error while recording
+                    // per-input error classes and retryability in input order.
+                    summary.first_error = message.clone();
+                    let refusal = GuardedBatchRefusal {
+                        entry_index: index,
                         missing,
-                    }),
-                }),
+                    };
+                    for (failed_index, failed_edge) in edges.iter().enumerate() {
+                        refusal.record_failure(&mut summary, failed_index, failed_edge, &message);
+                    }
+                    Ok(GuardedBatchOutcome {
+                        summary,
+                        refused: Some(refusal),
+                    })
+                }
                 EdgeUpsertRefusal::ResurrectionRequired { edge } => {
                     Err(resurrection_required_error("upsert_edges_guarded", &edge))
                 }
@@ -2285,20 +2320,8 @@ impl GraphStore for SqlGraphStore {
             ),
         })?;
         self.with_reader("query_edges", move |conn| {
-            let (where_clause, filter_params) = build_edge_filter_sql(&namespace, &filter);
-
-            let count_sql = format!("SELECT COUNT(*) FROM graph_edges{}", where_clause);
-            let total: i64 = {
-                let mut stmt = conn.prepare(&count_sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    filter_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
-
+            let (where_clause, mut all_params) = build_edge_filter_sql(&namespace, &filter);
             let order_clause = edge_order_clause(&sort);
-
-            let (_, data_filter_params) = build_edge_filter_sql(&namespace, &filter);
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
             all_params.push(Box::new(limit_i64));
             all_params.push(Box::new(offset_i64));
 
@@ -2322,10 +2345,7 @@ impl GraphStore for SqlGraphStore {
                 items.push(row?);
             }
 
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            Ok(Page { items, total: None })
         })
         .await
     }
@@ -2413,22 +2433,9 @@ impl GraphStore for SqlGraphStore {
             let namespaces_json = serde_json::to_string(&namespaces)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
-            let (where_clause, filter_params) =
+            let (where_clause, mut all_params) =
                 build_edge_filter_sql_for_namespaces_json(&namespaces_json, &filter);
-
-            let count_sql = format!("SELECT COUNT(*) FROM graph_edges{}", where_clause);
-            let total: i64 = {
-                let mut stmt = conn.prepare(&count_sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    filter_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
-
             let order_clause = edge_order_clause(&sort);
-
-            let (_, data_filter_params) =
-                build_edge_filter_sql_for_namespaces_json(&namespaces_json, &filter);
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = data_filter_params;
             all_params.push(Box::new(limit_i64));
             all_params.push(Box::new(offset_i64));
 
@@ -2452,10 +2459,7 @@ impl GraphStore for SqlGraphStore {
                 items.push(row?);
             }
 
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            Ok(Page { items, total: None })
         })
         .await
     }

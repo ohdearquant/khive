@@ -69,6 +69,8 @@ async fn plant_inbound_message(
 
     let id = Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: "local".into(),
         kind: "message".into(),
@@ -117,6 +119,8 @@ async fn plant_inbound_message_in_namespace(
 
     let id = Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: namespace.to_string(),
         kind: "message".into(),
@@ -514,6 +518,8 @@ async fn probe_ignores_outbound_messages() {
         .expect("authorize local namespace");
     let store = rt.notes(&token).expect("notes store");
     let note = Note {
+        version: 1,
+        key: None,
         id: Uuid::new_v4(),
         namespace: "local".into(),
         kind: "message".into(),
@@ -871,6 +877,48 @@ async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
         "an implausible pre-upgrade timestamp cursor must reset to baseline, not \
          permanently suppress messages: {messages:?}"
     );
+    // #2400: the reset has to be visible to the caller. Without it a poller
+    // reads a baseline page as arrivals and cannot tell the difference.
+    assert_eq!(
+        result["cursor_reset"],
+        json!(true),
+        "#2400: a discarded cursor must be reported to the caller: {result}"
+    );
+}
+
+/// #2400: `cursor_reset` is an exception report, so it must be absent from the
+/// two ordinary shapes. A poller that treats its presence as a signal would
+/// otherwise reset on every pass.
+#[tokio::test]
+async fn probe_omits_cursor_reset_when_the_cursor_is_honoured() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+    plant_inbound_message(&rt, actor, "lambda:khive", 1_000_000, None, false).await;
+
+    let baseline = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    assert!(
+        baseline.get("cursor_reset").is_none(),
+        "#2400: a probe with no since_us discarded nothing: {baseline}"
+    );
+    let cursor = baseline["cursor_us"].as_i64().expect("cursor_us");
+
+    plant_inbound_message(&rt, actor, "lambda:khive", 2_000_000, None, false).await;
+    let followed = registry
+        .dispatch("comm.probe", json!({ "actor": actor, "since_us": cursor }))
+        .await
+        .expect("probe succeeds");
+    assert!(
+        followed.get("cursor_reset").is_none(),
+        "#2400: a round-tripped cursor was honoured: {followed}"
+    );
+    assert_eq!(
+        followed["new_messages"].as_array().expect("array").len(),
+        1,
+        "control: the honoured cursor still returns the message planted after it: {followed}"
+    );
 }
 
 /// Regression for #827: `notes_seq` has no fixed ceiling on how
@@ -1009,6 +1057,8 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // Reopen through the normal runtime boot path -- this runs
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1024,6 +1074,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
@@ -1195,6 +1246,8 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // `run_migrations` to latest (including V8's forward repair) and the
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1210,6 +1263,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 

@@ -11,7 +11,7 @@ use clap::Parser;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_git::ingest::{run_ingest, IngestOptions};
-use khive_runtime::{KhiveRuntime, Namespace, PackRegistry, VerbRegistryBuilder};
+use khive_runtime::{IngestAuditStore, KhiveRuntime, Namespace, PackRegistry};
 
 /// Arguments for `kkernel git-ingest`.
 #[derive(Parser, Debug)]
@@ -61,23 +61,19 @@ pub async fn run_git_ingest(args: GitIngestArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
-    // Mirrors `KhiveMcpServer::with_packs` (khive-mcp/src/server.rs): same
+    // Shared with `kkernel code-ingest` (`code_ingest.rs`): same
     // gate/namespace/visibility/actor wiring, built from the SAME
     // `runtime.config().packs` list a live server would use, so the ingester
-    // observes identical `KindHook`/edge-rule/verb behavior.
-    let mut builder = VerbRegistryBuilder::new();
-    builder.with_gate(runtime.config().gate.clone());
-    builder.with_default_namespace(runtime.config().default_namespace.as_str());
-    builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
-    builder.with_actor_id(runtime.config().actor_id.clone());
-    PackRegistry::register_packs(
-        &runtime.config().packs.clone(),
-        runtime.clone(),
-        &mut builder,
-    )
-    .map_err(|e| anyhow::anyhow!("pack registration failed: {e:?}"))?;
-    let registry = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-    runtime.install_edge_rules(registry.all_edge_rules());
+    // observes identical `KindHook`/edge-rule/verb behavior. `false`: this
+    // path dispatches per-write through the registry rather than persisting
+    // one batch-level gate consultation, and carried no event-store
+    // attachment before this extraction — unlike `code-ingest`'s new
+    // `code.findings_ingest` gate consultation (ADR-018 Amendment 4), the
+    // per-write dispatches already went through `VerbRegistry::dispatch`,
+    // which is a broader change than this PR's registry-bootstrap
+    // deduplication is scoped to.
+    let registry = PackRegistry::build_ingest_registry(&runtime, IngestAuditStore::Detach)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let report = run_ingest(
         &runtime,

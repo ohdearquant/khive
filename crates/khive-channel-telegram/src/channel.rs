@@ -120,7 +120,7 @@ impl Channel for TelegramChannel {
 
     /// Send a single outbound message. Only the configured maintainer slug is
     /// routable in v1 (ADR-056 "Outbound addressing"); any other
-    /// `telegram:<slug>` recipient is unroutable and is logged and dropped,
+    /// `telegram:<slug>` recipient is rejected as a permanent envelope error,
     /// never silently misdelivered to the maintainer chat.
     async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
         let slug = strip_kind_prefix(&envelope.to, "telegram");
@@ -128,9 +128,11 @@ impl Channel for TelegramChannel {
             tracing::warn!(
                 slug,
                 "telegram: unroutable recipient slug (only the configured maintainer slug is \
-                 routable in v1); dropping outbound message"
+                 routable in v1); rejecting outbound message"
             );
-            return Ok(());
+            return Err(ChannelError::InvalidEnvelope(format!(
+                "telegram recipient {slug:?} is not routable"
+            )));
         }
         self.connector
             .send_message(self.config.maintainer_chat_id, &envelope.content)
@@ -431,16 +433,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_unroutable_slug_is_dropped_not_misdelivered() {
+    async fn send_to_unroutable_slug_is_permanent_and_not_misdelivered() {
         let connector = std::sync::Arc::new(MockConnector::new(vec![]));
         let ch = TelegramChannel::with_connector(make_config(), Box::new(connector.clone()));
 
         let env = ChannelEnvelope::new(BOT_SELF_ADDRESS, "telegram:someone-else", "reply text");
-        ch.send(env).await.unwrap();
+        let error = ch.send(env).await.expect_err("unroutable slug must fail");
 
         assert!(
             connector.sent.lock().unwrap().is_empty(),
             "an unroutable slug must never be sent to the maintainer chat"
+        );
+        assert!(matches!(error, ChannelError::InvalidEnvelope(_)));
+        assert_eq!(
+            error.delivery_failure_class(),
+            khive_channel::DeliveryFailureClass::Permanent
         );
     }
 

@@ -439,13 +439,15 @@ async fn create_all_note_kinds() {
         "question",
         "decision",
         "reference",
+        "head",
     ] {
-        rt.create_note(&tok, kind, None, "content", Some(0.5), None, vec![])
+        let content = if kind == "head" { "{}" } else { "content" };
+        rt.create_note(&tok, kind, None, content, Some(0.5), None, vec![])
             .await
             .unwrap();
     }
     let all = rt.list_notes(&tok, None, 50, 0).await.unwrap();
-    assert_eq!(all.len(), 5);
+    assert_eq!(all.len(), 6);
 }
 
 // =============================================================================
@@ -1938,6 +1940,8 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -1953,6 +1957,7 @@ async fn file_backed_runtime_persists() {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -1964,6 +1969,8 @@ async fn file_backed_runtime_persists() {
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -1979,6 +1986,7 @@ async fn file_backed_runtime_persists() {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -2588,6 +2596,8 @@ mod embedder_registry_tests {
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2603,6 +2613,7 @@ mod embedder_registry_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime")
     }
@@ -2743,6 +2754,8 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2758,6 +2771,7 @@ mod embedder_registry_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime with two models");
 

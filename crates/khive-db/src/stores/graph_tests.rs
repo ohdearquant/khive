@@ -3,8 +3,19 @@ use crate::pool::PoolConfig;
 use khive_storage::types::{
     Direction, TraversalExecutionBudget, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
 };
+use khive_storage::{BatchWriteErrorClass, BatchWriteRetryability};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
+
+fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("count") => {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
 
 /// Deterministic barrier immediately before the in-transaction endpoint
 /// probe used by an observed guarded edge write.
@@ -286,6 +297,95 @@ fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) ->
 }
 
 #[tokio::test]
+async fn edge_pages_run_when_sqlite_count_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("graph-count-free-pages.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+    // Pooled-reader mode lets the authorizer below observe the exact
+    // connection used by both the control count and the page queries.
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "count-free-a");
+    for namespace in ["count-free-a", "count-free-b"] {
+        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+        edge.namespace = namespace.to_string();
+        store.upsert_edge(edge).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .count_edges_in_namespaces(
+                &["count-free-a".to_string(), "count-free-b".to_string()],
+                EdgeFilter::default(),
+            )
+            .await
+            .unwrap(),
+        2,
+        "the explicit count API remains exact"
+    );
+
+    {
+        let reader = pool.reader().unwrap();
+        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+    }
+
+    assert!(
+        store.count_edges(EdgeFilter::default()).await.is_err(),
+        "the exact-count control must be rejected by the authorizer"
+    );
+    let page = store
+        .query_edges(
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("single-namespace page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 1);
+
+    let namespaces = vec!["count-free-a".to_string(), "count-free-b".to_string()];
+    assert!(
+        store
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .is_err(),
+        "the multi-namespace exact-count control must be rejected by the authorizer"
+    );
+    let page = store
+        .query_edges_in_namespaces(
+            &namespaces,
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("multi-namespace page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 2);
+
+    let reader = pool.reader().unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[tokio::test]
 async fn query_edges_in_namespaces_offset_paging_enumerates_exactly() {
     // #2088 regression: two namespaces, every edge sharing one created_at
     // (the worst tie population), paged by offset to exhaustion. The single
@@ -325,7 +425,7 @@ async fn query_edges_in_namespaces_offset_paging_enumerates_exactly() {
             )
             .await
             .unwrap();
-        assert_eq!(page.total, Some(40));
+        assert_eq!(page.total, None);
         if page.items.is_empty() {
             break;
         }
@@ -527,6 +627,237 @@ async fn observed_upsert_uses_canonical_symmetric_natural_key() {
     assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
     assert_eq!(updated.edge.id, first_id);
     assert_eq!(updated.edge.weight, 0.8);
+}
+
+#[tokio::test]
+async fn insert_edge_if_absent_preserves_the_natural_key_winner() {
+    let store = setup_memory_store();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let winner = make_edge(source, target, EdgeRelation::DependsOn, 1.0);
+    let winner_id = winner.id;
+    let mut loser = make_edge(source, target, EdgeRelation::DependsOn, 0.25);
+    loser.metadata = Some(serde_json::json!({"kind": "loser"}));
+    let loser_id = loser.id;
+
+    assert!(store.insert_edge_if_absent(winner).await.unwrap());
+    assert!(!store.insert_edge_if_absent(loser).await.unwrap());
+
+    let persisted = store.get_edge(winner_id).await.unwrap().unwrap();
+    assert!((persisted.weight - 1.0).abs() < f64::EPSILON);
+    assert_eq!(persisted.metadata, None);
+    assert!(store.get_edge(loser_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observed_batch_upsert_reports_updated_preimage_and_created_rows() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let other_target = Uuid::new_v4();
+    for id in [source, target, other_target] {
+        insert_live_entity(&pool, id);
+    }
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+    original.metadata = Some(serde_json::json!({"revision": 1, "old_only": true}));
+    original.target_backend = Some("old-backend".into());
+    let original_id = original.id;
+    store.upsert_edge(original).await.unwrap();
+    let original = store.get_edge(original_id).await.unwrap().unwrap();
+
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let replacement_id = replacement.id;
+    let created = make_edge(source, other_target, EdgeRelation::Extends, 0.5);
+    let created_id = created.id;
+    let outcome = store
+        .upsert_edges_guarded_observed(vec![
+            EdgeUpsertRequest {
+                edge: replacement.clone(),
+                resurrect: false,
+            },
+            EdgeUpsertRequest {
+                edge: created,
+                resurrect: false,
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(outcome.refusal.is_none());
+    assert_eq!(outcome.rows.len(), 2);
+    let updated = &outcome.rows[0];
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, original_id);
+    assert_eq!(updated.edge.created_at, original.created_at);
+    assert_eq!(updated.edge.weight, replacement.weight);
+    assert_eq!(updated.edge.metadata, replacement.metadata);
+    assert_eq!(updated.edge.target_backend, None);
+    assert_eq!(
+        serde_json::to_value(updated.previous.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(outcome.rows[1].disposition, EdgeUpsertDisposition::Created);
+    assert_eq!(outcome.rows[1].edge.id, created_id);
+    assert!(outcome.rows[1].previous.is_none());
+    for row in &outcome.rows {
+        let persisted = store.get_edge(row.edge.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::to_value(&row.edge).unwrap()
+        );
+    }
+    assert!(store.get_edge(replacement_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observed_batch_upsert_later_refusal_preserves_earlier_replacement() {
+    for (route, is_file_backed, use_writer_task) in [
+        ("memory_fallback", false, false),
+        ("file_fallback", true, false),
+        ("writer_task", true, true),
+    ] {
+        for resurrection_refusal in [false, true] {
+            let directory = is_file_backed.then(|| tempfile::tempdir().unwrap());
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: directory
+                        .as_ref()
+                        .map(|dir| dir.path().join("batch-refusal.db")),
+                    write_queue_enabled: Some(use_writer_task),
+                    write_routing_strict: use_writer_task,
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            {
+                let writer = pool.writer().unwrap();
+                writer.conn().execute_batch(GRAPH_DDL).unwrap();
+                writer
+                    .conn()
+                    .execute_batch(
+                        "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+                    )
+                    .unwrap();
+            }
+            let store = SqlGraphStore::new_scoped(Arc::clone(&pool), is_file_backed, "default");
+            assert_eq!(
+                pool.writer_task_handle().unwrap().is_some(),
+                use_writer_task,
+                "{route}"
+            );
+            let source = Uuid::new_v4();
+            let target = Uuid::new_v4();
+            let refused_target = Uuid::new_v4();
+            let other_target = Uuid::new_v4();
+            for id in [source, target, refused_target, other_target] {
+                insert_live_entity(&pool, id);
+            }
+            let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+            original.metadata = Some(serde_json::json!({"revision": 1}));
+            original.target_backend = Some("original-backend".into());
+            let original_id = original.id;
+            store.upsert_edge(original).await.unwrap();
+            let original = store.get_edge(original_id).await.unwrap().unwrap();
+
+            let tombstone = if resurrection_refusal {
+                let mut edge = make_edge(target, refused_target, EdgeRelation::Extends, 0.5);
+                edge.metadata = Some(serde_json::json!({"tombstone": true}));
+                let id = edge.id;
+                store.upsert_edge(edge).await.unwrap();
+                store.delete_edge(id, DeleteMode::Soft).await.unwrap();
+                store.get_edge_including_deleted(id).await.unwrap()
+            } else {
+                hard_delete_entity(&pool, refused_target);
+                None
+            };
+            let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+            replacement.metadata = Some(serde_json::json!({"revision": 2}));
+            let refused = make_edge(target, refused_target, EdgeRelation::Extends, 0.9);
+            let created = make_edge(source, other_target, EdgeRelation::Extends, 1.0);
+            let incoming_ids = [replacement.id, refused.id, created.id];
+
+            let acquisitions_before = pool.writer_acquisition_snapshot();
+            let outcome = store
+                .upsert_edges_guarded_observed(
+                    [replacement, refused, created]
+                        .into_iter()
+                        .map(|edge| EdgeUpsertRequest {
+                            edge,
+                            resurrect: false,
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let acquisitions_after = pool.writer_acquisition_snapshot();
+            assert_eq!(
+                (
+                    acquisitions_after.pooled_acquisitions
+                        - acquisitions_before.pooled_acquisitions,
+                    acquisitions_after.standalone_acquisitions
+                        - acquisitions_before.standalone_acquisitions,
+                    acquisitions_after.writer_task_acquisitions
+                        - acquisitions_before.writer_task_acquisitions,
+                ),
+                match route {
+                    "memory_fallback" => (1, 0, 0),
+                    "file_fallback" => (0, 1, 0),
+                    "writer_task" => (0, 0, 1),
+                    _ => unreachable!(),
+                },
+                "{route}: the refused batch must execute on the selected writer route"
+            );
+
+            assert!(outcome.rows.is_empty());
+            let refusal = outcome.refusal.expect("later entry must refuse the batch");
+            assert_eq!(refusal.entry_index, 1);
+            match (refusal.reason, tombstone) {
+                (EdgeUpsertRefusal::ResurrectionRequired { edge }, Some(tombstone)) => {
+                    assert_eq!(
+                        serde_json::to_value(&edge).unwrap(),
+                        serde_json::to_value(&tombstone).unwrap()
+                    );
+                    let persisted = store
+                        .get_edge_including_deleted(tombstone.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&persisted).unwrap(),
+                        serde_json::to_value(&tombstone).unwrap()
+                    );
+                }
+                (EdgeUpsertRefusal::MissingEndpoints(missing), None) => {
+                    assert!(!missing.source);
+                    assert!(missing.target);
+                }
+                other => panic!("unexpected later refusal: {other:?}"),
+            }
+            let persisted = store.get_edge(original_id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&persisted).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "{route}: preflight must refuse before replacing an earlier live edge"
+            );
+            for id in incoming_ids {
+                assert!(store
+                    .get_edge_including_deleted(id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            let writer_join = pool.take_writer_task_join();
+            drop(store);
+            drop(pool);
+            if let Some(writer_join) = writer_join {
+                writer_join.await.unwrap();
+            }
+            drop(directory);
+        }
+    }
 }
 
 /// The base `PRIMARY KEY (namespace, id)` alone would let two namespaces
@@ -740,7 +1071,7 @@ async fn query_edges_in_namespaces_offset_paging_exceeds_sqlite_variable_limit()
             )
             .await
             .unwrap();
-        assert_eq!(page.total, Some(12));
+        assert_eq!(page.total, None);
         if page.items.is_empty() {
             break;
         }
@@ -4231,12 +4562,225 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
         "b (the batch entry's target) must be reported missing"
     );
     assert!(!refusal.missing.source, "a was never deleted");
+    assert_eq!(outcome.summary.failed, 2);
+    assert_eq!(outcome.summary.errors.len(), 2);
+    assert_eq!(outcome.summary.errors[0].item_id, Some(ids[0].to_string()));
+    assert_eq!(outcome.summary.errors[1].item_id, Some(ids[1].to_string()));
+    assert_eq!(
+        outcome.summary.errors[0].class,
+        BatchWriteErrorClass::InvalidInput
+    );
+    assert_eq!(
+        outcome.summary.errors[0].retryability,
+        BatchWriteRetryability::Permanent
+    );
+    assert_eq!(
+        outcome.summary.errors[1].class,
+        BatchWriteErrorClass::BatchAborted
+    );
+    assert_eq!(
+        outcome.summary.errors[1].retryability,
+        BatchWriteRetryability::Unknown
+    );
+    assert_eq!(
+        outcome
+            .summary
+            .error_counts
+            .iter()
+            .map(|count| count.count)
+            .sum::<u64>(),
+        outcome.summary.failed
+    );
 
     for id in ids {
         assert!(
             store.get_edge(id).await.unwrap().is_none(),
             "batch must be all-or-nothing: {id:?} must not be persisted"
         );
+    }
+}
+
+#[tokio::test]
+async fn legacy_guarded_batch_later_refusal_classifies_culprit_and_aborted_siblings() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let other_target = Uuid::new_v4();
+    let missing_target = Uuid::new_v4();
+    for id in [source, target, other_target] {
+        insert_live_entity(&pool, id);
+    }
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+    original.metadata = Some(serde_json::json!({"revision": 1}));
+    let original_id = original.id;
+    store.upsert_edge(original).await.unwrap();
+    let original = store.get_edge(original_id).await.unwrap().unwrap();
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let edges = vec![
+        replacement,
+        make_edge(target, missing_target, EdgeRelation::Extends, 0.5),
+        make_edge(source, other_target, EdgeRelation::Extends, 1.0),
+    ];
+
+    let outcome = store.upsert_edges_guarded(edges.clone()).await.unwrap();
+    let refusal = outcome.refused.as_ref().unwrap();
+    assert_eq!(refusal.entry_index, 1);
+    assert!(!refusal.missing.source);
+    assert!(refusal.missing.target);
+    let summary = &outcome.summary;
+    assert_eq!(summary.attempted, 3);
+    assert_eq!(summary.affected, 0);
+    assert_eq!(summary.failed, 3);
+    assert_eq!(summary.errors.len(), 3);
+    assert_eq!(summary.errors_omitted, 0);
+    assert!(!summary.errors_truncated);
+    assert_eq!(
+        summary.first_error,
+        format!(
+            "batch entry 1: edge endpoint no longer exists at write time: source {target} or target {missing_target}"
+        )
+    );
+    for (index, error) in summary.errors.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(edges[index].id.to_string()));
+        if index == 1 {
+            assert_eq!(error.class, BatchWriteErrorClass::InvalidInput);
+            assert_eq!(error.retryability, BatchWriteRetryability::Permanent);
+            assert_eq!(error.message, summary.first_error);
+        } else {
+            assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+            assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+            assert_eq!(
+                error.message,
+                format!(
+                    "batch entry {index} was not written because guarded batch entry 1 was refused"
+                )
+            );
+        }
+    }
+    assert_eq!(summary.error_counts.len(), 2);
+    for count in &summary.error_counts {
+        match count.class {
+            BatchWriteErrorClass::InvalidInput => assert_eq!(count.count, 1),
+            BatchWriteErrorClass::BatchAborted => assert_eq!(count.count, 2),
+            other => panic!("unexpected refusal error class: {other:?}"),
+        }
+    }
+    let page = outcome
+        .refusal_page(
+            &edges,
+            None,
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.total, Some(3));
+    assert_eq!(page.items, summary.errors);
+    let persisted = store.get_edge(original_id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&persisted).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    for edge in edges {
+        assert!(store
+            .get_edge_including_deleted(edge.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn upsert_edges_guarded_preserves_refusal_beyond_summary_cap() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let missing_target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+    let cap = khive_storage::MAX_BATCH_WRITE_ERROR_DETAILS;
+    let mut edges: Vec<_> = (0..cap + 3)
+        .map(|_| make_edge(source, target, EdgeRelation::Extends, 1.0))
+        .collect();
+    edges[cap + 1] = make_edge(source, missing_target, EdgeRelation::Extends, 1.0);
+    let ids: Vec<_> = edges.iter().map(|edge| edge.id).collect();
+
+    let outcome = store.upsert_edges_guarded(edges.clone()).await.unwrap();
+    let refusal = outcome.refused.as_ref().unwrap();
+    assert_eq!(refusal.entry_index, cap + 1);
+    assert!(!refusal.missing.source);
+    assert!(refusal.missing.target);
+    let summary = &outcome.summary;
+    assert_eq!(summary.affected, 0);
+    assert_eq!(summary.attempted, (cap + 3) as u64);
+    assert_eq!(summary.failed, summary.attempted);
+    assert_eq!(summary.errors.len(), cap);
+    assert_eq!(summary.errors_omitted, 3);
+    assert!(summary.errors_truncated);
+    assert_eq!(summary.first_error, format!(
+        "batch entry {}: edge endpoint no longer exists at write time: source {source} or target {missing_target}",
+        cap + 1,
+    ));
+    for (index, error) in summary.errors.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(ids[index].to_string()));
+        assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+        assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+        assert_eq!(
+            error.message,
+            format!(
+                "batch entry {index} was not written because guarded batch entry {} was refused",
+                cap + 1,
+            )
+        );
+    }
+    assert_eq!(summary.error_counts.len(), 2);
+    assert_eq!(
+        summary.error_counts[0].class,
+        BatchWriteErrorClass::InvalidInput
+    );
+    assert_eq!(summary.error_counts[0].count, 1);
+    assert_eq!(
+        summary.error_counts[1].class,
+        BatchWriteErrorClass::BatchAborted
+    );
+    assert_eq!(summary.error_counts[1].count, (cap + 2) as u64);
+    let mut enumerated = Vec::new();
+    while enumerated.len() < edges.len() {
+        let page = outcome
+            .refusal_page(
+                &edges,
+                None,
+                PageRequest {
+                    offset: enumerated.len() as u64,
+                    limit: u32::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.total, Some(edges.len() as u64));
+        assert!(!page.items.is_empty());
+        assert!(page.items.len() <= cap);
+        enumerated.extend(page.items);
+    }
+    assert_eq!(enumerated.len(), edges.len());
+    assert_eq!(&enumerated[..cap], summary.errors.as_slice());
+    for (index, error) in enumerated.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(ids[index].to_string()));
+        if index == cap + 1 {
+            assert_eq!(error.class, BatchWriteErrorClass::InvalidInput);
+            assert_eq!(error.retryability, BatchWriteRetryability::Permanent);
+            assert_eq!(error.message, summary.first_error);
+        } else {
+            assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+            assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+        }
+    }
+    for id in ids {
+        assert!(store.get_edge(id).await.unwrap().is_none());
     }
 }
 

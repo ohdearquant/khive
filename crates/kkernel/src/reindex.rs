@@ -19,7 +19,7 @@ use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{
     entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
-    KhiveRuntime, Namespace,
+    KhiveConfig, KhiveRuntime, Namespace,
 };
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
@@ -136,7 +136,9 @@ impl ProgressBar {
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
     /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
-    /// ephemeral in-memory database, matching `kkernel mcp`/`kkernel exec`.
+    /// ephemeral in-memory database in single-backend mode. When discovered
+    /// config declares `[[backends]]`, this must explicitly match one declared
+    /// persistent SQLite path.
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
 
@@ -191,9 +193,79 @@ pub struct ReindexArgs {
     #[arg(long, conflicts_with = "no_knowledge")]
     pub sections_only: bool,
 
+    /// Rebuild and rank-1 integrity-check both global knowledge FTS indexes
+    /// (`fts_knowledge`, `fts_sections`). Off by default: these indexes cover
+    /// the whole database, while a reindex run always targets one namespace
+    /// (an omitted `--namespace` resolves to the configured one), so no run
+    /// scope implies the rebuild. The rebuild runs after the knowledge pass,
+    /// so it conflicts with `--no-knowledge` rather than silently doing
+    /// nothing under it.
+    #[arg(long, conflicts_with = "no_knowledge")]
+    pub rebuild_fts: bool,
+
     /// Print human-readable output instead of JSON.
     #[arg(long)]
     pub human: bool,
+}
+
+/// Load the same discovered config as runtime resolution and ensure that a
+/// one-database reindex cannot silently escape a declared backend topology.
+///
+/// Returns `None` when no `[[backends]]` are declared (reindex keeps its
+/// ordinary single-backend `--db` behavior); `Some` with the validated target
+/// otherwise. Callers must open exactly the returned target's path — see
+/// [`open_validated_reindex_backend`].
+fn validate_declared_reindex_target(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+) -> Result<Option<khive_mcp::serve::ValidatedReindexTarget>> {
+    let discovery_anchor = khive_mcp::serve::config_discovery_db_anchor(db);
+    let loaded =
+        KhiveConfig::load_with_home_fallback_and_source(config, discovery_anchor.as_deref())
+            .context("load reindex khive config for backend-target validation")?;
+    let config_source = loaded.as_ref().map(|(_, source)| source.as_path());
+    let backends = loaded
+        .as_ref()
+        .map(|(config, _)| config.backends.as_slice())
+        .unwrap_or_default();
+
+    khive_mcp::serve::validate_reindex_db_target_with_source(db, backends, config_source)
+}
+
+/// Open the runtime `kkernel reindex` writes to, binding the open to the
+/// filesystem identity [`validate_declared_reindex_target`] already checked.
+///
+/// When a declared-backend topology produced a validated target, this
+/// overrides `cfg.db_path` to that target's canonical path — never the raw
+/// `--db`/`KHIVE_DB` string, which may still name a symlink at this point —
+/// and calls [`khive_mcp::serve::reverify_reindex_target_identity`]
+/// immediately beforehand so a symlink retargeted, or the declared file
+/// replaced in place, since validation is refused before `KhiveRuntime::new`
+/// opens (and migrates) anything. Config discovery is unaffected: `cfg` was
+/// already fully resolved by the caller against the raw `--db` input, and
+/// only the field that decides which file gets opened is overridden here.
+///
+/// With no validated target (no `[[backends]]` declared), `cfg` is used
+/// unchanged — ordinary single-backend reindex behavior.
+fn open_validated_reindex_backend(
+    mut cfg: khive_runtime::RuntimeConfig,
+    validated: Option<&khive_mcp::serve::ValidatedReindexTarget>,
+) -> Result<KhiveRuntime> {
+    if let Some(validated) = validated {
+        khive_mcp::serve::reverify_reindex_target_identity(validated)?;
+        cfg.db_path = Some(validated.path.clone());
+    }
+    KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// What a `--rebuild-fts` run actually did, so a caller never has to take
+/// "it rebuilt the FTS indexes" on faith — the names, wall time, and the
+/// rank-1 integrity-check outcome are all reported.
+#[derive(Serialize)]
+struct KnowledgeFtsRebuildReport {
+    indexes: Vec<String>,
+    elapsed_ms: u64,
+    integrity_ok: bool,
 }
 
 #[derive(Serialize)]
@@ -204,6 +276,9 @@ struct ReindexReport {
     knowledge_atoms_indexed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_sections_indexed: Option<u64>,
+    /// Present only when `--rebuild-fts` actually ran the global FTS rebuild.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_fts_rebuild: Option<KnowledgeFtsRebuildReport>,
     /// Atoms whose vector write failed during the knowledge pass.
     knowledge_atoms_failed: u64,
     /// True when the knowledge pass itself errored (could not run to completion).
@@ -473,6 +548,9 @@ async fn filter_unembedded(
 /// MCP server serves recall from. Fails closed on any partial failure unless
 /// `--best-effort` is set.
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
+    let validated_target =
+        validate_declared_reindex_target(args.db.as_deref(), args.config.as_deref())?;
+
     // Namespace precedence mirrors `kkernel mcp`:
     //   1. --namespace / KHIVE_NAMESPACE (explicit CLI/env) — skips config tier
     //   2. [actor] id in the config file
@@ -495,7 +573,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     // `!explicit`, `resolve_runtime_config` may have applied `[actor] id` from
     // the config file, making `cfg.default_namespace` differ from the CLI value.
     let resolved_ns = cfg.default_namespace.clone();
-    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rt = open_validated_reindex_backend(cfg, validated_target.as_ref())?;
     let token = rt
         .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -506,6 +584,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let do_knowledge = !args.no_knowledge; // knowledge corpus
     let do_atoms = do_knowledge && !args.sections_only;
     let do_sections = do_knowledge && !args.no_sections;
+
+    let rebuild_fts = args.rebuild_fts;
 
     // Explicit --model targets a single engine; otherwise fan out to ALL
     // registered engines, matching the runtime's multi-model write path so a
@@ -716,6 +796,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut knowledge_pass_errored = false;
     let mut knowledge_ann_failed = false;
     let mut knowledge_sections_failed: u64 = 0;
+    let mut knowledge_fts_rebuild: Option<KnowledgeFtsRebuildReport> = None;
     if do_atoms || do_sections {
         let atom_bar = ProgressBar::new("atoms");
         let section_bar = ProgressBar::new("sections");
@@ -786,6 +867,22 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         }
     }
 
+    // The FTS rebuild is a whole-database operation, so it goes through the
+    // operator entry point rather than the namespace-scoped reindex options.
+    // It runs only after a clean knowledge pass: a failed pass already exits
+    // non-zero, and a rebuild on top of it would report evidence for a run
+    // the operator is about to be told failed.
+    if rebuild_fts && !knowledge_pass_errored {
+        match khive_pack_knowledge::rebuild_knowledge_fts_indexes(&rt).await {
+            Ok(fts) => knowledge_fts_rebuild = Some(fts_rebuild_report(&fts)),
+            Err(e) => {
+                tracing::error!(error = %e, "knowledge FTS rebuild failed");
+                eprintln!("\nerror: knowledge FTS rebuild failed: {e}");
+                knowledge_pass_errored = true;
+            }
+        }
+    }
+
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let report = ReindexReport {
@@ -793,6 +890,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         notes_processed,
         knowledge_atoms_indexed,
         knowledge_sections_indexed,
+        knowledge_fts_rebuild,
         knowledge_atoms_failed,
         knowledge_pass_errored,
         knowledge_ann_failed,
@@ -808,6 +906,27 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
     print_report(&report, args.human);
     finish(&report, args.best_effort)
+}
+
+/// Parse the `{indexes, elapsed_ms, integrity_ok}` value returned by the
+/// knowledge FTS rebuild into the report shape.
+fn fts_rebuild_report(fts: &serde_json::Value) -> KnowledgeFtsRebuildReport {
+    KnowledgeFtsRebuildReport {
+        indexes: fts
+            .get("indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        elapsed_ms: fts.get("elapsed_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+        integrity_ok: fts
+            .get("integrity_ok")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 /// Decide the process exit from a completed report: `Ok(())` when clean or in
@@ -1251,6 +1370,14 @@ fn render_human_report(report: &ReindexReport) -> String {
     if report.knowledge_ann_failed {
         output.push_str("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)\n");
     }
+    if let Some(fts) = &report.knowledge_fts_rebuild {
+        output.push_str(&format!(
+            "Knowledge FTS rebuild: {} in {}ms, integrity {}\n",
+            fts.indexes.join(", "),
+            fts.elapsed_ms,
+            if fts.integrity_ok { "OK" } else { "FAILED" }
+        ));
+    }
     if !report.models_used.is_empty() {
         output.push_str(&format!("Models: {}\n", report.models_used.join(", ")));
     }
@@ -1289,6 +1416,62 @@ mod tests {
         let path = dir.join("empty-khive-config.toml");
         std::fs::write(&path, "").expect("write isolated empty config");
         path
+    }
+
+    fn write_declared_backend_test_config(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main.db");
+        let knowledge = dir.join("knowledge.db");
+        let config = dir.join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "knowledge"
+kind = "sqlite"
+path = "{}"
+"#,
+                main.display(),
+                knowledge.display(),
+            ),
+        )
+        .expect("write declared-backend config");
+        (config, main, knowledge)
+    }
+
+    /// One writable `main` backend plus one `read_only = true` `archive`
+    /// backend, so a reindex validator test can assert the read-only path is
+    /// refused while the writable path (the control) still passes.
+    fn write_read_only_backend_test_config(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main.db");
+        let archive = dir.join("archive.db");
+        let config = dir.join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+read_only = true
+"#,
+                main.display(),
+                archive.display(),
+            ),
+        )
+        .expect("write read-only-backend config");
+        (config, main, archive)
     }
 
     #[test]
@@ -1779,6 +1962,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: Some(0),
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
             knowledge_ann_failed: false,
@@ -1867,6 +2051,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: Some(10),
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: true,
@@ -1900,6 +2085,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: Some(0),
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,
@@ -1944,6 +2130,30 @@ mod tests {
         assert!(decide_result(false, true).is_ok());
     }
 
+    #[test]
+    fn rebuild_fts_conflicts_with_no_knowledge() {
+        // The rebuild lives inside the knowledge pass; skipping that pass
+        // while asking for the rebuild must be refused at parse time instead
+        // of accepted and ignored.
+        let err = ReindexArgs::try_parse_from(["reindex", "--rebuild-fts", "--no-knowledge"])
+            .expect_err("--rebuild-fts with --no-knowledge must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let ok = ReindexArgs::try_parse_from(["reindex", "--rebuild-fts"])
+            .expect("--rebuild-fts alone parses");
+        assert!(ok.rebuild_fts);
+    }
+
+    #[test]
+    fn rebuild_fts_is_off_unless_requested() {
+        // The FTS indexes are global while every run targets one namespace,
+        // so no run shape implies the rebuild: only the explicit flag does.
+        let default_run = ReindexArgs::try_parse_from(["reindex"]).expect("bare reindex parses");
+        assert!(!default_run.rebuild_fts);
+        let keep_existing_run = ReindexArgs::try_parse_from(["reindex", "--keep-existing"])
+            .expect("keep-existing run parses");
+        assert!(!keep_existing_run.rebuild_fts);
+    }
+
     // DB resolution parity with `kkernel exec` / `kkernel mcp`. The shared
     // helper is unit-tested in `dbpath`; here we assert reindex consumes it
     // through clap (`--db` / `KHIVE_DB` / `:memory:`) the same way.
@@ -1963,6 +2173,259 @@ mod tests {
     #[test]
     fn db_absent_leaves_default() {
         assert_eq!(resolve_db_override(None), None);
+    }
+
+    #[test]
+    #[serial]
+    fn declared_backends_require_an_explicit_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, _) = write_declared_backend_test_config(dir.path());
+
+        let error = validate_declared_reindex_target(None, Some(&config))
+            .expect_err("a topology-backed reindex without a target must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("requires an explicit persistent --db / KHIVE_DB target"));
+        assert!(message.contains(&config.display().to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn declared_secondary_backend_is_a_valid_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, knowledge) = write_declared_backend_test_config(dir.path());
+
+        validate_declared_reindex_target(knowledge.to_str(), Some(&config))
+            .expect("reindex may target any explicitly declared SQLite backend");
+    }
+
+    #[test]
+    #[serial]
+    fn undeclared_reindex_target_is_rejected_with_config_source() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, _, _) = write_declared_backend_test_config(dir.path());
+        let wrong = dir.path().join("typo.db");
+
+        let error = validate_declared_reindex_target(wrong.to_str(), Some(&config))
+            .expect_err("an undeclared target must never be reindexed");
+        let message = error.to_string();
+        assert!(message.contains("is not a path declared in [[backends]]"));
+        assert!(message.contains(&config.display().to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn read_only_declared_backend_is_refused_as_reindex_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, main, archive) = write_read_only_backend_test_config(dir.path());
+
+        // Expected before the fix: the read-only path passes the validator,
+        // since it only matched declared paths and never inspected
+        // `read_only` — reindex always writes, so that is wrong.
+        let error = validate_declared_reindex_target(archive.to_str(), Some(&config))
+            .expect_err("a backend declared read_only must never be reindexed");
+        let message = error.to_string();
+        assert!(message.contains(&archive.display().to_string()));
+        assert!(message.contains("read_only"));
+
+        // Control: the writable backend in the same config still passes.
+        validate_declared_reindex_target(main.to_str(), Some(&config))
+            .expect("a writable declared backend remains a valid reindex target");
+
+        // Control: an undeclared path is still refused as before.
+        let wrong = dir.path().join("typo.db");
+        validate_declared_reindex_target(wrong.to_str(), Some(&config))
+            .expect_err("an undeclared target must never be reindexed");
+    }
+
+    #[test]
+    #[serial]
+    fn single_backend_reindex_keeps_ordinary_db_override_behavior() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = write_empty_test_config(dir.path());
+        let target = dir.path().join("ordinary.db");
+
+        let validated = validate_declared_reindex_target(target.to_str(), Some(&config))
+            .expect("without [[backends]], --db remains an ordinary target");
+        assert!(
+            validated.is_none(),
+            "no [[backends]] declared: there is no validated identity to bind, so the \
+             ordinary single-backend --db path must be used unchanged"
+        );
+    }
+
+    /// Build the same `RuntimeConfig` `run_reindex` would resolve for `db`, so
+    /// the tests below drive `open_validated_reindex_backend` (the actual open
+    /// path) without running a full reindex.
+    fn resolve_reindex_test_config(
+        db: Option<&str>,
+        config: &std::path::Path,
+    ) -> khive_runtime::RuntimeConfig {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db,
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve reindex runtime config")
+    }
+
+    #[test]
+    #[serial]
+    fn nothing_changed_between_validation_and_open_succeeds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                a_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(a_db.to_str(), Some(&config))
+            .expect("a.db is the declared main backend")
+            .expect("backends declared: a validated target must be returned");
+
+        let cfg = resolve_reindex_test_config(a_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("an unchanged declared target must open normally (control)");
+    }
+
+    #[test]
+    #[serial]
+    fn declared_secondary_backend_open_targets_its_own_file_not_main() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (config, main_db, knowledge_db) = write_declared_backend_test_config(dir.path());
+
+        let validated = validate_declared_reindex_target(knowledge_db.to_str(), Some(&config))
+            .expect("knowledge.db is a declared secondary backend")
+            .expect("backends declared: a validated target must be returned");
+        assert_eq!(
+            validated.path.file_name(),
+            knowledge_db.file_name(),
+            "the validated target must be knowledge.db, not main.db"
+        );
+
+        let cfg = resolve_reindex_test_config(knowledge_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("declared secondary backend must open");
+
+        assert!(
+            knowledge_db.exists(),
+            "reindex must create/open the targeted secondary backend"
+        );
+        assert!(
+            !main_db.exists(),
+            "no override normalization on the reindex path may redirect the secondary \
+             target to main (control)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn symlink_retargeted_after_validation_does_not_redirect_the_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let b_db = dir.path().join("b.db");
+        let link_db = dir.path().join("link.db");
+        std::fs::write(&a_db, b"").expect("create a.db");
+        std::os::unix::fs::symlink(&a_db, &link_db).expect("create symlink");
+
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                link_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(link_db.to_str(), Some(&config))
+            .expect("link.db resolves through the symlink to the declared backend")
+            .expect("backends declared: a validated target must be returned");
+        assert_eq!(
+            validated.path,
+            a_db.canonicalize().expect("canonicalize a.db"),
+            "validation must resolve the symlink to a.db's own canonical path"
+        );
+
+        // Attacker retargets the symlink to an undeclared file after
+        // validation, before anything opens it.
+        std::fs::remove_file(&link_db).expect("remove symlink");
+        std::os::unix::fs::symlink(&b_db, &link_db).expect("retarget symlink");
+
+        // Expected before the fix: `run_reindex` resolved `cfg.db_path` from
+        // the RAW `--db` string alone (tilde-expansion only, never
+        // canonicalized), so `KhiveRuntime::new` opened straight through
+        // `link.db` and the OS followed its CURRENT target — this
+        // demonstrates that pre-fix behavior directly, since
+        // `open_validated_reindex_backend` did not exist before this fix.
+        let pre_fix_cfg = resolve_reindex_test_config(link_db.to_str(), &config);
+        KhiveRuntime::new(pre_fix_cfg)
+            .expect("red before the fix: the retargeted symlink opens without complaint");
+        assert!(
+            b_db.exists(),
+            "red before the fix: resolving the raw --db string at open time follows the \
+             retargeted symlink and creates the undeclared b.db"
+        );
+        std::fs::remove_file(&b_db).expect("reset the undeclared file for the fixed path");
+
+        // Fixed path: the open is pinned to the canonical path validation
+        // observed, so the retargeted symlink has no effect.
+        let cfg = resolve_reindex_test_config(link_db.to_str(), &config);
+        open_validated_reindex_backend(cfg, Some(&validated))
+            .expect("open the declared backend through its validated identity");
+        assert!(
+            !b_db.exists(),
+            "the retargeted undeclared file must never be touched"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn file_replaced_in_place_after_validation_is_refused_at_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_db = dir.path().join("a.db");
+        let other_db = dir.path().join("other.db");
+        std::fs::write(&a_db, b"declared backend").expect("create a.db");
+        std::fs::write(&other_db, b"a different file entirely").expect("create other.db");
+
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = \"{}\"\n",
+                a_db.display()
+            ),
+        )
+        .expect("write config");
+
+        let validated = validate_declared_reindex_target(a_db.to_str(), Some(&config))
+            .expect("a.db is the declared main backend")
+            .expect("backends declared: a validated target must be returned");
+
+        // Same path string, different underlying file: replace a.db in place
+        // between validation and open. The pre-fix validator only ever
+        // compared canonicalized path STRINGS, never filesystem identity, so
+        // this is the arm that proves the check binds to identity, not to
+        // the string that survived the rename.
+        std::fs::rename(&other_db, &a_db).expect("swap a.db's contents in place");
+
+        let cfg = resolve_reindex_test_config(a_db.to_str(), &config);
+        let error = open_validated_reindex_backend(cfg, Some(&validated))
+            .map(|_| ())
+            .expect_err("a file swapped in place after validation must be refused, not opened");
+        let message = error.to_string();
+        assert!(message.contains("changed identity between validation and open"));
+        assert!(message.contains(&a_db.display().to_string()));
     }
 
     #[test]
@@ -2236,6 +2699,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,
@@ -2469,6 +2933,7 @@ mod tests {
             best_effort: true,
             no_sections: false,
             sections_only: false,
+            rebuild_fts: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2746,6 +3211,7 @@ mod tests {
             best_effort: true,
             no_sections: false,
             sections_only: false,
+            rebuild_fts: false,
             human: false,
         };
         run_reindex(args).await.expect("run_reindex must succeed");
@@ -2779,6 +3245,186 @@ mod tests {
         assert_eq!(
             count, 3,
             "run_reindex must populate entity FTS even when no embedding model is configured"
+        );
+    }
+
+    /// Seeds one knowledge atom and deliberately desynchronizes `fts_knowledge`
+    /// against it (same technique as the pack-level FTS-repair regression),
+    /// so a caller can observe whether a later `run_reindex` call repaired it.
+    async fn seed_desynced_knowledge_fts(db_path: &str, config: &std::path::Path) {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db_path),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for seed");
+        let rt = KhiveRuntime::new(cfg).expect("seed runtime");
+        let mut writer = rt.sql().writer().await.expect("knowledge writer");
+        writer
+            .execute_batch(vec![
+                SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms \
+                          (id, namespace, slug, name, content, created_at, updated_at) \
+                          VALUES ('9de50000-0000-4000-8000-000000000001', 'local', \
+                                  'reindex-fts-scope', 'Reindex FTS Scope', \
+                                  'scopeable lexical atom document', 1, 1)"
+                        .into(),
+                    params: vec![],
+                    label: Some("test.reindex_fts_scope.atom".into()),
+                },
+                SqlStatement {
+                    sql: "INSERT INTO fts_knowledge \
+                          (fts_knowledge, rowid, id, namespace, slug, name, content) \
+                          SELECT 'delete', rowid, id, namespace, slug, name, content \
+                          FROM knowledge_atoms \
+                          WHERE id = '9de50000-0000-4000-8000-000000000001'"
+                        .into(),
+                    params: vec![],
+                    label: Some("test.reindex_fts_scope.desync".into()),
+                },
+            ])
+            .await
+            .expect("seed and desynchronize fts_knowledge");
+    }
+
+    /// True once `fts_knowledge` again matches the seeded atom's content —
+    /// i.e. the desync `seed_desynced_knowledge_fts` created was repaired.
+    async fn knowledge_fts_repaired(db_path: &str, config: &std::path::Path) -> bool {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db_path),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config for verify");
+        let rt = KhiveRuntime::new(cfg).expect("verify runtime");
+        let mut reader = rt.sql().reader().await.expect("knowledge reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT count(*) AS n FROM fts_knowledge \
+                      WHERE fts_knowledge MATCH 'scopeable'"
+                    .into(),
+                params: vec![],
+                label: Some("test.reindex_fts_scope.verify".into()),
+            })
+            .await
+            .expect("query fts_knowledge")
+            .expect("count row");
+        matches!(row.get("n"), Some(SqlValue::Integer(1)))
+    }
+
+    // Regression for the FTS-rebuild scoping fix: an explicit `--namespace`
+    // makes the run scoped, and `fts_knowledge`/`fts_sections` are global —
+    // rebuilding them on a scoped run is exactly the wasted writer work this
+    // fix removes. Before the fix, `rebuild_fts` was unconditionally `true`
+    // and this desync would have been repaired regardless of scope.
+    #[tokio::test]
+    async fn run_reindex_scoped_run_does_not_rebuild_fts() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
+
+        seed_desynced_knowledge_fts(&db_path, &config).await;
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: Some(config.clone()),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: Some("local".to_string()), // explicit → scoped run
+            knowledge_only: false,
+            no_knowledge: false,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        assert!(
+            !knowledge_fts_repaired(&db_path, &config).await,
+            "a namespace-scoped run must NOT rebuild the global knowledge FTS indexes"
+        );
+    }
+
+    // Companion to the scoped-run test above: a run with no explicit
+    // --namespace still targets one namespace (the configured one), so it
+    // does not imply the global rebuild either. Only the flag does.
+    #[tokio::test]
+    async fn run_reindex_without_the_flag_does_not_rebuild_fts() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
+
+        seed_desynced_knowledge_fts(&db_path, &config).await;
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: Some(config.clone()),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: None, // omitted namespace resolves to the configured one
+            knowledge_only: false,
+            no_knowledge: false,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        assert!(
+            !knowledge_fts_repaired(&db_path, &config).await,
+            "a run without --rebuild-fts must not rebuild the global knowledge FTS indexes"
+        );
+    }
+
+    // The explicit flag routes through the operator entry point and repairs
+    // the desync end to end.
+    #[tokio::test]
+    async fn run_reindex_with_the_flag_rebuilds_fts() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("utf8 path").to_string();
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let config = write_empty_test_config(config_dir.path());
+
+        seed_desynced_knowledge_fts(&db_path, &config).await;
+
+        let args = ReindexArgs {
+            db: Some(db_path.clone()),
+            config: Some(config.clone()),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: None,
+            knowledge_only: false,
+            no_knowledge: false,
+            best_effort: true,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: true,
+            human: false,
+        };
+        run_reindex(args).await.expect("run_reindex must succeed");
+
+        assert!(
+            knowledge_fts_repaired(&db_path, &config).await,
+            "--rebuild-fts must rebuild and repair the global knowledge FTS indexes"
         );
     }
 
@@ -2833,6 +3479,7 @@ mod tests {
             notes_processed: 0,
             knowledge_atoms_indexed: None,
             knowledge_sections_indexed: None,
+            knowledge_fts_rebuild: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: false,

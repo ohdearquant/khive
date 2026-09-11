@@ -1,4 +1,4 @@
-//! Regression coverage for issue #1758's `knowledge.import` integrity slice.
+//! Regression coverage for `knowledge.import` identity and integrity (#1758, #1984).
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
@@ -131,6 +131,232 @@ async fn directory_import_uses_root_relative_slugs_and_provenance() {
         assert_eq!(atom["properties"]["source_path"], source_path);
         assert_eq!(atom["source_uri"], format!("file:{source_path}"));
     }
+}
+
+#[tokio::test]
+async fn frontmatter_id_maps_metadata_and_strips_body_in_atom_mode() {
+    let f = fixture();
+    let root = TempDir::new().expect("temp root");
+    let body = "# Body Heading\n\nThis body contains the searchable prose that should be indexed without YAML metadata syntax while retaining enough meaningful words for deterministic atom validation and retrieval behavior.\n";
+    let source = format!(
+        "---\nid: Canonical.Doc-42\nname: Frontmatter Name\ntags:\n  - retrieval\n  - ingestion\nproperties:\n  category: procedure\n  revision: 2\nowner: research\n---\n{body}"
+    );
+    let path = root.path().join("fallback-name.md");
+    std::fs::write(&path, source).expect("frontmatter markdown");
+
+    let response = f
+        .dispatch(
+            "knowledge.import",
+            json!({
+                "path": path.to_str().expect("utf-8 path"),
+                "chunk_strategy": "atom"
+            }),
+        )
+        .await
+        .expect("frontmatter import");
+    assert_eq!(response["imported_atoms"], 1);
+
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "canonical-doc-42" }))
+        .await
+        .expect("canonical atom");
+    assert_eq!(atom["slug"], "canonical-doc-42");
+    assert_eq!(atom["name"], "Frontmatter Name");
+    assert_eq!(atom["content"], body);
+    assert_eq!(atom["tags"], json!(["retrieval", "ingestion"]));
+    assert_eq!(atom["properties"]["category"], "procedure");
+    assert_eq!(atom["properties"]["revision"], 2);
+    assert_eq!(atom["properties"]["owner"], "research");
+    assert_eq!(atom["properties"]["source_path"], "fallback-name.md");
+    assert_eq!(atom["properties"]["atlas_id"], "Canonical.Doc-42");
+    assert_eq!(atom["source_uri"], "atlas:Canonical.Doc-42");
+}
+
+#[tokio::test]
+async fn frontmatter_canonical_id_updates_existing_slug_and_reimports_idempotently() {
+    let f = fixture();
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "canonical-doc-42",
+            "name": "Existing Atom",
+            "content": "existing dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "properties": {"atlas_id": "Canonical.Doc-42"},
+            "source_uri": "atlas:Canonical.Doc-42",
+            "source_type": "manual",
+            "finalized": true
+        }] }),
+    )
+    .await
+    .expect("seed canonical atom");
+    let original = f
+        .dispatch("knowledge.get", json!({ "id": "canonical-doc-42" }))
+        .await
+        .expect("seed read");
+
+    let root = TempDir::new().expect("temp root");
+    let path = root.path().join("different-filename.md");
+    let first_body = "# Imported Name\n\nThis first imported body contains enough useful prose to update the existing canonical atom without creating a second identity or losing deterministic source provenance.\n";
+    std::fs::write(
+        &path,
+        format!("---\nid: Canonical.Doc-42\nname: Imported Name\n---\n{first_body}"),
+    )
+    .expect("first source");
+    f.dispatch(
+        "knowledge.import",
+        json!({
+            "path": path.to_str().expect("utf-8 path"),
+            "chunk_strategy": "atom"
+        }),
+    )
+    .await
+    .expect("update existing canonical atom");
+
+    let updated = f
+        .dispatch("knowledge.get", json!({ "id": "canonical-doc-42" }))
+        .await
+        .expect("updated read");
+    assert_eq!(updated["id"], original["id"]);
+    assert_eq!(updated["name"], "Imported Name");
+    assert_eq!(updated["content"], first_body);
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        1
+    );
+
+    let second_body = "# Imported Name V2\n\nThis second imported body proves a repeated canonical import updates the same atom identifier and leaves exactly one durable corpus row after completion.\n";
+    std::fs::write(
+        &path,
+        format!("---\nid: Canonical.Doc-42\nname: Imported Name V2\n---\n{second_body}"),
+    )
+    .expect("second source");
+    f.dispatch(
+        "knowledge.import",
+        json!({
+            "path": path.to_str().expect("utf-8 path"),
+            "chunk_strategy": "atom"
+        }),
+    )
+    .await
+    .expect("repeat canonical import");
+    let repeated = f
+        .dispatch("knowledge.get", json!({ "id": "canonical-doc-42" }))
+        .await
+        .expect("repeat read");
+    assert_eq!(repeated["id"], original["id"]);
+    assert_eq!(repeated["content"], second_body);
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn canonical_identity_collision_is_rejected_before_any_write() {
+    let f = fixture();
+    let root = TempDir::new().expect("temp root");
+    for (directory, filename) in [("alpha", "one.md"), ("beta", "two.md")] {
+        let nested = root.path().join(directory);
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(
+            nested.join(filename),
+            format!("---\nid: Shared.Canonical-ID\n---\n{}", markdown(directory)),
+        )
+        .expect("canonical collision source");
+    }
+
+    let error = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": root.path().to_str().expect("utf-8 root") }),
+        )
+        .await
+        .expect_err("canonical collision must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("normalized slug collision"), "{message}");
+    assert!(message.contains("alpha/one.md"), "{message}");
+    assert!(message.contains("beta/two.md"), "{message}");
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        0,
+        "canonical collision validation must precede every write"
+    );
+}
+
+#[tokio::test]
+async fn malformed_frontmatter_is_rejected_before_any_write() {
+    let f = fixture();
+    let root = TempDir::new().expect("temp root");
+    std::fs::write(root.path().join("a-valid.md"), markdown("Valid First")).expect("valid source");
+    std::fs::write(
+        root.path().join("z-invalid.md"),
+        "---\nid: unterminated-frontmatter\n# This never closes\n\nThe remaining source has enough words to pass ordinary atom validation but must fail frontmatter preflight before any earlier document is written to storage.\n",
+    )
+    .expect("invalid source");
+
+    let error = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": root.path().to_str().expect("utf-8 root") }),
+        )
+        .await
+        .expect_err("unterminated frontmatter must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("frontmatter"), "{message}");
+    assert!(message.contains("z-invalid.md"), "{message}");
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        0,
+        "frontmatter parsing must finish before the first write"
+    );
+}
+
+#[tokio::test]
+async fn existing_identity_on_a_different_slug_is_refused_without_duplicate() {
+    let f = fixture();
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "legacy-slug",
+            "name": "Legacy Canonical Atom",
+            "content": "existing dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+            "properties": {"atlas_id": "Canonical.Doc-42"},
+            "source_uri": "atlas:Canonical.Doc-42",
+            "source_type": "manual",
+            "finalized": true
+        }] }),
+    )
+    .await
+    .expect("seed legacy identity");
+
+    let root = TempDir::new().expect("temp root");
+    let path = root.path().join("canonical.md");
+    std::fs::write(
+        &path,
+        "---\nid: Canonical.Doc-42\n---\n# Canonical\n\nThis body contains enough meaningful prose for import validation while exercising duplicate prevention against a differently slugged existing canonical identity.\n",
+    )
+    .expect("canonical source");
+
+    let error = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": path.to_str().expect("utf-8 path") }),
+        )
+        .await
+        .expect_err("ambiguous existing identity must be refused");
+    let message = error.to_string();
+    assert!(message.contains("legacy-slug"), "{message}");
+    assert!(message.contains("canonical-doc-42"), "{message}");
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+            .await,
+        1,
+        "refusal must not create a near-duplicate"
+    );
 }
 
 #[tokio::test]
