@@ -1255,8 +1255,11 @@ async fn validate_read_target(
         .and_then(Value::as_str)
     {
         if to_actor != caller_actor {
+            // The resolved uuid stays out of this message: a caller who asked by
+            // 8-char prefix would otherwise learn both that a message exists and
+            // its full id from a refusal (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "read: message {id} is not addressed to caller actor {caller_actor:?}"
+                "read: that message is not addressed to caller actor {caller_actor:?}"
             )));
         }
     } else {
@@ -1538,8 +1541,11 @@ pub(crate) async fn handle_reply(
         let is_participant = original_from_actor.as_deref() == Some(caller_actor)
             || original_to_actor.as_deref() == Some(caller_actor);
         if !is_participant {
+            // Same non-disclosure rule as `read` above: the refusal names the
+            // caller's own actor and nothing the caller did not already supply
+            // (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "reply: message {id} is not addressed to or from caller actor {caller_actor:?}"
+                "reply: that message is not addressed to or from caller actor {caller_actor:?}"
             )));
         }
     } else {
