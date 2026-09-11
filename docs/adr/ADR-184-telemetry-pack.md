@@ -155,9 +155,13 @@ proposal. There is no window to fall out of, so a `gap: true` would be read by e
 resumed too late" when the only thing it could mean is "some kinds are never stored". Keeping the
 name and changing the meaning is worse than changing the name.
 
-`telemetry.read` returns **`coverage`** instead: the list of requested kinds whose configured carrier
-is `ephemeral` and which therefore have no stored rows, alongside the durable kinds the result covers
-in full. An empty `coverage.ephemeral` list means the result is complete for everything asked for.
+`telemetry.read` returns **`coverage`** instead, carrying two facts with each labelled for what it
+is: the window the read covered and the durable kinds the result covers in full, and separately the
+requested kinds whose carrier is `ephemeral` in the configuration in force at read time. That second
+list is a statement about configuration and never about the rows. A kind made ephemeral after its
+rows were already stored is named there and still has those rows returned by the same read, which is
+why the list cannot be computed by asking which kinds came back empty. An empty `coverage.ephemeral`
+list means every requested kind is durable under the current table.
 The reader learns the shape of what it cannot see, which is the property the original `gap` flag was
 reaching for.
 
@@ -224,7 +228,9 @@ is not a finding.
    through it reproduces the classification decision that `emit` made for both a classified and an
    unclassified kind.
 10. `telemetry.read` over a mixed request returns `coverage.ephemeral` naming exactly the requested
-    ephemeral kinds, and an all-durable request returns an empty `coverage.ephemeral` as the control.
+    kinds whose carrier is ephemeral in the configuration in force at read time, and an all-durable
+    request returns an empty `coverage.ephemeral` as the control. Arm 20 carries the half that
+    separates this from "the kinds that came back empty", and both are required.
 11. `telemetry.counts` over a stream being appended to concurrently returns a total consistent with a
     single pinned head: the same window counted twice across an append returns the pinned total, and
     a re-read after the pin is released reflects the new row.
