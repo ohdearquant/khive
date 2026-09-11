@@ -63,6 +63,9 @@ pub struct SecretMatch {
     pub trigger: Option<&'static str>,
     /// `first6...N` — the first 6 chars of the match followed by the total length.
     pub masked: String,
+    /// Which record and field the match came from, when the caller scanned a
+    /// batch. `None` for a single-record scan, where the caller already knows.
+    pub location: Option<String>,
 }
 
 impl std::fmt::Display for SecretMatch {
@@ -70,6 +73,9 @@ impl std::fmt::Display for SecretMatch {
         write!(f, "content matches secret pattern {}", self.detector)?;
         if let Some(trigger) = self.trigger {
             write!(f, " near '{trigger}'")?;
+        }
+        if let Some(location) = &self.location {
+            write!(f, " in {location}")?;
         }
         write!(f, ". {}", block_guidance(self.detector))
     }
@@ -131,6 +137,24 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
         check(tag)?;
     }
     Ok(())
+}
+
+/// Name the record and field a batch-loop refusal came from.
+///
+/// A batch verb scans each record and returns on the first refusal, so the
+/// caller gets ONE error for N records. Without this the error names only the
+/// matched text, which by construction is text the caller cannot find: it sits
+/// in whichever sibling record refused, and every other record in the call is
+/// rejected with it (khive #2605). Pass through anything that is not a gate
+/// refusal unchanged — this adds identity, it does not reclassify.
+pub fn locate<T>(result: RuntimeResult<T>, record: &str, field: &str) -> RuntimeResult<T> {
+    result.map_err(|error| match error {
+        RuntimeError::SecretDetected(matched) => RuntimeError::SecretDetected(SecretMatch {
+            location: Some(format!("{record}.{field}")),
+            ..matched
+        }),
+        other => other,
+    })
 }
 
 // ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
@@ -2499,6 +2523,7 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
         detector,
         trigger: None,
         masked,
+        location: None,
     }
 }
 

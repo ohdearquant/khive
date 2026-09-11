@@ -1032,11 +1032,13 @@ mod channel_ingest_failure_class_tests {
             detector: "fixture",
             trigger: None,
             masked: "first-rendering".to_string(),
+            location: None,
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
             trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
+            location: None,
         });
 
         assert_ne!(first.to_string(), second.to_string());

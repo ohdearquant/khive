@@ -268,24 +268,26 @@ impl KnowledgeHandlers {
             };
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
-            // before any reader/writer is acquired.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&atom_in.name)?;
-            khive_runtime::secret_gate::check(&content)?;
+            // before any reader/writer is acquired. Every refusal is located to the
+            // atom that produced it: this loop returns ONE error for the whole batch,
+            // and the matched text is by construction text the caller cannot place
+            // without being told which atom it came from (#2605).
+            use khive_runtime::secret_gate::{self, locate};
+            locate(secret_gate::check(&slug), &slug, "slug")?;
+            locate(secret_gate::check(&atom_in.name), &slug, "name")?;
+            locate(secret_gate::check(&content), &slug, "content")?;
             if let Some(ref tags_vec) = atom_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
+                locate(secret_gate::check_tags(tags_vec), &slug, "tags")?;
             }
             if let Some(ref props) = atom_in.properties {
-                khive_runtime::secret_gate::check_json(props)?;
+                locate(secret_gate::check_json(props), &slug, "properties")?;
             }
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
-                atom_in.properties.as_ref(),
-            )?;
+            secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
             if let Some(Some(uri)) = &atom_in.source_uri {
-                khive_runtime::secret_gate::check(uri)?;
+                locate(secret_gate::check(uri), &slug, "source_uri")?;
             }
             if let Some(Some(st)) = &atom_in.source_type {
-                khive_runtime::secret_gate::check(st)?;
+                locate(secret_gate::check(st), &slug, "source_type")?;
             }
         }
 

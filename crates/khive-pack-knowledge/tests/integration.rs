@@ -4035,6 +4035,48 @@ fn is_secret_detected(err: &RuntimeError) -> bool {
     matches!(err, RuntimeError::SecretDetected(_))
 }
 
+/// A batch refusal names the atom it came from. Without this the caller holds N
+/// atoms and one error describing text that lives in whichever sibling refused,
+/// so a clean atom and a refusing one are indistinguishable in the response
+/// (#2605).
+#[tokio::test]
+async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
+    let f = pack(rt());
+    let result = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [
+                    {
+                        "slug": "clean-sibling-atom",
+                        "name": "Clean Sibling",
+                        "content": "This atom carries ordinary prose about retrieval augmented generation and contains nothing credential shaped anywhere in it.",
+                    },
+                    {
+                        "slug": "atom-carrying-the-credential",
+                        "name": "Offending Atom",
+                        "content": "deploy token ghp_FakeGitHubToken0000000000000000000", // gitleaks:allow
+                    },
+                ]
+            }),
+        )
+        .await;
+    let err = result.expect_err("a credential in the second atom must refuse the call");
+    assert!(
+        is_secret_detected(&err),
+        "the refusal must stay classified as a secret detection; got: {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("atom-carrying-the-credential"),
+        "the refusal must name the atom that produced it; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("clean-sibling-atom"),
+        "the refusal must not name a bystander atom; got: {rendered}"
+    );
+}
+
 /// knowledge.upsert_domains with a credential-shaped slug must be rejected.
 #[tokio::test]
 async fn upsert_domains_blocks_secret_in_slug_insert() {
