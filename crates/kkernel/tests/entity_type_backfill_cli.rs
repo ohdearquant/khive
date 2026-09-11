@@ -143,26 +143,20 @@ impl Fixture {
             .pool()
             .reader()
             .expect("fixture reader");
-        let mut statement = reader
-            .prepare(
-                "SELECT id, json_object( \
+        let encoded = reader
+            .query_row(
+                "SELECT json_group_object(id, json(snapshot)) FROM ( \
+                 SELECT id, json_object( \
                  'namespace', namespace, 'kind', kind, 'entity_type', entity_type, \
                  'name', name, 'description', description, 'properties', json(properties), \
                  'tags', json(tags), 'created_at', created_at, 'updated_at', updated_at, \
-                 'deleted_at', deleted_at, 'merged_into', merged_into, 'merge_event_id', merge_event_id) \
-                 FROM entities ORDER BY id",
+                 'deleted_at', deleted_at, 'merged_into', merged_into, 'merge_event_id', merge_event_id) AS snapshot \
+                 FROM entities ORDER BY id)",
+                [],
+                |row| row.get::<_, String>(0),
             )
-            .expect("prepare exact entity snapshot");
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
             .expect("query exact entity snapshot");
-        rows.map(|row| {
-            let (id, encoded) = row.expect("entity row");
-            (id, serde_json::from_str(&encoded).expect("entity JSON"))
-        })
-        .collect()
+        serde_json::from_str(&encoded).expect("entity snapshot JSON")
     }
 
     fn freeze_sidecars(&self) -> Vec<(PathBuf, std::fs::Permissions)> {
@@ -509,6 +503,7 @@ fn entity_type_backfill_routes_only_to_the_configured_kg_backend() {
     for route in ["main", "other"] {
         let main = Fixture::new();
         let other = Fixture::new();
+        let logs = tempfile::tempdir().expect("private writer diagnostics");
         let config = main.root.path().join("multi.toml");
         let encoded = toml::to_string(&json!({
             "runtime":{"packs":["kg", "git"]},
@@ -531,6 +526,8 @@ fn entity_type_backfill_routes_only_to_the_configured_kg_backend() {
         let discovery_events = discovery_parent.join("khive.db.events.db");
         assert!(!discovery_parent.exists());
         let output = isolated_command(main.root.path())
+            // Process diagnostics are not discovery or backend database writes.
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", logs.path())
             .env_remove("KHIVE_EVENTS_SPLIT")
             .args(["entity-type-backfill", "--apply", "--config"])
             .arg(&config)
@@ -550,7 +547,8 @@ fn entity_type_backfill_routes_only_to_the_configured_kg_backend() {
         assert_eq!(target.entities()[&id(4)]["entity_type"], "adr");
         assert!(
             !discovery_events.exists() && !discovery_parent.exists(),
-            "default-on events split must not materialize the discovery store ({route})"
+            "default-on events split must not materialize the discovery store ({route}): {:?}",
+            files(main.root.path()).keys().collect::<Vec<_>>()
         );
         for fixture in [&main, &other] {
             assert!(
