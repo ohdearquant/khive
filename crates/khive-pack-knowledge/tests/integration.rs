@@ -4050,12 +4050,12 @@ async fn upsert_atoms_refusal_names_the_offending_atom_not_just_the_text() {
                     {
                         "slug": "clean-sibling-atom",
                         "name": "Clean Sibling",
-                        "content": "This atom carries ordinary prose about retrieval augmented generation and contains nothing credential shaped anywhere in it.",
+                        "content": "This atom carries ordinary prose about retrieval augmented generation and contains nothing credential shaped anywhere in it, only plain words about ranking and recall quality.",
                     },
                     {
                         "slug": "atom-carrying-the-credential",
                         "name": "Offending Atom",
-                        "content": "deploy token ghp_FakeGitHubToken0000000000000000000", // gitleaks:allow
+                        "content": "The deploy token for the staging cluster is ghp_FakeGitHubToken0000000000000000000 and it must be rotated before the next release ships to every tenant.", // gitleaks:allow
                     },
                 ]
             }),
