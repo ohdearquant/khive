@@ -591,3 +591,93 @@ row-absent arms above carry `cause: "absent"`, which is the arm that pins the tw
 mapping under Amendment 9 resolves no actor row and is unaffected by items 1 and 2 beyond the
 repository lookup itself. Mutation expectation: swapping the two resolutions on the remote path
 turns the both-absent arm red without touching any other arm.
+
+## Amendment 11 (2026-09-11): moving a ref to a commit that already exists
+
+**Status**: Proposed.
+
+### The gap
+
+`local_git::update_branch` is already a compare-and-swap ref update: it validates both object ids,
+refuses a symbolic target with `ref_symbolic`, and runs `update-ref --no-deref --create-reflog` with
+the expected old value. Both of its callers fix one side of it. `create_branch_ref` is
+`update_branch` with `expected` pinned to the zero oid, so `git.branch` can only create. `git.commit`
+passes a sha it has just minted from a manifest tree, so the new value is always a commit that did
+not exist a moment ago. `git.branch`'s own `expected` parameter does not close the gap either: it is
+compared against the resolution of `from`, the source commit, not against the destination ref's
+current value.
+
+So no verb in the pack points an existing ref at an already-existing commit, and the primitive that
+would do it safely is already written and tested.
+
+A consumer reaches this the moment a result is published: the commit was made elsewhere, on another
+branch or in another run, and what remains is to move a ref to it if and only if that is a
+fast-forward. Against a local git that is two commands, `merge-base --is-ancestor` and then
+`update-ref`, and between them the ref can move. The swap does catch the move, but it catches it by
+refusing on the value it was told to expect, while the ancestry question was answered about a pair
+that no longer holds. Both questions have to be answered inside one operation, which is why this is
+one verb and not a documented pair of existing ones.
+
+### A11.1 `git.update_ref`
+
+```
+git.update_ref(repo, branch, to, expected, require_fast_forward?, reason?)
+    -> {repo, ref, from, to, fast_forward, receipt_id}
+```
+
+- `expected` is required, 40 lowercase hex, and an explicit null is refused with `invalid_params`.
+  This is the contract `git.commit`'s `expected_head` already states, and it is the whole safety
+  property of the verb: a verb that moves a ref never accepts "whatever is there now".
+- `to` must already resolve, in this repository, to an object of type commit. A ref name, a tag, a
+  tree or an unknown id is `invalid_params`; the zero oid is refused, since deleting a ref is not
+  this verb.
+- `require_fast_forward` defaults to `true`. The ancestry test runs on the resolved object ids inside
+  the same operation and under the same repository write lock the swap takes, so its answer cannot
+  have expired when the swap runs. It is not new machinery: `operation_recorded` in the same file
+  already shells `merge-base --is-ancestor` against resolved oids. A move that is not a fast-forward
+  under the default refuses `non_fast_forward`, the value the push path already uses for the same
+  question.
+- `fast_forward` is returned as a field rather than left for the caller to infer, so a caller that
+  deliberately passed `require_fast_forward: false` still records which kind of move it made.
+- `from` is returned beside `to`, because a receipt naming only the destination cannot be reconciled
+  against the repository afterwards.
+- A destination that is not at `expected` refuses `expected_head_mismatch`, the value `git.commit`
+  uses for the same mismatch; a symbolic destination keeps `ref_symbolic`.
+- `reason` is a free-text operator note recorded on the receipt. It is not the reflog marker, which
+  stays the receipt id.
+- The `[git_write]` allow-list, the branch allow-list within it, and the Gate apply exactly as they do
+  to the other write verbs. `tool.check` is consulted on `git.update_ref` before the repository is
+  touched, as Amendment 4 requires of every write verb.
+- The receipt settles the way `git.branch` and `git.commit` receipts settle. `update_branch_sync`
+  already writes the marker into the reflog, so `git.reconcile`'s `operation_recorded` path works
+  unchanged once this verb is added to the two-verb match that guards it. That match is the one place
+  where forgetting this verb fails silently rather than loudly.
+
+### Acceptance
+
+1. **The move.** A ref at A, a commit B that already exists with A as an ancestor, `expected: A` and
+   `to: B`: the ref reads B afterwards, the result carries `from: A`, `to: B`, `fast_forward: true`,
+   and `git.reconcile` finds the operation by its marker. Control: the same call against a ref that
+   has moved to C in between refuses `expected_head_mismatch` and the ref still reads C.
+2. **Ancestry inside the operation.** B not a descendant of A refuses `non_fast_forward` with nothing
+   written; the same call with `require_fast_forward: false` commits and returns
+   `fast_forward: false`. The two arms differ only in that field.
+3. **`expected` is not optional.** Omitted, null, short, upper-case and non-hex each refuse
+   `invalid_params` before the repository is read.
+4. **`to` must be a commit.** A branch name, a tag name, a tree id, an unknown id and the zero oid
+   each refuse `invalid_params`.
+5. **Symbolic destination.** A symref installed at the destination refuses `ref_symbolic` and no ref
+   moves, including the symref's own target.
+6. **Gate and policy.** With `git.update_ref` absent from the use policy the call refuses
+   `policy_denied` with no ref movement; with the repository absent from the allow-list it refuses on
+   the gate, and the refusal carries the table it read as Amendment 10 requires.
+7. **The verb census.** The public verb count is a hard-coded number in several places, the binary
+   smoke test among them. The count moves with this verb or the change is not complete.
+
+Mutation expectation: replacing the in-operation ancestry test with one run before the lock leaves
+every arm above green, because none of them race. The arm that proves the test is inside is arm 1's
+control read at the ref store rather than from the result, paired with a fixture that moves the ref
+between the ancestry answer and the swap; state that arm before running it, since a passing suite
+without it says nothing about the property the verb exists for.
+
+Not in scope: deleting a ref, moving a tag, moving `HEAD`, and any ref outside `refs/heads/`.
