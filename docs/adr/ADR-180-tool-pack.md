@@ -93,3 +93,51 @@ Re-registration does not update properties; pattern matching is prefix only; the
 best effort and reported in `notified`; capability expansion reads up to fifty implementers per
 concept; the grants table is pack-local until the grants primitive exists. These are listed for the
 audit pass, not hidden.
+
+## Amendment 1 (2026-09-10): a grant resolves on the registry row, not on the name
+
+The Approval section keys a grant on `(actor, tool)` where `tool` is the registered name, and the
+`tool_grants` table stores that name as a string. A name is a label whose meaning is supplied by the
+registry row it resolves to, so a grant written that way approves whatever that name means at check
+time rather than what the decider saw. Issue #2547 closed the nearest path to changing a registered
+meaning in place, and #2545 put the resolved registry row on the exec receipt. This
+amendment closes the remaining gap on the decision side.
+
+1. **A granted row pins the object it approved.** `tool.grant` records, on the row it flips, the id
+   of the registry entity the name resolves to at that moment and a digest over that row's policy
+   inputs: `source`, `side_effect`, `trust` and `schema`, canonically serialized. The digest is not
+   over the whole entity: name, description, tags, capabilities and `registered_at` are outside it,
+   so linking a capability or editing a description does not invalidate a grant. `tool.request` does
+   not pin; the request records what was asked for, and only the decision binds.
+
+2. **`tool.check` resolves an active grant by id.** A `granted` row is active when it has not
+   expired, its pinned id equals the id the name resolves to now, and its pinned digest equals the
+   digest of that row now. A row failing either comparison is not active and the resolution
+   continues to policy and then default, exactly as if no grant existed. The answer's `source` stays
+   `grant` only when a grant decided it.
+
+3. **A grant on a name with no registry row is unpinned and ends at first registration.**
+   `tool.check` answers `ask` for an unregistered name, so a request and a grant can both be written
+   before the name exists. Such a row records a null id and a null digest and is active only while
+   the name remains unregistered. The first `tool.register` of that name makes it inactive; it is not
+   silently promoted onto the new row, because nobody approved that row.
+
+4. **Why the pin rather than trusting the refusal.** The registry rows are opaque to the generic
+   entity verbs today, which makes the pinned digest stable in ordinary operation. That is a property
+   of one refusal, not of the grant. The pin states the decision's own assumption, so a later
+   relaxation, a restore from a backup, or a second writer inside the owning pack shows up as a grant
+   that stops being active rather than as a grant that quietly approves something else.
+
+### Acceptance
+
+10. `tool.grant` on a request for a registered name stores the registry id and a non-null digest;
+    `tool.check` then answers `allow` from `grant` with that row id.
+11. With the grant active, updating the row's `description` through the owning pack leaves the
+    decision `allow` from `grant` (the digest excludes description). Changing `side_effect` makes the
+    same check answer from `policy` or `default` instead, and the grant row stays `granted`.
+12. A grant written against an unregistered name answers `allow` from `grant`; registering that name
+    makes the same check answer `ask`, and a second grant against the now-registered row answers
+    `allow` again with the new row id (mutation control: the two grants differ only in the pin).
+13. A `granted` row whose pinned id points at a different registered object is inactive: the check
+    answers from policy or default, and restoring the correct id on that same row answers `allow`
+    from `grant` again.
