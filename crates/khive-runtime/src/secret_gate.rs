@@ -366,8 +366,8 @@ fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
                 let core_len = sub
                     .trim_end_matches(['"', '\'', '`', '}', ']', ')', ',', ';'])
                     .len();
-                let end = start + core_len.max(1);
-                spans.push((start, end));
+                let end = extend_across_invisible_bridge(text, start + core_len.max(1));
+                push_mask_spans(text, start, end, &mut spans);
                 // `scan_from` only returns matches with start >= from, and `end`
                 // is strictly greater than `start`, so `from` strictly advances.
                 from = end;
@@ -376,6 +376,85 @@ fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
         }
     }
     (spans, scan_work_bytes)
+}
+
+/// A character that splits a payload without showing anything: non-ASCII and not
+/// a letter or digit, so U+200B and its neighbours qualify while the letters of a
+/// non-ASCII password do not. The second half of that predicate is load-bearing:
+/// `redis://:密码@host` is ONE credential whose characters are non-ASCII, and a
+/// rule keyed on non-ASCII alone splits it and prints the password between two
+/// redaction markers.
+fn is_invisible_bridge_separator(c: char) -> bool {
+    !c.is_ascii() && !c.is_alphanumeric()
+}
+
+/// Byte offset a redaction must reach when the payload continues past `end`
+/// behind an INVISIBLE separator.
+///
+/// A gap made only of [`is_invisible_bridge_separator`] characters is not something
+/// a person types between a credential and the next word; it is how one payload is
+/// split so each half falls under a detector's length floor. Detection already
+/// reconstructs those chains ([`bridge_fragment_chain`]), but the masker redacted
+/// only the token the scan returned, so the rest of the same payload survived into
+/// stored text. Gaps holding any ASCII character — the ordinary spaces and newlines
+/// between a commit sha and the prose after it — are never walked, so this cannot
+/// eat surrounding text.
+fn extend_across_invisible_bridge(text: &str, end: usize) -> usize {
+    let mut end = end;
+    for _ in 1..MAX_BRIDGE_FRAGMENTS {
+        let rest = &text[end..];
+        let Some(gap_len) = rest.find(|c: char| c.is_ascii_alphanumeric()) else {
+            break;
+        };
+        let gap = &rest[..gap_len];
+        if gap.is_empty() || !gap.chars().all(is_invisible_bridge_separator) {
+            break;
+        }
+        let fragment = &rest[gap_len..];
+        let fragment_len = fragment
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(fragment.len());
+        if fragment_len < MIN_BRIDGE_FRAGMENT_LEN {
+            break;
+        }
+        end += gap_len + fragment_len;
+    }
+    end
+}
+
+/// Push the redaction spans for `text[start..end]`, breaking at
+/// [`is_invisible_bridge_separator`] characters so a separator that joined two
+/// fragments of one payload stays visible instead of being swallowed into a single
+/// marker.
+///
+/// A span holding no such character — every ordinary credential, base64 and JWT
+/// forms included, whose `.` `+` `/` `=` are ASCII, and non-ASCII passwords, whose
+/// letters are alphanumeric — is pushed whole, so this changes nothing for them. A
+/// span that yields no run at all is pushed whole as well: redacting more than
+/// necessary is the safe direction.
+fn push_mask_spans(text: &str, start: usize, end: usize, spans: &mut Vec<(usize, usize)>) {
+    let span = &text[start..end];
+    if !span.chars().any(is_invisible_bridge_separator) {
+        spans.push((start, end));
+        return;
+    }
+    let before = spans.len();
+    let mut run_start: Option<usize> = None;
+    for (offset, ch) in span.char_indices() {
+        if is_invisible_bridge_separator(ch) {
+            if let Some(run) = run_start.take() {
+                spans.push((start + run, start + offset));
+            }
+        } else {
+            run_start.get_or_insert(offset);
+        }
+    }
+    if let Some(run) = run_start {
+        spans.push((start + run, end));
+    }
+    if spans.len() == before {
+        spans.push((start, end));
+    }
 }
 
 /// Maximum characters of raw error text admitted to the masking pass.
