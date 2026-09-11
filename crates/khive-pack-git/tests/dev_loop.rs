@@ -698,7 +698,14 @@ async fn arm15_overrides_and_unmapped_actor_refuse_before_resolver() {
         }
         if !mapped {
             let error = f.err("git.commit", f.commit_params(&manifest)).await;
-            assert_eq!(f.refusal_receipt(&error).await["reason"], "actor_unmapped");
+            let row = f.refusal_receipt(&error).await;
+            assert_eq!(row["reason"], "actor_unmapped");
+            // The reason alone does not say which table was read, and this verb reads
+            // only the actors one (ADR-182 Amendment 10 item 2).
+            assert_eq!(
+                row["result"]["refusal"],
+                json!({"table":"git_write.actors","key":ACTOR,"cause":"absent"})
+            );
         }
         assert_eq!(f.resolver_count(), 0);
         assert_eq!(f.git_bytes(&["show-ref"]), refs);

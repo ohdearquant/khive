@@ -472,9 +472,13 @@ impl GitPack {
                     return Err(Failure::refused("expected_head_mismatch"));
                 }
                 let config = &self.runtime().config().git_write;
-                let actor = credentials::resolve_actor(config, &receipt.actor)
-                    .await
-                    .map_err(|_| Failure::refused("actor_unmapped"))?;
+                let actor = match credentials::resolve_actor(config, &receipt.actor).await {
+                    Ok(actor) => actor,
+                    Err(_) => {
+                        receipt.result = credentials::actor_refusal(config, &receipt.actor);
+                        return Err(Failure::refused("actor_unmapped"));
+                    }
+                };
                 receipt.credential = json!({"source":"actor", "ref":actor.credential_ref, "platform_identity":actor.platform_identity});
                 receipts::persist(self.runtime(), receipt).await?;
                 let tree = required(params, "tree")?;

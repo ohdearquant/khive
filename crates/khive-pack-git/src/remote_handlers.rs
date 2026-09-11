@@ -214,6 +214,13 @@ fn decode_file_path(path: &str) -> Result<String, Failure> {
     String::from_utf8(decoded).map_err(|_| Failure::refused("remote_scheme"))
 }
 
+/// The refusal payload a `repository_unmapped` receipt carries (ADR-182 Amendment 10).
+/// The reason alone reads as a statement about the allowlist, which is a different
+/// table and is usually the one such a configuration does have.
+fn repository_refusal(path: &str) -> Value {
+    json!({"refusal": {"table": "git_write.repositories", "key": path}})
+}
+
 impl GitPack {
     pub(crate) fn remote_repository(
         &self,
@@ -406,7 +413,12 @@ impl GitPack {
         receipt: &mut Receipt,
     ) -> Result<Value, Failure> {
         let repo = std::path::PathBuf::from(&receipt.repo);
-        let target = self.remote_repository(&repo)?;
+        let repo_key = receipt.repo.clone();
+        let target = self.remote_repository(&repo).inspect_err(|failure| {
+            if failure.reason == "repository_unmapped" {
+                receipt.result = repository_refusal(&repo_key);
+            }
+        })?;
         if target.slug.is_empty() {
             receipt.credential = json!({"source":"none"});
             if verb != "git.push" {
@@ -427,10 +439,14 @@ impl GitPack {
         if target.slug.is_empty() {
             return self.push_exact(None, &target, params, receipt).await;
         }
-        let (identity, secret) =
-            credentials::resolve_remote(&self.runtime().config().git_write, &receipt.actor)
-                .await
-                .map_err(|_| Failure::refused("actor_unmapped"))?;
+        let config = &self.runtime().config().git_write;
+        let (identity, secret) = match credentials::resolve_remote(config, &receipt.actor).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                receipt.result = credentials::actor_refusal(config, &receipt.actor);
+                return Err(Failure::refused("actor_unmapped"));
+            }
+        };
         receipt.credential = json!({"source":"actor", "ref":identity.credential_ref, "platform_identity":identity.platform_identity});
         receipts::persist(self.runtime(), receipt).await?;
         let secret = secret.value();
@@ -882,19 +898,26 @@ impl GitPack {
         if prior.disposition != Disposition::Unknown {
             return Ok(());
         }
-        let target = self.remote_repository(repo)?;
+        let repo_key = prior.repo.clone();
+        let target = self.remote_repository(repo).inspect_err(|failure| {
+            if failure.reason == "repository_unmapped" {
+                prior.result = repository_refusal(&repo_key);
+            }
+        })?;
+        let config = &self.runtime().config().git_write;
         let secret = if target.slug.is_empty() {
             if prior.verb != "git.push" {
                 return Err(Failure::refused("remote_scheme"));
             }
             None
         } else {
-            Some(
-                credentials::resolve_remote(&self.runtime().config().git_write, &prior.actor)
-                    .await
-                    .map_err(|_| Failure::refused("actor_unmapped"))?
-                    .1,
-            )
+            match credentials::resolve_remote(config, &prior.actor).await {
+                Ok(resolved) => Some(resolved.1),
+                Err(_) => {
+                    prior.result = credentials::actor_refusal(config, &prior.actor);
+                    return Err(Failure::refused("actor_unmapped"));
+                }
+            }
         };
         let committed = match prior.verb.as_str() {
             "git.push" => {
