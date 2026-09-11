@@ -256,3 +256,38 @@ This alternative is rejected because leaving message-role, cancellation, cleanup
 ## Open research item
 
 One question remains open rather than decided by this ADR: which externally hosted coding-agent transports satisfy the stripped-transport contract in §2 (native tool execution disabled, model interaction returned to the runtime) without a bespoke per-provider adapter. Owner: this ADR's provider-boundary maintainer. Gate: a published comparison of candidate transports against the stripped-transport contract, before a second externally hosted provider (beyond the first reference implementation) ships in this runtime.
+
+## Amendment: ordinary mounted-tool dispatch (2026-09-08)
+
+This amendment supersedes the §3 Outbound tool-source mounts Naming and Authorization
+claims that a mounted identifier is "not a registered verb" and is "never resolvable
+through ordinary `request` or CLI verb dispatch". A configured `<mount>.<tool>` is a
+`Visibility::Verb` route owned by pack `<mount>`. Ordinary `request(ops)` and `kkernel exec`
+call it under the resolved caller's authorization through the same single gate, audit,
+and operation envelope as native verbs. Registration and re-pin remain operator-only;
+no model-facing verb can register a source or widen its pinned identifier set.
+
+The initial implementation supports stdio subprocesses only. Catalog-entry digests are
+BLAKE3 over recursively key-sorted, whitespace-free JSON containing `name`, `description`,
+`inputSchema`, and `outputSchema`; omitted optional fields are represented as null.
+Effect classes are operator declarations, defaulting to `mutating`. `tools/list` is
+refreshed for each call, and the persisted generation is re-read after that refresh and
+before `tools/call`. Missing or changed definitions deny as catalog drift. Restarting a
+runtime does not silently re-pin an existing catalog. An operator re-pin replaces the
+set, digests and classes and increments the generation in one compare-and-swap transaction
+with its audit row. Discovery and digest computation occur before opening that writer.
+
+Each runtime owns its configured subprocesses, starts them at boot, and permits one
+logged restart. A second death leaves the mount down until the runtime restarts. The
+foreign-operation timeout defaults to 30 seconds and is configurable. Foreign failures
+are ordinary `KhiveError` values classified as `tool_error`, `tool_timeout`, or
+`tool_malformed`, with no raw foreign error payload. Environment configuration contains
+variable names; credential values are neither persisted in the catalog nor logged.
+
+The agent pack is opt-in. Until a provider adapter exists, `agent.spawn` refuses
+`provider_unavailable` before creating a process record. The other agent verbs operate
+on existing process records. This does not implement the agent loop or remote process
+attachments. The existing enrollment gate applies to mounted and native calls alike;
+per-verb grants and peer-class effect allowlists remain dependent on their own policy
+implementation. The pinned effect and generation are included on the ordinary dispatch
+audit row so classification is observable before that policy work lands.

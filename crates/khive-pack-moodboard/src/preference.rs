@@ -29,7 +29,6 @@ pub(crate) const RANDOMIZATION_REVISION: &str = "moodboard-side-v1";
 pub(crate) const PAIR_SPLIT_REVISION: &str = "moodboard-pair-split-v1";
 pub(crate) const TRAINING_REVISION: &str = "moodboard-logistic-bce-l2-v1";
 pub(crate) const MODEL_FAMILY: &str = "pairwise_zero_intercept_logistic";
-pub(crate) const FANN_CRATE_VERSION: &str = "0.9.0";
 pub(crate) const FANN_FORMAT: &str = "FANN binary v1";
 
 pub(crate) const MIN_TRAIN_DECISIVE_GROUPS: usize = 64;
@@ -1086,7 +1085,7 @@ pub(crate) fn train_model(
         test_metrics: test_metrics(data, &probabilities, tie_band_half_width),
         fann: FannProvenance {
             crate_name: "lattice-fann".to_string(),
-            crate_version: FANN_CRATE_VERSION.to_string(),
+            crate_version: crate::LATTICE_VERSION.to_string(),
             format: FANN_FORMAT.to_string(),
             architecture: format!("{FEATURE_COUNT}->1 linear; zero intercept"),
             network_content_ref: String::new(),
@@ -1112,7 +1111,7 @@ pub(crate) fn validate_loaded_bundle(bundle: &ModelBundle) -> Result<(), Runtime
         ));
     }
     if bundle.fann.crate_name != "lattice-fann"
-        || bundle.fann.crate_version != FANN_CRATE_VERSION
+        || bundle.fann.crate_version != crate::LATTICE_VERSION
         || bundle.fann.format != FANN_FORMAT
         || bundle.fann.architecture != format!("{FEATURE_COUNT}->1 linear; zero intercept")
         || !is_lower_hex_64(&bundle.fann.network_content_ref)
@@ -1675,7 +1674,7 @@ pub(crate) mod tests {
         let data = prepare_training_data(&sufficient_records(false), &scope).unwrap();
         let mut trained = train_model(&data, scope).unwrap();
         trained.bundle.fann.network_content_ref = "f".repeat(64);
-        assert_eq!(trained.bundle.fann.crate_version, "0.9.0");
+        assert_eq!(trained.bundle.fann.crate_version, crate::LATTICE_VERSION);
         validate_loaded_bundle(&trained.bundle).unwrap();
 
         let mut prior_fann_version = trained.bundle.clone();

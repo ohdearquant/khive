@@ -42,7 +42,7 @@ operation is successful but its operation envelope also carries:
   "missing_backends": ["archive"],
   "backend_errors": {
     "archive": {
-      "kind": "backend_error",
+      "kind": "timeout",
       "message": "backend search timed out after 5000ms"
     }
   }
@@ -51,8 +51,17 @@ operation is successful but its operation envelope also carries:
 
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
-presentation transforms only `result`, and daemon frame-budget omission keeps
-the bounded diagnostics even if the result itself must be omitted. If no hit
+presentation transforms only `result`. Daemon frame-budget handling keeps the
+bounded diagnostics if an oversized result becomes a typed
+`response_frame_budget_exceeded` error, decided after the whole request has
+already run: it moves `status`/`partial`/`missing_backends`/`backend_errors*`
+under `error.search` (they are defined only on a successful entry, and this
+one just flipped to `ok: false`). The error's `retryable` is always `false` —
+reissuing an identical search overflows the identical budget identically, and
+`search` also schedules a best-effort `SearchExecuted` telemetry event on
+every dispatch with no dedup key, so a lost response must not be advertised
+as safe to reissue either way; the entry carries `executed: true` and
+`recoverable: "read_outcome"` instead. If no hit
 survives filtering, `missing_backends` and `backend_errors` instead live inside
 the `search_incomplete` error. Complete searches omit both fields. At most 16
 causes and one per-operation wire budget are retained; truncation is explicit
@@ -60,6 +69,32 @@ through `backend_errors_truncated` and `backend_errors_omitted`. Backend ids and
 messages are credential-masked before exposure; changed backend ids carry a
 stable hash suffix and `backend_id_masked: true`, ids are capped at 256 Unicode
 scalar values, and messages are capped at 1,024 Unicode scalar values.
+Each retained cause is typed as `timeout` for coordinator and typed runtime
+deadline failures, or `backend_error` otherwise. A degraded-empty
+`search_incomplete` error reports `retryable: true` only when every failed leg
+is a timeout; any mixed or non-timeout failure keeps it false. This policy is
+computed before diagnostic truncation, so an omitted cause cannot change the
+classification. Every `retryable: true` error also carries `retry_after_ms`.
+The server computes that pace from the full pre-truncation failure set as
+2,000ms plus 250ms for each failed backend after the first, capped at 10,000ms.
+
+A conforming client that acts on `retryable: true` uses this published policy:
+
+- At most three total attempts per logical request (the first attempt plus no
+  more than two reissues).
+- Before reissue number _n_ (starting at 1), wait a base of
+  `max(retry_after_ms, 2000) * 2^(n - 1)` milliseconds plus nonnegative random
+  jitter of at most half that base. Jitter must never shorten the server-named
+  delay.
+- Key a circuit breaker by the failed backend set. Open it after three
+  consecutive all-timeout `search_incomplete` outcomes for that same set,
+  suppressing first attempts as well as retries for 30 seconds. Then admit one
+  half-open probe: a successful search closes the breaker; another all-timeout
+  outcome reopens it for 30 seconds.
+
+The server publishes and names this pace but cannot enforce client-side
+admission. Clients that do not implement the complete budget, backoff, and
+breaker policy must not act on `retryable: true` automatically.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

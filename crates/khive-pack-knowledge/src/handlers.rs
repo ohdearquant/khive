@@ -587,7 +587,7 @@ mod tests {
 
         let mut config = khive_runtime::RuntimeConfig::no_embeddings();
         config.packs = vec!["kg".to_string()];
-        config.backend_id = khive_runtime::BackendId::new("knowledge");
+        config.backend_id = khive_runtime::BackendId::parse("knowledge").expect("valid backend id");
 
         KhiveRuntime::from_backend(knowledge_backend, config).with_core_backend(main_backend)
     }
@@ -1052,6 +1052,8 @@ mod tests {
         // `embedding_model` to a real on-disk model, which is absent on CI
         // runners and fails entity creation with `ModelInitialization`.
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -1067,6 +1069,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some("leo".to_string()),
+            exec: Default::default(),
         })
         .expect("in-memory runtime with actor");
 

@@ -35,6 +35,56 @@ db.diagnostics()          # writer/WAL/checkpoint counters
 - A `batch()` is one request, not a transaction: ops succeed or fail
   individually and the per-op results say which.
 
+## Check request syntax
+
+`Session.plan(ops)` sends the original request text to the daemon's parser without
+executing any operations:
+
+```python
+from khive import Session
+
+session = Session()
+plan = session.plan('create(kind="note", content="sample") | get(id=$prev.id)')
+if plan["parsed"]:
+    print(plan["mode"], plan["stage_count"], plan["stages"])
+else:
+    print(plan["error"])
+```
+
+The returned dictionary preserves the daemon's plan: each stage includes its
+index, verb, pack, whether the verb is known, normalized arguments and unresolved
+`prev_refs`. `limits` contains `max_ops`, `max_depth` and `max_input_len`. An unknown
+verb has `known: false` and `pack: null`; it can still parse successfully.
+
+A syntax error returns `parsed: false` and an error string, with no `stages`.
+Transport failures and rejected frames still raise the usual client exceptions.
+A plan is not permission to execute or a check that references will resolve.
+
+Planning requires daemon protocol version 5. Older daemons raise
+`ProtocolMismatch`; the client never falls back to sending the operations as an
+ordinary request. Plan frames omit caller identity and rendering options; the
+required namespace field is sent empty. `session.request(...)` retains its
+ordinary dispatch behavior and returns per-operation results.
+
+## Typed recall outcome
+
+`Session.recall(query, ...)` runs one `memory.recall` and returns a `RecallOutcome`
+instead of a raw row list, so the response class the daemon distinguishes survives
+the client boundary:
+
+```python
+outcome = session.recall("what did we decide about retries", limit=5)
+for hit in outcome.hits:          # RecallHit rows: id, score, content, ...
+    print(hit.id, hit.score, hit.is_degraded, hit.is_truncated)
+print(outcome.degraded, outcome.truncated, outcome.degraded_reason, outcome.envelope_class)
+```
+
+A non-empty recall is a bare row array with per-row `degraded` and `truncated`
+stamps; an empty recall that needs a reason arrives as an object envelope
+(`degraded`, `truncated`, or both). `RecallOutcome.from_result` reads either shape,
+`enveloped` records which one arrived, and a clean empty recall has both flags false.
+A failed op raises `OperationError` with the daemon's error object unchanged.
+
 ## Scratch database
 
 Experiments should run against a scratch daemon, not a production store:

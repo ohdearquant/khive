@@ -12,6 +12,20 @@ valid UTF-8. `notes.ndjson` remains optional when absent, but a present notes pa
 readable UTF-8. Even where a downstream rule skips an unreadable file, the unconditional
 structural rule ensures that an input read failure cannot produce a passing aggregate report.
 
+## Amendment (2026-09-10): explicit empty-graph summary
+
+The validation summary includes `empty`, which is true when zero nonblank NDJSON lines were
+read across `entities.ndjson`, `edges.ndjson`, and optional `notes.ndjson`. Empty and
+whitespace-only inputs therefore report `empty: true`; an entity-only or note-only graph is
+nonempty even when `edges.ndjson` has no records. Malformed nonblank lines still count as
+input records and fail schema validation. Unreadable inputs contribute no counted records
+and still fail `required-input-files`; `empty` does not imply that every input was readable.
+
+This is a content signal independent of `passed` and the exit code. Readable zero-record
+inputs remain structurally valid, including under `--strict`, while consumers requiring a
+nonempty graph can check `summary.empty` explicitly. Text output labels an empty graph in
+the summary (including `--quiet`), and GitHub output emits an empty-graph notice.
+
 ## Context
 
 [ADR-020](ADR-020-git-native-kg-implementation.md) introduced `kkernel kg validate` to guard the
@@ -241,18 +255,20 @@ decorative UI elements — they appear in terminal output and log files alike.
     "info": 0,
     "entities": 420,
     "edges": 1100,
+    "empty": false,
     "passed": true
   }
 }
 ```
 
 `summary.passed` is `true` when `errors == 0`. With `--strict`, `passed` is `true` only
-when `errors == 0 && warnings == 0`.
+when `errors == 0 && warnings == 0`. `summary.empty` reports the absence of nonblank input
+records independently of this validation verdict.
 
 #### GitHub Actions (`--format github`)
 
 Emits `::error file=...::` and `::warning file=...::` annotations so violations surface
-inline in the PR diff view. No output for passing rules.
+inline in the PR diff view. Passing rules emit no violations; an empty graph emits a notice.
 
 ### 6. Exit codes
 

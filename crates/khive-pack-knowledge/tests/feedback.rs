@@ -39,6 +39,8 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 /// to a real on-disk model, absent on CI runners.
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -54,6 +56,7 @@ fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor.to_string()),
+        exec: Default::default(),
     })
     .expect("runtime with actor")
 }

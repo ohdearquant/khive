@@ -7,7 +7,7 @@
 //! cancellation races and request deadlines. Write closures never register.
 
 use std::cell::RefCell;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -53,28 +53,31 @@ pub fn sqlite_interrupt_hard_cap_from_env() -> Duration {
     Duration::from_millis(millis)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 struct DbReadTestContext {
     progress_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
     fail_progress_clear: bool,
+    #[cfg(test)]
     settlement_bounds: Option<(Duration, Duration)>,
+    #[cfg(test)]
     bounded_wait_probe: Option<Arc<AtomicBool>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 tokio::task_local! {
     static DB_READ_TEST_CONTEXT: DbReadTestContext;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn current_test_context() -> DbReadTestContext {
     DB_READ_TEST_CONTEXT
         .try_with(Clone::clone)
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn scope_test_read_progress<F>(
     probe: Arc<std::sync::atomic::AtomicUsize>,
     future: F,
@@ -161,7 +164,7 @@ struct ReadControl {
     operation: &'static str,
     interrupt_grace: Duration,
     interrupt_hard_cap: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     progress_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     fail_progress_clear: bool,
@@ -171,7 +174,7 @@ struct ReadControl {
 
 impl ReadControl {
     fn new(context: &RequestReadContext, operation: &'static str) -> Arc<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let test_context = current_test_context();
         let default_settlement_bounds = (
             sqlite_interrupt_grace_from_env(),
@@ -195,7 +198,7 @@ impl ReadControl {
             operation,
             interrupt_grace,
             interrupt_hard_cap,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             progress_probe: test_context.progress_probe,
             #[cfg(test)]
             fail_progress_clear: test_context.fail_progress_clear,
@@ -234,10 +237,6 @@ impl ReadControl {
     }
 
     fn progress_should_stop(&self) -> bool {
-        #[cfg(test)]
-        if let Some(probe) = &self.progress_probe {
-            probe.fetch_add(1, Ordering::Relaxed);
-        }
         // This callback runs every 1,000 SQLite VM instructions. Never take
         // the lifecycle mutex here: it exists only to protect ownership of
         // the InterruptHandle used by asynchronous cancellers.
@@ -314,9 +313,16 @@ impl ReadControl {
         }
 
         let callback = Arc::clone(self);
-        if let Err(error) =
-            conn.progress_handler(1_000, Some(move || callback.progress_should_stop()))
-        {
+        if let Err(error) = conn.progress_handler(
+            1_000,
+            Some(move || {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(probe) = &callback.progress_probe {
+                    probe.fetch_add(1, Ordering::Relaxed);
+                }
+                callback.progress_should_stop()
+            }),
+        ) {
             self.cleanup_failed.store(true, Ordering::Release);
             self.finish();
             return Err(StorageError::driver(capability, self.operation, error));

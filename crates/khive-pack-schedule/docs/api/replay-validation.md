@@ -15,8 +15,9 @@ relative to `Utc::now()`.
 
 ## `validate_repeat` — executable repeat spec
 
-Accepts only `daily`, `weekly`, and `monthly`, the recurrence forms the pending-events
-runner can advance. Every five-field cron expression is rejected at creation. This
+Accepts exactly what `repeat::parse_repeat` accepts, the one parser the pending-events
+runner advances with: `daily`, `weekly`, `monthly`, `every:<N><s|m|h|d>` intervals, and
+five-field cron expressions in UTC. Everything else is rejected at creation. This
 prevents an accepted recurrence from silently firing once and becoming terminal when
 the runner cannot calculate its next occurrence.
 

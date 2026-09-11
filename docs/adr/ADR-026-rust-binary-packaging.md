@@ -132,7 +132,8 @@ unsigned Windows binaries work but trigger SmartScreen warnings on first run.
 
 ### Atomic release semantics
 
-Six platform publishes plus the umbrella publish = seven npm releases per khive version.
+Six platform publishes plus the umbrella publish = seven npm releases per khive version
+(eight with the `@khive-ai/cli` alias of Amendment 3).
 If any subpackage publish fails, the umbrella must not publish. The release pipeline
 enforces this: all subpackage jobs must succeed before the umbrella publish job runs.
 Partial failure leaves the user able to install the previous khive version unchanged.
@@ -252,7 +253,8 @@ users install once and run constantly, install size is a real friction point.
 
 - **Six native binaries built per release**, two per binary set (`kkernel` + `khive-mcp`)
   pre-convergence, dropping to one binary set post-convergence (ADR-003).
-- **Seven npm publishes per release** (six subpackages + umbrella). Releases must be
+- **Seven npm publishes per release** (six subpackages + umbrella; eight with the alias of
+  Amendment 3). Releases must be
   atomic — partial failure must not publish the umbrella.
 - **CI complexity** — a 6-job release matrix instead of 1. Mitigated by `cargo-zigbuild`
   handling musl/arm64 cross-compile.
@@ -378,3 +380,27 @@ the installed binary and stops the old daemon after verification so bridges can 
 new artifact under ADR-049. The ordering guarantee is narrower: no install or daemon
 interruption is reachable unless the exact artifact being staged has passed the pack/verb
 surface probe.
+
+## Amendment 3 (2026-09-02): the `@khive-ai/cli` compatibility alias
+
+`npm/cli-alias` publishes `@khive-ai/cli`, an alias whose only dependency is `khive` at the
+exact same version and whose `bin` entries point into that dependency. It is the eighth npm
+release per khive version: the six platform subpackages, the umbrella, then the alias.
+
+Ordering and gates. Both release paths (`.github/workflows/release.yml` and
+`scripts/npm-publish.sh`) refuse to publish anything when the alias version or its exact
+`khive` dependency differs from the release version, and both publish the alias last, after
+the umbrella it depends on is on the registry. The workflow rewrites the alias's version and
+dependency to the dispatch version before publishing it.
+
+Failure semantics. The atomic boundary of the accepted text is unchanged for the seven
+packages the umbrella covers: no subpackage failure lets the umbrella publish, and no
+umbrella failure lets the alias publish. The alias sits outside that boundary. If the
+umbrella publishes and the alias publish fails, `khive@VERSION` is installable and
+`@khive-ai/cli` stays at its previous version, which depends on the previous `khive`
+exactly, so alias installs keep resolving a consistent pair, one release behind. The
+workflow's publish job is not resumable; the repair path is `scripts/npm-publish.sh`, which
+skips every package already on the registry at the release version and publishes only what
+is missing. Its alias skip requires the published alias to carry the exact `khive`
+dependency; a published alias with a different dependency stops the script with an error
+instead of being reported as done.

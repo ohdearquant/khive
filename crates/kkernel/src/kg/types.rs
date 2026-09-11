@@ -449,6 +449,7 @@ pub struct ValidationSummary {
     pub info: usize,
     pub entities: usize,
     pub edges: usize,
+    pub empty: bool,
     pub passed: bool,
 }
 

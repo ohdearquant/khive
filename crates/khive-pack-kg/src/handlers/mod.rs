@@ -9,11 +9,13 @@ mod graph;
 mod link;
 mod list;
 mod merge;
+mod note_list;
 mod params;
 mod proposal;
 mod resolve;
 mod search;
 mod stats;
+mod stream;
 mod update;
 mod whoami;
 
@@ -45,3 +47,6 @@ pub(crate) use common::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stream_tests;

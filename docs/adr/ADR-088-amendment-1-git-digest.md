@@ -18,8 +18,9 @@ The directive is to make digestion agent-facing, and to accept a remote URL dire
 agent can point the verb at any repository and ingest its history without a pre-existing
 local clone.
 
-This amendment supersedes ADR-088's "no new agent-facing verbs" clause for exactly one
-verb. Note kinds, edge usage, cursor semantics, secret masking, and the `gh` access path
+This amendment originally superseded ADR-088's "no new agent-facing verbs" clause for
+`git.digest`. The proposed 2026-09-10 operational rider below adds a read-only cursor
+inspection verb. Note kinds, edge usage, cursor semantics, secret masking, and the `gh` access path
 remain unchanged except where the accepted operational rider below narrows GitHub
 capability detection and successful-response durability.
 
@@ -157,10 +158,12 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
 
 ### Remote-URL mode
 
-1. Clone to a daemon-owned scratch directory (`~/.khive/scratch/git-digest/<hash>/`),
-   `git clone --filter=blob:none` (history + trees without file blobs — commit walking
-   needs messages and file lists, not contents; `git log --name-only` works against a
-   partial clone with lazy fetch disabled for our read pattern).
+1. Clone to a daemon-owned scratch directory (`~/.khive/scratch/git-digest/<hash>/`)
+   only when `commits` are requested. An issues/pull-requests-only pass never needs a
+   checkout and goes directly to the source-bound GitHub API path. Required clones use
+   `git clone --filter=blob:none --no-checkout` (history + trees without file blobs —
+   commit walking needs messages and file lists, not contents; `git log --name-only`
+   works against a partial clone with lazy fetch disabled for our read pattern).
 2. Derive `owner/repo` from the canonical source, target that value explicitly in the
    source-bound `gh repo view` probe, and pass it explicitly to issue/PR listing; skip
    requested remote sources with a stable warning when that operation is unavailable.
@@ -168,12 +171,36 @@ frozen `until`; temporary absence is not evidence that the pass failed or commit
    of re-cloning. An LRU cap (default 5 repos / 2GB, config `[git] digest_cache_*`) evicts
    oldest; eviction is safe because cursors live in the database, not the clone.
    Additionally, a per-clone size cap (operator-configurable, default 1GB) bounds any
-   single clone: if a clone or fetch would exceed it, the operation aborts with a clear
-   error before writing further — `max_items` bounds ingestion work, but only this cap
-   bounds disk consumption by a single large-history repository before LRU eviction can
-   apply.
+   single clone: a fresh clone's staging directory is monitored while the child runs and
+   the clone process tree is stopped and reaped once the limit is observed; a final
+   measurement remains the race backstop before publication. Fetches are measured and
+   removed before further use when over cap. `max_items` bounds ingestion work, but only
+   this cap bounds disk consumption by a single large-history repository before LRU
+   eviction can apply.
 4. Cleanup on eviction uses directory removal of the scratch path only (never touches
    user-owned paths).
+
+5. Failure contract (2026-09-02). When the initial clone or fetch that establishes a
+   cache entry (step 1) fails, it returns the typed `RemoteFetchError { remote, message }`
+   in-process rather than a generic error: `remote` is the canonical URL with any embedded
+   credentials and query string redacted, and `message` is the cache/setup error text: a
+   synthesized exit-status summary for a failed git invocation, or the I/O, size-cap, or
+   unsafe-replace guard message for a non-git cache failure; none of these retain git's
+   own stderr. This typed variant reaches in-process `VerbRegistry::dispatch` callers; the
+   MCP `request` envelope has no dedicated wire encoding for it and falls back to
+   rendering the plain error message, so an MCP caller still has to read that text to tell
+   it apart from `InvalidInput`. Because `remote` is redacted before the error is built,
+   the rendered message, in-process or on the wire, never contains the credential or
+   query material stripped from it. A clone/fetch failure hit later, while repairing a
+   missing object during commit walking against an already-cached clone (a bounded
+   refetch-then-reclone attempt), is not raised as `RemoteFetchError`. A git-level refetch
+   failure is followed by the one guarded reclone, and each successful repair earns exactly
+   one more snapshot attempt: the ingest completes normally only when that attempt
+   succeeds. When the bounded repair ultimately fails (a non-git refetch failure, a failed
+   reclone, or a snapshot that still fails after the reclone) the failure is wrapped as a
+   plain error that reaches the caller as `InvalidInput`; no third repair is attempted. A
+   source that cannot be parsed as a local path or a remote URL also stays `InvalidInput`,
+   and storage failures keep their existing error types.
 
 ### Accepted cache crash-residue rider (2026-08-09)
 
@@ -289,6 +316,39 @@ returned `IngestReport`; the field is `0` for a pass with no over-cap commits.
 This reuses the pack-kg `create` verb's existing `embedding_content` parameter (a
 non-empty proper prefix of `content`, subject to the same secret-gate check as any other
 stored text) rather than adding pack-git-local truncation logic.
+
+## Proposed operational rider: persisted cursor inspection (2026-09-10)
+
+Add `git.ingest_cursor(project, source_kind)` as an `Assertive`, `AlwaysVerbose` read.
+Both arguments are required: a full live project UUID and one of `commits`, `issues`,
+or `pull_requests`. Canonical `get` authorization uses the caller's identity and
+resolved request namespace; full UUID access follows the existing namespace-agnostic
+by-ID contract. A checkpoint's namespace remains continuation metadata.
+
+`NamespaceToken` retains the originating Gate namespace separately from the storage
+primary. Dispatch stamps it from the resolved Gate request; direct minting and
+`with_namespace` reminting default it to the primary. This new read uses that metadata
+for nested `get`, so an implicit non-local Gate scope cannot become `local` merely
+because the default storage primary is local. Existing storage namespace, visibility,
+and `RequestIdentity::from_token` projection semantics remain unchanged.
+
+One SQL statement reads the cursor and its `_checkpoint` row from the existing
+`git_mirror_cursor` table (`pull_requests` maps to stored `prs`). Return the canonical
+`project_id`, public `source_kind`, and nullable `cursor` / `checkpoint` objects. Each
+object contains the opaque stored string `value`, integer microsecond `updated_at`,
+nullable UTF-8 `value_bytes`, and boolean `truncated`. Preserve absence separately from
+a present SQL NULL. Values over 256 KiB per row are wholly omitted with `truncated: true`
+and their actual byte count. The pair is one statement snapshot, not two separately
+timed reads. No new schema, ingestion, external process, cursor write, normalization,
+or repair is introduced; ordinary runtime authorization and audit still apply.
+
+This supplies persisted position after terminal ambiguity, including exact page-boundary
+membership that a timestamp alone cannot reveal. It does not identify a request, prove
+completion, establish resumability, or establish that a timed-out request stopped.
+Concurrent ingestion can advance after the snapshot. Receipt recovery above remains
+the way to recover a completed request's report. See the complete
+[API contract](../../crates/khive-pack-git/docs/api/ingest_cursor.md) for row shapes,
+bounds, and recovery guidance. This rider remains proposed pending review and merge.
 
 ## Consequences
 
