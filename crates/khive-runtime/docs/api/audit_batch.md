@@ -87,6 +87,47 @@ degrade-safety whenever the real pack of that name was not also loaded. The whol
 decision — pack trust, category, and the `(pack, verb)` allowlist — is precomputed once when
 `VerbRegistryBuilder::build` runs, not re-derived per dispatch.
 
+For a successful non-degrade-safe operation, the domain effect may already be committed when its
+deferred audit row is enqueued. Those rows, and `GitDigestReceipt` rows, use
+`AuditBatch::submit_until_resolved()` (khive#2256): crossing `admission_deadline` emits a warning
+but keeps awaiting the same generation receiver, now bounded by a second, larger
+`AuditBatchConfig::resolution_deadline` (khive#2331) rather than unbounded — a stalled
+`append_events_idempotent()` call must not retain the completed write's caller, its request slot,
+and its audit-lane waiter forever, exhausting both request and audit capacity. If
+`resolution_deadline` also elapses, the caller gets the dedicated `ResolutionDeadlineExpired`
+reason instead of `AdmissionDeadlineExpired`, so a caller (and diagnostics reading the reason) can
+tell a merely-slow admission wait apart from a resolution wait that gave up entirely. Either way
+the handler is not invoked again and the row is not re-enqueued — the row is left exactly where
+the driver holds it for the driver to resolve independently. Pre-enqueue `QueueAdmissionExhausted`
+and real store/driver failures still return errors. Ordinary `submit()` retains the bounded
+deadline contract for admission-degrade reads, failed/denied outcomes, and pure observability.
+
+## The driver's own append bound and the abandoned-append cap (khive#2331)
+
+`resolution_deadline` bounds only how long a _caller_ keeps waiting; it does nothing to stop the
+_driver_ from holding one stalled generation forever. `supervisor_loop` wraps its
+`run_generation` child's `.await` in its own `driver_append_deadline` (3x `resolution_deadline`,
+derived rather than a separate config field — see the rationale on `driver_append_deadline` in
+`audit_batch.rs`). If that elapses, the generation is recorded with
+`AuditTerminalReason::DriverAppendAbandoned`, every waiter on it resolves with that reason, and
+the loop immediately drains whatever has queued in `pending` since — the row is never re-enqueued
+and any already-committed domain effect is never retried. The underlying store call is not
+cancelled (it may not be safely abortable mid-write); it is handed to a detached task that drives
+it to completion and discards whatever it eventually returns.
+
+Left unbounded, a store whose append never returns would mint one such detached task per
+`driver_append_deadline` forever, each retaining up to `max_rows_per_generation` events.
+`AuditBatchConfig::max_abandoned_appends` (default 4) caps how many may be outstanding at once.
+Before spawning a generation's child, the driver checks the current count: at or above the cap,
+the store is treated as wedged and the generation is shed instead — no child task, no store call,
+every waiter resolves immediately with `AuditTerminalReason::StoreWedged`, and `flush_failures`
+increments. A shed generation costs no store work. As soon as one outstanding append returns
+(commit or failure — each recorded on `AuditBatchHealthMetrics::late_append_commits` /
+`late_append_failures`, so an operator can see a wedged store later drained), the count drops
+below the cap and the next generation attempts a real append again; recovery needs no timer of its
+own. Combined, the two bounds cap the retained-buffer growth a wedged store can cause at
+`max_abandoned_appends * max_rows_per_generation` rows.
+
 ## Supervision and failure ownership (owner ruling R1)
 
 The supervisor loop retains its `JoinHandle` and spawns each generation's commit as its own child
