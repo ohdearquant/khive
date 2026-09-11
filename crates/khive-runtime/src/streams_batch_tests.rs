@@ -790,7 +790,7 @@ async fn stream_batch_fence_rechecks_after_writer_admission() {
         Some(NoteFence {
             key: "fence".into(),
             kind: "head".into(),
-            expected_version: 1,
+            expected_version: Some(1),
         }),
         vec![],
     )
@@ -869,12 +869,12 @@ async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission
                         NoteFence {
                             key: "stable".into(),
                             kind: "head".into(),
-                            expected_version: 1,
+                            expected_version: Some(1),
                         },
                         NoteFence {
                             key: "renewed".into(),
                             kind: "head".into(),
-                            expected_version: 1,
+                            expected_version: Some(1),
                         },
                     ],
                 ),
@@ -1210,12 +1210,12 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
                             NoteFence {
                                 key: "first".into(),
                                 kind: "head".into(),
-                                expected_version: 1,
+                                expected_version: Some(1),
                             },
                             NoteFence {
                                 key: "second".into(),
                                 kind: "head".into(),
-                                expected_version: if stale { 2 } else { 1 },
+                                expected_version: Some(if stale { 2 } else { 1 }),
                             },
                         ],
                     ),
