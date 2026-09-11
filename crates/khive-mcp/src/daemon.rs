@@ -243,6 +243,7 @@ struct ConfigIdFields<'a> {
     gate: &'a str,
     git_write: &'a str,
     brain: &'a str,
+    telemetry: &'a str,
     display_timezone: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
@@ -262,6 +263,9 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
     let (packs, rest) = base.split_once("];db=")?;
     let (rest, display_timezone) = rest
         .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, telemetry) = rest
+        .rsplit_once(";telemetry=")
         .unwrap_or((rest, "<legacy-absent>"));
     let (rest, brain) = rest
         .rsplit_once(";brain=")
@@ -296,6 +300,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         gate,
         git_write,
         brain,
+        telemetry,
         display_timezone,
         backends,
         pack_backends,
@@ -332,6 +337,8 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "git_write"
     } else if client.brain != daemon.brain {
         "brain"
+    } else if client.telemetry != daemon.telemetry {
+        "telemetry"
     } else if client.display_timezone != daemon.display_timezone {
         "display_tz"
     } else if client.backends != daemon.backends {
@@ -3724,6 +3731,29 @@ mod tests {
             crate::server::compute_config_id_with_runtime_policies(&changed, None, true, false);
 
         assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "brain");
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_telemetry_policy_and_legacy_absence() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.telemetry.default_carrier = khive_runtime::TelemetryCarrier::Durable;
+        let client =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let daemon =
+            crate::server::compute_config_id_with_runtime_policies(&changed, None, true, false);
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "telemetry"
+        );
+
+        let (prefix, rest) = client.split_once(";telemetry=").unwrap();
+        let (_, suffix) = rest.split_once(";display_tz=").unwrap();
+        let legacy = format!("{prefix};display_tz={suffix}");
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&legacy)),
+            "telemetry"
+        );
     }
 
     #[test]

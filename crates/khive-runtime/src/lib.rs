@@ -51,6 +51,7 @@ pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
 mod streams;
+pub mod telemetry_config;
 pub use streams::{
     refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal, StreamObservation,
     StreamWriteSpec,
@@ -163,6 +164,10 @@ pub use runtime::{
     NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+pub use telemetry_config::{
+    TelemetryCarrier, TelemetryChannelConfig, TelemetryConfig, TelemetryFailurePosture,
+    TelemetryPolicy,
+};
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

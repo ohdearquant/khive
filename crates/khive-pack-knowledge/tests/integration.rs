@@ -2282,6 +2282,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),
@@ -4731,6 +4732,7 @@ mod kg_blend {
         recorded: Option<Arc<Mutex<Vec<String>>>>,
     ) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -5095,6 +5097,7 @@ mod kg_blend {
 
         let calls = Arc::new(Mutex::new(0usize));
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -5514,6 +5517,7 @@ mod kg_blend {
 
     fn rt_with_failing_blend_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),

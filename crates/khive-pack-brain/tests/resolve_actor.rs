@@ -12,6 +12,7 @@ use serde_json::json;
 
 fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

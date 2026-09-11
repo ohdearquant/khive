@@ -875,6 +875,14 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     );
     let brain = format!("{:x}", brain_hasher.finalize());
 
+    let mut telemetry_hasher = Sha256::new();
+    telemetry_hasher.update(b"khive.telemetry-policy.v1");
+    telemetry_hasher.update(
+        serde_json::to_vec(&config.telemetry)
+            .expect("telemetry configuration is JSON serializable"),
+    );
+    let telemetry = format!("{:x}", telemetry_hasher.finalize());
+
     let backend = if storage_read_only {
         format!("{:?}:read_only", config.backend_id)
     } else {
@@ -909,7 +917,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};telemetry={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -921,6 +929,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         gate,
         git_write,
         brain,
+        telemetry,
         config.display_timezone.name(),
     );
 
@@ -6443,6 +6452,50 @@ mod tests {
     }
 
     #[test]
+    fn config_id_separates_telemetry_policy_without_exposing_values() {
+        use khive_runtime::{TelemetryCarrier, TelemetryChannelConfig, TelemetryFailurePosture};
+
+        let mut base = RuntimeConfig::no_embeddings();
+        base.telemetry.stream = "example-telemetry-stream".into();
+        base.telemetry.channels.push(TelemetryChannelConfig {
+            kinds: vec!["run.completed".into()],
+            carrier: TelemetryCarrier::Durable,
+            failure_posture: TelemetryFailurePosture::Stop,
+        });
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let original = fingerprint(&base);
+        assert!(!original.contains("example-telemetry-stream"));
+        assert!(!original.contains("run.completed"));
+        assert_eq!(original, fingerprint(&base.clone()));
+        for field in [
+            "stream",
+            "default_carrier",
+            "kinds",
+            "carrier",
+            "failure_posture",
+            "channels",
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "stream" => changed.telemetry.stream.push('2'),
+                "default_carrier" => changed.telemetry.default_carrier = TelemetryCarrier::Durable,
+                "kinds" => changed.telemetry.channels[0]
+                    .kinds
+                    .push("run.failed".into()),
+                "carrier" => changed.telemetry.channels[0].carrier = TelemetryCarrier::Ephemeral,
+                "failure_posture" => {
+                    changed.telemetry.channels[0].failure_posture = TelemetryFailurePosture::Gap
+                }
+                "channels" => changed.telemetry.channels.clear(),
+                _ => unreachable!(),
+            }
+            assert_ne!(original, fingerprint(&changed), "changed {field}");
+        }
+    }
+
+    #[test]
     fn config_id_differs_when_caller_enrollment_policy_differs() {
         let base = RuntimeConfig::no_embeddings();
         let enrolled = RuntimeConfig {
@@ -8830,6 +8883,47 @@ mod tests {
             .map(|l| l.trim_start().split(' ').next().unwrap())
             .collect();
         assert_eq!(names, vec!["assign", "list", "search"]);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn telemetry_inventory_dispatch_preserves_configured_carriers() {
+        use khive_runtime::{TelemetryCarrier, TelemetryChannelConfig, TelemetryFailurePosture};
+
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".into(), "telemetry".into()];
+        config.telemetry.stream = "configured-events".into();
+        config.telemetry.channels.push(TelemetryChannelConfig {
+            kinds: vec!["run.completed".into()],
+            carrier: TelemetryCarrier::Durable,
+            failure_posture: TelemetryFailurePosture::Stop,
+        });
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("linked telemetry factory");
+        let durable = server
+            .registry
+            .dispatch(
+                "telemetry.emit",
+                json!({"kind":"run.completed","payload":{"count":1}}),
+            )
+            .await
+            .expect("configured durable emit");
+        assert_eq!(durable["carrier"], "durable");
+        let ephemeral = server
+            .registry
+            .dispatch("telemetry.emit", json!({"kind":"new.event","payload":null}))
+            .await
+            .expect("default ephemeral emit");
+        assert_eq!(ephemeral["carrier"], "ephemeral");
+        assert_eq!(ephemeral["dropped"], true);
+        let page = server
+            .registry
+            .dispatch("stream.read", json!({"stream":"configured-events"}))
+            .await
+            .expect("existing stream read");
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["record"]["kind"], "run.completed");
     }
 
     // ── #658 regression: brain dispatch hook wired into production builder ──
