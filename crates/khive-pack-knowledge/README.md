@@ -7,9 +7,10 @@ rerank, and composed into markdown briefings under a token budget.
 ## Features
 
 - **TF-IDF corpus search** (`knowledge.search`) over atom name/tags/content, with
-  score bands (`>=0.46` reliable, `0.42-0.46` mixed, `<0.42` mostly off-target),
-  query decomposition, and RRF fusion against an ANN pass when an embedder is
-  configured
+  request-relative scores, per-result lexical/ANN score provenance, query
+  decomposition, and RRF fusion against an ANN pass when an embedder is configured.
+  Scores are not calibrated probabilities; interpret rank together with
+  `score_provenance` and the response's `candidate_provenance`
 - **Section-level records** (`knowledge.edit`) — a closed 10-value `section_type`
   enum (`overview`, `core_model`, `formalism`, `failure_modes`, ... `other`) per
   atom, each independently disputable and adjudicable (ADR-051)
@@ -34,6 +35,14 @@ through the MCP `request` DSL (or `kkernel exec`). A caller issues:
 ```text
 request(ops="knowledge.search(query=\"block-max wand posting list pruning\", limit=10)")
 ```
+
+Each `knowledge.search` result includes `score_provenance`: the contributing
+`sources` (`lexical`, `ann`, or both), whether `embedding_rerank` ran successfully,
+`normalization: "s_over_s_plus_1"`, and `calibrated: false`. The response's
+`candidate_provenance.lexical` distinguishes `matched`, `no_match`, `filtered`,
+`partial_timeout`, and `timed_out`. Its `fallback` is `ann` only when returned
+results have ANN evidence and none has lexical evidence; otherwise it is `none`.
+A genuine lexical miss contributes no candidates from unrelated recent rows.
 
 The same DSL runs from the shell without an MCP client via `kkernel exec`:
 
