@@ -235,17 +235,15 @@ Direction + read-status + `to_actor` filters are pushed into SQL. For
 `idx_notes_unread_probe_recipient_direction`'s key, so the listing seeks that
 recipient-scoped partial index the same way the unread count does: work scales
 with the caller's own unread inbound set, never with other actors' backlog or
-the caller's own outbound send history. For `status="read"`/`"all"`, no index
-in the current schema carries that same `ifnull(...)` key outside the
-unread-only partial index — and, measured directly rather than assumed, even
-forcing the general, non-partial `idx_comm_message_to_actor` index (keyed on
-the raw `json_extract(...)` expression, without the `ifnull` wrapper) does not
-yield a recipient-scoped seek for this `OR`-shaped predicate. Both listings
-therefore still fall back to `idx_comm_message_direction` (namespace + kind +
-direction + read only) and scan every inbound, or every, message in the
-namespace regardless of recipient. That gap is unresolved by this change;
-closing it needs a new non-partial `ifnull`-keyed index (a schema/migration
-change), not a `FilterOp` change. The read filter uses `json_type` to match
+the caller's own outbound send history. For `status="read"`/`"all"`, migration
+V33 adds `idx_notes_message_recipient_direction`, with the same `ifnull(...)`
+recipient and direction keys over all live notes (#2377, #2517). These listings
+seek the caller and legacy-recipient partitions instead of scanning every
+actor's inbox. The read-status predicate remains residual, so the cost of a read
+listing can still depend on the caller's own unread backlog. The migration
+recreates the unread partial index after the full index to preserve unread plan
+selection before `ANALYZE`; normal store access does not rebuild either index.
+The read filter uses `json_type` to match
 the old `as_bool().unwrap_or(false)` semantics — only JSON boolean `true`
 counts as read, missing/false/string/integer all count as unread. Exact
 `from_actor` and inclusive `since` (`created_at >=`) also stay in SQL.

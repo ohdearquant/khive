@@ -3485,13 +3485,15 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 
     // -- Control: reproduce the pre-fix (direction-blind) index shape and
     // show the same assertion fails, proving the bound above is real and not
-    // an artifact of small numbers or an unrelated planner choice. --
+    // an artifact of small numbers or an unrelated planner choice. V33's
+    // full index also supplies direction, so remove it only in this control. --
     let control_pool = setup_pool();
     {
         let writer = control_pool.writer().unwrap();
         let conn = writer.conn();
         conn.execute_batch(
             "DROP INDEX idx_notes_unread_probe_recipient_direction;
+             DROP INDEX idx_notes_message_recipient_direction;
              CREATE INDEX idx_notes_unread_probe_recipient_control
                  ON notes(namespace, kind,
                           ifnull(json_extract(properties, '$.to_actor'), ''),
@@ -4452,18 +4454,11 @@ async fn json_type_ne_missing_rejects_non_vocabulary_value() {
 }
 
 /// khive#2392: `fetch_notes_after`'s `status="all"`/`status="read"` inbox
-/// listings (no `$.read` filter, or `JsonTypeEq` rather than the tuned
-/// `JsonTypeNeMissing` probe) have no index ending in `(created_at DESC, id
-/// ASC)` for their `(namespace, kind, direction, to_actor[, read])`
-/// partition, so the lt-branch (`created_at < ? ORDER BY created_at DESC, id
-/// ASC`) still costs a full partition scan plus a temp-b-tree sort on every
-/// internal page — pins the expected-arm SCAN-plus-sort plan so a future
-/// index addition is a deliberate, measured change rather than a silent
-/// drift. See `candidate_created_at_id_seek_index_flips_unread_probe_plan`
-/// for why the natural fix (a general `(namespace, kind, created_at DESC, id
-/// ASC)` index) was measured and rejected rather than shipped.
+/// listings now seek recipient, direction and timestamp through V33. The
+/// caller and legacy-recipient partitions still require a merged sort; the
+/// regression forbids falling back to a namespace-wide scan before that sort.
 #[tokio::test]
-async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
+async fn comm_inbox_status_all_lt_branch_seeks_recipient_index() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
     use khive_storage::types::SqlValue;
 
@@ -4539,18 +4534,17 @@ async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
     let plan = plan_details(reader.conn(), &lt_sql, &lt_params);
     assert!(
         plan.contains("USE TEMP B-TREE FOR ORDER BY"),
-        "expected arm: the lt-branch still sorts because no index ends in \
-         (created_at DESC, id ASC) for this partition, got:\n{plan}"
+        "the two recipient partitions still require a merged ordering, got:\n{plan}"
     );
     assert!(
-        !plan.contains("idx_notes_kind_created_seek"),
-        "no such index exists in production schema; a name match here would mean \
-         this test started reading stale state"
+        plan.contains("idx_notes_message_recipient_direction")
+            && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=? AND created_at<?"),
+        "the lt-branch must seek recipient, direction, and timestamp: {plan}"
     );
 }
 
 /// khive#2392: the natural seekable fix for the gap pinned by
-/// `comm_inbox_status_all_lt_branch_has_no_seek_index` — a general
+/// the pre-V33 inbox schema — a general
 /// `(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL`
 /// index — was measured, not just assumed, before deciding not to ship it.
 /// Standalone it cuts the lt-branch scan from 57,473 to 7,223 VM steps for a
