@@ -50,11 +50,13 @@ sha2 = { workspace = true }
 khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }
 khive-request = { version = "0.8.0", path = "../khive-request" }
 # Self dev-dependency: requests this crate's own `fault-injection` and
-# `test-internals` features for its `tests/` integration binaries. Cargo's
-# feature unification means plain `cargo test -p khive-runtime` already
-# builds and runs those feature-gated tests (e.g.
-# `tests/adr133_audit_batch.rs`, `tests/read_verb_admission_exhaustion.rs`)
-# with no extra `--features` flag.
+# `test-internals` features for its `tests/` integration binaries. Those link
+# the lib as an external crate, so items gated on `any(test, feature =
+# "fault-injection")` (e.g. `run_daemon_in_process_test`) are otherwise
+# unreachable from there. Cargo's feature unification means plain
+# `cargo test -p khive-runtime` already builds and runs the feature-gated
+# tests (e.g. `tests/adr133_audit_batch.rs`,
+# `tests/read_verb_admission_exhaustion.rs`) with no extra `--features` flag.
 khive-runtime = { path = ".", features = ["fault-injection", "test-internals"] }
 khive-gate-rego = { version = "0.8.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }

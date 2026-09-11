@@ -108,6 +108,11 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "agent_skill",
         aliases: &["skill_manifest"],
     },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "research_report",
+        aliases: &[],
+    },
     // ── Concept ─────────────────────────────────────────────────────────────
     EntityTypeDef {
         kind: EntityKind::Concept,
@@ -679,6 +684,22 @@ mod tests {
     }
 
     // ── Basic happy-path resolution ──────────────────────────────────────────
+
+    #[test]
+    fn research_report_resolves_in_every_stored_spelling() {
+        let r = reg();
+        for raw in ["research-report", "research_report", "Research Report"] {
+            let res = r
+                .resolve(EntityKind::Document, Some(raw))
+                .unwrap_or_else(|e| panic!("{raw} must resolve as a Document subtype: {e}"));
+            assert_eq!(res.entity_type.as_deref(), Some("research_report"), "{raw}");
+        }
+        // A Document genre, not a Concept one: the same spelling on another
+        // kind is still refused, so the registry stays kind-scoped.
+        assert!(r
+            .resolve(EntityKind::Concept, Some("research-report"))
+            .is_err());
+    }
 
     #[test]
     fn resolve_paper_infers_document() {
