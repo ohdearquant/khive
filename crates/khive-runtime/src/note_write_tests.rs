@@ -19,6 +19,161 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 const MODEL: &str = "note-version-test";
 
 #[test]
+fn note_fence_explicit_absence_and_alias_serialize_canonically() {
+    use crate::note_write::NoteFences;
+
+    for expected in [None, Some(1), Some(i64::MAX)] {
+        for field in ["expected_version", "version"] {
+            let mut value = json!({"kind":"head", "key":"fence/serde"});
+            value[field] = json!(expected);
+            let fence: NoteFence = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(fence.expected_version, expected);
+            fence.validate().unwrap();
+            let canonical = json!({
+                "kind":"head", "key":"fence/serde", "expected_version":expected
+            });
+            assert_eq!(serde_json::to_value(&fence).unwrap(), canonical);
+            let round_trip: NoteFence =
+                serde_json::from_value(serde_json::to_value(&fence).unwrap()).unwrap();
+            assert_eq!(round_trip.expected_version, expected);
+            for listed in [false, true] {
+                let input = if listed {
+                    json!([value.clone()])
+                } else {
+                    value.clone()
+                };
+                let fences: NoteFences = serde_json::from_value(input).unwrap();
+                assert_eq!(fences.entries()[0].expected_version, expected);
+                let serialized = if listed {
+                    json!([canonical.clone()])
+                } else {
+                    canonical.clone()
+                };
+                assert_eq!(serde_json::to_value(fences).unwrap(), serialized);
+            }
+        }
+    }
+}
+
+#[test]
+fn note_fence_requires_present_version_and_rejects_invalid_forms() {
+    use crate::note_write::NoteFences;
+
+    let missing = json!({"kind":"head", "key":"fence/serde"});
+    let direct = serde_json::from_value::<NoteFence>(missing.clone()).unwrap_err();
+    assert!(direct
+        .to_string()
+        .contains("fence requires expected_version (positive integer or null)"));
+    let mut invalid = vec![missing];
+    for field in ["expected_version", "version"] {
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(false),
+            json!("1"),
+            json!(1.5),
+            json!([]),
+            json!({}),
+        ] {
+            let mut fence = json!({"kind":"head", "key":"fence/serde"});
+            fence[field] = value;
+            invalid.push(fence);
+        }
+    }
+    for fence in invalid {
+        for input in [fence.clone(), json!([fence])] {
+            let message = serde_json::from_value::<NoteFences>(input)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("fence requires expected_version (positive integer or null)"),
+                "{message}"
+            );
+            assert!(!message.contains("Shape"), "{message}");
+            assert!(!message.contains("untagged enum"), "{message}");
+        }
+    }
+
+    for value in [json!(null), json!(1)] {
+        let duplicate = json!({
+            "kind":"head", "key":"fence/serde",
+            "expected_version":value, "version":value
+        });
+        let direct = serde_json::from_value::<NoteFence>(duplicate.clone()).unwrap_err();
+        assert!(direct.to_string().contains("duplicate field"), "{direct}");
+        for input in [duplicate.clone(), json!([duplicate])] {
+            let message = serde_json::from_value::<NoteFences>(input)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("duplicate field"), "{message}");
+            assert!(message.contains("expected_version"), "{message}");
+        }
+    }
+    let unknown = json!({
+        "kind":"head", "key":"fence/serde", "expected_version":null, "extra":true
+    });
+    for input in [unknown.clone(), json!([unknown])] {
+        let message = serde_json::from_value::<NoteFences>(input)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("unknown field"), "{message}");
+        assert!(message.contains("extra"), "{message}");
+    }
+    for input in [
+        json!(null),
+        json!([null]),
+        json!([]),
+        json!(true),
+        json!("fence"),
+    ] {
+        let message = serde_json::from_value::<NoteFences>(input)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("fence"), "{message}");
+        assert!(!message.contains("Shape"), "{message}");
+        assert!(!message.contains("untagged enum"), "{message}");
+    }
+}
+
+#[test]
+fn absence_fence_conflict_keeps_canonical_details_and_version_cas_shape() {
+    use crate::note_write::NoteWriteConflict;
+
+    for index in [None, Some(0)] {
+        for member in [None, Some(2)] {
+            let error = NoteWriteConflict::Fence {
+                key: "fence/serde".into(),
+                expected: None,
+                current: Some(3),
+                index,
+            }
+            .into_error_at_member(member);
+            let details = serde_json::to_value(error.details().unwrap()).unwrap();
+            let mut expected = json!({
+                "reason":"fence_conflict", "key":"fence/serde",
+                "expected_version":"absent", "current_version":"3"
+            });
+            if let Some(index) = index {
+                expected["index"] = json!(index.to_string());
+            }
+            if let Some(member) = member {
+                expected["member"] = json!(member.to_string());
+            }
+            assert_eq!(details, expected);
+        }
+    }
+    let error = NoteWriteConflict::Version {
+        expected: 1,
+        current: 2,
+    }
+    .into_error();
+    assert_eq!(
+        serde_json::to_value(error.details().unwrap()).unwrap(),
+        json!({"reason":"version_conflict", "expected_version":"1", "current_version":"2"})
+    );
+}
+
+#[test]
 fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
     use crate::note_write::NoteFences;
 
@@ -26,7 +181,7 @@ fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
         .map(|index| NoteFence {
             key: format!("fence-cap/{index}"),
             kind: "head".into(),
-            expected_version: 1,
+            expected_version: Some(1),
         })
         .collect();
     let at_cap = NoteFences::Many(entries.clone());
@@ -37,12 +192,12 @@ fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
     over_cap.push(NoteFence {
         key: "fence-cap/100".into(),
         kind: "head".into(),
-        expected_version: 1,
+        expected_version: Some(1),
     });
     for malformed in [false, true] {
         let mut entries = over_cap.clone();
         if malformed {
-            entries[0].expected_version = 0;
+            entries[0].expected_version = Some(0);
         }
         let fences = NoteFences::Many(entries);
         let error = fences.validate().unwrap_err();
@@ -114,6 +269,102 @@ async fn ordered_fences_observe_prior_write_in_same_transaction() {
                 .unwrap()
                 .unwrap(),
             note
+        );
+    }
+}
+
+#[tokio::test]
+async fn absence_fence_observes_prior_create_in_same_transaction_and_rolls_back() {
+    use crate::atomic_message::{AtomicNoteOptions, AtomicNoteSpec};
+    use crate::note_create::{prepare_note_create, KeyPublication};
+    use crate::note_write::NoteFences;
+
+    for listed in [false, true] {
+        let (runtime, token, _) = fixture();
+        let target = create(&runtime, &token, "absence/target", None).await;
+        let (mut prepared, _) = prepare_note_create(
+            &runtime,
+            AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "head",
+                name: None,
+                content: "{}",
+                properties: None,
+            },
+            AtomicNoteOptions {
+                key: Some("absence/holder"),
+                embed: Some(false),
+                ..Default::default()
+            },
+            &[],
+            KeyPublication::AtInsert,
+        )
+        .await
+        .unwrap();
+        let holder_id = prepared.notes[0].id;
+        let fence = NoteFence {
+            key: "absence/holder".into(),
+            kind: "head".into(),
+            expected_version: None,
+        };
+        let mut update = patch("{\"changed\":true}", 1, None);
+        update.write_options.fence = Some(if listed {
+            NoteFences::Many(vec![fence])
+        } else {
+            fence.into()
+        });
+        let (_, target_plan) = runtime
+            .prepare_versioned_note_update(&token, target.clone(), update.clone())
+            .await
+            .unwrap();
+        let target_op_index = prepared.plans.len();
+        prepared.plans.push(AtomicOpPlan::Update(target_plan));
+        let outcome = run_atomic_unit(runtime.sql().as_ref(), prepared.plans)
+            .await
+            .unwrap();
+        let AtomicRunOutcome::RolledBack {
+            failed_op_index,
+            failure: crate::atomic_runner::AtomicOpFailure::NoteConflict(conflict),
+            ..
+        } = outcome
+        else {
+            panic!("absence fence must see the earlier create and roll back: {outcome:?}");
+        };
+        assert_eq!(failed_op_index, target_op_index);
+        let details = serde_json::to_value(conflict.into_error().details().unwrap()).unwrap();
+        let mut expected = json!({
+            "reason":"fence_conflict", "key":"absence/holder",
+            "expected_version":"absent", "current_version":"1"
+        });
+        if listed {
+            expected["index"] = json!("0");
+        }
+        assert_eq!(details, expected);
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(holder_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(target.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            runtime
+                .update_note(&token, target.id, update)
+                .await
+                .unwrap()
+                .version,
+            2
         );
     }
 }
@@ -472,7 +723,7 @@ async fn version_fence_and_prior_operation_roll_back_together() {
             NoteFence {
                 key: key.into(),
                 kind: "head".into(),
-                expected_version: expected,
+                expected_version: Some(expected),
             }
             .into(),
         );
@@ -509,7 +760,7 @@ async fn version_fence_and_prior_operation_roll_back_together() {
         NoteFence {
             key: fence.key.clone().unwrap(),
             kind: "head".into(),
-            expected_version: 1,
+            expected_version: Some(1),
         }
         .into(),
     );

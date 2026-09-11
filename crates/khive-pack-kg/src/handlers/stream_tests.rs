@@ -57,6 +57,197 @@ fn fence(key: &str, version: i64) -> Value {
     json!({"key":key, "kind":"head", "expected_version":version})
 }
 
+fn fence_version_field(key: &str, field: &str, version: Value) -> Value {
+    let mut member = json!({"key":key, "kind":"head"});
+    member[field] = version;
+    member
+}
+
+async fn absence_fence_subject(registry: &VerbRegistry, state: &str) {
+    if state == "missing" {
+        return;
+    }
+    let subject = lease(registry, "lease/absence").await;
+    for version in 1..3 {
+        registry
+            .dispatch(
+                "update",
+                json!({"id":subject["id"], "content":json!({"held":version}).to_string(), "expected_version":version}),
+            )
+            .await
+            .unwrap();
+    }
+    if state == "soft_deleted" {
+        registry
+            .dispatch("delete", json!({"id":subject["id"]}))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn absence_fences_match_aliases_on_single_write_surfaces() {
+    for verb in ["create", "update", "stream.append"] {
+        for listed in [false, true] {
+            for state in ["missing", "live", "soft_deleted"] {
+                let mut outcomes = Vec::new();
+                for field in ["expected_version", "version"] {
+                    let (rt, registry) = surface();
+                    lease(&registry, "lease/guard").await;
+                    absence_fence_subject(&registry, state).await;
+                    let target = lease(&registry, "write/target").await;
+                    let absent = fence_version_field("lease/absence", field, Value::Null);
+                    let fences = if listed {
+                        json!([fence("lease/guard", 1), absent])
+                    } else {
+                        absent
+                    };
+                    let args = match verb {
+                        "create" => {
+                            json!({"kind":"head", "key":"write/created", "content":"{\"written\":true}", "fence":fences})
+                        }
+                        "update" => {
+                            json!({"id":target["id"], "content":"{\"written\":true}", "expected_version":1, "fence":fences})
+                        }
+                        _ => {
+                            json!({"stream":"absence-target", "record":{"written":true}, "fence":fences})
+                        }
+                    };
+                    let before = population(&rt).await;
+                    let result = registry.dispatch(verb, args).await;
+                    if state == "live" {
+                        let error = reason(result.unwrap_err(), "fence_conflict");
+                        let mut details = json!({"reason":"fence_conflict", "key":"lease/absence", "expected_version":"absent", "current_version":"3"});
+                        if listed {
+                            details["index"] = json!("1");
+                        }
+                        assert_eq!(error["details"], details, "{verb} {field} list={listed}");
+                        assert_eq!(population(&rt).await, before);
+                        let after = registry
+                            .dispatch("get", json!({"id":target["id"]}))
+                            .await
+                            .unwrap();
+                        assert_eq!(after["version"], target["version"]);
+                        assert_eq!(after["content"], target["content"]);
+                        assert_eq!(heads(&registry, &["absence-target"]).await, vec![0]);
+                        outcomes.push(error["details"].clone());
+                    } else {
+                        let result = result.unwrap_or_else(|error| {
+                            panic!("{verb} {field} {state} list={listed}: {error}")
+                        });
+                        let outcome = if verb == "stream.append" {
+                            assert_eq!(result["seq"], 1);
+                            let read = registry
+                                .dispatch("stream.read", json!({"stream":"absence-target"}))
+                                .await
+                                .unwrap();
+                            assert_eq!(read["entries"][0]["record"], json!({"written":true}));
+                            json!({"seq":result["seq"], "record":read["entries"][0]["record"]})
+                        } else {
+                            let id = if verb == "update" {
+                                &target["id"]
+                            } else {
+                                &result["id"]
+                            };
+                            let after = registry.dispatch("get", json!({"id":id})).await.unwrap();
+                            assert_eq!(after["version"], if verb == "update" { 2 } else { 1 });
+                            assert_eq!(after["content"], "{\"written\":true}");
+                            json!({"version":after["version"], "content":after["content"]})
+                        };
+                        outcomes.push(outcome);
+                    }
+                }
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "canonical and alias: {verb} {state} list={listed}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fence_version_presence_and_invalid_fields_refuse_before_single_writes() {
+    let (rt, registry) = surface();
+    let target = lease(&registry, "write/target").await;
+    let mut invalid = vec![
+        ("missing", json!({"key":"lease/absence", "kind":"head"})),
+        (
+            "duplicate_alias",
+            json!({"key":"lease/absence", "kind":"head", "expected_version":null, "version":null}),
+        ),
+        (
+            "unknown",
+            json!({"key":"lease/absence", "kind":"head", "expected_version":null, "extra":true}),
+        ),
+    ];
+    for field in ["expected_version", "version"] {
+        for value in [
+            json!(0),
+            json!(-1),
+            json!("1"),
+            json!(1.5),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            invalid.push((
+                "invalid_version",
+                fence_version_field("lease/absence", field, value),
+            ));
+        }
+    }
+    for (case, member) in invalid {
+        for listed in [false, true] {
+            let fences = if listed {
+                json!([member])
+            } else {
+                member.clone()
+            };
+            for (verb, args) in [
+                (
+                    "create",
+                    json!({"kind":"head", "key":"write/created", "content":"new", "fence":fences}),
+                ),
+                (
+                    "update",
+                    json!({"id":target["id"], "content":"changed", "fence":fences}),
+                ),
+                (
+                    "stream.append",
+                    json!({"stream":"invalid-absence", "record":true, "fence":fences}),
+                ),
+            ] {
+                let before = population(&rt).await;
+                let error = registry.dispatch(verb, args).await.unwrap_err();
+                let RuntimeError::InvalidInput(message) = error else {
+                    panic!("{verb} {case}: {error:?}")
+                };
+                assert!(message.contains("fence"), "{verb} {case}: {message}");
+                assert!(
+                    !message.contains("Shape") && !message.contains("untagged enum"),
+                    "{message}"
+                );
+                if case == "missing" {
+                    assert!(
+                        message
+                            .contains("fence requires expected_version (positive integer or null)"),
+                        "{message}"
+                    );
+                }
+                assert_eq!(population(&rt).await, before, "{verb} {case}");
+                let after = registry
+                    .dispatch("get", json!({"id":target["id"]}))
+                    .await
+                    .unwrap();
+                assert_eq!(after["version"], target["version"]);
+                assert_eq!(after["content"], target["content"]);
+            }
+        }
+    }
+    assert_eq!(heads(&registry, &["invalid-absence"]).await, vec![0]);
+}
+
 #[tokio::test]
 async fn ordered_fences_commit_objects_and_lists_on_notes_and_streams() {
     let (_, registry) = surface();

@@ -138,9 +138,35 @@ To reconcile a lost reply, retry the same `expected_seq`. On conflict, read
 chain (`|`) preserves caller order; a request array gives dense numbers in writer
 admission order, which need not be array order.
 
-A supplied `fence`, including null, is refused until the later slice with
-versioned leases. This slice adds no lease fence, batch verb, retention, drop,
-subscription or protocol version change.
+`stream.append`, singleton note `create`/`update`, and `stream.batch` append
+members accept a `fence` object `{key, kind, expected_version}` or a non-empty
+ordered list of at most 100 distinct `(kind, key)` objects. Each entry requires
+`expected_version`: an integer at least 1 asserts the live holder's exact version
+in the write namespace; explicit null asserts that no live note holds that
+`(kind, key)`. Missing and soft-deleted notes satisfy an absence assertion.
+`version` is accepted as an input alias instead of `expected_version`; supplying
+both names, omitting both, or supplying unknown fields is invalid. Serialization
+always emits `expected_version`, including an explicit null for absence.
+
+Fences are checked in order in the same writer transaction as the write. A
+mismatch returns `fence_conflict`; an absence conflict carries string-valued
+`expected_version="absent"` and the live `current_version`. List refusals also
+carry a zero-based string `index`. Oversized lists are rejected with
+`invalid_input` naming the cap and count sent before entry interpretation or
+writer admission. Empty lists, duplicate `(kind, key)` entries and outer
+`fence:null` are invalid on these surfaces.
+
+The batch-wide `stream.batch(fence=...)` accepts one object with the same entry
+contract, not a list. An object selects atomic mode and is checked before the
+first member writes; `atomic=false` beside it is invalid. Unlike the single-write
+and append-member surfaces, top-level `stream.batch(fence=null)` means no fence
+and does not select atomic mode. Append-member fences are checked before any
+member writes in their transaction; an atomic member refusal also carries its
+string `member` position.
+
+`stream.batch(observed=...)` is unchanged: each observation still requires its
+`version` field, with no `expected_version` alias. Its optional `id` and
+`live_until` contracts do not apply to fence objects; fences add no expiry check.
 
 ```text
 request(ops='stream.append(stream="run", record={"step":1}, expected_seq=1)', presentation="verbose")

@@ -10,20 +10,56 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 /// Each fence adds a keyed read while holding the writer, like a batch observation.
 pub const MAX_NOTE_FENCES: usize = 100;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct NoteFence {
     pub key: String,
     pub kind: String,
-    pub expected_version: i64,
+    /// None asserts absence; the JSON field is still required.
+    pub expected_version: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for NoteFence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            key: String,
+            kind: String,
+            #[serde(alias = "version")]
+            expected_version: Option<i64>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // Option alone treats omission as null. Absence must be asserted explicitly.
+        if value.get("expected_version").is_none() && value.get("version").is_none() {
+            return Err(serde::de::Error::custom(
+                "fence requires expected_version (positive integer or null)",
+            ));
+        }
+        let fields = Fields::deserialize(value).map_err(|error| {
+            serde::de::Error::custom(format!(
+                "fence requires expected_version (positive integer or null): {error}"
+            ))
+        })?;
+        Ok(Self {
+            key: fields.key,
+            kind: fields.kind,
+            expected_version: fields.expected_version,
+        })
+    }
 }
 
 impl NoteFence {
     pub fn validate(&self) -> RuntimeResult<()> {
         crate::keyed_memory::validate_memory_key(&self.key)?;
-        if self.kind.is_empty() || self.expected_version < 1 {
+        if self.kind.is_empty() {
             return Err(RuntimeError::InvalidInput(
-                "fence requires a note kind and a positive expected_version".into(),
+                "fence requires a note kind".into(),
+            ));
+        }
+        if self.expected_version.is_some_and(|version| version < 1) {
+            return Err(RuntimeError::InvalidInput(
+                "fence requires expected_version (positive integer or null)".into(),
             ));
         }
         Ok(())
@@ -83,19 +119,26 @@ impl NoteFences {
 
 impl<'de> Deserialize<'de> for NoteFences {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Shape {
-            One(NoteFence),
-            Many(Vec<NoteFence>),
-        }
         let value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(entries) = value.as_array() {
-            Self::validate_count(entries.len()).map_err(serde::de::Error::custom)?;
-        }
-        let fences = match Shape::deserialize(value).map_err(serde::de::Error::custom)? {
-            Shape::One(fence) => Self::One(fence),
-            Shape::Many(fences) => Self::Many(fences),
+        let fences = match value {
+            serde_json::Value::Object(_) => {
+                Self::One(NoteFence::deserialize(value).map_err(serde::de::Error::custom)?)
+            }
+            serde_json::Value::Array(entries) => {
+                Self::validate_count(entries.len()).map_err(serde::de::Error::custom)?;
+                let mut fences = Vec::with_capacity(entries.len());
+                for (index, entry) in entries.into_iter().enumerate() {
+                    fences.push(NoteFence::deserialize(entry).map_err(|error| {
+                        serde::de::Error::custom(format!("fence entry {index}: {error}"))
+                    })?);
+                }
+                Self::Many(fences)
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "fence requires an object or a non-empty list of objects with key, kind and expected_version (positive integer or null)",
+                ));
+            }
         };
         fences.validate().map_err(serde::de::Error::custom)?;
         Ok(fences)
@@ -247,7 +290,7 @@ pub enum NoteWriteConflict {
     },
     Fence {
         key: String,
-        expected: i64,
+        expected: Option<i64>,
         current: Option<i64>,
         index: Option<usize>,
     },
@@ -281,7 +324,10 @@ impl NoteWriteConflict {
                 let mut fields = vec![
                     ("reason", "fence_conflict".into()),
                     ("key", key),
-                    ("expected_version", expected.to_string()),
+                    (
+                        "expected_version",
+                        expected.map_or_else(|| "absent".into(), |version| version.to_string()),
+                    ),
                 ];
                 if let Some(current) = current {
                     fields.push(("current_version", current.to_string()));
@@ -338,7 +384,7 @@ impl NoteWriteGuard {
                     ))
                 }
             };
-            if current != Some(fence.expected_version) {
+            if current != fence.expected_version {
                 return Ok(Some(NoteWriteConflict::Fence {
                     key: fence.key.clone(),
                     expected: fence.expected_version,
