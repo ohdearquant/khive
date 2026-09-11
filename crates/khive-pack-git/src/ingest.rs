@@ -2677,12 +2677,29 @@ fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
 /// crates/khive-pack-git/docs/api/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
 const PAGE_LIMIT: usize = 1000;
 
+fn page_fetch_limit(budget: &Budget, checkpoint: &PageCheckpoint, floor: Option<&str>) -> usize {
+    let Some(remaining) = budget.remaining else {
+        return PAGE_LIMIT;
+    };
+    // Inclusive queries replay acknowledged rows for free. Reserve room for
+    // those rows so even a one-visit budget can reach an unseen timestamp tie.
+    let boundary_replays = if checkpoint.floor.as_deref() == floor {
+        checkpoint.at_floor.len()
+    } else {
+        0
+    };
+    (remaining.min(PAGE_LIMIT as u64) as usize)
+        .saturating_add(boundary_replays)
+        .saturating_add(checkpoint.undated.len())
+        .min(PAGE_LIMIT)
+}
+
 /// What a paging loop should do after processing one fetched page — the
 /// entire "was the remote window proven exhausted" decision lives here. See
 /// crates/khive-pack-git/docs/api/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PageOutcome {
-    /// Page held fewer than `PAGE_LIMIT` items: remote window proven exhausted.
+    /// Page held fewer than the requested limit: remote window proven exhausted.
     WindowComplete,
     /// Page was full and the local budget is exhausted: stop, not proven exhausted.
     StopBudgetExhausted,
@@ -2694,11 +2711,12 @@ enum PageOutcome {
 
 fn decide_page_outcome(
     page_len: usize,
+    requested_limit: usize,
     current_floor: Option<&str>,
     last_updated_at: Option<&str>,
     budget_exhausted: bool,
 ) -> PageOutcome {
-    if page_len < PAGE_LIMIT {
+    if page_len < requested_limit {
         return PageOutcome::WindowComplete;
     }
     if budget_exhausted {
@@ -2727,8 +2745,14 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-fn fetch_pr_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhPr>> {
+fn fetch_pr_page(
+    repo: &Path,
+    gh_repo: &str,
+    floor: Option<&str>,
+    limit: usize,
+) -> Result<Vec<GhPr>> {
     let search = search_query(floor);
+    let limit = limit.to_string();
     let raw = gh_json(
         repo,
         gh_repo,
@@ -2740,7 +2764,7 @@ fn fetch_pr_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<
             "--search",
             search.as_str(),
             "--limit",
-            "1000",
+            &limit,
             "--json",
             PR_FIELDS,
         ],
@@ -2748,8 +2772,14 @@ fn fetch_pr_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<
     serde_json::from_str(&raw).context("parsing gh pr list --json")
 }
 
-fn fetch_issue_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhIssue>> {
+fn fetch_issue_page(
+    repo: &Path,
+    gh_repo: &str,
+    floor: Option<&str>,
+    limit: usize,
+) -> Result<Vec<GhIssue>> {
     let search = search_query(floor);
+    let limit = limit.to_string();
     let raw = gh_json(
         repo,
         gh_repo,
@@ -2761,7 +2791,7 @@ fn fetch_issue_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<V
             "--search",
             search.as_str(),
             "--limit",
-            "1000",
+            &limit,
             "--json",
             ISSUE_FIELDS,
         ],
@@ -2890,7 +2920,8 @@ async fn ingest_prs(
         // leaving the loop before the window completes IS stopping early,
         // and the arms below specialize the reason when they fire.
         let first_page = report.sources.pull_requests.is_none();
-        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref()) {
+        let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
+        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref(), requested_limit) {
             Ok(page) => {
                 if first_page {
                     report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
@@ -3061,6 +3092,7 @@ async fn ingest_prs(
         write_page_checkpoint(runtime, project_id, "prs", &checkpoint).await?;
         match decide_page_outcome(
             page_len,
+            requested_limit,
             floor.as_deref(),
             last_updated_at.as_deref(),
             budget.exhausted(),
@@ -3169,7 +3201,8 @@ async fn ingest_issues(
         // the walk-start marker also pre-seeds the stopped-early state that
         // leaving the loop early implies.
         let first_page = report.sources.issues.is_none();
-        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref()) {
+        let requested_limit = page_fetch_limit(budget, &checkpoint, floor.as_deref());
+        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref(), requested_limit) {
             Ok(page) => {
                 if first_page {
                     report.sources.issues = Some(IngestSourceState::StoppedEarly(
@@ -3336,6 +3369,7 @@ async fn ingest_issues(
         write_page_checkpoint(runtime, project_id, "issues", &checkpoint).await?;
         match decide_page_outcome(
             page_len,
+            requested_limit,
             floor.as_deref(),
             last_updated_at.as_deref(),
             budget.exhausted(),
@@ -3408,15 +3442,46 @@ mod paging_tests {
     }
 
     #[test]
+    fn fetch_limit_reserves_only_replayed_boundaries_and_caps_unbounded_budgets() {
+        let mut checkpoint = PageCheckpoint::new("local", Some("A".into()));
+        let budget = Budget { remaining: Some(1) };
+        assert_eq!(page_fetch_limit(&budget, &checkpoint, Some("A")), 1);
+        checkpoint.at_floor.insert(10, Uuid::nil());
+        checkpoint.at_floor.insert(20, Uuid::nil());
+        checkpoint.undated.insert(30, Uuid::nil());
+        assert_eq!(page_fetch_limit(&budget, &checkpoint, Some("A")), 4);
+        assert_eq!(page_fetch_limit(&budget, &checkpoint, Some("B")), 2);
+        for remaining in [None, Some(2000), Some(u64::MAX)] {
+            assert_eq!(
+                page_fetch_limit(&Budget { remaining }, &checkpoint, Some("A")),
+                PAGE_LIMIT
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_reduced_page_does_not_prove_remote_exhaustion() {
+        assert_eq!(
+            decide_page_outcome(1, 1, None, Some("A"), true),
+            PageOutcome::StopBudgetExhausted
+        );
+        assert_eq!(
+            decide_page_outcome(2, 3, Some("A"), Some("A"), false),
+            PageOutcome::WindowComplete
+        );
+    }
+
+    #[test]
     fn short_page_proves_window_complete_regardless_of_budget() {
-        let outcome = decide_page_outcome(42, None, Some("2024-01-01T00:00:00Z"), false);
+        let outcome =
+            decide_page_outcome(42, PAGE_LIMIT, None, Some("2024-01-01T00:00:00Z"), false);
         assert_eq!(outcome, PageOutcome::WindowComplete);
         assert!(page_outcome_proves_window_complete(outcome));
 
         // Even a page that runs out of budget mid-way is still a proof of
         // completeness if the page itself was short — the loop always
         // finishes sorting/processing the whole (short) page first.
-        let outcome = decide_page_outcome(0, None, None, true);
+        let outcome = decide_page_outcome(0, PAGE_LIMIT, None, None, true);
         assert_eq!(outcome, PageOutcome::WindowComplete);
     }
 
@@ -3428,28 +3493,28 @@ mod paging_tests {
     /// not proven exhausted just because the local budget wasn't hit.
     #[test]
     fn full_page_with_stalled_floor_is_not_window_complete_even_with_budget_left() {
-        let outcome = decide_page_outcome(PAGE_LIMIT, Some("X"), Some("X"), false);
+        let outcome = decide_page_outcome(PAGE_LIMIT, PAGE_LIMIT, Some("X"), Some("X"), false);
         assert_eq!(outcome, PageOutcome::StopFloorStalled);
         assert!(!page_outcome_proves_window_complete(outcome));
     }
 
     #[test]
     fn full_page_with_advancing_floor_and_budget_left_continues() {
-        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), false);
+        let outcome = decide_page_outcome(PAGE_LIMIT, PAGE_LIMIT, Some("A"), Some("B"), false);
         assert_eq!(outcome, PageOutcome::Continue("B".to_string()));
         assert!(!page_outcome_proves_window_complete(outcome));
     }
 
     #[test]
     fn full_page_with_exhausted_budget_stops_without_proving_completeness() {
-        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), true);
+        let outcome = decide_page_outcome(PAGE_LIMIT, PAGE_LIMIT, Some("A"), Some("B"), true);
         assert_eq!(outcome, PageOutcome::StopBudgetExhausted);
         assert!(!page_outcome_proves_window_complete(outcome));
     }
 
     #[test]
     fn full_page_with_no_updated_at_stalls_rather_than_looping_forever() {
-        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), None, false);
+        let outcome = decide_page_outcome(PAGE_LIMIT, PAGE_LIMIT, Some("A"), None, false);
         assert_eq!(outcome, PageOutcome::StopFloorStalled);
     }
 }
