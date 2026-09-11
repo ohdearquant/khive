@@ -681,3 +681,80 @@ between the ancestry answer and the swap; state that arm before running it, sinc
 without it says nothing about the property the verb exists for.
 
 Not in scope: deleting a ref, moving a tag, moving `HEAD`, and any ref outside `refs/heads/`.
+
+## Amendment 12 (2026-09-11): the git program the write surface runs is configuration
+
+The write surface spawns `git` by name and lets the process PATH resolve it. That is a decision
+nobody made, and it shows up in three places.
+
+**Operational.** `git.push` refuses `unsupported_toolchain` when the git it resolves does not
+advertise `reflog write`, which Amendment 6 requires. A host can carry two gits, an older one
+earlier on PATH and a newer one further down, and the write verbs are then unusable on a machine
+that has a perfectly good git installed. The only remedies available today are to change the
+environment of a long-lived daemon, which is a heavy and poorly audited act, or to drop the
+capability the marker depends on.
+
+**Testing.** The only way to reach the `unsupported_toolchain` arm is to replace the process PATH,
+because the program is resolved by name at spawn. Process environment is global to a test binary,
+so that case interferes with every other case in it that spawns git. Issue #2589 records this in
+the remote test binary and #2515 recorded it in another.
+
+**Contract.** The receipt already names `toolchain.git_version` and `toolchain.missing_capability`,
+so the surface already treats _which_ git ran as part of the record. It is not part of the
+configuration, so the record names something the operator cannot set.
+
+1. **`[git_write]` gains an optional `program`.** Its value is an absolute path to the git
+   executable the write surface runs.
+
+   ```toml
+   [git_write]
+   program = "/opt/homebrew/bin/git"
+   ```
+
+   A bare name is refused: it would reintroduce the PATH question this amendment exists to remove.
+   The program is never caller-supplied. No verb parameter selects it, the only input is
+   configuration, and every argv-hardening rule in ADR-108 and its amendments is unchanged.
+
+2. **Validated at config load, fail-closed.** `KhiveConfig::validate` refuses startup when
+   `program` is set and is not absolute, does not exist, or is not executable. Three distinct
+   refusals, each naming `git_write.program` and which of the three conditions failed. A configured
+   program that fails validation never falls back to PATH; a surface that silently falls back when
+   its configured program is wrong is the failure this amendment is written against.
+
+3. **Default unchanged.** With no `program`, the surface resolves `git` exactly as today, so no
+   existing deployment changes behaviour.
+
+4. **Recorded.** Where the receipt names `toolchain.git_version` it also names the program that
+   answered, so a reader can tell a host default from a configured one.
+
+5. **What this does not do.** It does not make the `reflog write` capability optional: a
+   configured program lacking it refuses exactly as an unconfigured one does, with the same reason
+   and the same receipt fields. It does not add a per-repository or per-actor program. It does not
+   change what any verb refuses.
+
+Acceptance arms:
+
+1. With no `program`, every existing arm passes unchanged and the resolved program is the one PATH
+   gives. Control: the same suite on a host carrying two gits on PATH resolves the first.
+2. `program` set to an absolute path to a git that advertises the capability: `git.push` succeeds on
+   a host whose PATH-first git does not. This is the arm the operational problem is about and the
+   one that cannot be faked, because the host has both binaries.
+3. `program` set to a wrapper that answers `--version` with an old version and refuses `reflog -h`:
+   `git.push` refuses `unsupported_toolchain`, the receipt names that version, and **the test
+   modifies no process environment**. This arm replaces the PATH mutation issue #2589 is about, and
+   moving that existing case onto this seam is part of the change rather than a follow-up.
+4. `program` not absolute, absent, or not executable: startup refuses naming `git_write.program` and
+   the reason. Three separate arms, since three different mistakes produce them.
+5. A caller parameter named `program` is rejected as an unknown field by every git verb taking a
+   repository, which is the control that keeps the input surface where this amendment puts it.
+
+Mutation expectation, stated before running: making the validator accept a relative path turns arm 4
+red and leaves arms 1 through 3 green. That separation is the reason the validation is specified
+apart from the resolution.
+
+Cost, so the size is not a surprise: the program has to reach the single place that builds the git
+command, a free function that today takes no configuration. The handlers already hold the git-write
+configuration, so the work is carrying it one layer further, through the in-crate helpers and their
+call sites. It is mechanical and it is not small. It is also the reason a global is excluded: a
+static or a process env var would reintroduce exactly the defect this amendment removes and would
+make arm 3 impossible to write.
