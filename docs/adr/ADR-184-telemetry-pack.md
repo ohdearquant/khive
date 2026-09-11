@@ -118,6 +118,13 @@ outcome = "recorded"   the event is in the log; seq is present and is its dense 
 ```
 
 - `seq` is present **if and only if** `outcome == "recorded"` and `carrier == "durable"`.
+- `receipt_id` names the persisted stream record, and it is present **if and only if** there is one
+  to name: on a durable `recorded` outcome it is that record's id, and it is `null` on `dropped` and
+  on `unknown`. The signature writes it unconditionally because, like `outcome`, its absence must
+  never be the thing a reader interprets. `unknown` is the case the rule exists for: the append may
+  have committed, so a non-null id there would assert a record the verb cannot see, and a caller
+  re-reading to resolve an indeterminate outcome must go by the identity it sent rather than by a
+  receipt it was handed. `dropped` is simpler, because nothing was written under either carrier.
 - `error` is present **if and only if** the result was not the configured behaviour: always for
   `outcome == "unknown"`, and for a `dropped` on a durable channel, which is a refusal and has a
   reason. It is the original structured error, unmodified. The failure path writes it; it is never
