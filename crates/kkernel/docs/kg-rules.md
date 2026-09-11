@@ -57,6 +57,12 @@ Seven structural checks run unconditionally before configurable rules and cannot
 
 When `notes.ndjson` is present, an eighth **valid note kinds** check runs at `error` severity against the note-kind taxonomy merged from all registered packs. The optional file's absence does not add that rule to the report.
 
+The JSON summary includes `empty`: true when no nonblank records were read from entities,
+edges, or optional notes. This is independent of `passed`: readable empty inputs are
+structurally valid, while missing or unreadable inputs still fail validation. Consumers
+requiring a nonempty graph should also check `summary.empty`. Text output labels an empty
+graph in the summary, and GitHub output emits a notice.
+
 ## CLI Options
 
 ```

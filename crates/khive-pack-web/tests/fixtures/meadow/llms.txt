@@ -1,0 +1,11 @@
+# Meadow Archive
+
+> A fictional archive for exploring meadow plants and seasonal observations.
+
+```yaml
+version: "1.0"
+profile: "ARW-3"
+site:
+  name: "Meadow Archive"
+  homepage: "https://meadow.invalid"
+```

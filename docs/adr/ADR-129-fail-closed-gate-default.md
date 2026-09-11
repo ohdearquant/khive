@@ -13,7 +13,7 @@
   invariant with store-held caller grants and hierarchical subactor identity,
   delivering per-caller differentiation in per-view form
 
-> **Implementation status (2026-08-18):** This accepted staged design is
+> **Implementation status (2026-08-30):** This accepted staged design is
 > partially shipped. Stage 1a has landed: every `Gate::check` call-site in
 > `khive-runtime` — both `dispatch_with_identity` and
 > `dispatch_intercepted_with_identity` — now treats a `GateError` as a
@@ -21,12 +21,13 @@
 > pack handler, and the caller-visible `reason` on that refusal is a stable
 > classification derived from the `GateError` variant, never the gate
 > backend's own error text (which may embed connection details or
-> credentials and stays in the server-side log only). Stage 1b through
-> Stage 2 remain unshipped: the current runtime default is still
-> `AllowAllGate`, and the ADR-143 store-held caller-grant model has not been
-> implemented. Because silently accepting Amendment 2's now-superseded
-> `[gate]` roster would claim enforcement that does not exist, this build
-> rejects every `[gate]` table at configuration load. This note records
+> credentials and stays in the server-side log only). A static compatibility
+> `[gate]` roster is also shipped and enforced: exact `granted_actors` plus
+> the independent `grant_unattributed` flag install a fail-closed enrollment
+> gate when the table is present. Stage 1b through Stage 2 remain unshipped:
+> the current runtime default is still `AllowAllGate`, and the ADR-143
+> store-held caller-grant model has not been implemented. The static roster is
+> read on every boot rather than imported once. This note records
 > implementation state only; it does not change the accepted fail-closed
 > decision or ADR-143's superseding design.
 

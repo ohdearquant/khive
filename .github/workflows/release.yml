@@ -10,7 +10,8 @@ name: Release
 # workflow today.
 #
 # Builds Rust binaries per-platform, publishes each khive-kernel-{platform}
-# npm subpackage, then publishes the umbrella khive package.
+# npm subpackage, publishes the umbrella khive package, then publishes its
+# exact-version @khive-ai/cli compatibility alias.
 #
 # Per ADR-026 §"Atomic release semantics": all subpackage publishes must
 # succeed before the umbrella publishes. This is enforced by separating the
@@ -21,8 +22,8 @@ name: Release
 #     artifact. No `npm publish` happens here.
 #
 #   Phase 2 (publish-all, single job): downloads all six platform artifacts,
-#     updates versions, publishes the six subpackages, then publishes the
-#     umbrella — in a single sequential job. If any subpackage publish fails,
+#     updates versions, publishes the six subpackages, the umbrella, then the
+#     dependent CLI alias — in a single sequential job. If any subpackage publish fails,
 #     the umbrella is never published. Because publishing is serialised in one
 #     job, partial failure cannot leave mismatched versions permanently on the
 #     registry (any already-published subpackage can be unpublished within 72h
@@ -181,7 +182,7 @@ jobs:
           exclude: ${{ steps.semver-excludes.outputs.list }}
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Phase 2: Publish all subpackages + umbrella atomically in a single job.
+  # Phase 2: Publish all subpackages + umbrella + CLI alias in a single job.
   # Runs only after ALL Phase 1 jobs succeed (needs: build-platform with
   # fail-fast: true propagates any single failure here) and the release SemVer
   # gate passes.
@@ -225,13 +226,23 @@ jobs:
         run: |
           CARGO_VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/version = |"/,""); print; exit}' crates/Cargo.toml)
           NPM_VERSION=$(node -p "require('./npm/package.json').version")
-          echo "inputs.version=${VERSION} crates/Cargo.toml=${CARGO_VERSION} npm/package.json=${NPM_VERSION}"
+          ALIAS_VERSION=$(node -p "require('./npm/cli-alias/package.json').version")
+          ALIAS_KHIVE_VERSION=$(node -p "require('./npm/cli-alias/package.json').dependencies.khive")
+          echo "inputs.version=${VERSION} crates/Cargo.toml=${CARGO_VERSION} npm/package.json=${NPM_VERSION} npm/cli-alias=${ALIAS_VERSION} alias-khive=${ALIAS_KHIVE_VERSION}"
           if [ "$VERSION" != "$CARGO_VERSION" ]; then
             echo "::error::Dispatch version ${VERSION} does not match crates/Cargo.toml workspace version ${CARGO_VERSION}"
             exit 1
           fi
           if [ "$VERSION" != "$NPM_VERSION" ]; then
             echo "::error::Dispatch version ${VERSION} does not match npm/package.json version ${NPM_VERSION}"
+            exit 1
+          fi
+          if [ "$VERSION" != "$ALIAS_VERSION" ]; then
+            echo "::error::Dispatch version ${VERSION} does not match npm/cli-alias/package.json version ${ALIAS_VERSION}"
+            exit 1
+          fi
+          if [ "$VERSION" != "$ALIAS_KHIVE_VERSION" ]; then
+            echo "::error::@khive-ai/cli depends on khive ${ALIAS_KHIVE_VERSION}, expected ${VERSION}"
             exit 1
           fi
 
@@ -322,6 +333,26 @@ jobs:
 
       - name: Publish khive (umbrella)
         working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # The alias carries an exact-version dependency on the umbrella, so it
+      # must be rewritten and published only after khive@VERSION is available.
+      - name: Set CLI alias version and khive dependency
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/cli-alias/package.json'));
+            pkg.version = process.env.VERSION;
+            pkg.dependencies.khive = process.env.VERSION;
+            fs.writeFileSync('npm/cli-alias/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Publish @khive-ai/cli (compatibility alias)
+        working-directory: npm/cli-alias
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

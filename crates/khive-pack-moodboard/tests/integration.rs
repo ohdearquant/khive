@@ -40,7 +40,7 @@ fn core_and_moodboard_runtimes() -> (KhiveRuntime, KhiveRuntime) {
     let secondary_backend = make_backend();
     let mut config = RuntimeConfig::no_embeddings();
     config.packs = vec!["kg".to_string(), "moodboard".to_string()];
-    config.backend_id = BackendId::new("moodboard");
+    config.backend_id = BackendId::parse("moodboard").expect("valid backend id");
     let moodboard =
         KhiveRuntime::from_backend(secondary_backend, config).with_core_backend(main_backend);
     let core = moodboard.core();

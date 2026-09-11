@@ -69,6 +69,8 @@ async fn plant_inbound_message(
 
     let id = Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: "local".into(),
         kind: "message".into(),
@@ -117,6 +119,8 @@ async fn plant_inbound_message_in_namespace(
 
     let id = Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: namespace.to_string(),
         kind: "message".into(),
@@ -514,6 +518,8 @@ async fn probe_ignores_outbound_messages() {
         .expect("authorize local namespace");
     let store = rt.notes(&token).expect("notes store");
     let note = Note {
+        version: 1,
+        key: None,
         id: Uuid::new_v4(),
         namespace: "local".into(),
         kind: "message".into(),
@@ -1009,6 +1015,8 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // Reopen through the normal runtime boot path -- this runs
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1024,6 +1032,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
@@ -1195,6 +1204,8 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // `run_migrations` to latest (including V8's forward repair) and the
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1210,6 +1221,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 

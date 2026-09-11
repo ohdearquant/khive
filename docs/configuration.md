@@ -40,23 +40,71 @@ env pair (or built-in defaults), and storage falls back to the single-file
 A malformed file at whichever tier is found is always an error. A parse
 failure is never silently skipped in favor of a lower tier.
 
-### Authorization configuration is reserved
+### Caller enrollment gate
 
-The current runtime does not expose an operator `[gate]` configuration
-surface. Any present `[gate]` table, including an empty one, is rejected during
-startup. This is deliberate: accepting caller-enrollment keys that the runtime
-does not enforce would give operators a false authorization boundary.
+An optional `[gate]` table installs khive's built-in static caller-enrollment
+policy at the runtime authorization seam:
 
-The accepted authorization direction remains ADR-129's fail-closed gate and
-ADR-143's store-held caller grants. ADR-143 supersedes a steady-state
-configuration roster; its one-time legacy import is not implemented in this
-build. Until that store-held model ships, do not add `[gate]` to `khive.toml`.
-Embedders can still install a `Gate` implementation programmatically through
-`RuntimeConfig::gate`.
+```toml
+[gate]
+granted_actors = ["lambda:khive", "service:indexer"]
+grant_unattributed = false
+```
+
+`granted_actors` is an exact allowlist of resolved actor ids. Every entry must
+be a valid namespace spelling and duplicate entries have no additional effect.
+`grant_unattributed` independently controls the implicit anonymous/local
+caller; an entry named `local` in `granted_actors` does not enroll that caller.
+An actor absent from the list receives a typed authorization denial. An
+explicit empty `[gate]` table therefore denies every caller, while omitting the
+table preserves the gate supplied by the composition root (the current
+`RuntimeConfig` default is still `AllowAllGate`).
+
+The table is closed because it is security-sensitive: unknown or misspelled
+keys fail startup rather than being ignored. The policy is also part of the
+MCP daemon configuration fingerprint, so clients cannot silently reuse a
+daemon started with a different roster.
+
+This is a live, static compatibility policy, read on every boot. It does not
+implement ADR-143's accepted store-held caller grants, mutation surface, or
+one-time import epoch. Those remain separate future work; until they ship,
+changing these keys and restarting changes the active enrollment policy.
+Embedders may instead install another `Gate` implementation programmatically
+through `RuntimeConfig::gate` when `[gate]` is absent.
 
 (Source: `KhiveConfig::load_with_home_fallback` and the inner
 `load_with_roots`, `crates/khive-runtime/src/engine_config.rs`, the `load`
 family starting around line 298.)
+
+### Brain read scope
+
+Brain event counts, profile resolution, and binding listing default to the
+authorized caller's actor scope. An explicit foreign `actor` must be in the
+caller's visible namespace set; adding a visible namespace does not widen the
+default actor scope.
+
+The optional `[brain]` table grants selected actor ids permission to request
+aggregate event counts:
+
+```toml
+[brain]
+fleet_readers = []
+# To permit a named aggregate reader instead:
+# fleet_readers = ["service:metrics"]
+```
+
+`fleet_readers` is a list of strings (`Vec<String>`), defaulting to empty when the
+table or key is absent. Entries are exact actor ids, not display names, namespace
+patterns, or stored event actor prefixes. The empty list grants no caller access
+to `brain.event_counts(all_actors=true)`. A listed caller must still explicitly
+request `all_actors=true`; its ordinary requests remain scoped to itself.
+
+The serving process's resolved configuration controls this permission. Changing a
+client-local list does not grant access on an already-running daemon. Unknown keys
+inside `[brain]` fail startup. This setting does not enroll callers with the Gate,
+widen their namespace visibility, or grant an aggregate mode to profile resolution
+or binding listing. See the [brain API reference](guide/api-reference.md#brainevent_counts--assertive)
+for actor-filter and anonymous-caller behavior.
 
 ### The naming wrinkle: `khive.toml` vs `config.toml`
 
@@ -110,12 +158,13 @@ path   = "~/.khive/khive.db"
 name   = "sessions"
 kind   = "sqlite"
 path   = "~/.khive/sessions.db"
+served_kinds = ["note", "event"]
 
 [packs.session]
 backend = "sessions"
 ```
 
-The full field reference (`name`, `kind`, `path`, `read_only`, and the
+The full field reference (`name`, `kind`, `path`, `served_kinds`, `read_only`, and the
 currently-rejected `cache_mb` / `journal_mode` fields) and the pack-routing
 model (which packs default to `main`, how a custom pack binds a backend, the
 `main`-backend requirement, canonical-path deduplication, and cross-backend

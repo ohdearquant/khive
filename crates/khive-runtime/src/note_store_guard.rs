@@ -42,8 +42,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_storage::{
-    BatchWriteSummary, DeleteMode, Note, NoteFilter, NoteStore, Page, PageRequest, SeekCursor,
-    SeekPage, StorageCapability, StorageError, StorageResult,
+    BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, Page, PageRequest,
+    SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -176,6 +176,28 @@ impl PolicyEnforcingNoteStore {
 
 #[async_trait]
 impl NoteStore for PolicyEnforcingNoteStore {
+    async fn get_live_notes_by_key(
+        &self,
+        namespace: &str,
+        key: &str,
+        kind: Option<&str>,
+    ) -> StorageResult<Vec<Note>> {
+        self.inner.get_live_notes_by_key(namespace, key, kind).await
+    }
+
+    async fn query_keyed_notes(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        prefix: &str,
+        after: Option<&khive_storage::note::NoteKeyCursor>,
+        page: PageRequest,
+    ) -> StorageResult<(Vec<Note>, Option<khive_storage::note::NoteKeyCursor>)> {
+        self.inner
+            .query_keyed_notes(namespace, filter, prefix, after, page)
+            .await
+    }
+
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
         reject_if_forged_message_note(&note, "upsert_note")?;
         self.inner.upsert_note(note).await
@@ -281,6 +303,17 @@ impl NoteStore for PolicyEnforcingNoteStore {
         self.inner.query_notes(namespace, kind, page).await
     }
 
+    async fn query_notes_count_free(
+        &self,
+        namespace: &str,
+        kind: Option<&str>,
+        page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        self.inner
+            .query_notes_count_free(namespace, kind, page)
+            .await
+    }
+
     async fn query_notes_filtered(
         &self,
         namespace: &str,
@@ -292,6 +325,17 @@ impl NoteStore for PolicyEnforcingNoteStore {
             .await
     }
 
+    async fn query_notes_filtered_count_free(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        page: PageRequest,
+    ) -> StorageResult<Page<Note>> {
+        self.inner
+            .query_notes_filtered_count_free(namespace, filter, page)
+            .await
+    }
+
     async fn count_notes_filtered_in_snapshot(
         &self,
         namespace: &str,
@@ -299,6 +343,17 @@ impl NoteStore for PolicyEnforcingNoteStore {
     ) -> StorageResult<Vec<u64>> {
         self.inner
             .count_notes_filtered_in_snapshot(namespace, filters)
+            .await
+    }
+
+    async fn count_notes_filtered_bounded_in_snapshot(
+        &self,
+        namespace: &str,
+        filters: &[NoteFilter],
+        cap: u32,
+    ) -> StorageResult<Vec<BoundedCount>> {
+        self.inner
+            .count_notes_filtered_bounded_in_snapshot(namespace, filters, cap)
             .await
     }
 

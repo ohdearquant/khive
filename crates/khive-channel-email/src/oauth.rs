@@ -162,7 +162,7 @@ impl TokenProvider {
             }
             Err(_) => {
                 drop(guard);
-                return Err(ChannelError::Auth(format!(
+                return Err(ChannelError::Transport(format!(
                     "OAuth2 token refresh timed out ({TOKEN_REFRESH_TIMEOUT:?})"
                 )));
             }
@@ -228,6 +228,22 @@ fn validate_token_response(resp: &TokenResponse) -> Result<(), ChannelError> {
     Ok(())
 }
 
+fn classify_oauth_endpoint_error(status: reqwest::StatusCode, error_code: &str) -> ChannelError {
+    let message = format!("OAuth2 token endpoint returned HTTP {status}: {error_code}");
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || matches!(
+            error_code,
+            "server_error" | "slow_down" | "temporarily_unavailable"
+        )
+    {
+        ChannelError::Transport(message)
+    } else {
+        ChannelError::Auth(message)
+    }
+}
+
 /// Fetch an app-only OAuth2 token from Microsoft's v2 client-credentials endpoint.
 ///
 /// Scope is fixed to `https://outlook.office365.com/.default` for Exchange Online.
@@ -252,18 +268,16 @@ async fn fetch_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| ChannelError::Auth(format!("OAuth2 token request failed: {e}")))?;
+        .map_err(|e| ChannelError::Transport(format!("OAuth2 token request failed: {e}")))?;
 
     if !resp.status().is_success() {
         // Read the body to extract a standardised error code; the raw body is
         // intentionally discarded — it may contain credential echoes, HTML, or
         // CRLF sequences usable for log injection.
-        let status = resp.status().as_u16();
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         let error_code = sanitize_oauth_error(&body);
-        return Err(ChannelError::Auth(format!(
-            "OAuth2 token endpoint returned HTTP {status}: {error_code}"
-        )));
+        return Err(classify_oauth_endpoint_error(status, error_code));
     }
 
     let token_resp = resp
@@ -549,10 +563,10 @@ mod tests {
             .expect("stalled refresh task must not panic")
             .expect_err("stalled refresh must time out");
         match err {
-            ChannelError::Auth(message) => {
+            ChannelError::Transport(message) => {
                 assert_eq!(message, "OAuth2 token refresh timed out (15s)");
             }
-            other => panic!("expected ChannelError::Auth, got {other:?}"),
+            other => panic!("expected ChannelError::Transport, got {other:?}"),
         }
 
         let token = tokio::time::timeout(Duration::from_secs(1), retry)
@@ -663,6 +677,22 @@ mod tests {
             expires_in: 3600,
             token_type: Some("Bearer".to_string()),
         }
+    }
+
+    #[test]
+    fn oauth_endpoint_pressure_is_transient_but_client_rejection_is_permanent() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let error = classify_oauth_endpoint_error(status, "temporarily_unavailable");
+            assert!(matches!(error, ChannelError::Transport(_)), "{status}");
+        }
+
+        let error =
+            classify_oauth_endpoint_error(reqwest::StatusCode::BAD_REQUEST, "invalid_client");
+        assert!(matches!(error, ChannelError::Auth(_)));
     }
 
     /// After one successful refresh populates the cache, a second call must

@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import os
 import shutil
-import tempfile
 import signal
-import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,6 +49,8 @@ def scratch_daemon():
     env = os.environ.copy()
     env["KHIVE_SOCKET"] = str(sock)
     env["KHIVE_PID"] = str(root / "khived.pid")
+    env["KHIVE_LOCK"] = str(root / "khived.recovery.lock")
+    env["KHIVE_RECOVERER_LOCK"] = str(root / "khived.recoverer.lock")
     proc = subprocess.Popen(
         [
             binary,

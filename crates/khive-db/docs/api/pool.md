@@ -85,147 +85,112 @@ another test's entry being reported as "oldest", but it still shares the
 same `tx_registry` serial group as `checkpoint.rs`'s and `sql_bridge.rs`'s
 registry tests for defense-in-depth against cross-test interference.
 
-## Raw SQL bridge admission and writer-handle budget
+## Pooled reader routing and raw-SQL exception budget
 
-File-backed `SqlBridge` handles keep their standalone connection for the
-handle lifetime, preserving connection-local statement/cache behavior across
-calls and one explicitly admitted deferred read transaction. The pool
-therefore owns two shared permit sets across every bridge constructed over it:
-reader opens and active reads are capped at the effective `max_readers` (with a
-minimum of one in degraded mode), and standalone writer handles are capped at
-one. Acquisition waits only for `checkout_timeout` and then returns
-`StorageError::Timeout`. An idle reader handle retains its cached connection
-but no reader permit; a standalone writer retains its writer permit until the
-handle drops. Once a read has entered `spawn_blocking`, its connection and
-operation permit travel together; cancelling the awaiting task retains both
-until SQLite finishes and drops the resource, so a detached blocking call
-cannot escape the active-read cap.
-Reader-open saturation reports `sql_bridge.reader_open`; active-query
-saturation reports `sql_bridge.reader_operation`.
+Every typed store read uses `ConnectionPool::reader_until` for both file-backed
+and in-memory databases. A file-backed `SqlAccess::reader()` is only a logical
+handle: constructing or retaining it opens no SQLite connection. Its ordinary
+`query_row`, `query_all`, and `query_page` calls check out one pooled reader for
+the operation and return it only after statement finalization, callback cleanup,
+and connection reset/replacement. Ordinary reads through a queue-backed
+`SqlWriter` use the same route. There is no standalone fallback after pool
+saturation.
 
-Cached read-only handles admit one explicit top-level deferred read transaction:
-`BEGIN`, `BEGIN TRANSACTION`, and `BEGIN DEFERRED [TRANSACTION]` retain the
-opening operation's reader permit, subsequent queries reuse it, and
-`COMMIT`/`END` or full `ROLLBACK` releases it only after SQLite returns to
-autocommit. The same successful `BEGIN` registers a backend-scoped
-`sql_bridge_cached_read_transaction` span in `tx_registry`; queries and
-rejected nested controls retain it, and terminal control, cancellation,
-cleanup, or handle drop deregisters it only after the SQLite snapshot ends.
+The pool-wide reader admission budget is the effective `max_readers` (minimum
+one in degraded in-memory mode). Pooled guards and the explicit raw-SQL
+transaction exception below share that budget, so their combined live work
+cannot exceed it. A real wait that exhausts `checkout_timeout` before work
+begins returns retryable `StorageError::AdmissionTimeout`; cancellation or an
+expired request context returns non-retryable `StorageError::Timeout`. Raw-SQL
+ordinary reads name `sql_bridge.reader_operation`; typed stores retain their
+capability operation name.
+
+`KHIVE_CHECKOUT_TIMEOUT_SECS` configures `checkout_timeout` (default five
+seconds) for each reader-admission attempt. One operation can perform several
+sequential reads, and each operation-scoped checkout has its own bounded wait;
+the caller's total wall time can therefore exceed five seconds even though no
+single admission wait does. The timeout never triggers a fresh connection open.
+
+### Closed standalone-reader exceptions
+
+`ConnectionPool::open_standalone_reader` is crate-private and requires a
+`StandaloneReaderPurpose`; there is no ordinary-request variant. The closed
+list is:
+
+- an explicitly requested, multi-call deferred raw-SQL read transaction;
+- boot-time schema/model-registry inspection that runs before a runtime pool
+  can own the read;
+- a diagnostic that genuinely requires an independent snapshot.
+
+The current PASSIVE `db_diagnostics` probe is not the third case: PASSIVE may
+backfill WAL frames and therefore deliberately uses its separately documented,
+untracked standalone writer. Adding any new standalone-reader purpose requires
+changing the enum and the ADR exception list together.
+
+For the raw-SQL transaction exception, `BEGIN`, `BEGIN TRANSACTION`, and
+`BEGIN DEFERRED [TRANSACTION]` lazily open one standalone reader and retain one
+reader-admission permit. Subsequent queries reuse that connection and permit;
+`COMMIT`/`END` or full `ROLLBACK` closes the connection and releases admission
+only after SQLite returns to autocommit. A successful begin also registers a
+backend-scoped `sql_bridge_cached_read_transaction` span in `tx_registry`.
 Immediate/exclusive starts, `START`, nested `BEGIN`, `SAVEPOINT`, `RELEASE`,
-and `ROLLBACK ... TO` are rejected with
-`StorageError::InvalidInput`; `execute_batch` still rejects every transaction
-control form. A terminal statement that fails while SQLite remains in the
-transaction keeps the permit, allowing a later full rollback or safe handle
-drop rather than exposing an unadmitted snapshot.
+and `ROLLBACK ... TO` remain `StorageError::InvalidInput`. The compatible
+standalone-open timeout remains `StorageError::Timeout` at
+`sql_bridge.reader_open`; it is counted in reader diagnostics.
 
-As a defense-in-depth postcondition, every ordinary cached-reader operation
-must be in autocommit before its operation permit is released. Unadmitted state
-is rolled back while the permit is still held; an uncleanable connection is
-discarded first. The connection field precedes the explicit-transaction permit
-in the owned handle, so cancellation or handle drop closes SQLite (and its WAL
-snapshot) before returning admission. An idle cached reader can therefore
-never retain a WAL snapshot outside the active-read budget.
+An interrupted explicit transaction is rolled back before reuse. If rollback
+or callback cleanup cannot prove a safe autocommit connection, it is closed and
+the logical reader is poisoned, preserving the existing
+"connection already consumed" failure on later calls. A successful terminal
+control closes the exceptional connection, and the same logical handle returns
+to pooled routing for its next ordinary query.
 
-`multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progress`
-is the #1828 integration contract: eight cached reader handles remain open
-against a two-reader budget after each handle completes its one-shot read. The
-test proves idle handles no longer retain admission while repeated writes and
-the central ADR-091 PASSIVE checkpointer make complete frame progress and keep
-the WAL bounded. Autocheckpoint is disabled in the fixture, so the result
-neither depends on per-commit checkpoint I/O nor weakens #1848's single central
-checkpoint-owner direction.
+### Reader diagnostics
 
-This fixture does not reproduce or close #1460 or #1812. An idle autocommit
-connection does not pin WAL; those issues concern production stdio/multiprocess
-pinning and continuous concurrent-session WAL bounds, respectively, and remain
-open pending their own production-shaped regressions and fixes.
+`db_diagnostics.reader_contention` is pool-scoped and resets only when the
+`ConnectionPool` is reconstructed. It reports:
 
-Cancelling an in-flight call also permanently invalidates a STANDALONE
-reader/writer handle: the call takes the boxed handle's connection on entry
-and only a completed await returns it, so every subsequent call on the same
-standalone handle returns a "connection already consumed" error. Callers
-that cancel or time out such a call must drop the handle and acquire a
-fresh one. A QUEUE-BACKED writer handle is different by design: its writes
-route through the writer task (no boxed connection to lose), and its reads
-lazily reopen a cached read-only connection, so a cancelled
-queue-backed read is followed by a successful reopen on the next read
-rather than a hard failure. The reopen is still bounded by the reader
-permit budget: the cancelled call's connection and permit travel into the
-detached blocking task and stay held until SQLite finishes, so while a
-detached cancelled read holds the LAST reader permit, the reopen times out
-on the reader budget (typed `Timeout`, `sql_bridge.reader_open`) and
-succeeds only once the detached read completes and releases the permit
-(pinned by `cancelled_inflight_queue_backed_read_reopens_after_detached_read_completes`).
+- `reader_admission_capacity` and the point-in-time
+  `available_reader_admission_slots`;
+- aggregate request `reader_acquisitions`, split into
+  `pooled_reader_checkouts` and `standalone_reader_opens`;
+- `infrastructure_standalone_reader_opens`, kept outside the request aggregate;
+- `reader_checkout_timeouts`, including pooled and closed-exception admission
+  waits but excluding cooperative cancellation;
+- point-in-time and peak pooled checkouts, completed pooled checkouts, and the
+  longest completed pooled hold in microseconds. Hold time includes reset or
+  replacement because the connection is not reusable before that finishes.
 
-The manual `atomic_unit` path (write queue flag off, or no writer task
-available) acquires the same one-permit writer budget before opening its
-standalone writer. A live `writer()` handle therefore makes such an
-`atomic_unit()` wait and time out after `checkout_timeout`, and vice versa:
-do not hold a boxed writer handle across an `atomic_unit()` call on the same
-pool — drop the handle first. With the write queue enabled, `atomic_unit`
-runs inside the writer task instead and never touches this budget.
-The cached-reader admission state does not apply to a standalone read-write
-writer: its handle-scoped writer permit remains held across the whole manual
-transaction, including reader-supertrait calls within that transaction, while
-each such read additionally uses an active-reader permit.
+These fields make a reader wait's shape observable end to end: capacity,
+availability, active/peak work, bounded failures, and completed hold evidence
+appear in one payload, so a caller can distinguish an admission wait that
+resolves within its first window from one that times out. A flat
+`standalone_reader_opens` counter across ordinary read verbs is ADR-166 G2's
+route invariant.
 
-### Request cancellation (supersedes detached-natural-completion wording)
+### Writer handles and request cancellation
 
-Request-owned reads install an exact-connection interrupt handle plus the one
-connection-global progress callback. Cancellation and the absolute request
-deadline stop SQLite VM work; the connection and active permit remain owned
-until the worker stops (or remain inside the detached worker after the bounded
-interrupt-settlement window), so live SQLite state is never returned early.
-An interrupted explicit read transaction is rolled back before reuse; rollback
-or callback cleanup failure closes/replaces the connection. A subsequent
-borrower therefore sees neither the old handler nor its WAL snapshot.
-Reader-pool and cached-reader semaphore admission poll the same latched signal
-in bounded slices. Cancellation before checkout therefore returns promptly and
-the closure refuses to execute when a connection later becomes available; an
-already-admitted statement still follows the classification rules below.
+The manual `atomic_unit` path (write queue off or unavailable) and a standalone
+`writer()` share a separate one-permit writer budget. A standalone read-write
+writer preserves reads on its own connection for transaction visibility; each
+reader-supertrait call also takes reader admission, but it is not a standalone
+reader open. A queue-backed writer opens no standalone connection for ordinary
+reads and uses the pool as described above; only its explicit deferred read
+transaction takes the closed exception.
 
-Prepared-statement classification is authoritative: only
-`Statement::readonly()` statements outside transaction control register.
-DML-with-RETURNING, transaction control, `execute_batch`, atomic units, and
-all admitted writes run without request-read interruption and return their real
-completion result. Recorded cancellation translates only a causal
-`SQLITE_INTERRUPT`; unrelated driver failures retain their original error.
+Request-owned reads install an exact-connection interrupt handle plus the
+connection-global progress callback. Cancellation and the absolute deadline
+stop SQLite VM work; the connection and permit remain owned until cleanup
+finishes (or inside the detached worker after the bounded hard-cap path), so
+admission cannot be returned ahead of live SQLite state. Prepared-statement
+classification remains authoritative: only `Statement::readonly()` statements
+outside transaction control register for interruption. DML-with-RETURNING,
+transaction control, `execute_batch`, atomic units, and admitted writes preserve
+their completion result.
 
-When the write queue is enabled, `writer()` is queue-first (ADR-136 D1
-gate 1): it opens no standalone connection and holds no writer permit, and
-every mutating call routes through the writer task. Reads through such a
-queue-backed writer handle lazily open a standalone READ-ONLY connection on
-first use (`SqliteWriter::ensure_conn`) and cache it without a reader permit;
-each ordinary query acquires the pool-wide reader permit for its blocking
-operation, while an explicit deferred read transaction retains one permit
-across its whole multi-call span.
-The read-only open still ensures a queue-backed handle can never execute DML
-on an untracked read-write connection. The one-permit writer budget therefore
-counts only standalone read-write writer handles — the flag-off/degraded
-`writer()` path and the manual `atomic_unit` path above. Hold a writer handle
-only for a burst of operations, then drop it.
-
-The optional writer task owns its separate, fixed connection and is not a
-caller-held SQL bridge handle. Store-specific standalone connections are also
-outside this raw-SQL handle budget; their write ownership remains governed by
-ADR-067 and ADR-135.
-
-`query_page` materializes at most the caller's requested `page.limit` rows on
-the SQLite bridge, but it does not impose a server-side maximum. Callers own
-choosing sane limits; large offsets and expensive query plans can still make
-SQLite do substantial engine work before those bounded rows are returned.
-
-These caps are NOT a global SQLite connection cap. The reader semaphore bounds
-concurrent opens and active raw-SQL reads, not idle cached reader connections;
-callers retaining many reader handles remain responsible for their process's
-file-descriptor budget. The writer semaphore bounds caller-held standalone
-read-write handles. The pool's own reader queue and writer connection, the
-writer task's fixed connection, store-specific standalone connections, and
-diagnostics/checkpoint connections all sit outside these budgets. Both
-semaphore capacities (`sql_bridge_reader_slots` at the effective reader count,
-`sql_bridge_writer_slots` at one) are fixed at pool construction
-(`ConnectionPool::new`) and never resized; the budget for a database file is
-whatever the pool that owns it was built with.
+`query_page` materializes at most the caller's requested `page.limit` rows but
+does not impose a server-side maximum. Large offsets or expensive plans can
+still make SQLite do substantial work before those bounded rows return.
 
 ## `execute_batch` transaction-control rejection and handle poisoning
 

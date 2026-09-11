@@ -98,18 +98,13 @@ pub fn delete_record_attachments_statement(
 /// core migration, not by this accessor.
 pub struct SqlAttachmentStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlAttachmentStore {
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         let writer_task = pool.writer_task_handle().ok().flatten();
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -149,40 +144,13 @@ impl SqlAttachmentStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Attachments,
-                operation,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, operation))?;
-                    scope.run(&conn, || {
-                        f(&conn).map_err(|error| map_err(error, operation))
-                    })
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Attachments,
-                operation,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Attachments,
-                        operation,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| {
-                        f(conn).map_err(|error| map_err(error, operation))
-                    })
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Attachments,
+            operation,
+            move |conn| f(conn).map_err(|error| map_err(error, operation)),
+        )
+        .await
     }
 }
 

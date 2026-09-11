@@ -485,3 +485,44 @@ async fn next_and_tasks_limit_param_documents_the_200_cap() {
         );
     }
 }
+
+/// The task body is accepted by `gtd.assign` (stored as `properties.description`
+/// and mirrored into content); the verb's help must advertise it, or a client
+/// reading `help=true` cannot discover the body field.
+#[tokio::test]
+async fn assign_advertises_the_description_param_and_stores_it() {
+    use khive_pack_gtd::GtdPack;
+    use khive_runtime::pack::HandlerDef;
+    use khive_types::Pack;
+
+    let handlers: &[HandlerDef] = GtdPack::HANDLERS;
+    let assign_def = handlers
+        .iter()
+        .find(|h| h.name == "gtd.assign")
+        .expect("gtd.assign must be declared");
+    let description = assign_def
+        .params
+        .iter()
+        .find(|p| p.name == "description")
+        .expect("gtd.assign must advertise a description param");
+    assert_eq!(description.param_type, "string");
+    assert!(!description.required);
+
+    let fixture = pack(rt());
+    let task = assign(
+        &fixture,
+        json!({"title": "body discovery", "description": "the body", "assignee": "lambda:test"}),
+    )
+    .await;
+    let id = task["id"].as_str().expect("task id");
+    let record = fixture
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get task record");
+    let stored = record["properties"]["description"].as_str();
+    assert_eq!(
+        stored,
+        Some("the body"),
+        "task record must carry the body; got {record}"
+    );
+}

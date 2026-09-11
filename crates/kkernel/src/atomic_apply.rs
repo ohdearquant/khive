@@ -570,12 +570,16 @@ pub(crate) async fn execute_atomic_ops_file(
             failure,
         } => {
             let error_message = describe_failure(&failure);
+            let error_value = match &failure {
+                AtomicOpFailure::NoteConflict(conflict) => json!(conflict.clone().into_error()),
+                _ => json!(error_message),
+            };
             let results: Vec<Value> = ops
                 .iter()
                 .enumerate()
                 .map(|(idx, op)| {
                     if idx == failed_op_index {
-                        json!({"ok": false, "tool": op.tool, "op_index": idx, "error": error_message})
+                        json!({"ok": false, "tool": op.tool, "op_index": idx, "error": error_value})
                     } else {
                         json!({"ok": false, "tool": op.tool, "op_index": idx, "error": "not applied: whole atomic unit rolled back"})
                     }
@@ -634,6 +638,7 @@ async fn apply_gtd_audit_post_commit_effects(
 
 fn describe_failure(failure: &AtomicOpFailure) -> String {
     match failure {
+        AtomicOpFailure::NoteConflict(conflict) => conflict.clone().into_error().to_string(),
         AtomicOpFailure::GuardFailed {
             statement_label,
             expected,
@@ -1375,7 +1380,10 @@ mod validate_atomic_args_tests {
     #[test]
     fn atomic_update_result_uses_matching_post_commit_truncation_outcome() {
         let note_id = Uuid::new_v4();
-        let effect = PostCommitEffect::ReindexNote { note_id };
+        let effect = PostCommitEffect::ReindexNote {
+            note_id,
+            version: 2,
+        };
         let outcomes = vec![khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
             effect: effect.clone(),
             truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
@@ -1403,7 +1411,10 @@ mod validate_atomic_args_tests {
     #[test]
     fn atomic_duplicate_update_effect_aggregates_later_truncation_outcome() {
         let note_id = Uuid::new_v4();
-        let effect = PostCommitEffect::ReindexNote { note_id };
+        let effect = PostCommitEffect::ReindexNote {
+            note_id,
+            version: 2,
+        };
         let outcomes = vec![
             khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
                 effect: effect.clone(),
@@ -1517,18 +1528,34 @@ mod tests {
 
     use khive_types::Namespace;
 
-    fn scratch_runtime() -> KhiveRuntime {
+    /// Owns a file-backed runtime and removes its database directory after shutdown.
+    struct TestRuntime {
+        runtime: KhiveRuntime,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestRuntime {
+        type Target = KhiveRuntime;
+
+        fn deref(&self) -> &Self::Target {
+            &self.runtime
+        }
+    }
+
+    fn scratch_runtime() -> TestRuntime {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic_apply_gtd.db");
-        let rt = KhiveRuntime::new(RuntimeConfig {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: Some(path),
             embedding_model: None,
             additional_embedding_models: vec![],
             ..RuntimeConfig::default()
         })
         .expect("runtime");
-        std::mem::forget(dir);
-        rt
+        TestRuntime {
+            runtime,
+            _temp_dir: dir,
+        }
     }
 
     /// Seed a live GTD task note directly (bypassing `gtd.assign`'s handler,
@@ -2099,6 +2126,71 @@ mod tests {
         assert_eq!(task_properties(&persisted)["status"], "inbox");
     }
 
+    #[tokio::test]
+    async fn atomic_version_only_change_then_stale_noop_rolls_back_whole_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (stale_noop, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.transition",
+            &json!({"id": task_id.to_string(), "status": "inbox"}),
+        )
+        .await
+        .unwrap();
+        // Equal-value DML preserves the timestamp and status, but its trigger
+        // advances version. Only the revision predicate catches this change.
+        let equal_update = AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
+            task_id,
+            vec![PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE notes SET content=content WHERE id=?1".into(),
+                    params: vec![SqlValue::Text(task_id.to_string())],
+                    label: Some("equal-value-note-update".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            false,
+            PostCommitEffect::None,
+        ));
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![equal_update, stale_noop],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed { observed: 0, .. },
+                }
+            ),
+            "stale version must invalidate the no-op: {outcome:?}"
+        );
+        let after = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
     /// A deletion earlier in the unit must likewise invalidate a no-op that
     /// was prepared while the task still existed. The no-op's assertion is
     /// what forces the delete to roll back as part of the whole unit.
@@ -2498,6 +2590,14 @@ mod tests {
             .expect("read task")
             .expect("task exists");
         assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            after.version, before.version,
+            "a same-status assertion must not mutate the note revision"
+        );
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
         assert!(task_properties(&after).get("transition_note").is_none());
     }
 
