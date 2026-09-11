@@ -180,7 +180,8 @@ submitted again unchanged.
 `brain.auto_feedback(namespace=...)` writes and folds feedback only in that exact namespace;
 it does not train the default/live namespace's posterior state.
 Omitting `signal` is an abstention and emits no feedback event. When `signal` is present, `target_id`
-must exactly match one `results[].id`; rank position never supplies a judgment.
+must exactly match one result's `full_id` (falling back to `id` when absent); default JSON
+recall results can be forwarded unchanged. Rank position never supplies a judgment.
 
 ### Comm pack — 10 verbs (`comm.` prefix)
 
