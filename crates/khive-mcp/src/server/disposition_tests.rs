@@ -1,13 +1,26 @@
 //! ADR-133 A3: prove dispositions against actual domain storage, not a stand-in vector.
 
-use super::*;
+#[cfg(unix)]
+use super::ForwardFuture;
+use super::{
+    failure_entry, frame_budget_omission, runtime_error_value, DispatchOrigin, KhiveMcpServer,
+};
+use crate::tools::request::RequestParams;
 use khive_runtime::audit_batch::{AuditBatchConfig, AuditBatchControl, AuditTerminalReason};
-use khive_runtime::{AuditObligationFailure, DomainDisposition, Namespace};
+use khive_runtime::{
+    AuditObligationFailure, DomainDisposition, KhiveRuntime, Namespace, RuntimeConfig,
+    RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
 use khive_storage::event::IdempotentEventBatchResult;
 use khive_storage::{
-    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageResult,
+    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageCapability,
+    StorageResult,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 
 /// Domain handlers keep their real SQLite stores. Only the registry's separate
 /// audit append is rejected, after preflight has accepted the actual audit row.

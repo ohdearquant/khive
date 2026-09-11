@@ -157,9 +157,13 @@ fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{AuditObligationFailure, DenialAuditOutcome, DenialReceipt};
+    use super::runtime_error_value;
+    use crate::{
+        AuditObligationFailure, DenialAuditOutcome, DenialReceipt, DomainDisposition, RuntimeError,
+    };
+    use khive_storage::StorageCapability;
     use khive_types::{Details, ErrorCode, ErrorDomain, KhiveError};
+    use serde_json::json;
 
     #[test]
     fn projection_preserves_structured_source_fields_and_serialized_bytes() {

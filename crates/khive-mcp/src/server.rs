@@ -4889,10 +4889,42 @@ impl ServerHandler for KhiveMcpServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::coordinator::BackendSearchFailure;
+    use super::{
+        attach_audit_persistence_advisories, backend_errors_value, bounded_backend_error_key,
+        bounded_backend_error_message, build_instructions, build_verb_catalog,
+        canonical_fingerprint_path, chain_aggregation_depth_reject,
+        chain_ok_envelope_or_depth_error, compute_config_id, compute_config_id_with_ann_fresh_tail,
+        compute_config_id_with_runtime_policies, compute_config_id_with_storage_mode,
+        coordinator_search_visibility, dsl_err_to_mcp, empty_rendered_daemon_frame_len,
+        encode_backend_topology, ensure_bridge_request_id, entry_escaped_len, envelope_escaped_len,
+        envelope_metadata, envelope_metadata_escaped_len, execute_bounded_batch,
+        fit_rendered_batch_envelope, format_served_kinds_suffix, frame_budget_omission,
+        ok_envelope, parallel_batch_envelope, present_ok_envelope_or_depth_error, render_result,
+        rendered_response_daemon_frame_len, rendered_response_fits_daemon_frame,
+        request_read_timeout, result_exceeds_depth_limit, runtime_error_value,
+        scope_mcp_request_read_cancellation, search_diagnostic_value, search_diagnostic_wire_len,
+        search_retry_after_ms, serialize_response_value, serialized_response_len,
+        BackendErrorDiagnostic, BatchTask, DispatchOrigin, KhiveMcpServer, OpSuccess,
+        RunParsedContext, SearchArmEvidence, SearchArmParticipation, SearchArmStatus,
+        SearchDegradation, SearchStatus, BATCH_RESPONSE_BUDGET_BYTES, MAX_BACKEND_ERROR_ENTRIES,
+        MAX_BACKEND_ERROR_KEY_CHARS, MAX_BACKEND_ERROR_MESSAGE_CHARS, MAX_BATCH_CONCURRENCY,
+        MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP, MISSING_BACKEND_ERROR_MESSAGE,
+    };
+    #[cfg(unix)]
+    use super::{stdio_serve_mode_for, ForwardFuture, StdioServeMode};
+    use crate::coordinator::{
+        BackendSearchFailure, BackendSearchFailureKind, CoordSearchResult, CoordinatorService,
+    };
+    use crate::tools::request::RequestParams;
+    use khive_request::{parse_request, ExecutionMode, TypedJsonOp};
+    use khive_runtime::{
+        render_format, DomainDisposition, KhiveRuntime, Namespace, OutputFormat, PresentationMode,
+        RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    };
+    use rmcp::{handler::server::wrapper::Parameters, ErrorData as McpError};
+    use serde_json::{json, Value};
+    use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
-    use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
@@ -5177,7 +5209,18 @@ mod tests {
 
     #[cfg(unix)]
     mod read_replay_tests {
-        use super::*;
+        use super::super::{ForwardFuture, KhiveMcpServer};
+        use super::{clear_daemon_env, stats_without_request_local_usage};
+        use crate::tools::request::RequestParams;
+        use khive_runtime::{
+            KhiveRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+        };
+        use rmcp::handler::server::wrapper::Parameters;
+        use serde_json::Value;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         thread_local! {
             static CAPTURED_FORWARD: std::cell::RefCell<Option<(String, bool)>> =
@@ -10902,9 +10945,15 @@ mod tests {
 }
 #[cfg(test)]
 mod request_read_cancellation_tests {
-    use std::time::Duration;
-
-    use super::*;
+    use super::{
+        scope_mcp_request_read_cancellation, stdio_bridge_response_deadline_from_env,
+        KhiveMcpServer,
+    };
+    use crate::tools::request::RequestParams;
+    use khive_runtime::{KhiveRuntime, RuntimeConfig};
+    use rmcp::{handler::server::wrapper::Parameters, ErrorData as McpError};
+    use serde_json::Value;
+    use std::{future::Future, sync::Arc, time::Duration};
 
     #[derive(Clone)]
     struct EofProbeServer {

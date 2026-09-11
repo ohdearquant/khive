@@ -152,7 +152,7 @@ pub fn pack_handler(name: &str) -> Result<Option<PackInfo>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{build_registry, list_packs, pack_handler, VerbInfo, VerbVisibility};
     use serial_test::serial;
 
     /// Regression: introspection registry construction MUST succeed under

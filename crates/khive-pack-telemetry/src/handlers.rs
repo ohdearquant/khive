@@ -8,8 +8,6 @@ use khive_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-#[cfg(test)]
-use uuid::Uuid;
 
 mod actor_scope;
 use actor_scope::{caller_actor, is_caller, ActorScope};

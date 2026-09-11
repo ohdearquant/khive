@@ -1509,10 +1509,10 @@ mod batch_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::atomic_prepare::{prepare_delete, prepare_update};
     use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
-    use crate::{Namespace, NotePatch};
+    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError};
+    use serde_json::{json, Value};
 
     #[tokio::test]
     async fn stream_atomic_metadata_cas_preserves_record_and_refuses_stale_plan() {
