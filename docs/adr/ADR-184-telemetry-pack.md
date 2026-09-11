@@ -116,12 +116,24 @@ outcome = "recorded"   the event is in the log; seq is present and is its dense 
 ```
 
 - `seq` is present **if and only if** `outcome == "recorded"` and `carrier == "durable"`.
-- `error` is present **if and only if** `outcome == "unknown"`, and it is the original structured
-  error, unmodified. The failure path writes it; it is never reconstructed by the caller of the
-  failure path, and it is never flattened to a string.
+- `error` is present **if and only if** the result was not the configured behaviour: always for
+  `outcome == "unknown"`, and for a `dropped` on a durable channel, which is a refusal and has a
+  reason. It is the original structured error, unmodified. The failure path writes it; it is never
+  reconstructed by the caller of the failure path, and it is never flattened to a string.
 - An ephemeral channel returns `outcome == "dropped"` with no `error`. That is the configured
   behaviour, not a failure, and conflating it with a failed durable append would make the one field
   that readers act on unable to separate policy from incident.
+- **`carrier` is the discriminator between policy and incident, and `outcome` alone is not.** A
+  durable append refused before any domain effect also returns `dropped`, so the two are told apart
+  by the pair: `carrier == "ephemeral"` with `dropped` is the operator's classification working as
+  configured, and `carrier == "durable"` with `dropped` is an incident. A consumer alerting on "my
+  durable telemetry is being dropped" keys on the pair, never on `outcome` by itself. Arm 13 is what
+  makes that pair observable rather than merely true.
+- A durable `dropped` additionally carries its refusal reason in `error`; an ephemeral `dropped`
+  carries none, because a configured drop has no reason to report. So `error` is present exactly
+  when the result was not the configured behaviour, which gives the same separation a second,
+  independent reading. (Stated as a delta on the rule above rather than an exception to it: the
+  invariant is that `error` is absent only for `recorded` and for a configured ephemeral drop.)
 - `outcome == "unknown"` is **never** reported as `dropped`, under any posture. A false "dropped"
   tells a reader the event definitely is not in the log, which is the one thing not known.
 
@@ -162,6 +174,28 @@ An incremental rollup is an optimization to reach for when a measurement says re
 is too slow. Building it first would add a second source of truth for a number, and a disagreement
 between a rollup and the log it summarizes is resolved by re-deriving from the log anyway.
 
+### D7: Attribution is stamped, and reads scope to the caller
+
+`telemetry.emit` takes an optional `actor`. **The resolved acting identity is what gets stamped, and
+a `actor` argument naming anything else is ignored rather than refused.** Refusing would turn an
+attribution disagreement into a runtime failure inside the emitting task, which is the argument D3
+already makes against refusing an unclassified kind, and consistency inside one record is worth more
+than either option's marginal merit.
+
+Ignoring it silently would be worse than refusing, so the override is made visible the same way D3
+makes its fallback visible: the result carries the `actor` that was stamped, and
+`actor_argument_ignored: true` when the call named a different one. An emitter that believes it is
+attributing to someone else learns otherwise from its own result.
+
+This matters beyond tidiness. `telemetry.counts` groups by actor, so without a stamping rule a
+per-actor utilization figure is a number the measured party wrote about itself.
+
+Reads scope to the caller. `telemetry.read` and `telemetry.counts` return only the calling actor's
+events by default. A read naming a foreign actor requires that actor to be visible to the caller,
+and an all-actors read requires the caller to be in the configured fleet-readers allowlist. This is
+deliberately the same model `brain.event_counts` already enforces rather than a second one invented
+here; a stream name is not an authorization, so naming an arbitrary stream grants nothing on its own.
+
 ## Acceptance, stated before implementation
 
 Every arm names its control in the same test, because an absence without a same-call positive control
@@ -183,8 +217,9 @@ is not a finding.
    returned; under `gap` for the same injected failure, a result is returned carrying that same error
    in `error`. One injected failure, two postures, one test.
 7. No posture retries: in every injected-failure fixture the append-attempt counter is exactly one.
-8. `outcome: "unknown"` never appears with `seq`, and `outcome: "recorded"` never appears with
-   `error`. Asserted structurally over every arm above rather than by inspection.
+8. `outcome: "unknown"` never appears with `seq`, `outcome: "recorded"` never appears with `error`,
+   and an ephemeral `dropped` never appears with `error` while a durable `dropped` always does.
+   Asserted structurally over every arm above rather than by inspection.
 9. `telemetry.channels()` returns the declared default and every configured entry, and a round trip
    through it reproduces the classification decision that `emit` made for both a classified and an
    unclassified kind.
@@ -195,6 +230,21 @@ is not a finding.
     a re-read after the pin is released reflects the new row.
 12. The pack is absent from a default-pack boot and present under `--pack telemetry`, verified by the
     verb list in both, not by a config read.
+13. **The policy-versus-incident pair.** An ephemeral drop and a durable append refused before any
+    domain effect are emitted in one test. Both return `outcome: "dropped"`; the results must differ
+    in `carrier`, and the durable one must carry an `error` while the ephemeral one must not. This is
+    the control arm 4 otherwise lacks: without it, `dropped` is asserted but never shown to be
+    separable.
+14. An emit naming an `actor` other than the resolved acting identity stamps the resolved one and
+    returns `actor_argument_ignored: true`; an emit naming the resolved identity, and an emit naming
+    none, both stamp the same value with the flag absent. All three in one test, and
+    `telemetry.counts` grouped by actor attributes all three to the resolved identity.
+15. `telemetry.read` and `telemetry.counts` return only the caller's events when no actor is named,
+    proved with a second actor's events present in the same stream as the control. A read that
+    returned everything and a read that returned nothing must both fail this arm.
+16. A read naming a foreign actor the caller cannot see refuses; the same read for a visible actor
+    succeeds in the same test. An all-actors read refuses for a caller outside the fleet-readers
+    allowlist and succeeds for one inside it, also paired in one test.
 
 ## Rationale
 
