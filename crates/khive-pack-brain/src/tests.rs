@@ -3528,7 +3528,21 @@ async fn brain_auto_feedback_full_id_rejects_conflicts_duplicates_and_malformed_
     let token = rt.authorize(Namespace::local()).unwrap();
     let target = create_test_entity(&rt, &token).await;
     let other = create_test_entity(&rt, &token).await;
-    let before = json!(pack.snapshot());
+    // The default profile is rebuilt with a fresh `created_at` the first time a
+    // dispatch loads state, so that one field moves for reasons unrelated to
+    // feedback. Everything else in the snapshot must stay byte-identical.
+    let snapshot_without_profile_creation_times = |pack: &BrainPack| {
+        let mut value = json!(pack.snapshot());
+        if let Some(profiles) = value.get_mut("profiles").and_then(Value::as_object_mut) {
+            for profile in profiles.values_mut() {
+                if let Some(fields) = profile.as_object_mut() {
+                    fields.remove("created_at");
+                }
+            }
+        }
+        value
+    };
+    let before = snapshot_without_profile_creation_times(&pack);
     for (results, selected, message) in [
         (
             json!([{"id": &other[..8], "full_id": other}]),
@@ -3606,7 +3620,11 @@ async fn brain_auto_feedback_full_id_rejects_conflicts_duplicates_and_malformed_
             .await
             .expect_err("invalid canonical identity or ambiguous aliases must refuse");
         assert!(error.to_string().contains(message), "{error}");
-        assert_eq!(json!(pack.snapshot()), before, "{error}");
+        assert_eq!(
+            snapshot_without_profile_creation_times(&pack),
+            before,
+            "{error}"
+        );
     }
     assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
     let events = rt
