@@ -460,7 +460,27 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        std::env::set_var("PATH", dir.path());
+        // Prepend rather than replace: `PATH` is process-global and every other case in
+        // this binary resolves `git` by name through it, so a replacement makes their spawns
+        // fail with NotFound for the length of this case (#2589). Prepending still shadows
+        // `gh`, which is all this fixture needs.
+        let shimmed = match std::env::var_os("PATH") {
+            Some(prior) => {
+                let mut paths = vec![dir.path().to_path_buf()];
+                paths.extend(std::env::split_paths(&prior));
+                std::env::join_paths(paths).unwrap()
+            }
+            None => dir.path().as_os_str().to_os_string(),
+        };
+        std::env::set_var("PATH", shimmed);
+        assert!(
+            std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success()),
+            "this case must leave `git` resolvable on PATH: the variable is process-global and \
+             concurrent cases in this binary spawn `git` by name"
+        );
         let pr = json!({"headRefOid":"a".repeat(40),"reviewDecision":"APPROVED"});
         let data = json!({"data":{"repository":{"pullRequest":pr}}});
         for (response, expected) in [
