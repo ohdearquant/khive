@@ -216,9 +216,11 @@ async fn legacy_state_census_public_writes_store_only_canonical_statuses() {
                 .unwrap_or_else(|| {
                     panic!("{verb} response carries neither full_id nor id: {created}")
                 });
-            ids.push(Uuid::parse_str(created_id).unwrap_or_else(|e| {
-                panic!("{verb} returned a non-UUID id {created_id:?}: {e}")
-            }));
+            ids.push(
+                Uuid::parse_str(created_id).unwrap_or_else(|e| {
+                    panic!("{verb} returned a non-UUID id {created_id:?}: {e}")
+                }),
+            );
         }
         for status in ["archived", "unknown"] {
             let mut args = json!({"title": "invalid state", "status": status});
