@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, DeleteMode,
-    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
-    GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome, MissingEndpoints, NeighborHit,
-    NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder,
-    SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
+    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
+    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
+    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
+    TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1204,37 +1204,16 @@ fn batch_upsert_edges_guarded(
             // is not first in input order. The details themselves remain in
             // input order below.
             summary.first_error = message.clone();
+            let refusal = GuardedBatchRefusal {
+                entry_index: index,
+                missing,
+            };
             for (failed_index, failed_edge) in edges.iter().enumerate() {
-                let (class, retryability, detail) = if failed_index == index {
-                    (
-                        BatchWriteErrorClass::InvalidInput,
-                        BatchWriteRetryability::Permanent,
-                        message.clone(),
-                    )
-                } else {
-                    (
-                        BatchWriteErrorClass::BatchAborted,
-                        BatchWriteRetryability::Unknown,
-                        format!(
-                            "batch entry {failed_index} was not written because guarded batch \
-                             entry {index} was refused"
-                        ),
-                    )
-                };
-                summary.record_failure(
-                    failed_index,
-                    Some(failed_edge.id.to_string()),
-                    class,
-                    retryability,
-                    detail,
-                );
+                refusal.record_failure(&mut summary, failed_index, failed_edge, &message);
             }
             return Ok(GuardedBatchOutcome {
                 summary,
-                refused: Some(GuardedBatchRefusal {
-                    entry_index: index,
-                    missing,
-                }),
+                refused: Some(refusal),
             });
         }
     }

@@ -3,6 +3,7 @@ use crate::pool::PoolConfig;
 use khive_storage::types::{
     Direction, TraversalExecutionBudget, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
 };
+use khive_storage::{BatchWriteErrorClass, BatchWriteRetryability};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
@@ -4246,6 +4247,97 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
             store.get_edge(id).await.unwrap().is_none(),
             "batch must be all-or-nothing: {id:?} must not be persisted"
         );
+    }
+}
+
+#[tokio::test]
+async fn upsert_edges_guarded_preserves_refusal_beyond_summary_cap() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let missing_target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+    let cap = khive_storage::MAX_BATCH_WRITE_ERROR_DETAILS;
+    let mut edges: Vec<_> = (0..cap + 3)
+        .map(|_| make_edge(source, target, EdgeRelation::Extends, 1.0))
+        .collect();
+    edges[cap + 1] = make_edge(source, missing_target, EdgeRelation::Extends, 1.0);
+    let ids: Vec<_> = edges.iter().map(|edge| edge.id).collect();
+
+    let outcome = store.upsert_edges_guarded(edges.clone()).await.unwrap();
+    let refusal = outcome.refused.as_ref().unwrap();
+    assert_eq!(refusal.entry_index, cap + 1);
+    assert!(!refusal.missing.source);
+    assert!(refusal.missing.target);
+    let summary = &outcome.summary;
+    assert_eq!(summary.affected, 0);
+    assert_eq!(summary.attempted, (cap + 3) as u64);
+    assert_eq!(summary.failed, summary.attempted);
+    assert_eq!(summary.errors.len(), cap);
+    assert_eq!(summary.errors_omitted, 3);
+    assert!(summary.errors_truncated);
+    assert_eq!(summary.first_error, format!(
+        "batch entry {}: edge endpoint no longer exists at write time: source {source} or target {missing_target}",
+        cap + 1,
+    ));
+    for (index, error) in summary.errors.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(ids[index].to_string()));
+        assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+        assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+        assert_eq!(
+            error.message,
+            format!(
+                "batch entry {index} was not written because guarded batch entry {} was refused",
+                cap + 1,
+            )
+        );
+    }
+    assert_eq!(summary.error_counts.len(), 2);
+    assert_eq!(
+        summary.error_counts[0].class,
+        BatchWriteErrorClass::InvalidInput
+    );
+    assert_eq!(summary.error_counts[0].count, 1);
+    assert_eq!(
+        summary.error_counts[1].class,
+        BatchWriteErrorClass::BatchAborted
+    );
+    assert_eq!(summary.error_counts[1].count, (cap + 2) as u64);
+    let mut enumerated = Vec::new();
+    while enumerated.len() < edges.len() {
+        let page = outcome
+            .refusal_page(
+                &edges,
+                None,
+                PageRequest {
+                    offset: enumerated.len() as u64,
+                    limit: u32::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.total, Some(edges.len() as u64));
+        assert!(!page.items.is_empty());
+        assert!(page.items.len() <= cap);
+        enumerated.extend(page.items);
+    }
+    assert_eq!(enumerated.len(), edges.len());
+    assert_eq!(&enumerated[..cap], summary.errors.as_slice());
+    for (index, error) in enumerated.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(ids[index].to_string()));
+        if index == cap + 1 {
+            assert_eq!(error.class, BatchWriteErrorClass::InvalidInput);
+            assert_eq!(error.retryability, BatchWriteRetryability::Permanent);
+            assert_eq!(error.message, summary.first_error);
+        } else {
+            assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+            assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+        }
+    }
+    for id in ids {
+        assert!(store.get_edge(id).await.unwrap().is_none());
     }
 }
 
