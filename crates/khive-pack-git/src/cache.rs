@@ -26,8 +26,10 @@
 //! enforcement, slot serialization).
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -109,6 +111,206 @@ impl From<std::io::Error> for CacheError {
     fn from(e: std::io::Error) -> Self {
         CacheError::Io(e)
     }
+}
+
+const MAX_GIT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+
+pub(crate) fn sanitize_diagnostic(message: &str) -> String {
+    message
+        .lines()
+        .map(|line| {
+            let line: String = line
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\t')
+                .collect();
+            let sanitized = line
+                .split_whitespace()
+                .map(|word| {
+                    // Remove whole URL/address tokens, including a URL cut off
+                    // at the capture bound before its userinfo separator.
+                    if word.contains("://") || word.contains('@') {
+                        "[redacted remote]"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let lower = sanitized.to_ascii_lowercase();
+            if [
+                "authorization:",
+                "cookie:",
+                "password=",
+                "password:",
+                "token=",
+                "token:",
+                "secret=",
+                "secret:",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                return "[redacted credential diagnostic]".to_string();
+            }
+            sanitized
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn capture_diagnostic(mut stderr: impl Read, finished: &AtomicBool) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = match stderr.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if finished.load(Ordering::Acquire) {
+                    return Ok(retained);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            return Ok(retained);
+        }
+        let keep = count.min(MAX_GIT_DIAGNOSTIC_BYTES - retained.len());
+        retained.extend_from_slice(&buffer[..keep]);
+        if retained.len() == MAX_GIT_DIAGNOSTIC_BYTES && finished.load(Ordering::Acquire) {
+            return Ok(retained);
+        }
+    }
+}
+
+struct DiagnosticPipe(std::process::ChildStderr);
+
+impl DiagnosticPipe {
+    fn new(stderr: std::process::ChildStderr) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = stderr.as_raw_fd();
+            // The owned pipe has one reader; nonblocking mode lets that
+            // reader stop when git exits even if a descendant retained it.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self(stderr))
+    }
+}
+
+impl Read for DiagnosticPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+            use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+            let mut available = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    self.0.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    Ok(0)
+                } else {
+                    Err(error)
+                };
+            }
+            if available == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = buffer.len().min(available as usize);
+            return self.0.read(&mut buffer[..count]);
+        }
+        #[cfg(not(windows))]
+        self.0.read(buffer)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn with_git_diagnostics(
+    command: &mut Command,
+    operation: &str,
+    run: impl FnOnce(&mut std::process::Child) -> Result<(), CacheError>,
+) -> Result<(), CacheError> {
+    let mut child = command
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
+    let stderr = match DiagnosticPipe::new(child.stderr.take().expect("stderr configured as piped"))
+    {
+        Ok(stderr) => stderr,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CacheError::Git(format!(
+                "preparing {operation} diagnostic capture failed"
+            )));
+        }
+    };
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Drain concurrently even after the retained prefix fills, so git
+        // cannot deadlock on a full pipe while the clone-size monitor runs.
+        let captured = match std::thread::Builder::new()
+            .spawn_scoped(scope, || capture_diagnostic(stderr, &finished))
+        {
+            Ok(captured) => captured,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CacheError::Git(format!(
+                    "starting {operation} diagnostic reader failed"
+                )));
+            }
+        };
+        let result = run(&mut child);
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        finished.store(true, Ordering::Release);
+        let diagnostic = captured
+            .join()
+            .ok()
+            .and_then(Result::ok)
+            .map(|bytes| sanitize_diagnostic(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        result.map_err(|error| match error {
+            CacheError::Git(message) if !diagnostic.trim().is_empty() => {
+                CacheError::Git(format!("{message}: {diagnostic}"))
+            }
+            other => other,
+        })
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn with_git_diagnostics(
+    command: &mut Command,
+    operation: &str,
+    run: impl FnOnce(&mut std::process::Child) -> Result<(), CacheError>,
+) -> Result<(), CacheError> {
+    let mut child = command
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| CacheError::Git(format!("spawning {operation}: {error}")))?;
+    run(&mut child)
 }
 
 fn scratch_root() -> PathBuf {
@@ -1127,62 +1329,60 @@ fn clone(url: &str, dest: &Path, cap: u64) -> Result<(), CacheError> {
         command.creation_flags(windows_job::CREATE_SUSPENDED);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| CacheError::Git(format!("spawning git clone: {e}")))?;
-
-    #[cfg(windows)]
-    let isolation = match windows_job::CloneJob::create_and_adopt(&child) {
-        Ok(job) => job,
-        Err(e) => {
-            // The child is still suspended and has run no code; a plain kill
-            // (no job needed, since nothing was assigned to one) is enough.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
-    #[cfg(not(windows))]
-    let isolation: CloneIsolation = ();
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
+    with_git_diagnostics(&mut command, "git clone", |child| {
+        #[cfg(windows)]
+        let isolation = match windows_job::CloneJob::create_and_adopt(child) {
+            Ok(job) => job,
             Err(e) => {
-                terminate_clone(&mut child, &isolation)?;
-                return Err(CacheError::Git(format!(
-                    "waiting for git clone {:?}: {e}",
-                    redact_repo_url(url)
-                )));
-            }
-        }
-
-        let walk_start = std::time::Instant::now();
-        let size = match dir_size(dest) {
-            Ok(size) => size,
-            // Git creates the destination itself; it is legitimately absent
-            // for the first few polls after spawn.
-            Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => {
-                terminate_clone(&mut child, &isolation)?;
+                // The child is still suspended and has run no code; a plain kill
+                // (no job needed, since nothing was assigned to one) is enough.
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(e);
             }
         };
-        let walk_elapsed = walk_start.elapsed();
-        if size > cap {
-            terminate_clone(&mut child, &isolation)?;
-            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        #[cfg(not(windows))]
+        let isolation: CloneIsolation = ();
+
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => {
+                    terminate_clone(child, &isolation)?;
+                    return Err(CacheError::Git(format!(
+                        "waiting for git clone {:?}: {e}",
+                        redact_repo_url(url)
+                    )));
+                }
+            }
+
+            let walk_start = std::time::Instant::now();
+            let size = match dir_size(dest) {
+                Ok(size) => size,
+                // Git creates the destination itself; it is legitimately absent
+                // for the first few polls after spawn.
+                Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => {
+                    terminate_clone(child, &isolation)?;
+                    return Err(e);
+                }
+            };
+            let walk_elapsed = walk_start.elapsed();
+            if size > cap {
+                terminate_clone(child, &isolation)?;
+                return Err(CacheError::CloneTooLarge { bytes: size, cap });
+            }
+            std::thread::sleep(poll_sleep_duration(walk_elapsed));
+        };
+        if !status.success() {
+            return Err(CacheError::Git(format!(
+                "git clone {:?} failed (exit {status})",
+                redact_repo_url(url)
+            )));
         }
-        std::thread::sleep(poll_sleep_duration(walk_elapsed));
-    };
-    if !status.success() {
-        return Err(CacheError::Git(format!(
-            "git clone {:?} failed (exit {status})",
-            redact_repo_url(url)
-        )));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Stop and reap an in-flight clone. On Unix the child is its own process
@@ -1400,7 +1600,8 @@ fn fetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
     // on an ancestor repository, and an absolute `--git-dir` still follows a
     // symlink swapped in after revalidation. `git_at_slot` binds the command
     // to the validated directory object itself.
-    let status = git_at_slot(repo, slot)
+    let mut command = git_at_slot(repo, slot);
+    command
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
@@ -1410,16 +1611,19 @@ fn fetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
         .arg("fetch")
         .arg("--prune")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|e| CacheError::Git(format!("spawning git fetch: {e}")))?;
-    if !status.success() {
-        return Err(CacheError::Git(format!(
-            "git fetch in {} failed (exit {status})",
-            repo.display()
-        )));
-    }
-    Ok(())
+        .stdout(Stdio::null());
+    with_git_diagnostics(&mut command, "git fetch", |child| {
+        let status = child
+            .wait()
+            .map_err(|e| CacheError::Git(format!("waiting for git fetch: {e}")))?;
+        if !status.success() {
+            return Err(CacheError::Git(format!(
+                "git fetch in {} failed (exit {status})",
+                repo.display()
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Issue #765 repair primitive: `git fetch --refetch origin` obtains a
@@ -1427,7 +1631,8 @@ fn fetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
 /// existing object store.
 fn fetch_refetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
     // Descriptor-bound — see `fetch` for the discovery and symlink hazards.
-    let status = git_at_slot(repo, slot)
+    let mut command = git_at_slot(repo, slot);
+    command
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
@@ -1438,16 +1643,19 @@ fn fetch_refetch(repo: &Path, slot: &ValidatedSlot) -> Result<(), CacheError> {
         .arg("--refetch")
         .arg("origin")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|e| CacheError::Git(format!("spawning git fetch --refetch: {e}")))?;
-    if !status.success() {
-        return Err(CacheError::Git(format!(
-            "git fetch --refetch in {} failed (exit {status})",
-            repo.display()
-        )));
-    }
-    Ok(())
+        .stdout(Stdio::null());
+    with_git_diagnostics(&mut command, "git fetch --refetch", |child| {
+        let status = child
+            .wait()
+            .map_err(|e| CacheError::Git(format!("waiting for git fetch --refetch: {e}")))?;
+        if !status.success() {
+            return Err(CacheError::Git(format!(
+                "git fetch --refetch in {} failed (exit {status})",
+                repo.display()
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Wraps an I/O error with the operation and path it happened on.
@@ -1865,6 +2073,53 @@ pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_diagnostic_capture_is_bounded_drained_and_redacted() {
+        let mut input = std::io::Cursor::new(vec![b'x'; MAX_GIT_DIAGNOSTIC_BYTES * 3]);
+        let captured =
+            capture_diagnostic(&mut input, &AtomicBool::new(false)).expect("capture diagnostic");
+        assert_eq!(captured.len(), MAX_GIT_DIAGNOSTIC_BYTES);
+        assert_eq!(input.position(), (MAX_GIT_DIAGNOSTIC_BYTES * 3) as u64);
+
+        let sanitized = sanitize_diagnostic(
+            "fatal: authentication failed for 'https://user:tok3n@example.com/repo?token=SECRET'\nAuthorization: Bearer PRIVATE\nCookie: session=SESSION\nfatal: https://user:partial\nerror: connection refused\u{001b}",
+        );
+        assert!(sanitized.contains("authentication failed"), "{sanitized}");
+        assert!(sanitized.contains("connection refused"), "{sanitized}");
+        for secret in [
+            "user", "tok3n", "SECRET", "PRIVATE", "SESSION", "partial", "\u{001b}",
+        ] {
+            assert!(!sanitized.contains(secret), "{sanitized}");
+        }
+    }
+
+    #[test]
+    fn git_diagnostic_capture_stops_without_descendant_eof() {
+        struct OpenPipe;
+        impl Read for OpenPipe {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        assert!(capture_diagnostic(OpenPipe, &AtomicBool::new(true))
+            .unwrap()
+            .is_empty());
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::fd::OwnedFd;
+            let (reader, mut retained_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+            retained_writer.write_all(b"fatal: unavailable").unwrap();
+            let stderr = std::process::ChildStderr::from(OwnedFd::from(reader));
+            let pipe = DiagnosticPipe::new(stderr).unwrap();
+            assert_eq!(
+                capture_diagnostic(pipe, &AtomicBool::new(true)).unwrap(),
+                b"fatal: unavailable"
+            );
+            drop(retained_writer);
+        }
+    }
 
     /// Build a directory shaped exactly like a real `ensure_clone` cache slot.
     fn make_owned_entry(root: &Path, key: &str, with_marker: bool) -> PathBuf {

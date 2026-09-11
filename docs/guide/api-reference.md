@@ -42,15 +42,17 @@ write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to sys
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
-`git.pr_merge` (ADR-182). A remote `git.digest` source whose initial
-clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
-to in-process callers; the MCP `request` envelope renders it as a plain error message
-rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
-clone/fetch failure hit later while repairing an already-cached clone surfaces as
-`InvalidInput` only when the bounded refetch-then-reclone repair ultimately fails (a
-successful repair earns one more snapshot attempt, and the digest completes only when
-that attempt succeeds); a source that parses as neither a local path nor a remote URL
-is `InvalidInput` as well.
+`git.pr_merge` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
+cache failures in `git.digest` return `RemoteFetchError` in-process. On the MCP `request`
+wire, the failed `tool: "git.digest"` result carries
+`error: {kind: "remote_fetch_error", remote, message, domain_disposition}`. `remote`
+is the digest source URL without userinfo, query, or fragment; `message` names the failed
+setup/recovery stage and includes available bounded, sanitized git diagnostics, or the
+non-git I/O, size-cap, or ownership-refusal text. It is not a git-write policy-table or
+receipt error (ADR-088 Amendment 1, Remote-URL mode, point 5). A successful repair earns
+one more snapshot attempt; a snapshot still failing after the bounded repairs remains
+`InvalidInput`. A source that parses as neither a local path nor a remote URL also remains
+`InvalidInput`. An error does not imply rollback of earlier ingest work.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 

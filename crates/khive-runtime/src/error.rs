@@ -685,7 +685,8 @@ pub enum RuntimeError {
     #[error("cross-namespace write denied: cannot write to remote namespace {namespace:?}")]
     CrossNamespaceWrite { namespace: String },
 
-    /// A remote fetch failed (network error, authentication failure, etc.).
+    /// Remote cache setup or repair failed. Producers redact the source and
+    /// sanitize diagnostics before constructing this wire-visible error.
     #[error("remote fetch error for remote={remote:?}: {message}")]
     RemoteFetchError { remote: String, message: String },
 
