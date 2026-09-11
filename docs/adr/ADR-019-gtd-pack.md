@@ -726,3 +726,48 @@ The per-pack plugin this ADR describes (`marketplace/gtd/`, a `plugin.json` pinn
 still reachable by setting `KHIVE_PACKS=gtd` on that server's environment, which is the runtime
 selection §Configuration describes. The `marketplace/gtd/plugin.json` lines above are the design at
 acceptance and are kept as history; the shipping manifest is `.claude-plugin/marketplace.json`.
+
+## Amendment 2 (2026-09-10): legacy task state boundaries (#2394)
+
+Default `gtd.tasks` includes only the canonical open strings (`inbox`, `next`,
+`waiting`, `someday`, `active`). Missing and non-text stored statuses retain the
+existing semantic `inbox` fallback. Unknown strings, including legacy `archived`
+and unnormalized aliases, are excluded before pagination, like terminal records;
+this does not declare them successfully completed or change their stored state.
+Explicit filters still accept canonical statuses and normalize caller aliases.
+
+The property-filter adapter adds `TextInOrNonText`: membership for JSON text and
+inclusion for missing/non-text values. Existing filters combine only with AND;
+the single-value `TextEqOrNonText` cannot express this set, and `In` would discard
+the documented legacy fallback. An empty set matches only the non-text branch.
+No index-seek or latency improvement is asserted by this correctness change.
+
+The existing empty-default-list envelope now identifies `unrecognized_status`
+alongside `done` and `cancelled` in `filter_excluded` when a matching excluded
+record exists. Generic `list(kind="task")` and by-ID `get` retain access to the
+original records. Lifecycle preparation shared by canonical and atomic
+`gtd.transition`/`gtd.complete` rejects a noncanonical stored string explicitly;
+it does not reinterpret `archived` as `done` or `cancelled`. Unknown-state blockers
+are diagnostically `invalid`/`broken`, not pending actionable work.
+
+Public task creation continues to normalize accepted aliases and reject unknown
+statuses. Generic task updates cannot patch the lifecycle-owned `status`,
+`completed_at`, or `transition_history` fields; lifecycle changes belong to the
+GTD verbs. These rules govern supported writes, not a migration or a reinterpretation
+of historical imports. Private-fixture census tests cover both creation forms,
+lifecycle writes, and refused generic status updates.
+
+Legacy repair is an evidence-driven curation operation, not a read side effect.
+Establish the intended terminal state from the original import or audit evidence
+before correcting `archived`, and retain `archived_at` and the original transition
+history as provenance. Neither successful completion nor cancellation may be
+inferred solely from the old spelling.
+
+The timestamp sub-request of #2394 is deferred. Storage timestamps are microseconds
+since the Unix epoch; the report alone does not establish the import's original
+units or a correct replacement instant. There is no `gtd.stats` verb. Do not infer
+a replacement `created_at`/`updated_at` from `archived_at` or rewrite dates during
+reads or lifecycle validation. Any manual repair requires independently verified
+source timestamps/units, an operator-reviewed correction, and preserved original
+values; this amendment supplies neither an automatic repair nor speculative
+timestamp diagnostics.

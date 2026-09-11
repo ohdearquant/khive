@@ -5,6 +5,25 @@ population by `property_filters` (status, assignee, priority) without either
 scanning the entire table on every call or missing older matching tasks
 behind a wall of newer non-matching churn.
 
+## Legacy state filtering (#2394)
+
+Default `gtd.tasks` selects canonical open status strings before pagination;
+terminal and unrecognized strings such as `archived` do not consume page slots.
+Missing and non-text statuses retain the legacy `inbox` fallback. Explicit
+canonical status filters and caller aliases are unchanged.
+
+When matching records were excluded and the default page is empty, the existing
+object envelope lists `done`, `cancelled`, and `unrecognized_status` under
+`filter_excluded`. Inspect historical rows with `list(kind="task")` or by-ID `get`;
+the query never rewrites their status, history, or timestamps. Unknown-state
+blockers are reported as `invalid` with a `broken` dependency state.
+
+`gtd.transition` and `gtd.complete`, including atomic preparation, reject unknown
+stored string states with an explicit invalid-stored-status error. Repair needs
+reviewed source evidence, preserving `archived_at` and transition history. The
+timestamp repair sub-request is deferred: the original units/replacement dates
+are unverified, storage uses microseconds, and no `gtd.stats` verb exists.
+
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 
 Fetches every `task` note matching `property_filters` in a single bounded

@@ -4697,25 +4697,18 @@ async fn narrowing_hot_property_index_to_kind_task_is_not_chosen() {
     );
 }
 
-/// khive#2392: `gtd.tasks()` with no `status=` filter compiles
+/// Historical khive#2392 control: the former default GTD filter compiled
 /// `FilterOp::NotInOrMissing(["done", "cancelled"])` on `$.status`
-/// (`handle_tasks` in `crates/khive-pack-gtd/src/handlers.rs`), which
-/// `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
+/// which `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
 /// (...))` -- an open exclusion, not a bounded set, so `idx_notes_task_status`
 /// cannot narrow it to an index range seek; the planner can only walk the
 /// `(namespace, kind)` partition.
 ///
-/// No seekable rewrite preserves the documented semantics either: the
-/// listing must keep a task whose `$.status` is missing *or* any unrecognized
-/// legacy value (see `handle_tasks`'s comment on why `NotInOrMissing` was
-/// chosen over `Ne`), so the exclusion set is open-ended and cannot be
-/// rewritten as `status IN (<the 5 known non-terminal statuses>)` -- that
-/// would silently drop a task carrying a status string outside
-/// `TASK_STATUSES`, which is exactly the case this predicate exists to keep.
-/// This test measures and pins the current (unindexed) plan rather than
-/// leaving the claim unverified.
+/// Issue #2394 replaces GTD's open-ended exclusion with a canonical text
+/// allowlist plus non-text fallback. This test retains the old predicate's
+/// measured plan as a control; it does not claim the new predicate is seekable.
 #[tokio::test]
-async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
+async fn legacy_gtd_tasks_not_in_or_missing_has_no_seek_index() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
     use khive_storage::types::SqlValue;
 
@@ -4753,4 +4746,75 @@ async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
          keyed index seek, so idx_notes_task_status must not appear in the plan, \
          got:\n{plan}"
     );
+}
+
+#[tokio::test]
+async fn text_in_or_non_text_filters_before_pagination_with_count_parity() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    let properties = [
+        serde_json::json!({}),
+        serde_json::json!({"status": null}),
+        serde_json::json!({"status": false}),
+        serde_json::json!({"status": 4}),
+        serde_json::json!({"status": []}),
+        serde_json::json!({"status": {}}),
+        serde_json::json!({"status": "inbox"}),
+        serde_json::json!({"status": "next"}),
+        serde_json::json!({"status": "archived"}),
+        serde_json::json!({"status": "done"}),
+        serde_json::json!({"status": ""}),
+    ];
+    let mut ids = Vec::new();
+    for (index, properties) in properties.into_iter().enumerate() {
+        let mut note = make_note_with_props("default", "task", "predicate fixture", properties);
+        note.created_at = index as i64 + 1;
+        ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    for (values, matching) in [
+        (
+            vec![
+                SqlValue::Text("inbox".into()),
+                SqlValue::Text("next".into()),
+            ],
+            8,
+        ),
+        (vec![], 6),
+    ] {
+        let filter = NoteFilter {
+            kind: Some("task".into()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.status".into(),
+                op: FilterOp::TextInOrNonText(values),
+                value: SqlValue::Null,
+            }],
+            ..Default::default()
+        };
+        for offset in 0..=matching {
+            let page = PageRequest {
+                limit: 1,
+                offset: offset as u64,
+            };
+            let counted = store
+                .query_notes_filtered("default", &filter, page.clone())
+                .await
+                .unwrap();
+            let count_free = store
+                .query_notes_filtered_count_free("default", &filter, page)
+                .await
+                .unwrap();
+            assert_eq!(counted.total, Some(matching as u64));
+            assert_eq!(count_free.total, None);
+            assert_eq!(counted.items, count_free.items);
+            if offset == matching {
+                assert!(count_free.items.is_empty());
+            } else {
+                assert_eq!(count_free.items.len(), 1);
+                assert_eq!(count_free.items[0].id, ids[matching - offset - 1]);
+            }
+        }
+    }
 }

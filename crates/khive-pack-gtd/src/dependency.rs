@@ -153,6 +153,10 @@ fn diagnose_task(
                 broken = true;
                 blocked_by.push(json!({"id": raw, "state": "cancelled"}));
             }
+            status if !crate::schema::TASK_STATUSES.contains(&status) => {
+                broken = true;
+                blocked_by.push(json!({"id": raw, "state": "invalid", "status": status}));
+            }
             status => blocked_by.push(json!({
                 "id": raw,
                 "state": "pending",

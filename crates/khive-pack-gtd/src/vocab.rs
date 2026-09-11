@@ -233,12 +233,14 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "gtd.tasks",
         description: "List tasks filtered by status, assignee, priority. DEFAULT (no `status` \
-                       given): excludes terminal statuses (done, cancelled) so the default \
+                       given): includes canonical open states and the legacy missing/non-text \
+                       inbox fallback; excludes terminal and unrecognized stored statuses so the default \
                        listing shows only active work. Pass status=\"done\" or \
                        status=\"cancelled\" explicitly to see completed/cancelled tasks — an \
                        empty result under the default filter does NOT mean the task doesn't \
                        exist; the response carries `filter_excluded` when the default filter \
-                       is the reason the result is empty (issue #96).",
+                       is the reason the result is empty (issue #96). Inspect legacy records \
+                       through list(kind=\"task\"); they are not silently rewritten.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

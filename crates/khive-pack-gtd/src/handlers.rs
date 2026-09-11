@@ -26,7 +26,7 @@ use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::schema::{
     allowed_transitions, can_transition, is_terminal, is_valid_priority, is_valid_status,
-    normalize_status, TASK_LIFECYCLE_HELP,
+    normalize_status, TASK_LIFECYCLE_HELP, TASK_STATUSES,
 };
 use crate::GtdPack;
 
@@ -865,6 +865,14 @@ async fn load_task(
     }
 
     let current = task_status(note.properties.as_ref());
+    if !TASK_STATUSES.contains(&current.as_str()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "task {} has invalid stored status {current:?}; valid stored statuses: {}; \
+             legacy state requires reviewed repair, not a lifecycle transition",
+            short_id(note.id),
+            TASK_STATUSES.join(", ")
+        )));
+    }
     Ok((note, current))
 }
 
@@ -1475,11 +1483,13 @@ impl GtdPack {
         // empty even though done tasks exist), and deep pages re-scanned the
         // same rows since the underlying fetch offset never advanced.
         //
-        // When no status= is provided, exclude terminal states (done,
-        // cancelled) so the default listing shows only active work, while
-        // still counting a task with no `status` property yet as `inbox`
-        // (non-terminal, included) — hence `NotInOrMissing` rather than `Ne`,
-        // which would silently drop rows where `$.status` is absent.
+        // Only canonical open strings are work. Missing and non-text legacy
+        // values retain the same semantic inbox fallback as task_status.
+        let open_statuses: Vec<SqlValue> = TASK_STATUSES
+            .iter()
+            .filter(|status| !is_terminal(status))
+            .map(|status| SqlValue::Text((*status).to_string()))
+            .collect();
         let mut property_filters = vec![match status_filter.as_deref() {
             Some(want) => PropertyFilter {
                 json_path: "$.status".to_string(),
@@ -1498,10 +1508,7 @@ impl GtdPack {
             },
             None => PropertyFilter {
                 json_path: "$.status".to_string(),
-                op: FilterOp::NotInOrMissing(vec![
-                    SqlValue::Text("done".to_string()),
-                    SqlValue::Text("cancelled".to_string()),
-                ]),
+                op: FilterOp::TextInOrNonText(open_statuses.clone()),
                 value: SqlValue::Null,
             },
         }];
@@ -1571,20 +1578,22 @@ impl GtdPack {
             .collect();
 
         // #96: a bare `[]` is indistinguishable from "no such task" when the
-        // *default* terminal-status exclusion is what emptied the result —
+        // *default* state exclusion is what emptied the result —
         // the common case a caller hits right after `gtd.complete`. Probe for
-        // a terminal task with the same namespace/assignee/priority filters
+        // an excluded task with the same namespace/assignee/priority filters
         // before changing the response shape; other empty results keep the
         // established bare array.
         if result.is_empty() && status_filter.is_none() {
             property_filters[0] = PropertyFilter {
                 json_path: "$.status".to_string(),
-                op: FilterOp::In(vec![
-                    SqlValue::Text("done".to_string()),
-                    SqlValue::Text("cancelled".to_string()),
-                ]),
+                op: FilterOp::NotInOrMissing(open_statuses),
                 value: SqlValue::Null,
             };
+            property_filters.push(PropertyFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("text".to_string()),
+            });
             let terminal_filter = NoteFilter {
                 kind: Some("task".to_string()),
                 property_filters,
@@ -1608,10 +1617,11 @@ impl GtdPack {
             if !terminal_page.items.is_empty() {
                 return Ok(json!({
                     "tasks": result,
-                    "filter_excluded": ["done", "cancelled"],
-                    "hint": "no tasks matched, but the default filter excludes done/cancelled \
-                              tasks — pass status=\"done\" or status=\"cancelled\" to check \
-                              whether a completed task exists before concluding it doesn't",
+                    "filter_excluded": ["done", "cancelled", "unrecognized_status"],
+                    "hint": "no tasks matched, but the default filter excludes terminal and \
+                              unrecognized stored statuses; pass status=\"done\" or \
+                              status=\"cancelled\" for terminal tasks, or use list(kind=\"task\") \
+                              to inspect legacy records before a reviewed repair",
                 }));
             }
         }
