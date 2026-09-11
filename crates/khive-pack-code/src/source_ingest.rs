@@ -8,19 +8,20 @@
 //! continue.
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
-//! (ADR-085 D6 #4) via `upsert_entity`. A gate refusal quarantines that one
+//! (ADR-085 D6 #4) via the guarded entity-mutation seam. A gate refusal quarantines that one
 //! item — it is recorded in [`CodeSourceIngestReport::blocked`] and skipped —
 //! rather than aborting the rest of the sweep, the same
 //! per-record posture `git.digest` already uses for its own write refusals.
 //!
 //! Identity (B4): every entity this pipeline creates has a `uuid5`-derived
-//! id, so re-ingesting the same path is a pure upsert — no dedup lookups are
-//! needed to avoid duplicate rows. Edge ids are likewise `uuid5`-derived from
-//! their endpoints, so re-creating the same edge is also an idempotent
-//! upsert. B6 cross-repo resolution and B5 staleness stamping are both
-//! driven off this determinism: an unresolved specifier records only the
-//! information needed to recompute its target's id later, and the
-//! synchronous re-resolve pass (`reresolve_pass`) does exactly that.
+//! id, so re-ingesting the same path needs no dedup lookup. Edge ids are
+//! likewise `uuid5`-derived from their endpoints. Re-ingest applies each
+//! semantic delta through a conditional-insert/guarded-replacement loop, so
+//! two sweeps targeting the same map cannot replace one another's unrelated
+//! properties or evidence. B6 cross-repo resolution and B5 staleness
+//! stamping are both driven off this determinism: an unresolved specifier
+//! records only the information needed to recompute its target's id later,
+//! and the synchronous re-resolve pass (`reresolve_pass`) does exactly that.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -39,6 +40,41 @@ use crate::extractor::{DeclKind, ExtractedDeclaration, ExtractedFile};
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+
+#[cfg(test)]
+mod race_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use tokio::sync::Barrier;
+
+    pub(super) struct OneShotPause {
+        barrier: Arc<Barrier>,
+        used: AtomicBool,
+    }
+
+    impl OneShotPause {
+        pub(super) fn new(barrier: Arc<Barrier>) -> Self {
+            Self {
+                barrier,
+                used: AtomicBool::new(false),
+            }
+        }
+    }
+
+    tokio::task_local! {
+        pub(super) static AFTER_ROW_READ: Arc<OneShotPause>;
+    }
+
+    pub(super) async fn pause_after_row_read() {
+        let Ok(pause) = AFTER_ROW_READ.try_with(Arc::clone) else {
+            return;
+        };
+        if !pause.used.swap(true, Ordering::AcqRel) {
+            pause.barrier.wait().await;
+        }
+    }
+}
 
 /// One content write the runtime secret gate refused during this pass.
 ///
@@ -606,22 +642,28 @@ fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Upserts `entity` after running it through [`gate_check`]. Returns
-/// `Ok(false)` without writing anything when the gate refuses the entity:
-/// the refusal is recorded in `report.blocked` keyed by `file`, and the
-/// caller moves on to the next item rather than aborting the whole ingest
-/// (quarantine, don't abort, mirroring `git.digest`'s
-/// per-record refusal handling). Any other `RuntimeError` — not a gate
-/// refusal — still propagates as an error, since only a gate refusal is
-/// safe to treat as "skip this one item and continue".
-async fn upsert_entity(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    entity: Entity,
+const MAX_ROW_REBASE_ATTEMPTS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMutationOutcome {
+    Created,
+    Updated,
+    Unchanged,
+    Blocked,
+}
+
+impl RowMutationOutcome {
+    fn wrote(self) -> bool {
+        matches!(self, Self::Created | Self::Updated)
+    }
+}
+
+fn gate_allows_entity(
+    entity: &Entity,
     file: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
-    if let Err(err) = gate_check(&entity) {
+    if let Err(err) = gate_check(entity) {
         return match err {
             RuntimeError::SecretDetected(secret) => {
                 report.blocked_count += 1;
@@ -635,21 +677,167 @@ async fn upsert_entity(
             other => Err(other.into()),
         };
     }
-    let document = entity_fts_document(&entity);
-    rt.entities(token)?
-        .upsert_entity(entity)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    // This direct ingest path intentionally bypasses the runtime create/update
-    // verbs, so it must compose the same FTS write itself. Fail the call if the
-    // index write fails: returning an apparently healthy but unsearchable map
-    // makes an empty search result indistinguishable from a correct answer.
+    Ok(true)
+}
+
+async fn index_entity(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    entity: &Entity,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
     rt.text(token)?
-        .upsert_document(document)
+        .upsert_document(entity_fts_document(entity))
         .await
         .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
     report.fts_indexed += 1;
-    Ok(true)
+    Ok(())
+}
+
+fn advancing_entity_revision(requested: i64, current: i64) -> Result<i64, CodeSourceIngestError> {
+    let minimum = current.checked_add(1).ok_or_else(|| {
+        CodeSourceIngestError::Storage(format!(
+            "entity revision {current} cannot advance past i64::MAX"
+        ))
+    })?;
+    Ok(requested.max(minimum))
+}
+
+fn advancing_edge_revision(
+    requested: DateTime<Utc>,
+    current: DateTime<Utc>,
+) -> Result<DateTime<Utc>, CodeSourceIngestError> {
+    let current_micros = current.timestamp_micros();
+    let minimum = current_micros.checked_add(1).ok_or_else(|| {
+        CodeSourceIngestError::Storage(format!(
+            "edge revision {current_micros} cannot advance past i64::MAX"
+        ))
+    })?;
+    let micros = requested.timestamp_micros().max(minimum);
+    DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+        CodeSourceIngestError::Storage(format!("edge revision {micros} is out of range"))
+    })
+}
+
+async fn mutate_entity<F>(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    file: &str,
+    report: &mut CodeSourceIngestReport,
+    mut apply: F,
+) -> Result<RowMutationOutcome, CodeSourceIngestError>
+where
+    F: FnMut(Option<&Entity>) -> Option<Entity>,
+{
+    let store = rt.entities(token)?;
+    for _ in 0..MAX_ROW_REBASE_ATTEMPTS {
+        let current = store
+            .get_entity_including_deleted(id)
+            .await
+            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+        #[cfg(test)]
+        race_seam::pause_after_row_read().await;
+        let Some(mut replacement) = apply(current.as_ref()) else {
+            return Ok(RowMutationOutcome::Unchanged);
+        };
+        if replacement.id != id {
+            return Err(CodeSourceIngestError::Storage(format!(
+                "entity mutation for {id} produced replacement {}",
+                replacement.id
+            )));
+        }
+        replacement.deleted_at = None;
+
+        let outcome = if let Some(snapshot) = current.as_ref() {
+            replacement.created_at = snapshot.created_at;
+            replacement.updated_at =
+                advancing_entity_revision(replacement.updated_at, snapshot.updated_at)?;
+            if !gate_allows_entity(&replacement, file, report)? {
+                return Ok(RowMutationOutcome::Blocked);
+            }
+            store
+                .replace_entity_if_unchanged(
+                    replacement.clone(),
+                    snapshot.updated_at,
+                    snapshot.deleted_at,
+                )
+                .await
+                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
+                .then_some(RowMutationOutcome::Updated)
+        } else {
+            if !gate_allows_entity(&replacement, file, report)? {
+                return Ok(RowMutationOutcome::Blocked);
+            }
+            store
+                .insert_entity_if_absent(replacement.clone())
+                .await
+                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
+                .then_some(RowMutationOutcome::Created)
+        };
+
+        if let Some(outcome) = outcome {
+            index_entity(rt, token, &replacement, report).await?;
+            return Ok(outcome);
+        }
+    }
+    Err(CodeSourceIngestError::Storage(format!(
+        "entity {id} changed during all {MAX_ROW_REBASE_ATTEMPTS} code-map rebase attempts"
+    )))
+}
+
+async fn mutate_edge<F>(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    mut apply: F,
+) -> Result<RowMutationOutcome, CodeSourceIngestError>
+where
+    F: FnMut(Option<&Edge>) -> Option<Edge>,
+{
+    let store = rt.graph(token)?;
+    let link_id = LinkId::from(id);
+    for _ in 0..MAX_ROW_REBASE_ATTEMPTS {
+        let current = store
+            .get_edge_including_deleted(link_id)
+            .await
+            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+        #[cfg(test)]
+        race_seam::pause_after_row_read().await;
+        let Some(mut replacement) = apply(current.as_ref()) else {
+            return Ok(RowMutationOutcome::Unchanged);
+        };
+        if Uuid::from(replacement.id) != id {
+            return Err(CodeSourceIngestError::Storage(format!(
+                "edge mutation for {id} produced replacement {}",
+                Uuid::from(replacement.id)
+            )));
+        }
+        replacement.deleted_at = None;
+
+        let outcome = if let Some(snapshot) = current.as_ref() {
+            replacement.created_at = snapshot.created_at;
+            replacement.updated_at =
+                advancing_edge_revision(replacement.updated_at, snapshot.updated_at)?;
+            store
+                .replace_edge_if_unchanged(replacement, snapshot.updated_at, snapshot.deleted_at)
+                .await
+                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
+                .then_some(RowMutationOutcome::Updated)
+        } else {
+            store
+                .insert_edge_if_absent(replacement)
+                .await
+                .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
+                .then_some(RowMutationOutcome::Created)
+        };
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
+        }
+    }
+    Err(CodeSourceIngestError::Storage(format!(
+        "edge {id} changed during all {MAX_ROW_REBASE_ATTEMPTS} code-map rebase attempts"
+    )))
 }
 
 /// Upserts the edge and returns `true` when it did not previously exist
@@ -666,31 +854,31 @@ async fn upsert_edge(
     metadata: Value,
     now: DateTime<Utc>,
 ) -> Result<bool, CodeSourceIngestError> {
-    let link_id = LinkId::from(id);
-    let graph = rt.graph(token)?;
-    let existed = graph
-        .get_edge(link_id)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?
-        .is_some();
-    let edge = Edge {
-        id: link_id,
-        namespace: token.namespace().as_str().to_string(),
-        source_id,
-        target_id,
-        relation,
-        weight: 1.0,
-        created_at: now,
-        updated_at: now,
-        deleted_at: None,
-        metadata: Some(metadata),
-        target_backend: None,
-    };
-    graph
-        .upsert_edge(edge)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    Ok(!existed)
+    let outcome = mutate_edge(rt, token, id, |current| {
+        let mut edge = current.cloned().unwrap_or(Edge {
+            id: LinkId::from(id),
+            namespace: token.namespace().as_str().to_string(),
+            source_id,
+            target_id,
+            relation,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        });
+        edge.namespace = token.namespace().as_str().to_string();
+        edge.source_id = source_id;
+        edge.target_id = target_id;
+        edge.relation = relation;
+        edge.weight = 1.0;
+        edge.updated_at = now;
+        edge.metadata = Some(metadata.clone());
+        Some(edge)
+    })
+    .await?;
+    Ok(outcome == RowMutationOutcome::Created)
 }
 
 fn ts(dt: DateTime<Utc>) -> i64 {
@@ -717,48 +905,40 @@ async fn upsert_project(
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = project_uuid(name);
-    let existing = get_entity_opt(rt, token, id).await?;
-    let is_new = existing.is_none();
-
-    let mut sweep_clock = existing
-        .as_ref()
-        .and_then(|e| e.properties.as_ref())
-        .and_then(|p| p.get("sweep_clock"))
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    sweep_clock.insert(language.to_string(), json!(sweep_time.to_rfc3339()));
-
-    let unresolved = existing
-        .as_ref()
-        .and_then(|e| e.properties.as_ref())
-        .map(read_unresolved)
-        .unwrap_or_default();
-
-    let mut props = serde_json::Map::new();
-    props.insert("source_project".into(), json!(name));
-    props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-    props.insert("sweep_clock".into(), Value::Object(sweep_clock));
-    if !unresolved.is_empty() {
-        props.insert(
-            "unresolved_specifiers".into(),
-            serde_json::to_value(&unresolved).expect("serializes"),
-        );
-    }
-
-    let mut entity = Entity::new(token.namespace().as_str(), "project", name);
-    entity.id = id;
-    entity.properties = Some(Value::Object(props));
     let now = ts(sweep_time);
-    entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
-    entity.updated_at = now;
-    if !upsert_entity(rt, token, entity, source_label, report).await? {
-        return Ok(None);
-    }
+    let outcome = mutate_entity(rt, token, id, source_label, report, |current| {
+        let mut entity = current
+            .cloned()
+            .unwrap_or_else(|| Entity::new(token.namespace().as_str(), "project", name));
+        let mut props = entity
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut sweep_clock = props
+            .get("sweep_clock")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        sweep_clock.insert(language.to_string(), json!(sweep_time.to_rfc3339()));
+        props.insert("source_project".into(), json!(name));
+        props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+        props.insert("sweep_clock".into(), Value::Object(sweep_clock));
+        entity.id = id;
+        entity.namespace = token.namespace().as_str().to_string();
+        entity.kind = "project".to_string();
+        entity.name = name.to_string();
+        entity.properties = Some(Value::Object(props));
+        entity.updated_at = now;
+        Some(entity)
+    })
+    .await?;
 
-    if is_new {
-        report.projects_created += 1;
-    } else {
-        report.projects_updated += 1;
+    match outcome {
+        RowMutationOutcome::Blocked => return Ok(None),
+        RowMutationOutcome::Created => report.projects_created += 1,
+        RowMutationOutcome::Updated => report.projects_updated += 1,
+        RowMutationOutcome::Unchanged => {}
     }
     Ok(Some(id))
 }
@@ -849,70 +1029,48 @@ async fn upsert_module(
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = module_uuid(source_project, language, module_path);
-    let existing = get_entity_opt(rt, token, id).await?;
-    let is_new = existing.is_none();
-
-    let unresolved = existing
-        .as_ref()
-        .and_then(|e| e.properties.as_ref())
-        .map(read_unresolved)
-        .unwrap_or_default();
-    let existing_props = existing.as_ref().and_then(|e| e.properties.as_ref());
-
-    let mut props = serde_json::Map::new();
-    props.insert("source_project".into(), json!(source_project));
-    props.insert("language".into(), json!(language));
-    props.insert("module_path".into(), json!(module_path));
-    props.insert("source_path".into(), json!(source_path));
-    props.insert("source_revision".into(), json!(source_revision));
-    props.insert("content_hash".into(), json!(content_hash));
-    props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-    // L1.5-owned fields: preserve verbatim, default only for a new row —
-    // `stamp_import_scan_coverage` is the sole writer of the accurate value.
-    for key in [
-        "import_scan_status",
-        "import_specifier_count",
-        "unresolved_import_count",
-    ] {
-        if let Some(value) = existing_props.and_then(|p| p.get(key)) {
-            props.insert(key.to_string(), value.clone());
-        }
-    }
-    if !props.contains_key("import_scan_status") {
-        props.insert("import_scan_status".into(), json!("unscanned"));
-    }
-    // L2-owned scan state is preserved by L1/L1.5 passes and unchanged L2
-    // refreshes. A changed L2 input omits it in this same module upsert, so
-    // readers cannot observe stale declaration ownership under new bytes.
-    if preserve_l2_state {
-        for key in ["declaration_ids", "l2_pending_impls", "l2_content_hash"] {
-            if let Some(value) = existing_props.and_then(|p| p.get(key)) {
-                props.insert(key.to_string(), value.clone());
+    let now = ts(sweep_time);
+    let outcome = mutate_entity(rt, token, id, file, report, |current| {
+        let mut entity = current.cloned().unwrap_or_else(|| {
+            Entity::new(token.namespace().as_str(), "concept", module_path)
+                .with_entity_type(Some("module"))
+        });
+        let mut props = entity
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        props.insert("source_project".into(), json!(source_project));
+        props.insert("language".into(), json!(language));
+        props.insert("module_path".into(), json!(module_path));
+        props.insert("source_path".into(), json!(source_path));
+        props.insert("source_revision".into(), json!(source_revision));
+        props.insert("content_hash".into(), json!(content_hash));
+        props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+        props
+            .entry("import_scan_status".to_string())
+            .or_insert_with(|| json!("unscanned"));
+        if !preserve_l2_state {
+            for key in ["declaration_ids", "l2_pending_impls", "l2_content_hash"] {
+                props.remove(key);
             }
         }
-    }
-    if !unresolved.is_empty() {
-        props.insert(
-            "unresolved_specifiers".into(),
-            serde_json::to_value(&unresolved).expect("serializes"),
-        );
-    }
+        entity.id = id;
+        entity.namespace = token.namespace().as_str().to_string();
+        entity.kind = "concept".to_string();
+        entity.entity_type = Some("module".to_string());
+        entity.name = module_path.to_string();
+        entity.properties = Some(Value::Object(props));
+        entity.updated_at = now;
+        Some(entity)
+    })
+    .await?;
 
-    let mut entity = Entity::new(token.namespace().as_str(), "concept", module_path)
-        .with_entity_type(Some("module"));
-    entity.id = id;
-    entity.properties = Some(Value::Object(props));
-    let now = ts(sweep_time);
-    entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
-    entity.updated_at = now;
-    if !upsert_entity(rt, token, entity, file, report).await? {
-        return Ok(None);
-    }
-
-    if is_new {
-        report.modules_created += 1;
-    } else {
-        report.modules_updated += 1;
+    match outcome {
+        RowMutationOutcome::Blocked => return Ok(None),
+        RowMutationOutcome::Created => report.modules_created += 1,
+        RowMutationOutcome::Updated => report.modules_updated += 1,
+        RowMutationOutcome::Unchanged => {}
     }
     Ok(Some(id))
 }
@@ -925,7 +1083,7 @@ async fn upsert_module(
 /// When the gate refuses the updated properties (e.g. `spec.specifier` is
 /// itself secret-shaped), the refusal is recorded in `report.blocked` keyed
 /// by `file` and the specifier is simply not recorded this sweep — the
-/// entity itself is untouched, since `upsert_entity` blocks before writing.
+/// entity itself is untouched, since the guarded mutation blocks before writing.
 async fn record_unresolved(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -934,29 +1092,31 @@ async fn record_unresolved(
     file: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let Some(mut entity) = get_entity_opt(rt, token, entity_id).await? else {
-        return Ok(());
-    };
-    let mut list = entity
-        .properties
-        .as_ref()
-        .map(read_unresolved)
-        .unwrap_or_default();
-    if list.contains(&spec) {
-        return Ok(());
-    }
-    list.push(spec);
-    let mut props = entity
-        .properties
-        .clone()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    props.insert(
-        "unresolved_specifiers".into(),
-        serde_json::to_value(&list).expect("serializes"),
-    );
-    entity.properties = Some(Value::Object(props));
-    if upsert_entity(rt, token, entity, file, report).await? {
+    let outcome = mutate_entity(rt, token, entity_id, file, report, |current| {
+        let mut entity = current?.clone();
+        let mut list = entity
+            .properties
+            .as_ref()
+            .map(read_unresolved)
+            .unwrap_or_default();
+        if list.contains(&spec) {
+            return None;
+        }
+        list.push(spec.clone());
+        let mut props = entity
+            .properties
+            .clone()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "unresolved_specifiers".into(),
+            serde_json::to_value(&list).expect("serializes"),
+        );
+        entity.properties = Some(Value::Object(props));
+        Some(entity)
+    })
+    .await?;
+    if outcome.wrote() {
         report.unresolved_recorded += 1;
     }
     Ok(())
@@ -1062,40 +1222,32 @@ async fn upsert_dependency_edge(
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let edge_id = edge_uuid(EdgeRelation::DependsOn, source_id, target_id);
-    let link_id = LinkId::from(edge_id);
-    let graph = rt.graph(token)?;
-    let existing = graph
-        .get_edge(link_id)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let existed = existing.is_some();
-    let metadata = merge_dependency_metadata(
-        existing.as_ref().and_then(|e| e.metadata.as_ref()),
-        dependency_kind,
-        dependency_scope,
-        language,
-    );
-    let edge = Edge {
-        id: link_id,
-        namespace: token.namespace().as_str().to_string(),
-        source_id,
-        target_id,
-        relation: EdgeRelation::DependsOn,
-        weight: 1.0,
-        created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(now),
-        updated_at: now,
-        deleted_at: None,
-        metadata: Some(metadata),
-        target_backend: None,
-    };
-    graph
-        .upsert_edge(edge)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    if existed {
-        report.edges_updated += 1;
-    } else {
-        report.edges_created += 1;
+    let outcome = mutate_edge(rt, token, edge_id, |current| {
+        let metadata = merge_dependency_metadata(
+            current.and_then(|edge| edge.metadata.as_ref()),
+            dependency_kind,
+            dependency_scope,
+            language,
+        );
+        Some(Edge {
+            id: LinkId::from(edge_id),
+            namespace: token.namespace().as_str().to_string(),
+            source_id,
+            target_id,
+            relation: EdgeRelation::DependsOn,
+            weight: 1.0,
+            created_at: current.map(|edge| edge.created_at).unwrap_or(now),
+            updated_at: now,
+            deleted_at: None,
+            metadata: Some(metadata),
+            target_backend: current.and_then(|edge| edge.target_backend.clone()),
+        })
+    })
+    .await?;
+    match outcome {
+        RowMutationOutcome::Created => report.edges_created += 1,
+        RowMutationOutcome::Updated => report.edges_updated += 1,
+        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
     }
     Ok(())
 }
@@ -1147,7 +1299,7 @@ async fn reresolve_pass(
             },
             _ => continue,
         };
-        let Some(mut entity) = get_entity_opt(rt, token, id).await? else {
+        let Some(entity) = get_entity_opt(rt, token, id).await? else {
             continue;
         };
         let source_project = entity
@@ -1165,6 +1317,7 @@ async fn reresolve_pass(
         if list.is_empty() {
             continue;
         }
+        let original_list = list.clone();
         let mut still_unresolved = Vec::new();
         let mut changed = false;
         for mut spec in list.drain(..) {
@@ -1248,22 +1401,37 @@ async fn reresolve_pass(
             }
         }
         if changed {
-            let mut props = entity
-                .properties
-                .clone()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            if still_unresolved.is_empty() {
-                props.remove("unresolved_specifiers");
-            } else {
-                props.insert(
-                    "unresolved_specifiers".into(),
-                    serde_json::to_value(&still_unresolved).expect("serializes"),
-                );
-            }
-            entity.properties = Some(Value::Object(props));
-            let entity_label = entity.id.to_string();
-            upsert_entity(rt, token, entity, &entity_label, report).await?;
+            let entity_label = id.to_string();
+            mutate_entity(rt, token, id, &entity_label, report, |current| {
+                let mut entity = current?.clone();
+                let mut rebased = entity
+                    .properties
+                    .as_ref()
+                    .map(read_unresolved)
+                    .unwrap_or_default();
+                rebased.retain(|specifier| !original_list.contains(specifier));
+                for specifier in &still_unresolved {
+                    if !rebased.contains(specifier) {
+                        rebased.push(specifier.clone());
+                    }
+                }
+                let mut props = entity
+                    .properties
+                    .clone()
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if rebased.is_empty() {
+                    props.remove("unresolved_specifiers");
+                } else {
+                    props.insert(
+                        "unresolved_specifiers".into(),
+                        serde_json::to_value(&rebased).expect("serializes"),
+                    );
+                }
+                entity.properties = Some(Value::Object(props));
+                Some(entity)
+            })
+            .await?;
         }
     }
     Ok(())
@@ -1290,51 +1458,50 @@ async fn stamp_import_scan_coverage(
             }
         }
 
-        let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
-            // F2 contract: every module from a completed scan must carry
-            // coverage stamps. A scan-map module missing here is a contract
-            // violation — report it instead of silently skipping.
+        let source_label = get_entity_opt(rt, token, module_id)
+            .await?
+            .as_ref()
+            .and_then(|module| module.properties.as_ref())
+            .and_then(|properties| properties.get("source_path"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| module_id.to_string());
+        let mut row_missing = false;
+        let mut invalid_properties = false;
+        let outcome = mutate_entity(rt, token, module_id, &source_label, report, |current| {
+            row_missing = current.is_none();
+            let mut module = current?.clone();
+            let Some(Value::Object(mut props)) = module.properties.clone() else {
+                invalid_properties = true;
+                return None;
+            };
+            props.insert(
+                "import_scan_status".into(),
+                json!(if unresolved_count == 0 {
+                    "scanned"
+                } else {
+                    "partially_resolved"
+                }),
+            );
+            props.insert("import_specifier_count".into(), json!(scan.imports.len()));
+            props.insert("unresolved_import_count".into(), json!(unresolved_count));
+            module.properties = Some(Value::Object(props));
+            Some(module)
+        })
+        .await?;
+        if row_missing {
             report.warnings.push(format!(
                 "module {module_id} from this sweep's scan map was missing at stamp time; \
                  coverage stamps skipped (F2 contract violation)"
             ));
             report.coverage_stamps_missed += 1;
-            continue;
-        };
-        let source_label = module
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.get("source_path"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| module_id.to_string());
-        let mut props = match module.properties.clone() {
-            Some(Value::Object(map)) => map,
-            _ => {
-                // `upsert_module` normally writes an object; anything else
-                // means the row drifted outside this pipeline. Never rebuild
-                // from nothing because that would destroy unrelated module
-                // provenance properties.
-                report.warnings.push(format!(
-                    "module {module_id} has missing or non-object properties at stamp time; \
-                     coverage stamp skipped (F2 contract violation)"
-                ));
-                report.coverage_stamps_missed += 1;
-                continue;
-            }
-        };
-        props.insert(
-            "import_scan_status".into(),
-            json!(if unresolved_count == 0 {
-                "scanned"
-            } else {
-                "partially_resolved"
-            }),
-        );
-        props.insert("import_specifier_count".into(), json!(scan.imports.len()));
-        props.insert("unresolved_import_count".into(), json!(unresolved_count));
-        module.properties = Some(Value::Object(props));
-        if !upsert_entity(rt, token, module, &source_label, report).await? {
+        } else if invalid_properties {
+            report.warnings.push(format!(
+                "module {module_id} has missing or non-object properties at stamp time; \
+                 coverage stamp skipped (F2 contract violation)"
+            ));
+            report.coverage_stamps_missed += 1;
+        } else if outcome == RowMutationOutcome::Blocked {
             report.coverage_stamps_missed += 1;
         }
     }
@@ -2104,29 +2271,31 @@ async fn record_l2_unresolved(
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
-    let Some(mut entity) = get_entity_opt(rt, token, entity_id).await? else {
-        return Ok(false);
-    };
-    let mut list = entity
-        .properties
-        .as_ref()
-        .map(read_l2_unresolved)
-        .unwrap_or_default();
-    if list.contains(&reference) {
-        return Ok(false);
-    }
-    list.push(reference);
-    let mut props = entity
-        .properties
-        .clone()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    props.insert(
-        "l2_unresolved_references".into(),
-        serde_json::to_value(&list).expect("serializes"),
-    );
-    entity.properties = Some(Value::Object(props));
-    upsert_entity(rt, token, entity, file_label, report).await
+    let outcome = mutate_entity(rt, token, entity_id, file_label, report, |current| {
+        let mut entity = current?.clone();
+        let mut list = entity
+            .properties
+            .as_ref()
+            .map(read_l2_unresolved)
+            .unwrap_or_default();
+        if list.contains(&reference) {
+            return None;
+        }
+        list.push(reference.clone());
+        let mut props = entity
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "l2_unresolved_references".into(),
+            serde_json::to_value(&list).expect("serializes"),
+        );
+        entity.properties = Some(Value::Object(props));
+        Some(entity)
+    })
+    .await?;
+    Ok(outcome.wrote())
 }
 
 /// Attempt immediate same-project resolution of one call/type reference
@@ -2238,41 +2407,33 @@ async fn upsert_l2_depends_on(
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let edge_id = edge_uuid(EdgeRelation::DependsOn, source_id, target_id);
-    let link_id = LinkId::from(edge_id);
-    let graph = rt.graph(token)?;
-    let existing = graph
-        .get_edge(link_id)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let existed = existing.is_some();
-    let metadata = merge_l2_evidence(
-        existing.as_ref().and_then(|e| e.metadata.as_ref()),
-        evidence,
-        language,
-        now,
-    );
-    let edge = Edge {
-        id: link_id,
-        namespace: token.namespace().as_str().to_string(),
-        source_id,
-        target_id,
-        relation: EdgeRelation::DependsOn,
-        weight: 1.0,
-        created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(now),
-        updated_at: now,
-        deleted_at: None,
-        metadata: Some(metadata),
-        target_backend: None,
-    };
-    graph
-        .upsert_edge(edge)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    let outcome = mutate_edge(rt, token, edge_id, |current| {
+        let metadata = merge_l2_evidence(
+            current.and_then(|edge| edge.metadata.as_ref()),
+            evidence,
+            language,
+            now,
+        );
+        Some(Edge {
+            id: LinkId::from(edge_id),
+            namespace: token.namespace().as_str().to_string(),
+            source_id,
+            target_id,
+            relation: EdgeRelation::DependsOn,
+            weight: 1.0,
+            created_at: current.map(|edge| edge.created_at).unwrap_or(now),
+            updated_at: now,
+            deleted_at: None,
+            metadata: Some(metadata),
+            target_backend: current.and_then(|edge| edge.target_backend.clone()),
+        })
+    })
+    .await?;
     state.stamped_edge_ids.insert(edge_id);
-    if existed {
-        report.edges_updated += 1;
-    } else {
-        report.edges_created += 1;
+    match outcome {
+        RowMutationOutcome::Created => report.edges_created += 1,
+        RowMutationOutcome::Updated => report.edges_updated += 1,
+        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
     }
     Ok(())
 }
@@ -2289,38 +2450,35 @@ async fn upsert_l2_implements(
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let edge_id = edge_uuid(EdgeRelation::Implements, type_id, trait_id);
-    let link_id = LinkId::from(edge_id);
-    let graph = rt.graph(token)?;
-    let existing = graph
-        .get_edge(link_id)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let existed = existing.is_some();
-    graph
-        .upsert_edge(Edge {
-            id: link_id,
+    let outcome = mutate_edge(rt, token, edge_id, |current| {
+        let mut metadata = current
+            .and_then(|edge| edge.metadata.as_ref())
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        metadata.insert("l2_derived".into(), json!(true));
+        metadata.insert("language".into(), json!(language));
+        metadata.insert("last_seen_at".into(), json!(now.to_rfc3339()));
+        Some(Edge {
+            id: LinkId::from(edge_id),
             namespace: token.namespace().as_str().to_string(),
             source_id: type_id,
             target_id: trait_id,
             relation: EdgeRelation::Implements,
             weight: 1.0,
-            created_at: existing.as_ref().map(|edge| edge.created_at).unwrap_or(now),
+            created_at: current.map(|edge| edge.created_at).unwrap_or(now),
             updated_at: now,
             deleted_at: None,
-            metadata: Some(json!({
-                "l2_derived": true,
-                "language": language,
-                "last_seen_at": now.to_rfc3339(),
-            })),
-            target_backend: None,
+            metadata: Some(Value::Object(metadata)),
+            target_backend: current.and_then(|edge| edge.target_backend.clone()),
         })
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    })
+    .await?;
     state.stamped_edge_ids.insert(edge_id);
-    if existed {
-        report.edges_updated += 1;
-    } else {
-        report.edges_created += 1;
+    match outcome {
+        RowMutationOutcome::Created => report.edges_created += 1,
+        RowMutationOutcome::Updated => report.edges_updated += 1,
+        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
     }
     Ok(())
 }
@@ -2436,33 +2594,35 @@ async fn record_l2_pending_impl(
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
-    let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
-        return Ok(false);
-    };
     let entry = L2PendingImpl {
         type_path,
         trait_path,
     };
-    let mut list = module
-        .properties
-        .as_ref()
-        .map(read_l2_pending_impls)
-        .unwrap_or_default();
-    if list.contains(&entry) {
-        return Ok(false);
-    }
-    list.push(entry);
-    let mut props = module
-        .properties
-        .clone()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    props.insert(
-        "l2_pending_impls".into(),
-        serde_json::to_value(&list).expect("serializes"),
-    );
-    module.properties = Some(Value::Object(props));
-    upsert_entity(rt, token, module, file_label, report).await
+    let outcome = mutate_entity(rt, token, module_id, file_label, report, |current| {
+        let mut module = current?.clone();
+        let mut list = module
+            .properties
+            .as_ref()
+            .map(read_l2_pending_impls)
+            .unwrap_or_default();
+        if list.contains(&entry) {
+            return None;
+        }
+        list.push(entry.clone());
+        let mut props = module
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "l2_pending_impls".into(),
+            serde_json::to_value(&list).expect("serializes"),
+        );
+        module.properties = Some(Value::Object(props));
+        Some(module)
+    })
+    .await?;
+    Ok(outcome.wrote())
 }
 
 /// Upsert (create or refresh) the `contains` edge from a declaration's
@@ -2483,51 +2643,44 @@ async fn stamp_containment_edge(
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let edge_id = edge_uuid(EdgeRelation::Contains, owner_id, child_id);
-    let link_id = LinkId::from(edge_id);
-    let graph = rt.graph(token)?;
-    let existing = graph
-        .get_edge(link_id)
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let metadata = match existing.as_ref().and_then(|edge| edge.metadata.as_ref()) {
-        Some(metadata)
-            if preserve_non_l2_metadata
-                && !metadata
-                    .get("l2_derived")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false) =>
-        {
-            metadata.clone()
-        }
-        _ => json!({
-            "l2_derived": true,
-            "language": stamp.language,
-            "last_seen_at": stamp.sweep_time.to_rfc3339(),
-        }),
-    };
-    graph
-        .upsert_edge(Edge {
-            id: link_id,
+    let outcome = mutate_edge(rt, token, edge_id, |current| {
+        let metadata = match current.and_then(|edge| edge.metadata.as_ref()) {
+            Some(metadata)
+                if preserve_non_l2_metadata
+                    && !metadata
+                        .get("l2_derived")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false) =>
+            {
+                metadata.clone()
+            }
+            _ => json!({
+                "l2_derived": true,
+                "language": stamp.language,
+                "last_seen_at": stamp.sweep_time.to_rfc3339(),
+            }),
+        };
+        Some(Edge {
+            id: LinkId::from(edge_id),
             namespace: token.namespace().as_str().to_string(),
             source_id: owner_id,
             target_id: child_id,
             relation: EdgeRelation::Contains,
             weight: 1.0,
-            created_at: existing
-                .as_ref()
+            created_at: current
                 .map(|edge| edge.created_at)
                 .unwrap_or(stamp.sweep_time),
             updated_at: stamp.sweep_time,
             deleted_at: None,
             metadata: Some(metadata),
-            target_backend: None,
+            target_backend: current.and_then(|edge| edge.target_backend.clone()),
         })
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    if existing.is_some() {
-        report.edges_updated += 1;
-    } else {
-        report.edges_created += 1;
+    })
+    .await?;
+    match outcome {
+        RowMutationOutcome::Created => report.edges_created += 1,
+        RowMutationOutcome::Updated => report.edges_updated += 1,
+        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
     }
     Ok(())
 }
@@ -2565,38 +2718,46 @@ async fn upsert_declaration(
     } else {
         containing_module_path.to_string()
     };
-    let existing = get_entity_opt(rt, token, id).await?;
-    let is_new = existing.is_none();
-
-    let mut props = serde_json::Map::new();
-    props.insert("source_project".into(), json!(source_project));
-    props.insert("language".into(), json!(language));
-    // `module_path` is the containing module used in the UUID preimage for
-    // every declaration, including inline-module declarations. The returned
-    // `own_module_path` is only traversal context for that module's children.
-    props.insert("module_path".into(), json!(containing_module_path));
-    props.insert("source_path".into(), json!(source_path));
-    props.insert("source_revision".into(), json!(source_revision));
-    props.insert("content_hash".into(), json!(decl.content_hash));
-    props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-
-    let mut entity = Entity::new(token.namespace().as_str(), "concept", decl.name.clone())
-        .with_entity_type(Some(canonical_kind));
-    entity.id = id;
-    entity.description = decl.description.clone();
-    entity.properties = Some(Value::Object(props));
     let now = ts(sweep_time);
-    entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
-    entity.updated_at = now;
-
-    if !upsert_entity(rt, token, entity, file_label, report).await? {
+    let outcome = mutate_entity(rt, token, id, file_label, report, |current| {
+        let mut entity = current.cloned().unwrap_or_else(|| {
+            Entity::new(token.namespace().as_str(), "concept", decl.name.clone())
+                .with_entity_type(Some(canonical_kind))
+        });
+        let mut props = entity
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        props.insert("source_project".into(), json!(source_project));
+        props.insert("language".into(), json!(language));
+        // `module_path` is the containing module used in the UUID preimage for
+        // every declaration, including inline-module declarations. The returned
+        // `own_module_path` is only traversal context for that module's children.
+        props.insert("module_path".into(), json!(containing_module_path));
+        props.insert("source_path".into(), json!(source_path));
+        props.insert("source_revision".into(), json!(source_revision));
+        props.insert("content_hash".into(), json!(decl.content_hash));
+        props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+        entity.id = id;
+        entity.namespace = token.namespace().as_str().to_string();
+        entity.kind = "concept".to_string();
+        entity.entity_type = Some(canonical_kind.to_string());
+        entity.name = decl.name.clone();
+        entity.description = decl.description.clone();
+        entity.properties = Some(Value::Object(props));
+        entity.updated_at = now;
+        Some(entity)
+    })
+    .await?;
+    if outcome == RowMutationOutcome::Blocked {
         return Ok(None);
     }
     if let Some(l2) = report.l2.as_mut() {
-        if is_new {
-            l2.symbols_created += 1;
-        } else {
-            l2.symbols_updated += 1;
+        match outcome {
+            RowMutationOutcome::Created => l2.symbols_created += 1,
+            RowMutationOutcome::Updated => l2.symbols_updated += 1,
+            RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
         }
     }
     Ok(Some((id, own_module_path)))
@@ -2613,24 +2774,22 @@ async fn clear_l2_ownership(
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
-        return Ok(());
-    };
-    let Some(mut props) = module
-        .properties
-        .clone()
-        .and_then(|v| v.as_object().cloned())
-    else {
-        return Ok(());
-    };
-    let removed_ownership = props.remove("declaration_ids").is_some();
-    let removed_pending_impls = props.remove("l2_pending_impls").is_some();
-    let removed_content_hash = props.remove("l2_content_hash").is_some();
-    if !removed_ownership && !removed_pending_impls && !removed_content_hash {
-        return Ok(()); // already un-stamped, nothing to clear
-    }
-    module.properties = Some(Value::Object(props));
-    upsert_entity(rt, token, module, file_label, report).await?;
+    mutate_entity(rt, token, module_id, file_label, report, |current| {
+        let mut module = current?.clone();
+        let mut props = module
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())?;
+        let changed = ["declaration_ids", "l2_pending_impls", "l2_content_hash"]
+            .into_iter()
+            .any(|key| props.remove(key).is_some());
+        if !changed {
+            return None;
+        }
+        module.properties = Some(Value::Object(props));
+        Some(module)
+    })
+    .await?;
     Ok(())
 }
 
@@ -2646,33 +2805,38 @@ async fn stamp_l2_declarations(
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
-    let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
+    let mut row_missing = false;
+    let mut invalid_properties = false;
+    mutate_entity(rt, token, module_id, file_label, report, |current| {
+        row_missing = current.is_none();
+        let mut module = current?.clone();
+        let Some(Value::Object(mut props)) = module.properties.clone() else {
+            invalid_properties = true;
+            return None;
+        };
+        props.insert(
+            "declaration_ids".into(),
+            json!(declaration_ids
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()),
+        );
+        props.insert("l2_content_hash".into(), json!(content_hash));
+        module.properties = Some(Value::Object(props));
+        Some(module)
+    })
+    .await?;
+    if row_missing {
         report.warnings.push(format!(
             "L2 module {module_id} from this sweep was missing at stamp time; \
              declaration_ids not recorded"
         ));
-        return Ok(());
-    };
-    let mut props = match module.properties.clone() {
-        Some(Value::Object(map)) => map,
-        _ => {
-            report.warnings.push(format!(
-                "L2 module {module_id} has missing or non-object properties at stamp time; \
-                 declaration_ids not recorded"
-            ));
-            return Ok(());
-        }
-    };
-    props.insert(
-        "declaration_ids".into(),
-        json!(declaration_ids
-            .iter()
-            .map(Uuid::to_string)
-            .collect::<Vec<_>>()),
-    );
-    props.insert("l2_content_hash".into(), json!(content_hash));
-    module.properties = Some(Value::Object(props));
-    upsert_entity(rt, token, module, file_label, report).await?;
+    } else if invalid_properties {
+        report.warnings.push(format!(
+            "L2 module {module_id} has missing or non-object properties at stamp time; \
+             declaration_ids not recorded"
+        ));
+    }
     Ok(())
 }
 
@@ -2713,22 +2877,51 @@ async fn refresh_l2_declarations(
         declarations.push(entity);
     }
 
-    for mut declaration in declarations {
-        let mut properties = declaration
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        properties.insert("source_path".into(), json!(source_path));
-        properties.insert("source_revision".into(), json!(source_revision));
-        properties.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-        declaration.properties = Some(Value::Object(properties));
-        declaration.updated_at = ts(sweep_time);
-        if !upsert_entity(rt, token, declaration, file_label, report).await? {
+    for declaration in declarations {
+        let id = declaration.id;
+        let mut current_valid = true;
+        let outcome = mutate_entity(rt, token, id, file_label, report, |current| {
+            let Some(mut declaration) = current.cloned() else {
+                current_valid = false;
+                return None;
+            };
+            let properties = declaration.properties.as_ref();
+            current_valid = declaration
+                .entity_type
+                .as_deref()
+                .and_then(DeclKind::from_code_token)
+                .is_some()
+                && properties
+                    .and_then(|value| value.get("source_project"))
+                    .and_then(Value::as_str)
+                    == Some(source_project)
+                && properties
+                    .and_then(|value| value.get("language"))
+                    .and_then(Value::as_str)
+                    == Some(language);
+            if !current_valid {
+                return None;
+            }
+            let mut properties = declaration
+                .properties
+                .clone()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            properties.insert("source_path".into(), json!(source_path));
+            properties.insert("source_revision".into(), json!(source_revision));
+            properties.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+            declaration.properties = Some(Value::Object(properties));
+            declaration.updated_at = ts(sweep_time);
+            Some(declaration)
+        })
+        .await?;
+        if !current_valid || outcome == RowMutationOutcome::Blocked {
             return Ok(false);
         }
-        if let Some(l2) = report.l2.as_mut() {
-            l2.symbols_updated += 1;
+        if outcome.wrote() {
+            if let Some(l2) = report.l2.as_mut() {
+                l2.symbols_updated += 1;
+            }
         }
     }
     Ok(true)
@@ -3147,7 +3340,7 @@ async fn refresh_unchanged_l2_edges(
         .get_edges(&edge_ids.into_iter().map(LinkId::from).collect::<Vec<_>>())
         .await
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    for mut edge in edges {
+    for edge in edges {
         let Some(source_owner) = state.current_declarations.get(&edge.source_id).cloned() else {
             continue;
         };
@@ -3156,29 +3349,41 @@ async fn refresh_unchanged_l2_edges(
         {
             continue;
         }
-        let mut metadata = edge
+        if !edge
             .metadata
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        if !metadata
-            .get("l2_derived")
+            .as_ref()
+            .and_then(|metadata| metadata.get("l2_derived"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
             continue;
         }
-        metadata.insert("language".into(), json!(source_owner.language));
-        metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-        edge.updated_at = sweep_time;
-        edge.metadata = Some(Value::Object(metadata));
         let edge_id = Uuid::from(edge.id);
-        graph
-            .upsert_edge(edge)
-            .await
-            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-        state.stamped_edge_ids.insert(edge_id);
-        report.edges_updated += 1;
+        let outcome = mutate_edge(rt, token, edge_id, |current| {
+            let mut edge = current?.clone();
+            let mut metadata = edge
+                .metadata
+                .clone()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            if !metadata
+                .get("l2_derived")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            metadata.insert("language".into(), json!(source_owner.language));
+            metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+            edge.updated_at = sweep_time;
+            edge.metadata = Some(Value::Object(metadata));
+            Some(edge)
+        })
+        .await?;
+        if outcome.wrote() {
+            state.stamped_edge_ids.insert(edge_id);
+            report.edges_updated += 1;
+        }
     }
 
     let hits = graph
@@ -3198,7 +3403,7 @@ async fn refresh_unchanged_l2_edges(
         .get_edges(&edge_ids.into_iter().map(LinkId::from).collect::<Vec<_>>())
         .await
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    for mut edge in edges {
+    for edge in edges {
         let Some(target_owner) = state.current_declarations.get(&edge.target_id).cloned() else {
             continue;
         };
@@ -3211,27 +3416,40 @@ async fn refresh_unchanged_l2_edges(
         {
             continue;
         }
-        let mut metadata = edge
+        if !edge
             .metadata
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        if !metadata
-            .get("l2_derived")
+            .as_ref()
+            .and_then(|metadata| metadata.get("l2_derived"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
             continue;
         }
-        metadata.insert("language".into(), json!(target_owner.language));
-        metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-        edge.updated_at = sweep_time;
-        edge.metadata = Some(Value::Object(metadata));
-        graph
-            .upsert_edge(edge)
-            .await
-            .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-        report.edges_updated += 1;
+        let edge_id = Uuid::from(edge.id);
+        let outcome = mutate_edge(rt, token, edge_id, |current| {
+            let mut edge = current?.clone();
+            let mut metadata = edge
+                .metadata
+                .clone()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            if !metadata
+                .get("l2_derived")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            metadata.insert("language".into(), json!(target_owner.language));
+            metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+            edge.updated_at = sweep_time;
+            edge.metadata = Some(Value::Object(metadata));
+            Some(edge)
+        })
+        .await?;
+        if outcome.wrote() {
+            report.edges_updated += 1;
+        }
     }
     Ok(())
 }
@@ -3313,6 +3531,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
+        let original_pending = pending.clone();
         let mut still_pending = Vec::new();
         let mut pending_changed = false;
         for reference in pending {
@@ -3364,22 +3583,36 @@ async fn l2_reresolve_pass(
         }
         if pending_changed {
             let label = id.to_string();
-            let mut props = entity
-                .properties
-                .clone()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            if still_pending.is_empty() {
-                props.remove("l2_unresolved_references");
-            } else {
-                props.insert(
-                    "l2_unresolved_references".into(),
-                    serde_json::to_value(&still_pending).expect("serializes"),
-                );
-            }
-            let mut entity = entity;
-            entity.properties = Some(Value::Object(props));
-            upsert_entity(rt, token, entity, &label, report).await?;
+            mutate_entity(rt, token, id, &label, report, |current| {
+                let mut entity = current?.clone();
+                let mut rebased = entity
+                    .properties
+                    .as_ref()
+                    .map(read_l2_unresolved)
+                    .unwrap_or_default();
+                rebased.retain(|reference| !original_pending.contains(reference));
+                for reference in &still_pending {
+                    if !rebased.contains(reference) {
+                        rebased.push(reference.clone());
+                    }
+                }
+                let mut props = entity
+                    .properties
+                    .clone()
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if rebased.is_empty() {
+                    props.remove("l2_unresolved_references");
+                } else {
+                    props.insert(
+                        "l2_unresolved_references".into(),
+                        serde_json::to_value(&rebased).expect("serializes"),
+                    );
+                }
+                entity.properties = Some(Value::Object(props));
+                Some(entity)
+            })
+            .await?;
         }
     }
 
@@ -3443,6 +3676,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
+        let original_pending = pending.clone();
         let mut still_pending = Vec::new();
         let mut resolved_any = false;
         for entry in pending {
@@ -3488,22 +3722,36 @@ async fn l2_reresolve_pass(
         }
         if resolved_any {
             let label = module_id.to_string();
-            let mut props = module
-                .properties
-                .clone()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            if still_pending.is_empty() {
-                props.remove("l2_pending_impls");
-            } else {
-                props.insert(
-                    "l2_pending_impls".into(),
-                    serde_json::to_value(&still_pending).expect("serializes"),
-                );
-            }
-            let mut module = module;
-            module.properties = Some(Value::Object(props));
-            upsert_entity(rt, token, module, &label, report).await?;
+            mutate_entity(rt, token, module_id, &label, report, |current| {
+                let mut module = current?.clone();
+                let mut rebased = module
+                    .properties
+                    .as_ref()
+                    .map(read_l2_pending_impls)
+                    .unwrap_or_default();
+                rebased.retain(|entry| !original_pending.contains(entry));
+                for entry in &still_pending {
+                    if !rebased.contains(entry) {
+                        rebased.push(entry.clone());
+                    }
+                }
+                let mut props = module
+                    .properties
+                    .clone()
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if rebased.is_empty() {
+                    props.remove("l2_pending_impls");
+                } else {
+                    props.insert(
+                        "l2_pending_impls".into(),
+                        serde_json::to_value(&rebased).expect("serializes"),
+                    );
+                }
+                module.properties = Some(Value::Object(props));
+                Some(module)
+            })
+            .await?;
         }
     }
 
@@ -3524,6 +3772,17 @@ mod tests {
     use super::*;
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
+
+    fn runtime_on(db_path: &Path) -> (KhiveRuntime, NamespaceToken) {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path.to_path_buf()),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("target runtime opens");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        (runtime, token)
+    }
 
     #[test]
     fn invalid_declaration_ids_force_reparse() {
@@ -3651,5 +3910,211 @@ mod tests {
         assert!(error.to_string().contains("entity FTS indexing"));
         assert_eq!(report.fts_indexed, 0);
         assert_eq!(report.l2.expect("L2 report").symbols_created, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier() {
+        let root = TempDir::new().expect("temporary database directory");
+        let db_path = root.path().join("entity-race.db");
+        let (runtime_a, token_a) = runtime_on(&db_path);
+        let entity_id = project_uuid("race-fixture");
+        let mut entity = Entity::new(token_a.namespace().as_str(), "project", "race-fixture");
+        entity.id = entity_id;
+        entity.properties = Some(json!({"source_project": "race-fixture"}));
+        let seed_revision = entity.updated_at;
+        runtime_a
+            .entities(&token_a)
+            .expect("entity store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let (runtime_b, token_b) = runtime_on(&db_path);
+        let specifier_a = UnresolvedSpec {
+            specifier: "alpha".to_string(),
+            target_kind: "project".to_string(),
+            dependency_kind: "dependencies".to_string(),
+            dependency_scope: "normal".to_string(),
+            language: "rust".to_string(),
+        };
+        let specifier_b = UnresolvedSpec {
+            specifier: "beta".to_string(),
+            target_kind: "project".to_string(),
+            dependency_kind: "dev-dependencies".to_string(),
+            dependency_scope: "dev".to_string(),
+            language: "rust".to_string(),
+        };
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let pause_a = std::sync::Arc::new(race_seam::OneShotPause::new(std::sync::Arc::clone(
+            &barrier,
+        )));
+        let pause_b = std::sync::Arc::new(race_seam::OneShotPause::new(barrier));
+        let mut report_a = CodeSourceIngestReport::default();
+        let mut report_b = CodeSourceIngestReport::default();
+
+        let (result_a, result_b) = tokio::join!(
+            race_seam::AFTER_ROW_READ.scope(
+                pause_a,
+                record_unresolved(
+                    &runtime_a,
+                    &token_a,
+                    entity_id,
+                    specifier_a.clone(),
+                    "alpha.rs",
+                    &mut report_a,
+                ),
+            ),
+            race_seam::AFTER_ROW_READ.scope(
+                pause_b,
+                record_unresolved(
+                    &runtime_b,
+                    &token_b,
+                    entity_id,
+                    specifier_b.clone(),
+                    "beta.rs",
+                    &mut report_b,
+                ),
+            ),
+        );
+        result_a.expect("writer A completes");
+        result_b.expect("writer B completes");
+
+        let stored = runtime_a
+            .entities(&token_a)
+            .expect("entity store")
+            .get_entity(entity_id)
+            .await
+            .expect("read entity")
+            .expect("entity remains");
+        let specifiers = stored
+            .properties
+            .as_ref()
+            .map(read_unresolved)
+            .unwrap_or_default();
+        assert_eq!(
+            specifiers.len(),
+            2,
+            "two additions derived from one entity revision must both survive: {specifiers:?}"
+        );
+        assert!(specifiers.contains(&specifier_a));
+        assert!(specifiers.contains(&specifier_b));
+        assert!(stored.updated_at > seed_revision);
+        assert_eq!(report_a.unresolved_recorded, 1);
+        assert_eq!(report_b.unresolved_recorded, 1);
+        assert_eq!(report_a.fts_indexed, 1);
+        assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind() {
+        let root = TempDir::new().expect("temporary database directory");
+        let db_path = root.path().join("edge-race.db");
+        let (runtime_a, token_a) = runtime_on(&db_path);
+        let source_id = project_uuid("source");
+        let target_id = project_uuid("target");
+        for (id, name) in [(source_id, "source"), (target_id, "target")] {
+            let mut entity = Entity::new(token_a.namespace().as_str(), "project", name);
+            entity.id = id;
+            runtime_a
+                .entities(&token_a)
+                .expect("entity store")
+                .upsert_entity(entity)
+                .await
+                .expect("seed endpoint");
+        }
+        let seed_time = Utc::now();
+        let mut seed_report = CodeSourceIngestReport::default();
+        upsert_dependency_edge(
+            &runtime_a,
+            &token_a,
+            source_id,
+            target_id,
+            "dependencies",
+            "normal",
+            "rust",
+            seed_time,
+            &mut seed_report,
+        )
+        .await
+        .expect("seed dependency edge");
+
+        let (runtime_b, token_b) = runtime_on(&db_path);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let pause_a = std::sync::Arc::new(race_seam::OneShotPause::new(std::sync::Arc::clone(
+            &barrier,
+        )));
+        let pause_b = std::sync::Arc::new(race_seam::OneShotPause::new(barrier));
+        let mut report_a = CodeSourceIngestReport::default();
+        let mut report_b = CodeSourceIngestReport::default();
+        let update_time = seed_time + chrono::Duration::seconds(1);
+
+        let (result_a, result_b) = tokio::join!(
+            race_seam::AFTER_ROW_READ.scope(
+                pause_a,
+                upsert_dependency_edge(
+                    &runtime_a,
+                    &token_a,
+                    source_id,
+                    target_id,
+                    "dev-dependencies",
+                    "dev",
+                    "rust",
+                    update_time,
+                    &mut report_a,
+                ),
+            ),
+            race_seam::AFTER_ROW_READ.scope(
+                pause_b,
+                upsert_dependency_edge(
+                    &runtime_b,
+                    &token_b,
+                    source_id,
+                    target_id,
+                    "build-dependencies",
+                    "build",
+                    "rust",
+                    update_time,
+                    &mut report_b,
+                ),
+            ),
+        );
+        result_a.expect("writer A completes");
+        result_b.expect("writer B completes");
+
+        let edge = runtime_a
+            .graph(&token_a)
+            .expect("graph store")
+            .get_edge(LinkId::from(edge_uuid(
+                EdgeRelation::DependsOn,
+                source_id,
+                target_id,
+            )))
+            .await
+            .expect("read dependency edge")
+            .expect("dependency edge remains");
+        let kinds: BTreeSet<String> = edge
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("dependency_kinds"))
+            .and_then(Value::as_array)
+            .expect("dependency kinds")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "build-dependencies".to_string(),
+                "dependencies".to_string(),
+                "dev-dependencies".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            "two evidence additions derived from one edge revision must both survive"
+        );
+        assert_eq!(report_a.edges_updated, 1);
+        assert_eq!(report_b.edges_updated, 1);
+        assert!(edge.updated_at > update_time);
     }
 }
