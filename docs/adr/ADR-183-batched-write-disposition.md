@@ -55,15 +55,29 @@ A partial disposition is a successful op. Its result body is:
 
 ```json
 {
-  "status": "ok" | "partial",
+  "status": "ok" | "partial" | "incomplete",
   "committed": [ { "index": 0, "id": "..." } ],
-  "refused":  [ { "index": 1, "field": "content", "reason": "..." } ]
+  "refused":  [ { "index": 1, "field": "content", "reason": "..." } ],
+  "stopped":  { "index": 2, "reason": "...", "disposition": "not_written" | "unknown" }
 }
 ```
 
+`stopped` is present if and only if `status` is `incomplete`, and is absent from an `ok` or a
+`partial` result. Its shape is the one section 6 defines, and it is repeated here because this
+block is what an implementer reads: a schema that named the status without the object the status
+requires would leave the one field a caller keys on to be discovered from prose.
+
 - `status` is `ok` when every record in the request committed; `partial` when every record was
-  attempted and at least one refused; `incomplete` when the call stopped early and some records
-  were never attempted (§6). `incomplete` takes precedence over `partial`.
+  attempted and at least one refused; `incomplete` when the call **stopped on a storage failure**
+  (§6), whether or not any records remained after the one that failed. `incomplete` takes
+  precedence over `partial`.
+
+  The status is defined by the stop, not by the remainder, and the difference is load-bearing on
+  exactly one shape. A store failure on the LAST record leaves nothing unattempted, so a
+  remainder-based definition would call it `partial` while §6 calls it `incomplete`. That shape is
+  also where the indeterminate outcome lives: a caller keying on `incomplete` to know it must
+  re-read would skip the re-read on the one call whose `stopped.disposition` may be `unknown`.
+  `stopped` rides an `incomplete` result in both cases.
 - A record is identified by its **zero-based position in the request list**, never by a
   caller-supplied name. The slug is itself a scanned field, so echoing it would return the very
   text a secret-gate refusal exists to withhold; and two records in one payload may carry the same
@@ -163,7 +177,7 @@ sent, by their own identity, before deciding.
 ### 7. A partial result is a success the caller must not mistake for a full one
 
 A partial disposition is a successful op, so the hazard moves: a caller that checks only `ok`
-after a 97-record upsert now believes 97 landed when 90 did. Two bindings close that gap without
+after a 97-record upsert now believes 97 landed when 90 did. Three bindings close that gap without
 edits to existing callers:
 
 - `kkernel exec --strict` treats a result whose `status` is `partial` or `incomplete` as a failed
@@ -172,6 +186,15 @@ edits to existing callers:
 - The verbose presentation and the MCP summary line print the refused count beside the committed
   count for a partial result, never the ids alone; an `incomplete` result additionally prints the
   stopped index and its disposition.
+- The request-level `summary` counts a partial or incomplete op in a field of its own rather than
+  silently inside `succeeded`: `summary` gains `partial`, and the request `status` reports it.
+  The request level has its own vocabulary, `success` | `partial` | `aborted`, and `ok` is not a
+  value in it; `ok` is the op result body's field, defined above. Today the request status is
+  derived as `success` unless some op failed or aborted, so a request whose every op succeeded
+  partially reports `success`. This binding extends that derivation by one clause: a non-zero
+  `summary.partial` makes the request status `partial` as well. This binding is the one that reaches agents. A partial op carries `ok: true`, so
+  without it a reader of `summary: {total: 1, succeeded: 1, failed: 0}` sees an unqualified success
+  for a call that refused seven records, and `summary` is the field agents read first.
 
 ## Consequences
 
@@ -219,3 +242,14 @@ Stated before implementation, per verb the census binds:
     (`status: "ok"`), which exits zero.
 11. The verbose presentation and the MCP summary line for a partial result carry the refused count
     beside the committed count; a fixture with two committed and one refused renders both numbers.
+12. A storage failure injected on the LAST record of a three-record call returns
+    `status: "incomplete"`, not `partial`, with `stopped.index` 2 and nothing left unattempted.
+    This is the arm the §2 definition exists for: a remainder-based reading returns `partial` here
+    and the caller skips the re-read that an indeterminate outcome requires.
+13. A one-op request whose result carries `status: "partial"` returns a request-level `summary`
+    with `partial: 1` and a request `status` of `"partial"`; the control is the same call with
+    every record committing, which returns `partial: 0` and a request `status` of `"success"`.
+    Both values are read at the request envelope, not at the op body, and `"ok"` appears at
+    neither point of this arm. The arm additionally
+    asserts that `succeeded` and `failed` are IDENTICAL across the two calls, because that is the
+    reading which cannot tell them apart today and the reason this binding exists.
