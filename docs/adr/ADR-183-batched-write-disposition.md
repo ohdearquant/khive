@@ -61,7 +61,9 @@ A partial disposition is a successful op. Its result body is:
 }
 ```
 
-- `status` is `partial` exactly when `refused` is non-empty, and `ok` otherwise.
+- `status` is `ok` when every record in the request committed; `partial` when every record was
+  attempted and at least one refused; `incomplete` when the call stopped early and some records
+  were never attempted (§6). `incomplete` takes precedence over `partial`.
 - A record is identified by its **zero-based position in the request list**, never by a
   caller-supplied name. The slug is itself a scanned field, so echoing it would return the very
   text a secret-gate refusal exists to withhold; and two records in one payload may carry the same
@@ -72,6 +74,11 @@ A partial disposition is a successful op. Its result body is:
   renders a masked form in `reason`; the disposition adds position, it does not widen disclosure.
 - `status`, `committed` and `refused` are fields of the result body. Records are nested objects
   inside `committed` and `refused`; a record's own properties cannot shadow them.
+- **Every list this ADR defines rides the successful result body, never an error.** The error
+  model's `details` is a bounded set of string pairs (`khive-types::Details`, eight entries, with
+  its own truncation indicator), so it can carry the scalars that locate a refusal — `index`,
+  `field`, `reason` — and cannot carry a record list. Any disposition that has records to name is
+  therefore a result, not an error.
 
 ### 3. `atomic=true` is how a caller asks for all-or-nothing
 
@@ -107,7 +114,7 @@ census at one revision, not part of the rule.
 | `knowledge.upsert_atoms`   | `atoms`     | aborts on the first refusal, nothing written           | partial by default, `atomic` opt-in       |
 | `knowledge.upsert_domains` | `domains`   | aborts on the first refusal, earlier domains committed | partial by default, `atomic` opt-in (§3)  |
 | `create(items=...)`        | `items`     | `atomic` flag, default `true`, per-index errors        | unchanged; a precedent with its own shape |
-| `kg.stream.batch`          | `ops`       | `atomic` flag, default `fence.is_some()`               | unchanged; the precedent                  |
+| `stream.batch`             | `ops`       | `atomic` flag, default `fence.is_some()`               | unchanged; the precedent                  |
 
 `knowledge.import` is **not** bound. Its input is a filesystem path, not a record list, and
 ADR-048 already requires discovery, parsing, validation and secret-scan failures to abort before
@@ -129,14 +136,29 @@ record's position and field. This is the half that is true regardless of which w
 decided, and it lands first: an all-or-nothing batch whose single error cannot be located is
 unusable whether or not partial commit exists.
 
-### 6. A storage failure after earlier commits is reported with what committed
+### 6. A storage failure names what committed, and never claims to know an unknown outcome
 
-Under the default disposition each passing record commits in its own transaction. If the store
-fails on a later record, the records committed before it are durable and the call must say so.
-The op fails with an error whose `details` carry `committed` (every record already durable, by
-`index` and `id`) and the failing `index`; no record after the failing one is attempted. Under
-`atomic=true` there is one transaction, so a storage failure commits nothing and the error carries
-no `committed` list.
+Under the default disposition each passing record commits in its own transaction. A store failure
+on record `i` does not discard the records already durable, and the call says so rather than
+failing the op: it returns `status: "incomplete"`, `committed` naming every durable record, and
+
+```json
+"stopped": { "index": 2, "reason": "...", "disposition": "not_written" | "unknown" }
+```
+
+No record after `i` is attempted. `disposition` is `not_written` when the writer reports a
+definite failure and `unknown` when it reports an indeterminate one — the storage layer's existing
+`SideEffectsUnknown` writer state, which means the write may or may not have committed.
+
+Under `atomic=true` there is one transaction. A definite storage failure commits nothing, and the
+op fails. **An indeterminate outcome is not converted into "nothing committed":** the op fails
+with the runtime's existing unknown-side-effects class, which already states that the durability
+of that transaction is unresolved.
+
+In both modes an `unknown` disposition is a caller obligation, not a retry the verb performs. The
+verb never re-reads and never retries on the caller's behalf, because a blind retry of a batch
+whose first attempt may have committed is a duplicate write. The caller re-reads the records it
+sent, by their own identity, before deciding.
 
 ### 7. A partial result is a success the caller must not mistake for a full one
 
@@ -144,10 +166,12 @@ A partial disposition is a successful op, so the hazard moves: a caller that che
 after a 97-record upsert now believes 97 landed when 90 did. Two bindings close that gap without
 edits to existing callers:
 
-- `kkernel exec --strict` treats a result whose `status` is `partial` as a failed op for its exit
-  code, exactly as it treats `ok: false`. Every strict script keeps the guarantee it had.
+- `kkernel exec --strict` treats a result whose `status` is `partial` or `incomplete` as a failed
+  op for its exit code, exactly as it treats `ok: false`. Every strict script keeps the guarantee
+  it had.
 - The verbose presentation and the MCP summary line print the refused count beside the committed
-  count for a partial result, never the ids alone.
+  count for a partial result, never the ids alone; an `incomplete` result additionally prints the
+  stopped index and its disposition.
 
 ## Consequences
 
@@ -183,12 +207,15 @@ Stated before implementation, per verb the census binds:
    indices.
 7. `knowledge.upsert_domains` with `atomic=true`, two domains, the second refusing: the first is
    not present in the store afterwards. This arm fails against today's handler.
-8. A storage failure injected on the second record of a three-record default-disposition call:
-   the error's `details.committed` names index 0, `details.index` is 1, and the third record is
-   absent from the store.
+8. A storage failure injected on the second record of a three-record default-disposition call
+   returns `status: "incomplete"` with `committed` naming index 0, `stopped.index` 1, and the
+   third record absent from the store. Two arms by writer outcome: a definite failure gives
+   `stopped.disposition: "not_written"`, an indeterminate one gives `"unknown"`, and neither arm
+   is an op-level error.
 9. Mutation control: restoring the `?` that returns on the first refusal must fail arms 1, 5 and 6
    and leave arm 2 green, since arm 2 is the behaviour being restored.
-10. `kkernel exec --strict` over a call whose result is `status: "partial"` exits non-zero; the
-    control is the same call with every record passing (`status: "ok"`), which exits zero.
+10. `kkernel exec --strict` over a call whose result is `status: "partial"` exits non-zero, and
+    likewise for `"incomplete"`; the control is the same call with every record passing
+    (`status: "ok"`), which exits zero.
 11. The verbose presentation and the MCP summary line for a partial result carry the refused count
     beside the committed count; a fixture with two committed and one refused renders both numbers.
