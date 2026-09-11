@@ -41,8 +41,9 @@ make a filtered call return early with an empty page.
 
 `comm.probe` is a strictly read-only verb built for frequent polling (e.g.
 every 30s by many monitors): it never mutates the `read` flag or writes any
-row. It runs a single indexed query (`INDEXED BY idx_comm_message_to_actor`)
-over inbound messages addressed to the given `actor`.
+row. The page and stale unread count are computed in one SQL statement and
+share a snapshot. Both include only live inbound messages whose recipient
+exactly matches the given `actor` in the caller's namespace.
 
 Args:
 
@@ -54,18 +55,29 @@ Args:
 
 Returns:
 
-- `cursor_us`: an opaque, monotonically increasing token (currently backed
-  by the durable `notes_seq.seq` commit-order sequence), or `0` if no
-  inbound messages exist for the actor.
+- `cursor_us`: an opaque, nondecreasing token backed by the durable
+  `notes_seq.seq` commit-order sequence. It is the maximum sequence among
+  the rows actually returned, floored by the honored caller cursor. An
+  empty page does not advance that cursor; an empty baseline returns `0`.
   Round-trip it as the next call's `since_us`; do not treat it as a
   timestamp or compute elapsed time from it (#780).
-- `new_messages` — up to 100 newest matching rows, each `{id, created_at_us,
-  from_actor, subject?}`, ordered ascending (newest-last) by `created_at`.
+- `new_messages` — the earliest 100 unseen matching rows in commit-sequence
+  order, or all remaining rows if fewer, each `{id, created_at_us, from_actor,
+  subject?}`. The selected page is displayed ascending (newest-last) by
+  `created_at`. Round-tripping the cursor retrieves subsequent pages without
+  skipping messages when a burst exceeds 100 rows.
   `created_at_us` is a real display timestamp, useful for "how long ago did
   this arrive", but it is not the cursor and carries no ordering guarantee
   relative to `cursor_us`.
-- `stale_unread_count` — count of inbound unread messages older than
-  `stale_minutes`.
+- `stale_unread_count` — the stale unread count capped at `1000`: values
+  below `1000` are exact; `1000` means at least 1000. It covers all matching
+  inbound unread messages strictly older than the `stale_minutes` cutoff,
+  independently of the arrival cursor and returned page. Only JSON boolean
+  `true` in `properties.read` marks a message read; missing, null, or other
+  values remain unread.
+- `cursor_reset` — present as `true` only when the supplied cursor exceeds
+  the store's durable global sequence high-water mark and is discarded in
+  favor of a baseline page. It is absent for baseline and honored cursors.
 
 The response shape is frozen: it is a public polling contract and must stay
 minimal and stable. `cursor_us`/`since_us` keep their `_us`-suffixed wire
