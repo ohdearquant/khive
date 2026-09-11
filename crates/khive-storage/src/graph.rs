@@ -77,6 +77,8 @@ pub trait GraphStore: Send + Sync + 'static {
     /// `GuardedBatchOutcome::refused` names the first failing batch entry and
     /// its missing endpoint(s) — determined by the same in-transaction
     /// pre-check that aborted the batch, not a post-hoc re-read.
+    /// Retain the original ordered input to enumerate every aborted write via
+    /// [`GuardedBatchOutcome::refusal_page`] beyond the default bounded sample.
     ///
     /// Default returns `StorageError::Unsupported`, for the same reason as
     /// [`GraphStore::upsert_edge_guarded`]'s default.
