@@ -482,6 +482,15 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
         for foreign_count in [0, 6000] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("mailbox.sqlite");
+            // Sent already changes plans after ANALYZE as the population grows.
+            // Compare this inbox migration to an identical no-full-index cell.
+            let baseline_path = temp.path().join("baseline.sqlite");
+            let mut baseline_conn = fixture_with_connection(
+                Connection::open(&baseline_path).unwrap(),
+                foreign_count,
+                0,
+                None,
+            );
             let mut conn = fixture_with_connection(
                 Connection::open(&path).unwrap(),
                 foreign_count,
@@ -491,7 +500,16 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
             if !fresh_schema {
                 conn.execute_batch(&migration).unwrap();
                 register_comm_indexes(&conn);
+                register_comm_indexes(&baseline_conn);
             }
+            let full_exists: bool = baseline_conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'idx_notes_message_recipient_direction')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!full_exists, "sent baseline must exclude the full index");
             for (stage_index, stage) in [
                 "fresh_connection",
                 "reopened",
@@ -504,9 +522,12 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                 if stage.ends_with("reopened") {
                     drop(conn);
                     conn = Connection::open(&path).unwrap();
+                    drop(baseline_conn);
+                    baseline_conn = Connection::open(&baseline_path).unwrap();
                 }
                 if *stage == "analyzed" {
                     conn.execute_batch("ANALYZE").unwrap();
+                    baseline_conn.execute_batch("ANALYZE").unwrap();
                 }
                 for (index, status) in ["unread", "read", "all", "sent"].iter().enumerate() {
                     let filter = if *status == "sent" {
@@ -515,18 +536,31 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                         inbox_filter(status, false)
                     };
                     let result = measure(&conn, &filter);
-                    assert_actor_seek(&result, status);
+                    let sent_baseline =
+                        (*status == "sent").then(|| measure(&baseline_conn, &filter));
+                    if let Some(before) = &sent_baseline {
+                        assert_eq!(result["sql"], before["sql"]);
+                        assert_eq!(result["ids"], before["ids"]);
+                        let before_steps = before["vm_steps"].as_u64().unwrap();
+                        let after_steps = result["vm_steps"].as_u64().unwrap();
+                        assert!(after_steps <= before_steps,
+                            "{fresh_schema}/{foreign_count}/{stage}: sent work regressed ({before} -> {result})");
+                    } else {
+                        assert_actor_seek(&result, status);
+                    }
                     if foreign_count == 0 {
                         small_results.push(result.clone());
                     } else {
                         let baseline: &Value = &small_results[stage_index * 4 + index];
                         assert_eq!(result["ids"], baseline["ids"]);
-                        let steps = result["vm_steps"].as_u64().unwrap();
-                        let baseline_steps = baseline["vm_steps"].as_u64().unwrap();
-                        assert!(steps <= baseline_steps + 128,
-                            "{fresh_schema}/{stage}/{status}: foreign mailbox growth must not add row-proportional work ({baseline_steps} -> {steps})");
+                        if *status != "sent" {
+                            let steps = result["vm_steps"].as_u64().unwrap();
+                            let baseline_steps = baseline["vm_steps"].as_u64().unwrap();
+                            assert!(steps <= baseline_steps + 128,
+                                "{fresh_schema}/{stage}/{status}: foreign mailbox growth must not add row-proportional work ({baseline_steps} -> {steps})");
+                        }
                     }
-                    measurements.push(json!({"fresh_schema":fresh_schema,"stage":stage,"foreign_count":foreign_count,"status":status,"result":result}));
+                    measurements.push(json!({"fresh_schema":fresh_schema,"stage":stage,"foreign_count":foreign_count,"status":status,"result":result,"sent_baseline":sent_baseline}));
                 }
             }
         }
