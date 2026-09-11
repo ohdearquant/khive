@@ -3985,7 +3985,7 @@ mod tests {
 
     #[test]
     fn issue_1988_latex_exemption_does_not_hide_credential_runs() {
-        let credential = "a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4";
+        let credential = "a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4"; // gitleaks:allow
         let content = format!(r"api key: \texttt{{{credential}}}");
 
         assert!(

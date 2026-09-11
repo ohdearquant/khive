@@ -59,6 +59,7 @@ impl CoordinatorService for SubstrateCoordinatorService {
         self.inner.registry().primary().map(|e| e.id.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn link(
         &self,
         namespace: &Namespace,
@@ -67,22 +68,27 @@ impl CoordinatorService for SubstrateCoordinatorService {
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
+        resurrect: bool,
     ) -> Result<CoordLinkResult, CoordError> {
         self.inner
-            .link_cross_backend(namespace, source_id, target_id, relation, weight, metadata)
+            .link_cross_backend_observed(
+                namespace, source_id, target_id, relation, weight, metadata, resurrect,
+            )
             .await
-            .and_then(|edge| {
-                let cross_backend = edge.target_backend.is_some();
-                let target_backend_id = edge
+            .and_then(|row| {
+                let cross_backend = row.edge.target_backend.is_some();
+                let target_backend_id = row
+                    .edge
                     .target_backend
                     .as_deref()
                     .map(BackendId::parse)
                     .transpose()
                     .map_err(|error| format!("stored target backend is invalid: {error}"))?;
                 Ok(CoordLinkResult {
-                    edge,
+                    edge: row.edge,
                     cross_backend,
                     target_backend_id,
+                    mutation: row.disposition,
                 })
             })
             .map_err(|msg| {
