@@ -138,6 +138,17 @@ The op fails with an error whose `details` carry `committed` (every record alrea
 `atomic=true` there is one transaction, so a storage failure commits nothing and the error carries
 no `committed` list.
 
+### 7. A partial result is a success the caller must not mistake for a full one
+
+A partial disposition is a successful op, so the hazard moves: a caller that checks only `ok`
+after a 97-record upsert now believes 97 landed when 90 did. Two bindings close that gap without
+edits to existing callers:
+
+- `kkernel exec --strict` treats a result whose `status` is `partial` as a failed op for its exit
+  code, exactly as it treats `ok: false`. Every strict script keeps the guarantee it had.
+- The verbose presentation and the MCP summary line print the refused count beside the committed
+  count for a partial result, never the ids alone.
+
 ## Consequences
 
 A caller that today treats any error from a batched write as "nothing was written" becomes wrong
@@ -177,3 +188,7 @@ Stated before implementation, per verb the census binds:
    absent from the store.
 9. Mutation control: restoring the `?` that returns on the first refusal must fail arms 1, 5 and 6
    and leave arm 2 green, since arm 2 is the behaviour being restored.
+10. `kkernel exec --strict` over a call whose result is `status: "partial"` exits non-zero; the
+    control is the same call with every record passing (`status: "ok"`), which exits zero.
+11. The verbose presentation and the MCP summary line for a partial result carry the refused count
+    beside the committed count; a fixture with two committed and one refused renders both numbers.
