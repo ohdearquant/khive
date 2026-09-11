@@ -540,3 +540,30 @@ behavior, and provenance semantics that cannot be represented as `base_kind + en
 - `FromStr`: accepts base kind names + short aliases (`art`, `svc`). Subtype tokens resolve
   through the registry, not `FromStr`.
 - SQL: `entity_type TEXT NULL` column, indexed with `(namespace, kind, entity_type)`.
+
+## Amendment (2026-09-10): `adr` and `research_report` are Document genres
+
+Two spellings account for 1,382 of the entities on a production store whose
+`properties.type` names a genre the registry does not know: `adr` (682) and
+`research-report` (700), both on `Document`. They are not ad-hoc: a decision
+record and a research report are authored communicative works with a stable
+shape, and the Document column already carries their neighbours `report`,
+`specification` and `documentation`.
+
+Both are added as canonical Document subtypes:
+
+| Kind         | Added                                                           |
+| ------------ | --------------------------------------------------------------- |
+| **Document** | `adr` (alias `architecture_decision_record`), `research_report` |
+
+`research-report` needs no alias: normalization turns a hyphen into an
+underscore before lookup, so the stored spelling resolves to the canonical name.
+`adr` carries the long form as an alias because that is how the genre is named in
+prose.
+
+Both remain kind-scoped. The same spelling on `Concept` is still refused, which
+is the arm that keeps this from becoming a free-floating tag.
+
+This amendment exists so the legacy backfill has one pass rather than two. It
+converts the two largest unregistered groups on a real store from residue into
+rows a backfill can promote through the normal write path, with validation.
