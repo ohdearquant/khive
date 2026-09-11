@@ -252,7 +252,7 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let now = now_us();
 
-        for atom_in in &p.atoms {
+        for (index, atom_in) in p.atoms.iter().enumerate() {
             let slug = atom_in.slug.trim().to_string();
             if slug.is_empty() {
                 return Err(RuntimeError::InvalidInput(
@@ -268,24 +268,27 @@ impl KnowledgeHandlers {
             };
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
-            // before any reader/writer is acquired.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&atom_in.name)?;
-            khive_runtime::secret_gate::check(&content)?;
+            // before any reader/writer is acquired. Every refusal is located to the
+            // atom that produced it by POSITION, never by slug: this loop returns ONE
+            // error for the whole batch, the slug is itself a scanned field, and two
+            // atoms may share a slug within one payload (#2605).
+            use khive_runtime::secret_gate::{self, locate};
+            let record = format!("atoms[{index}]");
+            locate(secret_gate::check(&slug), &record, "slug")?;
+            locate(secret_gate::check(&atom_in.name), &record, "name")?;
+            locate(secret_gate::check(&content), &record, "content")?;
             if let Some(ref tags_vec) = atom_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
+                locate(secret_gate::check_tags(tags_vec), &record, "tags")?;
             }
             if let Some(ref props) = atom_in.properties {
-                khive_runtime::secret_gate::check_json(props)?;
+                locate(secret_gate::check_json(props), &record, "properties")?;
             }
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
-                atom_in.properties.as_ref(),
-            )?;
+            secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
             if let Some(Some(uri)) = &atom_in.source_uri {
-                khive_runtime::secret_gate::check(uri)?;
+                locate(secret_gate::check(uri), &record, "source_uri")?;
             }
             if let Some(Some(st)) = &atom_in.source_type {
-                khive_runtime::secret_gate::check(st)?;
+                locate(secret_gate::check(st), &record, "source_type")?;
             }
         }
 
