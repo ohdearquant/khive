@@ -55,8 +55,16 @@ const SHIM_DIR: &str = "shim-bin";
 /// process-global, so a fixture built concurrently resolves git through the shim and CACHES that
 /// path; the shim's temporary directory is then removed with its fixture and every later spawn of
 /// the cached path fails with ENOENT. Skipping the shim directory here keeps that case's PATH
-/// mutation invisible to every other fixture, which is what serialising the whole file would
-/// otherwise be needed for.
+/// mutation invisible to every other FIXTURE.
+///
+/// It does not keep it invisible to the code under test, which is the other half and the reason
+/// every case in this file now carries `git_dev_loop_env`. `base_command` builds
+/// `Command::new("git")` and hands the process's current PATH to the child, so the verb resolves
+/// its program by name at spawn, against whatever PATH the process holds at that instant. A case
+/// running beside a shim case therefore resolves the shim, or a path inside a fixture directory
+/// being deleted as that case ends, and reports `git_failed` for a reason nothing in its own body
+/// explains. The window is scheduler time, so it opens under load and stays shut on a quiet
+/// machine: 2 of 13 runs failed under one busy loop per core, 0 of 19 without them (#2515).
 fn git_program() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
         .filter(|dir| dir.file_name() != Some(std::ffi::OsStr::new(SHIM_DIR)))
@@ -1606,6 +1614,7 @@ fn status_paths(result: &Value) -> Vec<String> {
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn status_agrees_with_native_porcelain_and_changes_nothing_on_disk() {
     let f = Fixture::new(true, true).await;
     for verb in ["git.status", "git.log"] {
@@ -1645,6 +1654,7 @@ async fn status_agrees_with_native_porcelain_and_changes_nothing_on_disk() {
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn status_total_counts_the_whole_repository_even_when_entries_are_capped() {
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
@@ -1668,6 +1678,7 @@ async fn status_total_counts_the_whole_repository_even_when_entries_are_capped()
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn status_keeps_a_path_holding_a_newline_a_space_and_non_ascii_as_one_entry() {
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
@@ -1684,6 +1695,7 @@ async fn status_keeps_a_path_holding_a_newline_a_space_and_non_ascii_as_one_entr
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
@@ -1763,6 +1775,7 @@ async fn log_refusal_names_the_git_exit_status() {
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn log_agrees_with_native_rev_list_and_bounds_its_page() {
     let f = Fixture::new(true, true).await;
     f.policy("git.log", "allow").await;
@@ -1806,6 +1819,7 @@ async fn log_agrees_with_native_rev_list_and_bounds_its_page() {
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn log_treats_a_path_filter_literally_rather_than_as_a_glob() {
     let f = Fixture::new(true, true).await;
     f.policy("git.log", "allow").await;
@@ -1839,6 +1853,7 @@ async fn log_treats_a_path_filter_literally_rather_than_as_a_glob() {
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn status_and_log_refuse_off_allowlist_and_on_deny_and_write_no_receipt() {
     // No status/log grant is made here on purpose. The allowlist is consulted before the policy,
     // so the off-allowlist arm below refuses without one, which is what proves that ordering.
@@ -1886,6 +1901,7 @@ async fn status_and_log_refuse_off_allowlist_and_on_deny_and_write_no_receipt() 
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn init_makes_an_allowlisted_empty_directory_a_repository_and_records_a_receipt() {
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
@@ -1931,6 +1947,7 @@ async fn init_makes_an_allowlisted_empty_directory_a_repository_and_records_a_re
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn init_refuses_a_target_that_already_holds_a_repository_and_leaves_it_untouched() {
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
@@ -1959,6 +1976,7 @@ async fn init_refuses_a_target_that_already_holds_a_repository_and_leaves_it_unt
 }
 
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn init_refuses_a_directory_that_is_not_allowlisted() {
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
@@ -1984,6 +2002,7 @@ async fn init_refuses_a_directory_that_is_not_allowlisted() {
 /// the marker on the unhardened control first, because a marker that never fires proves nothing
 /// about the hardened call.
 #[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn read_verbs_never_execute_repository_configured_filters_or_signers() {
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
