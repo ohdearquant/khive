@@ -207,7 +207,18 @@ async fn legacy_state_census_public_writes_store_only_canonical_statuses() {
                 args["kind"] = json!("task");
             }
             let created = pack.dispatch(verb, args).await.unwrap();
-            ids.push(Uuid::parse_str(created["full_id"].as_str().unwrap()).unwrap());
+            // `gtd.assign` answers with `full_id`; the generic `create` verb
+            // answers with the record's own `id`. Both are full UUIDs.
+            let created_id = created
+                .get("full_id")
+                .or_else(|| created.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!("{verb} response carries neither full_id nor id: {created}")
+                });
+            ids.push(Uuid::parse_str(created_id).unwrap_or_else(|e| {
+                panic!("{verb} returned a non-UUID id {created_id:?}: {e}")
+            }));
         }
         for status in ["archived", "unknown"] {
             let mut args = json!({"title": "invalid state", "status": status});
