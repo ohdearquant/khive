@@ -424,7 +424,12 @@ impl GitPack {
         match verb {
             "git.init" => {
                 let branch = optional(params, "branch")?.unwrap_or("main");
-                let head = local_git::init(repo, branch).await?;
+                let head = local_git::init(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                )
+                .await?;
                 let result = json!({"repo":repo.display().to_string(), "branch":head,
                     "receipt_id":receipt.id});
                 receipt.result = result.clone();
@@ -452,7 +457,12 @@ impl GitPack {
             "git.branch" => {
                 let name = required(params, "name")?;
                 let from = optional(params, "from")?;
-                let sha = local_git::resolve_commit(repo, from.unwrap_or("HEAD")).await?;
+                let sha = local_git::resolve_commit(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    from.unwrap_or("HEAD"),
+                )
+                .await?;
                 if optional(params, "expected")?
                     .is_some_and(|expected| !sha.eq_ignore_ascii_case(expected))
                 {
@@ -462,13 +472,27 @@ impl GitPack {
                     "sha":sha, "ref":format!("refs/heads/{name}"), "receipt_id":receipt.id});
                 receipt.result = result.clone();
                 receipts::persist(self.runtime(), receipt).await?;
-                local_git::create_branch_ref(repo, name, &sha, &receipt.id).await?;
+                local_git::create_branch_ref(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    name,
+                    &sha,
+                    &receipt.id,
+                )
+                .await?;
                 Ok(result)
             }
             "git.commit" => {
                 let branch = required(params, "branch")?;
                 let expected = required(params, "expected_head")?.to_ascii_lowercase();
-                if local_git::branch_head(repo, branch).await? != expected {
+                if local_git::branch_head(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                )
+                .await?
+                    != expected
+                {
                     return Err(Failure::refused("expected_head_mismatch"));
                 }
                 let config = &self.runtime().config().git_write;
@@ -484,6 +508,7 @@ impl GitPack {
                 let tree = required(params, "tree")?;
                 let git_tree = local_git::write_manifest_tree(self.runtime(), repo, tree).await?;
                 let sha = local_git::create_commit(
+                    self.runtime().config().git_write.git_program(),
                     repo,
                     &git_tree,
                     &expected,
@@ -497,7 +522,15 @@ impl GitPack {
                 receipt.result = result.clone();
                 // The candidate SHA is durable before update-ref can have an effect.
                 receipts::persist(self.runtime(), receipt).await?;
-                local_git::update_branch(repo, branch, &sha, &expected, &receipt.id).await?;
+                local_git::update_branch(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                    &sha,
+                    &expected,
+                    &receipt.id,
+                )
+                .await?;
                 Ok(result)
             }
             "git.reconcile" => {
@@ -527,9 +560,15 @@ impl GitPack {
                     if let (Some(branch), Some(sha)) = (branch, sha) {
                         // Settlement requires both the operation marker and current reachability.
                         // Missing/pruned evidence or a rewound ref leaves the prior row unknown.
-                        if local_git::operation_recorded(repo, branch, sha, &prior.id)
-                            .await
-                            .unwrap_or(false)
+                        if local_git::operation_recorded(
+                            self.runtime().config().git_write.git_program(),
+                            repo,
+                            branch,
+                            sha,
+                            &prior.id,
+                        )
+                        .await
+                        .unwrap_or(false)
                         {
                             prior.disposition = Disposition::Committed;
                             prior.finished_at = Some(chrono::Utc::now().timestamp_micros());
@@ -724,9 +763,14 @@ impl GitPack {
                 .ok_or_else(invalid)? as usize,
         };
         let (canonical, index) = self.read_gate(token, registry, "git.status", repo).await?;
-        let result = local_git::status(&canonical, untracked, limit)
-            .await
-            .map_err(read_refusal)?;
+        let result = local_git::status(
+            self.runtime().config().git_write.git_program(),
+            &canonical,
+            untracked,
+            limit,
+        )
+        .await
+        .map_err(read_refusal)?;
         let entries = serde_json::to_value(&result.entries)
             .map_err(|_| RuntimeError::Internal("status entries did not serialize".into()))?;
         let branch = serde_json::to_value(&result.branch)
@@ -763,9 +807,15 @@ impl GitPack {
                 .ok_or_else(invalid)? as usize,
         };
         let (canonical, index) = self.read_gate(token, registry, "git.log", repo).await?;
-        let commits = local_git::log(&canonical, reference, limit, path)
-            .await
-            .map_err(read_refusal)?;
+        let commits = local_git::log(
+            self.runtime().config().git_write.git_program(),
+            &canonical,
+            reference,
+            limit,
+            path,
+        )
+        .await
+        .map_err(read_refusal)?;
         let truncated = commits.len() == limit;
         let commits = serde_json::to_value(&commits)
             .map_err(|_| RuntimeError::Internal("log entries did not serialize".into()))?;

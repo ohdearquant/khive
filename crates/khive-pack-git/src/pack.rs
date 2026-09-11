@@ -46,9 +46,12 @@ impl Pack for GitPack {
 impl GitPack {
     /// Create a new `GitPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        let remote = crate::remote_transport::GhTransport::new(
+            runtime.config().git_write.git_program().to_path_buf(),
+        );
         Self {
             runtime,
-            remote: Arc::new(crate::remote_transport::GhTransport),
+            remote: Arc::new(remote),
         }
     }
 

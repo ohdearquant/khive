@@ -55,9 +55,11 @@ pub trait RemoteTransport: Send + Sync {
     async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError>;
 }
 
-pub struct GhTransport;
+pub struct GhTransport {
+    program: PathBuf,
+}
 
-fn isolated(program: &str) -> Command {
+fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
@@ -79,8 +81,8 @@ fn isolated(program: &str) -> Command {
     command
 }
 
-fn git_command(repo: &Path, token: Option<&str>) -> Command {
-    let mut command = isolated("git");
+fn git_command(program: &Path, repo: &Path, token: Option<&str>) -> Command {
+    let mut command = isolated(program.as_os_str());
     for setting in [
         "core.hooksPath=/dev/null",
         "core.fsmonitor=false",
@@ -156,9 +158,9 @@ async fn run(
     Ok(result)
 }
 
-async fn bare() -> Result<tempfile::TempDir, RemoteError> {
+async fn bare(program: &Path) -> Result<tempfile::TempDir, RemoteError> {
     let dir = tempfile::tempdir().map_err(|_| RemoteError::Unavailable)?;
-    let mut command = git_command(dir.path(), None);
+    let mut command = git_command(program, dir.path(), None);
     command.args(["init", "--bare", "--quiet", "--template="]);
     if !run(command, None, false).await?.0 {
         return Err(RemoteError::Unavailable);
@@ -171,6 +173,10 @@ fn valid_oid(value: &str) -> bool {
 }
 
 impl GhTransport {
+    pub fn new(program: PathBuf) -> Self {
+        Self { program }
+    }
+
     async fn call_api(
         &self,
         token: &str,
@@ -252,9 +258,9 @@ impl RemoteTransport for GhTransport {
         remote: &str,
         branch: &str,
     ) -> Result<Option<String>, RemoteError> {
-        let scratch = bare().await?;
+        let scratch = bare(&self.program).await?;
         let reference = format!("refs/heads/{branch}");
-        let mut command = git_command(scratch.path(), token);
+        let mut command = git_command(&self.program, scratch.path(), token);
         if token.is_none() {
             command.args([
                 "-c",
@@ -284,17 +290,18 @@ impl RemoteTransport for GhTransport {
     }
 
     async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError> {
-        push_native(token, request, token.is_none()).await
+        push_native(&self.program, token, request, token.is_none()).await
     }
 }
 
 pub(crate) async fn push_native(
+    program: &Path,
     token: Option<&str>,
     request: PushRequest,
     allow_file: bool,
 ) -> Result<(), RemoteError> {
-    let scratch = bare().await?;
-    let objects = crate::local_git::object_directory(&request.repo)
+    let scratch = bare(program).await?;
+    let objects = crate::local_git::object_directory(program, &request.repo)
         .await
         .map_err(|_| RemoteError::Unavailable)?;
     let reference = format!("refs/heads/{}", request.branch);
@@ -303,7 +310,8 @@ pub(crate) async fn push_native(
         "--force-with-lease={reference}:{}",
         request.expected_remote.as_deref().unwrap_or("")
     );
-    let mut command = git_command(scratch.path(), token);
+    let mut command = git_command(program, scratch.path(), token);
+    let receive_pack;
     if allow_file {
         command.args([
             "-c",
@@ -325,7 +333,12 @@ pub(crate) async fn push_native(
         // Local transport runs the destination's receive-pack as this process, and the
         // client-side hooks path above does not reach it: the destination's own hooks would
         // run. The receive-pack invocation carries its own hooks path instead.
-        args.push("--receive-pack=git -c core.hooksPath=/dev/null receive-pack");
+        let program = program.to_str().ok_or(RemoteError::Unavailable)?;
+        receive_pack = format!(
+            "--receive-pack='{}' -c core.hooksPath=/dev/null receive-pack",
+            program.replace('\'', "'\\''")
+        );
+        args.push(&receive_pack);
     }
     args.extend([
         lease.as_str(),
@@ -502,7 +515,7 @@ mod tests {
             ),
         ] {
             std::fs::write(dir.path().join("response"), response).unwrap();
-            let actual = GhTransport
+            let actual = GhTransport::new("git".into())
                 .review_decision("fixture-secret", "owner/project", 42)
                 .await;
             assert_eq!(actual, expected);

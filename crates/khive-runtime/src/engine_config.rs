@@ -450,6 +450,9 @@ pub struct GitWriteEntryConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteSectionConfig {
+    /// Absolute git executable override; absent preserves PATH resolution.
+    #[serde(default)]
+    pub program: Option<PathBuf>,
     #[serde(default)]
     pub allowed: Vec<GitWriteEntryConfig>,
     #[serde(default)]
@@ -515,6 +518,7 @@ fn default_git_credential_resolver() -> Vec<String> {
 impl Default for GitWriteSectionConfig {
     fn default() -> Self {
         Self {
+            program: None,
             allowed: Vec::new(),
             actors: BTreeMap::new(),
             repositories: BTreeMap::new(),
@@ -526,11 +530,44 @@ impl Default for GitWriteSectionConfig {
 }
 
 impl GitWriteSectionConfig {
+    pub fn git_program(&self) -> &Path {
+        self.program.as_deref().unwrap_or_else(|| Path::new("git"))
+    }
+
     pub fn validate_dev_loop(&self) -> Result<(), ConfigError> {
         let invalid = |key: &str, reason: &str| ConfigError::InvalidGitWriteConfig {
             key: key.to_string(),
             reason: reason.to_string(),
         };
+        if let Some(program) = &self.program {
+            if !program.is_absolute() {
+                return Err(invalid("git_write.program", "must be absolute"));
+            }
+            let metadata = std::fs::metadata(program).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    invalid("git_write.program", "does not exist")
+                } else {
+                    invalid("git_write.program", &format!("is not executable: {error}"))
+                }
+            })?;
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(windows)]
+            let executable = program
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+                });
+            #[cfg(not(any(unix, windows)))]
+            let executable = false;
+            if !metadata.is_file() || !executable {
+                return Err(invalid("git_write.program", "is not executable"));
+            }
+        }
         if self.contract_faults && !cfg!(feature = "contract-faults") {
             tracing::error!(
                 target: "khive.boot",
@@ -2886,6 +2923,106 @@ grant_unattributed = false
             .expect("no error")
             .expect("file found");
         assert!(cfg.git_write.allowed.is_empty());
+    }
+
+    fn write_git_program_config(dir: &tempfile::TempDir, program: &Path) -> PathBuf {
+        let program = toml::Value::String(program.to_str().unwrap().to_string());
+        write_toml(dir, &format!("[git_write]\nprogram = {program}\n"))
+    }
+
+    #[test]
+    fn git_program_absent_preserves_path_default() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in ["# no git_write section\n", "[git_write]\n"] {
+            let path = write_toml(&dir, content);
+            let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+            assert!(cfg.git_write.program.is_none());
+            assert_eq!(cfg.git_write.git_program(), Path::new("git"));
+        }
+        assert!(GitWriteSectionConfig::default().program.is_none());
+        assert_eq!(
+            GitWriteSectionConfig::default().git_program(),
+            Path::new("git")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn git_program_absolute_executable_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = std::env::current_exe().unwrap();
+        let path = write_git_program_config(&dir, &program);
+        let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        assert_eq!(cfg.git_write.program.as_deref(), Some(program.as_path()));
+        assert_eq!(cfg.git_write.git_program(), program);
+    }
+
+    #[test]
+    fn git_program_relative_path_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for program in ["git", "relative/git"] {
+            let path = write_git_program_config(&dir, Path::new(program));
+            let error = KhiveConfig::load(Some(&path)).expect_err("relative program must fail");
+            assert!(
+                matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                    if key == "git_write.program" && reason == "must be absolute"),
+                "unexpected error: {error}"
+            );
+            assert!(error.to_string().contains("git_write.program"));
+        }
+    }
+
+    #[test]
+    fn git_program_missing_file_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_git_program_config(&dir, &dir.path().join("missing-git"));
+        let error = KhiveConfig::load(Some(&path)).expect_err("missing program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
+    }
+
+    #[test]
+    fn git_program_nonexecutable_file_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("git.txt");
+        std::fs::write(&program, "not executable\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = write_git_program_config(&dir, &program);
+        let error = KhiveConfig::load(Some(&path)).expect_err("nonexecutable program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "is not executable"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
+    }
+
+    #[test]
+    fn git_program_directory_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("git.exe");
+        std::fs::create_dir(&program).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = write_git_program_config(&dir, &program);
+        let error = KhiveConfig::load(Some(&path)).expect_err("directory program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "is not executable"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
     }
 
     // A well-formed [[git_write.allowed]] entry parses correctly.

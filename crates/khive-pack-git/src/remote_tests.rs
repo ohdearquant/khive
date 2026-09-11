@@ -148,7 +148,7 @@ impl RemoteTransport for Recording {
             git(&self.bare, &["update-ref", "refs/heads/work", &sha]);
         }
         request.remote = self.bare.display().to_string();
-        crate::remote_transport::push_native(token, request, true).await?;
+        crate::remote_transport::push_native(Path::new("git"), token, request, true).await?;
         self.state.lock().unwrap().writes += 1;
         if lost {
             Err(RemoteError::Unknown)
@@ -257,7 +257,17 @@ impl Fixture {
         fault: Option<&str>,
         merge_refusals: &[&str],
     ) -> Self {
+        Self::with_program(allowed, fault, merge_refusals, || None).await
+    }
+
+    async fn with_program(
+        allowed: bool,
+        fault: Option<&str>,
+        merge_refusals: &[&str],
+        program: impl FnOnce() -> Option<PathBuf>,
+    ) -> Self {
         let env_guard = crate::cache::ENV_MUTEX.lock().await;
+        let program = program();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -324,6 +334,7 @@ impl Fixture {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             git_write: GitWriteSectionConfig {
+                program,
                 allowed: if allowed {
                     vec![GitWriteEntryConfig {
                         repo: repo.display().to_string(),
@@ -1029,7 +1040,7 @@ async fn push_cases_require_a_git_that_advertises_reflog_write() {
         "git init: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let (version, supported) = crate::local_git::push_marker_support(&repo)
+    let (version, supported) = crate::local_git::push_marker_support(Path::new("git"), &repo)
         .await
         .expect("capability probe");
     assert!(
@@ -1045,26 +1056,18 @@ async fn push_cases_require_a_git_that_advertises_reflog_write() {
 
 #[tokio::test]
 async fn remote_unsupported_git_is_receipted_before_credentials_or_network() {
-    struct RestorePath(std::ffi::OsString);
-    impl Drop for RestorePath {
-        fn drop(&mut self) {
-            std::env::set_var("PATH", &self.0);
-        }
-    }
-    let f = Fixture::new(true, None).await;
-    let old_path = std::env::var_os("PATH").unwrap();
-    let git_path = Command::new("/usr/bin/which").arg("git").output().unwrap();
-    assert!(git_path.status.success());
-    let git_path = PathBuf::from(String::from_utf8(git_path.stdout).unwrap().trim());
-    let bin = f.dir.path().join("old-git");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("old-git");
     std::fs::create_dir(&bin).unwrap();
     let wrapper = bin.join("git");
-    std::fs::write(&wrapper, format!("#!/bin/sh\ncase \"$*\" in\n*' --version') echo 'git version 2.40.0'; exit 0;;\n*' reflog -h') echo 'usage: git reflog show'; exit 129;;\nesac\nexec {} \"$@\"\n", quote(&git_path))).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut paths = vec![bin];
-    paths.extend(std::env::split_paths(&old_path));
-    let _restore = RestorePath(old_path);
-    std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+    let f = Fixture::with_program(true, None, &[], || {
+        let git_path = Command::new("/usr/bin/which").arg("git").output().unwrap();
+        assert!(git_path.status.success());
+        let git_path = PathBuf::from(String::from_utf8(git_path.stdout).unwrap().trim());
+        std::fs::write(&wrapper, format!("#!/bin/sh\ncase \"$*\" in\n*' --version') echo 'git version 2.40.0'; exit 0;;\n*' reflog -h') echo 'usage: git reflog show'; exit 129;;\nesac\nexec {} \"$@\"\n", quote(&git_path))).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Some(wrapper.clone())
+    }).await;
     f.refusal(&f.actor, "git.push", f.push(), "unsupported_toolchain")
         .await;
     let receipt = f.last(&f.actor).await;
@@ -1076,6 +1079,7 @@ async fn remote_unsupported_git_is_receipted_before_credentials_or_network() {
         receipt.result["toolchain"]["missing_capability"],
         "reflog write"
     );
+    assert_eq!(receipt.result["toolchain"]["git_program"], json!(wrapper));
     assert!(receipt.credential.is_null());
     assert!(f.remote.state.lock().unwrap().calls.is_empty());
     assert_eq!(remote_head(&f.remote.bare), Some(f.base.clone()));
