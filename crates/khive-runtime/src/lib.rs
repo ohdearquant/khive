@@ -20,10 +20,21 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod keyed_memory;
+#[cfg(test)]
+mod keyed_memory_tests;
+pub mod keyed_message;
+mod note_create;
+mod note_index;
+mod note_read;
 mod note_store_guard;
+pub mod note_write;
+#[cfg(test)]
+mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
@@ -39,6 +50,11 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod streams;
+pub use streams::{
+    refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal, StreamObservation,
+    StreamWriteSpec,
+};
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
@@ -79,14 +95,18 @@ pub use daemon::{
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
+    config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+    PackConfig, StorageSectionConfig,
 };
 pub use error::{
-    fts_text_leg_or_err, AdmissionFailureContext, ChannelIngestFailureClass, GuardedWriteFailure,
-    RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE,
-    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
+    ChannelIngestFailureClass, DenialAuditOutcome, DenialReceipt, DispatchError, DomainDisposition,
+    GuardedWriteFailure, RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext,
+    WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
+pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
@@ -94,8 +114,8 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
+    GateDecision, GateError, GateRef, GateRequest, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
@@ -114,28 +134,28 @@ pub use operations::{
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
-    EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
+    EntityCreateSpec, LinkSpec, NoteSearchHit, NoteSearchOutcome, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
-    IdResolutionMode, InterceptedDispatchResult, KindHook, NoteKindSpec, NoteLifecycleSpec,
-    PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration, PackRegistry,
-    PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan,
-    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
-    Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    IdResolutionMode, IngestAuditStore, InterceptedDispatchResult, KindHook, NoteKindSpec,
+    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration,
+    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
+    SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    VerifiedActor, Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
 pub use presentation::{
-    apply_redundancy_drop, micros_to_iso, present, render_format, rfc3339_to_utc_micros,
-    OutputFormat, PresentationMode,
+    apply_redundancy_drop, micros_to_iso, prepare_format_value, present, render_format,
+    rfc3339_to_utc_micros, OutputFormat, PresentationMode, RedundancyScope,
 };
 pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
-pub use retrieval::{SearchHit, SearchSource};
+pub use retrieval::{HybridSearchOutcome, SearchHit, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
@@ -147,3 +167,10 @@ pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,
 };
+
+#[cfg(test)]
+mod mount_config_tests;
+
+pub mod mount_config;
+
+pub mod mounted_verb;

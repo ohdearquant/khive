@@ -385,20 +385,19 @@ impl KgPack {
                 // N individual gets. Notes absent from the batch result (deleted
                 // between the search and the fetch) are simply absent from the map
                 // and filtered out by the `note_meta.get` guard below.
-                let note_meta: HashMap<Uuid, (String, Option<Value>, Option<String>, i64)> =
-                    if hits.is_empty() {
-                        HashMap::new()
-                    } else {
-                        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
-                        let note_store = self.runtime.notes(token)?;
-                        note_store
-                            .get_notes_batch(&candidate_ids)
-                            .await
-                            .map_err(RuntimeError::Storage)?
-                            .into_iter()
-                            .map(|n| (n.id, (n.kind, n.properties, n.name, n.created_at)))
-                            .collect()
-                    };
+                let note_meta: HashMap<Uuid, khive_storage::note::Note> = if hits.is_empty() {
+                    HashMap::new()
+                } else {
+                    let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.note_id).collect();
+                    let note_store = self.runtime.notes(token)?;
+                    note_store
+                        .get_notes_batch(&candidate_ids)
+                        .await
+                        .map_err(RuntimeError::Storage)?
+                        .into_iter()
+                        .map(|n| (n.id, n))
+                        .collect()
+                };
 
                 let filtered_hits: Vec<_> =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
@@ -407,9 +406,10 @@ impl KgPack {
                                 if source_filter.is_some_and(|source| h.source != source) {
                                     return false;
                                 }
-                                let Some((_, props, _, _)) = note_meta.get(&h.note_id) else {
+                                let Some(note) = note_meta.get(&h.note_id) else {
                                     return false;
                                 };
+                                let props = &note.properties;
                                 let props_ok =
                                     props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
                                 let tags_ok = tag_filter.is_none_or(|wanted| {
@@ -437,12 +437,12 @@ impl KgPack {
                 let result: Vec<Value> = filtered_hits
                     .iter()
                     .filter(|h| h.score.to_f64() >= request.min_score())
-                    .map(|h| {
-                        let meta = note_meta.get(&h.note_id);
-                        let note_kind = meta.map(|(k, _, _, _)| k.as_str());
-                        let name = meta.and_then(|(_, _, name, _)| name.clone());
-                        let created_at = meta.map(|(_, _, _, c)| micros_to_iso(*c));
-                        serde_json::json!({
+                    .filter_map(|h| {
+                        let note = note_meta.get(&h.note_id)?;
+                        let note_kind = note.kind.as_str();
+                        let name = &note.name;
+                        let created_at = micros_to_iso(note.created_at);
+                        Some(serde_json::json!({
                             "id": h.note_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
                             // `note_kind`/`title` are kept for compatibility.
@@ -454,7 +454,8 @@ impl KgPack {
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
-                        })
+                            "version": note.version,
+                        }))
                     })
                     .collect();
                 self.track_search_serve(

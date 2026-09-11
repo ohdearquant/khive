@@ -19,6 +19,27 @@ use crate::entity_type::EntityTypeDef;
 /// registry construction enforce one exact contract.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
 
+/// Tag marking a `tool` pack registry object.
+///
+/// The value is on-disk data on every row the tool registry has ever minted,
+/// so it is not free to change.
+pub const TOOL_REGISTRY_TAG: &str = "tool-registry";
+
+/// Tags whose presence makes an entity a pack's registry row.
+///
+/// Such a row is not ordinary metadata: its fields are policy inputs. The
+/// tool registry's `source` names the binary a granted tool name resolves to,
+/// and `side_effect` is read at run time and handed to the policy decision, so
+/// a caller who can patch the row can change what a granted name does without
+/// registering anything. The generic entity verbs therefore refuse to write a
+/// row carrying one of these tags, including a patch that would remove the tag
+/// itself, and the owning pack's verbs are the only writer.
+///
+/// This is a list rather than a field allow-list on purpose: a list of
+/// protected properties goes stale the first time a pack adds a
+/// capability-bearing property, which is exactly how `side_effect` was missed.
+pub const PACK_REGISTRY_TAGS: &[&str] = &[TOOL_REGISTRY_TAG];
+
 /// Visibility tier for a handler.
 ///
 /// `Verb` entries appear on the MCP wire and are invokable by agents.
@@ -39,7 +60,22 @@ pub enum Visibility {
 /// use the category of their parent verb or `Assertive` as a sensible default.
 ///
 /// The category is a documentation / introspection tag. It is NOT used for
-/// permission checking, transport routing, or return-shape selection.
+/// permission checking. It is one input — never the sole proof — to two
+/// narrow, sanctioned runtime decisions, both in `khive-runtime`'s
+/// `VerbRegistry`:
+/// - `admission_degrade_safe` treats `Assertive` as a necessary condition
+///   for letting a dispatch's own audit row degrade under transient
+///   admission pressure, combined with an explicit per-verb allowlist.
+/// - `is_retry_safe_after_frame_omission` treats `Assertive` as a necessary
+///   condition for telling a caller that a response lost to the MCP
+///   daemon's frame budget is safe to re-issue, combined with an explicit
+///   exclusion list.
+///
+/// Both combine the category with an audited list rather than trusting it
+/// alone, because several `Assertive` handlers schedule their own persisted
+/// or accounting-bearing side effect on every dispatch (`memory.recall`'s
+/// serve ledger, `search`'s `SearchExecuted` telemetry) that the speech-act
+/// classification cannot see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbCategory {
     /// Speaker represents a state of affairs — retrieves and presents facts.
@@ -171,7 +207,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
     /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
-    /// `comm.delivered`, `git.digest`.
+    /// `comm.delivered`, `git.digest`, `git.ingest_cursor`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -190,6 +226,8 @@ pub enum VerbPresentationPolicy {
     /// `git.digest` is included because its successful response is also the
     /// durable receipt payload. Presentation must not shorten `receipt_id` or
     /// otherwise make the returned result differ from the stored result.
+    /// `git.ingest_cursor` preserves raw checkpoint strings, full project UUIDs,
+    /// and stored microsecond timestamps for persisted-position inspection.
     AlwaysVerbose,
 }
 
@@ -213,7 +251,8 @@ impl HandlerDef {
             | "brain.auto_feedback"
             | "memory.feedback"
             | "comm.delivered"
-            | "git.digest" => VerbPresentationPolicy::AlwaysVerbose,
+            | "git.digest"
+            | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -626,6 +665,7 @@ mod tests {
             "memory.feedback",
             "comm.delivered",
             "git.digest",
+            "git.ingest_cursor",
         ];
         for name in always_verbose {
             let h = HandlerDef {

@@ -8,7 +8,11 @@
 //! path (guaranteeing same-filesystem rename), the written length is checked
 //! against the input length, then an atomic rename publishes the entry —
 //! crash-safe (a crash mid-write leaves an orphaned temp file, never a
-//! partially-committed blob).
+//! partially-committed blob). On Unix, publication also synchronizes the
+//! shard directory chain before acknowledging the reference. Initialization
+//! synchronizes the root and its parent, which must already exist and be
+//! durable. This is not a power-loss guarantee for arbitrary filesystems or
+//! devices. Non-Unix publication does not provide these directory barriers.
 
 use std::collections::HashMap;
 use std::fs;
@@ -942,11 +946,117 @@ fn acquire_root_write_lock_anchored(
 }
 
 #[cfg(unix)]
+struct BlobPublication {
+    #[cfg(test)]
+    hook: Option<sync_hook::Publication>,
+}
+
+#[cfg(unix)]
+impl BlobPublication {
+    fn step<T>(
+        &self,
+        operation: &'static str,
+        action: impl FnOnce() -> std::io::Result<T>,
+    ) -> StorageResult<T> {
+        self.io_step(operation, action)
+            .map_err(|error| map_io_err(error, operation))
+    }
+
+    fn io_step<T>(
+        &self,
+        _operation: &'static str,
+        action: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook.before(_operation)?;
+        }
+        let result = action()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook.completed(_operation);
+        }
+        Ok(result)
+    }
+
+    fn sync_directories(
+        &self,
+        root: &fs::File,
+        shard1: &fs::File,
+        shard2: &fs::File,
+    ) -> StorageResult<()> {
+        // Existing directories may come from an interrupted publication, so
+        // their presence cannot discharge a previous attempt's barriers.
+        for (operation, directory) in [
+            ("put_sync_shard", shard2),
+            ("put_sync_parent", shard1),
+            ("put_sync_root", root),
+        ] {
+            self.sync_directory(operation, directory)
+                .map_err(|error| map_io_err(error, operation))?;
+        }
+        Ok(())
+    }
+
+    fn sync_directory(&self, operation: &'static str, directory: &fs::File) -> std::io::Result<()> {
+        self.io_step(operation, || {
+            sync_directory(directory)?;
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook.directory_synced(operation, directory)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // Keep authority on the opened directory; no pathname is resolved
+        // again. File::sync_all uses F_FULLFSYNC on Apple, whereas this
+        // barrier specifically requests directory metadata persistence.
+        if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn publish_blob_at(
+    root: &fs::File,
+    shard1: &fs::File,
+    shard2: &fs::File,
+    temp_name: &str,
+    content_ref: &ContentRef,
+    publication: &BlobPublication,
+) -> StorageResult<()> {
+    use std::os::fd::AsRawFd;
+
+    if let Err(error) = publication.step("put_persist", || {
+        rename_entry_at(shard2.as_raw_fd(), temp_name, content_ref.as_str())
+    }) {
+        let _ = unlink_entry_at(shard2.as_raw_fd(), temp_name);
+        return Err(error);
+    }
+    // A barrier failure after rename leaves a complete but unacknowledged
+    // object. Do not delete it: readers may already hold its reference.
+    publication.sync_directories(root, shard1, shard2)
+}
+
+#[cfg(unix)]
 fn put_blocking_from_root_handle(
     root: &Path,
     root_handle: &std::fs::File,
     floor_bytes: u64,
     bytes: Vec<u8>,
+    publication: &BlobPublication,
 ) -> StorageResult<ContentRef> {
     use std::os::unix::io::AsRawFd;
 
@@ -958,10 +1068,19 @@ fn put_blocking_from_root_handle(
     // relative to the retained root. A missing shard level and a missing leaf
     // are both the ordinary publish path; every other traversal failure is a
     // hard refusal.
-    match open_blob_shard_file_at_no_follow(root_handle, &content_ref, libc::O_WRONLY) {
-        Ok(file) => {
+    let hex = content_ref.as_str();
+    let existing = (|| -> std::io::Result<_> {
+        let shard1 = openat_dir_no_follow(root_handle.as_raw_fd(), &hex[0..2])?;
+        let shard2 = openat_dir_no_follow(shard1.as_raw_fd(), &hex[2..4])?;
+        let file = openat_regular_file_no_follow(shard2.as_raw_fd(), hex, libc::O_WRONLY)?;
+        Ok((file, shard1, shard2))
+    })();
+    match existing {
+        Ok((file, shard1, shard2)) => {
             file.set_modified(SystemTime::now())
                 .map_err(|e| map_io_err(e, "put_touch_mtime"))?;
+            publication.step("put_fsync", || file.sync_all())?;
+            publication.sync_directories(root_handle, &shard1, &shard2)?;
             return Ok(content_ref);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -980,7 +1099,6 @@ fn put_blocking_from_root_handle(
         });
     }
 
-    let hex = content_ref.as_str();
     let shard1_dir = open_or_create_dir_at_no_follow(root_handle.as_raw_fd(), &hex[0..2])
         .map_err(|e| map_io_err(e, "put_mkdir"))?;
     let shard2_dir = open_or_create_dir_at_no_follow(shard1_dir.as_raw_fd(), &hex[2..4])
@@ -993,7 +1111,7 @@ fn put_blocking_from_root_handle(
         temp.write_all(&bytes)
             .map_err(|e| map_io_err(e, "put_write"))?;
         temp.flush().map_err(|e| map_io_err(e, "put_flush"))?;
-        temp.sync_all().map_err(|e| map_io_err(e, "put_fsync"))?;
+        publication.step("put_fsync", || temp.sync_all())?;
 
         let written_len = temp
             .metadata()
@@ -1016,10 +1134,14 @@ fn put_blocking_from_root_handle(
         return Err(error);
     }
 
-    if let Err(error) = rename_entry_at(shard2_dir.as_raw_fd(), &temp_name, hex) {
-        let _ = unlink_entry_at(shard2_dir.as_raw_fd(), &temp_name);
-        return Err(map_io_err(error, "put_persist"));
-    }
+    publish_blob_at(
+        root_handle,
+        &shard1_dir,
+        &shard2_dir,
+        &temp_name,
+        &content_ref,
+        publication,
+    )?;
     Ok(content_ref)
 }
 
@@ -1030,6 +1152,8 @@ fn put_blocking_from_root_handle(
     floor_bytes: u64,
     bytes: Vec<u8>,
 ) -> StorageResult<ContentRef> {
+    // This path retains file synchronization and atomic publication but does
+    // not claim the Unix directory-metadata persistence barrier.
     verify_blob_root_identity(root, root_handle).map_err(|e| map_io_err(e, "put_root_identity"))?;
     put_blocking(root, floor_bytes, bytes)
 }
@@ -2334,10 +2458,42 @@ impl FsBlobStore {
     /// steady-state condition.
     pub const DEFAULT_ORPHAN_SWEEP_GRACE: Duration = Duration::from_secs(3600);
 
-    /// Create a store rooted at `root`, creating the directory if absent.
+    /// Create a store rooted at `root`, creating only that directory if absent.
+    /// Its parent must already exist and be durable. Missing ancestors are
+    /// refused rather than becoming an unverified anchor after a failed retry.
+    /// On Unix every call synchronizes the root and its parent, including when
+    /// the root already exists. `open_existing` performs no such mutation.
     pub fn new(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
-        fs::create_dir_all(&root)?;
-        Self::open_existing(root, floor_bytes)
+        match fs::create_dir(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = root
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("blob root parent missing: {}", parent.display()),
+                )
+                .into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let store = Self::open_existing(root, floor_bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let publication = BlobPublication {
+                #[cfg(test)]
+                hook: sync_hook::take(&store.root).and_then(|hook| hook.publication),
+            };
+            let parent = openat_dir_no_follow(store.root_handle.as_raw_fd(), "..")?;
+            publication.sync_directory("init_sync_root", &store.root_handle)?;
+            publication.sync_directory("init_sync_parent", &parent)?;
+        }
+        Ok(store)
     }
 
     /// Open a store rooted at an existing directory without creating any
@@ -2418,7 +2574,17 @@ impl BlobStore for FsBlobStore {
                     let _ = h.reached.send(());
                     let _ = h.release.recv();
                 }
-                put_blocking_from_root_handle(&root, &root_handle, floor_bytes, bytes)
+                put_blocking_from_root_handle(
+                    &root,
+                    &root_handle,
+                    floor_bytes,
+                    bytes,
+                    #[cfg(unix)]
+                    &BlobPublication {
+                        #[cfg(test)]
+                        hook: hook.as_ref().and_then(|hook| hook.publication.clone()),
+                    },
+                )
             };
             #[cfg(test)]
             if let Some(h) = &hook {
@@ -2861,6 +3027,8 @@ mod sync_hook {
         pub(super) reached: Sender<()>,
         pub(super) release: Receiver<()>,
         pub(super) done: Sender<()>,
+        #[cfg(unix)]
+        pub(super) publication: Option<Publication>,
     }
 
     fn registry() -> &'static StdMutex<HashMap<PathBuf, VecDeque<Hook>>> {
@@ -2886,6 +3054,8 @@ mod sync_hook {
                 reached: reached_tx,
                 release: release_rx,
                 done: done_tx,
+                #[cfg(unix)]
+                publication: None,
             });
         (reached_rx, release_tx, done_rx)
     }
@@ -2902,6 +3072,96 @@ mod sync_hook {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&canonical)
             .and_then(VecDeque::pop_front)
+    }
+
+    #[cfg(unix)]
+    type StepAction = (&'static str, Box<dyn FnOnce() + Send>);
+
+    #[cfg(unix)]
+    type DirectorySync = (&'static str, u64, u64);
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    pub(super) struct Publication {
+        pub(super) completed: std::sync::Arc<StdMutex<Vec<&'static str>>>,
+        pub(super) directories: std::sync::Arc<StdMutex<Vec<DirectorySync>>>,
+        fail_at: Option<&'static str>,
+        action: std::sync::Arc<StdMutex<Option<StepAction>>>,
+    }
+
+    #[cfg(unix)]
+    impl Publication {
+        pub(super) fn before(&self, operation: &'static str) -> std::io::Result<()> {
+            if self.fail_at == Some(operation) {
+                return Err(std::io::Error::other("injected publication failure"));
+            }
+            let action = {
+                let mut slot = self.action.lock().unwrap();
+                if slot.as_ref().is_some_and(|(at, _)| *at == operation) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, action)) = action {
+                action();
+            }
+            Ok(())
+        }
+
+        pub(super) fn on_step(
+            &self,
+            operation: &'static str,
+            action: impl FnOnce() + Send + 'static,
+        ) {
+            *self.action.lock().unwrap() = Some((operation, Box::new(action)));
+        }
+
+        pub(super) fn completed(&self, operation: &'static str) {
+            self.completed.lock().unwrap().push(operation);
+        }
+
+        pub(super) fn directory_synced(
+            &self,
+            operation: &'static str,
+            directory: &std::fs::File,
+        ) -> std::io::Result<()> {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = directory.metadata()?;
+            self.directories
+                .lock()
+                .unwrap()
+                .push((operation, metadata.dev(), metadata.ino()));
+            Ok(())
+        }
+    }
+
+    /// Use the same one-shot FIFO as the cancellation controls. Disconnected
+    /// lifecycle channels make a publication-only hook observe without pausing.
+    #[cfg(unix)]
+    pub(super) fn install_publication(root: &Path, fail_at: Option<&'static str>) -> Publication {
+        let publication = Publication {
+            completed: std::sync::Arc::default(),
+            directories: std::sync::Arc::default(),
+            fail_at,
+            action: std::sync::Arc::default(),
+        };
+        let (reached, _) = std::sync::mpsc::channel();
+        let (_, release) = std::sync::mpsc::channel();
+        let (done, _) = std::sync::mpsc::channel();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.canonicalize().unwrap())
+            .or_default()
+            .push_back(Hook {
+                reached,
+                release,
+                done,
+                publication: Some(publication.clone()),
+            });
+        publication
     }
 }
 
@@ -3080,6 +3340,290 @@ mod tests {
             .unwrap()
             .with_orphan_sweep_grace(Duration::ZERO);
         (dir, store)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_cover_fresh_shards_and_dedup() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_dir, store) = store(0);
+        let bytes = b"publication barrier order".to_vec();
+        let hook = sync_hook::install_publication(store.root(), None);
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(
+            *hook.completed.lock().unwrap(),
+            [
+                "put_fsync",
+                "put_persist",
+                "put_sync_shard",
+                "put_sync_parent",
+                "put_sync_root"
+            ]
+        );
+        let path = shard_path(store.root(), &content_ref);
+        let directory_identity = |operation, path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            (operation, metadata.dev(), metadata.ino())
+        };
+        let expected_directories = [
+            directory_identity("put_sync_shard", path.parent().unwrap()),
+            directory_identity("put_sync_parent", path.parent().unwrap().parent().unwrap()),
+            directory_identity("put_sync_root", store.root()),
+        ];
+        assert_eq!(*hook.directories.lock().unwrap(), expected_directories);
+        let inode = fs::metadata(&path).unwrap().ino();
+        let reopened = FsBlobStore::open_existing(store.root().to_path_buf(), 0).unwrap();
+        let hook = sync_hook::install_publication(reopened.root(), None);
+        assert_eq!(reopened.put(bytes.clone()).await.unwrap(), content_ref);
+        assert_eq!(
+            *hook.completed.lock().unwrap(),
+            [
+                "put_fsync",
+                "put_sync_shard",
+                "put_sync_parent",
+                "put_sync_root"
+            ]
+        );
+        assert_eq!(*hook.directories.lock().unwrap(), expected_directories);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            reopened
+                .get_bounded_verified(&content_ref, bytes.len() as u64)
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_barriers_initialize_root_but_not_read_only_open() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        fs::create_dir(&root).unwrap();
+        let hook = sync_hook::install_publication(&root, None);
+        fs::remove_dir(&root).unwrap();
+        let store = FsBlobStore::new(root.clone(), 0).unwrap();
+        assert_eq!(
+            *hook.completed.lock().unwrap(),
+            ["init_sync_root", "init_sync_parent"]
+        );
+        let root_metadata = fs::metadata(&root).unwrap();
+        let parent_metadata = fs::metadata(dir.path()).unwrap();
+        assert_eq!(
+            *hook.directories.lock().unwrap(),
+            [
+                ("init_sync_root", root_metadata.dev(), root_metadata.ino()),
+                (
+                    "init_sync_parent",
+                    parent_metadata.dev(),
+                    parent_metadata.ino()
+                ),
+            ]
+        );
+
+        let hook = sync_hook::install_publication(store.root(), Some("init_sync_root"));
+        let reopened = FsBlobStore::open_existing(root.clone(), 0).unwrap();
+        assert!(hook.completed.lock().unwrap().is_empty());
+        assert!(FsBlobStore::new(root, 0).is_err());
+        assert!(hook.completed.lock().unwrap().is_empty());
+        assert_eq!(reopened.root(), store.root());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_barriers_retry_each_initialization_failure() {
+        for operation in ["init_sync_root", "init_sync_parent"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("blobs");
+            fs::create_dir(&root).unwrap();
+            let hook = sync_hook::install_publication(&root, Some(operation));
+            fs::remove_dir(&root).unwrap();
+            assert!(FsBlobStore::new(root.clone(), 0).is_err(), "{operation}");
+            assert!(root.is_dir());
+            assert!(!hook.completed.lock().unwrap().contains(&operation));
+
+            let retry = sync_hook::install_publication(&root, None);
+            FsBlobStore::new(root, 0).unwrap();
+            assert_eq!(
+                *retry.completed.lock().unwrap(),
+                ["init_sync_root", "init_sync_parent"]
+            );
+        }
+    }
+
+    #[test]
+    fn publication_barriers_refuse_missing_root_parent_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing").join("nested");
+        let root = parent.join("blobs");
+        let error = match FsBlobStore::new(root.clone(), 0) {
+            Ok(_) => panic!("missing parent must not be created"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("blob root parent missing"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&parent.display().to_string()),
+            "{error}"
+        );
+        assert!(!dir.path().join("missing").exists());
+
+        fs::create_dir_all(&parent).unwrap();
+        FsBlobStore::new(root, 0).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_barriers_fsync_propagates_kernel_errors() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = fs::File::from(std::os::fd::OwnedFd::from(socket));
+        // A trace-only no-op must not pass as a filesystem barrier. Sockets
+        // cannot be synchronized with fsync, so the real kernel call refuses.
+        assert!(sync_directory(&handle).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_fail_before_rename_without_publishing() {
+        for operation in ["put_fsync", "put_persist"] {
+            let (_dir, store) = store(0);
+            let bytes = b"unpublished failure".to_vec();
+            let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+            let hook = sync_hook::install_publication(store.root(), Some(operation));
+            let error = store.put(bytes.clone()).await.unwrap_err();
+            assert!(error.to_string().contains(operation), "{error}");
+            let path = shard_path(store.root(), &content_ref);
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 0);
+            assert!(!hook.completed.lock().unwrap().contains(&operation));
+            assert_eq!(store.put(bytes).await.unwrap(), content_ref);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_retry_after_each_directory_failure() {
+        use std::os::unix::fs::MetadataExt;
+
+        for operation in ["put_sync_shard", "put_sync_parent", "put_sync_root"] {
+            let (_dir, store) = store(0);
+            let bytes = b"retry a visible but unacknowledged blob".to_vec();
+            let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+            sync_hook::install_publication(store.root(), Some(operation));
+            let error = store.put(bytes.clone()).await.unwrap_err();
+            assert!(error.to_string().contains(operation), "{error}");
+            let path = shard_path(store.root(), &content_ref);
+            let inode = fs::metadata(&path).unwrap().ino();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+
+            let reopened = FsBlobStore::open_existing(store.root().to_path_buf(), 0).unwrap();
+            let failed_retry = sync_hook::install_publication(reopened.root(), Some(operation));
+            let error = reopened.put(bytes.clone()).await.unwrap_err();
+            assert!(error.to_string().contains(operation), "{error}");
+            assert!(!failed_retry
+                .completed
+                .lock()
+                .unwrap()
+                .contains(&"put_persist"));
+            let repaired = sync_hook::install_publication(reopened.root(), None);
+            assert_eq!(reopened.put(bytes.clone()).await.unwrap(), content_ref);
+            assert_eq!(
+                *repaired.completed.lock().unwrap(),
+                [
+                    "put_fsync",
+                    "put_sync_shard",
+                    "put_sync_parent",
+                    "put_sync_root"
+                ]
+            );
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_fault_is_scoped_to_one_root_and_put() {
+        let (_a, first) = store(0);
+        let (_b, second) = store(0);
+        sync_hook::install_publication(first.root(), Some("put_sync_shard"));
+        second.put(b"second".to_vec()).await.unwrap();
+        assert!(first.put(b"first".to_vec()).await.is_err());
+        first.put(b"first".to_vec()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_keep_open_handles_when_root_path_changes() {
+        let (dir, store) = store(0);
+        let root = store.root().to_path_buf();
+        let moved = dir.path().join("moved-root");
+        let hook = sync_hook::install_publication(&root, None);
+        let moved_for_hook = moved.clone();
+        hook.on_step("put_sync_shard", move || {
+            fs::rename(&root, moved_for_hook).unwrap();
+            // Reopening this spelling must fail; retained directory handles
+            // must still complete the publication against the original tree.
+            std::os::unix::fs::symlink(&root, &root).unwrap();
+        });
+        let bytes = b"pinned publication".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(fs::read(shard_path(&moved, &content_ref)).unwrap(), bytes);
+        assert_eq!(
+            *hook.completed.lock().unwrap(),
+            [
+                "put_fsync",
+                "put_persist",
+                "put_sync_shard",
+                "put_sync_parent",
+                "put_sync_root"
+            ]
+        );
+        assert!(store.put(bytes).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_barriers_reopen_in_a_fresh_process() {
+        let (_dir, store) = store(0);
+        let bytes = b"fresh process publication".to_vec();
+        let content_ref = store.put(bytes).await.unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stores::blob::tests::publication_barriers_process_reader",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KHIVE_TEST_BLOB_PUBLICATION_ROOT", store.root())
+            .env("KHIVE_TEST_BLOB_PUBLICATION_REF", content_ref.as_str())
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(String::from_utf8_lossy(&result.stdout).contains("verified published object"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper for publication_barriers_reopen_in_a_fresh_process"]
+    fn publication_barriers_process_reader() {
+        let root = PathBuf::from(std::env::var_os("KHIVE_TEST_BLOB_PUBLICATION_ROOT").unwrap());
+        let content_ref =
+            ContentRef::from_hex(std::env::var("KHIVE_TEST_BLOB_PUBLICATION_REF").unwrap())
+                .unwrap();
+        let store = FsBlobStore::open_existing(root, 0).unwrap();
+        let bytes = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(store.get_bounded_verified(&content_ref, 1024))
+            .unwrap();
+        assert_eq!(bytes, b"fresh process publication");
+        println!("verified published object");
     }
 
     /// Build the exact historical V20 prefix without invoking the V21
@@ -3758,6 +4302,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ancestor = dir.path().join("store-parent");
         let root = ancestor.join("blobs");
+        fs::create_dir(&ancestor).unwrap();
         let store = FsBlobStore::new(root.clone(), 0).unwrap();
         let bytes = b"same bytes in both trees".to_vec();
         let content_ref = store.put(bytes.clone()).await.unwrap();
@@ -5054,8 +5599,15 @@ mod tests {
         .await
         .expect_err("the probe must refuse when an id it would delete already names a row");
         assert!(
-            matches!(error, StorageError::Unsupported { .. }),
-            "expected StorageError::Unsupported, got {error:?}"
+            matches!(
+                &error,
+                StorageError::WriterTaskRequestFailed {
+                    request_state:
+                        khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source,
+                } if matches!(source.as_ref(), StorageError::Unsupported { .. })
+            ),
+            "expected a proven-rollback wrapper retaining StorageError::Unsupported, got {error:?}"
         );
 
         let reader = backend.pool().reader().unwrap();
@@ -6444,7 +6996,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transactional_orphan_sweep_walk_ignores_a_leaf_swapped_for_an_outside_symlink_mid_scan(
     ) {
-        // Regression for the PR #2201 review finding: the sweep's candidate
+        // Regression for #2201: the sweep's candidate
         // walk and grace-period mtime read used to be two separate,
         // path-based passes (`walk_blob_files` then `within_publish_grace`
         // via `fs::metadata(path)`), neither pinned to the retained

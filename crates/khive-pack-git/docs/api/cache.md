@@ -19,17 +19,14 @@ operator data.
 
 A per-clone size cap (`digest_cache_clone_max_bytes`) rejects a clone/fetch
 that grows past its own budget _before_ it ever enters the addressable cache
-slot: `ensure_clone` clones/fetches into a private staging directory under
-the cache root but outside every addressable `<cache_key>` slot, measures it,
-and only moves it into `<root>/<cache_key>/` when it is under the cap. A
-too-large clone is deleted from staging and never
-touches `evict_lru`'s bookkeeping or the cache slot. This guarantees the cap
-is enforced before the clone enters the cache — it does NOT bound the
-transient disk usage of the clone/fetch child process itself while it runs
-in staging (`git` has no reliable pre-flight or mid-transfer size check for
-a partial `--filter=blob:none` clone); a single oversized `git clone` can
-still transiently consume disk in the staging directory before this check
-rejects and removes it.
+slot. During a fresh clone, the staging directory is measured repeatedly;
+once it crosses the cap the isolated clone process group is terminated and
+reaped, and the private staging wrapper is removed. A final measurement
+after child exit closes the race between the last poll and completion. The
+clone is moved into `<root>/<cache_key>/` only when it remains under cap, so
+an oversized clone never touches `evict_lru`'s bookkeeping or the cache
+slot. Existing-slot fetches retain their post-fetch measure-and-remove
+boundary because they operate on an already owned, addressable clone.
 
 Config is env-var driven today (`KHIVE_GIT_DIGEST_CACHE_MAX_REPOS`,
 `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`, `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`,
@@ -173,14 +170,16 @@ Shared staging-clone-then-move path for both a first-time `ensure_clone`
 and a `reclone` repair: creates a per-call wrapper directory under the
 private staging namespace, opens and `try_lock`s its `.khive-staging.lock`
 file (held for this whole function — see "Private staging namespace and
-liveness-based reaping" above), clones into `<wrapper>/repo`, measures it
-against the per-clone cap, writes the `.khive-last-used` ownership marker
-into it, and only then moves it into the addressable `<root>/<cache_key>/`
-slot — an oversized clone never enters the cache slot, and because the
-marker is written before the atomic rename, a process interruption between
-clone and rename can never leave a live, markerless slot at the cache-key
-path (issue #765). The wrapper (lock file included) is removed on both the
-success and every failure path.
+liveness-based reaping" above), clones into `<wrapper>/repo` while polling
+its size against the per-clone cap, performs a final size measurement,
+writes the `.khive-last-used` ownership marker into it, and only then moves
+it into the addressable `<root>/<cache_key>/` slot. Crossing the cap stops
+and reaps the in-flight clone (its process group on Unix, its direct child on
+other targets) before cleanup. An oversized clone never enters the cache
+slot, and because the marker is written before the atomic rename, a process
+interruption between clone and rename can never leave a live, markerless
+slot at the cache-key path (issue #765). The wrapper (lock file included) is
+removed on both the success and every failure path.
 
 A kill can still interrupt the process before any Rust cleanup guard runs and
 leave the wrapper directory behind. `prepare_cache_root` / `reap_stale_staging`

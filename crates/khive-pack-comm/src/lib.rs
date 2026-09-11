@@ -1,6 +1,7 @@
 //! pack-comm — Communication pack providing ten public `comm.*` verbs.
 
 pub mod handlers;
+pub(crate) mod idempotency;
 pub(crate) mod inbox_signal;
 pub(crate) mod message;
 pub(crate) mod pack;
@@ -8,6 +9,11 @@ pub(crate) mod params;
 pub(crate) mod vocab;
 
 pub use pack::CommPack;
+
+#[cfg(test)]
+mod idempotency_tests;
+#[cfg(test)]
+mod inbox_filter_tests;
 
 /// The namespace the local single-tenant channel poll loop passes explicitly
 /// when it writes heartbeat rows. `comm.heartbeat` no longer pins every write

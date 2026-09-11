@@ -688,12 +688,12 @@ mod tests {
 
         let mut main_config = RuntimeConfig::no_embeddings();
         main_config.packs = vec!["kg".to_string()];
-        main_config.backend_id = BackendId::new(BackendId::MAIN);
+        main_config.backend_id = BackendId::parse(BackendId::MAIN).expect("valid backend id");
         let main = KhiveRuntime::from_backend(main_backend.clone(), main_config);
 
         let mut secondary_config = RuntimeConfig::no_embeddings();
         secondary_config.packs = vec!["kg".to_string()];
-        secondary_config.backend_id = BackendId::new("moodboard");
+        secondary_config.backend_id = BackendId::parse("moodboard").expect("valid backend id");
         let secondary = KhiveRuntime::from_backend(secondary_backend, secondary_config)
             .with_core_backend(main_backend);
         (main, secondary)

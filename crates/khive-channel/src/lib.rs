@@ -247,6 +247,10 @@ pub enum ChannelError {
     /// Transport-level connection or I/O failure.
     #[error("transport error: {0}")]
     Transport(String),
+    /// A definitive transport rejection for which retrying the same envelope
+    /// cannot help (for example SMTP 5xx or a Telegram client-error response).
+    #[error("permanent transport error: {0}")]
+    PermanentTransport(String),
     /// Authentication failure (TLS, credentials, etc.).
     #[error("authentication error: {0}")]
     Auth(String),
@@ -256,6 +260,28 @@ pub enum ChannelError {
     /// The envelope is malformed or missing required fields.
     #[error("invalid envelope: {0}")]
     InvalidEnvelope(String),
+}
+
+/// Whether an outbound delivery error should remain pending or terminate the
+/// message. Attempt count never changes this classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailureClass {
+    Transient,
+    Permanent,
+}
+
+impl ChannelError {
+    /// Classify this error for durable outbound-note delivery state.
+    pub fn delivery_failure_class(&self) -> DeliveryFailureClass {
+        match self {
+            Self::Transport(_) => DeliveryFailureClass::Transient,
+            Self::Config(_)
+            | Self::PermanentTransport(_)
+            | Self::Auth(_)
+            | Self::UnauthorizedSender(_)
+            | Self::InvalidEnvelope(_) => DeliveryFailureClass::Permanent,
+        }
+    }
 }
 
 /// A channel transport adapter.
@@ -569,6 +595,31 @@ mod tests {
         assert!(e.to_string().contains("missing host"));
         let e2 = ChannelError::UnauthorizedSender("attacker@example.com".into());
         assert!(e2.to_string().contains("attacker@example.com"));
+    }
+
+    #[test]
+    fn outbound_delivery_failure_classification_separates_pressure_from_rejection() {
+        assert_eq!(
+            ChannelError::Transport("connection reset".into()).delivery_failure_class(),
+            DeliveryFailureClass::Transient
+        );
+        assert_eq!(
+            ChannelError::PermanentTransport("550 recipient rejected".into())
+                .delivery_failure_class(),
+            DeliveryFailureClass::Permanent
+        );
+        for error in [
+            ChannelError::Config("missing host".into()),
+            ChannelError::Auth("invalid credentials".into()),
+            ChannelError::UnauthorizedSender("denied".into()),
+            ChannelError::InvalidEnvelope("bad recipient".into()),
+        ] {
+            assert_eq!(
+                error.delivery_failure_class(),
+                DeliveryFailureClass::Permanent,
+                "static failure must not remain in a raw-cadence retry loop: {error}"
+            );
+        }
     }
 
     #[test]

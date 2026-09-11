@@ -29,7 +29,11 @@ The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
   text are dropped without creating an envelope. Outbound delivery accepts the configured
   maintainer address in two spellings — `telegram:<maintainer_slug>` or the bare
   `<maintainer_slug>` (the kind prefix is stripped when present, not required) — and every other
-  address is logged and dropped, never redirected to the maintainer.
+  address returns a permanent envelope error and is recorded as a terminal outbound failure,
+  never redirected to the maintainer.
+- Bot API 408, 429, and 5xx responses are transient delivery failures. Other 4xx responses are
+  permanent for the individual outbound note. The shared outbox loop durably backs off transient
+  failures and terminally records permanent ones.
 - Bot tokens must not appear in diagnostics. `TelegramChannelConfig` has a manual `Debug`
   implementation that masks the token, and connector errors remove request URLs containing it.
 - `poll` uses Telegram's offset watermark and ignores its timestamp argument. A fetched batch only

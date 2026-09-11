@@ -391,6 +391,7 @@ mod tests {
         let document = |subject_id, repetitions: usize| TextDocument {
             subject_id,
             kind: SubstrateKind::Entity,
+            record_kind: None,
             namespace: "local".to_string(),
             title: None,
             body: std::iter::repeat_n(query_text, repetitions)

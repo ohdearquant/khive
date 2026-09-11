@@ -52,16 +52,9 @@ import tempfile
 import traceback
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Binary location
-# ---------------------------------------------------------------------------
+from kkernel_binary import resolve_binary_path
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(
-        os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"
-    ),
-)
+BINARY = resolve_binary_path()
 
 # ---------------------------------------------------------------------------
 # Low-level JSON-RPC + MCP helpers
@@ -177,6 +170,24 @@ def _tool(proc: subprocess.Popen, name: str, args: dict) -> Any:
     return value
 
 
+def _op_error_text(error: Any) -> str:
+    """Return the human-readable text of a per-op error.
+
+    Per-op errors are structured objects carrying `message` alongside
+    `kind` and `domain_disposition`; servers before that change sent a bare
+    string. The object is the current contract, so a dict that does not carry
+    a string `message` is a contract failure rather than something to coerce.
+    """
+    if isinstance(error, dict):
+        message = error.get("message")
+        assert isinstance(message, str), (
+            f"a structured per-op error must carry a string 'message'; got: {error!r}"
+        )
+        return message
+    assert isinstance(error, str), f"per-op error must be an object or a string; got: {error!r}"
+    return error
+
+
 def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
     """Assert the verb call fails. Return the error message string.
 
@@ -194,7 +205,7 @@ def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
         return err.get("message", str(err))
 
     if "_op_error" in result:
-        return result["_op_error"]
+        return _op_error_text(result["_op_error"])
 
     raise AssertionError(
         f"Expected verb '{name}' to fail but got success:\n{result.get('_ok')!r}"

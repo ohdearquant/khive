@@ -44,11 +44,16 @@ fn setup_trigram_store(table_key: &str) -> Fts5TextSearch {
              namespace UNINDEXED, \
              metadata UNINDEXED, \
              updated_at UNINDEXED, \
+             record_kind, \
              tokenize = 'trigram'\
              )",
             table_name
         );
         writer.conn().execute_batch(&ddl).unwrap();
+        writer
+            .conn()
+            .execute_batch(&rowid_map_ddl(&table_name))
+            .unwrap();
     }
 
     Fts5TextSearch::new(pool, false, table_key.to_string())
@@ -58,6 +63,7 @@ fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
     TextDocument {
         subject_id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: if title.is_empty() {
             None
         } else {
@@ -68,6 +74,18 @@ fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
         namespace: "test_ns".to_string(),
         metadata: None,
         updated_at: Utc::now(),
+    }
+}
+
+fn make_record_kind_document(
+    subject_id: Uuid,
+    record_kind: &str,
+    title: &str,
+    body: &str,
+) -> TextDocument {
+    TextDocument {
+        record_kind: Some(record_kind.to_string()),
+        ..make_document(subject_id, title, body)
     }
 }
 
@@ -86,6 +104,7 @@ async fn test_upsert_and_search() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Entity,
+        record_kind: None,
         title: Some("Rust Programming".to_string()),
         body: "Rust is a systems programming language focused on safety and performance."
             .to_string(),
@@ -168,6 +187,397 @@ async fn test_phrase_search() {
     assert_eq!(hits.len(), 2);
 }
 
+/// A stale map entry — left behind by a crash between an FTS-row delete and
+/// its own map-row delete — must not make `get_document`/`delete_document`
+/// operate on whatever
+/// unrelated document FTS5 later reuses that freed rowid for. Seeds A,
+/// removes A's FTS row directly via raw SQL while leaving its map entry
+/// dangling (reproducing the crash window), inserts B at the exact freed
+/// rowid (pinned explicitly rather than relying on FTS5's own rowid-reuse
+/// policy), then asserts `get_document(A)` is `None`, `delete_document(A)`
+/// returns `false`, and B is untouched.
+#[tokio::test]
+async fn stale_map_entry_never_returns_or_deletes_the_wrong_document() {
+    let store = setup_memory_store("stale_map_wrong_doc");
+    let ns = "test_ns";
+
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let a_rowid: i64 = {
+        let writer = store.pool.writer().unwrap();
+        let rowid: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read A's rowid");
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {table} WHERE rowid = ?1"),
+                rusqlite::params![rowid],
+            )
+            .expect("delete A's FTS row directly, leaving its map entry stale");
+        rowid
+    };
+
+    let b = Uuid::new_v4();
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (?1, ?2, 'note', '', 'second document', '[]', ?3, NULL, 0, NULL)"
+                ),
+                rusqlite::params![a_rowid, b.to_string(), ns],
+            )
+            .expect("insert B reusing A's freed rowid");
+        // A real upsert would also write B's own map entry — do that here so
+        // the assertions below isolate A's stale entry as the only anomaly.
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table}_rowids (namespace, subject_id, rowid) VALUES (?1, ?2, ?3)"
+                ),
+                rusqlite::params![ns, b.to_string(), a_rowid],
+            )
+            .expect("insert B's own map entry");
+    }
+
+    let fetched_a = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched_a.is_none(),
+        "a stale map entry must not resolve get_document(A) to B's document, got {fetched_a:?}"
+    );
+
+    let deleted_a = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        !deleted_a,
+        "a stale map entry must not let delete_document(A) delete B's row"
+    );
+
+    let fetched_b = store.get_document(ns, b).await.unwrap();
+    assert!(
+        fetched_b.is_some(),
+        "B's document must remain intact after A's stale-map operations"
+    );
+}
+
+/// The batch upsert path (`batch_upsert_documents_dml`) must recheck the
+/// same key predicate the single-row delete already does: a stale map entry
+/// for A pointing at a rowid B now occupies must not let `upsert_documents`
+/// delete B while re-inserting A. Reproduces the same crash-window setup as
+/// `stale_map_entry_never_returns_or_deletes_the_wrong_document` above, then
+/// drives the fix via the batch path instead of the single-document path.
+#[tokio::test]
+async fn batch_upsert_never_deletes_the_wrong_document_via_a_stale_map_entry() {
+    let store = setup_memory_store("stale_map_batch_upsert");
+    let ns = "test_ns";
+
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let a_rowid: i64 = {
+        let writer = store.pool.writer().unwrap();
+        let rowid: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read A's rowid");
+        writer
+            .conn()
+            .execute(
+                &format!("DELETE FROM {table} WHERE rowid = ?1"),
+                rusqlite::params![rowid],
+            )
+            .expect("delete A's FTS row directly, leaving its map entry stale");
+        rowid
+    };
+
+    let b = Uuid::new_v4();
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (rowid, subject_id, kind, title, body, tags, namespace, metadata, \
+                      updated_at, record_kind) \
+                     VALUES (?1, ?2, 'note', '', 'second document', '[]', ?3, NULL, 0, NULL)"
+                ),
+                rusqlite::params![a_rowid, b.to_string(), ns],
+            )
+            .expect("insert B reusing A's freed rowid");
+        writer
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {table}_rowids (namespace, subject_id, rowid) VALUES (?1, ?2, ?3)"
+                ),
+                rusqlite::params![ns, b.to_string(), a_rowid],
+            )
+            .expect("insert B's own map entry");
+    }
+
+    let summary = store
+        .upsert_documents(vec![make_document(a, "Doc A v2", "updated document")])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.failed, 0,
+        "the batch upsert itself must succeed, got {summary:?}"
+    );
+    assert_eq!(summary.affected, 1);
+
+    let fetched_b = store.get_document(ns, b).await.unwrap();
+    assert!(
+        fetched_b.is_some(),
+        "a stale map entry for A must not let batch upsert delete B's row, got None"
+    );
+    assert_eq!(fetched_b.unwrap().body, "second document");
+
+    let fetched_a = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched_a.is_some(),
+        "A must be inserted and correctly mapped by the batch upsert"
+    );
+    assert_eq!(fetched_a.unwrap().body, "updated document");
+}
+
+/// `delete_document_dml`'s unmanaged (no-writer-task) path wraps the FTS-row
+/// delete and the map-row delete in one explicit `BEGIN IMMEDIATE` / `COMMIT`
+/// / `ROLLBACK` block (`Fts5TextSearch::delete_document`'s fallback, used
+/// when `current_writer_task` returns `None`) so a failure between the two
+/// statements rolls both back together instead of leaving the FTS row
+/// deleted while its map row survives. Forces that failure via the
+/// `delete_dml_test_seam` for this test's own `(ns, a)` key and asserts on
+/// the raw rows that neither statement's effect was left half-committed,
+/// then disarms the seam and confirms a real delete still removes both rows.
+///
+/// No `#[serial_test::serial]` needed: the seam only fires for the armed
+/// `(namespace, subject_id)` key, so a concurrent test operating on a
+/// different key (e.g. `test_delete_document`) is unaffected even while this
+/// test's seam is armed.
+#[tokio::test]
+async fn unmanaged_delete_rolls_back_the_fts_row_when_the_map_delete_fails() {
+    let store = setup_memory_store("unmanaged_delete_rollback");
+    assert!(
+        store
+            .current_writer_task("precondition_check")
+            .unwrap()
+            .is_none(),
+        "this test exercises the no-writer-task fallback path; a writer-task \
+         handle here would route delete_document through the queue's own \
+         transaction instead of the explicit BEGIN IMMEDIATE block under test"
+    );
+
+    let ns = "test_ns";
+    let a = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "first document"))
+        .await
+        .unwrap();
+
+    let table = store.table_name.clone();
+    let map_table = rowid_map_table(&table);
+
+    struct ResetSeamOnDrop {
+        namespace: String,
+        subject_id: Uuid,
+    }
+    impl Drop for ResetSeamOnDrop {
+        fn drop(&mut self) {
+            delete_dml_test_seam::disarm(&self.namespace, self.subject_id);
+        }
+    }
+    let reset_seam = ResetSeamOnDrop {
+        namespace: ns.to_string(),
+        subject_id: a,
+    };
+    delete_dml_test_seam::arm(ns, a);
+
+    let result = store.delete_document(ns, a).await;
+    assert!(
+        result.is_err(),
+        "the forced map-row-delete failure must surface as an error, got {result:?}"
+    );
+
+    {
+        let writer = store.pool.writer().unwrap();
+        let fts_count: i64 = writer
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE subject_id = ?1"),
+                rusqlite::params![a.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_count, 1,
+            "the FTS-row delete must roll back alongside the failed map-row delete"
+        );
+
+        let map_count: i64 = writer
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {map_table} WHERE namespace = ?1 AND subject_id = ?2"
+                ),
+                rusqlite::params![ns, a.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            map_count, 1,
+            "the map row must survive a rolled-back delete alongside its FTS row"
+        );
+    }
+
+    let fetched = store.get_document(ns, a).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "a rolled-back delete must leave the document fully readable, got {fetched:?}"
+    );
+
+    drop(reset_seam);
+
+    let deleted = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        deleted,
+        "with the seam cleared, delete_document must succeed and remove both rows"
+    );
+
+    let writer = store.pool.writer().unwrap();
+    let fts_count: i64 = writer
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE subject_id = ?1"),
+            rusqlite::params![a.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fts_count, 0,
+        "the FTS row must be gone after the real delete"
+    );
+
+    let map_count: i64 = writer
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {map_table} WHERE namespace = ?1 AND subject_id = ?2"),
+            rusqlite::params![ns, a.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        map_count, 0,
+        "the map row must be gone after the real delete"
+    );
+}
+
+/// The seam's targets are stored in a shared set, not a single `Option`
+/// slot -- two independently armed `(namespace, subject_id)` targets must
+/// not clobber each other: arming a second target must not disturb the
+/// first, disarming one target must remove only that target and leave the
+/// other armed, and a delete against either target while armed must roll
+/// back on its own key regardless of what else is armed at the time.
+#[tokio::test]
+async fn delete_dml_test_seam_isolates_two_independently_armed_targets() {
+    let store = setup_memory_store("seam_isolation");
+    let ns = "test_ns";
+    let a = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    store
+        .upsert_document(make_document(a, "Doc A", "doc a body"))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(c, "Doc C", "doc c body"))
+        .await
+        .unwrap();
+
+    delete_dml_test_seam::arm(ns, a);
+    delete_dml_test_seam::arm(ns, c);
+    assert!(
+        delete_dml_test_seam::matches(ns, a),
+        "arming a second target must not un-arm the first"
+    );
+    assert!(
+        delete_dml_test_seam::matches(ns, c),
+        "the second target must itself be armed"
+    );
+
+    // Both targets armed concurrently: each delete must roll back under its
+    // own key, independent of the other's armed state.
+    let (result_a, result_c) =
+        tokio::join!(store.delete_document(ns, a), store.delete_document(ns, c));
+    assert!(
+        result_a.is_err(),
+        "A's forced failure must fire while A is armed"
+    );
+    assert!(
+        result_c.is_err(),
+        "C's forced failure must fire while C is armed, independent of A"
+    );
+    assert!(
+        store.get_document(ns, a).await.unwrap().is_some(),
+        "A's rolled-back delete must leave A readable"
+    );
+    assert!(
+        store.get_document(ns, c).await.unwrap().is_some(),
+        "C's rolled-back delete must leave C readable"
+    );
+
+    // Disarm only A -- C's own target must survive untouched.
+    delete_dml_test_seam::disarm(ns, a);
+    assert!(
+        !delete_dml_test_seam::matches(ns, a),
+        "disarming A must remove exactly A's own target"
+    );
+    assert!(
+        delete_dml_test_seam::matches(ns, c),
+        "disarming A must leave C's independently armed target in place"
+    );
+
+    let deleted_a = store.delete_document(ns, a).await.unwrap();
+    assert!(
+        deleted_a,
+        "with A disarmed, its delete must succeed for real"
+    );
+    let result_c_still_armed = store.delete_document(ns, c).await;
+    assert!(
+        result_c_still_armed.is_err(),
+        "C must still force-fail: disarming A must not have disarmed C"
+    );
+
+    delete_dml_test_seam::disarm(ns, c);
+    let deleted_c = store.delete_document(ns, c).await.unwrap();
+    assert!(
+        deleted_c,
+        "with C disarmed, its delete must succeed for real"
+    );
+}
+
 #[tokio::test]
 async fn test_delete_document() {
     let store = setup_memory_store("delete");
@@ -203,6 +613,237 @@ async fn test_delete_document() {
     assert!(doc.is_none());
 }
 
+/// The pre-fix `DELETE` scanned the whole FTS5 virtual
+/// table because `namespace`/`subject_id` are `UNINDEXED` columns; the
+/// rowid-map version resolves the same lookup through the map's primary key
+/// instead. This test pins both plan shapes as strings measured against a
+/// live `EXPLAIN QUERY PLAN`, not shapes it merely expects, and keeps the OLD
+/// statement inline as the control so a future edit to either builder cannot
+/// silently make this comparison meaningless.
+#[test]
+fn delete_statement_plan_uses_the_map_not_a_table_scan() {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    ensure_fts5_schema(&conn, "plan_check").expect("schema");
+    let table = "fts_plan_check";
+
+    // The exact statement `delete_document_statement` issued before this fix.
+    // `VIRTUAL TABLE INDEX 0:` with NO trailing operator is FTS5's plan label
+    // for an unconstrained cursor: every row is opened and tested, because
+    // `namespace`/`subject_id` are UNINDEXED and xBestIndex has nothing to
+    // push down. That bare, operator-less form is the control this test
+    // pins — measured live, not assumed.
+    const OLD_DELETE_SQL: &str = "DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2";
+    let old_sql = OLD_DELETE_SQL.replace("{table}", table);
+    let old_plan = explain_query_plan(
+        &conn,
+        &old_sql,
+        &["local", "00000000-0000-0000-0000-000000000000"],
+    );
+    let unconstrained_scan = format!("SCAN {table} VIRTUAL TABLE INDEX 0:");
+    assert!(
+        old_plan
+            .iter()
+            .any(|step| step.trim_end() == unconstrained_scan.trim_end()),
+        "control (pre-fix) plan must be an unconstrained FTS5 scan: {old_plan:?}"
+    );
+
+    let new_statement = delete_document_statement(
+        table,
+        "local",
+        Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap(),
+    );
+    let new_plan = explain_query_plan(
+        &conn,
+        &new_statement.sql,
+        &["local", "00000000-0000-0000-0000-000000000000"],
+    );
+    assert!(
+        !new_plan.iter().any(|step| step.trim_end() == unconstrained_scan.trim_end()),
+        "fixed plan must not fall back to the unconstrained FTS5 scan the control used: {new_plan:?}"
+    );
+    assert!(
+        new_plan
+            .iter()
+            .any(|step| step.contains("SEARCH fts_plan_check_rowids USING PRIMARY KEY")),
+        "fixed plan must search the rowid map by its primary key: {new_plan:?}"
+    );
+    assert!(
+        new_plan
+            .iter()
+            .any(|step| step.contains(&format!("SCAN {table} VIRTUAL TABLE INDEX 0:="))),
+        "fixed plan's FTS5 access must be constrained (rowid equality driven by the map's \
+         primary-key search), not the bare unconstrained cursor: {new_plan:?}"
+    );
+}
+
+/// Runs `EXPLAIN QUERY PLAN` for `sql` bound with `params` (all bound as
+/// text — sufficient for this file's plan-shape assertions) and returns each
+/// step's human-readable `detail` column.
+fn explain_query_plan(conn: &rusqlite::Connection, sql: &str, params: &[&str]) -> Vec<String> {
+    let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = conn.prepare(&plan_sql).expect("prepare EXPLAIN QUERY PLAN");
+    let params: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+        .expect("query plan rows");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect plan steps")
+}
+
+/// `insert_document_map_statement`'s `last_insert_rowid()` must
+/// resolve to the FTS5 `INSERT` that ran immediately before it on the same
+/// connection — this is the whole correctness argument for keeping the two
+/// statements adjacent instead of assuming SQLite's `INSERT`-then-read-back
+/// contract without checking it against the actual FTS5 virtual table
+/// implementation.
+#[test]
+fn last_insert_rowid_reflects_the_fts5_insert() {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    ensure_fts5_schema(&conn, "rowid_check").expect("schema");
+    let table = "fts_rowid_check";
+
+    let doc = make_document(Uuid::new_v4(), "Title", "Body");
+    let insert_stmt = insert_document_statement(table, &doc);
+    {
+        let mut stmt = conn.prepare(&insert_stmt.sql).expect("prepare fts insert");
+        crate::sql_bridge::bind_params(&mut stmt, &insert_stmt.params).expect("bind fts insert");
+        stmt.raw_execute().expect("insert fts row");
+    }
+    let observed_rowid = conn.last_insert_rowid();
+
+    let actual_rowid: i64 = conn
+        .query_row(
+            &format!("SELECT rowid FROM {table} WHERE subject_id = ?1"),
+            rusqlite::params![doc.subject_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("read back inserted row's rowid");
+    assert_eq!(
+        observed_rowid, actual_rowid,
+        "last_insert_rowid() must equal the FTS5 insert's own rowid"
+    );
+}
+
+/// Not a CI test — a manual scale measurement, run with:
+/// `cargo test -p khive-db --lib scale_measurement_delete_by_subject -- --ignored --nocapture`
+///
+/// Builds a 200,000-row, ~1.6 KB-body `fts_notes`-shaped table on disk under
+/// `/private/tmp/` (production-shaped: file-backed, trigram-tokenized,
+/// non-trivial body text — an in-memory table or tiny bodies would not
+/// reproduce the overflow-page I/O the pre-fix scan pays for), then times
+/// 100 deletes by subject through the OLD (pre-fix, literal) statement and
+/// 100 through the NEW (rowid-map) statement, against the same corpus.
+#[test]
+#[ignore = "manual scale measurement, not a CI assertion — see doc comment"]
+fn scale_measurement_delete_by_subject() {
+    let path = std::path::PathBuf::from(format!(
+        "/private/tmp/khive-fts-scale-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).expect("open scratch db under /private/tmp");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE fts_notes USING fts5(\
+         subject_id UNINDEXED, kind UNINDEXED, title, body, tags UNINDEXED, \
+         namespace UNINDEXED, metadata UNINDEXED, updated_at UNINDEXED, record_kind, \
+         tokenize = 'trigram')",
+    )
+    .expect("create production-shaped fts_notes");
+    conn.execute_batch(&rowid_map_ddl("fts_notes"))
+        .expect("create rowid map");
+
+    const ROW_COUNT: usize = 200_000;
+    const DELETE_COUNT: usize = 100;
+    let body_filler = "the quick brown fox jumps over the lazy dog ".repeat(35); // ~1.6 KB
+    let ids: Vec<Uuid> = (0..ROW_COUNT).map(|_| Uuid::new_v4()).collect();
+
+    let seed_start = std::time::Instant::now();
+    conn.execute_batch("BEGIN").expect("begin seed");
+    {
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO fts_notes \
+                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                 VALUES (?1, 'note', '', ?2, '[]', 'local', NULL, 0, 'memory')",
+            )
+            .expect("prepare seed insert");
+        for id in &ids {
+            let body = format!("{body_filler}{id}");
+            insert
+                .execute(rusqlite::params![id.to_string(), body])
+                .expect("insert seed row");
+        }
+    }
+    conn.execute_batch("COMMIT").expect("commit seed");
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO fts_notes_rowids (namespace, subject_id, rowid) \
+         SELECT namespace, subject_id, rowid FROM fts_notes ORDER BY rowid ASC",
+    )
+    .expect("backfill rowid map");
+    eprintln!(
+        "seeded {ROW_COUNT} rows (~{} bytes/body) in {:?}",
+        body_filler.len(),
+        seed_start.elapsed()
+    );
+
+    // OLD: the literal statement `delete_document_statement` issued before
+    // this fix — namespace/subject_id are UNINDEXED, so this is a full scan.
+    const OLD_DELETE_SQL: &str = "DELETE FROM fts_notes WHERE namespace = ?1 AND subject_id = ?2";
+    let old_start = std::time::Instant::now();
+    {
+        let mut stmt = conn.prepare(OLD_DELETE_SQL).expect("prepare old delete");
+        for id in &ids[0..DELETE_COUNT] {
+            let affected = stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("old delete");
+            assert_eq!(affected, 1);
+        }
+    }
+    let old_elapsed = old_start.elapsed();
+
+    // NEW: the rowid-map statement, against the (now 200,000 - 100 row, i.e.
+    // still effectively 200,000-row) same corpus.
+    let new_statement_sql = delete_document_statement("fts_notes", "local", ids[DELETE_COUNT]).sql;
+    let new_start = std::time::Instant::now();
+    {
+        let mut fts_stmt = conn
+            .prepare(&new_statement_sql)
+            .expect("prepare new delete");
+        let mut map_stmt = conn
+            .prepare("DELETE FROM fts_notes_rowids WHERE namespace = ?1 AND subject_id = ?2")
+            .expect("prepare new delete map");
+        for id in &ids[DELETE_COUNT..DELETE_COUNT * 2] {
+            let affected = fts_stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("new delete");
+            assert_eq!(affected, 1);
+            map_stmt
+                .execute(rusqlite::params!["local", id.to_string()])
+                .expect("new delete map row");
+        }
+    }
+    let new_elapsed = new_start.elapsed();
+
+    let ratio = old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(1e-9);
+    eprintln!(
+        "{DELETE_COUNT} deletes by subject over {ROW_COUNT} rows: \
+         OLD (full scan) = {old_elapsed:?}, NEW (rowid map) = {new_elapsed:?}, ratio = {ratio:.1}x"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+
+    assert!(
+        new_elapsed < old_elapsed,
+        "the rowid-map delete must be faster than the full-scan delete at this scale \
+         (old={old_elapsed:?}, new={new_elapsed:?})"
+    );
+}
+
 #[tokio::test]
 async fn test_count_with_filter() {
     let store = setup_memory_store("count_filter");
@@ -217,6 +858,7 @@ async fn test_count_with_filter() {
         let doc = TextDocument {
             subject_id: Uuid::new_v4(),
             kind,
+            record_kind: None,
             title: Some(format!("Doc {}", i)),
             body: format!("Content for document number {}", i),
             tags: vec![],
@@ -265,6 +907,7 @@ async fn test_get_document_roundtrip() {
     let original = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: Some("memory".to_string()),
         title: Some("Important Memo".to_string()),
         body: "This memo contains critical information.".to_string(),
         tags: vec!["important".to_string(), "memo".to_string()],
@@ -278,6 +921,7 @@ async fn test_get_document_roundtrip() {
     let retrieved = store.get_document("work", id).await.unwrap().unwrap();
     assert_eq!(retrieved.subject_id, id);
     assert_eq!(retrieved.kind, SubstrateKind::Note);
+    assert_eq!(retrieved.record_kind.as_deref(), Some("memory"));
     assert_eq!(retrieved.title, Some("Important Memo".to_string()));
     assert_eq!(retrieved.body, "This memo contains critical information.");
     assert_eq!(retrieved.tags, vec!["important", "memo"]);
@@ -315,6 +959,7 @@ async fn test_batch_upsert() {
         .map(|i| TextDocument {
             subject_id: Uuid::new_v4(),
             kind: SubstrateKind::Entity,
+            record_kind: None,
             title: Some(format!("Item {}", i)),
             body: format!("This is the body content for item number {}", i),
             tags: vec![format!("tag_{}", i % 5)],
@@ -381,6 +1026,7 @@ async fn test_search_with_kind_filter() {
         .upsert_document(TextDocument {
             subject_id: id_entity,
             kind: SubstrateKind::Entity,
+            record_kind: None,
             title: Some("Rust Guide".to_string()),
             body: "A comprehensive guide to Rust programming.".to_string(),
             tags: vec![],
@@ -395,6 +1041,7 @@ async fn test_search_with_kind_filter() {
         .upsert_document(TextDocument {
             subject_id: id_note,
             kind: SubstrateKind::Note,
+            record_kind: None,
             title: Some("Rust Notes".to_string()),
             body: "Quick notes about Rust concepts.".to_string(),
             tags: vec![],
@@ -422,6 +1069,154 @@ async fn test_search_with_kind_filter() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].subject_id, id_entity);
+}
+
+#[tokio::test]
+async fn record_kind_filter_preserves_results_and_scopes_every_gather_mode() {
+    let store = setup_trigram_store("record_kind_gather_modes");
+    let memory_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    for id in memory_ids {
+        store
+            .upsert_document(make_record_kind_document(
+                id,
+                "memory",
+                "recall fixture",
+                "zircon recall evidence",
+            ))
+            .await
+            .unwrap();
+    }
+
+    let request = |record_kinds: Vec<String>| TextSearchRequest {
+        query: "zircon".to_string(),
+        mode: TextQueryMode::Plain,
+        filter: Some(TextFilter {
+            namespaces: vec!["test_ns".to_string()],
+            record_kinds,
+            ..TextFilter::default()
+        }),
+        top_k: 10,
+        snippet_chars: 0,
+    };
+    let before_noise = store.search(request(Vec::new())).await.unwrap();
+    assert_eq!(before_noise.len(), memory_ids.len());
+    let mut classifier_only_query = request(Vec::new());
+    classifier_only_query.query = "memory".to_string();
+    assert!(
+        store
+            .search(classifier_only_query)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unscoped lexical query must not match indexed classifier text"
+    );
+
+    for i in 0..100 {
+        store
+            .upsert_document(make_record_kind_document(
+                Uuid::new_v4(),
+                "message",
+                &format!("unrelated {i}"),
+                "zircon recall evidence",
+            ))
+            .await
+            .unwrap();
+    }
+
+    let ranked = store
+        .search(request(vec!["memory".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ranked.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+        before_noise
+            .iter()
+            .map(|hit| hit.subject_id)
+            .collect::<Vec<_>>(),
+        "indexed corpus scoping must preserve the memory-only result set and order"
+    );
+
+    for options in [
+        TextSearchOptions {
+            gather_mode: khive_storage::types::TextGatherMode::Unranked,
+            gather_limit: None,
+        },
+        TextSearchOptions {
+            gather_mode: khive_storage::types::TextGatherMode::RankWithinCap,
+            gather_limit: Some(20),
+        },
+    ] {
+        let hits = store
+            .search_with_options(request(vec!["memory".to_string()]), options)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), memory_ids.len());
+        assert!(
+            hits.iter().all(|hit| memory_ids.contains(&hit.subject_id)),
+            "every gather mode must honor the indexed record-kind corpus"
+        );
+    }
+}
+
+#[tokio::test]
+async fn record_kind_filter_scopes_count_term_stats_and_short_kind_fallback() {
+    let store = setup_trigram_store("record_kind_counts");
+    for (record_kind, body) in [
+        ("memory", "common rare recall"),
+        ("memory", "common recall"),
+        ("message", "common rare message"),
+        ("message", "common rare message"),
+        ("ai", "common rare short classifier"),
+    ] {
+        store
+            .upsert_document(make_record_kind_document(
+                Uuid::new_v4(),
+                record_kind,
+                "fixture",
+                body,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let memory_filter = TextFilter {
+        namespaces: vec!["test_ns".to_string()],
+        record_kinds: vec!["memory".to_string()],
+        ..TextFilter::default()
+    };
+    assert_eq!(store.count(memory_filter.clone()).await.unwrap(), 2);
+    let stats = store
+        .term_stats(TextTermStatsRequest {
+            terms: vec!["common".to_string(), "rare".to_string()],
+            filter: Some(memory_filter),
+        })
+        .await
+        .unwrap();
+    let common = stats.iter().find(|stat| stat.term == "common").unwrap();
+    let rare = stats.iter().find(|stat| stat.term == "rare").unwrap();
+    assert_eq!(common.document_count, 2);
+    assert_eq!(common.document_frequency, 2);
+    assert_eq!(rare.document_frequency, 1);
+
+    let short_kind_hits = store
+        .search(TextSearchRequest {
+            query: "common".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(TextFilter {
+                namespaces: vec!["test_ns".to_string()],
+                record_kinds: vec!["ai".to_string()],
+                ..TextFilter::default()
+            }),
+            top_k: 10,
+            snippet_chars: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        short_kind_hits.len(),
+        1,
+        "a classifier too short for trigram postings must retain exact-filter correctness"
+    );
 }
 
 #[tokio::test]
@@ -1570,6 +2365,7 @@ async fn test_rename_namespace() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: Some("Rename test".to_string()),
         body: "keyword_unique_xyz".to_string(),
         tags: vec![],
@@ -1626,6 +2422,7 @@ async fn test_metadata_none_roundtrip() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         namespace: "test_ns".to_string(),
         title: None,
         body: "no metadata".to_string(),
@@ -1646,6 +2443,7 @@ async fn test_rename_namespace_noop() {
     let doc = TextDocument {
         subject_id: id,
         kind: SubstrateKind::Note,
+        record_kind: None,
         title: None,
         body: "noop_test_content".to_string(),
         tags: vec![],
@@ -2774,4 +3572,122 @@ fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
             .expect("write task must not panic")
             .expect("upsert_document must succeed once unblocked");
     });
+}
+
+/// #1907: memory recall's lexical work must scale with the memory corpus, not
+/// with unrelated notes that happen to match the same common query term.
+#[test]
+fn memory_kind_match_work_is_bounded_by_memory_corpus() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rusqlite::functions::FunctionFlags;
+
+    fn measure(noise_rows: usize) -> (usize, usize, String) {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_notes USING fts5(\
+             subject_id UNINDEXED, \
+             kind UNINDEXED, \
+             title, \
+             body, \
+             tags UNINDEXED, \
+             namespace UNINDEXED, \
+             metadata UNINDEXED, \
+             updated_at UNINDEXED, \
+             record_kind, \
+             tokenize = 'trigram'\
+             )",
+        )
+        .expect("production-shaped trigram table");
+        conn.execute_batch(&rowid_map_ddl("fts_notes"))
+            .expect("production-shaped rowid map");
+
+        conn.execute_batch("BEGIN").expect("begin seed");
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO fts_notes \
+                    (subject_id, kind, title, body, tags, namespace, metadata, updated_at, record_kind) \
+                     VALUES (?1, 'note', '', 'common recall token', '[]', 'local', NULL, 0, ?2)",
+                )
+                .expect("prepare seed insert");
+            for i in 0..noise_rows {
+                insert
+                    .execute(rusqlite::params![format!("noise-{i}"), "message"])
+                    .expect("insert non-memory note");
+            }
+            for i in 0..50 {
+                insert
+                    .execute(rusqlite::params![format!("memory-{i}"), "memory"])
+                    .expect("insert memory note");
+            }
+        }
+        conn.execute_batch("COMMIT").expect("commit seed");
+
+        let visits = std::sync::Arc::new(AtomicUsize::new(0));
+        let visits_for_fn = std::sync::Arc::clone(&visits);
+        conn.create_scalar_function(
+            "visit_memory_kind",
+            1,
+            FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                visits_for_fn.fetch_add(1, Ordering::Relaxed);
+                Ok(i64::from(ctx.get::<String>(0)? == "memory"))
+            },
+        )
+        .expect("register visit counter");
+
+        let filter = TextFilter {
+            record_kinds: vec!["memory".to_string()],
+            ..TextFilter::default()
+        };
+        let match_expr = build_filtered_match_expr("common", TextQueryMode::Plain, Some(&filter))
+            .expect("filtered MATCH expression");
+        assert!(
+            match_expr.contains("record_kind : \"memory\""),
+            "granular kind must be part of MATCH, got {match_expr:?}"
+        );
+        let sql = format!(
+            "SELECT subject_id FROM fts_notes \
+             WHERE fts_notes MATCH ?1 \
+             AND rank MATCH '{LEXICAL_BM25_RANK}' \
+             AND visit_memory_kind(record_kind) = 1 \
+             ORDER BY rank LIMIT 20"
+        );
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain")
+            .query_map([&match_expr], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect explain")
+            .join("\n");
+        let hits = conn
+            .prepare(&sql)
+            .expect("prepare measured query")
+            .query_map([&match_expr], |row| row.get::<_, String>(0))
+            .expect("run measured query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect measured hits");
+
+        (hits.len(), visits.load(Ordering::Relaxed), plan)
+    }
+
+    let (small_hits, small_visits, small_plan) = measure(200);
+    let (large_hits, large_visits, large_plan) = measure(2_000);
+    assert_eq!(small_hits, 20);
+    assert_eq!(large_hits, 20);
+    assert_eq!(
+        small_visits, 20,
+        "only the requested memory top-K is visited"
+    );
+    assert_eq!(large_visits, 20, "unrelated notes must add no visits");
+    assert!(small_plan.contains("VIRTUAL TABLE"), "{small_plan}");
+    assert!(large_plan.contains("VIRTUAL TABLE"), "{large_plan}");
+    assert!(
+        large_visits < small_visits.saturating_mul(3),
+        "memory query scanned the unrelated note corpus: {small_visits} candidate visits \
+         with 200 noise rows versus {large_visits} with 2,000 noise rows\n\
+         small plan:\n{small_plan}\nlarge plan:\n{large_plan}"
+    );
 }

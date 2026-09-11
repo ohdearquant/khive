@@ -35,7 +35,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "atoms",
                 param_type: "array<object>",
                 required: true,
-                description: "List of atoms: {slug, name, content, tags?, properties?, finalized?}",
+                description: "List of atoms: {slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}. On update, omitted source/finalized fields are preserved; null clears a source or resets finalized to false without demoting lifecycle status.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -84,7 +84,10 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.list",
-        description: "Paginated listing of atoms or domains",
+        description: "Paginated listing of atoms or domains. Legacy offset pages use the declared \
+                      created_at DESC, id DESC order. For complete walks use after=\"\" and \
+                      round-trip next_after; cursor pages seek by created_at ASC, id ASC and are \
+                      not shifted by concurrent inserts.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -106,7 +109,34 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "offset",
                 param_type: "integer",
                 required: false,
-                description: "Pagination offset",
+                description: "Pagination offset (default 0), ordered by created_at DESC then id DESC. \
+                              Prefer after for full-store walks; offset and after are mutually exclusive.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after",
+                param_type: "string",
+                required: false,
+                description: "Keyset cursor for a stable full-store walk. Pass \"\" to start, then \
+                              round-trip the prior page's next_after full UUID. Cursor pages use \
+                              created_at ASC, id ASC. This is a live traversal: inserts behind an \
+                              issued boundary belong to a fresh walk; inserts ahead may extend the \
+                              current walk. Reuse the same type/status/fields filters. Soft-deleting \
+                              a boundary does not invalidate it; missing, wrong-type, or out-of-namespace \
+                              cursors fail. Stop when next_after is null; cursor pages carry no total \
+                              (counting is a full scan per page). Mutually exclusive with offset.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "fields",
+                param_type: "array<string>",
+                required: false,
+                description: "Non-empty exact response projection. Atom fields: id, namespace, slug, \
+                              name, content, tags, properties, status, source_uri, source_type, finalized, \
+                              kind, created_at, updated_at. Domain fields: id, namespace, slug, name, \
+                              description, tags, members, kind, created_at, updated_at. Unknown fields \
+                              fail. Storage selects only requested columns plus hidden pagination keys; \
+                              use [\"id\",\"slug\"] for efficient inventory walks.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -169,7 +199,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.index",
-        description: "Backfill embeddings + FTS for atoms/domains",
+        description: "Backfill atom embeddings. Does not rebuild the global FTS indexes: that is a whole-database operation independent of the caller's namespace, with no per-caller cost admission on this verb, so it is reachable only through the `kkernel reindex` operator CLI (`--rebuild-fts`).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -213,7 +243,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "candidates",
                 param_type: "array<object>",
                 required: true,
-                description: "Scored items: {id, score, size, name?, content?, category?, information_gain?}. `knowledge.suggest`'s `results` feed this directly.",
+                description: "Scored items: {id, score, size, name?, members?, content?, category?, information_gain?}. `members` is an optional live member count; candidates with members=0 are not selected. `knowledge.suggest`'s `results` feed this directly.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -361,7 +391,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.suggest",
-        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size} — `size` is the aggregate estimated-token cost of the domain's member atom bodies that compose expands, in the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction. When ANN candidate retrieval is unavailable, the response sets `ann_unavailable: true` and reports `degraded.mode`: `no_match` when lexical/FTS retrieval found no candidates, `ann_candidates_degraded` when lexical/FTS candidates still received fresh embedding cosine reranking, or `lexical_only` when that fresh rerank did not run.",
+        description: "Suggest relevant knowledge domains for a query. Draft and deprecated domain atoms are excluded by default (same quality default as knowledge.search). Each result carries {id, name, score, size, members} — `size` is the aggregate estimated-token cost of the domain's live member atom bodies, and `members` is their count. A present domain without live members has size 0 and members 0. The size uses the same unit as `knowledge.fold`'s `budget`, so results feed `knowledge.fold(candidates=...)` directly with no caller-side field construction. When ANN candidate retrieval is unavailable, the response sets `ann_unavailable: true` and reports `degraded.mode`: `no_match` when lexical/FTS retrieval found no candidates, `ann_candidates_degraded` when lexical/FTS candidates still received fresh embedding cosine reranking, or `lexical_only` when that fresh rerank did not run.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -433,7 +463,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "auto_limit",
                 param_type: "integer",
                 required: false,
-                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20).",
+                description: "Number of domains to auto-suggest from `query` when both domain_ids and atom_ids are empty (default 5, clamped 1-20). This caps suggested candidates before domains without live members are dropped, so auto-compose may compose fewer domains than auto_limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -764,7 +794,15 @@ mod tests {
             ("knowledge.get", &["id", "include_sections"]),
             (
                 "knowledge.list",
-                &["type", "limit", "offset", "status", "exclude_status"],
+                &[
+                    "type",
+                    "limit",
+                    "offset",
+                    "after",
+                    "fields",
+                    "status",
+                    "exclude_status",
+                ],
             ),
             ("knowledge.delete_atoms", &["ids", "cascade"]),
             ("knowledge.stats", &[]),

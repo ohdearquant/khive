@@ -298,6 +298,7 @@ impl Inner {
         let drained: Vec<Waiting> = std::mem::take(&mut state.pending);
         if !already_failed {
             state.flush_failures += 1;
+            state.degraded = true;
             let generation_id = state.next_generation_id;
             state.generations.push(AuditGenerationSnapshot {
                 generation_id,
@@ -394,7 +395,8 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         // configured bounded retries exist for — treating them as terminal
         // would abandon a generation on the first blip of a daemon restart.
         StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
-        StorageError::WriterTaskTerminated { request_state } => match request_state {
+        StorageError::WriterTaskRequestFailed { request_state, .. }
+        | StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }
@@ -582,6 +584,7 @@ async fn supervisor_loop(
                     state.in_flight_generation = None;
                     state.store_batch_calls += 1;
                     state.flush_failures += 1;
+                    state.degraded = true;
                     let generation_id = state.next_generation_id.saturating_sub(1);
                     state.generations.push(AuditGenerationSnapshot {
                         generation_id,

@@ -38,6 +38,7 @@ export const NOTE_KINDS = [
   "question",
   "decision",
   "reference",
+  "head",
 ] as const;
 
 export const EDGE_RELATION_FAMILY_NAMES = [
@@ -84,6 +85,7 @@ export type OntologyIconName =
   | "circle-help"
   | "signpost"
   | "bookmark"
+  | "git-commit"
   | "circle";
 
 export type KindLegendEntry = Readonly<{
@@ -157,6 +159,11 @@ export const NOTE_KIND_LEGEND = {
     label: "Reference",
     icon: "bookmark",
     hue: "var(--ontology-reference)",
+  },
+  head: {
+    label: "Head",
+    icon: "git-commit",
+    hue: "var(--ontology-head)",
   },
 } as const satisfies Record<NoteKind, KindLegendEntry>;
 

@@ -1369,17 +1369,18 @@ of course part of statement execution and is not “external work” in this rul
 **Complete production write-scope audit (current tree).** The owner row is the review unit; every
 production caller named in that row was inspected through its commit/rollback edge.
 
-| Transaction owner                               | Production scopes/callers                                                                                               | Work inside the transaction                                                   | Verdict                                 |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
-| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                                      | Migration DDL/DML and ledger insert                                           | SQL-only                                |
-| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                                           | Synchronous statement sequences over one borrowed connection                  | SQL-only                                |
-| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests                 | The request's prepared SQL statements and bounded row/result folding          | SQL-only after the blob-GC repair below |
-| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                                           | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping | SQL-only                                |
-| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, `agents`, and `attachment` batch/upsert/delete methods | Bounded per-item SQL loops and result counters                                | SQL-only                                |
-| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                                        | sqlite-vec/ordinary table statements and bounded row binding                  | SQL-only                                |
-| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                                           | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert  | SQL-only                                |
-| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup          | DML/query statements and bounded validation/folding                           | SQL-only                                |
-| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                               | Root walk, metadata, advisory locking, and file deletion                      | Explicitly outside SQLite transactions  |
+| Transaction owner                               | Production scopes/callers                                                                                                           | Work inside the transaction                                                                                                                                                                                 | Verdict                                 |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `run_migrations_locked` and `apply_schema_plan` | Core versioned migrations; pack service migrations                                                                                  | Migration DDL/DML and ledger insert                                                                                                                                                                         | SQL-only                                |
+| `WriterGuard::transaction`                      | Pack auxiliary DDL; runtime symmetric edge update; entity/note merge fallback                                                       | Synchronous statement sequences over one borrowed connection                                                                                                                                                | SQL-only                                |
+| `writer_task::drain_loop`                       | All `send`/`send_bounded` store mutations, queue-backed `SqlBridge` batches, and `atomic_unit` requests                             | The request's prepared SQL statements and bounded row/result folding                                                                                                                                        | SQL-only after the blob-GC repair below |
+| `SqlBridge` manual owners                       | Standalone and pool-backed `execute_batch`; flag-off `run_manual_atomic_unit`                                                       | Pre-prepared parameterized statements, commit/rollback, poisoning bookkeeping                                                                                                                               | SQL-only                                |
+| Store flag-off batch owners                     | `entity`, `note`, `event`, `graph`, `text`, `sparse`, `vectors`, `agents`, and `attachment` batch/upsert/delete methods             | Bounded per-item SQL loops and result counters                                                                                                                                                              | SQL-only                                |
+| Vector-store private IMMEDIATE transactions     | Vector batch upsert/delete/orphan reconciliation                                                                                    | sqlite-vec/ordinary table statements and bounded row binding                                                                                                                                                | SQL-only                                |
+| Retrieval weight private IMMEDIATE transaction  | `engine_weights::apply_weight_delta_with_eta`                                                                                       | One scalar read, bounded EMA arithmetic, weight upsert, and audit-row insert                                                                                                                                | SQL-only                                |
+| Runtime/pack `AtomicUnitOp` callers             | Runtime atomic runner and ANN registry; brain fold/persist; session mirror ingest; blob recovery/claim/cleanup; web manifest ingest | DML/query statements and bounded validation/folding; web ingest prepares validated entity/FTS/edge DML before admission (at most 10,000 entities and 50,000 edges)                                          | SQL-only                                |
+| Mounted catalog re-pin                          | `khive-mounts::store::replace`                                                                                                      | One generation-guarded catalog UPDATE, followed only on success by prebuilt event/observation INSERT statements; all process I/O, JSON serialization, digests, diff and event preparation precede admission | SQL-only; failed CAS changes nothing    |
+| Blob physical GC (outside owner)                | `FsBlobStore::transactional_orphan_sweep`                                                                                           | Root walk, metadata, advisory locking, and file deletion                                                                                                                                                    | Explicitly outside SQLite transactions  |
 
 **Blob cross-resource repair.** The sweep now prepares its file candidates before SQLite opens a
 writer transaction. The protocol first holds a process-local lock keyed by the canonical database
@@ -1496,3 +1497,234 @@ Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
 second-stage join bound above). These bound read work and interrupt
 settlement only. They do not change write admission, commit, rollback,
 checkpoint, or TRUNCATE policy.
+
+### 2026-08-30 amendment (Amendment 13): pooled file-backed snapshots
+
+ADR-165 Slice 2 replaces the ordinary file-backed
+standalone/cached-reader population with the pre-opened reader pool. Every typed
+store read and every ordinary read-only `SqlBridge` operation now owns one
+`ReaderGuard` for exactly its interruptible operation. Returning a guard
+finalizes the statement, clears connection-global read state, restores or
+replaces the connection, and only then returns shared reader admission. There
+is no standalone fallback on saturation. This shrinks the ordinary WAL-pin
+population to the fixed pool and removes idle logical `SqlReader` handles from
+the SQLite connection census entirely.
+
+Amendment 7's explicit transaction rule remains. A caller-requested top-level
+deferred read transaction is the sole request-path standalone-reader exception:
+its standalone connection, admission permit, `tx_registry` span, maximum-age
+guard, and cleanup lifecycle remain one unit until terminal control or
+fail-closed disposal. Boot-time inspection before pool construction and a
+diagnostic that truly requires an independent snapshot are the closed
+infrastructure exceptions. The current PASSIVE diagnostic probe uses its
+separately documented standalone writer because checkpoint backfill is not a
+read-only snapshot.
+
+Pool-scoped diagnostics expose configured and available reader admission,
+pooled versus standalone route counts, separately attributed infrastructure
+opens, admission timeouts, active/peak/completed pooled checkouts, and maximum
+completed pooled hold time. The counters reset with pool reconstruction; point-
+in-time capacity/availability and active values are explicitly not lifetime
+counters. Completed hold time includes reset/replacement, so it measures the
+whole interval during which a checkout could withhold reusable capacity.
+
+### 2026-09-02 amendment (Amendment 14): `ReaderGuard` is a read-only capability outside `khive-db`
+
+A `ReaderGuard` returned by `ConnectionPool::reader` never hands a raw
+`rusqlite::Connection` to a caller outside `khive-db`. Internally, typed
+stores and raw-SQL routes reach the connection through the crate-private
+`ReaderGuard::conn`, proven read-only either by construction or by an
+explicit `mark_dirty` call before any state-changing statement. The one
+public accessor, `ReaderGuard::query_row`, checks `sql` against the same
+allow-listed read-shape classifier the pooled `SqlReader` surface uses for
+raw SQL (`SELECT`, `WITH ... SELECT`, `VALUES`, `EXPLAIN`, and a fixed
+read-only `PRAGMA` set) before it reaches SQLite, and refuses `BEGIN`, DML,
+DDL, `ATTACH`, and setting `PRAGMA`s outright — a lease never becomes a
+vector for opening a transaction or mutating the database. An admitted
+statement still marks the checkout dirty unconditionally, so `Drop` pays the
+pristine-state scan (or, in degraded shared-lease mode, the settings/
+rollback verification) before the connection is reused or the shared lease
+is released.
+
+### 2026-08-30 amendment (Amendment 15): read-only reconciliation and bounded producer-temp cleanup
+
+**Supersession.** This amendment supersedes Amendment 6 only where it says
+`db_diagnostics` cannot enumerate the sidecar and must omit
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap`. The daemon's one-pass-per-tick
+rule, housekeeping/attribution distinction, and evidence-retention policy remain unchanged.
+
+**Read-only operator reconciliation.** `walpin::inspect_live` is a third enumeration purpose. It
+shares the descriptor-bound directory and entry validation, identity/freshness classification,
+entry-size limit, and 512-entry work cap with checkpoint attribution, but every deletion policy is
+disabled. Dead, reused, malformed, stale, symlinked, and producer-temp evidence remains on disk.
+The report states whether listing truncated and how many trusted stale producer temps ordinary
+housekeeping would reap. `db_diagnostics` reconciles that result with the independently bounded OS
+holder census: `complete` requires a complete census, an untruncated sidecar walk, no unknown
+sidecar classifications, and sidecar evidence for every confirmed holder. Each missing condition
+is an explicit degradation reason. The diagnostic request therefore measures cleanup candidates
+but never becomes the actor that consumes its own forensic evidence. Amendment 6's disable rule
+applies here too: an operator who has explicitly disabled the sidecar gets a degraded result
+naming that as the reason, never a silent `inspect_live` call against a facility they turned off.
+Every operational path this pass touches — the sidecar directory and the WAL file it reasons
+about — is derived from the pool's canonical path, not its raw configured one, matching the
+checkpoint sidecar writers; a symlinked or otherwise aliased configured path must not send this
+reconciliation looking beside the alias while the evidence sits beside the canonical file.
+
+**Producer-temp residue.** The atomic writers' exact `.<pid>.json.tmp` and
+`.<pid>.beacon.tmp` names are now recognized in a separate bounded listing lane instead of being
+indistinguishable from arbitrary hidden files. Ordinary housekeeping and checkpoint attribution
+may remove a candidate only after it is older than the staleness window, its body parses as its
+recorded kind, its recorded PID matches its filename, and its producer is positively dead or its
+parsed start-time identity proves PID reuse. A malformed body or a filename/body PID mismatch is
+retained and reported as unknown evidence regardless of whether the named PID is alive or dead —
+identity is validated before liveness is ever consulted, so a crash-truncated write or an
+already-recycled PID slot cannot be reaped on liveness alone. Fresh temps, live matching
+producers, uninspectable processes, non-owned entries, symlinks, and all unrecognized dot-names
+are likewise retained. The candidate is opened with the existing non-following, regular-file,
+ownership, and size checks; immediately before unlink, its device/inode identity is rechecked
+against the classified object, closing the wide races (stale content lingering, a symlink swapped
+in). POSIX has no delete-if-still-this-inode primitive for a plain unlink, so the recheck and the
+unlink remain two separate syscalls: a producer that replaces the same name in the instant between
+them can still have its new write removed. A producer that loses this narrow race observes its own
+rename fail because the temp it just wrote is already gone — every writer here already treats a
+missing temp as a transient failure to retry on the next tick, never as data loss, so this is the
+outcome such a producer must tolerate, not a race this recheck actually closes. The ordinary and
+producer-temp result sets each cap at 512 entries and the raw directory scan retains its existing
+bounded multiplier. Thus a crash population drains over bounded ticks without letting one cleanup
+pass scale with historical residue.
+
+**Database byte composition.** The same operator report now runs SQLite's read-only aggregate
+`dbstat` view on its guarded standalone connection. It returns per-object page/byte totals and
+file-wide row-table, index, FTS, vector, mixed row-and-embedding, internal, freelist, and
+unaccounted totals. Tables containing both ordinary rows and an embedding BLOB stay in the mixed
+class because SQLite pages cannot support a defensible per-column split. Object detail is capped
+and reports truncation/omission explicitly; aggregate class totals continue across the full
+`dbstat` result.
+
+### 2026-08-30 amendment (Amendment 16): bounded FTS5 segment maintenance
+
+**Motivation.** The production main store reached 212,803 indexed notes with
+11 `fts_notes` segments and 10 `fts_entities` segments. Short
+`memory.recall` requests spent seconds in the FTS arm while ANN remained
+sub-millisecond. FTS5 normally merges on foreground writes, but no bounded
+background owner continued incremental optimize work during lower-traffic
+periods. Counting distinct segment IDs through `%_idx` is itself a full scan,
+so that query is unsuitable for the operator diagnostic meant to explain a
+large index.
+
+**Decision.** The main backend's existing dedicated checkpoint task owns a
+second, independent FTS maintenance cadence. Every due call considers exactly
+one of `fts_entities` or `fts_notes` in round-robin order and requests at most
+one configured page budget through FTS5's incremental `merge` command. A
+negative budget begins an incremental optimize cycle; positive budgets
+continue it. The default is 500 pages every 300 seconds with a two-segment
+minimum. The unbounded `optimize` command is not used. Secondary checkpoint
+tasks do not assume these substrate tables exist.
+
+SQLite's persistent `automerge` and `crisismerge` settings remain unchanged.
+Retuning them could shift unpredictable merge work onto foreground commits;
+the explicit maintenance owner instead supplies a bounded, observable work
+budget. Any later retune requires separate production workload evidence.
+
+The merge temporarily sets the dedicated connection's `busy_timeout` to zero.
+It never waits behind an application writer, never enters the pooled writer
+mutex, and does not change the PASSIVE/TRUNCATE gates defined above. Busy,
+threshold, progress, no-op, requested-page, and error outcomes are
+process-lifetime counters. A maintenance failure is independent of a
+successful checkpoint observation and does not discard the connection.
+The converse is not free, however: once a step's merge statement is
+executing it holds SQLite's write lock like any other write, so an
+application writer may wait behind that one step for its execution time,
+bounded by the configured page budget. The step runs off the checkpoint
+task's Tokio worker thread (`tokio::task::spawn_blocking`), so it cannot
+stall the async runtime itself while it executes — only the SQLite-level
+write lock is shared with application writers.
+
+**Diagnostics.** FTS5 documents row id 10 in each `%_data` shadow table as the
+binary structure record. `db_diagnostics.fts_segments` decodes those two
+single rows to report level and segment counts; it never scans `%_idx` and
+never runs a corpus-sized `COUNT`. Malformed/missing structure data degrades
+to `fts_segments_error`. `db_diagnostics.fts_maintenance` exposes the bounded
+maintenance counters. This adds derived-index writes only; it changes no
+logical records, migrations, recall ordering, or WAL escalation policy.
+
+### 2026-09-08 amendment (Amendment 17): stream-append write scope
+
+**What this adds.** Amendment 11's audit table is normative and exhaustive, and its review guard
+requires any new `SqlAccess::atomic_unit` caller to be entered in it. The stream ledger introduced
+with the `note_streams` migration adds one such caller, `KhiveRuntime::stream_append` in
+`crates/khive-runtime/src/streams.rs`. This amendment records its audit row rather than editing
+Amendment 11 in place, so the inventory grows by append and the earlier text stays readable as
+what was true when it was written.
+
+| Transaction owner                   | Production scopes/callers         | Work inside the transaction                                                                                                                                                                                   | Verdict  |
+| ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::stream_append` | One head `SELECT COALESCE(MAX(seq), 0)`, a checked integer increment, a comparison against the caller's expected sequence, the note plan's prepared statements with their row guards, and one ledger `INSERT` | SQL-only |
+
+**Why the row holds.** Everything the append needs is materialized before the transaction opens:
+the record is serialized, and the note plan, with its content, index and vector statements, is
+produced by the shared note preparation path. The closure's only awaited value is the writer it
+is handed. It performs no filesystem, process or network work, calls into no other subsystem, and
+computes no embedding. The statement loop is bounded by the prepared plan for a single note. The
+sequence precondition is evaluated inside the same transaction that installs the row, which is the
+point of putting it there: a precondition checked outside the writer would be advisory.
+
+**Conflict is a return, not an error path.** A failed expected-sequence comparison returns a
+conflict outcome from the closure and lets the transaction end normally, so a losing conditional
+append does not roll back through the error path or hold the writer while a caller decides what to
+do. The refusal is reported after the transaction closes.
+
+**Metadata compare-and-set keeps its existing owner.** The stream work also updates record
+metadata through a single prepared statement under the transaction owners already inventoried in
+Amendment 11. That path adds no new scope and needs no row of its own; it is named here only so a
+reader auditing the stream surface does not go looking for a missing entry.
+
+**Basis, stated plainly.** This row was established by reading the caller through its commit edge.
+The first-poll enforcement arm and the fault-injection arms for this caller have not been executed;
+they run with the stream work's own gate. The row is entered under the same review guard it
+documents, and the guard's requirement is that the entry exists and the body respects the
+invariant, which is what was checked.
+
+### 2026-09-10 amendment (Amendment 18): stream-batch write scope, and its one open bound
+
+**What this adds.** Amendment 17 entered the single-append caller. The batch surface that landed
+after it adds a second caller under the same owner, `run_prepared_stream_batch` in
+`crates/khive-runtime/src/streams.rs`, and Amendment 11's review guard requires its own row. This
+amendment records it, again by appending rather than editing either earlier table.
+
+| Transaction owner                   | Production scopes/callers                     | Work inside the transaction                                                                                                                                                                                                                                                                                                           | Verdict                                                    |
+| ----------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Runtime/pack `AtomicUnitOp` callers | `runtime::streams::run_prepared_stream_batch` | At most one `SELECT khive_now_micros()`, taken only when an observation carries a deadline; the batch fence check; one paired `SELECT id, version` per observed entry; then per member either a prepared note plan with its row guards and one ledger `INSERT`, or a keyed write's prepared plan and one `SELECT version, updated_at` | SQL-only; hold size unbounded by member count (issue 2543) |
+
+**Why the row holds.** Every member arrives as a prepared action: the note is serialized and its
+plan produced by the shared preparation path before the transaction opens, so the closure binds
+and executes statements and folds bounded results. It performs no filesystem, process or network
+work, calls into no other subsystem, computes no embedding, and awaits nothing but the writer it
+is handed. The stream head is read at most once per distinct stream in the batch and memoized for
+the rest of it. A refusal, whether from the fence, an observation, a sequence comparison or a
+member's own row guard, returns from the closure and rolls the transaction back through the normal
+path.
+
+**Why the predicates are inside.** The fence and the observation set are preconditions for the
+whole batch, so they are evaluated in the same transaction that installs the writes; checked
+outside the writer they would be advisory, which is the same reason Amendment 17 gives for the
+single append's sequence comparison. The deadline comparison reads the writer's own clock through
+SQLite rather than the process clock, so one transaction has one time.
+
+**The per-member mode is bounded by construction.** `stream_batch_per_member` runs the same
+closure with a one-element member list, once per member, so each writer hold covers exactly one
+member and admits no fence or observation set.
+
+**The open bound, stated rather than implied.** In atomic mode the statement count inside the
+writer hold grows with the number of members and observations the caller sends. The verb refuses
+an empty list, and it does not cap a large one: the only ceiling today is the daemon's 8 MiB frame,
+which is a transport limit rather than a decision about writer hold time, and it admits a member
+count on the order of a hundred thousand. Every comparable path in this document names its own
+number instead: web manifest ingest at 10,000 entities and 50,000 edges, blob GC at 128 rows per
+unit. This row is entered with that gap named, not resolved; the verb-level cap is a change to the
+stream contract and belongs to that contract's own amendment, not to this inventory.
+
+**Basis.** Read at `crates/khive-runtime/src/streams.rs` through the closure's commit and refusal
+edges and through both member kinds, and at `crates/khive-pack-kg/src/handlers/stream.rs` for what
+the verb admits. The frame constant is `crates/khive-runtime/src/daemon.rs`. No new arms were run
+for this row; the stream suites that cover these paths ran with the work that introduced them.

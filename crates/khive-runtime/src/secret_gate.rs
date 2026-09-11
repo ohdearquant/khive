@@ -2,7 +2,8 @@
 //!
 //! Scans caller-supplied content strings before any storage write. A match
 //! causes a hard `RuntimeError::SecretDetected` that names the detector and
-//! carries a masked excerpt — it never echoes the full candidate back.
+//! carries a masked excerpt internally. Its display names the rule and trigger
+//! without echoing any candidate text.
 //!
 //! Scope: **credentials only** — API keys, tokens, private keys, passwords,
 //! and connection strings with embedded credentials. General PII (emails,
@@ -15,8 +16,10 @@
 //!    secret keys, URL userinfo (`scheme://user:pass@`).
 //! 2. **High-entropy token heuristic** — base64/hex/base64url runs ≥ 24 chars
 //!    near a trigger word (key, secret, password, credential, bearer, auth,
-//!    apikey, api_key, access_key, private_key). The word `token` alone is
-//!    NOT a trigger, to avoid blocking `tokenizer_*`, `token_count`, etc.
+//!    apikey, api_key, access_key, private_key). A standalone `token` still
+//!    triggers opaque entropy detection, but does not by itself label a UUID
+//!    as a credential; compound identifiers such as `tokenizer_*` and
+//!    `token_count` remain excluded.
 //!
 //! Credential-shaped labels and assignments dominate the allowlist below.
 //! Public VCS revisions and plausible file paths remain exempt in ordinary
@@ -56,19 +59,19 @@ use crate::error::{RuntimeError, RuntimeResult};
 pub struct SecretMatch {
     /// Human-readable name of the detector that fired.
     pub detector: &'static str,
+    /// Canonical trigger from the matched context; known-prefix rules need none.
+    pub trigger: Option<&'static str>,
     /// `first6...N` — the first 6 chars of the match followed by the total length.
     pub masked: String,
 }
 
 impl std::fmt::Display for SecretMatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "content matches secret pattern {} at masked excerpt {}. {}",
-            self.detector,
-            self.masked,
-            block_guidance(self.detector)
-        )
+        write!(f, "content matches secret pattern {}", self.detector)?;
+        if let Some(trigger) = self.trigger {
+            write!(f, " near '{trigger}'")?;
+        }
+        write!(f, ". {}", block_guidance(self.detector))
     }
 }
 
@@ -219,6 +222,7 @@ thread_local! {
 /// verbatim, so a non-leftmost match would leak an earlier secret detected by a
 /// lower-priority detector (e.g. an `sk-ant-` key sitting to the left of a
 /// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
+#[cfg(test)]
 fn scan_match(text: &str) -> Option<(&str, &'static str)> {
     let tokens = tokenize_entropy_tokens(text);
     scan_from(text, 0, &tokens)
@@ -274,7 +278,23 @@ fn keep_leftmost<'a>(
 
 /// Return the first `SecretMatch` found in `text`, or `None`.
 fn scan(text: &str) -> Option<SecretMatch> {
-    scan_match(text).map(|(slice, detector)| build_match(detector, slice))
+    let tokens = tokenize_entropy_tokens(text);
+    scan_from(text, 0, &tokens).map(|(slice, detector)| {
+        let mut matched = build_match(detector, slice);
+        if matches!(
+            detector,
+            "high-entropy-token"
+                | "uuid-near-trigger"
+                | "content-hash-near-trigger"
+                | "hex-credential-token"
+        ) {
+            let offset = slice.as_ptr() as usize - text.as_ptr() as usize;
+            let index = tokens.partition_point(|&(start, _)| start <= offset) - 1;
+            matched.trigger =
+                entropy_trigger(text, &tokens, index, detector == "uuid-near-trigger");
+        }
+        matched
+    })
 }
 
 /// Redact every detected secret span in `text`, replacing each with
@@ -917,6 +937,55 @@ fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
+// A bare Git-length value uses line-local context. The preceding label line
+// remains authoritative when it explicitly ends in an assignment delimiter.
+// Bridge anchors retain full-window context so masking cannot leave a fragment behind.
+fn entropy_trigger(
+    text: &str,
+    tokens: &[(usize, &str)],
+    index: usize,
+    credential_label_only: bool,
+) -> Option<&'static str> {
+    let (offset, raw) = tokens[index];
+    let window_start = floor_char_boundary(text, offset.saturating_sub(TRIGGER_WINDOW));
+    let window_end = floor_char_boundary(text, offset + raw.len() + TRIGGER_WINDOW);
+    let token = strip_delimiters(raw);
+    let standalone_revision = token.len() == 40
+        && token.bytes().all(|b| b.is_ascii_hexdigit())
+        && bridge_fragment_chain(tokens, text, index).len() == 1;
+    let (start, end, preceding_label) = if standalone_revision {
+        let line_start = text[window_start..offset]
+            .rfind(['\r', '\n'])
+            .map_or(window_start, |i| window_start + i + 1);
+        let line_end = text[offset + raw.len()..window_end]
+            .find(['\r', '\n'])
+            .map_or(window_end, |i| offset + raw.len() + i);
+        let before_line = &text[window_start..line_start];
+        let previous = before_line
+            .strip_suffix("\r\n")
+            .or_else(|| before_line.strip_suffix(['\r', '\n']))
+            .unwrap_or("");
+        let previous_start = previous.rfind(['\r', '\n']).map_or(0, |i| i + 1);
+        let previous = previous[previous_start..].trim_end();
+        let label = if previous.ends_with([':', '=']) {
+            find_trigger(previous, credential_label_only)
+        } else {
+            None
+        };
+        (
+            line_start.max(window_start),
+            line_end.min(window_end),
+            label,
+        )
+    } else {
+        (window_start, window_end, None)
+    };
+    find_trigger(&text[start..offset], credential_label_only)
+        .or_else(|| find_trigger(&text[offset + raw.len()..end], credential_label_only))
+        .or_else(|| inline_credential_trigger(raw))
+        .or(preceding_label)
+}
+
 /// `from` restricts which tokens may be RETURNED (only those starting at or
 /// after `from`), but the trigger-context window is still computed over the full
 /// `text`. This lets [`mask_secrets`] advance past an earlier redaction without
@@ -932,7 +1001,7 @@ fn check_entropy_heuristic<'a>(
         token_offset < from
     });
 
-    for (idx, &(tok_offset, raw_token)) in tokens.iter().enumerate().skip(first_token) {
+    for (idx, &(_, raw_token)) in tokens.iter().enumerate().skip(first_token) {
         // Strip common delimiters that wrap the actual value.
         let token = strip_delimiters(raw_token);
         // Only RETURN tokens at or after `from` (already-redacted spans lie
@@ -953,31 +1022,28 @@ fn check_entropy_heuristic<'a>(
         // `shannon_entropy` over its bytes is a true per-character entropy.
 
         // Compute the trigger window before any shape-based allowlist decision.
-        // UUID and base64 content-hash exemptions remain trigger-sensitive.
+        // UUIDs require credential-label context rather than a generic mention
+        // of `token`; base64 content-hash exemptions remain trigger-sensitive.
         // VCS revisions and file paths use narrower syntactic context below.
-        let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
-        let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
-        let window = &text[window_start..window_end];
-        let raw_start = tok_offset - window_start;
-        let raw_end = raw_start + raw_token.len();
+        let near_trigger = entropy_trigger(text, tokens, idx, false).is_some();
+        let uuid_near_credential_label = entropy_trigger(text, tokens, idx, true).is_some();
 
-        // Must not provide its own trigger context (e.g. a path slug like
-        // `ADR-051-cli-auth-and-kg-git-workflow.md`); see
-        // docs/api/secret_gate.md#check_entropy_heuristic--per-token-flagging-sequence.
-        let near_trigger = contains_trigger(&window[..raw_start])
-            || contains_trigger(&window[raw_end..])
-            || has_inline_credential_trigger(raw_token);
-
-        // Step 1 (see doc: per-token flagging sequence). UUID/content-hash checks fall
-        // through to detection near a trigger rather than being silently passed —
-        // hex-shaped entropy alone (<=4.0 bits/char) can never reach ENTROPY_THRESHOLD.
-        if near_trigger && value_candidates(token).any(is_uuid_canonical) {
+        // Step 1 (see doc: per-token flagging sequence). UUIDs fall through only
+        // beside an explicit credential label; the generic word `token` remains
+        // trigger context for opaque values but is common in design prose. Content
+        // hashes retain the broader trigger rule. Hex-shaped entropy alone (<=4.0
+        // bits/char) can never reach ENTROPY_THRESHOLD.
+        let has_uuid_candidate = value_candidates(token).any(is_uuid_canonical);
+        if uuid_near_credential_label && has_uuid_candidate {
             return Some((token, "uuid-near-trigger"));
         }
         if near_trigger && value_candidates(token).any(is_base64_content_hash) {
             return Some((token, "content-hash-near-trigger"));
         }
-        if !near_trigger && (is_uuid_canonical(token) || is_base64_content_hash(token)) {
+        if !uuid_near_credential_label && is_uuid_canonical(token) {
+            continue;
+        }
+        if !near_trigger && is_base64_content_hash(token) {
             continue;
         }
 
@@ -1730,11 +1796,11 @@ fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
     contains_word(low_window, needle, false)
 }
 
-/// Returns `true` when a compound credential label begins at an identifier
+/// Finds a canonical compound credential label beginning at an identifier
 /// boundary. The trailing edge is deliberately unbounded so version suffixes
 /// and larger underscore-composed labels remain protected.
-fn contains_compound_trigger(low_text: &str) -> bool {
-    COMPOUND_TRIGGER_WORDS.iter().any(|needle| {
+fn compound_trigger(low_text: &str) -> Option<&'static str> {
+    COMPOUND_TRIGGER_WORDS.iter().copied().find(|needle| {
         let mut start = 0;
         while let Some(rel) = low_text[start..].find(needle) {
             let abs = start + rel;
@@ -1752,16 +1818,18 @@ fn contains_compound_trigger(low_text: &str) -> bool {
     })
 }
 
-/// Returns `true` when `text` contains a boundary-delimited credential trigger.
-fn contains_trigger(text: &str) -> bool {
+fn find_trigger(text: &str, credential_label_only: bool) -> Option<&'static str> {
     let low = text.to_ascii_lowercase();
     TRIGGER_WORDS
         .iter()
-        .any(|tw| contains_bounded_word(&low, tw))
-        || contains_compound_trigger(&low)
-        || has_standalone_token(&low)
-        || has_token_assignment(&low)
-        || has_assignment_credential_trigger(&low)
+        .copied()
+        .find(|tw| contains_bounded_word(&low, tw))
+        .or_else(|| compound_trigger(&low))
+        .or_else(|| {
+            ((!credential_label_only && has_standalone_token(&low)) || has_token_assignment(&low))
+                .then_some("token")
+        })
+        .or_else(|| assignment_credential_trigger(&low))
 }
 
 /// Detect a credential-bearing assignment label before an `=` or `:`.
@@ -1769,10 +1837,10 @@ fn contains_trigger(text: &str) -> bool {
 /// The separator may be preceded by whitespace or a JSON quote. Compound
 /// triggers deliberately retain substring matching inside the label so common
 /// version suffixes such as `api_keyv2` remain protected.
-fn has_assignment_credential_trigger(low_text: &str) -> bool {
-    low_text.char_indices().any(|(index, ch)| {
+fn assignment_credential_trigger(low_text: &str) -> Option<&'static str> {
+    low_text.char_indices().find_map(|(index, ch)| {
         if !matches!(ch, '=' | ':') {
-            return false;
+            return None;
         }
         let before =
             low_text[..index].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
@@ -1782,11 +1850,15 @@ fn has_assignment_credential_trigger(low_text: &str) -> bool {
             .unwrap_or_default();
         COMPOUND_TRIGGER_WORDS
             .iter()
-            .any(|needle| label.contains(needle))
-            || TRIGGER_WORDS
-                .iter()
-                .any(|tw| contains_bounded_word(label, tw))
-            || label == "token"
+            .copied()
+            .find(|needle| label.contains(needle))
+            .or_else(|| {
+                TRIGGER_WORDS
+                    .iter()
+                    .copied()
+                    .find(|tw| contains_bounded_word(label, tw))
+            })
+            .or_else(|| (label == "token").then_some("token"))
     })
 }
 
@@ -1799,20 +1871,27 @@ fn has_assignment_credential_trigger(low_text: &str) -> bool {
 /// without an assignment are retained for compatibility with shapes such as
 /// `session_secret_<value>`.
 fn has_inline_credential_trigger(raw_token: &str) -> bool {
+    inline_credential_trigger(raw_token).is_some()
+}
+
+fn inline_credential_trigger(raw_token: &str) -> Option<&'static str> {
     let low = raw_token.to_ascii_lowercase();
-
-    if has_assignment_credential_trigger(&low) {
-        return true;
-    }
-
-    !low.contains(['/', '-', '.'])
-        && low.contains('_')
-        && (COMPOUND_TRIGGER_WORDS
-            .iter()
-            .any(|needle| low.contains(needle))
-            || TRIGGER_WORDS
+    assignment_credential_trigger(&low).or_else(|| {
+        if !low.contains(['/', '-', '.']) && low.contains('_') {
+            COMPOUND_TRIGGER_WORDS
                 .iter()
-                .any(|tw| contains_bounded_word(&low, tw)))
+                .copied()
+                .find(|needle| low.contains(needle))
+                .or_else(|| {
+                    TRIGGER_WORDS
+                        .iter()
+                        .copied()
+                        .find(|tw| contains_bounded_word(&low, tw))
+                })
+        } else {
+            None
+        }
+    })
 }
 
 /// Returns `true` when `low_window` contains the word `token` as a standalone
@@ -2127,7 +2206,11 @@ fn build_match(detector: &'static str, candidate: &str) -> SecretMatch {
     let chars: Vec<char> = candidate.chars().collect();
     let preview: String = chars.iter().take(6).collect();
     let masked = format!("{}...{}chars", preview, chars.len());
-    SecretMatch { detector, masked }
+    SecretMatch {
+        detector,
+        trigger: None,
+        masked,
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -3272,6 +3355,144 @@ mod tests {
             "hex40 near 'commit sha' context must be allowed; fired: {:?}",
             scan(&commit_line)
         );
+    }
+
+    const GIT_LENGTH_FIXTURE: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
+    #[test]
+    fn bare_forty_hex_line_three_allows_trigger_on_line_one_within_window() {
+        let content = format!("auth changes\nready\n{GIT_LENGTH_FIXTURE}");
+        assert!(content.len() < TRIGGER_WINDOW);
+        assert!(check(&content).is_ok());
+        assert_eq!(mask_secrets(&content), content);
+    }
+
+    #[test]
+    fn bare_forty_hex_line_three_allows_trigger_beyond_window() {
+        let content = format!("auth changes\n{}\n{GIT_LENGTH_FIXTURE}", "-".repeat(150));
+        assert!(check(&content).is_ok());
+    }
+
+    #[test]
+    fn forty_hex_allows_direct_sha_or_commit_marker_in_prose() {
+        for marker in ["sha:", "commit"] {
+            let content = format!("auth changes\nready\n{marker} {GIT_LENGTH_FIXTURE}");
+            assert!(check(&content).is_ok(), "{marker}");
+        }
+    }
+
+    #[test]
+    fn forty_hex_refuses_same_line_token_assignment() {
+        let content = format!("token: {GIT_LENGTH_FIXTURE}");
+        let matched = scan(&content).expect("explicit credential assignment");
+        assert_eq!(matched.detector, "hex-credential-token");
+        assert_eq!(matched.trigger, Some("token"));
+        assert!(check(&content).is_err());
+        assert!(!mask_secrets(&content).contains(GIT_LENGTH_FIXTURE));
+    }
+
+    #[test]
+    fn forty_hex_refuses_previous_label_line_ending_colon_or_equals() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for delimiter in [":", "="] {
+                let content = format!("token{delimiter}{newline}  `{GIT_LENGTH_FIXTURE}`");
+                let matched = scan(&content).expect("previous line labels the value");
+                assert_eq!(matched.detector, "hex-credential-token");
+                assert_eq!(matched.trigger, Some("token"));
+                assert!(!mask_secrets(&content).contains(GIT_LENGTH_FIXTURE));
+            }
+        }
+    }
+
+    #[test]
+    fn forty_hex_context_stays_on_line_except_immediate_assignment_label() {
+        for content in [
+            format!("token\n{GIT_LENGTH_FIXTURE}"),
+            format!("token:\n\n{GIT_LENGTH_FIXTURE}"),
+            format!("{GIT_LENGTH_FIXTURE}\nauth changes"),
+            format!("token_count:\n{GIT_LENGTH_FIXTURE}"),
+            format!("authorized:\n{GIT_LENGTH_FIXTURE}"),
+            format!("{}\n{GIT_LENGTH_FIXTURE}\n密钥", "文".repeat(80)),
+        ] {
+            assert!(check(&content).is_ok(), "{content}");
+        }
+        for content in [
+            format!("{GIT_LENGTH_FIXTURE} auth"),
+            format!("api_keyv2 =\n{GIT_LENGTH_FIXTURE}"),
+            format!("secret for deploy: \n{GIT_LENGTH_FIXTURE}"),
+        ] {
+            assert!(check(&content).is_err(), "{content}");
+        }
+    }
+
+    #[test]
+    fn other_hex_lengths_still_refuse_cross_line_trigger_context() {
+        for length in [32, 64, 128] {
+            let value = "a".repeat(length);
+            let content = format!("auth changes\nready\n{value}");
+            let matched = scan(&content).expect("unchanged cross-line context");
+            assert_eq!(matched.detector, "hex-credential-token");
+            assert_eq!(matched.trigger, Some("auth"));
+        }
+    }
+
+    #[test]
+    fn prefixed_hex_of_forty_bytes_keeps_cross_line_trigger_context() {
+        for prefix in ["0x", "0X"] {
+            let value = format!("{prefix}{}", "a".repeat(38));
+            let content = format!("auth changes\nready\n{value}");
+            assert!(check(&content).is_err());
+            assert!(!mask_secrets(&content).contains(&value));
+        }
+    }
+
+    #[test]
+    fn forty_hex_beside_bridgeable_prose_keeps_conservative_trigger_context() {
+        let content = format!("auth changes\ncompleted\n{GIT_LENGTH_FIXTURE}");
+        assert!(check(&content).is_err());
+        assert!(!mask_secrets(&content).contains(GIT_LENGTH_FIXTURE));
+    }
+
+    #[test]
+    fn forty_hex_bridge_fragments_keep_cross_line_detection_and_full_masking() {
+        for lengths in [(40, 24), (24, 40), (40, 40)] {
+            let first = "a".repeat(lengths.0);
+            let second = "b".repeat(lengths.1);
+            let content = format!("auth changes\nready\n{first}\u{200B}{second}");
+            let matched = scan(&content).expect("fragment keeps original trigger context");
+            assert_eq!(matched.detector, "hex-credential-token");
+            assert_eq!(matched.trigger, Some("auth"));
+            let masked = mask_secrets(&content);
+            assert!(!masked.contains(&first), "first fragment remains");
+            assert!(!masked.contains(&second), "second fragment remains");
+            assert_eq!(
+                masked,
+                "auth changes\nready\n***MASKED***\u{200B}***MASKED***"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_names_rule_and_canonical_trigger_without_candidate_text() {
+        for (label, trigger) in [
+            ("token", "token"),
+            ("AUTH", "auth"),
+            ("api_keyv2", "api_key"),
+        ] {
+            let content = format!("{label}: {GIT_LENGTH_FIXTURE}");
+            let error = check(&content).unwrap_err().to_string();
+            assert!(error.contains("hex-credential-token"));
+            assert!(error.contains(&format!("near '{trigger}'")), "{error}");
+            assert!(!error.contains(&GIT_LENGTH_FIXTURE[..6]));
+        }
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let error = check(&format!("secret: {opaque}")).unwrap_err().to_string();
+        assert!(error.contains("high-entropy-token near 'secret'"));
+        assert!(!error.contains(&opaque[..6]));
+        let provider = "AKIAFAKEKEY1234567890";
+        let matched = scan(provider).unwrap();
+        assert_eq!(matched.trigger, None);
+        assert!(!matched.to_string().contains(&provider[..6]));
     }
 
     #[test]
@@ -5290,6 +5511,37 @@ mod tests {
              (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
+    }
+
+    #[test]
+    fn allows_uuid_on_line_after_benign_token_contract_title() {
+        let content = "Design language and token contract\n550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            check(content).is_ok(),
+            "a generic token-contract title must not make a next-line UUID look like a secret; \
+             got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn generic_token_uuid_exemption_keeps_strong_credential_controls() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let cases = [
+            (format!("service token {opaque}"), "high-entropy-token"),
+            (format!("token={opaque}"), "high-entropy-token"),
+            (format!("token={uuid}"), "uuid-near-trigger"),
+            (format!("api_key {uuid}"), "uuid-near-trigger"),
+        ];
+
+        for (content, detector) in cases {
+            assert_eq!(
+                scan(&content).map(|matched| matched.detector),
+                Some(detector),
+                "credential-shaped control must remain blocked: {content:?}"
+            );
+        }
     }
 
     // ── UUID/hash value extraction from assignment and wrapper syntax ───────

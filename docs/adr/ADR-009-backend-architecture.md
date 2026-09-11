@@ -406,5 +406,5 @@ read-to-replacement race without changing the ordinary upsert contract.
   still permits a stale document to overwrite concurrent changes.
 
 No open design question remains within this storage amendment: the conflict is a typed storage
-outcome, ordinary upserts retain their existing semantics, and the six-site boundary above is
+outcome, ordinary upserts retain their existing semantics, and the eight-site boundary above is
 explicit.

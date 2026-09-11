@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [features]
+contract-faults = []
 fault-injection = []
 test-internals = []
 
@@ -46,6 +47,8 @@ unicode-general-category = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+khive-db = { version = "0.8.0", path = "../khive-db", features = ["test-support"] }
+khive-request = { version = "0.8.0", path = "../khive-request" }
 # Self-dependency to enable `fault-injection` for integration tests under
 # `tests/`: those link the lib as an external crate, so `#[cfg(test)]` items
 # gated `any(test, feature = "fault-injection")` (e.g. `run_daemon_in_process_test`)

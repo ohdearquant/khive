@@ -900,7 +900,8 @@ accepted placement for future implementation, not a shipped operator knob.
 
 ## Amendment 3 (2026-08-26): Admission-Pressure Read-Cost Undercount for an Explicit Allowlist
 
-**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+**Status**: Accepted, implemented alongside PR #2228 and extended across the reviewed
+cross-pack Assertive surface for khive#2217 (khive#2147/khive#2208).
 
 Decision (b) established that accounting rides the per-dispatch audit row: `resource.cost_unit`
 lives in the same `EventKind::Audit` row the dispatch's own audit obligation writes
@@ -914,13 +915,53 @@ itself, for a fixed, named set of read verbs.
 Under audit-lane admission pressure — `AuditTerminalReason::QueueAdmissionExhausted` (the row was
 refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineExpired` (the
 caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
-the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
-(`crates/khive-runtime/src/pack.rs`: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`,
-`context`, `query`, `resolve`, `whoami`, `verbs`) may be dropped best-effort instead of failing the
-dispatch. The caller still receives the read's successful result.
+the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` may be
+dropped best-effort instead of failing the dispatch. The caller still receives the read's
+successful result. The fixed, reviewed set currently contains 39 verbs, grouped by owning pack:
+
+- agent: `agent.observe`;
+- blob: `blob.get`, `blob.stat`;
+- brain: `brain.event_counts`, `brain.profiles`, `brain.profile`, `brain.resolve`,
+  `brain.bindings`;
+- comm: `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.thread`, `comm.health`,
+  `comm.probe`;
+- gtd: `gtd.next`, `gtd.tasks`;
+- kg: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`, `context`, `query`,
+  `resolve`, `whoami`, `verbs`;
+- knowledge: `knowledge.get`, `knowledge.list`, `knowledge.stats`, `knowledge.fold`,
+  `knowledge.topic`;
+- moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
+- schedule: `schedule.agenda`;
+- session: `session.list`, `session.resume`, `session.export`.
+
+The cross-pack source census classifies every current public Assertive handler exactly once.
+`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O), and
+`knowledge.search` / `knowledge.suggest` / `knowledge.compose` (persistent ANN
+consumer/checkpoint maintenance) remain explicitly fail-closed. A new Assertive handler is not
+eligible until its side effects are reviewed and the closed census is updated.
+
+Eligibility is bound to the owning pack and verb together, not the verb name alone: each entry on
+the allowlist names a `(pack, verb)` pair, and a handler only degrades if the pack that actually
+registered it matches the pack named beside that verb. A verb name by itself is not a sound key —
+any pack loaded through the same registration path could otherwise declare a handler under a name
+that collides with an allowlisted one while performing a durable write of its own, and inherit
+degrade-safety it never earned.
+
+A third condition binds this to registration, not self-report: the pack's `name()` is a value the
+`PackRuntime` trait object reports about itself, so pack identity alone is not a sound key either
+— any pack is free to claim any name, including an allowlisted one, whether or not the real pack
+of that name is also loaded (verb names are unique per registry, so this matters exactly when it
+is not). Eligibility additionally requires that the pack was registered through the composition
+root's trusted path: `PackRegistry::register_packs`/`register_packs_with_runtimes`, which resolve
+packs only from `inventory`-discovered `&'static dyn PackFactory` instances collected at link time,
+not from request-time or caller-supplied data. A pack registered through the public,
+untrusted `VerbRegistryBuilder::register` is never eligible, regardless of what it reports about
+itself. This is where trust is granted — at the composition root, not inside the eligibility check
+— and the check reduces to a set membership test precomputed once when `VerbRegistryBuilder::build`
+runs, not re-derived by scanning packs on every dispatch.
 
 **Consequence, stated precisely:** `brain.event_counts`'s `total_cost_unit` and
-`cost_unit_by_verb` aggregation (Amendment 1) undercount those eleven verbs by the `cost_unit` of
+`cost_unit_by_verb` aggregation (Amendment 1) undercount those 39 verbs by the `cost_unit` of
 every row dropped this way — but the two terminal reasons above are not the same fact, and
 conflating them into one counter would report a number no operator could act on:
 
@@ -965,3 +1006,229 @@ considered and rejected for this PR as new storage-and-plumbing machinery. See t
 amendment in `docs/adr/ADR-133-incidental-writes-off-the-request-hot-path.md` ("Amendment 1") for
 the corresponding narrowing of that record's D4/INV-1 language, which this same PR's change
 requires.
+
+## Amendment 4 (2026-09-01): Extending the Admission-Degrade Allowlist to Operational Read Verbs
+
+**Status**: Proposed.
+
+Amendment 3 scoped the admission-pressure read-cost undercount to eleven KG-base verbs. A
+store-pressure incident measured on 2026-08-31 showed the cost of that scoping: during a
+sustained admission-pressure window (32 `AdmissionDeadlineExpired` dispatch failures in one
+process's stderr over ~3 minutes), the dispatches that failed were `comm.heartbeat`,
+`comm.cursor_get`, and `gtd.tasks` — the polling, cursor, and task-listing verbs operational
+clients depend on precisely when the store is under pressure. The verbs most needed during an
+incident were exactly the ones outside the allowlist, so they kept hard-fail semantics and
+amplified the outage: clients retried failed reads into an already-saturated admission lane.
+
+### Decision
+
+Extend `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` with eight operational read verbs, each
+individually reviewed under Amendment 3's criterion (declared `VerbCategory::Assertive` AND no
+write-shaped call on the dispatch path). The review evidence is a lexical scan for
+`INSERT|UPDATE|DELETE|writer()|write_|upsert|persist|execute_script|mark_`
+(comment-only mentions excluded), at the revision this amendment was drafted against.
+
+**Evidence depth, stated precisely:** the scan covers each handler's full brace-scoped extent
+PLUS each direct helper the handlers call that could carry a write off-extent. The helpers so
+scanned — each brace-scoped and found write-free — are `wait_for_inbox_response`
+(`crates/khive-pack-comm/src/handlers.rs:683-731`), `query_inbox_response` (`:734-837`),
+`count_unread_messages` (`:855-905`), `load_quarantine_counts` (`:2544-2609`),
+`notes_seq_high_water_mark` (`:2871-2887`), `query_probe` (`:2889-2986`),
+`fetch_all_matching_tasks` (`crates/khive-pack-gtd/src/handlers.rs:802-839`), and
+`diagnose_tasks` (`crates/khive-pack-gtd/src/dependency.rs:46-88`). An earlier draft named only
+three of these; review found the enumeration incomplete against its own claim, and the other
+five were scanned with the same instrument before this text was corrected — all clean, table
+unchanged. A lexical scan answers the question it encodes: transitive callees below these named
+helpers are covered by the criterion's enforcement point (the census test and review of the
+handlers' own code), not by this table.
+
+| Verb             | Category  | Handler extent scanned                             | Dispatch-path writes            | Eligible |
+| ---------------- | --------- | -------------------------------------------------- | ------------------------------- | -------- |
+| `gtd.tasks`      | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1434-1618`  | none                            | yes      |
+| `gtd.next`       | Assertive | `crates/khive-pack-gtd/src/handlers.rs:1291-1358`  | none                            | yes      |
+| `comm.inbox`     | Assertive | `crates/khive-pack-comm/src/handlers.rs:462-681`   | none                            | yes      |
+| `comm.unread`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:841-853`   | none                            | yes      |
+| `comm.thread`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:1511-1834` | none (comment mentions only)    | yes      |
+| `comm.delivered` | Assertive | `crates/khive-pack-comm/src/handlers.rs:401-460`   | none                            | yes      |
+| `comm.probe`     | Assertive | `crates/khive-pack-comm/src/handlers.rs:2838-2869` | none (doc-comment mention only) | yes      |
+| `comm.health`    | Assertive | `crates/khive-pack-comm/src/handlers.rs:2645-2836` | none                            | yes      |
+
+### Named exclusions, with reasons
+
+- **`comm.heartbeat` — excluded by design.** It is `VerbCategory::Declaration` and its primary
+  effect is a persist ("Persist a per-channel-credential heartbeat row"). Its audit row is
+  obligation-bearing exactly as Amendment 3's "What does not change" requires for writes. Its
+  failures during the incident were the mechanism working as specified.
+- **`comm.cursor_get` — excluded as-is, with a named precondition.** Although declared Assertive,
+  its dispatch path checks out the writer connection and runs a schema-ensure
+  `execute_script` (`crates/khive-pack-comm/src/handlers.rs:3009-3011`) before its SELECT. Two
+  consequences: it performs a write-shaped operation per dispatch, and under writer contention its
+  body stalls on the writer checkout — so degrading its audit row would not have made it
+  incident-safe anyway. Precondition for a future amendment: move the schema-ensure to
+  pack initialization and read through a reader connection; only then does it meet the criterion.
+- **`memory.recall` and `db_diagnostics`** remain excluded for the reasons Amendment 3's
+  implementation records (background accounting write; physical checkpoint I/O).
+
+### What the extension does and does not buy
+
+The exception still covers only the dispatch's OWN audit row under the two transient admission
+terminal reasons. It does not make any verb's body immune to store pressure: a read whose body
+times out on its own query still fails. The incident evidence supports exactly this scope — the
+three failing dispatches named above failed at audit admission (`AdmissionDeadlineExpired`
+surfaced as the dispatch error), which is the failure class this mechanism removes for eligible
+reads.
+
+### Mechanical requirements
+
+1. **Canonical entry form**: an allowlist entry is the handler's registered `name` — the exact
+   dispatch verb string — which is BARE for the KG base pack (`"get"`, `"list"`, ...) and
+   NAMESPACED for every other pack (`"gtd.tasks"`, `"comm.inbox"`, ...). The eight additions use
+   their namespaced names. `admission_degrade_safe` matches on the dispatch verb string and
+   cross-checks the category by walking every registered pack's handlers, so cross-pack
+   membership needs no lookup change — but a mis-spelled or dead entry silently never matches,
+   which is why requirement 2 makes resolution an asserted property rather than an assumption.
+2. The census test (`admission_degrade_safe_verbs_are_registered_assertive`) currently re-derives
+   classifications from `crates/khive-pack-kg/src/handler_defs.rs` alone; per its own documentation,
+   adding verbs from other packs REQUIRES extending its source scan to
+   `crates/khive-pack-comm/src/vocab.rs` and `crates/khive-pack-gtd/src/vocab.rs`. The extended
+   census must additionally assert (a) that EVERY allowlist entry resolves to exactly one
+   registered handler — so a dead entry fails loud instead of silently never matching; (b) that
+   the allowlist equals THIS amendment's enumeration exactly (the eleven Amendment 3 verbs plus
+   the eight named here) — so an unreviewed addition on any branch fails the census rather than
+   widening the D4/INV-1 exception silently; and (c) that the two named exclusions cannot be
+   silently re-added, exactly as the existing test does for `memory.recall` and `db_diagnostics`.
+3. The Amendment 3 undercount consequence now covers nineteen verbs; the two disjoint diagnostics
+   counters are unchanged and already verb-agnostic.
+
+### Enumeration authority and in-flight coordination
+
+The authoritative enumeration of the exception's verb set is this document, not the constant in
+`crates/khive-runtime/src/pack.rs`; requirement 2(b) is what keeps the two mechanically equal. At
+drafting time at least one in-flight branch carries a WIDER allowlist (namespaced comm and gtd
+entries plus `agent.observe`, `blob.get`, `blob.stat`, and five `brain.*` verbs) with no per-verb
+review of the additions. Sequencing: such a branch must either trim its allowlist to this
+amendment's enumeration before landing, or its additional verbs must first receive the same
+per-verb review (category + brace-scoped dispatch-path scan + named helpers) in a stacked
+amendment signed before that branch lands. The census equality assertion enforces this
+mechanically: a wider list fails the test until its amendment exists.
+
+ADR-133 Amendment 2 carries the corresponding qualification of D4/INV-1 scope.
+
+## Amendment 5 (2026-09-10): Caller-Scoped Brain Reads
+
+**Status**: Accepted.
+
+### Default and explicit actor scope
+
+`brain.event_counts`, `brain.resolve`, and `brain.bindings` derive their default
+actor scope from the authorized request token, not the identity that constructed
+the registry or started the serving process. The caller label is the actor id
+when its kind is `actor`, and `kind:id` for other actor kinds.
+
+- With `actor` omitted, `brain.event_counts` counts only that caller's events.
+  For kind `actor`, the canonical stored label is `actor:` followed by the
+  unmodified raw principal id, prepending that prefix exactly once even when the
+  id already begins with a reserved stamped-kind prefix. A historical bare alias
+  also matches only when the raw id does not begin with `<kind>:` for any kind in
+  `RUNTIME_STAMPED_ACTOR_KINDS`: `actor`, `anonymous`, or `agent`. Such prefixed ids
+  match only their canonical stored label. Only this default view combines the
+  permitted spellings into one `counts_by_actor` key, using the caller label;
+  other kinds match their exact caller label. An empty result has no actor keys.
+- With `actor` omitted, `brain.bindings` returns only binding rows whose actor is
+  the caller label. This is an exact row filter, not the wildcard fallback used
+  during profile resolution.
+- With `actor` omitted, `brain.resolve` resolves the caller's profile, retaining
+  the existing wildcard binding fallback. Anonymous callers remain the exception:
+  their absent actor resolves only wildcard bindings, never an explicit `local`
+  or `anonymous:local` binding. Anonymous event-count and binding-list reads still
+  default to their own `anonymous:local` label, not all actors.
+
+An explicit `actor` is allowed when it names the caller itself or when the
+requested actor id is in the token's visible namespace set. That visibility test
+is exact string equality between the requested actor id and one entry of the
+token's `visible_namespaces` list: no prefix match, no pattern, and no
+derivation of a namespace from the actor id. Other actor reads
+fail with `InvalidInput` naming the refused actor. An event-count actor filter
+without a reserved stamped-kind prefix matches bare and canonical stored labels.
+Every filter beginning with a reserved stamped-kind prefix matches that stored
+label exactly. Authorization parses the prefix once: self access requires both
+the kind and the remaining id to match the token's kind and id. For foreign
+access, an `actor:` filter checks the remaining raw id against visibility;
+`anonymous:` and `agent:` filters check the full, unchanged label. There is no
+self-access exception for a filter equal to the caller's collapsed label. This
+is a query-scope rule using the already-authorized token, not a new
+storage-isolation boundary. Existing namespace
+and consumer-kind filters retain their meaning.
+
+**Stored-label clarification (2026-09-10).** The distinct ordinary principals
+`caller-a` and `actor:caller-a` write canonical labels `actor:caller-a` and
+`actor:actor:caller-a`, respectively. The second principal has no bare alias and
+uses `actor="actor:actor:caller-a"` for an explicit self read. Its query with
+`actor="actor:caller-a"` selects the first principal's canonical label instead
+and requires visibility of `caller-a`.
+
+**Runtime-kind clarification (2026-09-10).** The shared
+`RUNTIME_STAMPED_ACTOR_KINDS` slice next to `ActorRef` in `khive-gate` reserves
+`actor:`, `anonymous:`, and `agent:` from historical bare aliases. A named
+principal with raw id `anonymous:local` therefore matches only its canonical
+`actor:anonymous:local` stamp by default and uses that same label for an explicit
+self filter. The filter `anonymous:local` instead selects the anonymous
+principal's canonical stamp; a named caller needs that full label in its visible
+set to read it. The same distinction applies to a named id such as `agent:worker`
+and the stamp of kind `agent`, id `worker`.
+
+This guarantee is limited to the reserved runtime-stamped kinds in the shared
+slice. The kind space remains open: `ActorRef::try_new` accepts any nonempty kind
+(and requires a nonempty id); the slice is not a closed validation enum. Adding
+a new runtime-stamped kind must extend the shared slice and include per-kind
+attributed-event tests that exercise the event-count consumer, so a separate
+hard-coded consumer list cannot silently omit the new kind. Custom kinds outside
+that slice are not covered by this alias-separation guarantee.
+
+**Binding readback clarification (2026-09-10).** A successful binding write does
+not grant read visibility. For example, caller `service:writer` may bind an
+existing profile to `service:reader`, but its subsequent `brain.bindings()` still
+filters for `service:writer` and does not return that foreign binding.
+`brain.bindings(actor="service:reader")` fails with `InvalidInput` unless
+`service:reader` is in the caller's visible set. Even with that visibility, the
+explicit actor filter is required; default reads remain caller-scoped. Binding
+rows identify the target actor, not the writer, and there is no "created by me"
+read exception. A write/read check must therefore bind the caller's own actor,
+or explicitly read a foreign actor that is visible to the caller.
+
+### Explicit aggregate event counts
+
+`brain.event_counts` accepts optional boolean `all_actors`, defaulting to false.
+`all_actors=true` removes the actor filter only when the serving runtime's
+`brain.fleet_readers` contains the caller's exact actor id. The corresponding
+`[brain] fleet_readers` configuration is a list of strings (`Vec<String>`) and
+defaults to empty. The serving process's resolved configuration is authoritative;
+neither a client's local configuration nor a wider visible namespace set grants
+aggregate access. Allowlisted callers still receive only their own events unless
+they explicitly request `all_actors=true`.
+
+`all_actors=true` and an explicit `actor` are mutually exclusive and fail with
+`InvalidInput`. False or omitted `all_actors` permits an authorized explicit actor
+filter. `all_actors` does not add an aggregate mode to profile resolution or
+binding listing.
+
+Explicit actor filters and aggregate reads preserve historical stored actor keys
+in `counts_by_actor`; alias collapse applies only to the omitted-actor default.
+All existing time-window, event-kind, pagination, truncation, and cost aggregation
+rules remain unchanged within the selected actor scope. No event rows are rewritten,
+and `brain.bind` and `brain.unbind` retain their write contracts.
+
+### Consequences
+
+Stage 1's windowed per-actor read, `brain.event_counts`, was minted to answer what
+the daemon was doing and on whose behalf. After this amendment it answers that
+question for the caller by default: a plain call returns the caller's own events
+and nothing else. The cross-actor answer, every actor at once, is no longer
+available to a caller by widening its own visibility; it requires `all_actors=true`
+and the caller's actor id in the serving daemon's `[brain] fleet_readers` list,
+which is empty by default and is set only in the serving configuration. An
+operator who wants the fleet-wide view therefore adds their actor id to that
+list and restarts or reconfigures the serving daemon; a client-side setting
+cannot grant it. The same narrowing applies to `brain.resolve` and
+`brain.bindings`: a caller sees its own profile and its own binding rows unless
+it names an actor it is allowed to see.

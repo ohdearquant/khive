@@ -33,6 +33,7 @@ use khive_runtime::{
 };
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ── fake embedder ─────────────────────────────────────────────────────────────
@@ -92,11 +93,13 @@ impl EmbedderProvider for FakeDimProvider {
 
 // Controlled two-topic embedder for the degraded-candidate ranking test.  The
 // query and genuinely relevant domain share the first axis; the domain whose
-// title only collides lexically shares the second.  The failing variant still
-// embeds/indexes the corpus and embeds the ANN query, but rejects the later
-// query-plus-candidates batch so the fresh rerank is genuinely unavailable.
+// title only collides lexically shares the second. The failing variant still
+// embeds/indexes the corpus and embeds the ANN query, but rejects the next
+// candidate batch so the fresh rerank is genuinely unavailable even though
+// #2232 no longer resends the cached query in that batch.
 struct ControlledRankingService {
     fail_fresh_rerank: bool,
+    query_embedded: AtomicBool,
 }
 
 #[async_trait]
@@ -106,10 +109,7 @@ impl EmbeddingService for ControlledRankingService {
         texts: &[String],
         _model: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.fail_fresh_rerank
-            && texts.len() > 1
-            && texts[0].contains("speculative decoding inference acceleration")
-        {
+        if self.fail_fresh_rerank && self.query_embedded.swap(false, Ordering::AcqRel) {
             return Err(EmbedError::InferenceFailed(
                 "controlled fresh-rerank failure".into(),
             ));
@@ -133,6 +133,18 @@ impl EmbeddingService for ControlledRankingService {
                 }
             })
             .collect())
+    }
+
+    async fn embed_query(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let result = self.embed(texts, model).await;
+        if result.is_ok() {
+            self.query_embedded.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn supports_model(&self, _model: EmbeddingModel) -> bool {
@@ -161,6 +173,7 @@ impl EmbedderProvider for ControlledRankingProvider {
     async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
         Ok(Arc::new(ControlledRankingService {
             fail_fresh_rerank: self.fail_fresh_rerank,
+            query_embedded: AtomicBool::new(false),
         }))
     }
 }
@@ -169,6 +182,8 @@ impl EmbedderProvider for ControlledRankingProvider {
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -184,14 +199,77 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
     rt
 }
 
-fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
+// Counts `EmbeddingService::embed` invocations (not texts) so a test can tell
+// whether an embedding rerank ran at all, distinct from the ANN query embed
+// that always runs first. `runtime.embed_query` and `runtime.embed_batch`
+// both route through this same `embed()` override (neither `FakeDimService`
+// nor this service overrides `embed_with_role`/`embed_query` separately), so
+// each call — one text or many — is exactly one increment.
+struct CountingEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EmbeddingService for CountingEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(texts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let v = (i + 1) as f32;
+                let norm = (DIM as f32 * v * v).sqrt();
+                vec![v / norm; DIM]
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "counting-dim"
+    }
+}
+
+struct CountingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EmbedderProvider for CountingProvider {
+    fn name(&self) -> &str {
+        MODEL_KEY
+    }
+
+    fn dimensions(&self) -> usize {
+        DIM
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(CountingEmbedder {
+            calls: self.calls.clone(),
+        }))
+    }
+}
+
+fn rt_with_counting_embedder() -> (KhiveRuntime, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -207,6 +285,35 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
+    })
+    .expect("in-memory runtime");
+    rt.register_embedder(CountingProvider {
+        calls: calls.clone(),
+    });
+    (rt, calls)
+}
+
+fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
+        git_write: Default::default(),
+        display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+        events_split: None,
+        db_path: None,
+        blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+        exec: Default::default(),
     })
     .expect("in-memory runtime");
     rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
@@ -219,6 +326,8 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
 /// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
 fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -234,6 +343,7 @@ fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("file-backed runtime");
     rt.register_embedder(FakeDimProvider);
@@ -247,6 +357,31 @@ fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     registry
+}
+
+async fn lexical_timeout_fixture(
+    atoms: Vec<serde_json::Value>,
+    domain: serde_json::Value,
+) -> (KhiveRuntime, VerbRegistry) {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    if !atoms.is_empty() {
+        registry
+            .dispatch("knowledge.upsert_atoms", json!({"atoms": atoms}))
+            .await
+            .expect("upsert member atoms");
+    }
+    registry
+        .dispatch("knowledge.upsert_domains", json!({"domains": [domain]}))
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({"rebuild_ann": false}))
+        .await
+        .expect("index");
+    // Index only the small corpus; these additional rows stay lexical-only.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    (rt, registry)
 }
 
 /// RAII guard: reset the timeout override when the test exits (even on panic).
@@ -410,8 +545,8 @@ async fn suggest_sets_ann_unavailable_when_warming_times_out() {
 /// `data["ann_unavailable"] = true` when the underlying `suggest` sets the flag.
 ///
 /// Auto-mode is triggered when `domain_ids` and `atom_ids` are absent. A live
-/// lexical domain with no members makes compose reach the separate "No atoms
-/// found" early return after degraded suggest has already selected a domain.
+/// lexical domain with no members is served by suggest but skipped by compose,
+/// which reaches the no-domains early return while preserving the signal.
 #[tokio::test]
 async fn compose_propagates_ann_unavailable_in_auto_mode() {
     let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
@@ -448,7 +583,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     let token = rt.authorize(Namespace::local()).expect("authorize");
     // Auto-mode requires ≥10 words; no domain_ids/atom_ids.
-    // type_weights are not reached because the selected domain has no members.
+    // type_weights are not reached because compose skips the zero-member domain.
     let result = KnowledgeHandlers::compose(
         &rt,
         &token,
@@ -471,8 +606,71 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
          got: {result}"
     );
     assert_eq!(
-        result["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
-        "the regression must exercise the empty-member early return; got: {result}"
+        result["data"]["markdown"],
+        "# Knowledge Briefing\n\nNo matching domains found for auto-suggest.",
+        "compose must skip the zero-member domain while preserving the signal; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn auto_compose_skips_zero_size_suggested_domains() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": "compose-live-member",
+                "name": "Compose Live Member",
+                "content": "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.",
+                "finalized": true
+            }]}),
+        )
+        .await
+        .expect("upsert live member");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "compose-empty-domain",
+                    "name": "Compose Empty Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": []
+                },
+                {
+                    "slug": "compose-populated-domain",
+                    "name": "Compose Populated Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["compose-live-member"]
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert empty and populated domains");
+    let response = registry
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "explain lexical domain member sizing search and token cost for automatic composition"}),
+        )
+        .await
+        .expect("auto-compose succeeds");
+    let domains = response["data"]["domains"].as_array().expect("domains");
+    assert_eq!(domains.len(), 1, "got: {response}");
+    assert_eq!(domains[0]["slug"], "compose-populated-domain");
+    assert_eq!(response["data"]["count"], 1, "got: {response}");
+    assert_eq!(response["data"]["atoms"][0]["slug"], "compose-live-member");
+
+    let explicit = registry
+        .dispatch(
+            "knowledge.compose",
+            json!({"query": "empty domain", "domain_ids": ["compose-empty-domain"]}),
+        )
+        .await
+        .expect("explicit empty-domain request remains supported");
+    assert_eq!(
+        explicit["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
+        "the candidate skip must not apply to explicit domain ids: {explicit}"
     );
 }
 
@@ -704,35 +902,22 @@ async fn suggest_flags_degraded_no_match_when_hits_empty() {
 /// stage precisely so they survive a lexical timeout (see `search.rs`'s
 /// `search`/`suggest` handlers); a real (unwarmed, no snapshot) `SharedAnn`
 /// still serves via the fresh-tail vector-store scan, so this exercises the
-/// production code path, not a mock.
+/// production code path, not a mock. When the expired deadline also leaves
+/// member sizing unrun, the survivor is reported under
+/// `degraded.member_sizing_timeout.excluded` instead of being served with a
+/// fabricated size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
-    let rt = rt_with_fake_embedder();
-    let registry = build_registry(&rt);
-
-    registry
-        .dispatch(
-            "knowledge.upsert_domains",
-            json!({"domains": [{
-                "slug": "degrade-lexical-timeout-domain",
-                "name": "Degrade Lexical Timeout Domain",
-                "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
-                "members": []
-            }]}),
-        )
-        .await
-        .expect("upsert domain");
-    registry
-        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
-        .await
-        .expect("index");
-
-    // A large low-overlap lexical corpus, seeded via raw SQL *after*
-    // `knowledge.index` above (which pages every un-deleted atom in the
-    // namespace) so these 200K rows are never embedded — only the domain is.
-    // This makes the bounded per-term lexical fetch itself take long enough
-    // to exceed a tight deadline, without paying to embed 200K atoms.
-    crate::knowledge::search::seed_low_overlap_corpus(&rt, 200_000, 20).await;
+    let (rt, _registry) = lexical_timeout_fixture(
+        Vec::new(),
+        json!({
+            "slug": "degrade-lexical-timeout-domain",
+            "name": "Degrade Lexical Timeout Domain",
+            "description": "a domain seeded only so ANN has a real vector to serve from the fresh-tail scan path when the lexical fetch itself exceeds the request read deadline during this regression test",
+            "members": []
+        }),
+    )
+    .await;
 
     // A fresh SharedAnn: nothing warmed, no snapshot. `search_eligible_ann_with_refill`
     // falls back to the fresh-tail vector-store scan, which still finds the
@@ -753,13 +938,645 @@ async fn lexical_timeout_degrades_suggest_to_ann_backed_results() {
         result["degraded"]["lexical_timeout"], true,
         "suggest must flag degraded.lexical_timeout when the lexical fetch times out; got: {result}"
     );
+    // The ANN survivor is never dropped silently: it is served in `results`
+    // when its member size was measured, and reported under
+    // `degraded.member_sizing_timeout.excluded` (rank and score intact, no
+    // fabricated size) when the expired request deadline left sizing unrun.
+    let surfaced: Vec<&str> = result["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            result["degraded"]["member_sizing_timeout"]["excluded"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|hit| hit["name"].as_str())
+        .collect();
+    assert_eq!(
+        surfaced,
+        vec!["Degrade Lexical Timeout Domain"],
+        "the only vector-backed candidate must be surfaced exactly once, served or withheld; got: {result}"
+    );
+    for hit in result["results"].as_array().into_iter().flatten() {
+        assert!(
+            hit["size"].is_u64(),
+            "every served result carries a measured size; got: {result}"
+        );
+    }
+}
+
+/// Issue #2396 fix 3 (revised): same outer-deadline shape as the test above,
+/// but the seeded domain has a real member atom, so a real (non-zero) size
+/// would be computed if member sizing ran. The expired ambient deadline
+/// skips member sizing entirely (the same `request_read_is_cancelled()`
+/// guard that skips the embedding rerank), and that domain must be withheld
+/// from `results` and reported under `degraded.member_sizing_timeout.excluded`
+/// instead — never left in `results` with `size: 0` (which would let a
+/// caller pass it into `knowledge.fold` as a free item) or `size: null`
+/// (which breaks the documented suggest -> fold passthrough, issue #105).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lexical_timeout_reports_member_sizing_as_unmeasured_not_zero() {
+    let (rt, registry) = lexical_timeout_fixture(
+        vec![json!({
+            "slug": "degrade-sizing-member-atom",
+            "name": "Degrade Sizing Member Atom",
+            "finalized": true,
+            "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+        })],
+        json!({
+            "slug": "degrade-sizing-domain",
+            "name": "Degrade Sizing Domain",
+            "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+            "members": ["degrade-sizing-member-atom"]
+        }),
+    )
+    .await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let deadline = std::time::Duration::from_millis(200);
+    let result = khive_storage::scope_request_read_deadline(
+        deadline,
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    )
+    .await
+    .expect("suggest must not Err on a lexical-stage read timeout");
+
+    assert_eq!(result["degraded"]["lexical_timeout"], true, "got: {result}");
+    assert!(
+        result["results"].as_array().is_some_and(Vec::is_empty),
+        "an unmeasured domain must be withheld from `results` entirely, never \
+         left in with size 0 or null; got: {result}"
+    );
+    let excluded = result["degraded"]["member_sizing_timeout"]["excluded"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        excluded.len(),
+        1,
+        "the degradation entry must list the excluded domain; got: {result}"
+    );
+    assert_eq!(excluded[0]["rank"], 1, "got: {result}");
+    assert!(
+        excluded[0]["id"].is_string()
+            && excluded[0]["name"].is_string()
+            && excluded[0]["score"].is_number()
+            && excluded[0].get("size").is_none(),
+        "an excluded entry must carry id/name/rank/score for reference, and no \
+         size; got: {result}"
+    );
+
+    registry
+        .dispatch(
+            "knowledge.fold",
+            json!({ "candidates": result["results"].clone(), "budget": 10_000 }),
+        )
+        .await
+        .expect(
+            "suggest's results must feed fold unmodified even when a domain was \
+             excluded for an unmeasured size (issue #105 passthrough)",
+        );
+}
+
+/// Issue #2396 follow-up: `suggest`'s documented contract (issue #105) is
+/// that a caller feeds its `results` straight into `knowledge.fold`'s
+/// `candidates` unmodified. A member-sizing timeout must not break that
+/// passthrough — the unpriced domain is withheld from `results` (and
+/// reported under `degraded.member_sizing_timeout.excluded`), never left in
+/// `results` with a `size` that `FoldCandidate`'s non-optional `usize`
+/// cannot parse. Before the fix, this test's `fold` dispatch failed with a
+/// parse error on the degraded domain's `size: null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suggest_results_under_a_member_sizing_timeout_still_pass_through_fold() {
+    let (rt, registry) = lexical_timeout_fixture(
+        vec![json!({
+            "slug": "degrade-sizing-passthrough-atom",
+            "name": "Degrade Sizing Passthrough Atom",
+            "finalized": true,
+            "content": "enough body content to price a non-zero token size for the owning domain if member sizing ever ran to completion"
+        })],
+        json!({
+            "slug": "degrade-sizing-passthrough-domain",
+            "name": "Degrade Sizing Passthrough Domain",
+            "description": "a domain with a real member atom, so a real (non-zero) size would be computed if member sizing ran, proving a timeout is reported as unmeasured rather than a coincidental zero",
+            "members": ["degrade-sizing-passthrough-atom"]
+        }),
+    )
+    .await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let deadline = std::time::Duration::from_millis(200);
+    let result = khive_storage::scope_request_read_deadline(
+        deadline,
+        KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+    )
+    .await
+    .expect("suggest must not Err on a lexical-stage read timeout");
+
+    assert!(
+        result["degraded"]["member_sizing_timeout"]["excluded"]
+            .as_array()
+            .is_some_and(|excluded| !excluded.is_empty()),
+        "the degraded scenario must produce at least one excluded domain; got: {result}"
+    );
+
+    registry
+        .dispatch(
+            "knowledge.fold",
+            json!({ "candidates": result["results"].clone(), "budget": 10_000 }),
+        )
+        .await
+        .expect("suggest's results must feed fold unmodified (issue #105 passthrough)");
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_serves_a_domain_with_only_a_deleted_member_at_zero() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": "sizing-deleted-member",
+                "name": "Sizing Deleted Member",
+                "content": "A live member body with enough content to have a nonzero estimated token cost before the atom is soft deleted.",
+                "finalized": true
+            }]}),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "sizing-measured-domain",
+                "name": "Sizing Measured Domain",
+                "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                "members": ["sizing-deleted-member"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+    let params = json!({"query": "lexical domain member sizing search", "limit": 1});
+    let baseline = KnowledgeHandlers::suggest(&rt, &token, params.clone(), &ann)
+        .await
+        .expect("suggest with live member");
+    assert_eq!(baseline["total"], 1, "got: {baseline}");
+    assert!(baseline["results"][0]["size"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(baseline["results"][0]["members"], 1, "got: {baseline}");
+
+    let deleted = registry
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({"ids": ["sizing-deleted-member"]}),
+        )
+        .await
+        .expect("soft-delete member atom");
+    assert_eq!(deleted["deleted"], 1, "got: {deleted}");
+
+    let result = KnowledgeHandlers::suggest(&rt, &token, params, &ann)
+        .await
+        .expect("suggest with deleted member");
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(result["results"][0]["id"], baseline["results"][0]["id"]);
+    assert_eq!(result["results"][0]["size"], 0, "got: {result}");
+    assert_eq!(result["results"][0]["members"], 0, "got: {result}");
+    assert!(
+        result["degraded"].get("member_sizing_timeout").is_none(),
+        "a measured zero must not be excluded; got: {result}"
+    );
+    assert_ne!(result["degraded"]["lexical_timeout"], true);
+    registry
+        .dispatch(
+            "knowledge.fold",
+            json!({"candidates": result["results"], "budget": 10_000}),
+        )
+        .await
+        .expect("member counts must preserve the unmodified suggest-to-fold input");
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_counts_only_live_members() {
+    const LIVE_NAME: &str = "Sizing Live Member";
+    const LIVE_BODY: &str = "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [
+                {
+                    "slug": "sizing-live-member",
+                    "name": LIVE_NAME,
+                    "content": LIVE_BODY,
+                    "finalized": true
+                },
+                {
+                    "slug": "sizing-removed-member",
+                    "name": "Sizing Removed Member",
+                    "content": LIVE_BODY,
+                    "finalized": true
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert members");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "sizing-mixed-domain",
+                "name": "Sizing Mixed Domain",
+                "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                "members": ["sizing-live-member", "sizing-removed-member"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    let deleted = registry
+        .dispatch(
+            "knowledge.delete_atoms",
+            json!({"ids": ["sizing-removed-member"]}),
+        )
+        .await
+        .expect("delete one member");
+    assert_eq!(deleted["deleted"], 1);
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let result = KnowledgeHandlers::suggest(
+        &rt,
+        &token,
+        json!({"query": "lexical domain member sizing search", "limit": 1}),
+        &vamana::new_shared(),
+    )
+    .await
+    .expect("suggest mixed membership");
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(result["results"][0]["members"], 1, "got: {result}");
+    assert_eq!(
+        result["results"][0]["size"],
+        crate::knowledge::util::estimate_compose_item_tokens(LIVE_NAME, LIVE_BODY),
+        "deleted members must not contribute to the measured cost; got: {result}"
+    );
+    assert!(result["degraded"].get("member_sizing_timeout").is_none());
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_counts_each_distinct_live_atom_once() {
+    const NAME: &str = "Sizing Shared Member Name";
+    const BODY: &str = "Stored text supplies a valid live member with a measurable cost for each domain while the separate domain descriptions determine candidate relevance and ordering.";
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [
+                {
+                    "slug": "sizing-distinct-member-a",
+                    "name": NAME,
+                    "content": BODY,
+                    "finalized": true
+                },
+                {
+                    "slug": "sizing-distinct-member-b",
+                    "name": NAME,
+                    "content": BODY,
+                    "finalized": true
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert distinct atoms with identical names and content");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "sizing-repeated-domain",
+                    "name": "Sizing Repeated Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-a"]
+                },
+                {
+                    "slug": "sizing-distinct-domain",
+                    "name": "Sizing Distinct Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-b"]
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert repeated and distinct membership");
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let result = KnowledgeHandlers::suggest(
+        &rt,
+        &token,
+        json!({"query": "lexical domain member sizing search", "limit": 2}),
+        &vamana::new_shared(),
+    )
+    .await
+    .expect("suggest domains with repeated and distinct members");
+    assert_eq!(result["total"], 2, "got: {result}");
+    let results = result["results"].as_array().expect("suggest results");
+    let single_atom_size = crate::knowledge::util::estimate_compose_item_tokens(NAME, BODY);
+    for (name, expected_members) in [("Sizing Repeated Domain", 1), ("Sizing Distinct Domain", 2)] {
+        let domain = results
+            .iter()
+            .find(|domain| domain["name"] == name)
+            .expect("domain is served");
+        assert_eq!(domain["members"], expected_members, "got: {result}");
+        assert_eq!(
+            domain["size"],
+            single_atom_size * expected_members,
+            "got: {result}"
+        );
+    }
+    assert!(result["degraded"].get("member_sizing_timeout").is_none());
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_serves_empty_or_missing_members_at_zero() {
+    for members in [json!([]), json!(["absent-member"])] {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let registry = build_registry(&rt);
+        registry
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({"domains": [{
+                    "slug": "sizing-empty-domain",
+                    "name": "Sizing Empty Domain",
+                    "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
+                    "members": members
+                }]}),
+            )
+            .await
+            .expect("upsert domain without live members");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::suggest(
+            &rt,
+            &token,
+            json!({"query": "lexical domain member sizing search", "limit": 1}),
+            &vamana::new_shared(),
+        )
+        .await
+        .expect("suggest domain without live members");
+        assert_eq!(result["total"], 1, "got: {result}");
+        assert_eq!(result["results"][0]["name"], "Sizing Empty Domain");
+        assert_eq!(result["results"][0]["size"], 0, "got: {result}");
+        assert_eq!(result["results"][0]["members"], 0, "got: {result}");
+        assert!(result["degraded"].get("member_sizing_timeout").is_none());
+        assert_ne!(result["degraded"]["lexical_timeout"], true);
+    }
+}
+
+#[tokio::test]
+async fn suggest_member_sizing_withholds_a_missing_domain_with_rank_and_score() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [
+                {
+                    "slug": "sizing-kept-domain",
+                    "name": "Sizing Kept Domain",
+                    "description": "Lexical domain member sizing search keeps measured domains available for token budget selection, because a fold budget can only admit domains whose compose cost is known.",
+                    "members": []
+                },
+                {
+                    "slug": "sizing-missing-domain",
+                    "name": "Sizing Missing Domain",
+                    "description": "Lexical domain member sizing search withholds domains whose canonical row cannot be measured and lists them under the degraded exclusion key with their rank and score.",
+                    "members": []
+                }
+            ]}),
+        )
+        .await
+        .expect("upsert domains");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+    let params = json!({"query": "lexical domain member sizing search", "limit": 2});
+    let baseline = KnowledgeHandlers::suggest(&rt, &token, params.clone(), &ann)
+        .await
+        .expect("suggest with both domain rows");
+    assert_eq!(baseline["total"], 2, "got: {baseline}");
+    let baseline_hits = baseline["results"].as_array().expect("baseline results");
+    let missing_rank = baseline_hits
+        .iter()
+        .position(|hit| hit["name"] == "Sizing Missing Domain")
+        .expect("domain to remove");
+    let missing = &baseline_hits[missing_rank];
+    let kept = baseline_hits
+        .iter()
+        .find(|hit| hit["name"] == "Sizing Kept Domain")
+        .expect("domain to retain");
+
+    // Retain the retrieval mirror so the hit list carries a domain that
+    // the canonical sizing query can no longer reach.
+    let access = rt.sql();
+    let mut writer = access.writer().await.expect("writer");
+    let removed = writer
+        .execute(khive_storage::types::SqlStatement {
+            sql: "DELETE FROM knowledge_domains WHERE namespace = 'local' AND id = ?1".into(),
+            params: vec![khive_storage::types::SqlValue::Text(
+                missing["id"].as_str().expect("domain id").to_owned(),
+            )],
+            label: None,
+        })
+        .await
+        .expect("remove canonical domain row");
+    assert_eq!(removed, 1);
+    drop(writer);
+
+    let result = KnowledgeHandlers::suggest(&rt, &token, params, &ann)
+        .await
+        .expect("suggest with a missing domain row");
+    assert_eq!(result["results"], json!([kept]), "got: {result}");
+    assert_eq!(result["total"], 1, "got: {result}");
+    assert_eq!(
+        result["degraded"]["member_sizing_timeout"]["excluded"],
+        json!([{
+            "id": missing["id"],
+            "name": missing["name"],
+            "rank": missing_rank + 1,
+            "score": missing["score"]
+        }]),
+        "the missing domain must be withheld with its original rank and score, without a size; got: {result}"
+    );
+    assert_ne!(result["degraded"]["lexical_timeout"], true);
+}
+
+/// Issue #1930 Amendment 2: a lexical-stage-*only* timeout (its own narrow
+/// budget expiring, not the request's) must not skip `search`'s embedding
+/// rerank. Paused time advances by the production stage budget after the
+/// first term, while the real handler runs under a 30-second request deadline.
+/// Removing the independent stage scope must fail this test even though the
+/// outer request remains healthy. `CountingEmbedder` proves the
+/// rerank actually ran: the ANN retrieval step always contributes exactly
+/// one `embed()` call, so a second call landing during this `search()`
+/// invocation can only be the rerank's `embed_batch`.
+#[tokio::test]
+async fn search_still_reranks_after_a_lexical_stage_only_timeout() {
+    let (rt, calls) = rt_with_counting_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-lexical-budget-atom",
+                    "name": "Degrade Lexical Budget Atom",
+                    "finalized": true,
+                    "content": "lexicalbudgetsentinel transformer retrieval corpus benchmark search latency vector index nearest neighbor ranking fusion embedding cosine similarity attention encoder decoder positional normalization residual connection"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    // These lexical-only rows are seeded after indexing; fake time, not
+    // corpus size or machine load, determines when the stage expires.
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 1_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let baseline = calls.load(Ordering::Acquire);
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let stage_budget =
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
+    assert!(stage_budget < std::time::Duration::from_secs(6));
+    tokio::time::pause();
+    let result =
+        khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
+            let result = crate::knowledge::search::with_fts_deadline_advance_after_term(
+                1,
+                stage_budget,
+                KnowledgeHandlers::search(&rt, &token, json!({ "query": query }), &ann),
+            )
+            .await;
+            assert!(khive_storage::ensure_request_read_active("test.search_stage").is_ok());
+            result
+        })
+        .await
+        .expect("search must not Err on a lexical-stage-only timeout");
+
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "search must flag degraded.lexical_timeout when only the lexical \
+         stage's own budget expires; got: {result}"
+    );
     assert!(
         result["total"].as_u64().unwrap_or(0) > 0,
-        "ANN candidates fetched before the lexical stage must still produce results; got: {result}"
+        "the seeded, ANN-indexed atom must still surface as a candidate; got: {result}"
+    );
+    let after = calls.load(Ordering::Acquire);
+    assert!(
+        after > baseline + 1,
+        "an embedding rerank call beyond the single ANN query embed must \
+         still run once the lexical-stage-only timeout returns control to a \
+         healthy ambient deadline; calls before={baseline}, after={after}"
+    );
+}
+
+/// Suggest-side companion to the rerank test above: a lexical-stage-*only*
+/// timeout must not skip member-token pricing either. The seeded domain has
+/// a real member atom (not an empty `members: []` like the sibling test
+/// above, which would report `size: 0` whether pricing ran or not) so a
+/// non-zero `size` is only possible if `load_domain_member_token_sizes`
+/// actually executed.
+#[tokio::test]
+async fn suggest_still_prices_members_after_a_lexical_stage_only_timeout() {
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "lexical-budget-member-atom",
+                    "name": "Lexical Budget Member Atom",
+                    "finalized": true,
+                    "content": "a member atom with enough body content to price a non-zero token size for the owning domain once suggest reaches its member-sizing stage after a lexical-stage-only timeout"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert member atom");
+    registry
+        .dispatch(
+            "knowledge.upsert_domains",
+            json!({"domains": [{
+                "slug": "lexical-budget-domain",
+                "name": "Lexical Budget Domain",
+                "description": "a domain seeded so suggest's member-sizing stage has real content to price after a lexical-stage-only timeout, not just an empty members list",
+                "members": ["lexical-budget-member-atom"]
+            }]}),
+        )
+        .await
+        .expect("upsert domain");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    crate::knowledge::search::seed_low_overlap_corpus(&rt, 1_000, 20).await;
+
+    let ann = vamana::new_shared();
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    let query = "term0 term1 term2 term3 term4 term5 term6 term7";
+    let stage_budget =
+        std::time::Duration::from_millis(crate::knowledge::search::LEXICAL_STAGE_BUDGET_MS);
+    tokio::time::pause();
+    let result =
+        khive_storage::scope_request_read_deadline(std::time::Duration::from_secs(30), async {
+            let result = crate::knowledge::search::with_fts_deadline_advance_after_term(
+                1,
+                stage_budget,
+                KnowledgeHandlers::suggest(&rt, &token, json!({ "query": query }), &ann),
+            )
+            .await;
+            assert!(khive_storage::ensure_request_read_active("test.suggest_stage").is_ok());
+            result
+        })
+        .await
+        .expect("suggest must not Err on a lexical-stage-only timeout");
+
+    assert_eq!(
+        result["degraded"]["lexical_timeout"], true,
+        "suggest must flag degraded.lexical_timeout when only the lexical \
+         stage's own budget expires; got: {result}"
+    );
+    assert!(
+        result["total"].as_u64().unwrap_or(0) > 0,
+        "the seeded, ANN-indexed domain must still surface as a candidate; got: {result}"
     );
     assert_eq!(
-        result["results"][0]["name"], "Degrade Lexical Timeout Domain",
+        result["results"][0]["name"], "Lexical Budget Domain",
         "the only vector-backed candidate must be the seeded domain; got: {result}"
+    );
+    assert!(
+        result["results"][0]["size"].as_u64().unwrap_or(0) > 0,
+        "member token sizing must still run once the lexical-stage-only \
+         timeout returns control to a healthy ambient deadline; got: {result}"
     );
 }
 

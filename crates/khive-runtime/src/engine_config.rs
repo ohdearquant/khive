@@ -4,19 +4,23 @@
 //! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
 //! to `KHIVE_EMBEDDING_MODEL` env vars when no config file is present.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use khive_types::namespace::Namespace;
-use serde::Deserialize;
+use khive_types::{namespace::Namespace, SubstrateKind};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::presentation::OutputFormat;
+use crate::{config::BackendId, presentation::OutputFormat};
 
 // ---- Error type ----
 
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("mount configuration: {reason}")]
+    InvalidMountConfig { reason: String },
+
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
 
@@ -44,8 +48,17 @@ pub enum ConfigError {
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
 
+    #[error("[gate].granted_actors entry {id:?} is not a valid actor id: {reason}")]
+    InvalidGrantedActorId { id: String, reason: String },
+
     #[error("duplicate backend name: {name:?}")]
     DuplicateBackendName { name: String },
+
+    #[error("invalid backend name {name:?}: {reason}")]
+    InvalidBackendName { name: String, reason: String },
+
+    #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
+    EmptyBackendServedKinds { name: String },
 
     #[error(
         "[packs.{pack}].backend = {backend:?} references an unknown backend; \
@@ -73,6 +86,12 @@ pub enum ConfigError {
     #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
     InvalidGitWriteEntry { repo: String, reason: String },
 
+    #[error("[git_write] {key}: {reason}")]
+    InvalidGitWriteConfig { key: String, reason: String },
+
+    #[error("[exec] {key}: {reason}")]
+    InvalidExecConfig { key: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -81,9 +100,10 @@ pub enum ConfigError {
     #[error("the explicitly selected config file does not exist: {path}")]
     ExplicitConfigMissing { path: PathBuf },
 
-    #[error(
-        "[gate] configuration is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
-    )]
+    /// Retained for source compatibility with callers that matched the
+    /// fail-loud behavior of older builds. Supported `[gate]` sections no
+    /// longer produce this error.
+    #[error("[gate] configuration is not supported by this build")]
     UnsupportedGateSection,
 
     #[error(
@@ -220,6 +240,24 @@ pub struct ActorConfig {
     pub allowed_outbound_namespaces: Vec<String>,
 }
 
+/// Built-in caller-enrollment policy configured by `[gate]`.
+///
+/// The table is intentionally closed: misspelled or future keys fail startup
+/// instead of being silently ignored at an authorization boundary. Presence
+/// installs [`khive_gate::CallerEnrollmentGate`]; absence preserves the gate
+/// already supplied in the base [`crate::RuntimeConfig`].
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateSectionConfig {
+    /// Exact resolved actor ids permitted to dispatch requests.
+    #[serde(default)]
+    pub granted_actors: Vec<String>,
+
+    /// Whether the implicit anonymous/local caller is admitted.
+    #[serde(default)]
+    pub grant_unattributed: bool,
+}
+
 // ---- Per-pack backend config (ADR-028) ----
 
 /// Storage backend kind.
@@ -263,6 +301,12 @@ pub struct BackendConfig {
     pub cache_mb: Option<u32>,
     /// SQLite journal mode (e.g. `"wal"`).
     pub journal_mode: Option<String>,
+    /// Substrate kinds this backend serves.
+    ///
+    /// Omission preserves conservative fan-out to this backend. An explicit
+    /// declaration is closed over [`SubstrateKind`] and must not be empty.
+    #[serde(default)]
+    pub served_kinds: Option<BTreeSet<SubstrateKind>>,
     /// Open the backend read-only. Defaults to `false`.
     #[serde(default)]
     pub read_only: bool,
@@ -364,6 +408,15 @@ pub struct StorageSectionConfig {
     pub blob: Option<BlobConfig>,
 }
 
+/// `[brain]` read policy resolved by the serving process.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BrainSectionConfig {
+    /// Actor ids permitted to request fleet-wide `brain.event_counts` reads.
+    #[serde(default)]
+    pub fleet_readers: Vec<String>,
+}
+
 // ---- git-write policy (ADR-108 Amendment) ----
 
 /// One `[[git_write.allowed]]` entry: a repo this operator has declared
@@ -375,7 +428,7 @@ pub struct StorageSectionConfig {
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteEntryConfig {
     /// Absolute local path to the allowlisted repository.
     pub repo: String,
@@ -395,10 +448,278 @@ pub struct GitWriteEntryConfig {
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
 /// ```
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteSectionConfig {
     #[serde(default)]
     pub allowed: Vec<GitWriteEntryConfig>,
+    #[serde(default)]
+    pub actors: BTreeMap<String, GitWriteActorConfig>,
+    #[serde(default)]
+    pub repositories: BTreeMap<String, GitWriteRepositoryConfig>,
+    #[serde(default = "default_git_credential_resolver")]
+    pub credential_resolver: Vec<String>,
+    #[serde(default)]
+    pub contract_faults: bool,
+    #[serde(default)]
+    pub fault: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteRepositoryConfig {
+    /// HTTPS platform remote, or an absolute path / file:/// URL with an empty slug.
+    pub remote: String,
+    /// owner/name for HTTPS; empty explicitly opts into credential-free local pushes.
+    pub slug: String,
+    pub visibility: String,
+    /// Merge dispatch refusals for this repository (ADR-182 Amendment 7):
+    /// `opener` refuses a `git.pr_merge` dispatched by the account or actor
+    /// that opened the pull request; `last_pusher` refuses one dispatched by
+    /// the login on the newest push receipt for `expected_head`. Empty (the
+    /// default) refuses neither.
+    #[serde(default)]
+    pub merge_refusals: Vec<String>,
+}
+
+impl GitWriteRepositoryConfig {
+    pub const MERGE_REFUSALS: [&'static str; 2] = ["opener", "last_pusher"];
+
+    /// Whether this repository row lists the named merge refusal.
+    pub fn refuses_merge_by(&self, entry: &str) -> bool {
+        self.merge_refusals.iter().any(|listed| listed == entry)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteActorConfig {
+    pub name: String,
+    pub email: String,
+    pub credential_ref: String,
+    pub platform_identity: String,
+}
+
+fn default_git_credential_resolver() -> Vec<String> {
+    [
+        "/usr/bin/security",
+        "find-generic-password",
+        "-w",
+        "-s",
+        "{ref}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+impl Default for GitWriteSectionConfig {
+    fn default() -> Self {
+        Self {
+            allowed: Vec::new(),
+            actors: BTreeMap::new(),
+            repositories: BTreeMap::new(),
+            credential_resolver: default_git_credential_resolver(),
+            contract_faults: false,
+            fault: None,
+        }
+    }
+}
+
+impl GitWriteSectionConfig {
+    pub fn validate_dev_loop(&self) -> Result<(), ConfigError> {
+        let invalid = |key: &str, reason: &str| ConfigError::InvalidGitWriteConfig {
+            key: key.to_string(),
+            reason: reason.to_string(),
+        };
+        if self.contract_faults && !cfg!(feature = "contract-faults") {
+            tracing::error!(
+                target: "khive.boot",
+                "[git_write] contract_faults requires the test-only contract-faults build feature"
+            );
+            return Err(invalid(
+                "contract_faults",
+                "requires the test-only contract-faults build feature",
+            ));
+        }
+        if let Some(fault) = &self.fault {
+            if !self.contract_faults {
+                return Err(invalid("fault", "requires contract_faults = true"));
+            }
+            let valid = fault.split_once(':').is_some_and(|(verb, point)| {
+                matches!(verb, "git.push" | "git.pr_merge")
+                    && matches!(
+                        point,
+                        "reply-lost-after-effect" | "audit-fails-after-effect"
+                    )
+            });
+            if !valid {
+                return Err(invalid("fault", "unsupported contract fault selector"));
+            }
+        }
+        for (path, repository) in &self.repositories {
+            let key = format!("repositories.{path}.merge_refusals");
+            let mut seen: Vec<&str> = Vec::new();
+            for entry in &repository.merge_refusals {
+                if !GitWriteRepositoryConfig::MERGE_REFUSALS.contains(&entry.as_str()) {
+                    return Err(invalid(&key, "entries must be opener or last_pusher"));
+                }
+                if seen.contains(&entry.as_str()) {
+                    return Err(invalid(&key, "entries must not repeat"));
+                }
+                seen.push(entry);
+            }
+        }
+        // The default keychain program is Unix-only. Legacy configurations with
+        // no actor mappings cannot invoke it, so they remain loadable elsewhere.
+        if !cfg!(unix)
+            && self.actors.is_empty()
+            && self.credential_resolver == default_git_credential_resolver()
+        {
+            return Ok(());
+        }
+        let argv = &self.credential_resolver;
+        let Some(program) = argv.first() else {
+            return Err(invalid("credential_resolver", "argv must not be empty"));
+        };
+        let program_path = Path::new(program);
+        if !program_path.is_absolute() {
+            return Err(invalid(
+                "credential_resolver",
+                "argv[0] must be an absolute path",
+            ));
+        }
+        let program_name = program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            program_name.trim_end_matches(".exe"),
+            "sh" | "bash"
+                | "dash"
+                | "zsh"
+                | "ksh"
+                | "fish"
+                | "csh"
+                | "tcsh"
+                | "cmd"
+                | "powershell"
+                | "pwsh"
+                | "env"
+        ) {
+            return Err(invalid(
+                "credential_resolver",
+                "shell or env launcher is not allowed",
+            ));
+        }
+        if argv.iter().any(|arg| arg.chars().any(char::is_control)) {
+            return Err(invalid(
+                "credential_resolver",
+                "argv must not contain control characters",
+            ));
+        }
+        if program.contains(['{', '}'])
+            || argv[1..]
+                .iter()
+                .any(|arg| arg != "{ref}" && arg.contains(['{', '}']))
+        {
+            return Err(invalid(
+                "credential_resolver",
+                "{ref} must be a complete argument and is the only allowed template",
+            ));
+        }
+        if !argv[1..].iter().any(|arg| arg == "{ref}") {
+            return Err(invalid(
+                "credential_resolver",
+                "argv must contain a {ref} argument",
+            ));
+        }
+        for (actor, identity) in &self.actors {
+            if actor.trim().is_empty() || actor.chars().any(char::is_control) {
+                return Err(invalid(
+                    "actors",
+                    "actor labels must be nonempty and contain no control characters",
+                ));
+            }
+            for (field, value) in [
+                ("name", &identity.name),
+                ("email", &identity.email),
+                ("credential_ref", &identity.credential_ref),
+                ("platform_identity", &identity.platform_identity),
+            ] {
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(invalid(
+                        &format!("actors.{actor}.{field}"),
+                        "must be nonempty and contain no control characters",
+                    ));
+                }
+            }
+            if identity.name.contains(['<', '>']) || identity.email.contains(['<', '>']) {
+                return Err(invalid(
+                    &format!("actors.{actor}"),
+                    "name and email must not contain Git identity delimiters",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---- exec sandbox (ADR-181) ----
+
+/// `[exec.limits]`: per-run resource limits applied to the sandboxed child
+/// and inherited by its descendants (`setrlimit` before exec).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ExecLimitsConfig {
+    #[serde(default)]
+    pub cpu_seconds: Option<u64>,
+    #[serde(default)]
+    pub address_space: Option<u64>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub nproc: Option<u64>,
+}
+
+/// `[exec]` section (ADR-181): where runs materialize, what they may read,
+/// which caller environment keys pass through, which binaries never run,
+/// output caps, wall-clock defaults and resource limits.
+///
+/// ```toml
+/// [exec]
+/// root = "/var/lib/khive/exec"
+/// read_roots = ["/opt/toolchains/python3.11"]
+/// env = ["SOURCE_DATE_EPOCH"]
+/// never = ["/usr/bin/curl"]
+/// max_output_bytes = 1048576
+/// timeout_default_s = 30
+/// timeout_max_s = 600
+/// keep = false
+///
+/// [exec.limits]
+/// cpu_seconds = 60
+/// file_size = 104857600
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ExecSectionConfig {
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub read_roots: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub never: Vec<String>,
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
+    #[serde(default)]
+    pub timeout_default_s: Option<f64>,
+    #[serde(default)]
+    pub timeout_max_s: Option<f64>,
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub limits: ExecLimitsConfig,
 }
 
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
@@ -406,17 +727,21 @@ pub struct GitWriteSectionConfig {
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
+/// - `[gate]`: built-in caller enrollment
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
+/// - `[brain]`: actor read policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
 ///
-/// Unknown keys are silently ignored by serde for forward compatibility. The
-/// security-sensitive `[gate]` exception is detected by [`KhiveConfig::load`]
-/// before deserialization so a request for caller enrollment can never be
-/// mistaken for active enforcement.
+/// Unknown top-level keys are silently ignored by serde for forward
+/// compatibility. The security-sensitive `[gate]` and `[brain]` tables are closed with
+/// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    #[serde(default)]
+    pub mounts: Vec<crate::mount_config::MountConfig>,
+
     /// Typed only so a top-level `db` key can be rejected loudly by
     /// [`KhiveConfig::validate`] instead of being silently ignored as an
     /// unknown key. Not a supported config-file storage selector: single-file
@@ -439,6 +764,12 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub actor: ActorConfig,
 
+    /// Optional caller-enrollment policy. A present, even empty, table is an
+    /// explicit fail-closed policy; an absent table preserves the runtime's
+    /// existing gate.
+    #[serde(default)]
+    pub gate: Option<GateSectionConfig>,
+
     /// Runtime knobs: namespace overrides, brain profile, etc.
     #[serde(default)]
     pub runtime: RuntimeSectionConfig,
@@ -458,6 +789,10 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub packs: std::collections::HashMap<String, PackConfig>,
 
+    /// Actor read policy. An absent or empty list grants no fleet-wide reads.
+    #[serde(default)]
+    pub brain: BrainSectionConfig,
+
     /// Git-write policy allowlist (ADR-108 Amendment). Absent or empty
     /// `allowed` fails closed — `khive-pack-git`'s write verbs are
     /// unavailable until this section is populated.
@@ -468,6 +803,11 @@ pub struct KhiveConfig {
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
     #[serde(default)]
     pub storage: StorageSectionConfig,
+
+    /// Exec sandbox section (ADR-181). Absent means no runs: the exec pack
+    /// refuses every `exec.run` until `[exec] read_roots` names a toolchain.
+    #[serde(default)]
+    pub exec: ExecSectionConfig,
 
     /// Rendering timezone configuration (ADR-169). Absent `timezone` resolves
     /// to the host's local zone at [`RuntimeConfig`](crate::RuntimeConfig)
@@ -566,17 +906,7 @@ impl KhiveConfig {
         let diagnostic_path = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         let raw = std::fs::read_to_string(&resolved)
             .map_err(|source| ConfigError::from(source).in_file(&diagnostic_path))?;
-        let parsed: toml::Value = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: diagnostic_path.clone(),
-            source,
-        })?;
-        if parsed
-            .as_table()
-            .is_some_and(|table| table.contains_key("gate"))
-        {
-            return Err(ConfigError::UnsupportedGateSection.in_file(&diagnostic_path));
-        }
-        let cfg: KhiveConfig = parsed.try_into().map_err(|source| ConfigError::Parse {
+        let cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
@@ -765,6 +1095,9 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        crate::mount_config::validate_mounts(&self.mounts)?;
+        self.git_write.validate_dev_loop()?;
+
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
         // config author expecting `db=` to select the database would
@@ -773,6 +1106,32 @@ impl KhiveConfig {
             if !value.is_empty() {
                 return Err(ConfigError::UnsupportedTopLevelDb {
                     value: value.to_string(),
+                });
+            }
+        }
+
+        // ADR-181 resource limits: macOS returns EINVAL for RLIMIT_AS and
+        // RLIMIT_DATA, and RLIMIT_NPROC counts every process of the uid, so
+        // neither can bound one run. Refuse loudly instead of pretending.
+        if cfg!(target_os = "macos") {
+            if self.exec.limits.address_space.is_some() {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "limits.address_space".to_string(),
+                    reason: "unsupported_on_platform: macOS does not enforce an address-space rlimit per process".to_string(),
+                });
+            }
+            if self.exec.limits.nproc.is_some() {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "limits.nproc".to_string(),
+                    reason: "unsupported_on_platform: RLIMIT_NPROC counts every process of the uid, not one run".to_string(),
+                });
+            }
+        }
+        if let (Some(d), Some(m)) = (self.exec.timeout_default_s, self.exec.timeout_max_s) {
+            if d > m {
+                return Err(ConfigError::InvalidExecConfig {
+                    key: "timeout_default_s".to_string(),
+                    reason: format!("default {d} exceeds timeout_max_s {m}"),
                 });
             }
         }
@@ -816,6 +1175,21 @@ impl KhiveConfig {
             }
         }
 
+        if let Some(gate) = &self.gate {
+            for id in &gate.granted_actors {
+                if id.is_empty() {
+                    return Err(ConfigError::InvalidGrantedActorId {
+                        id: id.clone(),
+                        reason: "actor ids must not be empty".to_string(),
+                    });
+                }
+                Namespace::parse(id).map_err(|error| ConfigError::InvalidGrantedActorId {
+                    id: id.clone(),
+                    reason: error.to_string(),
+                })?;
+            }
+        }
+
         // Validate actor.allowed_outbound_namespaces (fail-closed at startup on malformed entry).
         for ns_str in &self.actor.allowed_outbound_namespaces {
             if ns_str.is_empty() {
@@ -834,6 +1208,21 @@ impl KhiveConfig {
         if !self.backends.is_empty() {
             let mut seen_backends = std::collections::HashSet::new();
             for backend in &self.backends {
+                BackendId::parse(&backend.name).map_err(|error| {
+                    ConfigError::InvalidBackendName {
+                        name: backend.name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if backend
+                    .served_kinds
+                    .as_ref()
+                    .is_some_and(BTreeSet::is_empty)
+                {
+                    return Err(ConfigError::EmptyBackendServedKinds {
+                        name: backend.name.clone(),
+                    });
+                }
                 if !seen_backends.insert(backend.name.clone()) {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
@@ -1051,18 +1440,25 @@ mod tests {
         path
     }
 
+    fn in_memory_runtime_config() -> crate::RuntimeConfig {
+        crate::RuntimeConfig {
+            db_path: None,
+            ..crate::RuntimeConfig::no_embeddings()
+        }
+    }
+
     /// Load errors must name the config file they came from (#1892): the
-    /// gate refusal, validation errors, and I/O errors gain the loader's
-    /// `InFile` context, while `Parse` keeps carrying its own path. The
-    /// message suffix is the user-facing contract.
+    /// validation and I/O errors gain the loader's `InFile` context, while
+    /// `Parse` keeps carrying its own path. The message suffix is the
+    /// user-facing contract.
     #[test]
     fn load_errors_name_the_config_file() {
         let dir = tempfile::tempdir().unwrap();
 
         let gate = write_toml(&dir, "[gate]\nmode = \"x\"\n");
-        let err = KhiveConfig::load(Some(&gate)).expect_err("gate section must fail");
+        let err = KhiveConfig::load(Some(&gate)).expect_err("unknown gate key must fail");
         assert!(
-            err.to_string().contains("(config file: ") && err.to_string().contains("config.toml"),
+            err.to_string().contains(&gate.display().to_string()),
             "gate error must name the file, got: {err}"
         );
 
@@ -1535,7 +1931,7 @@ default = true
     }
 
     #[test]
-    fn home_gate_config_is_rejected_while_explicit_empty_config_is_hermetic() {
+    fn home_gate_config_loads_while_explicit_empty_config_is_hermetic() {
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
@@ -1545,12 +1941,13 @@ default = true
         )
         .unwrap();
 
-        let err = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
-            .expect_err("an unsupported home gate policy must still fail loud");
-        assert!(matches!(
-            config_error_root(&err),
-            ConfigError::UnsupportedGateSection
-        ));
+        let loaded = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+            .expect("supported home gate policy loads")
+            .expect("home config exists");
+        assert_eq!(
+            loaded.gate.expect("gate table").granted_actors,
+            vec!["lambda:enrolled"]
+        );
 
         let empty = project_dir.path().join("empty-khive-config.toml");
         std::fs::write(&empty, "").unwrap();
@@ -1559,6 +1956,7 @@ default = true
             .expect("the explicit config exists");
         assert!(isolated.engines.is_empty());
         assert!(isolated.actor.id.is_none());
+        assert!(isolated.gate.is_none());
     }
 
     #[test]
@@ -2105,6 +2503,94 @@ kind = "memory"
     }
 
     #[test]
+    fn test_empty_backend_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = ""
+kind = "memory"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("empty backend name must fail");
+        assert!(
+            matches!(config_error_root(&err), ConfigError::InvalidBackendName { ref name, .. } if name.is_empty()),
+            "expected InvalidBackendName for the empty name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_backend_served_kinds_absent_and_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "legacy"
+kind = "memory"
+
+[[backends]]
+name = "notes"
+kind = "memory"
+served_kinds = ["note", "event"]
+"#,
+        );
+        let config = KhiveConfig::load(Some(&path))
+            .expect("valid served-kind declarations")
+            .expect("config file found");
+
+        assert!(config.backends[0].served_kinds.is_none());
+        assert_eq!(
+            config.backends[1].served_kinds,
+            Some(BTreeSet::from([SubstrateKind::Note, SubstrateKind::Event]))
+        );
+    }
+
+    #[test]
+    fn test_empty_backend_served_kinds_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = []
+"#,
+        );
+        let error = KhiveConfig::load(Some(&path))
+            .expect_err("an explicit empty served-kind declaration must fail closed");
+
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::EmptyBackendServedKinds { name } if name == "main"
+        ));
+    }
+
+    #[test]
+    fn test_unknown_backend_served_kind_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = ["asset"]
+"#,
+        );
+        let error = KhiveConfig::load(Some(&path))
+            .expect_err("served-kind declarations use a closed vocabulary");
+
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::Parse { .. }
+        ));
+        assert!(error.to_string().contains("unknown variant `asset`"));
+    }
+
+    #[test]
     fn test_pack_referencing_undefined_backend_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
@@ -2203,7 +2689,7 @@ db = "/tmp/scratch/demo.db"
     }
 
     #[test]
-    fn gate_caller_enrollment_is_rejected_instead_of_ignored() {
+    fn gate_caller_enrollment_config_loads_for_runtime_enforcement() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
             &dir,
@@ -2214,27 +2700,104 @@ grant_unattributed = false
 "#,
         );
 
-        let err = KhiveConfig::load(Some(&path))
-            .expect_err("an unenforced caller-enrollment policy must abort startup");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::UnsupportedGateSection),
-            "expected UnsupportedGateSection, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("would not be enforced"),
-            "operator-facing error must explain the fail-loud reason: {err}"
-        );
+        let config = KhiveConfig::load(Some(&path))
+            .expect("the supported caller-enrollment policy must parse")
+            .expect("config exists");
+        let gate = config.gate.expect("gate section");
+        assert_eq!(gate.granted_actors, vec!["lambda:enrolled"]);
+        assert!(!gate.grant_unattributed);
     }
 
     #[test]
-    fn empty_gate_table_is_still_rejected() {
+    fn caller_enrollment_policy_is_enforced_at_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:enrolled"
+
+[gate]
+granted_actors = ["lambda:enrolled"]
+grant_unattributed = false
+"#,
+        );
+        let mut config = KhiveConfig::load(Some(&path))
+            .expect("load")
+            .expect("config exists");
+        let allowed = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(allowed).expect("runtime");
+        runtime
+            .authorize(Namespace::local())
+            .expect("listed actor is admitted");
+
+        config.actor.id = Some("lambda:other".to_string());
+        let denied = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { ref verb, ref reason, .. })
+                if verb == "authorize" && reason == "actor is not enrolled"
+        ));
+    }
+
+    #[test]
+    fn grant_unattributed_controls_anonymous_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngrant_unattributed = false\n");
+        let mut config = KhiveConfig::load(Some(&path))
+            .expect("load")
+            .expect("config exists");
+        let denied = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(denied).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { ref reason, .. })
+                if reason == "unattributed caller is not enrolled"
+        ));
+
+        config.gate.as_mut().expect("gate").grant_unattributed = true;
+        let allowed = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        crate::KhiveRuntime::new(allowed)
+            .expect("runtime")
+            .authorize(Namespace::local())
+            .expect("anonymous caller is explicitly admitted");
+    }
+
+    #[test]
+    fn empty_gate_table_is_explicit_deny_all_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(&dir, "[gate]\n");
-        let err = KhiveConfig::load(Some(&path))
-            .expect_err("a present gate table must never disappear through serde defaults");
+        let config = KhiveConfig::load(Some(&path))
+            .expect("empty gate table parses")
+            .expect("config exists");
+        assert_eq!(config.gate, Some(GateSectionConfig::default()));
+        let runtime_config =
+            crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let runtime = crate::KhiveRuntime::new(runtime_config).expect("runtime");
+        assert!(matches!(
+            runtime.authorize(Namespace::local()),
+            Err(crate::RuntimeError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_gate_key_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngranted_actor = [\"lambda:typo\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown gate key must fail");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn invalid_granted_actor_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\ngranted_actors = [\"not valid\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("invalid actor id must fail");
         assert!(matches!(
             config_error_root(&err),
-            ConfigError::UnsupportedGateSection
+            ConfigError::InvalidGrantedActorId { id, .. } if id == "not valid"
         ));
     }
 
@@ -2245,6 +2808,71 @@ grant_unattributed = false
         KhiveConfig::load(Some(&path))
             .expect("unrelated future config stays forward compatible")
             .expect("config exists");
+    }
+
+    #[test]
+    fn brain_fleet_readers_default_to_empty() {
+        assert!(KhiveConfig::default().brain.fleet_readers.is_empty());
+        assert!(in_memory_runtime_config().brain.fleet_readers.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            for brain in ["", "[brain]\n", "[brain]\nfleet_readers = []\n"] {
+                let path = write_toml(&dir, &format!("{engines}\n{brain}"));
+                let config = KhiveConfig::load(Some(&path))
+                    .expect("load")
+                    .expect("config exists");
+                assert!(config.brain.fleet_readers.is_empty());
+
+                let mut base = in_memory_runtime_config();
+                base.brain.fleet_readers = vec!["lambda:previous".to_string()];
+                let resolved = crate::runtime_config_from_khive_config(&config, base);
+                assert!(resolved.brain.fleet_readers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn brain_fleet_readers_parse_and_resolve_with_or_without_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    "{engines}\n[brain]\nfleet_readers = [\"lambda:reader\", \"lambda:auditor\"]\n"
+                ),
+            );
+            let config = KhiveConfig::load(Some(&path))
+                .expect("load")
+                .expect("config exists");
+            assert_eq!(
+                config.brain.fleet_readers,
+                vec!["lambda:reader", "lambda:auditor"]
+            );
+
+            let mut base = in_memory_runtime_config();
+            base.brain.fleet_readers = vec!["lambda:previous".to_string()];
+            let resolved = crate::runtime_config_from_khive_config(&config, base);
+            assert_eq!(
+                resolved.brain.fleet_readers,
+                vec!["lambda:reader", "lambda:auditor"]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_brain_key_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[brain]\nfleet_reader = [\"lambda:reader\"]\n");
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown brain key must fail");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────
@@ -2377,6 +3005,192 @@ branches = []
             matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
+    }
+
+    #[test]
+    fn git_actor_mapping_and_resolver_defaults_parse_without_resolution() {
+        let cfg: KhiveConfig = toml::from_str(
+            r#"
+[git_write.actors."lambda:example"]
+name = "Example"
+email = "example@example.invalid"
+credential_ref = "example-reference"
+platform_identity = "example-login"
+"#,
+        )
+        .unwrap();
+        if cfg!(unix) {
+            cfg.validate().unwrap();
+        } else {
+            assert!(cfg.validate().is_err());
+        }
+        let identity = &cfg.git_write.actors["lambda:example"];
+        assert_eq!(identity.name, "Example");
+        assert_eq!(identity.credential_ref, "example-reference");
+        assert_eq!(
+            cfg.git_write.credential_resolver,
+            GitWriteSectionConfig::default().credential_resolver
+        );
+    }
+
+    #[test]
+    fn git_resolver_accepts_only_absolute_argv_with_ref_template() {
+        for argv in [
+            vec![],
+            vec!["relative-resolver", "{ref}"],
+            vec!["/bin/sh", "-c", "{ref}"],
+            vec!["/usr/bin/env", "sh", "{ref}"],
+            vec!["/absolute/resolver", "{token}"],
+            vec!["/absolute/resolver", "--service={ref}"],
+            vec!["/absolute/resolver"],
+            vec!["/absolute/resolver", "{ref}", "bad\0arg"],
+        ] {
+            let config = GitWriteSectionConfig {
+                credential_resolver: argv.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate_dev_loop(),
+                Err(ConfigError::InvalidGitWriteConfig { key, .. }) if key == "credential_resolver"
+            ));
+        }
+        let config = GitWriteSectionConfig {
+            credential_resolver: vec![
+                std::env::temp_dir()
+                    .join("not-installed-yet/resolver")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--reference".to_string(),
+                "{ref}".to_string(),
+            ],
+            ..Default::default()
+        };
+        config.validate_dev_loop().unwrap();
+    }
+
+    #[test]
+    fn git_actor_mapping_rejects_invalid_identity_and_unknown_fields() {
+        let actor = GitWriteActorConfig {
+            name: "Example".to_string(),
+            email: "example@example.invalid".to_string(),
+            credential_ref: "example-reference".to_string(),
+            platform_identity: "example-login".to_string(),
+        };
+        for field in ["name", "email", "credential_ref", "platform_identity"] {
+            let mut invalid = actor.clone();
+            match field {
+                "name" => invalid.name.clear(),
+                "email" => invalid.email = "bad\nemail".to_string(),
+                "credential_ref" => invalid.credential_ref.clear(),
+                "platform_identity" => invalid.platform_identity.clear(),
+                _ => unreachable!(),
+            }
+            let config = GitWriteSectionConfig {
+                actors: BTreeMap::from([("example".to_string(), invalid)]),
+                ..Default::default()
+            };
+            assert!(config.validate_dev_loop().is_err());
+        }
+        assert!(toml::from_str::<GitWriteActorConfig>(
+            r#"name = "Example"
+email = "example@example.invalid"
+credential_ref = "reference"
+platform_identity = "login"
+credential = "not-an-accepted-field""#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
+        let row = |refusals: &[&str]| GitWriteSectionConfig {
+            repositories: BTreeMap::from([(
+                "/repo".to_string(),
+                GitWriteRepositoryConfig {
+                    remote: "https://github.com/example/repo".to_string(),
+                    slug: "example/repo".to_string(),
+                    visibility: "private".to_string(),
+                    merge_refusals: refusals.iter().map(|entry| entry.to_string()).collect(),
+                },
+            )]),
+            ..Default::default()
+        };
+        for refusals in [
+            &[][..],
+            &["opener"][..],
+            &["last_pusher"][..],
+            &["opener", "last_pusher"][..],
+        ] {
+            row(refusals).validate_dev_loop().unwrap();
+        }
+        for refusals in [
+            &["author"][..],
+            &["Opener"][..],
+            &["opener", "opener"][..],
+            &["last_pusher", "opener", "last_pusher"][..],
+        ] {
+            assert!(matches!(
+                row(refusals).validate_dev_loop(),
+                Err(ConfigError::InvalidGitWriteConfig { key, .. })
+                    if key == "repositories./repo.merge_refusals"
+            ));
+        }
+        let parsed: GitWriteRepositoryConfig = toml::from_str(
+            r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private""#,
+        )
+        .unwrap();
+        assert!(parsed.merge_refusals.is_empty());
+        assert!(toml::from_str::<GitWriteRepositoryConfig>(
+            r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+merge_refusal = ["opener"]"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn git_contract_faults_are_feature_gated_before_empty_engines_return() {
+        let cfg = KhiveConfig {
+            git_write: GitWriteSectionConfig {
+                contract_faults: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if cfg!(feature = "contract-faults") {
+            cfg.validate().unwrap();
+        } else {
+            let error = cfg.validate().unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidGitWriteConfig { .. }));
+            assert!(error.to_string().contains("contract-faults"));
+        }
+    }
+
+    #[test]
+    fn git_unmapped_legacy_default_remains_valid_on_every_platform() {
+        GitWriteSectionConfig::default()
+            .validate_dev_loop()
+            .unwrap();
+        let config = GitWriteSectionConfig {
+            credential_resolver: vec!["relative-resolver".to_string(), "{ref}".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate_dev_loop().is_err());
+    }
+
+    #[test]
+    fn git_fault_selectors_require_opt_in() {
+        let config = GitWriteSectionConfig {
+            fault: Some("git.push:reply-lost-after-effect".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate_dev_loop(),
+            Err(ConfigError::InvalidGitWriteConfig { key, .. }) if key == "fault"
+        ));
     }
 
     // ── [storage.blob] section (ADR-111 Amendment 2) ─────────────────────────

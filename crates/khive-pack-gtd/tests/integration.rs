@@ -2009,6 +2009,8 @@ async fn next_resolves_deps_older_than_500_task_window() {
     let blocker_id = uuid::Uuid::new_v4();
     let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000; // ~11 days ago
     let blocker = Note {
+        version: 1,
+        key: None,
         id: blocker_id,
         namespace: "local".to_string(),
         kind: "task".to_string(),
@@ -2033,6 +2035,8 @@ async fn next_resolves_deps_older_than_500_task_window() {
     let now = chrono::Utc::now().timestamp_micros();
     let fillers: Vec<Note> = (0..500_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2384,6 +2388,8 @@ async fn next_finds_actionable_task_older_than_fixed_window() {
     // An old, actionable p0 task — created long before any filler task.
     let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000; // ~11 days ago
     let old_task = Note {
+        version: 1,
+        key: None,
         id: uuid::Uuid::new_v4(),
         namespace: "local".to_string(),
         kind: "task".to_string(),
@@ -2408,6 +2414,8 @@ async fn next_finds_actionable_task_older_than_fixed_window() {
     let now = chrono::Utc::now().timestamp_micros();
     let fillers: Vec<Note> = (0..501_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2460,6 +2468,8 @@ async fn tasks_finds_done_task_older_than_fixed_window() {
 
     let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
     let old_task = Note {
+        version: 1,
+        key: None,
         id: uuid::Uuid::new_v4(),
         namespace: "local".to_string(),
         kind: "task".to_string(),
@@ -2485,6 +2495,8 @@ async fn tasks_finds_done_task_older_than_fixed_window() {
     let now = chrono::Utc::now().timestamp_micros();
     let fillers: Vec<Note> = (0..600_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2537,6 +2549,8 @@ async fn next_returns_explicit_error_when_matches_exceed_scan_bound() {
     let now = chrono::Utc::now().timestamp_micros();
     let tasks: Vec<Note> = (0..20_001_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2585,6 +2599,8 @@ async fn next_succeeds_when_matches_exactly_at_scan_bound() {
     let now = chrono::Utc::now().timestamp_micros();
     let tasks: Vec<Note> = (0..20_000_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2638,6 +2654,8 @@ async fn tasks_status_inbox_filter_matches_legacy_task_missing_status_property()
 
     let now = chrono::Utc::now().timestamp_micros();
     let legacy_task = Note {
+        version: 1,
+        key: None,
         id: uuid::Uuid::new_v4(),
         namespace: "local".to_string(),
         kind: "task".to_string(),
@@ -2697,6 +2715,8 @@ async fn tasks_status_inbox_filter_matches_persisted_null_and_all_non_text_statu
 
     for (offset, (title, status)) in malformed_statuses.iter().enumerate() {
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2752,6 +2772,8 @@ async fn tasks_priority_p2_filter_matches_legacy_task_missing_priority_property(
 
     let now = chrono::Utc::now().timestamp_micros();
     let legacy_task = Note {
+        version: 1,
+        key: None,
         id: uuid::Uuid::new_v4(),
         namespace: "local".to_string(),
         kind: "task".to_string(),
@@ -2814,6 +2836,8 @@ async fn tasks_pagination_returns_disjoint_pages() {
     let base_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
     let tasks: Vec<Note> = (0..60_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),
@@ -2837,6 +2861,8 @@ async fn tasks_pagination_returns_disjoint_pages() {
     let now = chrono::Utc::now().timestamp_micros();
     let fillers: Vec<Note> = (0..600_u32)
         .map(|i| Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
             kind: "task".to_string(),

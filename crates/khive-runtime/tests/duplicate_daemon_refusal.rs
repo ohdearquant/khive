@@ -24,6 +24,10 @@ struct NeverDispatch;
 
 #[async_trait]
 impl DaemonDispatch for NeverDispatch {
+    fn plan(&self, ops: &str) -> String {
+        khive_request::plan_request(ops, &Default::default()).to_string()
+    }
+
     async fn dispatch(
         &self,
         _ops: String,

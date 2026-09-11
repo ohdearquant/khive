@@ -127,6 +127,7 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
 
     let entities = count_ndjson_lines(&entities_path).unwrap_or(0);
     let edges = count_ndjson_lines(&edges_path).unwrap_or(0);
+    let notes = count_ndjson_lines(&notes_path).unwrap_or(0);
 
     let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.toml"));
 
@@ -165,6 +166,7 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
         info,
         entities,
         edges,
+        empty: entities == 0 && edges == 0 && notes == 0,
         passed,
     };
 
@@ -2010,13 +2012,17 @@ fn print_text_format(report: &ValidationReport, verbose: bool, quiet: bool) {
         }
     }
     let s = &report.summary;
+    let empty = if s.empty { "; empty graph" } else { "" };
     println!(
-        "\nSummary: {} error(s), {} warning(s), {} entities, {} edges",
+        "\nSummary: {} error(s), {} warning(s), {} entities, {} edges{empty}",
         s.errors, s.warnings, s.entities, s.edges
     );
 }
 
 fn print_github_format(report: &ValidationReport) {
+    if report.summary.empty {
+        println!("::notice ::Empty graph: no entity, edge, or note records read");
+    }
     for r in &report.rules {
         for v in &r.violations {
             let level = if r.severity == "error" {

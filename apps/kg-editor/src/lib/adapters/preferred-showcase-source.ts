@@ -22,8 +22,8 @@ export type LoadedShowcaseBundle = Readonly<{
 export type PreferredShowcaseOptions = Readonly<{
   /**
    * Operator-supplied bearer token for the protected DB-snapshot routes.
-   * When absent, the request is sent without credentials and the protected
-   * route fails closed to 404, which selects the curated static fallback.
+   * When absent and a curated asset exists, the asset is loaded directly so
+   * the browser does not probe a protected route it cannot authenticate to.
    */
   accessToken?: string | null;
 }>;
@@ -71,6 +71,17 @@ export async function loadPreferredShowcaseBundle(
     if (!entry.assetPath) {
       throw new ShowcaseAnalysisNotFoundError(entry.canonicalUrl);
     }
+    return {
+      bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
+      source: "curated-static-fallback",
+    };
+  }
+
+  // The snapshot route intentionally hides from unauthenticated callers with
+  // a 404. Avoid that guaranteed failed request when the curated fallback can
+  // satisfy the load immediately. Dynamic-only entries still probe the route
+  // so public deployments and an explicit not-found result keep working.
+  if (!options.accessToken?.trim() && entry.assetPath) {
     return {
       bundle: await loadStaticShowcaseBundle(entry, fetchBundle),
       source: "curated-static-fallback",

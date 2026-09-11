@@ -46,10 +46,17 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
 pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.send",
-        description: "Send a message, optionally threaded.",
+        description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "to",
                 param_type: "string",
@@ -114,10 +121,31 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.inbox",
-        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox.",
+        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "All-of exact, case-sensitive matches on properties.tags, in either box before offset and limit. An empty array adds no restriction.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Exact native record kind in either box before offset and limit. Comm sends and replies both have kind=message; application tags are separate.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "thread_id",
+                param_type: "uuid",
+                required: false,
+                description: "Full thread UUID matched against properties.thread_id in either box before offset and limit. Alternate UUID spellings are canonicalized; short prefixes are rejected.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
+            },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
@@ -220,7 +248,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
+        description: "Compatibility mark-read verb for one or up to 500 inbound messages; it does not retrieve message content. Mark writes are best-effort: each result carries status=success|failed|unknown (unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -242,7 +270,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.mark_read",
-        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Defaults to best-effort updates, with atomic=true for all-or-nothing mutation.",
+        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -264,7 +292,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.unread",
-        description: "Count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads).",
+        description: "Bounded count-only view of the caller's unread inbound messages (same filter as inbox(status=\"unread\"), no message payloads). Exact below count_cap=1000; count_saturated=true means at least that many.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
@@ -275,6 +303,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "id",
                 param_type: "string",

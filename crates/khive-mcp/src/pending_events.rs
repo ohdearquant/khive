@@ -38,10 +38,13 @@
 //!
 //! ## Repeat advancement
 //!
-//! Named aliases are advanced as follows:
+//! One parser, `khive_pack_schedule::repeat`, decides what a `repeat` value
+//! means for creation and for this executor:
 //! - `"daily"`   → `trigger_at + 1 day`
 //! - `"weekly"`  → `trigger_at + 7 days`
 //! - `"monthly"` → `trigger_at + 1 calendar month`
+//! - `"every:<N><s|m|h|d>"` → `trigger_at + N units`
+//! - a five-field cron expression → the next match after `trigger_at`, in UTC
 //!
 //! Unsupported repeat expressions are rejected at schedule creation and fail
 //! closed for legacy rows rather than silently degrading to one-shot delivery.
@@ -57,7 +60,7 @@
 //! legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde_json::{json, Value};
 
 use crate::server::KhiveMcpServer;
@@ -423,6 +426,7 @@ pub async fn run_pending_events_with_config(
                 return Err(error.context("pending-events: build server"));
             }
         };
+    tracing::info!(target: "khive.boot", "{}", crate::serve::resolved_actor_disclosure(server.actor_id()));
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"
@@ -848,11 +852,10 @@ async fn run_pending_events_on_with_lease(
                     continue;
                 };
 
-                if repeat
-                    .as_deref()
-                    .is_some_and(|repeat| !matches!(repeat, "daily" | "weekly" | "monthly"))
-                {
-                    let error = "scheduled event uses an unsupported repeat expression; only daily, weekly, and monthly are executable";
+                if repeat.as_deref().is_some_and(|repeat| {
+                    khive_pack_schedule::repeat::parse_repeat(repeat).is_err()
+                }) {
+                    let error = "scheduled event uses an unsupported repeat expression; it is not one the executor can advance";
                     summary.failed += 1;
                     let Some(expected_properties) =
                         current_properties_for_finalize(rt, ns_str, id, "unsupported-repeat").await
@@ -2597,20 +2600,12 @@ async fn finalize_firing_event(
 /// Compute the next `trigger_at` for a repeating event, given the current
 /// `trigger_at` and the `repeat` spec.
 ///
-/// Returns `Some(next)` for named aliases `"daily"` / `"weekly"` / `"monthly"`.
+/// Returns `Some(next)` for every form `khive_pack_schedule::repeat` parses.
 /// Returns `None` for an absent repeat. Unsupported expressions are rejected
 /// by schedule creation and fail closed before dispatch for legacy rows.
 fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match repeat.as_deref() {
-        Some("daily") => Some(current + Duration::days(1)),
-        Some("weekly") => Some(current + Duration::weeks(1)),
-        Some("monthly") => {
-            // Add one calendar month. chrono::Months handles month-boundary
-            // arithmetic (e.g. Jan 31 + 1 month = Feb 28/29).
-            current.checked_add_months(Months::new(1))
-        }
-        _ => None,
-    }
+    let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
+    repeat.next_after(current)
 }
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
@@ -2625,14 +2620,8 @@ fn advance_repeat_past_missed(
     current: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    let mut current = current;
-    loop {
-        let next = next_trigger_at(repeat, current)?;
-        if next > now {
-            return Some(next);
-        }
-        current = next;
-    }
+    let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
+    repeat.first_after(current, now)
 }
 
 fn reminder_delivery_action(actor: &str, content: &str) -> String {
@@ -3048,6 +3037,7 @@ async fn dispatch_action(
     let result = server
         .dispatch_request_replay_as(
             RequestParams {
+                plan: None,
                 ops: ops_str,
                 presentation: None,
                 presentation_per_op: None,
@@ -3328,7 +3318,7 @@ mod tests {
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use khive_types::{Details, HandlerDef, KhiveError, VerbCategory, Visibility};
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
@@ -3550,10 +3540,11 @@ mod tests {
         }
     }
 
-    fn tmp_db() -> (NamedTempFile, String) {
-        let f = NamedTempFile::new().expect("tempfile");
-        let path = f.path().to_str().expect("utf8 path").to_string();
-        (f, path)
+    fn tmp_db() -> (TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("khive-test.db");
+        let path = path.to_str().expect("utf8 path").to_string();
+        (dir, path)
     }
 
     /// Due, but inside the default missed-event grace window, so callers land
@@ -3602,6 +3593,7 @@ mod tests {
     async fn agenda_ticker_last_tick_at(server: &KhiveMcpServer) -> Option<DateTime<Utc>> {
         let response = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "schedule.agenda()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -3642,6 +3634,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn quiet_schedule_tick_loop_surfaces_an_advancing_then_stale_heartbeat() {
         let (_file, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -3686,6 +3679,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn schedule_ticker_heartbeat_is_process_local_and_missing_without_a_loop() {
         let (_file, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -3987,6 +3981,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn fired_reminder_delivers_to_creator_after_daemon_actor_changes() {
         let (_tmp, db_path) = tmp_db();
         let creator = "lambda:reminder-owner";
@@ -4051,6 +4046,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unprovenanced_reminder_ignores_forged_actor_property() {
         let (_tmp, db_path) = tmp_db();
         let daemon_actor = "lambda:daemon-owner";
@@ -4104,6 +4100,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn repeating_reminder_delivers_on_consecutive_fires() {
         let (_tmp, db_path) = tmp_db();
         let actor = "lambda:repeat-owner";
@@ -4134,6 +4131,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
         let (_tmp, db_path) = tmp_db();
         let actor = "lambda:failure-owner";
@@ -4225,6 +4223,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn due_event_is_fired() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4255,6 +4254,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn future_event_is_skipped() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4285,6 +4285,7 @@ mod tests {
     /// fire — proves the SQL due-ness predicate compares chronologically via
     /// `datetime(...)`, not as raw text.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn due_event_with_positive_offset_trigger_at_fires() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4325,6 +4326,7 @@ mod tests {
     /// NOT fire — the mirror case of the positive-offset test above, with the
     /// Rust-side `trigger_at > now` re-check as an additional backstop.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn future_event_with_negative_offset_trigger_at_is_not_fired() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4365,6 +4367,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn fired_event_is_idempotent() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4399,6 +4402,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daily_repeat_advances() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4446,6 +4450,7 @@ mod tests {
     /// still carry `+04:00` (and the same local wall-clock hour) on its next
     /// occurrence, not drift to a different wall-clock hour under `+00:00`.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn daily_repeat_advance_preserves_original_offset() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4515,6 +4520,7 @@ mod tests {
     /// recognized as due and advanced, not silently skipped forever as
     /// "unparseable".
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn relaxed_legacy_grammar_repeat_advance_preserves_offset() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4574,6 +4580,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn namespace_isolation() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4623,6 +4630,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn concurrent_replay_preserves_each_events_actor_and_namespace() {
         let (_tmp, db_path) = tmp_db();
         let creator_runtime = |actor: &str| {
@@ -4725,6 +4733,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn anonymous_creator_replay_preserves_anonymous_actor_kind() {
         let (_tmp, db_path) = tmp_db();
         let creator_rt = make_rt(&db_path).await;
@@ -4773,6 +4782,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn dispatch_failure_does_not_abort_drain() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -4817,6 +4827,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_scheduled_action_without_creator_fails_closed() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt_with_actor(&db_path, Some("lambda:daemon")).await;
@@ -4888,6 +4899,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn forged_created_by_actor_property_cannot_authorize_replay() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt_with_actor(&db_path, Some("lambda:daemon")).await;
@@ -4942,6 +4954,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn second_actor_cannot_rewrite_provenanced_schedule_intent() {
         let (_tmp, db_path) = tmp_db();
         let gate = std::sync::Arc::new(DenyAttackerCreateGate);
@@ -5021,11 +5034,12 @@ mod tests {
         // `scheduled_event` kind outright, and the runtime curation fence
         // refuses schedule-managed notes. Whichever layer fires first, the
         // rejection must name the scheduled-event trust boundary.
+        let update_error = update_response["results"][0]["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
-            update_response["results"][0]["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("schedule-managed")
-                    || error.contains("scheduled_event notes are not editable")),
+            update_error.contains("schedule-managed")
+                || update_error.contains("scheduled_event notes are not editable"),
             "the generic mutation fence must reject executable schedule changes: \
              {update_response}"
         );
@@ -5069,6 +5083,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn scheduled_action_replay_uses_creator_not_daemon_identity() {
         let (_tmp, db_path) = tmp_db();
         let creator_cfg = RuntimeConfig {
@@ -5139,6 +5154,7 @@ mod tests {
     /// contention under CI" in `crates/khive-mcp/docs/pending-events.md`.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn replayable_action_dispatches_without_failure_at_trigger_time() {
         struct RestoreTimeout(Option<String>);
         impl Drop for RestoreTimeout {
@@ -5203,6 +5219,7 @@ mod tests {
     /// unrelated "missing argument" rejection can't mask a reintroduced
     /// silent-drop bug.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn dispatch_action_rejects_non_literal_prev_reference() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5225,6 +5242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn replay_defense_rejects_legacy_internal_subhandler_payload() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5251,6 +5269,7 @@ mod tests {
     /// surfaces as a counted failure rather than aborting the drain or being
     /// swallowed, and that the drain still completes.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn dispatch_rejects_legacy_prev_reference_instead_of_dropping_it() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5277,6 +5296,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn legacy_multi_op_action_is_terminally_refused_without_partial_replay() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5328,6 +5348,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(config_ledger)]
     async fn renewable_lease_prevents_live_overrun_reclaim_and_double_dispatch() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5599,6 +5620,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn persisted_success_outcome_resumes_finalization_without_reinvocation() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5636,6 +5658,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn expired_row_finalize_failure_does_not_wedge_later_due_work() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5711,6 +5734,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn malformed_terminal_receipts_fail_indeterminate_without_replay() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5807,6 +5831,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn expired_invoking_receipt_fails_indeterminate_without_double_dispatch() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5845,6 +5870,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn failed_one_shot_is_retryable_and_succeeds_once_on_later_drain() {
         let (_tmp, db_path) = tmp_db();
         let gate = std::sync::Arc::new(FailFirstCreateGate::default());
@@ -5917,6 +5943,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn ambiguous_side_effect_is_indeterminate_and_never_blindly_retried() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -5974,18 +6001,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_cron_row_fails_closed_before_action_invocation() {
+    #[serial_test::serial(config_ledger)]
+    async fn legacy_unparseable_repeat_row_fails_closed_before_action_invocation() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
-        let marker = "legacy-cron-must-not-dispatch";
+        let marker = "legacy-repeat-must-not-dispatch";
         let action = format!("create(kind=\"observation\", content=\"{marker}\")");
         let id = create_scheduled_event(
             &rt,
             "local",
             &due_rfc3339(),
             Some(&action),
-            Some("0 9 * * 1"),
+            Some("hourly"),
             "schedule",
         )
         .await;
@@ -6017,6 +6045,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn empty_payload_finalization_retains_not_invoked_receipt() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6043,21 +6072,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn unsupported_repeat_finalize_failure_does_not_abort_later_rows() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
-        let cron_id = create_scheduled_event(
+        let legacy_id = create_scheduled_event(
             &rt,
             "local",
             &due_rfc3339(),
             Some("stats()"),
-            Some("0 9 * * 1"),
+            Some("hourly"),
             "schedule",
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let marker = "row-after-cron-finalize-failure";
+        let marker = "row-after-legacy-finalize-failure";
         let action = format!("create(kind=\"observation\", content=\"{marker}\")");
         let later_id = create_scheduled_event(
             &rt,
@@ -6076,15 +6106,15 @@ mod tests {
                     sql: format!(
                         "CREATE TRIGGER test_fail_unsupported_repeat_finalize \
                          BEFORE UPDATE OF properties ON notes \
-                         WHEN OLD.id = '{cron_id}' \
+                         WHEN OLD.id = '{legacy_id}' \
                            AND json_extract(OLD.properties, '$.status') = 'firing' \
                            AND json_extract(NEW.properties, '$.status') = 'failed' \
                          BEGIN \
-                           SELECT RAISE(FAIL, 'injected cron finalization failure'); \
+                           SELECT RAISE(FAIL, 'injected legacy finalization failure'); \
                          END"
                     ),
                     params: vec![],
-                    label: Some("test_install_cron_finalize_failure".into()),
+                    label: Some("test_install_legacy_finalize_failure".into()),
                 })
                 .await
                 .expect("install finalization failure trigger");
@@ -6098,7 +6128,7 @@ mod tests {
         assert_eq!(summary.fired, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(note_content_count(&rt, "observation", marker).await, 1);
-        assert_eq!(get_note_props(&rt, cron_id).await["status"], "firing");
+        assert_eq!(get_note_props(&rt, legacy_id).await["status"], "firing");
         assert_eq!(get_note_props(&rt, later_id).await["status"], "fired");
     }
 
@@ -6106,6 +6136,7 @@ mod tests {
     /// the row for firing must fail — proves a cancel can never be lost to a
     /// fire that was already in flight.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn fire_claim_wins_race_against_concurrent_cancel() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6128,6 +6159,7 @@ mod tests {
         .expect("serialize cancel op");
         let cancel_result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: cancel_ops,
                 presentation: None,
                 presentation_per_op: None,
@@ -6144,7 +6176,9 @@ mod tests {
             op_result["ok"], false,
             "cancel of a claimed (firing) event must fail, not silently succeed: {cancel_json}"
         );
-        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        let cancel_err = op_result["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
             cancel_err.contains("not pending"),
             "cancel must report the event is no longer pending; got: {cancel_err}"
@@ -6208,6 +6242,7 @@ mod tests {
     /// must be reclaimed back to `pending` and fired on the next pass,
     /// instead of being wedged forever.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn stale_firing_row_is_reclaimed_and_fired() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6261,6 +6296,7 @@ mod tests {
     /// timeout) must NOT be reclaimed — a live drain's in-flight claim is
     /// never stolen by the reclaim sweep.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn fresh_firing_row_is_not_reclaimed() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6561,6 +6597,7 @@ mod tests {
     /// finalizer's fresh current-properties read — no sleeps, no reliance on
     /// scheduler ordering.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn production_drain_preserves_a_property_written_between_claim_and_current_read() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6644,6 +6681,7 @@ mod tests {
     /// from the fresh read yields a terminal `fired`; scheduling from the stale
     /// page yields a rescheduled `pending` with an advanced `trigger_at`.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn production_drain_schedules_from_the_fresh_read_not_the_page_snapshot() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6807,6 +6845,7 @@ mod tests {
     /// between the candidate-page query and the claim: that is the window in
     /// which the occurrence id is already derived but not yet persisted.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn production_drain_refuses_to_claim_an_event_rescheduled_in_the_claim_window() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -6912,6 +6951,7 @@ mod tests {
     /// only in WHICH seam the write lands at, which is what makes the two
     /// windows separately load-bearing.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn production_drain_refuses_to_finalize_an_event_rescheduled_after_the_claim() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7000,6 +7040,7 @@ mod tests {
     /// a *stale* one — must still fail cleanly: reclaim only happens as part
     /// of a drain pass, so cancel itself never reclaims.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn cancel_on_stale_firing_row_still_fails_cleanly() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7033,6 +7074,7 @@ mod tests {
         .expect("serialize cancel op");
         let cancel_result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: cancel_ops,
                 presentation: None,
                 presentation_per_op: None,
@@ -7050,7 +7092,9 @@ mod tests {
             "cancel of a stale-but-still-firing event must fail, not silently succeed \
              (reclaim happens on drain, not cancel): {cancel_json}"
         );
-        let cancel_err = op_result["error"].as_str().unwrap_or("");
+        let cancel_err = op_result["error"]["message"]
+            .as_str()
+            .expect("error.message is text");
         assert!(
             cancel_err.contains("not pending"),
             "cancel must report the event is no longer pending; got: {cancel_err}"
@@ -7097,10 +7141,30 @@ mod tests {
     }
 
     #[test]
-    fn next_trigger_at_cron_returns_none() {
+    fn next_trigger_at_every_adds_the_interval_to_the_previous_trigger() {
         let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
-        // Write-time validation rejects cron; legacy rows fail closed before dispatch.
-        assert!(next_trigger_at(&Some("0 9 * * 1".to_string()), base).is_none());
+        let next = next_trigger_at(&Some("every:15m".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::minutes(15));
+        let next = next_trigger_at(&Some("every:2h".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::hours(2));
+    }
+
+    #[test]
+    fn next_trigger_at_cron_advances_to_the_next_match_in_utc() {
+        // 2026-06-01 is a Monday; the next Monday 09:00 is a week later.
+        let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let next = next_trigger_at(&Some("0 9 * * 1".to_string()), base).unwrap();
+        let expected: DateTime<Utc> = "2026-06-08T09:00:00Z".parse().unwrap();
+        assert_eq!(next, expected);
+        let next = next_trigger_at(&Some("*/15 * * * *".to_string()), base).unwrap();
+        assert_eq!(next, base + Duration::minutes(15));
+    }
+
+    #[test]
+    fn next_trigger_at_unparseable_legacy_row_fails_closed() {
+        let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        assert!(next_trigger_at(&Some("99 * * * *".to_string()), base).is_none());
+        assert!(next_trigger_at(&Some("every:0s".to_string()), base).is_none());
     }
 
     // ── ADR-106 missed-event policy ─────────────────────────────────────────
@@ -7126,6 +7190,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn advance_repeat_past_missed_interval_lands_on_the_first_future_occurrence() {
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let now: DateTime<Utc> = "2026-06-15T09:07:00Z".parse().unwrap();
+        let next =
+            advance_repeat_past_missed(&Some("every:15m".to_string()), original, now).unwrap();
+        let expected: DateTime<Utc> = "2026-06-15T09:15:00Z".parse().unwrap();
+        assert_eq!(
+            next, expected,
+            "phase-locked to the original trigger, strictly after now"
+        );
+        let on_the_dot: DateTime<Utc> = "2026-06-15T09:15:00Z".parse().unwrap();
+        let next = advance_repeat_past_missed(&Some("every:15m".to_string()), original, on_the_dot)
+            .unwrap();
+        assert_eq!(next, on_the_dot + Duration::minutes(15));
+    }
+
+    #[test]
+    fn advance_repeat_past_missed_cron_asks_the_pattern_from_now() {
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let now: DateTime<Utc> = "2026-06-17T10:00:00Z".parse().unwrap();
+        let next =
+            advance_repeat_past_missed(&Some("0 9 * * 1".to_string()), original, now).unwrap();
+        let expected: DateTime<Utc> = "2026-06-22T09:00:00Z".parse().unwrap();
+        assert_eq!(next, expected);
+    }
+
     /// No `repeat` never advances, so the caller marks a stale one-shot missed.
     #[test]
     fn advance_repeat_past_missed_no_repeat_returns_none() {
@@ -7135,6 +7226,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn missed_reminder_receipt_retains_creator_not_daemon_actor() {
         let (_tmp, db_path) = tmp_db();
         let creator_rt = make_rt_with_actor(&db_path, Some("lambda:reminder-owner")).await;
@@ -7181,6 +7273,7 @@ mod tests {
     /// `"missed"` and NONE dispatched — asserted by the absence of the
     /// side-effecting action's write, not just zeroed summary counters.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn nine_overdue_events_beyond_grace_are_missed_with_zero_dispatch() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7274,6 +7367,7 @@ mod tests {
     /// An event overdue by less than the grace window must still fire
     /// normally — the missed policy only applies beyond the grace threshold.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn overdue_within_grace_still_fires() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7313,6 +7407,7 @@ mod tests {
     /// `advance_repeat_past_missed_skips_all_accumulated_occurrences` unit
     /// test above with the full claim/finalize wiring.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn missed_repeat_is_rearmed_at_next_future_occurrence() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7377,6 +7472,7 @@ mod tests {
     /// `next_trigger_at`-derived arithmetic and must both render at the
     /// caller's original offset.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn missed_repeat_rearm_preserves_original_offset() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7427,6 +7523,7 @@ mod tests {
     /// fully processed in ONE drain pass, not silently truncated at the page
     /// boundary — 201 rows exercises the exact boundary.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn backlog_larger_than_page_size_is_fully_drained_in_one_pass() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7477,6 +7574,7 @@ mod tests {
     /// exactly ONE marker note per event exists, rather than trusting summary
     /// counters alone to catch a double-dispatch-one-finalize regression.
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn concurrent_drains_fire_each_row_exactly_once() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -7618,6 +7716,7 @@ mod tests {
     /// `kkernel exec`'s refusal-envelope downcast recognizes it.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_keeps_db_override_conflict_top_level() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7660,6 +7759,7 @@ mod tests {
     /// surfaces as `config error: ...` underneath).
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_wraps_non_conflict_build_errors_with_context() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7697,6 +7797,7 @@ mod tests {
     /// build context, not as a `DatabaseOverrideConflict`.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn run_pending_events_fails_loud_for_missing_explicit_config() {
         std::env::remove_var("KHIVE_DB");
         std::env::remove_var("KHIVE_PACKS");
@@ -7747,6 +7848,7 @@ mod tests {
     /// discarding the configured `[actor] id`.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
@@ -7797,6 +7899,7 @@ mod tests {
     /// that entry point for a synthesized, non-CLI-parsed namespace default.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");
@@ -7842,6 +7945,7 @@ mod tests {
     /// `build_server`'s actor-clearing path would have.
     #[tokio::test]
     #[serial_test::serial]
+    #[serial_test::serial(config_ledger)]
     async fn wrapper_succeeds_under_strict_actor_mode_with_configured_project_actor() {
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_DB");

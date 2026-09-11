@@ -86,7 +86,7 @@ impl DescriptorIdentity {
             checkpoint_sha256,
             inference: InferenceIdentity {
                 provider: "lattice-embed",
-                version: "0.9.0",
+                version: crate::LATTICE_VERSION,
             },
             preprocessing: PreprocessingIdentity {
                 revision: PREPROCESSING_REVISION,
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["dimensions"], 4);
         assert_eq!(value["prompt"]["revision"], PROMPT_REVISION);
-        assert_eq!(value["inference"]["version"], "0.9.0");
+        assert_eq!(value["inference"]["version"], crate::LATTICE_VERSION);
     }
 
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
             checkpoint_sha256: "1".repeat(64),
             inference: InferenceIdentity {
                 provider: "lattice-embed",
-                version: "0.9.0",
+                version: crate::LATTICE_VERSION,
             },
             preprocessing: PreprocessingIdentity {
                 revision: PREPROCESSING_REVISION,

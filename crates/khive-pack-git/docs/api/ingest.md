@@ -29,12 +29,33 @@ set `gh_available=false` and mark each requested remote source `skipped`; a
 commits-only pass does not probe and leaves `gh_available` unset. Public
 reasons are stable and omit both origin URLs and `gh` stderr.
 
+The `origin` fallback is controlled by `OriginIdentity`, passed down from
+each public entry point through `run_ingest_inner` to `probe_gh_repository`.
+`run_ingest` and `run_ingest_with_commit_recovery` pass
+`OriginIdentity::DeriveFromCwd`: both run against a real repository checkout
+(a local source, or a cloned remote), so falling back to that checkout's
+configured `origin` when the source itself carries no identity is safe.
+`run_remote_api_ingest` — the issues/pull-requests-only remote pass that
+never clones (see `crates/khive-pack-git/src/handlers.rs`'s remote branch) —
+passes `OriginIdentity::Never` instead: it runs `gh` from a neutral working
+directory that has no relationship to the requested repository, so deriving
+an identity from that directory's `origin` would silently borrow whatever
+repository the daemon process happens to be running inside. A source with no
+usable identity of its own fails the probe under `OriginIdentity::Never`
+rather than falling back.
+
 ## `Budget`
 
-Bounds the number of new-record creation attempts across a `run_ingest`
-pass (ADR-088 Amendment 1 `max_items`). Only creation attempts (success or
-failure) consume budget — cheap natural-key "already exists" skips do not,
-since they are not the work the bound exists to limit.
+Bounds fresh record visits across commits, PRs, and issues (ADR-088 Amendment 1
+`max_items`). A record consumes one unit **before** its natural-key lookup, whether
+it already exists, creates successfully, or fails validation or creation. Existing
+tracker records therefore cannot turn a small bound into an unbounded database scan.
+An exact durable boundary acknowledgment skips the lookup and consumes no unit;
+these replays do not increment `*_skipped_existing` (that count measures actual
+existence checks). Related lookups and enrichment within one record are not separate
+units. The bound does not limit git snapshot construction, the size of a fetched
+remote page, or subprocess wall time. Exact-budget passes retain the conservative
+`done=false` result; a subsequent pass proves completion.
 
 ## Secret-gate refusal accounting
 
@@ -185,18 +206,48 @@ see `find_document_for_path_tests`).
 
 ## `write_cursor`
 
-Called once per section (commits/prs/issues) after that section's loop
-finishes, with a value that stops advancing at the first per-record create
-failure (see the `cursor_stalled` handling in each `ingest_*` loop) — so
-the next pass re-walks from before the failure and retries it, while
-records that already landed (including ones ingested later in a stalled
-pass) are no-ops via natural-key dedupe.
-While a pass is stalled, the persisted floor also never advances on the
-strength of an ALREADY-EXISTING record walked after the stall point (its
-natural-key lookup proves only its own landing): advancing past one would
-persist a cursor strictly newer than the refused record's timestamp, and
-the next pass's inclusive `updated >= cursor` filter would skip the refused
-record forever instead of retrying it.
+Commits atomically persist a SHA and frozen snapshot continuation after each
+contiguous successful or already-existing record (`write_commit_checkpoint`).
+The sidecar retains the original base, immutable tip, and completed position in a
+topologically ordered walk. This prevents max-one passes from cycling between
+siblings in a merge DAG. The acknowledged prefix consumes no visits on resume;
+both Git history passes and recovery retries use the pinned tip. A completed old
+snapshot with a changed `HEAD` requires another call even with spare budget. See
+[the frozen snapshot contract](../ingest.md#cursor-stall-guarantee) for validation,
+the 8 KiB metadata cap, reset semantics, and failure handling.
+
+Issues and PRs persist a paired page checkpoint after each
+fetched page is processed, including a partial page stopped by the visit budget,
+and before fetching the next page. A later fetch or database failure therefore
+preserves the earlier saved prefix. A failure within a page can replay that page.
+
+The main `issues`/`prs` cursor remains a canonical timestamp. Versioned JSON in the
+same table under `issues_checkpoint`/`prs_checkpoint` holds the matching floor,
+namespace, and exact number-to-note-UUID maps for acknowledged boundary and undated
+records. Both rows are read in one snapshot and written by one multi-row UPSERT.
+A timestamp-only legacy cursor starts with empty acknowledgments; mismatched,
+malformed, oversized, or unknown-version metadata warns and falls back to the main
+cursor. Invalid main timestamps warn and restart the window, never enter `gh` argv.
+Metadata is not a public cursor format or a schema migration.
+
+Acknowledgments are durable completion facts, not a cache of live note existence.
+Deleting a mirrored note locally does not reset ingest progress, including at the
+inclusive boundary. To deliberately reimport deleted records, reset both the main
+cursor and its checkpoint row for that project/source kind. This is also required
+before relying on refreshed PR UUIDs for enrichment after local deletion.
+
+Acknowledgments remain after completion so a quiescent PR boundary cannot repeatedly
+spend the budget before issues or commits are reached. PR replay restores the merge
+SHA and PR-number linking maps using the stored UUID and current masked remote
+fields. Each map is capped at the 1,000-record remote page limit; undated entries
+are pruned to the currently fetched page. A cap overflow stops with a stalled
+cursor instead of silently dropping progress. Records acknowledged before an upstream
+edit are still governed by the existing append-only natural-key ingest behavior.
+
+Any per-record failure freezes the saved prefix. Neither later new nor existing
+records may advance it or be acknowledged beyond that failure. Publish this stall
+in the report before a fallible checkpoint write. The next pass retries the failed
+record; already-landed later records remain idempotent via natural-key dedupe.
 
 ## Issue #765: commit-snapshot recovery
 
@@ -229,7 +280,7 @@ with the metadata format has no clean, unambiguous delimiter.
 `CommitSnapshot` bundles both passes so a classified failure in either one
 can be retried as a single unit. `load_commit_snapshot` mirrors
 `ingest_commits`'s original inline sequencing: `touched_files` (a second,
-unscoped `git log --name-only` pass over the whole history) is skipped
+`git log --name-only` pass over the frozen tip's whole history) is skipped
 entirely when `walk_commits` found no new commits, since there is nothing
 new to annotate with touched paths.
 
@@ -240,7 +291,9 @@ one truthful success warning once the commit phase completes.
 used to repair a classified `GitLogError` — `recover_commit_snapshot`
 retries the snapshot load against that path (the same cache slot for both
 strategies in `cache.rs`, but callers are not required to keep it
-identical).
+identical). The tip is resolved once before recovery and remains fixed across
+retries, even when a replacement clone has a newer `HEAD`. A replacement that
+cannot provide the pinned objects fails without advancing the continuation.
 
 `recover_commit_snapshot` is bounded entirely by `recover`'s own return
 value: `Ok(Some(_))` retries the snapshot load against the recovered repo
@@ -334,10 +387,10 @@ last fetched page.
 
 `cursor_stalled` mirrors `ingest_commits`: once one record fails to create,
 later records in this pass are still attempted (so every failure surfaces
-in this pass's warnings), but `max_updated` no longer advances past the
+in this pass's warnings), but `checkpoint.floor` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
 it, while already-landed records are no-ops via the natural key.
-The freeze applies on every `max_updated` advance, including the
+The freeze applies on every `checkpoint.floor` advance, including the
 already-existing-record branch: while stalled, a later existing record with
 a newer timestamp must not pull the floor past the refused record (see
 `write_cursor` above).
@@ -346,9 +399,19 @@ Each page is already `sort:updated-asc` server-side, but `--search` makes
 no hard ordering guarantee across ties — both loops re-sort defensively so
 the frozen-cursor invariant (records walked in nondecreasing `updated_at`
 order) holds regardless. `is_new` is inclusive (`updated >= cursor`) for
-exactly the tie reason: a successful and a failing record sharing one
-`updated_at` must both be re-examined next pass until the cursor moves past
-that tie.
+exactly the tie reason: a failing or unseen record sharing the boundary
+`updated_at` must remain eligible. Only exact acknowledged numbers at that timestamp
+are replayed without lookup; a lower but unseen number remains eligible. Sorting
+uses `(updated_at, number)` for deterministic local order, not a remote numeric
+high-water predicate. Canonical undated records also retain exact acknowledgments,
+so `max_items=1` can progress without persisting malformed timestamp text.
+
+The existing remote search ceiling remains: a full 1,000-record page at one timestamp
+cannot prove that no further ties exist, so it reports stopped early rather than
+jumping past the timestamp. Arrivals older than an advanced floor remain outside
+this high-water contract. PRs still precede issues and commits to preserve enrichment;
+continuously arriving or permanently failing earlier-source work has no new fairness
+guarantee.
 
 In both `ingest_issues` and `ingest_prs`, the entire fetched page is
 classified before anything else—including the sort and paging-cursor
@@ -454,13 +517,13 @@ token into two lines, so `grep -av` removes only the header line and the
 deleted commit's path token survives in the stream as the orphan.
 
 Before walking commits, the ingester loads the same-namespace live ADR-085
-module index once for the repository snapshot HEAD. That snapshot is never
-truncated: `walk_commits` issues one unbounded `git log {since}..HEAD`, and
-`max_items` bounds only the create loop (a budget check after the snapshot
-loads), never the walk — so the snapshot HEAD is always the true repository
-HEAD of this pass, and the index anchors to modules-as-of-HEAD regardless of
-how many commits the budget lets this pass create. A module is eligible only
-when both `properties.source_revision` equals that HEAD and
+module index once for the frozen repository snapshot tip. The snapshot is never
+truncated by the visit budget: `walk_commits` reconstructs the original base-to-tip
+range in reverse topological order, and `max_items` bounds the fresh-record loop
+after the acknowledged prefix. The index therefore remains anchored to the same
+immutable tip throughout continuation, even if the repository's current `HEAD`
+advances. A module is eligible only when both `properties.source_revision` equals
+that tip and
 `properties.source_path` exactly equals the changed path. Requiring the
 revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still

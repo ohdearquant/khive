@@ -81,6 +81,17 @@ pub struct Page<T> {
     pub total: Option<u64>,
 }
 
+/// A count whose work and reported value are bounded by an explicit cap.
+///
+/// `saturated` distinguishes an exact count equal to `cap` from a population
+/// larger than the cap. When it is true, `count == cap` is a lower bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundedCount {
+    pub count: u64,
+    pub cap: u64,
+    pub saturated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

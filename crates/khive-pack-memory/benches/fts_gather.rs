@@ -190,6 +190,7 @@ fn note_filter() -> TextFilter {
     TextFilter {
         namespaces: vec![NS.to_string()],
         kinds: vec![SubstrateKind::Note],
+        record_kinds: vec!["memory".to_string()],
         ..TextFilter::default()
     }
 }
@@ -358,6 +359,7 @@ async fn main() {
         docs.push(TextDocument {
             subject_id: id,
             kind: SubstrateKind::Note,
+            record_kind: Some(row.kind.clone()),
             title: (!row.title.is_empty()).then_some(row.title),
             body: row.body,
             tags: vec![],

@@ -61,6 +61,13 @@ pub struct TextTermStats {
 pub struct TextDocument {
     pub subject_id: Uuid,
     pub kind: SubstrateKind,
+    /// Granular kind of the indexed record (`memory`, `task`, `concept`, ...).
+    ///
+    /// This is distinct from [`Self::kind`], which identifies only the
+    /// substrate. Backends may index this classifier so corpus-scoped searches
+    /// can prune before ranking instead of filtering a shared posting list.
+    #[serde(default)]
+    pub record_kind: Option<String>,
     pub namespace: String,
     pub title: Option<String>,
     pub body: String,
@@ -74,6 +81,11 @@ pub struct TextDocument {
 pub struct TextFilter {
     pub ids: Vec<Uuid>,
     pub kinds: Vec<SubstrateKind>,
+    /// Exact granular record kinds. Backends with an indexed classifier push
+    /// this restriction into candidate retrieval and retain an exact row
+    /// predicate as the correctness backstop.
+    #[serde(default)]
+    pub record_kinds: Vec<String>,
     pub namespaces: Vec<String>,
 }
 

@@ -1,0 +1,72 @@
+{
+  "version": "1.0",
+  "profile": "ARW-3",
+  "site": {
+    "name": "Meadow Archive",
+    "description": "A fictional archive of meadow plants and seasonal field notes.",
+    "homepage": "https://meadow.invalid",
+    "contact": "editor@meadow.invalid"
+  },
+  "content_signals": {
+    "search": "yes",
+    "ai_input": "yes",
+    "ai_train": "no"
+  },
+  "content": [
+    {
+      "url": "/plants",
+      "markdown_url": "/plants.md",
+      "description": "Browse the archive's fictional meadow plant records.",
+      "tags": ["botany", "plants"],
+      "purpose": "Find a plant record.",
+      "priority": "high",
+      "authored": true,
+      "chunks": [{"id": "plant-index", "heading": "Plant index", "type": "section"}]
+    },
+    {
+      "url": "/seasons",
+      "markdown_url": "/seasons.md",
+      "description": "Read fictional observations grouped by season.",
+      "tags": ["botany", "seasons"],
+      "purpose": "Explore seasonal observations.",
+      "priority": "medium",
+      "authored": true
+    }
+  ],
+  "tools": [
+    {
+      "name": "find_plant",
+      "description": "Look up a fictional plant record by its common name.",
+      "type": "rest",
+      "endpoint": "/api/plants",
+      "method": "GET",
+      "auth": "none",
+      "input_schema": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+      }
+    },
+    {
+      "name": "list_observations",
+      "description": "List fictional field observations for a season.",
+      "type": "rest",
+      "endpoint": "/api/observations",
+      "method": "GET",
+      "auth": "none",
+      "input_schema": {
+        "type": "object",
+        "properties": {"season": {"type": "string"}}
+      }
+    }
+  ],
+  "skills": [
+    {
+      "name": "prepare_field_visit",
+      "description": "Combine plant records with seasonal observations for a fictional visit.",
+      "skill_doc": "/skills/prepare_field_visit/SKILL.md",
+      "type": "skill-md",
+      "tools_required": ["find_plant", "list_observations"]
+    }
+  ]
+}

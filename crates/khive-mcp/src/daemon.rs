@@ -25,6 +25,17 @@ use tokio::net::UnixStream;
 
 use crate::tools::request::RequestParams;
 
+pub(crate) mod executable;
+
+/// Snapshot the stdio bridge image before config discovery or database boot can
+/// wait across an installation. Daemon and one-shot exec entrypoints omit this.
+pub fn capture_bridge_executable() {
+    executable::capture_at_startup();
+}
+
+#[cfg(test)]
+mod memory_namespace_tests;
+
 #[cfg(test)]
 mod test_harness;
 
@@ -229,7 +240,10 @@ struct ConfigIdFields<'a> {
     blob_hydration_bytes: &'a str,
     backend: &'a str,
     outbound: &'a str,
+    gate: &'a str,
     git_write: &'a str,
+    brain: &'a str,
+    display_timezone: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
 }
@@ -246,7 +260,16 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
 
     let base = base.strip_prefix("packs=[")?;
     let (packs, rest) = base.split_once("];db=")?;
+    let (rest, display_timezone) = rest
+        .rsplit_once(";display_tz=")
+        .unwrap_or((rest, "<legacy-absent>"));
+    let (rest, brain) = rest
+        .rsplit_once(";brain=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, gate) = rest
+        .rsplit_once(";gate=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
     let outbound = outbound.strip_suffix(']')?;
     let (rest, backend) = rest.rsplit_once(";backend=")?;
@@ -270,7 +293,10 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         blob_hydration_bytes,
         backend,
         outbound,
+        gate,
         git_write,
+        brain,
+        display_timezone,
         backends,
         pack_backends,
     })
@@ -300,8 +326,14 @@ fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static s
         "backend"
     } else if client.outbound != daemon.outbound {
         "outbound"
+    } else if client.gate != daemon.gate {
+        "gate"
     } else if client.git_write != daemon.git_write {
         "git_write"
+    } else if client.brain != daemon.brain {
+        "brain"
+    } else if client.display_timezone != daemon.display_timezone {
+        "display_tz"
     } else if client.backends != daemon.backends {
         "backends"
     } else if client.pack_backends != daemon.pack_backends {
@@ -395,7 +427,7 @@ fn fallback_or_reject(
 ) -> Option<Result<String, McpError>> {
     record_fallback(reason, config_id_client, config_id_daemon, namespace_client);
     if is_daemon_strict_mode() {
-        return Some(Err(McpError::internal_error(
+        return Some(Err(daemon_mcp_error(
             format!(
                 "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={}; \
                  refusing to complete the request via local dispatch",
@@ -414,6 +446,10 @@ fn fallback_or_reject(
 
 #[async_trait]
 impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
+    fn plan(&self, ops: &str) -> String {
+        self.plan_ops(ops)
+    }
+
     async fn dispatch(
         &self,
         ops: String,
@@ -424,7 +460,31 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         from_wire: bool,
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
+        self.dispatch_with_error_detail(
+            ops,
+            presentation,
+            presentation_per_op,
+            format,
+            format_per_op,
+            from_wire,
+            identity,
+        )
+        .await
+        .map_err(|error| error.message)
+    }
+
+    async fn dispatch_with_error_detail(
+        &self,
+        ops: String,
+        presentation: Option<String>,
+        presentation_per_op: Option<Vec<Option<String>>>,
+        format: Option<String>,
+        format_per_op: Option<Vec<Option<String>>>,
+        from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
+    ) -> Result<String, daemon::DaemonDispatchError> {
         let params = RequestParams {
+            plan: None,
             ops,
             presentation,
             presentation_per_op,
@@ -446,7 +506,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             crate::server::DispatchOrigin::Daemon,
         )
         .await
-        .map_err(|e| e.message.to_string())
+        .map_err(|error| daemon::DaemonDispatchError::new(error.message.to_string(), error.data))
     }
 
     async fn warm_all(&self) {
@@ -477,6 +537,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 // ── client ────────────────────────────────────────────────────────────────────
 
 /// Result of a single forward attempt to the daemon socket.
+#[derive(Debug)]
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
     Response(Box<DaemonResponseFrame>),
@@ -490,17 +551,22 @@ enum ForwardOutcome {
         kind: std::io::ErrorKind,
         os_error_code: Option<i32>,
     },
-    /// Connected but the response could not be decoded — most likely a stale
-    /// daemon speaking a different wire format.
+    /// Invalid response framing/JSON or a response timeout after a full write.
     ParseFailure,
+    /// EOF/reset after a full write; distinct from malformed frames/timeouts.
+    ResponseLost,
     /// Connected and decoded a response, but the daemon's `daemon_protocol_version`
-    /// does not match [`PROTOCOL_VERSION`] even though `version_mismatch` is false.
-    /// This is the new-client + old-daemon (pre-versioning) scenario: the old daemon
-    /// ignores the unknown request field and returns a decodable response whose
-    /// protocol fields default to `false`/`0`. Since the real request was already
-    /// written, the client must treat this exactly like `ParseFailure`: return a
-    /// hard error without retrying, locally dispatching, killing, or respawning.
-    ProtocolMismatch,
+    /// does not match [`PROTOCOL_VERSION`], in either direction. Below: the
+    /// new-client + old-daemon scenario, implicit (a pre-versioning daemon ignores
+    /// the unknown request field and returns a decodable response whose protocol
+    /// fields default to `false`/`0`) or explicit (`version_mismatch=true` with the
+    /// daemon's lower number). Above: this bridge is the stale side, a rebuild
+    /// swapped the on-disk binary and respawned the daemon under a newer protocol
+    /// while this process kept running the old one. Since the real request was
+    /// already written, the client treats both exactly like `ParseFailure`: a hard
+    /// error without retrying, locally dispatching, killing, or respawning; the
+    /// consumer arms the #714 self-heal beside it.
+    ProtocolMismatch { daemon_protocol_version: u32 },
 }
 
 fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
@@ -518,6 +584,13 @@ fn classify_socket_connect_error(error: std::io::Error) -> ForwardOutcome {
 }
 
 async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
+    try_forward_before(frame, None).await
+}
+
+async fn try_forward_before(
+    frame: &DaemonRequestFrame,
+    retry_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
     let sock = socket_path();
     #[cfg(test)]
     {
@@ -526,29 +599,111 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             return classify_socket_connect_error(std::io::Error::from_raw_os_error(forced_error));
         }
     }
-    let mut stream = match UnixStream::connect(&sock).await {
-        Ok(s) => s,
-        Err(error) => return classify_socket_connect_error(error),
+
+    // One absolute deadline bounds connect, write, and read together, so the
+    // whole socket exchange can never exceed the ceiling the read phase alone
+    // used to honour on its own. A same-UID peer that accepts the connection
+    // and never reads it would otherwise block the write forever with
+    // nothing above this function able to stop it.
+    //
+    // When this task inherited the caller's request-read deadline — the
+    // spawned forward task in `server.rs` wraps this call in
+    // `khive_storage::inherit_request_read_context` — that same absolute
+    // instant is reused here, so an admitted forward cannot outlive the
+    // deadline the rest of the request already obeys. Callers that never
+    // scoped a request context (this function's own unit tests, or any
+    // future caller outside the MCP bridge) fall back to a fresh relative
+    // ceiling: the same `request_read_timeout_from_env()` bound the read
+    // phase alone used before this change.
+    let deadline = khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at)
+        .unwrap_or_else(|| {
+            tokio::time::Instant::now() + khive_storage::request_read_timeout_from_env()
+        });
+    let deadline = retry_deadline.map_or(deadline, |retry| retry.min(deadline));
+
+    let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&sock)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(error)) => return classify_socket_connect_error(error),
+        Err(_elapsed) => {
+            // Nothing was ever written to a peer, so this is exactly the
+            // ordinary not-listening case: safe to let recovery proceed.
+            tracing::warn!(
+                "daemon connect timed out before the socket-exchange deadline — \
+                 treating as no socket"
+            );
+            return ForwardOutcome::NoSocket;
+        }
     };
     let payload = match serde_json::to_vec(frame) {
         Ok(p) => p,
         Err(_) => return ForwardOutcome::NoSocket,
     };
-    if write_frame(&mut stream, &payload).await.is_err() {
-        return ForwardOutcome::NoSocket;
+    match tokio::time::timeout_at(deadline, write_frame(&mut stream, &payload)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return ForwardOutcome::NoSocket,
+        Err(_elapsed) => {
+            // The write itself never completed. Dropping `stream` here (it
+            // goes out of scope on this return) closes the socket, so a peer
+            // that later resumes reading observes end-of-stream in the
+            // middle of the frame — at most the 4-byte length prefix and a
+            // short partial body — and can never finish `read_frame`'s
+            // `read_exact` for the full body. It cannot misdispatch a
+            // truncated request.
+            //
+            // Because nothing was fully delivered, this is NOT the
+            // post-write ambiguity the read-timeout arm below returns for
+            // (where the write had already completed and the request may
+            // already be executing on the daemon side). Treat it like
+            // `NoSocket` — the pre-write, "nothing sent" case — so
+            // `forward_or_spawn_with_exe`'s recovery path can kill and
+            // respawn a stuck peer and retry, instead of surfacing a
+            // permanent no-retry ambiguity error for what may just be a
+            // wedged process squatting on the socket path.
+            tracing::warn!(
+                "daemon write timed out before the socket-exchange deadline — \
+                 dropping the connection and treating as no socket"
+            );
+            return ForwardOutcome::NoSocket;
+        }
     }
-    let resp = match read_frame(&mut stream).await {
-        Ok(r) => r,
-        Err(e) => {
+    // The request is now fully written and may already be executing (or
+    // committed) on the daemon side, so a stalled or unresponsive daemon
+    // must not leave this read pending forever — that would keep the
+    // calling task (and the MCP handler awaiting it) alive indefinitely.
+    // Bounded by the same deadline as the connect and write phases above.
+    let resp = match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // The request was sent but the daemon closed the connection before
-            // sending a response frame — likely a daemon crash or panic during
-            // dispatch. Treat as ParseFailure (not NoSocket): the request may
-            // already have committed, so the caller must return a terminal
-            // ambiguity error without lifecycle actions or local dispatch.
+            // sending a response frame. This does not establish why it closed
+            // or whether dispatch completed. Only classified reads can replay;
+            // mutations remain ambiguous, with no recovery or local fallback.
             tracing::warn!(
                 error = %e,
-                "daemon closed connection without sending a response \
-                 (crash during dispatch?) — returning terminal ambiguity"
+                "daemon response unavailable after full request write"
+            );
+            return if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                ForwardOutcome::ResponseLost
+            } else {
+                ForwardOutcome::ParseFailure
+            };
+        }
+        Err(_elapsed) => {
+            // The daemon never answered within the deadline. The write
+            // already completed, so — exactly like the connection-closed case
+            // above — the request may already have committed; there is no
+            // safe retry or local fallback, only a terminal ambiguity error.
+            tracing::warn!(
+                "daemon response read timed out after the request was fully \
+                 written — returning terminal ambiguity"
             );
             return ForwardOutcome::ParseFailure;
         }
@@ -567,18 +722,24 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             // with `version_mismatch=true` and its own (lower) version number.
             // `daemon_protocol_version < PROTOCOL_VERSION` means the daemon is
             // stale — route through the same terminal error as the implicit case
-            // above. If `daemon_protocol_version > PROTOCOL_VERSION` the client
-            // binary is behind; let `map_response` return its hard error too.
-            let is_stale_daemon = frame.daemon_protocol_version != PROTOCOL_VERSION
-                && (!frame.version_mismatch || frame.daemon_protocol_version < PROTOCOL_VERSION);
-            if is_stale_daemon {
+            // above. `daemon_protocol_version > PROTOCOL_VERSION` means this bridge
+            // binary is behind: a rebuild swapped the on-disk binary and respawned
+            // the daemon under a newer protocol while this process kept running the
+            // old one. That is the scenario the #714 self-heal exists for, so it
+            // takes the same terminal path and the consumer arms the re-exec, which
+            // picks up the on-disk binary the daemon itself was spawned from.
+            // Leaving that direction to `map_response` returned the hard error on
+            // every request for the rest of the process's life and never re-exec'd.
+            if frame.daemon_protocol_version != PROTOCOL_VERSION {
                 tracing::warn!(
                     daemon_version = frame.daemon_protocol_version,
                     expected = PROTOCOL_VERSION,
                     explicit_mismatch = frame.version_mismatch,
                     "daemon protocol version mismatch after request write — rejecting without retry",
                 );
-                return ForwardOutcome::ProtocolMismatch;
+                return ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version: frame.daemon_protocol_version,
+                };
             }
             ForwardOutcome::Response(Box::new(frame))
         }
@@ -592,6 +753,120 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
             ForwardOutcome::ParseFailure
         }
     }
+}
+
+const HANDOVER_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const HANDOVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn bounded_retry_deadline() -> tokio::time::Instant {
+    let deadline = tokio::time::Instant::now() + HANDOVER_RETRY_WINDOW;
+    khive_storage::capture_request_read_context()
+        .deadline()
+        .map(khive_storage::RequestReadDeadline::async_at)
+        .map_or(deadline, |caller| caller.min(deadline))
+}
+
+fn recorded_daemon_is_alive() -> bool {
+    std::fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .is_some_and(process_is_alive)
+}
+
+async fn sleep_until_retry(deadline: tokio::time::Instant) {
+    tokio::time::sleep_until((tokio::time::Instant::now() + HANDOVER_RETRY_INTERVAL).min(deadline))
+        .await;
+}
+
+struct ReadReplayBudget {
+    remaining: usize,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ReadReplayBudget {
+    fn new(enabled: bool) -> Self {
+        Self {
+            remaining: if enabled { 2 } else { 0 },
+            deadline: None,
+        }
+    }
+}
+
+async fn try_forward_with_read_replay(
+    frame: &DaemonRequestFrame,
+    replay: &mut ReadReplayBudget,
+    attempt_deadline: Option<tokio::time::Instant>,
+) -> ForwardOutcome {
+    let outcome = try_forward_before(frame, attempt_deadline).await;
+    if !matches!(outcome, ForwardOutcome::ResponseLost) || replay.remaining == 0 {
+        return outcome;
+    }
+    let deadline = *replay.deadline.get_or_insert_with(|| {
+        let deadline = bounded_retry_deadline();
+        attempt_deadline.map_or(deadline, |attempt| attempt.min(deadline))
+    });
+    while replay.remaining > 0
+        && tokio::time::Instant::now() < deadline
+        && !khive_storage::request_read_is_cancelled()
+    {
+        sleep_until_retry(deadline).await;
+        if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled() {
+            break;
+        }
+        match try_forward_before(frame, Some(deadline)).await {
+            ForwardOutcome::NoSocket => {}
+            ForwardOutcome::ResponseLost => replay.remaining -= 1,
+            ForwardOutcome::Response(response)
+                if response.config_mismatch
+                    || response.namespace_mismatch
+                    || response.served_config_id.as_deref() != Some(frame.config_id.as_str()) =>
+            {
+                // A later identity rejection cannot erase the first dispatch
+                // or permit map_response to select local fallback.
+                return ForwardOutcome::ResponseLost;
+            }
+            other => return other,
+        }
+    }
+    // A read may have executed before losing its response. Even if its retry
+    // only saw missing sockets, never convert this to recovery/local fallback.
+    ForwardOutcome::ResponseLost
+}
+
+fn daemon_mcp_error(message: impl Into<String>, data: Option<serde_json::Value>) -> McpError {
+    let error = daemon::DaemonDispatchError::new(message, data);
+    McpError::internal_error(error.message, Some(error.error_detail))
+}
+
+/// The operator-facing text for a protocol mismatch, by direction. A daemon ahead
+/// of this bridge is the rebuilt-binary case: the bridge re-execs the on-disk binary
+/// once this response has flushed (#714), so the caller's next request reaches a
+/// bridge that matches.
+fn protocol_mismatch_message(daemon_protocol_version: u32) -> String {
+    if daemon_protocol_version > PROTOCOL_VERSION {
+        format!(
+            "daemon protocol mismatch: this bridge speaks version {PROTOCOL_VERSION}, the \
+             daemon speaks {daemon_protocol_version}; the bridge re-execs the current binary \
+             after this response, retry the request"
+        )
+    } else {
+        format!(
+            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+             run `make local` to rebuild the daemon binary"
+        )
+    }
+}
+
+fn protocol_mismatch_error(message: String, data: Option<serde_json::Value>) -> McpError {
+    let mut error = daemon::DaemonDispatchError::new(message, data);
+    error.error_detail["domain_disposition"] =
+        serde_json::json!(khive_runtime::DomainDisposition::Unknown.as_str());
+    error.error_detail["code"] = serde_json::json!("version_mismatch");
+    error.error_detail["kind"] = serde_json::json!("protocol");
+    if let Some(fields) = error.error_detail.as_object_mut() {
+        fields.remove("domain_result");
+    }
+    McpError::internal_error(error.message, Some(error.error_detail))
 }
 
 fn map_response(
@@ -609,7 +884,7 @@ fn map_response(
                 PROTOCOL_VERSION, resp.daemon_protocol_version,
             )
         });
-        return Some(Err(McpError::internal_error(msg, None)));
+        return Some(Err(protocol_mismatch_error(msg, resp.error_detail)));
     }
 
     if resp.namespace_mismatch {
@@ -649,7 +924,7 @@ fn map_response(
                 resp.served_config_id.as_deref().unwrap_or("unknown"),
             )
         });
-        Some(Err(McpError::internal_error(msg, None)))
+        Some(Err(daemon_mcp_error(msg, resp.error_detail)))
     }
 }
 
@@ -984,21 +1259,45 @@ async fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Signal the daemon named by the PID file and remove its rendezvous files
-/// only after its PID is positively confirmed dead (caller holds the recovery
-/// lock). The PID is captured before SIGTERM and ownership is re-checked by
-/// [`remove_daemon_paths_if_still_stale`] immediately before unlinking.
-async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<(), RecoveryError> {
+#[derive(Debug, PartialEq, Eq)]
+enum PidFileSnapshot {
+    Missing,
+    Present(Vec<u8>),
+    Unreadable,
+}
+
+impl PidFileSnapshot {
+    fn read(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::Present(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Present(bytes) => std::str::from_utf8(bytes).ok()?.trim().parse().ok(),
+            Self::Missing | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Signal under the boot lock, but release it before waiting: the incumbent
+/// needs that same lock to finish its own shutdown cleanup.
+async fn kill_stale_daemon_inner(
+    exit_timeout: std::time::Duration,
+    boot_guard: Option<std::fs::File>,
+) -> Result<PidFileSnapshot, RecoveryError> {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let pid_file = pid_path();
-    let expected_pid = std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+    let expected_snapshot = PidFileSnapshot::read(&pid_file);
+    let expected_pid = expected_snapshot.pid();
 
-    if let Some(pid) = expected_pid {
-        let wait_for_exit = match classify_pid_identity(pid) {
+    let wait_for_exit = if let Some(pid) = expected_pid {
+        match classify_pid_identity(pid) {
             PidIdentity::KhiveDaemon => {
                 if let Ok(signed) = i32::try_from(pid) {
                     if signed > 0 {
@@ -1025,34 +1324,46 @@ async fn kill_stale_daemon_inner(exit_timeout: std::time::Duration) -> Result<()
                 );
                 true
             }
-        };
+        }
+    } else {
+        false
+    };
+    drop(boot_guard);
+    if let Some(pid) = expected_pid {
         if wait_for_exit && !wait_for_process_exit(pid, exit_timeout).await {
             return Err(RecoveryError::IncumbentStillAlive { pid });
         }
     }
 
-    remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
-    Ok(())
+    Ok(expected_snapshot)
 }
 
 /// Remove `pid_file`/the daemon socket only if ownership has not changed since
-/// `expected_pid` was observed: the PID file must still name `expected_pid`,
-/// and the socket path must not already have a live listener answering it.
+/// `expected_snapshot` was observed: the PID file must be unchanged or absent,
+/// and connecting to the socket must report absence or connection refusal.
+/// Other connect errors leave ownership uncertain and refuse cleanup.
 /// Either signal changing means a replacement daemon claimed the rendezvous
 /// between the observation and this call, and unlinking would delete its live
 /// paths instead of the truly-stale ones (#645).
-fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: Option<u32>) {
-    let current_pid = std::fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    if current_pid != expected_pid {
+fn remove_daemon_paths_if_still_stale(
+    pid_file: &std::path::Path,
+    expected_snapshot: &PidFileSnapshot,
+) -> bool {
+    let current_snapshot = PidFileSnapshot::read(pid_file);
+    if matches!(expected_snapshot, PidFileSnapshot::Unreadable)
+        || matches!(current_snapshot, PidFileSnapshot::Unreadable)
+    {
+        return false;
+    }
+    // Graceful incumbent cleanup may already have removed its own PID file.
+    if current_snapshot != PidFileSnapshot::Missing && &current_snapshot != expected_snapshot {
         tracing::warn!(
-            expected_pid = ?expected_pid,
-            current_pid = ?current_pid,
+            expected_pid = ?expected_snapshot.pid(),
+            current_pid = ?current_snapshot.pid(),
             "pid file changed during stale-daemon cleanup — a replacement daemon \
              already claimed it; skipping unlink to avoid deleting its live paths"
         );
-        return;
+        return false;
     }
 
     let sock = socket_path();
@@ -1061,17 +1372,27 @@ fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: 
     // that bound after our probe found the old one dead. Combined with the
     // PID-file recheck above, this closes the window even when the recovery
     // lock alone did not exclude the replacement's boot.
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        tracing::warn!(
-            socket = ?sock,
-            "a live listener now answers the daemon socket — skipping unlink to \
-             avoid deleting a replacement daemon's rendezvous"
-        );
-        return;
+    match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(_) => {
+            tracing::warn!(socket = ?sock, "live listener claimed rendezvous; skipping cleanup and launch");
+            return false;
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(_) => return false,
     }
 
-    let _ = std::fs::remove_file(pid_file);
-    let _ = std::fs::remove_file(&sock);
+    for path in [pid_file, sock.as_path()] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Outcome of the under-lock identity probe.
@@ -1108,6 +1429,7 @@ enum ProbeOutcome {
 ///   `Timeout` → do NOT kill (daemon may be healthy-but-busy; NEVER-KILL-SLOW)
 async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
+        plan: false,
         ops: String::new(),
         presentation: None,
         presentation_per_op: None,
@@ -1177,7 +1499,8 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         Ok(
             ForwardOutcome::NoSocket
             | ForwardOutcome::ParseFailure
-            | ForwardOutcome::ProtocolMismatch,
+            | ForwardOutcome::ResponseLost
+            | ForwardOutcome::ProtocolMismatch { .. },
         ) => ProbeOutcome::Dead,
         Ok(ForwardOutcome::Unreachable {
             kind,
@@ -1486,18 +1809,30 @@ where
             Ok(RecoveryOutcome::Uncertain)
         }
         ProbeOutcome::Dead => {
-            // Also take the shared boot/recovery lock for the kill+spawn step
-            // itself, matching `acquire_recovery_lock`'s existing role of
-            // serializing this against the daemon server's own
-            // cleanup→bind→pid-write critical section. No deadlock risk: this
-            // is a distinct lock file from `recoverer_guard` above, acquired
-            // and dropped entirely within this arm.
+            let boot_lock = acquire_recovery_lock();
+            match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
+                ProbeOutcome::Alive | ProbeOutcome::Timeout => return Ok(RecoveryOutcome::Skipped),
+                ProbeOutcome::LockContended => return Ok(RecoveryOutcome::Uncertain),
+                ProbeOutcome::Dead => {}
+            }
+            let expected_snapshot = kill_stale_daemon_inner(exit_timeout, boot_lock).await?;
+            // Keep the recoverer-only lock throughout, but let graceful exit
+            // take the boot lock. An independently started successor can win
+            // while we wait, so recheck under the boot lock before unlink/spawn.
             let _boot_lock = acquire_recovery_lock();
-            kill_stale_daemon_inner(exit_timeout).await?;
-            launcher
-                .launch()
-                .map(RecoveryOutcome::Spawned)
-                .map_err(RecoveryError::Spawn)
+            match probe_daemon_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
+                ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
+                ProbeOutcome::LockContended => Ok(RecoveryOutcome::Uncertain),
+                ProbeOutcome::Dead => {
+                    if !remove_daemon_paths_if_still_stale(&pid_path(), &expected_snapshot) {
+                        return Ok(RecoveryOutcome::Uncertain);
+                    }
+                    launcher
+                        .launch()
+                        .map(RecoveryOutcome::Spawned)
+                        .map_err(RecoveryError::Spawn)
+                }
+            }
         }
     };
     drop(recoverer_guard);
@@ -1514,7 +1849,7 @@ where
 /// same daemon or a freshly-spawned one) and must never silently fall back to
 /// local dispatch, either of which could execute a mutation a second time.
 fn ambiguous_forward_error() -> McpError {
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
@@ -1535,7 +1870,7 @@ fn daemon_unreachable_error(
         ?os_error_code,
         "daemon socket is unreachable from this process; lifecycle recovery suppressed"
     );
-    McpError::internal_error(
+    daemon_mcp_error(
         "cannot reach daemon socket from this process; refusing daemon lifecycle recovery \
          because the daemon may still be healthy",
         Some(serde_json::json!({
@@ -1614,7 +1949,7 @@ fn respawn_failed_error(failure: RespawnFailure) -> McpError {
     } else {
         serde_json::json!({"reason": "respawn_failed"})
     };
-    McpError::internal_error(
+    daemon_mcp_error(
         "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
         Some(data),
     )
@@ -1633,7 +1968,7 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
     if is_daemon_strict_mode() {
         data[STRICT_FALLBACK_MARKER] = serde_json::Value::Bool(true);
     }
-    McpError::internal_error(
+    daemon_mcp_error(
         format!("daemon recovery refused: incumbent PID {pid} is still alive after the deadline"),
         Some(data),
     )
@@ -1674,13 +2009,30 @@ fn incumbent_still_alive_error(pid: u32) -> McpError {
 /// Pending self-heal action, armed by [`arm_pending_self_heal`] and taken by
 /// [`fire_pending_self_heal`]. `None` on a healthy bridge for its entire
 /// lifetime — the overwhelmingly common case.
-static PENDING_SELF_HEAL: std::sync::Mutex<Option<MismatchRecovery>> = std::sync::Mutex::new(None);
+struct PendingSelfHeal {
+    action: MismatchRecovery,
+    executable: Option<std::path::PathBuf>,
+}
+
+static PENDING_SELF_HEAL: std::sync::Mutex<Option<PendingSelfHeal>> = std::sync::Mutex::new(None);
+
+fn arm_executable_self_heal(executable: std::path::PathBuf) {
+    *PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingSelfHeal {
+        action: MismatchRecovery::ReexecScheduled,
+        executable: Some(executable),
+    });
+}
 
 fn arm_pending_self_heal(action: MismatchRecovery) {
     let mut slot = PENDING_SELF_HEAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(action);
+    *slot = Some(PendingSelfHeal {
+        action,
+        executable: None,
+    });
 }
 
 /// Take and perform whatever self-heal action is armed, if any. Called by
@@ -1694,8 +2046,14 @@ pub(crate) fn fire_pending_self_heal() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     match action {
-        Some(MismatchRecovery::ReexecScheduled) => reexec_in_place(),
-        Some(MismatchRecovery::DrainAndExit) => exit_process(),
+        Some(PendingSelfHeal {
+            action: MismatchRecovery::ReexecScheduled,
+            executable,
+        }) => reexec_in_place(executable),
+        Some(PendingSelfHeal {
+            action: MismatchRecovery::DrainAndExit,
+            ..
+        }) => exit_process(),
         None => {}
     }
 }
@@ -1812,7 +2170,8 @@ pub(crate) fn schedule_reexec_on_mismatch() {
     schedule_drain_and_exit();
 }
 
-/// Perform the actual re-exec: resolve the on-disk binary at *exec time* via
+/// Perform the actual re-exec: use the recorded path for an executable
+/// replacement, or resolve the on-disk binary at *exec time* via
 /// [`std::env::current_exe`] (the same primitive `spawn_daemon` already uses
 /// for "pick up whatever `make local` just replaced" — see `spawn_daemon`
 /// above), preserve the original argv, append the `--resumed-generation=1`
@@ -1826,20 +2185,18 @@ pub(crate) fn schedule_reexec_on_mismatch() {
 /// already sent to the client for this request; there is nothing safe to
 /// retry from here).
 #[cfg(all(unix, not(test)))]
-fn reexec_in_place() {
+fn reexec_in_place(executable: Option<std::path::PathBuf>) {
     use std::os::unix::process::CommandExt;
 
-    let exe = match std::env::current_exe() {
+    let exe = match executable.map(Ok).unwrap_or_else(std::env::current_exe) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "bridge self-heal re-exec failed: could not resolve current_exe");
             return;
         }
     };
-    // Drop any pre-existing marker defensively (should never be present here —
-    // `trigger_bridge_self_heal` only reaches this path for a first-generation
-    // process — but argv should never accumulate duplicates if that invariant
-    // is ever violated).
+    // Identity-triggered re-execs can recur across installs; retain one marker
+    // so protocol mismatches still apply the existing resumed loop-breaker.
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| !a.starts_with(RESUMED_GENERATION_ARG_PREFIX))
@@ -1913,7 +2270,7 @@ fn clear_pending_self_heal() {
 /// calls it (`schedule_reexec_on_mismatch`'s `not(unix)` arm never reaches
 /// `reexec_in_place` at all).
 #[cfg(all(test, unix))]
-fn reexec_in_place() {
+fn reexec_in_place(_executable: Option<std::path::PathBuf>) {
     REEXEC_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -2016,7 +2373,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             drop(guard);
         }
         Ok(Err(e)) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!(
                     "failed to acquire daemon boot/recovery lock while waiting for \
                      cold-boot quiescence: {e}"
@@ -2025,7 +2382,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
             ));
         }
         Err(e) => {
-            return BootFenceOutcome::HardError(McpError::internal_error(
+            return BootFenceOutcome::HardError(daemon_mcp_error(
                 format!("boot-quiescence wait task failed: {e}"),
                 None,
             ));
@@ -2041,7 +2398,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
     {
         ProbeOutcome::Alive => BootFenceOutcome::DaemonReady,
         ProbeOutcome::Dead => BootFenceOutcome::SafeLocalFallback,
-        ProbeOutcome::Timeout => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::Timeout => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence; not falling back to \
              local dispatch to avoid racing a possibly still-initializing index",
             None,
@@ -2051,7 +2408,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
         // own. Handled here only for match exhaustiveness over the shared
         // `ProbeOutcome` type; same fail-safe HardError as `Timeout` if it
         // were ever reached.
-        ProbeOutcome::LockContended => BootFenceOutcome::HardError(McpError::internal_error(
+        ProbeOutcome::LockContended => BootFenceOutcome::HardError(daemon_mcp_error(
             "daemon state uncertain after cold-boot quiescence (lock probe unexpectedly \
              contended); not falling back to local dispatch",
             None,
@@ -2101,15 +2458,25 @@ pub async fn forward_or_spawn_with_config_and_packs(
     db: Option<&str>,
     packs: Option<&[String]>,
 ) -> Option<Result<String, McpError>> {
+    forward_or_spawn_with_replay_policy(frame, config, db, packs, false).await
+}
+
+pub(crate) async fn forward_or_spawn_with_replay_policy(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+    replay_read_only: bool,
+) -> Option<Result<String, McpError>> {
     #[cfg(any(test, feature = "test-forward-seam"))]
-    if let Some(intercepted) = test_forward_seam::intercept(packs) {
+    if let Some(intercepted) = test_forward_seam::intercept(frame, packs) {
         return intercepted;
     }
     let spawn = || {
         let exe = std::env::current_exe()?;
         spawn_daemon_with_exe_and_config(&exe, config, db, packs)
     };
-    forward_or_spawn_with(frame, &spawn).await
+    forward_or_spawn_with_policy(frame, &spawn, replay_read_only).await
 }
 
 /// Forward a request, spawning the daemon if needed, without an explicit
@@ -2144,12 +2511,14 @@ pub async fn forward_or_spawn_with_config(
 /// re-declaration instead) can reach it.
 #[cfg(any(test, feature = "test-forward-seam"))]
 pub mod test_forward_seam {
-    use super::McpError;
+    use super::{DaemonRequestFrame, McpError};
     use std::cell::Cell;
 
     thread_local! {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static CAPTURED: std::cell::RefCell<Option<Option<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+        static CAPTURED_REQUEST_ID: std::cell::RefCell<Option<Option<u64>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -2159,6 +2528,7 @@ pub mod test_forward_seam {
     /// spawning a process; the hook then disarms itself.
     pub fn arm() {
         CAPTURED.with(|c| *c.borrow_mut() = None);
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = None);
         ARMED.with(|a| a.set(true));
     }
 
@@ -2171,12 +2541,24 @@ pub mod test_forward_seam {
         CAPTURED.with(|c| c.borrow_mut().take())
     }
 
-    pub(super) fn intercept(packs: Option<&[String]>) -> Option<Option<Result<String, McpError>>> {
+    /// Take the captured `frame.request_id` of the most recent armed call,
+    /// if any. Companion to `take_captured` for tests proving the bridge
+    /// correlation id (khive#948, khive-oss#2337) reaches the real
+    /// `forward_or_spawn_with_config_and_packs` adapter boundary unchanged.
+    pub fn take_captured_request_id() -> Option<Option<u64>> {
+        CAPTURED_REQUEST_ID.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn intercept(
+        frame: &DaemonRequestFrame,
+        packs: Option<&[String]>,
+    ) -> Option<Option<Result<String, McpError>>> {
         let was_armed = ARMED.with(|a| a.replace(false));
         if !was_armed {
             return None;
         }
         CAPTURED.with(|c| *c.borrow_mut() = Some(packs.map(<[String]>::to_vec)));
+        CAPTURED_REQUEST_ID.with(|c| *c.borrow_mut() = Some(frame.request_id));
         Some(Some(Ok(serde_json::json!({
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0},
@@ -2201,11 +2583,49 @@ async fn forward_or_spawn_with<F>(
 where
     F: Fn() -> std::io::Result<std::process::Child> + Sync,
 {
+    forward_or_spawn_with_policy(frame, spawn, false).await
+}
+
+async fn forward_or_spawn_with_policy<F>(
+    frame: &DaemonRequestFrame,
+    spawn: &F,
+    replay_read_only: bool,
+) -> Option<Result<String, McpError>>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
     }
 
-    match try_forward_inner(frame).await {
+    let mut replay = ReadReplayBudget::new(replay_read_only);
+    let mut first = try_forward_with_read_replay(frame, &mut replay, None).await;
+    if matches!(first, ForwardOutcome::NoSocket) && recorded_daemon_is_alive() {
+        let deadline = bounded_retry_deadline();
+        while matches!(first, ForwardOutcome::NoSocket)
+            && tokio::time::Instant::now() < deadline
+            && !khive_storage::request_read_is_cancelled()
+        {
+            sleep_until_retry(deadline).await;
+            if tokio::time::Instant::now() >= deadline || khive_storage::request_read_is_cancelled()
+            {
+                break;
+            }
+            first = try_forward_with_read_replay(frame, &mut replay, Some(deadline)).await;
+        }
+    }
+    if matches!(first, ForwardOutcome::NoSocket)
+        && (khive_storage::request_read_is_cancelled()
+            || khive_storage::capture_request_read_context()
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.async_at()))
+    {
+        return Some(Err(daemon_mcp_error(
+            "daemon reconnect deadline expired or request cancelled before dispatch; no lifecycle recovery attempted",
+            Some(serde_json::json!({"reason": "daemon_reconnect_expired"})),
+        )));
+    }
+    match first {
         ForwardOutcome::Response(resp) => {
             return map_response(*resp, &frame.config_id, &frame.namespace)
         }
@@ -2217,7 +2637,7 @@ where
             kind,
             os_error_code,
         } => return Some(Err(daemon_unreachable_error(frame, kind, os_error_code))),
-        ForwardOutcome::ParseFailure => {
+        ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
                 config_id = %config_id,
@@ -2228,7 +2648,9 @@ where
             );
             return Some(Err(ambiguous_forward_error()));
         }
-        ForwardOutcome::ProtocolMismatch => {
+        ForwardOutcome::ProtocolMismatch {
+            daemon_protocol_version,
+        } => {
             let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
                 config_id = %config_id,
@@ -2241,11 +2663,8 @@ where
             // process itself is the stale one. Trigger self-heal alongside
             // the hard error below, never in place of it.
             trigger_bridge_self_heal();
-            return Some(Err(McpError::internal_error(
-                format!(
-                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                     run `make local` to rebuild the daemon binary"
-                ),
+            return Some(Err(protocol_mismatch_error(
+                protocol_mismatch_message(daemon_protocol_version),
                 None,
             )));
         }
@@ -2297,11 +2716,12 @@ where
         }
     }
 
-    // Send the real frame exactly once now that a daemon is confirmed ready
+    // Send the real frame now that a daemon is confirmed ready
     // (or believed ready via Skipped). The connect attempt inside
     // `try_forward_inner` doubles as the readiness check — a `NoSocket`
     // outcome here just means "not listening yet" (nothing written), so keep
-    // retrying; any other outcome is terminal and returned immediately.
+    // retrying. Only the explicit read policy may replay a lost response;
+    // every other post-write outcome is terminal and returned immediately.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -2339,11 +2759,11 @@ where
                 BootFenceOutcome::HardError(err) => return Some(Err(err)),
             }
         }
-        match try_forward_inner(frame).await {
+        match try_forward_with_read_replay(frame, &mut replay, None).await {
             ForwardOutcome::Response(resp) => {
                 return map_response(*resp, &frame.config_id, &frame.namespace)
             }
-            ForwardOutcome::ParseFailure => {
+            ForwardOutcome::ParseFailure | ForwardOutcome::ResponseLost => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
                     config_id = %config_id,
@@ -2354,7 +2774,9 @@ where
                 );
                 return Some(Err(ambiguous_forward_error()));
             }
-            ForwardOutcome::ProtocolMismatch => {
+            ForwardOutcome::ProtocolMismatch {
+                daemon_protocol_version,
+            } => {
                 let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
                     config_id = %config_id,
@@ -2366,11 +2788,8 @@ where
                 // either arm can observe the mismatch depending on whether this
                 // was the first probe or a retry after a kill/respawn.
                 trigger_bridge_self_heal();
-                return Some(Err(McpError::internal_error(
-                    format!(
-                        "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                         run `make local` to rebuild the daemon binary"
-                    ),
+                return Some(Err(protocol_mismatch_error(
+                    protocol_mismatch_message(daemon_protocol_version),
                     None,
                 )));
             }
@@ -2387,8 +2806,20 @@ where
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+/// Let sibling unit tests compose the real frame mapping with a captured dispatch.
+#[cfg(all(unix, test))]
+pub(crate) fn map_response_for_test(
+    response: DaemonResponseFrame,
+    expected_config_id: &str,
+    namespace: &str,
+) -> Option<Result<String, McpError>> {
+    map_response(response, expected_config_id, namespace)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::test_harness::{
         clear_daemon_env, connect_when_ready, exchange, HarnessDispatch, InProcessDaemonHandle,
         InProcessDaemonLauncher, RecoveryTestGuard,
@@ -2460,11 +2891,374 @@ mod tests {
     const CFG: &str = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
     const NS: &str = "test";
 
+    mod handover {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        fn request(ops: &str) -> DaemonRequestFrame {
+            DaemonRequestFrame {
+                plan: false,
+                ops: ops.to_owned(),
+                presentation: None,
+                presentation_per_op: None,
+                namespace: NS.to_owned(),
+                actor_id: None,
+                process_ref: None,
+                visible_namespaces: Vec::new(),
+                config_id: CFG.to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                probe_only: false,
+                metrics_only: false,
+                format: None,
+                format_per_op: None,
+                from_wire: true,
+                request_id: Some(17),
+            }
+        }
+
+        fn isolate(dir: &std::path::Path) {
+            clear_daemon_env();
+            reset_counters();
+            std::env::set_var("KHIVE_SOCKET", dir.join("s"));
+            std::env::set_var("KHIVE_PID", dir.join("p"));
+            std::env::set_var("KHIVE_LOCK", dir.join("l"));
+            std::env::set_var("KHIVE_RECOVERER_LOCK", dir.join("r"));
+        }
+
+        fn never_spawn() -> std::io::Result<std::process::Child> {
+            panic!("socket handover must not spawn or invoke local fallback")
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn reconnect_waits_for_live_owner_socket_gap_without_recovery() {
+            let _cleanup = RecoveryTestGuard::new();
+            for refused in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let sock = socket_path();
+                std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+                if refused {
+                    drop(tokio::net::UnixListener::bind(&sock).unwrap());
+                }
+                let peer = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if refused {
+                        std::fs::remove_file(&sock).unwrap();
+                    }
+                    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let frame: DaemonRequestFrame =
+                        serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                    assert!(!frame.probe_only, "grace must not enter lifecycle probing");
+                    write_frame(
+                        &mut stream,
+                        &serde_json::to_vec(&frame_ok("gap-ok")).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    forward_or_spawn_with(&request("stats()"), &never_spawn),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.unwrap().unwrap(), "gap-ok");
+                peer.await.unwrap();
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn read_response_loss_replays_only_with_explicit_policy_and_keeps_identity() {
+            let _cleanup = RecoveryTestGuard::new();
+            for enabled in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let expected = request("comm.thread(id=\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\")");
+                let expected_json = serde_json::to_value(&expected).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let peer_calls = calls.clone();
+                let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+                let peer = tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = tokio::select! {
+                            _ = &mut done_rx => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        let bytes = read_frame(&mut stream).await.unwrap();
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                            expected_json
+                        );
+                        let attempt = peer_calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt > 0 {
+                            write_frame(
+                                &mut stream,
+                                &serde_json::to_vec(&frame_ok("replayed")).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    forward_or_spawn_with_policy(&expected, &never_spawn, enabled),
+                )
+                .await
+                .unwrap();
+                let _ = done_tx.send(());
+                if enabled {
+                    assert_eq!(result.unwrap().unwrap(), "replayed");
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+                peer.await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), if enabled { 2 } else { 1 });
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn read_replay_attempt_cap_and_identity_drift_stay_terminal() {
+            let _cleanup = RecoveryTestGuard::new();
+            for drift in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let peer_calls = calls.clone();
+                let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+                let peer = tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = tokio::select! {
+                            _ = &mut done_rx => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        read_frame(&mut stream).await.unwrap();
+                        let attempt = peer_calls.fetch_add(1, Ordering::SeqCst);
+                        if drift && attempt > 0 {
+                            let mut response = frame_ok("must-not-use");
+                            response.config_mismatch = true;
+                            response.served_config_id = Some("replacement-config".to_owned());
+                            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    forward_or_spawn_with_policy(&request("stats()"), &never_spawn, true),
+                )
+                .await
+                .unwrap();
+                let _ = done_tx.send(());
+                assert!(result.unwrap().is_err());
+                peer.await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), if drift { 2 } else { 3 });
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn replay_deadline_never_converts_lost_response_to_no_socket() {
+            let _cleanup = RecoveryTestGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            isolate(dir.path());
+            let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+            let peer = tokio::spawn(serve_crash_on_dispatch(listener));
+            let mut budget = ReadReplayBudget::new(true);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let outcome =
+                try_forward_with_read_replay(&request("stats()"), &mut budget, Some(deadline))
+                    .await;
+            assert!(matches!(outcome, ForwardOutcome::ResponseLost));
+            assert!(tokio::time::Instant::now() < deadline + Duration::from_millis(300));
+            peer.await.unwrap();
+            assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn reconnect_deadline_and_cancellation_prevent_fresh_recovery() {
+            let _cleanup = RecoveryTestGuard::new();
+            for cancel in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let canceller = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if cancel {
+                        tx.send(true).unwrap();
+                    }
+                    tx
+                });
+                let result = khive_storage::scope_request_read_cancellation(
+                    rx,
+                    khive_storage::scope_request_read_deadline(
+                        Duration::from_millis(60),
+                        forward_or_spawn_with(&request("stats()"), &never_spawn),
+                    ),
+                )
+                .await;
+                let error = result.unwrap().unwrap_err();
+                assert_eq!(error.data.unwrap()["reason"], "daemon_reconnect_expired");
+                assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+                canceller.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn classified_reads_do_not_replay_malformed_timeout_or_protocol_failures() {
+            let _cleanup = RecoveryTestGuard::new();
+            for kind in ["malformed", "timeout", "protocol"] {
+                let dir = tempfile::tempdir().unwrap();
+                isolate(dir.path());
+                let listener = tokio::net::UnixListener::bind(socket_path()).unwrap();
+                let peer = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_frame(&mut stream).await.unwrap();
+                    match kind {
+                        "malformed" => write_frame(&mut stream, b"not-json").await.unwrap(),
+                        "protocol" => {
+                            let mut response = frame_ok("wrong-version");
+                            response.daemon_protocol_version = PROTOCOL_VERSION + 1;
+                            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap())
+                                .await
+                                .unwrap();
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(750)).await,
+                    }
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                });
+                let mut budget = ReadReplayBudget::new(true);
+                let deadline = tokio::time::Instant::now()
+                    + if kind == "timeout" {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(2)
+                    };
+                let outcome =
+                    try_forward_with_read_replay(&request("stats()"), &mut budget, Some(deadline))
+                        .await;
+                match kind {
+                    "protocol" => {
+                        assert!(matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }))
+                    }
+                    _ => assert!(matches!(outcome, ForwardOutcome::ParseFailure)),
+                }
+                assert_eq!(budget.remaining, 2);
+                peer.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "isolated subprocess fixture"]
+        async fn graceful_incumbent_child() {
+            assert_eq!(
+                std::env::var("KHIVE_HANDOVER_TEST_CHILD").as_deref(),
+                Ok("1")
+            );
+            let _signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            run_daemon(HarnessDispatch::new(NS, "old-config"))
+                .await
+                .unwrap();
+            if let Ok(successor) = std::env::var("KHIVE_HANDOVER_SUCCESSOR_PID") {
+                std::fs::write(pid_path(), successor).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn recovery_releases_boot_lock_for_graceful_exit_and_rechecks_owner() {
+            for successor_wins in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut cleanup = RecoveryTestGuard::new();
+                isolate(dir.path());
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "daemon::tests::handover::graceful_incumbent_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("HOME", dir.path())
+                    .current_dir(dir.path())
+                    .env("KHIVE_HANDOVER_TEST_CHILD", "1")
+                    .env_remove("KHIVE_HANDOVER_SUCCESSOR_PID")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if successor_wins {
+                    command.env(
+                        "KHIVE_HANDOVER_SUCCESSOR_PID",
+                        std::process::id().to_string(),
+                    );
+                }
+                let incumbent_pid = cleanup.track_child(command.spawn().unwrap());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !matches!(
+                    probe_daemon_identity("old-config", NS, 100).await,
+                    ProbeOutcome::Alive
+                ) {
+                    assert!(tokio::time::Instant::now() < deadline, "child readiness");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                FORCE_PID_IS_DAEMON.store(true, Ordering::SeqCst);
+                let launches = AtomicUsize::new(0);
+                let spawn = || {
+                    assert!(!process_is_alive(incumbent_pid));
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 0"])
+                        .spawn()
+                };
+                let result =
+                    kill_and_respawn_with_exit_timeout(CFG, NS, &spawn, Duration::from_secs(2))
+                        .await;
+                match (successor_wins, result) {
+                    (false, Ok(RecoveryOutcome::Spawned(mut child))) => {
+                        assert!(child.wait().unwrap().success());
+                    }
+                    (true, Ok(RecoveryOutcome::Uncertain)) => {}
+                    (_, other) => panic!("unexpected recovery outcome: {other:?}"),
+                }
+                assert!(cleanup.child_mut().wait().unwrap().success());
+                assert_eq!(
+                    launches.load(Ordering::SeqCst),
+                    usize::from(!successor_wins)
+                );
+                if successor_wins {
+                    assert_eq!(
+                        std::fs::read_to_string(pid_path()).unwrap(),
+                        std::process::id().to_string()
+                    );
+                }
+            }
+        }
+    }
+
     fn frame_ok(result: &str) -> DaemonResponseFrame {
         DaemonResponseFrame {
             ok: true,
             result: Some(result.to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2480,6 +3274,7 @@ mod tests {
             ok: false,
             result: None,
             error: error.map(str::to_string),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2503,6 +3298,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: true,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2525,6 +3321,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(CFG.to_string()),
@@ -2549,6 +3346,7 @@ mod tests {
             ok: true,
             result: Some("served-by-broad-registry".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: None,
@@ -2575,6 +3373,7 @@ mod tests {
             ok: true,
             result: Some("served-by-other-config".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(
@@ -2604,6 +3403,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2629,6 +3429,81 @@ mod tests {
     }
 
     #[test]
+    fn disposition_map_response_preserves_error_detail_without_dispatch() {
+        let detail = serde_json::json!({
+            "kind": "obligation",
+            "code": "store_failure",
+            "message": "audit failed",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "persisted-row" },
+        });
+        let mut frame = frame_err(Some("audit failed"));
+        frame.error_detail = Some(detail.clone());
+        let error = map_response(frame, CFG, NS).unwrap().unwrap_err();
+        assert_eq!(error.message, "audit failed");
+        assert_eq!(error.data, Some(detail));
+    }
+
+    #[test]
+    fn disposition_legacy_and_lost_responses_are_unknown() {
+        let legacy = map_response(frame_err(Some("legacy failure")), CFG, NS)
+            .unwrap()
+            .unwrap_err();
+        for error in [legacy, ambiguous_forward_error()] {
+            let detail = error.data.unwrap();
+            assert_eq!(detail["domain_disposition"], "unknown");
+            assert!(detail.get("domain_result").is_none());
+        }
+    }
+
+    #[test]
+    fn disposition_version_mismatch_is_unknown_even_with_untrusted_detail() {
+        let mut frame = frame_err(Some("protocol mismatch"));
+        frame.version_mismatch = true;
+        frame.error_detail = Some(serde_json::json!({
+            "message": "protocol mismatch",
+            "domain_disposition": "committed",
+            "domain_result": { "id": "uncertain-peer-result" },
+        }));
+        let detail = map_response(frame, CFG, NS)
+            .unwrap()
+            .unwrap_err()
+            .data
+            .unwrap();
+        assert_eq!(detail["domain_disposition"], "unknown");
+        assert_eq!(detail["code"], "version_mismatch");
+        assert!(detail.get("domain_result").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn disposition_mcp_adapter_preserves_request_error_data() {
+        use daemon::DaemonDispatch;
+
+        let server = make_test_server();
+        let params = RequestParams {
+            plan: None,
+            ops: "[".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        };
+        let expected = server
+            .dispatch_request_inner(params, false, None, crate::server::DispatchOrigin::Daemon)
+            .await
+            .unwrap_err();
+        let actual = server
+            .dispatch_with_error_detail("[".to_string(), None, None, None, None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(actual.message, expected.message.to_string());
+        assert_eq!(Some(actual.error_detail), expected.data);
+    }
+
+    #[test]
     fn map_response_not_ok_without_message_yields_contextual_err() {
         match map_response(frame_err(None), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -2648,6 +3523,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("daemon protocol mismatch: client=0 daemon=1 — rebuild/update the client binary (make local)".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2677,6 +3553,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(CFG.to_string()),
@@ -2817,6 +3694,39 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_names_caller_enrollment_policy() {
+        let base = RuntimeConfig::no_embeddings();
+        let enrolled = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                vec!["lambda:enrolled".to_string()],
+                false,
+            )),
+            ..base.clone()
+        };
+        let revoked = RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::new(Vec::new(), false)),
+            ..base
+        };
+        let client = crate::server::compute_config_id_with_ann_fresh_tail(&enrolled, None, true);
+        let daemon = crate::server::compute_config_id_with_ann_fresh_tail(&revoked, None, true);
+
+        assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "gate");
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_brain_read_policy() {
+        let config = RuntimeConfig::no_embeddings();
+        let mut changed = config.clone();
+        changed.brain.fleet_readers = vec!["lambda:reader".to_string()];
+        let client =
+            crate::server::compute_config_id_with_runtime_policies(&config, None, true, false);
+        let daemon =
+            crate::server::compute_config_id_with_runtime_policies(&changed, None, true, false);
+
+        assert_eq!(first_config_mismatch_field(&client, Some(&daemon)), "brain");
+    }
+
+    #[test]
     fn first_config_mismatch_field_names_backend_topology_without_values() {
         let base = "packs=[kg];db=:memory:;embed=none;extra=[];fresh_tail=true;\
                     blob_hydration_bytes=268435456;backend=main;outbound=[];git_write=policy";
@@ -2860,6 +3770,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: true,
             served_config_id: Some(daemon.to_string()),
@@ -3150,6 +4061,7 @@ mod tests {
         std::env::set_var("KHIVE_NO_DAEMON", "1");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3194,6 +4106,7 @@ mod tests {
 
     fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3341,6 +4254,7 @@ mod tests {
     /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
     /// side hands the path over; this side proves it reaches `argv`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3370,6 +4284,7 @@ mod tests {
     /// (or `--pack`-flag, or config-file `[runtime].packs`) selection when it
     /// spawns a fresh daemon (khive-oss#1941).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_pack_flags_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3398,6 +4313,7 @@ mod tests {
     /// at all — the spawned daemon falls through to its own env/config
     /// resolution exactly as before this fix.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_omits_pack_flags_when_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3425,6 +4341,7 @@ mod tests {
     /// would bind the config's declared persistent backend files, the exact
     /// inversion of the operator's ephemeral invocation.
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3464,6 +4381,7 @@ mod tests {
     /// the frame's fingerprint has already been normalized to the
     /// no-override anchor (`normalize_redundant_db_override_with_source`).
     #[test]
+    #[serial]
     fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
@@ -3491,6 +4409,7 @@ mod tests {
     /// seam retries only ExecutableFileBusy, so holding this file open for
     /// writing forces the exact failure class reported by coverage CI.
     #[test]
+    #[serial]
     fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
@@ -3508,6 +4427,220 @@ mod tests {
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
+    }
+
+    /// Blank out `"..."` string-literal contents (escapes and
+    /// backslash-newline continuations included) so a spawn-seam name
+    /// mentioned in an error message or doc comment can never read as a
+    /// call.
+    fn strip_string_literals_for_census(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut in_string = false;
+        for line in text.lines() {
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '\\' {
+                        out.push(' ');
+                        if chars.next().is_some() {
+                            out.push(' ');
+                        }
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                        out.push('"');
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = true;
+                    }
+                    out.push(c);
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `true` if `text` contains a call to `name` — `name` immediately
+    /// followed by `(` (optional whitespace between, including newlines —
+    /// `rustfmt` is free to break a long call onto its own line), a
+    /// non-identifier character (or start of text) before it, and not
+    /// inside a string literal. Anchoring both boundaries matters here
+    /// specifically because `spawn_daemon_with_exe(` is a prefix-shaped
+    /// substring of `spawn_daemon_with_exe_and_config(` up to the
+    /// `_and_config` suffix — a plain `contains` check would still tell
+    /// them apart by luck (the character after `exe` differs), but a
+    /// boundary check makes that non-collision load-bearing instead of
+    /// incidental.
+    fn calls_name_for_census(text: &str, name: &str) -> bool {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let text = strip_string_literals_for_census(text);
+        let bytes = text.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(name) {
+            let idx = search_from + rel;
+            let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let after = idx + name.len();
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let after_ok = j < bytes.len() && bytes[j] == b'(';
+            let is_definition = text[..idx].ends_with("fn ");
+            if before_ok && after_ok && !is_definition {
+                return true;
+            }
+            search_from = idx + 1;
+        }
+        false
+    }
+
+    /// Regression for a scanner that only tolerated a space/tab between a
+    /// seam name and its `(` — see the identical fix and rationale for
+    /// `khive-runtime`'s `calls_name`.
+    #[test]
+    fn calls_name_for_census_matches_across_a_newline_before_the_parenthesis() {
+        let text = "fn wraps_it() {\n    spawn_daemon_with_exe\n        (exe)\n}";
+        assert!(calls_name_for_census(text, "spawn_daemon_with_exe"));
+    }
+
+    /// The name of the function whose signature starts at `sig_line`
+    /// (already stripped of leading whitespace), if any.
+    fn fn_name_from_signature_for_census(sig_line: &str) -> Option<&str> {
+        let mut rest = sig_line;
+        for prefix in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        let rest = rest
+            .strip_prefix("async fn ")
+            .or_else(|| rest.strip_prefix("fn "))?;
+        Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+    }
+
+    /// Recursively collect every `.rs` file under `dir` into `out`.
+    fn collect_rust_files_for_census(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files_for_census(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `spawn_daemon_with_exe_and_config` and its thin wrapper
+    /// `spawn_daemon_with_exe` are both module-private — visible only
+    /// inside `daemon.rs` and its descendant modules — so unlike the
+    /// config-ledger seam (`with_event_store`, `pub` and reachable from any
+    /// crate in the workspace), the real population for this census is
+    /// bounded to this file plus the `daemon/` submodule directory, not the
+    /// whole workspace. This walks that directory explicitly instead of
+    /// hard-coding "just this file" so a future submodule under `daemon/`
+    /// is covered without anyone remembering to widen the scan.
+    fn daemon_module_sources() -> Vec<(std::path::PathBuf, String)> {
+        let this_file = std::path::PathBuf::from(file!());
+        let daemon_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon.rs");
+        let daemon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut files = vec![daemon_rs];
+        if daemon_dir.is_dir() {
+            collect_rust_files_for_census(&daemon_dir, &mut files);
+        }
+        let _ = this_file; // `file!()` is relative; CARGO_MANIFEST_DIR-joined paths are the source of truth.
+        files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, text))
+            })
+            .collect()
+    }
+
+    /// Every direct test caller of the spawn seam — `daemon.rs` and its
+    /// `daemon/` submodules, the only places `spawn_daemon_with_exe[_and_
+    /// config]` are visible from — mutates the process-wide `SPAWN_COUNT`,
+    /// so it must share the default serial group with tests that reset and
+    /// assert that counter.
+    #[test]
+    fn direct_spawn_seam_test_callers_are_serialized() {
+        let sources = daemon_module_sources();
+        assert!(
+            !sources.is_empty(),
+            "the daemon-module source scan found no .rs files under \
+             crates/khive-mcp/src/daemon.rs or src/daemon/; the census's own file walk \
+             is broken, not the population it walks"
+        );
+
+        let spawn_calls = ["spawn_daemon_with_exe_and_config", "spawn_daemon_with_exe"];
+        let mut candidate_count = 0usize;
+        let mut offenders = Vec::new();
+
+        for (path, text) in &sources {
+            let lines: Vec<&str> = text.lines().collect();
+            let test_starts: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let trimmed = line.trim();
+                    trimmed == "#[test]" || trimmed.starts_with("#[tokio::test")
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            for (index, start) in test_starts.iter().copied().enumerate() {
+                let end = test_starts.get(index + 1).copied().unwrap_or(lines.len());
+                let span = &lines[start..end];
+                let span_text = span.join("\n");
+                let matched = spawn_calls
+                    .iter()
+                    .find(|seam| calls_name_for_census(&span_text, seam));
+                let Some(matched) = matched else {
+                    continue;
+                };
+                candidate_count += 1;
+
+                if !span.iter().any(|line| line.trim() == "#[serial]") {
+                    let signature_offset = span
+                        .iter()
+                        .position(|line| {
+                            fn_name_from_signature_for_census(line.trim_start()).is_some()
+                        })
+                        .expect("test span has a function signature");
+                    let name =
+                        fn_name_from_signature_for_census(span[signature_offset].trim_start())
+                            .unwrap_or("<unknown>");
+                    offenders.push(format!(
+                        "{}:{name} (reaches the spawn seam via `{matched}`)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            candidate_count > 0,
+            "census found zero direct spawn-seam test candidates under the daemon \
+             module ({} source files) — the scan is broken, not the population it \
+             should have found (this file's own argv-forwarding tests are known \
+             direct callers)",
+            sources.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "tests that directly call the SPAWN_COUNT-mutating spawn seam must use \
+             #[serial]; offenders: {offenders:?}"
+        );
     }
 
     /// The helper behind the retry above must actually retry the exact
@@ -3904,6 +5037,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3926,6 +5060,7 @@ mod tests {
 
         // (a) valid same-namespace, same-config op
         let req = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -3956,6 +5091,7 @@ mod tests {
 
         let reference_result = reference
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "stats()".to_string(),
                 presentation: Some("verbose".to_string()),
                 presentation_per_op: None,
@@ -3998,6 +5134,7 @@ mod tests {
         // the frame's OWN namespace ("other") over the same shared warm
         // registry, instead of setting `namespace_mismatch`.
         let other = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4036,6 +5173,7 @@ mod tests {
         // config_id reject stays hard under ADR-096 Fork 1 — only the
         // namespace reject was softened.
         let mismatched_config = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4062,6 +5200,7 @@ mod tests {
 
         // (d) version mismatch → explicit error, NOT namespace/config mismatch
         let wrong_version = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4080,8 +5219,20 @@ mod tests {
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
-            resp_ver.version_mismatch,
-            "wrong protocol version must set version_mismatch"
+            !resp_ver.version_mismatch,
+            "a client below the daemon's protocol is refused with version_mismatch=false: \
+             the flag is reserved for a client that is ahead, and the deployed bridges \
+             re-exec on this shape. The typed code below carries the fact instead."
+        );
+        assert_eq!(
+            resp_ver
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("version_mismatch"),
+            "the refusal must stay typed as a version mismatch; got: {:?}",
+            resp_ver.error_detail
         );
         assert!(!resp_ver.ok);
         assert!(
@@ -4132,6 +5283,7 @@ mod tests {
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["feat/*".to_string()],
             }],
+            ..Default::default()
         };
         let revoked_config = RuntimeConfig {
             git_write: GitWriteSectionConfig::default(),
@@ -4156,6 +5308,7 @@ mod tests {
         drop(ready);
 
         let request = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4225,6 +5378,7 @@ mod tests {
         drop(_ready);
 
         let alice_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"bob\", content=\"hello from alice\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4243,6 +5397,7 @@ mod tests {
             request_id: None,
         };
         let bob_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from bob\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4261,6 +5416,7 @@ mod tests {
             request_id: None,
         };
         let charlie_frame = DaemonRequestFrame {
+            plan: false,
             ops: "comm.send(to=\"alice\", content=\"hello from charlie\") | comm.thread(id=$prev.full_id)"
                 .to_string(),
             presentation: None,
@@ -4407,6 +5563,7 @@ mod tests {
         drop(_ready);
 
         let frame = |ops: &str, actor: &str, visible: &[Namespace]| DaemonRequestFrame {
+            plan: false,
             ops: ops.to_string(),
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
@@ -4508,12 +5665,14 @@ mod tests {
     // override machinery introduced for daemon-forwarded requests.
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn local_dispatch_without_identity_context_uses_baked_actor() {
         clear_daemon_env();
 
         let server = make_comm_test_server(Some("baked-actor"));
         let result = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: "comm.send(to=\"someone\", content=\"hello\")".to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -4564,6 +5723,7 @@ mod tests {
         drop(_ready);
 
         let frame = |from_wire: bool| DaemonRequestFrame {
+            plan: false,
             ops: "brain.state()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4597,7 +5757,8 @@ mod tests {
             first_wire["ok"], false,
             "from_wire=true subhandler must be blocked through the daemon: {first_wire}"
         );
-        let err_wire = first_wire["error"].as_str().unwrap_or("");
+        let err_wire = first_wire["error"]["message"].as_str().unwrap_or("");
+        assert_eq!(first_wire["error"]["domain_disposition"], "not_committed");
         assert!(
             err_wire.contains("permission denied") || err_wire.contains("subhandler"),
             "daemon-forward wire path must surface the subhandler gate error; got: {err_wire}"
@@ -4610,7 +5771,7 @@ mod tests {
             serde_json::from_str(resp_op.result.as_deref().expect("operator result body"))
                 .expect("decode operator result json");
         let first_op = &body_op["results"][0];
-        let err_op = first_op["error"].as_str().unwrap_or("");
+        let err_op = first_op["error"]["message"].as_str().unwrap_or("");
         assert!(
             !err_op.contains("permission denied") && !err_op.contains("subhandler"),
             "operator frame must NOT gate the subhandler through the daemon: {first_op}"
@@ -4672,6 +5833,7 @@ mod tests {
             ok: true,
             result: Some("stale-result".to_string()),
             error: None,
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -4726,6 +5888,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4774,6 +5937,127 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
+    // ── bridge behind the daemon: the self-heal must arm ─────────────────────
+    //
+    // A binary swap that carries a protocol bump respawns the daemon under the
+    // new number while every running bridge keeps the old one. The daemon
+    // refuses each request with `version_mismatch=true` and its higher number.
+    // Before the fix `try_forward_inner` classified that as `Response` and
+    // `map_response` returned the hard error on every request for the rest of
+    // the bridge's life; the #714 re-exec, built for exactly this scenario, was
+    // armed only for the daemon-behind direction. Now both directions classify
+    // as `ProtocolMismatch`, the error names the direction, and the re-exec is
+    // armed so the next flush re-execs the on-disk binary the daemon came from.
+
+    fn newer_daemon_response(config_id: &str) -> DaemonResponseFrame {
+        DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "daemon protocol mismatch: client={} daemon={} — \
+                 rebuild/update the client binary (make local)",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            )),
+            error_detail: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(config_id.to_string()),
+            version_mismatch: true,
+            daemon_protocol_version: PROTOCOL_VERSION + 1,
+            metrics: None,
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_behind_a_newer_daemon_returns_the_error_and_arms_reexec() {
+        clear_daemon_env();
+        clear_pending_self_heal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake newer-daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_one_response(
+            listener,
+            newer_daemon_response(config_id),
+        ));
+
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+
+        match result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("protocol mismatch"),
+                    "error must name 'protocol mismatch'; got: {message}"
+                );
+                assert!(
+                    message.contains("re-execs"),
+                    "error must say this bridge re-execs itself, not send the operator to \
+                     rebuild a daemon that is already current; got: {message}"
+                );
+            }
+            Some(Ok(v)) => {
+                panic!("forward_or_spawn must NOT accept a newer daemon's refusal; got Ok({v:?})")
+            }
+            None => panic!(
+                "forward_or_spawn must return Some(Err(..)) for protocol mismatch, \
+                 not None (which would cause silent fallback to local dispatch)"
+            ),
+        }
+
+        let armed = PENDING_SELF_HEAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pending| (pending.action, pending.executable.clone()));
+        assert_eq!(
+            armed,
+            Some((MismatchRecovery::ReexecScheduled, None)),
+            "a bridge behind the daemon must arm the in-place re-exec"
+        );
+        // The pid file belongs to the live daemon; the terminal path leaves it alone.
+        assert!(
+            pid_file.exists(),
+            "the newer daemon's pid file must survive"
+        );
+
+        clear_pending_self_heal();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
     // ── daemon crash mid-dispatch regression (#91) ────────────────────────────
     //
     // When the daemon crashes (or panics) during dispatch it closes the
@@ -4804,7 +6088,8 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_returns_parse_failure_when_daemon_closes_without_response() {
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_returns_response_lost_when_daemon_closes_without_response() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -4826,6 +6111,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -4849,11 +6135,325 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::ParseFailure),
+            matches!(outcome, ForwardOutcome::ResponseLost),
             "daemon crash (connection closed without response) must yield \
-             ParseFailure, not NoSocket — got a different variant"
+             ResponseLost, not NoSocket — got a different variant"
         );
 
+        clear_daemon_env();
+    }
+
+    // ── unbounded-write regression (khive-oss#2337) ────────────────────────────
+    //
+    // Before the fix, `try_forward_inner` only bounded the response *read*;
+    // the connect and write phases had no deadline at all. A same-UID peer
+    // that accepts the connection and never reads from it can fill the
+    // kernel socket send buffer and block the write forever — nothing above
+    // this function could stop it, so cancellation-shielding in `server.rs`
+    // would eventually detach the task, but the task, its `UnixStream`, and
+    // the request payload would live on indefinitely as long as that peer
+    // stays connected.
+    //
+    // The fix bounds connect, write, and read by one absolute deadline. On a
+    // write timeout the stream is dropped (so a peer that later resumes
+    // reading observes end-of-stream mid-frame) and the outcome is
+    // `NoSocket` — nothing was fully delivered, so it is safe for
+    // `forward_or_spawn_with_exe`'s recovery path to kill/respawn and retry,
+    // unlike the post-write `ParseFailure` ambiguity case above.
+
+    /// Accept one connection and never read from it, simulating a same-UID
+    /// peer that squats on the socket path without servicing requests. The
+    /// accepted stream is handed back over `hold` so the test can observe it
+    /// after the writer's own timeout fires.
+    async fn serve_accept_and_never_read(
+        listener: tokio::net::UnixListener,
+        hold: tokio::sync::oneshot::Sender<tokio::net::UnixStream>,
+    ) {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = hold.send(stream);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        // A short ceiling keeps this test fast. `try_forward_inner` has no
+        // inherited request-read context here (called directly, not via the
+        // `server.rs` spawn site), so it falls back to reading this env var
+        // fresh on every call via `request_read_timeout_from_env()` — real
+        // (unpaused) time, since a genuinely blocked socket write is real
+        // I/O, not a timer, and would not release control for a paused
+        // clock's auto-advance to fire.
+        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake silent-peer socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let fake_handle = tokio::spawn(serve_accept_and_never_read(listener, held_tx));
+
+        // Comfortably inside MAX_FRAME_BYTES but large enough to exceed any
+        // realistic Unix-domain-socket kernel send buffer, so the write
+        // blocks once that buffer fills (the peer above never reads).
+        let big_ops = format!("stats(padding=\"{}\")", "x".repeat(7 * 1024 * 1024));
+        assert!(
+            big_ops.len() < khive_runtime::daemon::MAX_FRAME_BYTES,
+            "test payload must stay under MAX_FRAME_BYTES so write_frame does not reject it \
+             outright before the timeout can be observed"
+        );
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: big_ops,
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let started = std::time::Instant::now();
+        // (a) `try_forward_inner` must return within the ceiling plus a
+        // margin, not hang on the unbounded write. Pre-fix this outer
+        // `tokio::time::timeout` is what actually terminates the test (the
+        // real call never returns on its own), which is the red-before
+        // signal for this assertion.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect(
+                    "try_forward_inner must return within the ceiling plus margin, not hang on an \
+             unbounded write to a silent peer",
+                );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, ForwardOutcome::NoSocket),
+            "a write that never completes delivered nothing, so it must be treated like the \
+             pre-write no-socket case (safe to retry/recover) — got a different variant: \
+             {outcome:?}",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the ~1s write-timeout ceiling to fire well under the 5s test bound; \
+             elapsed {elapsed:?}"
+        );
+
+        // (b) the peer's held stream must observe end-of-stream once
+        // `try_forward_inner` drops its end on timeout — proving the cleanup
+        // actually closed the socket rather than leaking it. Pre-fix this
+        // read hangs forever (the writer's task, and its stream, never went
+        // away), which is the red-before signal for this assertion.
+        let mut held_stream = held_rx.await.expect("peer accepted the connection");
+        // The kernel receive buffer may already hold bytes that made it
+        // through before the write blocked, so draining to end-of-stream
+        // takes a read loop, not a single read: the peer must consume
+        // whatever was already queued before it can observe the writer's
+        // end actually closing.
+        let drain_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            loop {
+                match held_stream.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect(
+            "peer-side read must not hang once try_forward_inner's write timeout has fired \
+             and dropped its end of the connection",
+        );
+        // A connection-reset error also proves the writer's end was dropped;
+        // `Ok(())` (clean end-of-stream) is the expected outcome here.
+        let _ = drain_result;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+        clear_daemon_env();
+    }
+
+    /// (d) The existing read-timeout arm — the peer reads the frame in full
+    /// but never answers — must still yield `ParseFailure` (terminal
+    /// ambiguity: the write completed, so the request may already be
+    /// executing on the daemon side). This is the control that proves the
+    /// write-phase fix above did not change the read-phase's own timeout
+    /// classification.
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::set_var("KHIVE_REQUEST_READ_TIMEOUT_SECS", "1");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        async fn serve_read_then_never_answer(listener: tokio::net::UnixListener) {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_frame(&mut stream).await;
+                std::future::pending::<()>().await;
+            }
+        }
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake read-then-silent socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_read_then_never_answer(listener));
+
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+
+        let started = std::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect("try_forward_inner must return within the ceiling plus margin");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, ForwardOutcome::ParseFailure),
+            "a read timeout after a completed write must stay ParseFailure (terminal \
+             ambiguity) — got a different variant: {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the ~1s read-timeout ceiling to fire well under the 5s test bound; \
+             elapsed {elapsed:?}"
+        );
+
+        fake_handle.abort();
+        clear_daemon_env();
+    }
+
+    /// (c) Control: a peer that reads the frame and answers normally well
+    /// within the ceiling still yields the ordinary `Response` outcome. The
+    /// end-to-end round trip in `daemon_round_trip_dispatches_and_enforces_config_id`
+    /// above already exercises `write_frame`/`read_frame` against a real
+    /// in-process daemon; this test instead drives `try_forward_inner`
+    /// itself, so the single-deadline rewrite above is checked directly at
+    /// the same call site the write/read-timeout tests use.
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn try_forward_inner_normal_response_within_ceiling_still_succeeds() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        async fn serve_one_ok_response(listener: tokio::net::UnixListener, config_id: String) {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = read_frame(&mut stream).await.expect("read request frame");
+                let req: DaemonRequestFrame =
+                    serde_json::from_slice(&req).expect("decode request frame");
+                assert_eq!(req.config_id, config_id);
+                let resp = DaemonResponseFrame {
+                    ok: true,
+                    result: Some(serde_json::json!({"results": [], "summary": {}}).to_string()),
+                    error: None,
+                    error_detail: None,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(req.config_id.clone()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                    request_id: req.request_id,
+                };
+                let payload = serde_json::to_vec(&resp).expect("serialize response frame");
+                write_frame(&mut stream, &payload)
+                    .await
+                    .expect("write response frame");
+            }
+        }
+
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake well-behaved socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let fake_handle = tokio::spawn(serve_one_ok_response(listener, config_id.to_string()));
+
+        let frame = DaemonRequestFrame {
+            plan: false,
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            process_ref: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: Some(555),
+        };
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), try_forward_inner(&frame))
+                .await
+                .expect("try_forward_inner must not time out against a well-behaved peer");
+
+        match outcome {
+            ForwardOutcome::Response(resp) => {
+                assert!(resp.ok, "well-behaved response must round-trip as ok=true");
+                assert_eq!(resp.request_id, Some(555));
+            }
+            other => panic!("expected ForwardOutcome::Response, got {other:?}"),
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
         clear_daemon_env();
     }
 
@@ -5248,10 +6848,15 @@ mod tests {
     struct BigDispatch {
         namespace: String,
         config_id: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
     impl daemon::DaemonDispatch for BigDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -5262,10 +6867,17 @@ mod tests {
             _from_wire: bool,
             _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
-            // Return a string whose serialized DaemonResponseFrame JSON length
-            // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
-            // a result of this size is comfortably over the cap.
-            Ok("X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1))
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({"results": [
+                {"ok": true, "tool": "create", "result": {
+                    "payload": "X".repeat(khive_runtime::daemon::MAX_FRAME_BYTES + 1),
+                }},
+                {"ok": false, "tool": "create", "error": {
+                    "kind": "internal", "message": "handler failed",
+                    "domain_disposition": "unknown",
+                }},
+            ]})
+            .to_string())
         }
 
         async fn warm_all(&self) {}
@@ -5295,9 +6907,11 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
 
         let config_id = "test-oversized-config";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dispatcher = BigDispatch {
             namespace: "test".to_string(),
             config_id: config_id.to_string(),
+            calls: std::sync::Arc::clone(&calls),
         };
 
         // Run the real daemon server (with handle_conn's oversized gate live).
@@ -5316,6 +6930,7 @@ mod tests {
             .expect("daemon pid must be a u32");
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5360,6 +6975,7 @@ mod tests {
             "KILL_COUNT must be 0 — oversized response must NOT trigger \
              kill_stale_daemon_inner (fails if handle_conn oversized gate is removed)"
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // The result must be Some(Err(..)) containing "too large" — the explicit
         // error frame the server sends when the real response is oversized.
@@ -5370,6 +6986,10 @@ mod tests {
                     "error must describe the oversized response; got: {}",
                     e.message
                 );
+                let detail = e.data.expect("frame-cap disposition");
+                assert_eq!(detail["domain_disposition"], "unknown");
+                assert_eq!(detail["code"], "response_frame_size_limit");
+                assert!(detail.get("domain_result").is_none());
             }
             Some(Ok(_)) => panic!("oversized response must not produce Ok result"),
             None => panic!(
@@ -5419,6 +7039,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for CountingDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -5446,6 +7070,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn recovery_path_dispatches_real_request_exactly_once() {
         clear_daemon_env();
         reset_counters();
@@ -5526,6 +7151,7 @@ mod tests {
 
         // Now forward the real request exactly once — the call site's single forward.
         let real_frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -5581,6 +7207,7 @@ mod tests {
                 ok: true,
                 result: None,
                 error: None,
+                error_detail: None,
                 namespace_mismatch: false,
                 config_mismatch: false,
                 served_config_id: Some(config_id.clone()),
@@ -5889,6 +7516,7 @@ mod tests {
 
         drop(connect_when_ready(&sock).await);
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6040,6 +7668,7 @@ mod tests {
         });
 
         let frame = std::sync::Arc::new(DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6133,6 +7762,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("parse error: empty ops string".to_string()),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -6222,6 +7852,10 @@ mod tests {
 
     #[async_trait]
     impl daemon::DaemonDispatch for FailDispatch {
+        fn plan(&self, ops: &str) -> String {
+            khive_request::plan_request(ops, &Default::default()).to_string()
+        }
+
         async fn dispatch(
             &self,
             _ops: String,
@@ -6274,6 +7908,7 @@ mod tests {
         drop(_ready);
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6344,6 +7979,7 @@ mod tests {
                  rebuild/update the client binary (make local)",
                 PROTOCOL_VERSION
             )),
+            error_detail: None,
             namespace_mismatch: false,
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
@@ -6356,9 +7992,14 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn v4_client_rejects_warm_v3_daemon_before_accepting_result() {
+    async fn current_client_rejects_warm_v3_daemon_before_accepting_result() {
         clear_daemon_env();
-        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        const {
+            assert!(
+                PROTOCOL_VERSION >= 4,
+                "process_ref requires protocol v4 or later"
+            )
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -6377,6 +8018,7 @@ mod tests {
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6399,7 +8041,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::ProtocolMismatch),
+            matches!(outcome, ForwardOutcome::ProtocolMismatch { .. }),
             "explicit version_mismatch=true with daemon_protocol_version < PROTOCOL_VERSION \
              must classify as ProtocolMismatch (terminal no-retry path), not Response \
              (which would lose the stable stale-daemon classification)"
@@ -6419,29 +8061,9 @@ mod tests {
     // This test asserts try_forward_inner returns ForwardOutcome::Response
     // (not ProtocolMismatch) so map_response produces the hard error.
 
-    fn newer_daemon_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
-        DaemonResponseFrame {
-            ok: false,
-            result: None,
-            error: Some(format!(
-                "daemon protocol mismatch: client={} daemon={} — \
-                 rebuild/update the client binary (make local)",
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION + 1
-            )),
-            namespace_mismatch: false,
-            config_mismatch: false,
-            served_config_id: Some(config_id.to_string()),
-            version_mismatch: true,
-            daemon_protocol_version: PROTOCOL_VERSION + 1,
-            metrics: None,
-            request_id: None,
-        }
-    }
-
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_newer_daemon_mismatch_yields_response_not_recovery() {
+    async fn try_forward_inner_behind_a_newer_daemon_yields_protocol_mismatch() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -6456,10 +8078,11 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind newer-daemon socket");
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
-        let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
+        let mismatch_resp = newer_daemon_response(config_id);
         let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6482,10 +8105,15 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
 
         assert!(
-            matches!(outcome, ForwardOutcome::Response(_)),
-            "version_mismatch=true with daemon_protocol_version > PROTOCOL_VERSION \
-             must yield Response (hard error via map_response), not ProtocolMismatch \
-             (the client binary, not the daemon, is stale)"
+            matches!(
+                outcome,
+                ForwardOutcome::ProtocolMismatch {
+                    daemon_protocol_version
+                } if daemon_protocol_version == PROTOCOL_VERSION + 1
+            ),
+            "a daemon ahead of this bridge yields ProtocolMismatch carrying the daemon's \
+             version, so the bridge answers the caller and then re-execs the current \
+             binary; the version_mismatch flag on the frame does not decide this"
         );
 
         clear_daemon_env();
@@ -6507,6 +8135,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial(config_ledger)]
     async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6552,6 +8181,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6657,6 +8287,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6744,6 +8375,7 @@ mod tests {
                     ok: true,
                     result: Some("daemon-handled-stats".to_string()),
                     error: None,
+                    error_detail: None,
                     namespace_mismatch: false,
                     config_mismatch: false,
                     served_config_id: Some(cfg_for_srv.clone()),
@@ -6758,6 +8390,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -6888,6 +8521,7 @@ mod tests {
         });
 
         let frame = DaemonRequestFrame {
+            plan: false,
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -7078,19 +8712,57 @@ mod tests {
     #[test]
     #[serial]
     fn remove_daemon_paths_if_still_stale_removes_when_pid_unchanged() {
+        let _cleanup = RecoveryTestGuard::new();
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("khived.pid");
         let sock = dir.path().join("khived.sock");
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::fs::write(&pid_file, "4242").expect("write pid file");
-        std::fs::write(&sock, "stale socket placeholder").expect("write stale sock placeholder");
+        drop(std::os::unix::net::UnixListener::bind(&sock).expect("bind stale socket"));
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&sock)
+                .expect_err("closed listener must refuse connections")
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused,
+        );
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
 
         assert!(!pid_file.exists(), "unchanged pid file must be removed");
         assert!(!sock.exists(), "stale socket must be removed");
         clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_skips_when_socket_probe_is_uncertain() {
+        let _cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let blocker = dir.path().join("not-a-directory");
+        let sock = blocker.join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::fs::write(&pid_file, "4242").expect("write pid file");
+        std::fs::write(&blocker, "not a socket directory").expect("write path blocker");
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&sock)
+                .expect_err("a non-directory parent makes the probe uncertain")
+                .kind(),
+            std::io::ErrorKind::NotADirectory,
+        );
+
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
+
+        assert_eq!(std::fs::read(&pid_file).unwrap(), b"4242");
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"not a socket directory");
     }
 
     #[test]
@@ -7105,7 +8777,10 @@ mod tests {
         std::fs::write(&pid_file, "5555").expect("write replacement pid file");
         std::fs::write(&sock, "replacement socket placeholder").expect("write sock placeholder");
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::Present(b"4242".to_vec()),
+        ));
 
         assert!(
             pid_file.exists(),
@@ -7133,7 +8808,10 @@ mod tests {
         // just before its own pid-write).
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind live socket");
 
-        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+        assert!(!remove_daemon_paths_if_still_stale(
+            &pid_file,
+            &PidFileSnapshot::read(&pid_file),
+        ));
 
         assert!(
             sock.exists(),
@@ -7144,6 +8822,52 @@ mod tests {
             "pid file must be left alone alongside the live socket"
         );
         clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_compares_malformed_pid_bytes() {
+        let _cleanup = RecoveryTestGuard::new();
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+
+        for contents in [
+            b"".as_slice(),
+            b"partial-pid".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            for changed in [false, true] {
+                std::fs::write(&pid_file, contents).expect("write incomplete pid file");
+                let expected_snapshot = PidFileSnapshot::read(&pid_file);
+                assert_eq!(expected_snapshot.pid(), None);
+                drop(std::os::unix::net::UnixListener::bind(&sock).expect("bind stale socket"));
+                let mut current_contents = contents.to_vec();
+                if changed {
+                    current_contents.push(b'\n');
+                    std::fs::write(&pid_file, &current_contents).expect("change pid file bytes");
+                }
+
+                assert_eq!(
+                    remove_daemon_paths_if_still_stale(&pid_file, &expected_snapshot),
+                    !changed,
+                );
+                if changed {
+                    assert_eq!(std::fs::read(&pid_file).unwrap(), current_contents);
+                    assert!(sock.exists(), "changed owner's socket must survive");
+                    std::fs::remove_file(&pid_file).unwrap();
+                    std::fs::remove_file(&sock).unwrap();
+                } else {
+                    assert!(
+                        !pid_file.exists(),
+                        "unchanged incomplete pid must be removed"
+                    );
+                    assert!(!sock.exists(), "unchanged stale socket must be removed");
+                }
+            }
+        }
     }
 
     // ── bridge self-heal on ProtocolMismatch (#714) ───────────────────────────

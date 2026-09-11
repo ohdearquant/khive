@@ -4,7 +4,7 @@ mod helpers;
 
 use helpers::build_conditional_event_insert;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
     event::Event,
     types::{SqlStatement, SqlValue},
@@ -140,6 +140,7 @@ impl ProposalsProjectionWorker {
     ) -> Result<bool, RuntimeError> {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
+        let event = EventAttribution::from_token(token).stamp(event);
         let projection_stmt = SqlStatement {
             sql: "UPDATE proposals_open \
                   SET status = 'applied', updated_at = ?1 \
@@ -268,6 +269,7 @@ impl ProposalsProjectionWorker {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
         let proposal_id = Uuid::from_u128(payload.proposal_id.to_u128());
+        let event = EventAttribution::from_token(token).stamp(event);
 
         let (new_status_opt, approve_delta, reject_delta): (Option<&str>, i64, i64) =
             match payload.decision {
@@ -350,6 +352,7 @@ impl ProposalsProjectionWorker {
     ) -> Result<(bool, Uuid), RuntimeError> {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
+        let event = EventAttribution::from_token(token).stamp(event);
 
         let projection_stmt = SqlStatement {
             sql: "UPDATE proposals_open \

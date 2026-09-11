@@ -119,8 +119,13 @@ impl SqlEventStore {
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         } else {
+            // Atomic SQL units release the connection guard between statements;
+            // share their unit budget so this transaction cannot overlap one.
+            let unit_slot = crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?;
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
+                // Cancellation of the caller must not release the slot before this job ends.
+                let _unit_slot = unit_slot;
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
                 f(guard.conn()).map_err(|e| map_err(e, op))
             })
@@ -134,36 +139,13 @@ impl SqlEventStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if self.is_file_backed {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Events,
-                op,
-                move |scope| {
-                    scope.ensure_active()?;
-                    let conn = pool
-                        .open_standalone_reader()
-                        .map_err(|error| map_sqlite_err(error, op))?;
-                    scope.run(&conn, || f(&conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        } else {
-            let pool = Arc::clone(&self.pool);
-            crate::read_cancellation::run_declared_interruptible_read(
-                StorageCapability::Events,
-                op,
-                move |scope| {
-                    let mut guard = pool.resolve_reader_checkout(
-                        StorageCapability::Events,
-                        op,
-                        pool.reader_until(|| scope.should_stop()),
-                    )?;
-                    scope.run_pooled_reader(&mut guard, |conn| f(conn).map_err(|e| map_err(e, op)))
-                },
-            )
-            .await
-        }
+        super::run_pooled_store_read(
+            Arc::clone(&self.pool),
+            StorageCapability::Events,
+            op,
+            move |conn| f(conn).map_err(|error| map_err(error, op)),
+        )
+        .await
     }
 }
 
@@ -388,8 +370,7 @@ fn batch_append_events_dml(
     Ok(BatchWriteSummary {
         attempted,
         affected,
-        failed: 0,
-        first_error: String::new(),
+        ..BatchWriteSummary::default()
     })
 }
 

@@ -18,10 +18,9 @@ import subprocess
 import sys
 import os
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+from kkernel_binary import resolve_binary_path
+
+BINARY = resolve_binary_path()
 
 request_id = 0
 
@@ -93,7 +92,13 @@ def call_verb_expect_error(proc, name, args):
         raise RuntimeError(
             f"expected verb {name} to fail but it succeeded: {first.get('result')}"
         )
-    return first.get("error", "")
+    err = first.get("error", "")
+    # Since the runtime started preserving domain outcomes, a per-op error is a
+    # structured object ({"kind", "message", "domain_disposition", ...}); the
+    # assertions below read its message text.
+    if isinstance(err, dict):
+        err = str(err.get("message") or err)
+    return err
 
 
 def spawn():
@@ -149,7 +154,10 @@ def test_learn_happy_path(proc):
     # Shape: 8-char short id + full UUID
     assert len(result["id"]) == 8, f"expected 8-char short id: {result['id']}"
     assert "-" in result["full_id"], f"expected UUID in full_id: {result['full_id']}"
-    assert result["namespace"] is not None
+    # Agent JSON elides namespace="local" (ADR-078 Amendment 3); a namespace that
+    # survives elision must be a non-local string.
+    namespace = result.get("namespace")
+    assert namespace is None or (isinstance(namespace, str) and namespace != "local"), result
     print("  [ok] learn happy path")
 
 

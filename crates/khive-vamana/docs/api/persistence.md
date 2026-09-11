@@ -102,6 +102,14 @@ valid — `load_or_build` never observes a torn v2 commit. Segments are staged u
 a live v1-format segment set. The directory entry is fsynced after both the metadata
 rename (commit gate) and the final segment-promotion renames.
 
+File-backed commits append a 16-byte random publication nonce after the existing
+41-byte watermark/codes trailer. Readers accept all three layouts: the original base
+record, the 41-byte trailer record, and the trailer-plus-nonce record. Portable
+containers continue to emit the deterministic 41-byte layout. The nonce does not alter
+the corpus fingerprint or restart classification; it makes the commit-record digest
+unique for every successful file rotation, including an identical checkpoint, so
+long-lived mmap owners can detect and release unlinked predecessor generations (#2081).
+
 `VamanaIndex::load_or_build` is the fingerprint-gated restore used by callers holding a
 live corpus. Decision tree:
 - `metadata.bin` with `KHVVAMG2` magic AND checksums valid AND fingerprint matches →

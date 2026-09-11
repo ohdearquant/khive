@@ -92,9 +92,15 @@ actually bumps and the check is green-able: the release gate (section 3).
 
 **Quality ratchet (replaces review for regression in coverage and code hygiene)**
 
-- `Coverage ratchet` — measures line coverage on the PR branch and blocks merge if coverage
-  falls below the current `main` baseline. The baseline is the last recorded value on `main`; it
-  can only be raised by a PR that adds tests, never lowered by a PR that removes them.
+- `Coverage measurement` and `Coverage ratchet` — split responsibilities for the coverage gate.
+  `Coverage measurement` runs the instrumented workspace test suite and reports the result as
+  advisory: a failed measurement (for example, the runner filling its disk) is recorded with a
+  warning and does not itself block merge. `Coverage ratchet` runs only when a measurement is
+  available and blocks merge if the measured line coverage falls below the current `main`
+  baseline. The baseline is the last recorded value on `main`; it can only be raised by a PR
+  that adds tests, never lowered by a PR that removes them. When no measurement is available,
+  `Coverage ratchet` is skipped rather than failed, and `CI gate` accepts that skip — the gate
+  treats an inconclusive measurement as different from a detected regression.
 - `Docs lint` — enforces documentation formatting conventions.
 - `Marketplace example validator` — validates the marketplace plugin examples remain
   syntactically correct.

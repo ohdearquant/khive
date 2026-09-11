@@ -501,9 +501,9 @@ mod tests {
     use crate::preference::{
         feature_schema_id, materialize_fann, sha256_hex, CalibrationProvenance, FannProvenance,
         ModelBundle, OptimizerProvenance, PreferenceScope, SplitCounts, TestMetrics,
-        TrainingProvenance, FANN_CRATE_VERSION, FANN_FORMAT, FEATURE_COUNT,
-        FEATURE_SCHEMA_CANONICAL_JSON, FEATURE_SCHEMA_VERSION, MODEL_BUNDLE_SCHEMA_VERSION,
-        MODEL_FAMILY, OPTIMIZER_BACKTRACKING_IDENTITY, PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY,
+        TrainingProvenance, FANN_FORMAT, FEATURE_COUNT, FEATURE_SCHEMA_CANONICAL_JSON,
+        FEATURE_SCHEMA_VERSION, MODEL_BUNDLE_SCHEMA_VERSION, MODEL_FAMILY,
+        OPTIMIZER_BACKTRACKING_IDENTITY, PAIR_SPLIT_REVISION, TIE_BAND_RULE_IDENTITY,
         TRAINING_REVISION,
     };
 
@@ -616,7 +616,7 @@ mod tests {
             },
             fann: FannProvenance {
                 crate_name: "lattice-fann".to_string(),
-                crate_version: FANN_CRATE_VERSION.to_string(),
+                crate_version: crate::LATTICE_VERSION.to_string(),
                 format: FANN_FORMAT.to_string(),
                 architecture: format!("{FEATURE_COUNT}->1 linear; zero intercept"),
                 network_content_ref: network_ref.to_string(),

@@ -370,6 +370,13 @@ the Context section promises:
 Both legacy `[gate]` keys become inputs to a single import epoch and are inert
 afterward.
 
+> **Implementation status (2026-08-30):** The current runtime enforces these
+> two keys as a live static caller-enrollment policy on every boot. That closes
+> the unsafe accepted-but-unenforced configuration state, but it does **not**
+> implement this section: there is no store-held grant epoch, mutation surface,
+> or inert-after-import behavior yet. Until this ADR is implemented, a config
+> change followed by restart changes the active roster.
+
 - **The epoch is a store-held marker with a uniqueness constraint, written
   atomically with the imported records in one transaction.** First-boot
   detection keys on the marker's absence, never on "no caller-grant records

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, GateValidationError, Obligation,
+    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
+    GateDecision, GateError, GateRef, GateRequest, GateValidationError, Obligation,
 };
 use khive_types::Namespace;
 
@@ -29,6 +29,58 @@ fn allow_all_gate_through_dyn() {
     let gate: GateRef = Arc::new(AllowAllGate);
     let decision = gate.check(&sample_request()).unwrap();
     assert!(decision.is_allow());
+}
+
+#[test]
+fn caller_enrollment_gate_allows_only_listed_explicit_actors() {
+    let gate = CallerEnrollmentGate::new(vec!["lambda:enrolled".into()], false);
+    let enrolled = GateRequest::new(
+        ActorRef::new("actor", "lambda:enrolled"),
+        Namespace::local(),
+        "search",
+        serde_json::Value::Null,
+    );
+    let unlisted = GateRequest::new(
+        ActorRef::new("actor", "lambda:other"),
+        Namespace::local(),
+        "search",
+        serde_json::Value::Null,
+    );
+
+    assert!(gate.check(&enrolled).unwrap().is_allow());
+    assert!(matches!(
+        gate.check(&unlisted).unwrap(),
+        GateDecision::Deny { reason } if reason == "actor is not enrolled"
+    ));
+}
+
+#[test]
+fn caller_enrollment_gate_governs_anonymous_separately() {
+    let anonymous = sample_request();
+    let deny = CallerEnrollmentGate::new(vec!["local".into()], false);
+    let allow = CallerEnrollmentGate::new(Vec::new(), true);
+
+    assert!(matches!(
+        deny.check(&anonymous).unwrap(),
+        GateDecision::Deny { reason } if reason == "unattributed caller is not enrolled"
+    ));
+    assert!(allow.check(&anonymous).unwrap().is_allow());
+}
+
+#[test]
+fn caller_enrollment_gate_fingerprint_is_order_independent() {
+    let first = CallerEnrollmentGate::new(vec!["b".into(), "a".into(), "a".into()], false);
+    let second = CallerEnrollmentGate::new(vec!["a".into(), "b".into()], false);
+    let changed = CallerEnrollmentGate::new(vec!["a".into(), "b".into()], true);
+
+    assert_eq!(
+        first.configuration_fingerprint(),
+        second.configuration_fingerprint()
+    );
+    assert_ne!(
+        first.configuration_fingerprint(),
+        changed.configuration_fingerprint()
+    );
 }
 
 #[test]

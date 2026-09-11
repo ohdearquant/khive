@@ -10,8 +10,12 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "khive MCP server library — served via the kkernel binary"
+# The shared parser corpus is available only in a workspace checkout.
+exclude = ["tests/plan_conformance.rs"]
 
 [dependencies]
+khive-mounts = { version = "0.8.0", path = "../khive-mounts" }
+khive-pack-agent = { version = "0.8.0", path = "../khive-pack-agent" }
 khive-db = { version = "0.8.0", path = "../khive-db" }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
@@ -25,8 +29,11 @@ khive-pack-comm = { version = "0.8.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.8.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.8.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.8.0", path = "../khive-pack-session" }
+khive-pack-tool = { version = "0.8.0", path = "../khive-pack-tool" }
+khive-pack-exec = { version = "0.8.0", path = "../khive-pack-exec" }
 khive-pack-git = { version = "0.8.0", path = "../khive-pack-git" }
 khive-pack-code = { version = "0.8.0", path = "../khive-pack-code" }
+khive-pack-web = { version = "0.8.0", path = "../khive-pack-web" }
 khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.8.0", path = "../khive-pack-moodboard", optional = true }
 khive-pack-workspace = { version = "0.8.0", path = "../khive-pack-workspace" }
@@ -81,10 +88,16 @@ test-forward-seam = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fault-injection"] }
+khive-runtime = { version = "0.8.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
 khive-storage = { version = "0.8.0", path = "../khive-storage", features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.8.0", path = "../khive-pack-knowledge" }
-rusqlite = { workspace = true, features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled", "hooks"] }
+syn = { workspace = true, features = ["visit"] }
+
+[[test]]
+name = "mcp_mount_fixture"
+path = "../khive-mounts/tests/fixture.rs"
+harness = false

@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 20    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 24    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -27,16 +27,30 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 4     | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its four verbs are `git.digest` (read/ingest) plus three
-write verbs, `git.commit` / `git.branch` / `git.push` (ADR-108), that shell to system git
-with hardened, allowlisted argv construction.
+`kkernel git-ingest` CLI drive. Its sixteen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+stored ingest cursor and checkpoint for one project and source kind), the three
+write verbs `git.commit` / `git.branch` / `git.push` (ADR-108) that shell to system git
+with hardened, allowlisted argv construction, the three read verbs `git.status` /
+`git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
+`git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
+`git.pr_merge` (ADR-182). A remote `git.digest` source whose initial
+clone or fetch setup fails returns a typed `RemoteFetchError` naming the redacted remote
+to in-process callers; the MCP `request` envelope renders it as a plain error message
+rather than structured fields (ADR-088 Amendment 1, Remote-URL mode, point 5). A
+clone/fetch failure hit later while repairing an already-cached clone surfaces as
+`InvalidInput` only when the bounded refetch-then-reclone repair ultimately fails (a
+successful repair earns one more snapshot attempt, and the digest completes only when
+that attempt succeeds); a source that parses as neither a local path nor a remote URL
+is `InvalidInput` as well.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
@@ -60,9 +74,14 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
+`tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
+`tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
+keeps a namespace-scoped registry of tools, skills, plugins and verbs as kg entities, joins them to
+capability concepts with `implements` edges, and answers what a caller may call (ADR-180).
+
 Pack selection resolves as `--pack` > `KHIVE_PACKS` > discovered `[runtime].packs` > the
 built-in production set. With no non-empty selection at any of the first three layers, the
-default binary loads all 12 packs. Use `verbs()` for the current aggregate rather than carrying
+default binary loads all 14 packs. Use `verbs()` for the current aggregate rather than carrying
 a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
@@ -187,7 +206,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 20 verbs
+## `kg` pack — 24 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -223,7 +242,7 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 ### `get` — Assertive
 
-Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
+Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
 | Param             | Type | Required | Notes                                                                  |
 | ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
@@ -463,6 +482,51 @@ operation is `ok: false` with `error.kind="search_incomplete"`; the structured
 error carries the same diagnostics. `backend_errors_truncated` plus
 `backend_errors_omitted` explicitly report causes omitted by safety bounds.
 
+Every successful KG search also carries `arm_participation` beside `result`;
+`search_incomplete` carries the same object inside `error`:
+
+```json
+{
+  "arm_participation": {
+    "text": { "status": "ran", "candidate_count": 0 },
+    "vector": { "status": "ran", "candidate_count": 8 }
+  }
+}
+```
+
+Each arm status is `ran`, `skipped`, or `error`. `ran` with zero candidates
+means that arm completed but contributed no final hit; `skipped` means it was
+not selected (for example, vector search without a configured embedding model);
+and `error` means that arm itself failed on at least one backend where it was
+selected — including a backend whose _other_ arm completed normally. A backend
+whose text leg completes and whose vector leg alone fails is therefore not
+"missing": it still contributed usable text hits, so it does not appear in
+`missing_backends` or `backend_errors`, and the response keeps
+`status: "complete"`. `arm_participation.vector.status` is the only place that
+failure surfaces on such a response — `text` still reports `"ran"`. A response
+is `"partial"` (with `missing_backends`/`backend_errors`) only when a whole
+backend's search failed outright — auth, timeout, or a failed text leg — not
+merely one of its arms. On such degraded responses, the bounded reason stays in
+`backend_errors`; its `kind` is the single constant `backend_error` in v0.8.0,
+and the two-value `timeout | backend_error` vocabulary of ADR-130 Amendment 2
+ships in v0.9.0. Arm entries do not duplicate those messages. `candidate_count`
+counts final hits
+whose `source` includes the arm, after server filters and the result limit, so a
+`both` hit increments both counts and each count is bounded by `limit`.
+
+This per-arm tolerance applies to the coordinated multi-backend search path,
+for both entity and note substrates. A single-backend deployment (the
+default — no coordinator installed) has no per-backend fan-out to isolate a
+failing arm from: a vector-arm failure there fails the whole search call, and
+the response carries no `arm_participation` at all.
+
+For an entity-name presence check, issue the short bare canonical name and
+require the matching row itself to report `source: "text"` or `"both"`. An
+all-vector response, or text-arm status `error`/`skipped`, is not evidence that
+the name is absent. Long keyword-dense queries may legitimately report text
+`ran` with `candidate_count: 0` because the lexical expression is selective;
+the explicit arm evidence makes that different from a silent skip or failure.
+
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
 ```json
@@ -522,7 +586,7 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors.
+Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
@@ -773,9 +837,16 @@ request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 
 ### `whoami` — Assertive
 
-Report the caller identity and namespace scope the runtime already resolved for this request.
-It takes no parameters and returns only identity labels, never tokens or credentials:
-`{actor_id, actor_kind, unattributed, namespace, visible_namespaces}`.
+Report the caller identity and namespace scope the runtime already resolved for this request,
+plus the serving process's build identity. It takes no parameters and never returns tokens or
+credentials: `{actor_id, actor_kind, unattributed, namespace, visible_namespaces, build: {version, revision}}`.
+
+`build.version` is the package version; `build.revision` is the source revision shown by that
+process's `kkernel --version`, including any `-dirty` suffix or the explicit `unstamped` fallback.
+These compile-time values share the source used by `db_diagnostics().build`; diagnostics calls
+the optional revision field `build_hash` and reports it as null for an unstamped build.
+Use `whoami()` for a lightweight build-identity probe: its handler reads existing token state
+and immutable build metadata without invoking database diagnostics or a checkpoint probe.
 
 ```
 request(ops="whoami()")
@@ -783,9 +854,30 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics for the main
-database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal`
-sidecar file size, and a WAL-pin holder census. Takes no parameters.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
+main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+`-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
+Takes no parameters.
+
+`reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
+reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
+configured total budget and its point-in-time availability; pooled reads and the explicit
+raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the sum of
+`pooled_reader_checkouts` and request-path `standalone_reader_opens`, while
+`infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
+must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
+exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
+`completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
+and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
+`reader_replacement_open_failures` counts a disqualified pooled-reader return whose replacement
+connection then also failed to open, permanently shrinking the physical pool by one slot below
+`max_readers`; non-zero here means the pool has fewer physical reader connections than
+configured, and each occurrence is also logged at `warn`.
+
+The timeout setting applies to each admission attempt. A verb that issues several sequential
+reads can spend more than one configured timeout in total wall time, but each attempt is bounded
+and saturation never falls back to opening a standalone connection.
 
 `writer_contention` contains monotonic counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
@@ -794,7 +886,13 @@ finite-wait main-pool mutex checkouts, the second counts successful per-operatio
 standalone writer opens, and the third counts dequeued writer-task requests that acquired its
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
-executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+executes; SQLite `BEGIN`/statement failures are separate stages.
+`writer_task_begin_busy` counts every busy/locked `BEGIN IMMEDIATE` refusal, matching its
+pre-retry meaning: a nonzero value reflects total contention regardless of retry policy.
+`writer_task_begin_busy_absorbed` is a subset of it — refusals a bounded pre-execution retry
+absorbed before the request closure ran, so the caller never observed them. A refusal not
+absorbed by a retry also surfaces to the caller as the typed, retryable `writer_task_begin_busy`
+stage. The request closure is never retried. `audit_append_failures` counts
 process-wide best-effort audit appends whose storage error was logged and swallowed —
 pure-observability rows only. An obligation-bearing row's commit failure (a dispatch outcome, an
 unknown-verb row, a `git.digest` receipt, or a gate denial's own audit row) is never counted here:
@@ -817,7 +915,8 @@ neither is ever `null`.
 `audit_batch_flush_failures`, `audit_degraded_rows`, and `audit_degraded` are additive fields
 supplied by the runtime's audit-batch control once one is registered: accepted batch generations
 that reached a terminal non-commit outcome after retry, pure-observability rows released without a
-commit, and a monotonic process-lifetime degradation flag, respectively. Each carries a matching
+commit, and a monotonic process-lifetime degradation flag that either of the first two sets,
+respectively. Each carries a matching
 `_unavailable_reason` field and reports `null` — never a fabricated `0`/`false` — for a direct
 `khive-db` caller or a runtime with no audit-batch control registered.
 
@@ -853,9 +952,21 @@ deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded
 `unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
 `unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
 holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
-`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are cleanup-enumeration
-measurements: this request deliberately does not run that mutating enumeration, so both fields are
-omitted rather than reporting fabricated `false`/`0` values.
+The holder census is reconciled with a separate, bounded, read-only sidecar pass. A complete census
+and conclusive sidecar walk can therefore produce `wal_pin.status: "complete"`; truncated walks,
+unknown sidecar identities, and OS-confirmed holders missing sidecar evidence degrade explicitly.
+`sidecar_listing_truncated` and `sidecar_entries_cleanup_would_reap` are measured by that pass. The
+latter is a forecast: diagnostics never performs the cleanup it reports.
+
+`size_composition` accounts SQLite pages by individual table or index using aggregate `dbstat`.
+It reports file-wide page/freelist/accounted/unaccounted byte totals plus operational class totals
+for ordinary row tables, indexes, FTS storage, vector storage, mixed row-and-embedding tables, and
+SQLite internal objects. A table that stores both ordinary columns and an `embedding BLOB` is kept
+in `mixed_embedding_bytes`: SQLite cannot attribute bytes within a shared page to one column, so
+the field is an upper bound for the embedding-bearing table, not a fabricated pure-vector byte
+count. Object detail is deterministic and capped at 4,096 rows; `objects_truncated` and
+`objects_omitted` make cap pressure explicit while the aggregate class totals still cover every
+object returned by `dbstat`. `size_composition_error` explains an unavailable report.
 
 `graph_edge_integrity` reports `duplicate_edge_id_groups`, `graph_edges_rows`,
 `graph_edges_seq_rows`, and `pre_v14_duplicate_edge_state_detected`. A non-zero duplicate group
@@ -1116,16 +1227,48 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 `truncated` is `true`, these sums are computed over the fetched page only, same as the other
 `counts_by_*` fields.
 
-| Param   | Type   | Required | Notes                                                                                                                                                       |
-| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
-| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
+| Param        | Type   | Required | Notes                                                                                                                                                                                                                                                                                                                                      |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `since`      | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                                                                                                                                                                                                       |
+| `until`      | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                                                                                                                                                                                                        |
+| `actor`      | string | no       | Defaults to the authorized caller. A filter prefixed with `actor:`, `anonymous:`, or `agent:` matches a stored label exactly. Self access compares kind and id; foreign access checks the raw id for `actor:` and the full label for other reserved kinds against the caller's visible set. Other filters match bare and canonical labels. |
+| `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                                                                                                            |
+| `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                                                                                                     |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
 ```
+
+For an actor of kind `actor`, the canonical stored label is `actor:` followed by
+the unmodified raw principal id, prepending the prefix exactly once. The default
+scope also matches a historical bare alias only when the raw id does not begin
+with any prefix reserved by `RUNTIME_STAMPED_ACTOR_KINDS`: `actor:`, `anonymous:`,
+or `agent:`. Such prefixed ids match only their canonical stored label. The default
+`counts_by_actor` combines the permitted spellings under one caller-label key, or
+has no keys when no events match. Other actor kinds match their exact caller label.
+Explicit `actor` and `all_actors=true` reads preserve stored actor keys. The caller
+label is the actor id for kind `actor`, otherwise `kind:id`; an anonymous caller
+therefore defaults to `anonymous:local`. A visible foreign actor is readable only
+when explicitly requested. An allowlisted aggregate reader also defaults to its
+own events unless it supplies `all_actors=true`. Client-local configuration cannot
+grant aggregate access on a serving daemon.
+
+For example, principal id `actor:caller-a` writes `actor:actor:caller-a` and uses
+`actor="actor:actor:caller-a"` for an explicit self read. The filter
+`actor="actor:caller-a"` instead selects the canonical label for principal
+`caller-a`, requiring visibility of that identity even when the filter equals
+the caller's raw id. Likewise, a named principal with id `anonymous:local` uses
+`actor="actor:anonymous:local"` for an explicit self read; the exact filter
+`actor="anonymous:local"` selects the anonymous principal and requires visibility
+of that full label. Prefix parsing happens once, and self access compares the
+token's kind and id rather than its collapsed caller label.
+
+The reserved-kind list is shared with the gate's `ActorRef` definition, not a
+closed kind enum. Custom kinds outside that list are not covered by the
+historical-alias separation guarantee. A new runtime-stamped kind must be added
+to the shared list and covered by per-kind event-count tests. See
+[configuration](../configuration.md#brain-read-scope) and
+[ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
 
 ### `brain.profiles` — Assertive
 
@@ -1155,15 +1298,20 @@ request(ops="brain.profile(profile_id=\"implementer-recall-v1\")")
 
 Show which profile would serve a caller context.
 
-| Param           | Type   | Required | Notes                                                        |
-| --------------- | ------ | -------- | ------------------------------------------------------------ |
-| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`). |
-| `actor`         | string | no       | Default `*` (wildcard match).                                |
-| `namespace`     | string | no       | Default `*` (wildcard match).                                |
+| Param           | Type   | Required | Notes                                                                                                       |
+| --------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `consumer_kind` | string | yes      | Verb/operation type about to be performed (e.g. `"recall"`).                                                |
+| `actor`         | string | no       | Defaults to the authorized caller. An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       | Default `*` (wildcard match).                                                                               |
 
 ```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
+request(ops="brain.resolve(consumer_kind=\"recall\")")
 ```
+
+Resolution retains wildcard binding fallback. For anonymous callers, an omitted
+actor remains wildcard-only and does not match explicit `local` or
+`anonymous:local` bindings. An explicit caller label is permitted; other actor ids
+require visibility. There is no `all_actors` resolution mode.
 
 ### `brain.activate` — Commissive
 
@@ -1237,17 +1385,17 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit caller-attributed feedback for one recall result — the convenience verb to call
 right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required    | Notes                                                                  |
-| ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
-| `query`                | string | yes         | The recall query that produced the results.                            |
-| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
-| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
-| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
-| `served_by_profile_id` | string | no          | Profile that served the recall.                                        |
-| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.       |
-| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
-| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
-| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail. |
+| Param                  | Type   | Required    | Notes                                                                                                                                                                            |
+| ---------------------- | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`                | string | yes         | The recall query that produced the results.                                                                                                                                      |
+| `results`              | array  | yes         | Recall result objects retained as candidate context: objects with an `id` field (result UUID or compact id) and optionally `served_by_profile_id`; bare id strings are rejected. |
+| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.                                                                                                                  |
+| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.                                                                                                                        |
+| `served_by_profile_id` | string | no          | Profile that served the recall.                                                                                                                                                  |
+| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.                                                                                                                 |
+| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.                                                                                                            |
+| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.                                                                                                              |
+| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail.                                                                                                           |
 
 Top-level serve-attribution fields are one pair and take precedence over the selected
 result's pair. If neither top-level field is supplied, both fields are copied from the
@@ -1308,20 +1456,29 @@ Remove rows from the profile resolution table. At least one filter is required.
 request(ops="brain.unbind(actor=\"role:implementer\")")
 ```
 
+The result includes `removed`, the number of matching bindings deleted. A successful
+request that matched nothing returns `removed: 0`. The legacy `unbound` field carries
+the same count for compatibility.
+
 ### `brain.bindings` — Assertive
 
-List rows in the profile resolution table, optionally filtered.
+List the authorized caller's rows in the profile resolution table, optionally
+narrowed by profile, namespace, and consumer kind. The actor filter matches exact
+binding rows; wildcard fallback belongs to profile resolution, not this listing.
 
-| Param           | Type   | Required | Notes |
-| --------------- | ------ | -------- | ----- |
-| `profile_id`    | string | no       |       |
-| `actor`         | string | no       |       |
-| `namespace`     | string | no       |       |
-| `consumer_kind` | string | no       |       |
+| Param           | Type   | Required | Notes                                                                                                                                              |
+| --------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `profile_id`    | string | no       |                                                                                                                                                    |
+| `actor`         | string | no       | Defaults to the caller label (`anonymous:local` for an anonymous caller). An explicit foreign actor must be in the caller's visible namespace set. |
+| `namespace`     | string | no       |                                                                                                                                                    |
+| `consumer_kind` | string | no       |                                                                                                                                                    |
 
 ```
 request(ops="brain.bindings(consumer_kind=\"recall\")")
 ```
+
+The caller's own label is always permitted as an explicit actor filter. There is
+no `all_actors` binding-list mode.
 
 ### `brain.create_profile` — Declaration
 
@@ -1409,9 +1566,12 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 List and page through the caller's filtered inbound messages (default) or sent
 history (`box="sent"`).
-The response keeps the inbox envelope. `unread_count` is the exact mailbox-wide
-unread count for the caller — independent of the page window and of `status`
-and sender filters — and is zero for sent rows.
+The response keeps the inbox envelope and adds explicit bounded-count metadata.
+`unread_count` is the mailbox-wide unread count for the caller — independent of
+the page window and of `status` and sender filters — and is exact below
+`unread_count_cap` (1,000). When `unread_count_saturated` is `true`, the count
+equals the cap and means "at least this many"; `false` means it is exact. Sent
+rows report zero and `false`.
 With `wait_ms`, an initially empty fully filtered page waits for a newly
 committed matching message and otherwise returns at the deadline.
 
@@ -1460,6 +1620,9 @@ are errors. Omit it for the existing full-body response.
 
 Count-only view of the caller's unread inbound messages — the same filter as
 `comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+Returns `{count, count_cap, count_saturated, actor}` with the same 1,000-row
+bound as the inbox metadata: `count_saturated=false` is exact, while `true`
+means `count == count_cap` is a lower bound.
 
 ```
 request(ops="comm.unread()")
@@ -1470,8 +1633,12 @@ request(ops="comm.unread()")
 Compatibility mark-read surface for one or more inbound messages. It does not retrieve message
 content; use `comm.inbox` or `comm.thread` for that. Outbound messages cannot be marked read. Mark writes
 are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
-remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
-single or bulk result and re-issue failures later.
+remain fatal, but a post-read mark failure returns `status: "failed"`, `read: false`, and
+`mark_error`. A write whose execution seam terminated after being accepted (so it may already
+have applied) instead returns `status: "unknown"`, `read: null`, and `mark_error` — check the
+message's current state through `comm.inbox` before re-issuing; re-issuing is safe, since marking
+a message read is idempotent. Successful items carry `status: "success"`; inspect each result and
+re-issue failures (or unresolved unknowns) later.
 
 | Param | Type            | Required    | Notes                                                                   |
 | ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
@@ -1484,8 +1651,9 @@ request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
 
 Exactly one of `id` or `ids` is required. The bulk response contains ordered
-`results` plus `requested_count`, `unique_count`, `marked_count`, and
-`failed_count`. Bulk updates are not atomic across messages: validation errors
+`results` plus `requested_count`, `unique_count`, `marked_count`, `unknown_count`, and
+`failed_count`, with aggregate `status=success|partial|failed|unknown`. Bulk updates are not atomic
+across messages: validation errors
 reject the call before any write, while later storage errors appear in each
 item's `read` and optional `mark_error`.
 
@@ -1613,11 +1781,11 @@ Time-triggered reminders and deferred verb dispatch. Optional; load with
 
 Create a time-triggered reminder.
 
-| Param     | Type   | Required | Notes                                                                                                 |
-| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `content` | string | yes      | Non-empty reminder message.                                                                           |
-| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                 |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
+| Param     | Type   | Required | Notes                                                                                                |
+| --------- | ------ | -------- | ---------------------------------------------------------------------------------------------------- |
+| `content` | string | yes      | Non-empty reminder message.                                                                          |
+| `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, `every:<N><s\|m\|h\|d>` (e.g. `every:15m`), or five-field cron in UTC. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -1713,17 +1881,31 @@ request(ops="knowledge.get(id=\"rope\", include_sections=true)")
 
 ### `knowledge.list` — Assertive
 
-Paginated listing of atoms or domains.
+Paginated listing of atoms or domains. Offset pages are ordered by
+`created_at DESC, id DESC`. For stable full-store traversal, start cursor mode
+with `after=""`, then reuse each non-null `next_after`; cursor pages are ordered
+by `created_at ASC, id ASC` and are not shifted by concurrent inserts.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `type`   | string  | no       | `atom`\|`domain` (default `atom`). |
-| `limit`  | integer | no       | Default 20, max 500.               |
-| `offset` | integer | no       | Pagination offset.                 |
+| Param            | Type            | Required | Notes                                                                                                                       |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `type`           | string          | no       | `atom`\|`domain` (default `atom`).                                                                                          |
+| `limit`          | integer         | no       | Default 20, max 500.                                                                                                        |
+| `offset`         | integer         | no       | Legacy offset pagination; mutually exclusive with `after`.                                                                  |
+| `after`          | string          | no       | `""` starts keyset mode; otherwise the full UUID from `next_after`. Missing, wrong-type, and out-of-namespace cursors fail. |
+| `fields`         | array\<string\> | no       | Strict non-empty projection. Use `["id","slug"]` for a key-only walk; unrequested content is not selected from storage.     |
+| `status`         | string/array    | no       | Atom status filter. Reuse it throughout a cursor walk.                                                                      |
+| `exclude_status` | string          | no       | Atom exclusion filter when `status` is absent. Reuse it throughout a cursor walk.                                           |
 
 ```
 request(ops="knowledge.list(type=\"domain\", limit=50)")
+request(ops="knowledge.list(type=\"atom\", fields=[\"id\",\"slug\"], after=\"\", limit=500)")
 ```
+
+Cursor traversal is live, not a snapshot. Inserts behind an issued boundary
+belong to a fresh walk; inserts ahead may extend the current walk. Existing
+rows are not shifted, skipped, or duplicated. Responses include machine-readable
+`order` and, in cursor mode, `next_after`. Stop when `next_after` is null;
+cursor pages carry no `total` (counting is a full scan per page), offset pages do.
 
 ### `knowledge.delete_atoms` — Commissive
 
@@ -1747,11 +1929,17 @@ request(ops="knowledge.stats()")
 
 ### `knowledge.index` — Commissive
 
-Backfill embeddings + FTS for atoms/domains.
+Backfill atom embeddings.
 
 The response includes `truncation_by_model`, keyed by every model that completed embedding work.
-Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
-outcomes; atom source content remains complete in SQL and FTS.
+Each truncation value contains `truncated` and `discarded_bytes` counters derived from the actual
+embedding outcomes; atom source content remains complete in SQL and FTS.
+
+This verb does not rebuild the FTS indexes. Rebuilding `fts_knowledge`/`fts_sections` is a
+whole-database operation independent of the caller's namespace, and the ordinary verb has no
+per-caller cost admission to bound it, so that rebuild is reachable only through the
+`kkernel reindex` operator CLI (`--rebuild-fts`), which reports the indexes rebuilt, elapsed
+time, and the rank-1 integrity-check outcome.
 
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
@@ -2032,7 +2220,54 @@ request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
 
 ---
 
-## `git` pack — 4 verbs
+## `exec` tree manifests
+
+The exec pack uses immutable `khive-tree/v1` manifests, also consumed by Git tree
+operations. See [ADR-181](../adr/ADR-181-exec-verb-sandboxed-run.md) for run and
+sandbox semantics.
+
+### `exec.tree`, `exec.tree_get`, `exec.tree_put`, `exec.tree_diff`
+
+| Verb             | Parameters                                                      | Result                           |
+| ---------------- | --------------------------------------------------------------- | -------------------------------- |
+| `exec.tree`      | `entries: [{path, ref, mode}]`                                  | `{tree}`                         |
+| `exec.tree_get`  | `tree`                                                          | `{tree, entries}`                |
+| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?}]` | `{tree, base, entries, changed}` |
+| `exec.tree_diff` | `base`, `head`                                                  | `{base, head, changed}`          |
+
+Entry modes are decimal `644` (file), `755` (executable file) or `120000`
+(symlink). A symlink's blob holds its literal target bytes, without an added
+newline or normalization. Entry paths must be relative and normalized, with no
+duplicates or entries below a file or symlink path. Empty `entries` is an empty
+tree. The schema string remains `khive-tree/v1`; existing file-only manifests
+remain valid.
+
+A put edit supplies exactly one of `ref`, `content` (UTF-8 text), or
+`delete: true`. Use `ref` for arbitrary target bytes. Its optional mode preserves
+an existing mode or defaults to `644` for a new path; deletes cannot carry a mode.
+Retargeting a link or switching between a symlink and a file is `modified`.
+Unsupported modes, duplicate edit paths and deletion of a missing path refuse
+the call without publishing a new tree.
+
+`exec.run` materializes real symlinks, including absolute or escaping targets.
+Seatbelt constrains access to resolved targets; `declared_write_paths` names
+tree-relative paths and does not expand sandbox access. Capture records link
+targets without following them, never descends through directory symlinks, and
+reports link additions, retargeting, removal and mode changes in `changed`.
+Sockets, FIFOs and devices remain skipped.
+
+`git.diff(input_kind="trees")` preserves symlink mode `120000` and target blobs,
+so its patches use Git's native symlink and file-conversion representation.
+This does not change the separate `git.checkout` symlink-refusal contract.
+
+---
+
+## `git` pack — 16 verbs
+
+The entries below cover the ingest and write surface; the dev-loop verbs
+(`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`) are specified in
+ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
 [ADR-088 Amendment 1](../adr/ADR-088-amendment-1-git-digest.md),
@@ -2135,6 +2370,13 @@ observed 300,000 ms bound is the MCP client's request default, so large
 `max_items` values can outlive a particular caller's wait while the daemon
 continues the pass. The durable receipt is the recovery contract; the item
 bound is not silently clamped to a transport-specific duration.
+
+### `git.ingest_cursor` — Assertive
+
+Reads the stored ingest cursor and checkpoint for a `project` and source kind in one
+snapshot. Values are exact opaque strings, not a completion receipt or a guarantee of
+resumability; oversized values are explicitly omitted. No ingest, remote access, or cursor
+writes (ADR-088 Amendment 1).
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
@@ -2300,3 +2542,57 @@ request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+
+## `tool` pack — 13 verbs
+
+Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
+`tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges
+(ADR-180). Every decision answer carries `decision` (`allow`, `deny`, `ask`), `source` (`grant`,
+`policy`, `default`) and the row id it came from.
+
+### `tool.register` — Commissive
+
+`tool.register(name, kind="tool", description, schema, source, side_effect="write", trust="external", capabilities=[], tags=[])`.
+Creates the object or returns the existing one by name (`created: false`); capabilities are created when
+absent and linked.
+
+### `tool.ingest` — Commissive
+
+`tool.ingest(source="khive")` registers every loaded verb under `khive:<pack>` with one capability per
+pack; `tool.ingest(source="mcp", server, tools=[...])` registers an MCP `tools/list` payload under
+`mcp:<server>`. Returns `registered` and `existing` counts.
+
+### `tool.suggest` — Assertive
+
+`tool.suggest(query, limit=10, kind, actor)`: hybrid search over the registry merged with capability
+concepts expanded through `implements`; each hit carries `score`, `via` (capability names) and the
+caller's `decision`.
+
+### `tool.describe` / `tool.list` — Assertive
+
+`tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
+`tool.list(kind, limit=100, offset=0)` pages the registry.
+
+### `tool.check` — Assertive
+
+`tool.check(tool, actor)`: active grant, then the most specific matching policy (`deny` over `ask` over
+`allow` on ties), then the default (`allow` for `read` side effects, `ask` otherwise and for unregistered
+names).
+
+### `tool.request` — Directive
+
+`tool.request(tool, actor, scope, reason, notify)`: returns the decision with `request_id: null` when
+already allowed; otherwise inserts a `requested` row and, when `notify` names an actor and the comm pack
+is loaded, mails it.
+
+### `tool.grant` / `tool.deny` / `tool.revoke` — Declaration
+
+`tool.grant(id, expires_in_s, note)` from `requested` or `denied`; `tool.deny(id, note)` from
+`requested` or `granted`; `tool.revoke(id, note)` from `granted`. Any other transition is refused with the
+current status. A requester cannot grant its own request.
+
+### `tool.requests` / `tool.policy` / `tool.policies`
+
+`tool.requests(status, actor, tool, limit=50)` lists grant rows; `tool.policy(actor, tool, decision, note)`
+stores a rule where `actor` and `tool` are exact labels, trailing-`*` prefixes or `*`;
+`tool.policies(actor, limit=100)` lists rules.

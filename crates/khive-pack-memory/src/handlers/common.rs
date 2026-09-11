@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,8 +32,52 @@ use crate::MemoryPack;
 /// engine-failure isolation (ADR-031) without a real ANN or sqlite-vec outage.
 #[cfg(test)]
 pub(super) mod retrieval_failpoints {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct AnnBuildHookState {
+        entered: Notify,
+        release: Notify,
+        completed: Notify,
+    }
+
+    /// RAII guard for one model's detached ANN build. Dropping the guard always
+    /// releases a held task and unregisters the hook so a failed test cannot
+    /// strand later tests in the same process.
+    pub struct AnnBuildHook {
+        model: String,
+        state: Arc<AnnBuildHookState>,
+    }
+
+    impl AnnBuildHook {
+        pub async fn wait_entered(&self) {
+            self.state.entered.notified().await;
+        }
+
+        pub fn release(&self) {
+            self.state.release.notify_one();
+        }
+
+        pub async fn wait_completed(&self) {
+            self.state.completed.notified().await;
+        }
+    }
+
+    impl Drop for AnnBuildHook {
+        fn drop(&mut self) {
+            self.release();
+            let mut hooks = ann_build_hooks().lock().unwrap();
+            let owns_entry = hooks
+                .get(&self.model)
+                .is_some_and(|state| Arc::ptr_eq(state, &self.state));
+            if owns_entry {
+                hooks.remove(&self.model);
+            }
+        }
+    }
 
     fn ann() -> &'static Mutex<HashSet<String>> {
         static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -43,6 +87,42 @@ pub(super) mod retrieval_failpoints {
     fn vec() -> &'static Mutex<HashSet<String>> {
         static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         S.get_or_init(Default::default)
+    }
+
+    fn ann_build_hooks() -> &'static Mutex<HashMap<String, Arc<AnnBuildHookState>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<AnnBuildHookState>>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    pub fn hold_ann_build(model: &str) -> AnnBuildHook {
+        let state = Arc::new(AnnBuildHookState::default());
+        match ann_build_hooks().lock().unwrap().entry(model.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("detached ANN build hook already installed for {model}")
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&state));
+            }
+        }
+        AnnBuildHook {
+            model: model.to_owned(),
+            state,
+        }
+    }
+
+    pub(super) async fn before_ann_build(model: &str) {
+        let hook = ann_build_hooks().lock().unwrap().get(model).cloned();
+        if let Some(hook) = hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+    }
+
+    pub(super) fn after_ann_build(model: &str) {
+        let hook = ann_build_hooks().lock().unwrap().get(model).cloned();
+        if let Some(hook) = hook {
+            hook.completed.notify_one();
+        }
     }
 
     pub fn fail_ann(model: &str) {
@@ -266,6 +346,7 @@ pub(super) fn balanced_recall_state_from_profile_response(
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
     pub(super) content: String,
+    pub(super) key: Option<String>,
     pub(super) memory_type: Option<String>,
     pub(super) salience: Option<f64>,
     #[serde(alias = "decay")]
@@ -303,6 +384,19 @@ pub(super) fn note_matches_tags(props: Option<&Value>, expected: &[String], mode
     }
 }
 
+/// True when the note's stored tags include any of `excluded`. A note without
+/// tags is never excluded.
+pub(super) fn note_has_any_tag(props: Option<&Value>, excluded: &[String]) -> bool {
+    let Some(stored) = props
+        .and_then(|p| p.get("tags"))
+        .and_then(|tags| tags.as_array())
+    else {
+        return false;
+    };
+    let stored: HashSet<&str> = stored.iter().filter_map(Value::as_str).collect();
+    excluded.iter().any(|tag| stored.contains(tag.as_str()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RecallParams {
@@ -323,6 +417,15 @@ pub(super) struct RecallParams {
     pub(super) tags: Option<Vec<String>>,
     #[serde(default)]
     pub(super) tag_mode: TagMode,
+    /// Drop memories whose stored tags include any of these values. Applied
+    /// after `tags`/`tag_mode` and before ranking and `limit`, so a run can
+    /// recall everything except its own writes.
+    #[serde(default)]
+    pub(super) exclude_tags: Option<Vec<String>>,
+    /// When true every hit carries `source_id`: the target of the memory's
+    /// `annotates` edge, or null when the memory has none.
+    #[serde(default)]
+    pub(super) include_source_id: Option<bool>,
     /// Entity names to boost in scoring.
     #[serde(default)]
     pub(super) entity_names: Option<Vec<String>>,
@@ -477,6 +580,79 @@ pub(super) fn make_pipeline(cfg: &RecallConfig) -> MemoryRecallPipeline {
 /// that failure-site reason and falls back to this label only if it is absent.
 pub(super) const ANN_DEGRADED_REASON: &str = "ann_unavailable";
 
+/// Wall time attributed to the named retrieval stages of one completed
+/// recall. FTS and the vector arm run concurrently, so these fields are not
+/// additive. Sequential outer widening rounds are accumulated; concurrent
+/// embedding models contribute the maximum ANN/fresh-tail duration rather
+/// than summing work that happened in parallel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RecallStageTimings {
+    embed: Duration,
+    fts: Duration,
+    ann: Duration,
+    fresh_tail: Duration,
+    hydrate: Duration,
+}
+
+impl RecallStageTimings {
+    pub(super) fn add_retrieval_round(&mut self, round: Self) {
+        self.embed = self.embed.saturating_add(round.embed);
+        self.fts = self.fts.saturating_add(round.fts);
+        self.ann = self.ann.saturating_add(round.ann);
+        self.fresh_tail = self.fresh_tail.saturating_add(round.fresh_tail);
+    }
+
+    pub(super) fn add_hydration(&mut self, elapsed: Duration) {
+        self.hydrate = self.hydrate.saturating_add(elapsed);
+    }
+
+    fn record_parallel_model(&mut self, ann: Duration, fresh_tail: Duration) {
+        self.ann = self.ann.max(ann);
+        self.fresh_tail = self.fresh_tail.max(fresh_tail);
+    }
+
+    pub(super) fn embed_ms(self) -> u64 {
+        duration_millis(self.embed)
+    }
+
+    pub(super) fn fts_ms(self) -> u64 {
+        duration_millis(self.fts)
+    }
+
+    pub(super) fn ann_ms(self) -> u64 {
+        duration_millis(self.ann)
+    }
+
+    pub(super) fn fresh_tail_ms(self) -> u64 {
+        duration_millis(self.fresh_tail)
+    }
+
+    pub(super) fn hydrate_ms(self) -> u64 {
+        duration_millis(self.hydrate)
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_millis_for_test(
+        embed: u64,
+        fts: u64,
+        ann: u64,
+        fresh_tail: u64,
+        hydrate: u64,
+    ) -> Self {
+        Self {
+            embed: Duration::from_millis(embed),
+            fts: Duration::from_millis(fts),
+            ann: Duration::from_millis(ann),
+            fresh_tail: Duration::from_millis(fresh_tail),
+            hydrate: Duration::from_millis(hydrate),
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 pub(super) struct RecallCandidateSet {
     pub(super) namespace: String,
     pub(super) text_hits: Vec<TextSearchHit>,
@@ -492,6 +668,7 @@ pub(super) struct RecallCandidateSet {
     /// model degraded. Surfaced on empty degraded responses so they are
     /// distinguishable from a genuine no-match.
     pub(super) ann_degraded_reason: Option<String>,
+    pub(super) timings: RecallStageTimings,
 }
 
 impl RecallCandidateSet {
@@ -575,6 +752,7 @@ pub(super) struct RecallVectorCandidateResult {
     /// #1657: the first degraded model's failure-site reason; `None` when no
     /// model degraded.
     pub(super) ann_degraded_reason: Option<String>,
+    timings: RecallStageTimings,
 }
 
 pub(super) fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
@@ -821,6 +999,7 @@ impl MemoryPack {
                     filter: Some(TextFilter {
                         namespaces: namespaces.to_vec(),
                         kinds: vec![SubstrateKind::Note],
+                        record_kinds: vec!["memory".to_string()],
                         ..TextFilter::default()
                     }),
                     top_k: candidate_limit,
@@ -870,15 +1049,21 @@ impl MemoryPack {
             .collect();
         let primary_ns = token.namespace().as_str().to_string();
 
-        let text_fut = self.collect_recall_text_hits(
-            token,
-            query,
-            &visible,
-            candidate_limit,
-            snippet_policy,
-            cjk_fts_bypass,
-            fts_gather,
-        );
+        let text_fut = async {
+            let started = Instant::now();
+            let hits = self
+                .collect_recall_text_hits(
+                    token,
+                    query,
+                    &visible,
+                    candidate_limit,
+                    snippet_policy,
+                    cjk_fts_bypass,
+                    fts_gather,
+                )
+                .await?;
+            Ok::<_, RuntimeError>((hits, started.elapsed()))
+        };
         let vector_fut = self.collect_recall_vector_hits(
             token,
             query,
@@ -891,7 +1076,9 @@ impl MemoryPack {
                 ann_ready_timeout_ms,
             },
         );
-        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        let ((text_hits, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        let mut timings = vector_result.timings;
+        timings.fts = fts_elapsed;
         khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
@@ -900,6 +1087,7 @@ impl MemoryPack {
             visible_namespaces: visible,
             ann_degraded: vector_result.ann_degraded,
             ann_degraded_reason: vector_result.ann_degraded_reason,
+            timings,
         })
     }
 
@@ -934,6 +1122,7 @@ impl MemoryPack {
         let call_id = PROF_CID.with(|c| c.get());
 
         let mut ann_degraded = false;
+        let mut timings = RecallStageTimings::default();
         // #1657: first degraded model's failure-site reason, propagated so an
         // empty degraded response can cite it verbatim.
         let mut ann_degraded_reason: Option<String> = None;
@@ -946,7 +1135,8 @@ impl MemoryPack {
         let vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)> = if model_names.is_empty() {
             vec![]
         } else {
-            let t_embed = if prof { Some(Instant::now()) } else { None };
+            let embed_started = Instant::now();
+            let t_embed = if prof { Some(embed_started) } else { None };
             let query_vecs: Vec<(String, Vec<f32>)> = match model_names.len() {
                 1 => {
                     let m = model_names.into_iter().next().unwrap();
@@ -1032,6 +1222,7 @@ impl MemoryPack {
                     collect_embed_results(named_results)?
                 }
             };
+            timings.embed = embed_started.elapsed();
 
             if prof {
                 if let Some(t) = t_embed {
@@ -1162,6 +1353,7 @@ impl MemoryPack {
             };
 
             for r in &per_model_results {
+                timings.record_parallel_model(r.ann_elapsed, r.fresh_tail_elapsed);
                 if r.degraded {
                     ann_degraded = true;
                     if ann_degraded_reason.is_none() {
@@ -1197,6 +1389,7 @@ impl MemoryPack {
             vector_hits_per_model,
             ann_degraded,
             ann_degraded_reason,
+            timings,
         })
     }
 
@@ -1268,6 +1461,10 @@ pub(super) struct PerModelAnnHits {
     pub(super) degraded_reason: Option<String>,
     /// This model fell through to the exact sqlite-vec scan instead of warm ANN.
     used_sqlite_vec_fallback: bool,
+    /// Time spent in ANN readiness/search/widening or exact sqlite-vec work,
+    /// excluding the separately measured fresh-tail leg.
+    ann_elapsed: Duration,
+    fresh_tail_elapsed: Duration,
 }
 
 /// Resolve one embedding model's vector candidates via warm ANN or the exact sqlite-vec
@@ -1289,6 +1486,7 @@ pub(super) async fn collect_model_ann_hits(
     ann_ready_timeout_ms: u64,
 ) -> Result<PerModelAnnHits, RuntimeError> {
     let degrade_name = model_name.clone();
+    let started = Instant::now();
     khive_storage::ensure_request_read_active("memory.recall")?;
     let result = collect_model_ann_hits_inner(
         runtime,
@@ -1327,6 +1525,8 @@ pub(super) async fn collect_model_ann_hits(
                     )
                 )),
                 used_sqlite_vec_fallback: false,
+                ann_elapsed: started.elapsed(),
+                fresh_tail_elapsed: Duration::ZERO,
             })
         }
     }
@@ -1352,6 +1552,7 @@ async fn collect_model_ann_hits_inner(
     ann_ready_timeout_ms: u64,
 ) -> Result<PerModelAnnHits, RuntimeError> {
     khive_storage::ensure_request_read_active("memory.recall")?;
+    let ann_started = Instant::now();
     let key = AnnKey::new(&model_name);
 
     // Global ANN search widens only when namespace post-filtering leaves too few hits.
@@ -1392,6 +1593,8 @@ async fn collect_model_ann_hits_inner(
             let ann_detached = ann.clone();
             let model_detached = model_name.clone();
             khive_runtime::track_background_task(async move {
+                #[cfg(test)]
+                retrieval_failpoints::before_ann_build(&model_detached).await;
                 let result = ann::ensure_ann_for_model(
                     &rt_detached,
                     &token_detached,
@@ -1399,6 +1602,8 @@ async fn collect_model_ann_hits_inner(
                     &model_detached,
                 )
                 .await;
+                #[cfg(test)]
+                retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
             });
             match khive_storage::await_request_read_phase(
@@ -1480,8 +1685,11 @@ async fn collect_model_ann_hits_inner(
         // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
         // §3's second tier guarantees visibility of the newest
         // rebuild-threshold-sized suffix of writes while FTS covers the rest.
+        let ann_elapsed = ann_started.elapsed();
+        let fresh_tail_started = Instant::now();
         let tail_outcome =
             ann::fresh_tail_leg(runtime, ann, &key, &model_name, &vec, ann_fetch_limit, None).await;
+        let fresh_tail_elapsed = fresh_tail_started.elapsed();
         khive_storage::ensure_request_read_active("memory.recall")?;
         let tail_ops = match tail_outcome {
             ann::FreshTailOutcome::Ops(ops) => ops,
@@ -1521,6 +1729,8 @@ async fn collect_model_ann_hits_inner(
             degraded: true,
             degraded_reason: Some(degrade_reason),
             used_sqlite_vec_fallback: false,
+            ann_elapsed,
+            fresh_tail_elapsed,
         });
     }
 
@@ -1540,7 +1750,17 @@ async fn collect_model_ann_hits_inner(
         }
 
         // Widen until enough visible hits survive or ANN reports corpus exhaustion.
-        let note_store = runtime.notes(token)?;
+        let operation = "memory.recall.note_store";
+        let note_result = khive_storage::await_request_read_phase(
+            operation,
+            crate::store_access::acquire_store(operation, {
+                let runtime = runtime.clone();
+                let token = token.clone();
+                move || runtime.notes(&token)
+            }),
+        )
+        .await??;
+        let note_store = note_result?;
         let visible_set: HashSet<&str> = visible_namespaces.iter().map(String::as_str).collect();
 
         // Empty namespace metadata is conservative; a visible-only set skips retry.
@@ -1611,6 +1831,8 @@ async fn collect_model_ann_hits_inner(
         // `best_raw` (from the same bridge instance, same lock acquisition)
         // by whichever search produced it, so the pair is always coherent —
         // never a newer watermark paired with an older search's candidates.
+        let ann_elapsed = ann_started.elapsed();
+        let fresh_tail_started = Instant::now();
         let outcome = ann::fresh_tail_leg(
             runtime,
             ann,
@@ -1621,6 +1843,7 @@ async fn collect_model_ann_hits_inner(
             Some(best_seq),
         )
         .await;
+        let fresh_tail_elapsed = fresh_tail_started.elapsed();
         khive_storage::ensure_request_read_active("memory.recall")?;
         // #1477: an exceptional fresh-tail skip (disabled, registration/registry
         // failure, reader/snapshot failure, or tail-fetch failure — never an
@@ -1651,6 +1874,8 @@ async fn collect_model_ann_hits_inner(
             degraded: fresh_tail_skip_reason.is_some(),
             degraded_reason: fresh_tail_skip_reason,
             used_sqlite_vec_fallback: false,
+            ann_elapsed,
+            fresh_tail_elapsed,
         });
     }
 
@@ -1699,12 +1924,35 @@ async fn collect_model_ann_hits_inner(
         degraded: false,
         degraded_reason: None,
         used_sqlite_vec_fallback: true,
+        ann_elapsed: ann_started.elapsed(),
+        fresh_tail_elapsed: Duration::ZERO,
     })
 }
 
 #[cfg(test)]
 mod request_cancellation_tests {
     use super::*;
+
+    #[test]
+    fn stage_timings_max_parallel_models_and_sum_sequential_rounds() {
+        let mut first_round = RecallStageTimings::default();
+        first_round.record_parallel_model(Duration::from_millis(13), Duration::from_millis(2));
+        first_round.record_parallel_model(Duration::from_millis(5), Duration::from_millis(11));
+        assert_eq!(first_round.ann_ms(), 13);
+        assert_eq!(first_round.fresh_tail_ms(), 11);
+
+        let second_round = RecallStageTimings::from_millis_for_test(3, 7, 17, 19, 0);
+        let mut total = RecallStageTimings::default();
+        total.add_retrieval_round(first_round);
+        total.add_retrieval_round(second_round);
+        total.add_hydration(Duration::from_millis(23));
+
+        assert_eq!(total.embed_ms(), 3);
+        assert_eq!(total.fts_ms(), 7);
+        assert_eq!(total.ann_ms(), 30);
+        assert_eq!(total.fresh_tail_ms(), 30);
+        assert_eq!(total.hydrate_ms(), 23);
+    }
 
     #[tokio::test]
     async fn cancelled_embedding_failure_cannot_degrade_to_a_healthy_engine() {

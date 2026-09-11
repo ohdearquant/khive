@@ -20,8 +20,10 @@ use crate::capability::StorageCapability;
 pub enum WriterTaskRequestState {
     /// The request's operation closure was never invoked.
     NotStarted,
-    /// The request panicked inside `BEGIN IMMEDIATE`, and that transaction was
-    /// successfully rolled back on the connection that owned it.
+    /// The request ran inside `BEGIN IMMEDIATE`, and that transaction was
+    /// successfully rolled back on the connection that owned it. The request
+    /// may have returned an error, failed COMMIT, or panicked; none of its
+    /// wrapped SQLite writes committed.
     TransactionRolledBack,
     /// The request was accepted, but its exact outcome cannot be established;
     /// it may already have produced side effects and must not be blindly
@@ -212,6 +214,18 @@ pub enum StorageError {
     )]
     WriterTaskBusy { timeout_ms: u64 },
 
+    /// One transaction-wrapped writer request returned an error, and the
+    /// writer then proved that request's SQLite transaction was rolled back.
+    /// Unlike [`StorageError::WriterTaskTerminated`], this does not retire the
+    /// writer seam. `source` preserves the operation or COMMIT error so its
+    /// capability and retry policy remain independently inspectable.
+    #[error("writer task request failed (request_state={request_state}): {source}")]
+    WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState,
+        #[source]
+        source: Box<StorageError>,
+    },
+
     /// A single-writer execution seam has terminated permanently. This is the
     /// historical writer-task variant and display name; the fail-closed
     /// pool-mutex fallback also uses it when transaction finalization becomes
@@ -281,6 +295,7 @@ impl StorageError {
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),
+            Self::WriterTaskRequestFailed { source, .. } => source.capability(),
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::AdmissionTimeout { .. }
@@ -297,6 +312,9 @@ impl StorageError {
 
     /// Whether this error is transient and the operation may succeed on retry.
     pub fn is_retryable(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_retryable();
+        }
         matches!(
             self,
             Self::Pool { .. }
@@ -326,6 +344,9 @@ impl StorageError {
     /// "successful" search (issue #389).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_fts5_syntax_error`.
     pub fn is_fts5_syntax_error(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_fts5_syntax_error();
+        }
         let Self::Driver {
             capability,
             operation,
@@ -358,6 +379,9 @@ impl StorageError {
     /// also hide genuine write failures (disk full, corruption).
     /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_unique_constraint_violation`.
     pub fn is_unique_constraint_violation(&self) -> bool {
+        if let Self::WriterTaskRequestFailed { source, .. } = self {
+            return source.is_unique_constraint_violation();
+        }
         let Self::Driver {
             capability,
             operation,
@@ -428,6 +452,47 @@ mod tests {
             "writer task could not begin within 175ms because SQLite remained busy; request was not executed"
         );
         assert_eq!(error.capability(), None);
+    }
+
+    #[test]
+    fn writer_task_request_failure_preserves_source_policy_and_rollback_state() {
+        let error = StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::Pool {
+                operation: "writer_task_commit".into(),
+                message: "commit refused".into(),
+            }),
+        };
+
+        assert_eq!(error.capability(), None);
+        assert!(
+            error.is_retryable(),
+            "rollback finality must not discard the source error's retry policy"
+        );
+        assert_eq!(
+            error.to_string(),
+            "writer task request failed (request_state=transaction_rolled_back): pool failure during writer_task_commit: commit refused"
+        );
+        assert_eq!(
+            StdError::source(&error).map(ToString::to_string),
+            Some("pool failure during writer_task_commit: commit refused".to_string()),
+            "the original typed storage error must remain the public source"
+        );
+    }
+
+    #[test]
+    fn writer_task_request_failure_does_not_invent_retryability() {
+        let error = StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "append_note".into(),
+                message: "deterministic refusal".into(),
+            }),
+        };
+
+        assert!(!error.is_retryable());
+        assert_eq!(error.capability(), Some(StorageCapability::Notes));
     }
 
     #[test]

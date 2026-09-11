@@ -78,7 +78,53 @@ state machine.
 
 If the entire MCP response is lost, the caller receives neither the result nor
 the structured error and therefore does not know the server-generated UUID.
-`comm.delivered` cannot resolve that wider response-loss case.
+Use a caller-chosen key for that wider response-loss case.
+
+### Recover a send or reply by key
+
+`comm.send` and `comm.reply` accept an optional `idempotency_key`. Pin the
+same sending actor, write namespace, key and request across attempts:
+
+```python
+first = session.send("actor:recipient", "Ready for review", subject="Update",
+                     idempotency_key="update-42", namespace="project")
+recovery = session.send("actor:recipient", "Ready for review", subject="Update",
+                        idempotency_key="update-42", namespace="project")
+```
+
+A successful first call returns `replayed: false`; a matching replay returns
+`replayed: true` with the original `full_id`, `recipient_id`, `thread_id` and
+`sent_at`. It creates no message copies, sends no new inbox signal, and does
+not repeat a reply's parent mark-read. Python `Session.send` and `Session.reply`
+return the raw per-operation outcome, including errors; they do not retry an
+operation error or a lost response automatically.
+
+Keys are exact strings of at most 512 UTF-8 bytes and cannot contain U+0000.
+Empty keys and other control characters are allowed. Different sending actors
+or explicit write namespaces have independent keys. Matching requests preserve
+the operation kind, trimmed recipient, exact body, optional subject, optional
+caller-supplied thread UUID, and tags. Omitted tags equal an empty list; order
+and duplicates otherwise matter. For replies, the resolved original message
+UUID also matters: a prefix and full spelling of that same UUID match, while
+two distinct parent notes do not. Omitted send thread IDs remain distinct from
+explicitly supplying the generated root UUID on a later call.
+
+Reusing a live key for different mail, or finding a missing or inconsistent
+recipient copy, returns a structured conflict with `details.reason=key_conflict`,
+the logical key, `existing_id`, and `domain_disposition=not_committed` for that
+attempt. No repair is performed. If a competing claim's holder disappears
+during reconciliation, the outcome is unknown; the server does not silently
+start a fresh insert.
+
+Both copies expose `properties.idempotency_key` through inbox and thread
+readback; `fields=["full_id", "idempotency_key"]` projects it directly.
+Marking an inbound message read retains the property. Outbound messages keep
+their existing mark-read refusal. Deleting the outbound claim releases the
+key: reuse can create a new pair even if the old inbound copy remains. This
+is recovery while the live claim exists, not permanent deduplication. Calls
+without a key keep their existing behavior and create a new pair each time.
+Older servers reject the unsupported `idempotency_key` argument instead of
+silently sending unkeyed mail. The client preserves that error without fallback.
 
 ### Inbox
 
@@ -141,11 +187,15 @@ request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 
 `comm.mark_read` requires `ids` with 1-500 full UUIDs or 8-character hex prefixes. It validates
 every target before mutation, deduplicates resolved IDs, and returns ordered results plus
-`requested_count`, `unique_count`, `marked_count`, and `failed_count`. The default
-`atomic=false` reuses the best-effort bulk behavior: later storage failures appear in each
-result's `read=false` and `mark_error` without rolling back an earlier success. With
-`atomic=true`, all unique marks are guarded and committed in one transaction; any failed
-recheck or storage statement rolls back the full set.
+`requested_count`, `unique_count`, `marked_count`, `unknown_count`, and `failed_count`. Each item
+carries `status=success|failed|unknown`; the aggregate carries
+`status=success|partial|failed|unknown`. The default `atomic=false` reuses the best-effort bulk
+behavior: later storage failures appear in each result's `read=false` and `mark_error` without
+rolling back an earlier success. A write whose execution seam terminated after being accepted (so
+it may already have applied) instead carries `status=unknown`, `read=null` — check the message's
+current state through `comm.inbox` before re-issuing that mark; re-issuing is safe, since marking
+a message read is idempotent. With `atomic=true`, all unique marks are guarded and committed in
+one transaction; any failed recheck or storage statement rolls back the full set.
 
 `comm.read` remains compatible with the 0.7.0 surface: exactly one of `id` or `ids` is required,
 and its bulk form remains best-effort. Prefer the named verb for new bulk callers.
@@ -283,7 +333,8 @@ request(ops="comm.send(to=\"email:prof.sheng@example.edu\", subject=\"Draft read
 
 `comm.send` itself only writes the note; it does not talk to SMTP directly.
 A background outbox loop polls every 5 seconds for undelivered outbound
-notes:
+notes. A note is eligible only when it has no terminal `delivery` value and
+its optional RFC 3339 `next_attempt_at` deadline is due:
 
 ```
 list(namespace=<ingest_namespace>, kind="message", direction="outbound", delivered=false, limit=200)
@@ -297,6 +348,17 @@ sent over SMTP, using the note's `subject`, `content`, and any
 `thread_id`/`in_reply_to_message_id`/`references_chain` properties to set the
 RFC 822 `Message-ID`, `In-Reply-To`, and `References` headers so replies group
 correctly in native mail clients.
+
+Delivery outcomes are durable note properties. Success records
+`delivery="delivered"` and `delivered_at`; a definitive configuration,
+authentication, allowlist, SMTP 5xx, or transport-specific client rejection
+records terminal `delivery="failed"`, `failed_at`, and `last_error`. Network
+failures, token-endpoint pressure, SMTP 4xx responses, Telegram 408/429/5xx
+responses, and similar transient errors leave the note pending, increment
+`delivery_attempts`, and set `next_attempt_at` using exponential backoff from
+5 seconds to a 30-minute ceiling. Polls skip the note until that deadline.
+There is no attempt-count promotion to failure; a later successful delivery
+clears `delivery_attempts` and `next_attempt_at`.
 
 ### How inbound ingestion works
 
@@ -348,7 +410,7 @@ Optional, with defaults:
   quarantine record instead of dropping it)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `lambda:leo`; inbound actor assigned to
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; inbound actor assigned to
   fresh, uncorrelated email messages)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)

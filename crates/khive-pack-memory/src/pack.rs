@@ -14,7 +14,7 @@ use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Vi
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
+use crate::ann::{new_shared_for_role, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -43,11 +43,22 @@ impl MemoryPack {
     ///
     /// See `crates/khive-pack-memory/docs/api/pack-integration.md`.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the memory
+    /// index from the full corpus. The serving factory passes the daemon role:
+    /// a corpus build is minutes of CPU and a segment rewrite every other reader
+    /// on the index root must absorb, so a short-lived client serves what is
+    /// persisted and leaves the build to the daemon. Direct constructions —
+    /// admin reindex, benches, tests — build, because building is what they are
+    /// for.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
-            ann: new_shared(),
+            ann: new_shared_for_role(builds_corpus_indexes),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
             recall_state: Mutex::new(BalancedRecallState::new(10_000)),
             brain_profile,
@@ -91,6 +102,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: true,
                 description: "Memory content to store.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "key",
+                param_type: "string",
+                required: false,
+                description: "Immutable operation key, at most 512 UTF-8 bytes and no NUL (empty is allowed). Unique among live memories in the write namespace. Replay returns key_conflict with existing_id; pin the original namespace when reconciling across actors.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -185,14 +203,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10).",
+                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100). Takes priority over limit.",
+                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -291,6 +309,20 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: false,
                 description: "Tag filter mode: \"any\" (OR, default) or \"all\" (AND). Only applies when tags is non-empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "exclude_tags",
+                param_type: "array",
+                required: false,
+                description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_source_id",
+                param_type: "boolean",
+                required: false,
+                description: "When true every hit carries source_id: the UUID the memory annotates (its source_id at remember time), or null when it has none. Default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -405,7 +437,10 @@ impl khive_runtime::PackFactory for MemoryPackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(MemoryPack::new(runtime))
+        Box::new(MemoryPack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 }
 
@@ -451,6 +486,7 @@ impl PackRuntime for MemoryPack {
         // population check below is genuinely load-only and remains useful.
         if !self.runtime.is_read_only() {
             crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
+            crate::ann::start_rotation_watcher(&self.runtime, &self.ann);
         }
         fts_population_guard(&self.runtime).await;
     }
@@ -570,6 +606,7 @@ mod recall_future_footprint_tests {
     use khive_runtime::{Namespace, VerbRegistryBuilder};
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
         // Measure on an explicitly roomy stack so the regression reports the
         // historical inline footprint instead of aborting the test process.
@@ -852,6 +889,7 @@ mod ann_route_tests {
     /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_second_call_uses_warm_ann_route() {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-route-")
@@ -938,6 +976,82 @@ mod ann_route_tests {
     }
 }
 
+/// Pack-level lifecycle coverage for `start_rotation_watcher`'s production
+/// wiring (issue #2340): the rotation tests in `ann.rs` call the private
+/// `refresh_rotated_segments_once` test helper directly, so nothing
+/// previously asserted that a writable `warm()` actually starts the tracked
+/// watcher, that a repeated `warm()` is idempotent, or that the watcher
+/// exits once its `AnnState` is dropped. Time is paused so the watcher's
+/// 5-second tick can be crossed deterministically instead of by a real
+/// sleep. `#[serial(background_tasks)]` matches every other test in this
+/// crate that reads the process-wide `background_task_count()` counter,
+/// since memory's warm-rebuild chain also tracks through it.
+#[cfg(test)]
+mod rotation_watcher_lifecycle_tests {
+    use super::*;
+
+    use khive_runtime::RuntimeConfig;
+    use serial_test::serial;
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).expect("writable runtime");
+        let pack = MemoryPack::new(rt);
+        let ann = pack.ann_for_test();
+
+        let before = khive_runtime::background_task_count();
+        pack.warm().await;
+        assert!(
+            crate::ann::rotation_watch_started_for_test(&ann),
+            "a writable warm must start the rotation watcher"
+        );
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "warm must track exactly one rotation watcher task"
+        );
+
+        // A repeated warm must not start a second tracked watcher.
+        pack.warm().await;
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before + 1,
+            "a repeated warm must be idempotent and not start a second watcher"
+        );
+
+        // The watcher retains only a Weak<AnnState>; dropping every strong
+        // reference lets its next tick observe the failed upgrade and exit.
+        let ann_weak = std::sync::Arc::downgrade(&ann);
+        drop(ann);
+        drop(pack);
+        assert!(
+            ann_weak.upgrade().is_none(),
+            "dropping the pack and the test's own clone must drop the last strong ANN reference"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..100 {
+            if khive_runtime::background_task_count() == before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            khive_runtime::background_task_count(),
+            before,
+            "the watcher must exit once its ANN state is dropped"
+        );
+    }
+}
+
 /// Mutation-hook tests assert ANN generation staleness directly after corpus changes.
 /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
 #[cfg(test)]
@@ -1015,6 +1129,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1045,6 +1160,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1072,6 +1188,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1101,6 +1218,7 @@ mod note_mutation_hook_tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);

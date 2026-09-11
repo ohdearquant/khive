@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn deny_commit(ctx: AuthContext<'_>) -> Authorization {
@@ -17,6 +18,15 @@ fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
         AuthAction::Transaction {
             operation: TransactionOperation::Rollback,
         } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
+
+fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Function { function_name } if function_name.eq_ignore_ascii_case("count") => {
+            Authorization::Deny
+        }
         _ => Authorization::Allow,
     }
 }
@@ -108,6 +118,284 @@ fn setup_memory_store() -> SqlNoteStore {
 
 fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
     Note::new(namespace, kind, content)
+}
+
+fn keyed_note(namespace: &str, kind: &str, key: &str) -> Note {
+    let mut note = make_note(namespace, kind, key);
+    note.key = Some(key.to_string());
+    note
+}
+
+fn assert_note_keys(notes: &[Note], expected_len: usize) {
+    assert_eq!(notes.len(), expected_len);
+    for note in notes {
+        assert_eq!(note.key.as_deref(), Some(note.content.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn note_key_round_trips_through_every_note_read_projection() {
+    let store = setup_memory_store();
+    let mut notes = vec![
+        keyed_note("local", "memory", "first"),
+        keyed_note("local", "memory", "second"),
+        keyed_note("local", "memory", "third"),
+    ];
+    for (index, note) in notes.iter_mut().enumerate() {
+        note.id = Uuid::from_u128(index as u128 + 1);
+        note.created_at = if index < 2 { 100 } else { 90 };
+    }
+    assert_eq!(store.upsert_notes(notes.clone()).await.unwrap().affected, 3);
+    let page = PageRequest {
+        offset: 0,
+        limit: 10,
+    };
+    let filter = NoteFilter {
+        kind: Some("memory".into()),
+        ..Default::default()
+    };
+    let first = store.get_note(notes[0].id).await.unwrap().unwrap();
+    assert_eq!(first, notes[0]);
+    assert_eq!(
+        store.get_note_including_deleted(first.id).await.unwrap(),
+        Some(first.clone())
+    );
+    assert_note_keys(
+        &store
+            .get_notes_batch(&[notes[0].id, notes[1].id])
+            .await
+            .unwrap(),
+        2,
+    );
+    assert_note_keys(
+        &store
+            .query_notes("local", Some("memory"), page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_count_free("local", Some("memory"), page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered("local", &filter, page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered_count_free("local", &filter, page.clone())
+            .await
+            .unwrap()
+            .items,
+        3,
+    );
+    assert_note_keys(
+        &store
+            .query_notes_filtered_bounded("local", &filter, 10)
+            .await
+            .unwrap(),
+        3,
+    );
+
+    let seek_filter = NoteFilter {
+        after: Some(NoteSeekAfter {
+            created_at: first.created_at,
+            id: first.id,
+        }),
+        ..filter.clone()
+    };
+    let after = store
+        .query_notes_filtered_count_free("local", &seek_filter, page)
+        .await
+        .unwrap();
+    assert_note_keys(&after.items, 2);
+    assert_eq!(after.items[0].id, notes[1].id);
+    assert_eq!(after.items[1].id, notes[2].id);
+
+    let first_page = store
+        .query_notes_filtered_after("local", &filter, None, 1)
+        .await
+        .unwrap();
+    assert_note_keys(&first_page.items, 1);
+    assert_eq!(first_page.items[0].id, notes[0].id);
+    let second_page = store
+        .query_notes_filtered_after("local", &filter, first_page.next_after, 10)
+        .await
+        .unwrap();
+    assert_note_keys(&second_page.items, 2);
+    assert_eq!(second_page.items[0].id, notes[1].id);
+}
+
+#[tokio::test]
+async fn note_key_is_scoped_by_namespace_and_kind_and_released_by_delete() {
+    let store = setup_memory_store();
+    let first = keyed_note("local", "memory", "shared");
+    store.upsert_note(first.clone()).await.unwrap();
+    assert!(store
+        .upsert_note(keyed_note("local", "memory", "shared"))
+        .await
+        .is_err());
+    store
+        .upsert_note(keyed_note("other", "memory", "shared"))
+        .await
+        .unwrap();
+    store
+        .upsert_note(keyed_note("local", "reference", "shared"))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .upsert_note(make_note("local", "memory", "unkeyed"))
+            .await
+            .unwrap();
+    }
+
+    assert!(store.delete_note(first.id, DeleteMode::Soft).await.unwrap());
+    let deleted = store
+        .get_note_including_deleted(first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.key.as_deref(), Some("shared"));
+    assert!(deleted.deleted_at.is_some());
+    let second = keyed_note("local", "memory", "shared");
+    store.upsert_note(second.clone()).await.unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(store
+        .delete_note(second.id, DeleteMode::Hard)
+        .await
+        .unwrap());
+    assert!(store
+        .get_note_including_deleted(second.id)
+        .await
+        .unwrap()
+        .is_none());
+    let third = keyed_note("local", "memory", "shared");
+    store.upsert_note(third.clone()).await.unwrap();
+    assert_ne!(second.id, third.id);
+    assert_eq!(store.count_notes("local", Some("memory")).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn note_key_round_trips_through_insert_paths_without_changing_external_id_dedup() {
+    let store = setup_memory_store();
+    let first = keyed_note("local", "memory", "insert-only");
+    assert!(store.insert_note_if_absent(first.clone()).await.unwrap());
+    assert_eq!(store.get_note(first.id).await.unwrap(), Some(first.clone()));
+    assert!(!store.insert_note_if_absent(first).await.unwrap());
+    assert!(store
+        .insert_note_if_absent(keyed_note("local", "memory", "insert-only"))
+        .await
+        .is_err());
+
+    let second = keyed_note("local", "memory", "try-insert");
+    assert!(store.try_insert_note(second.clone()).await.unwrap());
+    assert_eq!(store.get_note(second.id).await.unwrap(), Some(second));
+    let error = store
+        .try_insert_note(keyed_note("local", "memory", "try-insert"))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("constraint other than external_id dedup"));
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(crate::migrations::MIGRATIONS[4].up)
+            .unwrap();
+    }
+    let props = serde_json::json!({"external_id": "external-1"});
+    assert!(store
+        .try_insert_note(make_note("local", "message", "first").with_properties(props.clone()))
+        .await
+        .unwrap());
+    assert!(!store
+        .try_insert_note(make_note("local", "message", "second").with_properties(props))
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn note_key_survives_existing_full_and_property_updates() {
+    let store = setup_memory_store();
+    let original = keyed_note("local", "memory", "immutable");
+    let id = original.id;
+    store.upsert_note(original.clone()).await.unwrap();
+    let sequence = store.note_sequence(id).await.unwrap();
+
+    for candidate_key in [None, Some("replacement".to_string())] {
+        let mut update = store.get_note(id).await.unwrap().unwrap();
+        update.key = candidate_key;
+        update.content = "updated".to_string();
+        update.updated_at += 1;
+        store.upsert_note(update).await.unwrap();
+        assert_eq!(store.get_note(id).await.unwrap().unwrap().key, original.key);
+    }
+
+    let mut batch_update = store.get_note(id).await.unwrap().unwrap();
+    batch_update.key = Some("batch-replacement".to_string());
+    batch_update.updated_at += 1;
+    assert_eq!(
+        store
+            .upsert_notes(vec![batch_update])
+            .await
+            .unwrap()
+            .affected,
+        1
+    );
+    let snapshot = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(snapshot.key, original.key);
+    let mut replacement = snapshot.clone();
+    replacement.key = None;
+    replacement.updated_at += 1;
+    assert!(store
+        .replace_note_if_unchanged(replacement, snapshot.updated_at, snapshot.deleted_at)
+        .await
+        .unwrap());
+    assert_eq!(store.get_note(id).await.unwrap().unwrap().key, original.key);
+
+    assert!(store
+        .update_note_properties(
+            id,
+            Some(serde_json::json!({"tags": ["one"]})),
+            snapshot.updated_at + 2
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .set_note_property(
+            id,
+            "tags",
+            serde_json::json!(["two"]),
+            snapshot.updated_at + 3
+        )
+        .await
+        .unwrap());
+    let final_note = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(final_note.key, original.key);
+    assert_eq!(
+        final_note.properties.unwrap()["tags"],
+        serde_json::json!(["two"])
+    );
+    assert_eq!(store.note_sequence(id).await.unwrap(), sequence);
+
+    let mut unkeyed = make_note("local", "memory", "no identity");
+    store.upsert_note(unkeyed.clone()).await.unwrap();
+    unkeyed.key = Some("late identity".to_string());
+    store.upsert_note(unkeyed.clone()).await.unwrap();
+    assert_eq!(store.get_note(unkeyed.id).await.unwrap().unwrap().key, None);
 }
 
 #[tokio::test]
@@ -586,6 +874,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
 }
 
 #[tokio::test]
+#[serial]
 async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert() {
     for query in [SnapshotPageQuery::Basic, SnapshotPageQuery::Filtered] {
         assert_page_count_and_items_share_snapshot(query).await;
@@ -593,11 +882,262 @@ async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert()
 }
 
 #[tokio::test]
-async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     use khive_storage::note::PropertyFilter as NotePropFilter;
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("note-filter-count-snapshot.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-large-filter.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    // Use the pooled-reader mode so the authorizer installed below is the
+    // exact connection both control and count-free queries execute on.
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+    let namespace = format!("count-free-large-{}", Uuid::new_v4().simple());
+    let notes = (0..2_000)
+        .map(|index| {
+            let mut note = make_note_with_props(
+                &namespace,
+                "message",
+                &format!("message-{index}"),
+                serde_json::json!({"direction": "inbound"}),
+            );
+            note.created_at = index;
+            note
+        })
+        .collect();
+    let summary = store.upsert_notes(notes).await.unwrap();
+    assert_eq!(summary.failed, 0, "large filtered seed failed: {summary:?}");
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.direction".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("inbound".to_string()),
+        }],
+        ..NoteFilter::default()
+    };
+    {
+        let reader = pool.reader().unwrap();
+        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+    }
+
+    let request = PageRequest {
+        offset: 0,
+        limit: 6,
+    };
+    let exact_control = store
+        .query_notes_filtered(&namespace, &filter, request.clone())
+        .await;
+    assert!(
+        exact_control.is_err(),
+        "control exact-count page must be rejected by the count authorizer"
+    );
+
+    let exact_unfiltered_control = store
+        .query_notes(&namespace, Some("message"), request.clone())
+        .await;
+    assert!(
+        exact_unfiltered_control.is_err(),
+        "control unfiltered exact-count page must be rejected by the count authorizer"
+    );
+
+    let page = store
+        .query_notes_filtered_count_free(&namespace, &filter, request.clone())
+        .await
+        .expect("count-free page must not invoke SQLite count");
+    assert_eq!(page.total, None);
+    assert_eq!(page.items.len(), 6, "caller receives its lookahead row");
+    assert_eq!(page.items[0].content, "message-1999");
+    assert_eq!(page.items[5].content, "message-1994");
+
+    let unfiltered_page = store
+        .query_notes_count_free(&namespace, Some("message"), request)
+        .await
+        .expect("unfiltered count-free page must not invoke SQLite count");
+    assert_eq!(unfiltered_page.total, None);
+    assert_eq!(unfiltered_page.items.len(), 6);
+    assert_eq!(unfiltered_page.items[0].content, "message-1999");
+    assert_eq!(unfiltered_page.items[5].content, "message-1994");
+
+    let reader = pool.reader().unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_free_page_keeps_one_statement_snapshot_and_total_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("note-count-free-snapshot.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("count-free-snapshot-{}", Uuid::new_v4().simple());
+    let mut initial = Vec::new();
+    for content in ["a", "b", "c"] {
+        let mut note = make_note_with_props(
+            &namespace,
+            "message",
+            content,
+            serde_json::json!({"page_case": true}),
+        );
+        note.created_at = 10;
+        initial.push(note);
+    }
+    let mut expected_ids: Vec<_> = initial.iter().map(|note| note.id).collect();
+    expected_ids.sort();
+    store.upsert_notes(initial).await.unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![khive_storage::note::PropertyFilter {
+            json_path: "$.page_case".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Bool(true),
+        }],
+        ..NoteFilter::default()
+    };
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install("query_notes_filtered_count_free", namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filter = filter.clone();
+        tokio::spawn(async move {
+            store
+                .query_notes_filtered_count_free(
+                    &namespace,
+                    &filter,
+                    PageRequest {
+                        offset: 0,
+                        limit: 3,
+                    },
+                )
+                .await
+        })
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the row-step seam must not panic")
+        .expect("count-free query must step its first row");
+
+    let mut concurrent = make_note_with_props(
+        &namespace,
+        "message",
+        "concurrent",
+        serde_json::json!({"page_case": true}),
+    );
+    concurrent.created_at = 11;
+    let concurrent_id = concurrent.id;
+    store
+        .upsert_note(concurrent)
+        .await
+        .expect("WAL writer must commit while the page statement is paused");
+    proceed_tx.send(()).unwrap();
+
+    let page = query_task.await.unwrap().unwrap();
+    page_snapshot_seam::uninstall();
+    assert_eq!(page.total, None);
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        expected_ids,
+        "the lookahead page must retain id-ascending tie order on its pinned snapshot"
+    );
+
+    let after = store
+        .query_notes_filtered_count_free(
+            &namespace,
+            &filter,
+            PageRequest {
+                offset: 0,
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.items[0].id, concurrent_id);
+    assert_eq!(
+        after.items[1..]
+            .iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotCountQuery {
+    Exact,
+    Bounded,
+}
+
+impl SnapshotCountQuery {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Exact => "count_notes_filtered_in_snapshot",
+            Self::Bounded => "count_notes_filtered_bounded_in_snapshot",
+        }
+    }
+}
+
+async fn run_snapshot_count_query(
+    store: &SqlNoteStore,
+    query: SnapshotCountQuery,
+    namespace: &str,
+    filters: &[NoteFilter],
+) -> Result<Vec<u64>, StorageError> {
+    match query {
+        SnapshotCountQuery::Exact => {
+            store
+                .count_notes_filtered_in_snapshot(namespace, filters)
+                .await
+        }
+        SnapshotCountQuery::Bounded => store
+            .count_notes_filtered_bounded_in_snapshot(namespace, filters, 10)
+            .await
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|count| {
+                        assert!(!count.saturated, "one-row partition cannot hit cap");
+                        assert_eq!(count.cap, 10);
+                        count.count
+                    })
+                    .collect()
+            }),
+    }
+}
+
+async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQuery) {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(format!("note-filter-count-snapshot-{query:?}.db"));
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
             path: Some(path),
@@ -658,16 +1198,14 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
     ];
 
     let (reached_rx, proceed_tx) =
-        page_snapshot_seam::install("count_notes_filtered_in_snapshot", namespace.clone());
+        page_snapshot_seam::install(query.operation(), namespace.clone());
     let query_task = {
         let store = Arc::clone(&store);
         let namespace = namespace.clone();
         let filters = filters.clone();
-        tokio::spawn(async move {
-            store
-                .count_notes_filtered_in_snapshot(&namespace, &filters)
-                .await
-        })
+        tokio::spawn(
+            async move { run_snapshot_count_query(&store, query, &namespace, &filters).await },
+        )
     };
 
     tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
@@ -696,14 +1234,69 @@ async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update()
 
     assert_eq!(counts, vec![1, 0], "both partitions must use one snapshot");
 
-    let after = store
-        .count_notes_filtered_in_snapshot(&namespace, &filters)
+    let after = run_snapshot_count_query(&store, query, &namespace, &filters)
         .await
         .unwrap();
     assert_eq!(
         after,
         vec![0, 1],
         "the committed update must appear afterward"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn filtered_count_partitions_share_one_snapshot_during_concurrent_update() {
+    for query in [SnapshotCountQuery::Exact, SnapshotCountQuery::Bounded] {
+        assert_filtered_count_partitions_share_snapshot(query).await;
+    }
+}
+
+#[tokio::test]
+async fn bounded_filtered_count_is_exact_at_cap_and_saturates_above_it() {
+    use khive_storage::BoundedCount;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        ..NoteFilter::default()
+    };
+    for index in 0..5 {
+        store
+            .upsert_note(make_note("default", "message", &format!("message-{index}")))
+            .await
+            .unwrap();
+    }
+
+    let exact = store
+        .count_notes_filtered_bounded_in_snapshot("default", std::slice::from_ref(&filter), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        exact,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: false,
+        }],
+        "a population equal to the cap is still exact"
+    );
+
+    store
+        .upsert_note(make_note("default", "message", "over-cap"))
+        .await
+        .unwrap();
+    let saturated = store
+        .count_notes_filtered_bounded_in_snapshot("default", &[filter], 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        saturated,
+        vec![BoundedCount {
+            count: 5,
+            cap: 5,
+            saturated: true,
+        }]
     );
 }
 
@@ -965,8 +1558,14 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
         .await
         .expect_err("an ineligible target must abort the atomic patch");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert!(!error.is_retryable(), "a precondition conflict is terminal");
@@ -1071,8 +1670,14 @@ async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
         .await
         .expect_err("a later ineligible row must abort the writer-task transaction");
     assert!(
-        matches!(&error, StorageError::Conflict { message, .. }
-            if message.contains(&ineligible_id.to_string())),
+        matches!(
+            &error,
+            StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            } if matches!(source.as_ref(), StorageError::Conflict { message, .. }
+                if message.contains(&ineligible_id.to_string()))
+        ),
         "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
     assert_eq!(
@@ -1703,7 +2308,11 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
     assert!(
         matches!(
             &result,
-            Err(StorageError::Pool { operation, .. }) if operation == "test_pooled_commit"
+            Err(StorageError::WriterTaskRequestFailed {
+                request_state: WriterTaskRequestState::TransactionRolledBack,
+                source,
+            }) if matches!(source.as_ref(), StorageError::Pool { operation, .. }
+                if operation == "test_pooled_commit")
         ),
         "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"
     );
@@ -1945,11 +2554,19 @@ async fn page_offset_over_i64max_rejected() {
     );
 
     let filtered_result = store
-        .query_notes_filtered("ns1", &NoteFilter::default(), oversized)
+        .query_notes_filtered("ns1", &NoteFilter::default(), oversized.clone())
         .await;
     assert!(
         matches!(filtered_result, Err(StorageError::InvalidInput { .. })),
         "query_notes_filtered: expected InvalidInput, got {filtered_result:?}"
+    );
+
+    let count_free_result = store
+        .query_notes_filtered_count_free("ns1", &NoteFilter::default(), oversized)
+        .await;
+    assert!(
+        matches!(count_free_result, Err(StorageError::InvalidInput { .. })),
+        "query_notes_filtered_count_free: expected InvalidInput, got {count_free_result:?}"
     );
 }
 
@@ -2293,7 +2910,7 @@ fn transactional_write_refreshes_writer_task_after_construction_outside_runtime(
 // -- unread-probe partial index tests --
 
 /// The comm unread probe (badge count + inbox unread listing) must be served
-/// by `idx_notes_unread_probe_recipient`, so its work scales with the unread set, not
+/// by `idx_notes_unread_probe_recipient_direction`, so its work scales with the unread set, not
 /// total mailbox size. The assertions below are the actual discriminator: the
 /// generated WHERE SQL contains the literal form and `JsonTypeNeMissing` contributes
 /// no bind parameter. The plan before and after dropping the index is only an
@@ -2398,7 +3015,7 @@ async fn unread_probe_query_uses_partial_index() {
     };
     let indexed_plan = plan(&sql, &params);
     assert!(
-        indexed_plan.contains("idx_notes_unread_probe_recipient"),
+        indexed_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
     );
 
@@ -2411,11 +3028,11 @@ async fn unread_probe_query_uses_partial_index() {
     // a literal is provable at prepare time everywhere.)
     reader
         .conn()
-        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient")
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_direction")
         .unwrap();
     let control_plan = plan(&sql, &params);
     assert!(
-        !control_plan.contains("idx_notes_unread_probe_recipient"),
+        !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
         "control: dropped index must vanish from the plan, got:\n{control_plan}"
     );
 }
@@ -2496,14 +3113,14 @@ async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
         .collect();
     let plan = plan.join("\n");
     assert!(
-        plan.contains("idx_notes_unread_probe_recipient"),
+        plan.contains("idx_notes_unread_probe_recipient_direction"),
         "legacy recipient partition must use the partial index, got plan:\n{plan}"
     );
 }
 
 /// The unread probe's work must scale with the CALLER's unread set, not
 /// with other recipients' backlog: the recipient key column on
-/// `idx_notes_unread_probe_recipient` (the exact `ifnull(...)` expression
+/// `idx_notes_unread_probe_recipient_direction` (the exact `ifnull(...)` expression
 /// EqOrMissingIndexed generates) lets the planner exclude other actors' rows
 /// inside the index. Grow an irrelevant recipient's unread backlog 10x and
 /// assert the probe's VM step count stays flat — a recipient-blind scan
@@ -2617,6 +3234,1194 @@ async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
     );
 }
 
+/// khive#2318 follow-up: every `comm.send` durably writes an outbound copy
+/// addressed to the recipient (`to_actor` set the same as the inbound copy)
+/// whose `read` property is never subsequently set to `true` — the sender's
+/// own copy is never opened by the recipient. That outbound row sits in the
+/// same `(namespace, kind, to_actor)` partition of the unread-probe partial
+/// index as the recipient's genuinely unread inbound rows for the rest of
+/// its life. `direction='inbound'` is a residual predicate (a bound
+/// parameter, not a key column) on both the bounded-count SQL
+/// (`count_notes_filtered_bounded_in_snapshot`) and the ordered unread
+/// listing SQL, so growing a recipient's own OUTBOUND history — not another
+/// recipient's backlog, not the recipient's own unread inbound count — must
+/// not grow the work either statement does. This pins the fix
+/// (`idx_notes_unread_probe_recipient_direction`'s direction key column)
+/// against the regression it closes: the control section below reproduces
+/// the pre-fix shape and shows it fails the same assertion.
+#[tokio::test]
+async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    const CAP: i64 = 1_000;
+
+    fn count_filter() -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: FilterOp::EqOrMissingIndexed,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    // Mirrors count_notes_filtered_bounded_in_snapshot's inner SQL exactly
+    // (note.rs ~1618-1627): the LIMIT bounds rows that MATCH the full WHERE
+    // clause, not index entries visited before direction rejects them.
+    fn count_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!("SELECT COUNT(*) FROM (SELECT 1 FROM notes{where_sql} LIMIT ?{limit_idx})"),
+            params,
+        )
+    }
+
+    // Mirrors the ordered unread-listing shape (query_notes_filtered_bounded /
+    // the comm.inbox unread listing, note.rs ~1748-1752).
+    fn list_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(CAP + 1));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn seed_inbound(conn: &rusqlite::Connection, n: usize) {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'inbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("mine {i}"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    // Same recipient key (`to_actor: actor:a`) as the inbound rows above,
+    // direction='outbound', `read` absent — exactly the shape
+    // dual_write_message leaves behind for every message ever sent TO
+    // actor:a (the sender's own copy of that delivery), stamped strictly
+    // newer so a created_at DESC scan meets it before the caller's own rows.
+    fn seed_outbound(conn: &rusqlite::Connection, n: usize) {
+        let base: i64 = conn
+            .query_row("SELECT ifnull(max(created_at), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            let stamp = base + 1 + i as i64;
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', 'outbound', 'to_actor', 'actor:a'), \
+                         ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("sent-copy {i}"),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn measure(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (i64, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let value: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0)).unwrap();
+        (value, stmt.get_status(StatementStatus::VmStep))
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    // -- Fixed: idx_notes_unread_probe_recipient_direction is live. --
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_inbound(conn, 5);
+    }
+
+    let filter = count_filter();
+    let (count_sql, count_params) = count_sql_and_params(&filter);
+    let (list_sql, list_params) = list_sql_and_params(&filter);
+
+    {
+        let reader = pool.reader().unwrap();
+        let plan = |sql: &str, params: &[Box<dyn rusqlite::types::ToSql>]| -> String {
+            let mut stmt = reader
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let details: Vec<String> = stmt
+                .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            details.join("\n")
+        };
+        let count_plan = plan(&count_sql, &count_params);
+        assert!(
+            count_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "bounded-count query must be served by the direction-aware index, got:\n{count_plan}"
+        );
+        let list_plan = plan(&list_sql, &list_params);
+        assert!(
+            list_plan.contains("idx_notes_unread_probe_recipient_direction"),
+            "unread listing query must be served by the direction-aware index, got:\n{list_plan}"
+        );
+    }
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 3_000);
+    }
+    let (count_val_small, count_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_small, list_steps_small) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_small, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_small, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000); // cumulative outbound backlog: 30_000 (10x)
+    }
+    let (count_val_large, count_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    let (list_rows_large, list_steps_large) = {
+        let reader = pool.reader().unwrap();
+        measure_list(reader.conn(), &list_sql, &list_params)
+    };
+    assert_eq!(
+        count_val_large, 5,
+        "only the caller's unread inbound rows count"
+    );
+    assert_eq!(
+        list_rows_large, 5,
+        "only the caller's unread inbound rows list"
+    );
+
+    assert!(
+        count_steps_large < count_steps_small.saturating_mul(3),
+        "bounded-count work scaled with the recipient's own outbound history: \
+         {count_steps_small} VM steps at 3,000 outbound rows vs {count_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+    assert!(
+        list_steps_large < list_steps_small.saturating_mul(3),
+        "unread listing work scaled with the recipient's own outbound history: \
+         {list_steps_small} VM steps at 3,000 outbound rows vs {list_steps_large} at 30,000 \
+         (a direction-scoped probe stays flat; a direction-blind scan grows ~10x)"
+    );
+
+    // -- Control: reproduce the pre-fix (direction-blind) index shape and
+    // show the same assertion fails, proving the bound above is real and not
+    // an artifact of small numbers or an unrelated planner choice. --
+    let control_pool = setup_pool();
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch(
+            "DROP INDEX idx_notes_unread_probe_recipient_direction;
+             CREATE INDEX idx_notes_unread_probe_recipient_control
+                 ON notes(namespace, kind,
+                          ifnull(json_extract(properties, '$.to_actor'), ''),
+                          created_at DESC, id ASC)
+                 WHERE (json_type(properties, '$.read') IS NULL
+                        OR json_type(properties, '$.read') != 'true')
+                   AND deleted_at IS NULL;",
+        )
+        .unwrap();
+        seed_inbound(conn, 5);
+        seed_outbound(conn, 3_000);
+    }
+    let (control_count_small, control_count_steps_small) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    {
+        let writer = control_pool.writer().unwrap();
+        let conn = writer.conn();
+        seed_outbound(conn, 27_000);
+    }
+    let (control_count_large, control_count_steps_large) = {
+        let reader = control_pool.reader().unwrap();
+        measure(reader.conn(), &count_sql, &count_params)
+    };
+    assert_eq!(
+        control_count_small, 5,
+        "control: same correct value at 3,000 outbound"
+    );
+    assert_eq!(
+        control_count_large, 5,
+        "control: same correct value at 30,000 outbound"
+    );
+    assert!(
+        control_count_steps_large > control_count_steps_small.saturating_mul(3),
+        "control instrument did not reproduce the pre-fix growth: \
+         {control_count_steps_small} VM steps at 3,000 outbound rows vs \
+         {control_count_steps_large} at 30,000 under the direction-blind index shape \
+         (expected clear growth, proving the fixed measurement above is falsifiable)"
+    );
+}
+
+/// `comm.inbox(status="unread")` builds its `to_actor` predicate at
+/// khive-pack-comm/src/handlers.rs ~613-624: `direction` (`Eq`), `read`
+/// (`JsonTypeNeMissing`), then `to_actor`. Before this test's fix, that last
+/// filter used `FilterOp::EqOrMissing`, whose SQL
+/// (`(json_extract(...) = ? OR json_extract(...) IS NULL)`) is a different
+/// expression than any indexed key in the schema (the recipient-scoped
+/// partial index at `idx_notes_unread_probe_recipient_direction` is keyed on
+/// `ifnull(json_extract(...), '')`, not the raw extract), so the planner
+/// fell back to `idx_comm_message_direction` (namespace, kind, direction,
+/// read — no recipient key at all) and every caller's unread inbox listing
+/// scanned every unread inbound row IN THE NAMESPACE, not just their own.
+/// `idx_comm_message_direction` (khive-pack-comm/src/vocab.rs) is reproduced
+/// here verbatim since khive-db has no dependency on khive-pack-comm to
+/// import it from; it must be present for this test to reflect the real
+/// index landscape a comm-pack-loaded server actually has.
+///
+/// The control section pins the pre-fix `EqOrMissing` shape (still reachable
+/// as a `FilterOp` variant) against the exact regression this closes: it
+/// must NOT seek the recipient index and its scan work must grow with
+/// OTHER actors' unread backlog. The fixed section proves
+/// `FilterOp::EqOrLegacyIndexed` seeks the recipient-scoped partial index
+/// instead and stays flat.
+#[tokio::test]
+async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+    use rusqlite::StatementStatus;
+
+    fn listing_filter(to_actor_op: FilterOp) -> NoteFilter {
+        NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![
+                NotePropFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("inbound".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.read".to_string(),
+                    op: FilterOp::JsonTypeNeMissing,
+                    value: SqlValue::Text("true".to_string()),
+                },
+                NotePropFilter {
+                    json_path: "$.to_actor".to_string(),
+                    op: to_actor_op,
+                    value: SqlValue::Text("actor:a".to_string()),
+                },
+            ],
+            order_by: None,
+            ..Default::default()
+        }
+    }
+
+    fn listing_sql_and_params(
+        filter: &NoteFilter,
+    ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        params.push(Box::new(1001_i64));
+        let limit_idx = params.len();
+        (
+            format!(
+                "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+            ),
+            params,
+        )
+    }
+
+    fn plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn measure_list(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    fn seed(
+        conn: &rusqlite::Connection,
+        to_actor: &str,
+        direction: &str,
+        n: usize,
+        start_stamp: i64,
+    ) {
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, \
+                                    created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                         json_object('direction', ?3, 'to_actor', ?4), ?5, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("{to_actor}-{direction}-{i}"),
+                    direction,
+                    to_actor,
+                    start_stamp + i as i64,
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn build_pool_with_comm_indexes() -> Arc<ConnectionPool> {
+        let pool = setup_pool();
+        let writer = pool.writer().unwrap();
+        // Reproduces khive-pack-comm/src/vocab.rs COMM_SCHEMA_PLAN_STMTS's
+        // idx_comm_message_direction verbatim: applied at comm-pack init in
+        // the real system, so this test reflects the actual index landscape
+        // a comm-pack-loaded server has (khive-db cannot depend on
+        // khive-pack-comm to import the constant directly).
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+                    ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), created_at DESC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+        drop(writer);
+        pool
+    }
+
+    // -- Control: reproduce the pre-fix EqOrMissing shape. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrMissing);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let control_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "control must reproduce the pre-fix shape (no recipient-index seek), got:\n{control_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            // Another actor's unread backlog: same direction/read shape, disjoint recipient.
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "control: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large > steps_small.saturating_mul(3),
+            "control instrument did not reproduce the pre-fix growth: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-blind scan should grow sharply)"
+        );
+    }
+
+    // -- Fixed: EqOrLegacyIndexed seeks the recipient-scoped partial index. --
+    {
+        let pool = build_pool_with_comm_indexes();
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:a", "inbound", 5, 0);
+        }
+        let filter = listing_filter(FilterOp::EqOrLegacyIndexed);
+        let (sql, params) = listing_sql_and_params(&filter);
+        {
+            let reader = pool.reader().unwrap();
+            let fixed_plan = plan(reader.conn(), &sql, &params);
+            assert!(
+                fixed_plan.contains("idx_notes_unread_probe_recipient_direction"),
+                "fixed listing query must be served by the recipient-scoped partial index, got:\n{fixed_plan}"
+            );
+        }
+        let (_, steps_small) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        {
+            let writer = pool.writer().unwrap();
+            seed(writer.conn(), "actor:other", "inbound", 3_000, 10_000);
+        }
+        let (rows_after, steps_large) = {
+            let reader = pool.reader().unwrap();
+            measure_list(reader.conn(), &sql, &params)
+        };
+        assert_eq!(
+            rows_after, 5,
+            "fixed: still only the caller's own unread rows in the result set"
+        );
+        assert!(
+            steps_large < steps_small.saturating_mul(3),
+            "fixed listing work scaled with another actor's unread backlog: \
+             {steps_small} VM steps before vs {steps_large} after seeding another actor's \
+             3,000-row unread backlog (a recipient-scoped seek should stay flat)"
+        );
+    }
+}
+
+/// `EqOrLegacyIndexed` must match exactly the same rows `EqOrMissing` does,
+/// for every value shape the comm write paths (`comm.send`, `comm.reply`,
+/// `comm.ingest`) can produce: an exact recipient match, a legacy row with
+/// `to_actor` entirely absent, and — the case a naive `ifnull(...) IN (?, '')`
+/// predicate would get wrong — a row where `to_actor` is a present-but-empty
+/// JSON string. None of the three comm write paths can produce that last
+/// shape today (`validate_actor_label` rejects an empty `to` at `send`;
+/// `ingest` rejects an empty `to` before it reaches `to_actor`; `reply`'s
+/// fallback chain bottoms out at a `to`/`from` property pair every write
+/// path always sets non-empty) — but the generic `kg.create` surface is not
+/// comm-validated and can place such a row directly, so this fixes the
+/// value's behavior by construction rather than by unreachability.
+#[tokio::test]
+async fn eq_or_legacy_indexed_matches_eq_or_missing_on_every_write_path_shape() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let store = setup_memory_store();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "exact match",
+            serde_json::json!({"to_actor": "actor:a"}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "absent (legacy)",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "explicit null",
+            serde_json::json!({"to_actor": null}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "present empty string",
+            serde_json::json!({"to_actor": ""}),
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note_with_props(
+            "default",
+            "message",
+            "different recipient",
+            serde_json::json!({"to_actor": "actor:b"}),
+        ))
+        .await
+        .unwrap();
+
+    for op in [FilterOp::EqOrMissing, FilterOp::EqOrLegacyIndexed] {
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: op.clone(),
+                value: SqlValue::Text("actor:a".to_string()),
+            }],
+            ..Default::default()
+        };
+        let page = store
+            .query_notes_filtered(
+                "default",
+                &filter,
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut contents: Vec<&str> = page.items.iter().map(|n| n.content.as_str()).collect();
+        contents.sort_unstable();
+        assert_eq!(
+            contents,
+            vec!["absent (legacy)", "exact match", "explicit null"],
+            "{op:?}: must match the exact recipient plus absent/null legacy rows, \
+             and exclude the present-empty-string and different-recipient rows"
+        );
+    }
+}
+
+// ── khive#2390: hot note property-path indexes ──────────────────────────────
+
+fn plan_details(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[Box<dyn rusqlite::types::ToSql>],
+) -> String {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn listing_sql_and_params(
+    filter: &khive_storage::note::NoteFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+    params.push(Box::new(1_i64));
+    let limit_idx = params.len();
+    (
+        format!(
+            "SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT ?{limit_idx}"
+        ),
+        params,
+    )
+}
+
+/// `gtd.tasks(status=..., assignee=...)` compiles to exactly this shape
+/// (`FilterOp::Eq` on both `$.status` and `$.assignee` — see
+/// `crates/khive-pack-gtd/src/handlers.rs::handle_tasks`). Before V27 this
+/// scanned every `task` row in the namespace evaluating both `json_extract`
+/// calls; V27's `idx_notes_task_status`/`idx_notes_task_assignee` give the
+/// planner an equality seek on at least one of the two predicates instead.
+#[tokio::test]
+async fn gtd_tasks_status_and_assignee_query_uses_hot_property_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({
+                    "status": if i % 2 == 0 { "active" } else { "next" },
+                    "assignee": if i % 3 == 0 { "lambda:a" } else { "lambda:b" },
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("active".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.assignee".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("lambda:a".to_string()),
+            },
+        ],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+
+    let indexed_plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        indexed_plan.contains("idx_notes_task_status")
+            || indexed_plan.contains("idx_notes_task_assignee"),
+        "combined status+assignee query must be served by one of the new hot-property \
+         indexes, got plan:\n{indexed_plan}"
+    );
+
+    // Control: without the new indexes, the planner falls back to the
+    // namespace+kind index (or a full table scan) and must NOT reference
+    // either new index name.
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch("DROP INDEX idx_notes_task_status; DROP INDEX idx_notes_task_assignee;")
+            .unwrap();
+    }
+    let control_plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        !control_plan.contains("idx_notes_task_status")
+            && !control_plan.contains("idx_notes_task_assignee"),
+        "control: dropped indexes must vanish from the plan, got:\n{control_plan}"
+    );
+}
+
+/// `gtd.next(assignee=...)` compiles `$.status IN ('next','active')` via
+/// `FilterOp::In` plus an optional `FilterOp::Eq` on `$.assignee` (see
+/// `handle_next`). `idx_notes_task_assignee` must still serve the equality
+/// term even though the sibling predicate is a multi-value IN rather than a
+/// plain `=`.
+#[tokio::test]
+async fn gtd_next_status_in_with_assignee_query_uses_assignee_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({
+                    "status": if i % 2 == 0 { "active" } else { "done" },
+                    "assignee": if i % 3 == 0 { "lambda:a" } else { "lambda:b" },
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::In(vec![
+                    SqlValue::Text("next".to_string()),
+                    SqlValue::Text("active".to_string()),
+                ]),
+                value: SqlValue::Null,
+            },
+            NotePropFilter {
+                json_path: "$.assignee".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("lambda:a".to_string()),
+            },
+        ],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let indexed_plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        indexed_plan.contains("idx_notes_task_assignee"),
+        "the assignee equality term must be served by idx_notes_task_assignee even \
+         though the sibling status predicate is a multi-value IN, got plan:\n{indexed_plan}"
+    );
+    assert!(
+        !indexed_plan.contains("idx_notes_task_status"),
+        "got plan:\n{indexed_plan}"
+    );
+}
+
+/// The default unread-status inbox listing must stay on
+/// `idx_notes_unread_probe_recipient_direction`: that partial index excludes
+/// read rows structurally (via its `WHERE`), while any general
+/// `(to_actor, direction)`-shaped index can only exclude them with a
+/// residual filter, which costs more. With no `ANALYZE` statistics, SQLite
+/// prefers the first index it finds that matches the query shape rather than
+/// costing them, so a general index present alongside the partial one can
+/// still win the plan even though it does strictly more work -- this test
+/// pins the unread-scoped plan against reintroducing a competing general
+/// index without first re-measuring the tradeoff.
+#[tokio::test]
+async fn comm_inbox_unread_default_query_still_uses_partial_unread_probe_index() {
+    use khive_storage::note::PropertyFilter as NotePropFilter;
+    use khive_storage::note::{FilterOp, NoteFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "message",
+                &format!("message {i}"),
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": "lambda:reader",
+                    "read": false,
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrLegacyIndexed,
+                value: SqlValue::Text("lambda:reader".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        plan.contains("idx_notes_unread_probe_recipient_direction"),
+        "unread-default inbox listing must stay on the partial unread-probe index, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_notes_task_status") && !plan.contains("idx_notes_task_assignee"),
+        "unrelated new indexes must not appear in an unread-probe plan, got:\n{plan}"
+    );
+}
+
+/// [`NoteSeekAfter`] keyset paging over `query_notes_filtered_count_free`
+/// must reassemble the exact same total order as offset paging, with no
+/// duplicate or missing rows at page boundaries.
+#[tokio::test]
+async fn seek_after_paging_matches_offset_paging_exactly() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    for i in 0..900i64 {
+        let mut note = make_note("default", "widget", &format!("n{i}"));
+        note.created_at = i;
+        note.updated_at = i;
+        store.upsert_note(note).await.unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        ..Default::default()
+    };
+
+    let mut offset_ids = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let page = store
+            .query_notes_filtered_count_free("default", &filter, PageRequest { limit: 97, offset })
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset_ids.extend(page.items.iter().map(|n| n.id));
+        offset += 97;
+    }
+
+    let mut cursor_ids = Vec::new();
+    let mut cursor: Option<NoteSeekAfter> = None;
+    loop {
+        let mut page_filter = filter.clone();
+        page_filter.after = cursor;
+        let page = store
+            .query_notes_filtered_count_free(
+                "default",
+                &page_filter,
+                PageRequest {
+                    limit: 97,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        cursor = page.items.last().map(|n| NoteSeekAfter {
+            created_at: n.created_at,
+            id: n.id,
+        });
+        cursor_ids.extend(page.items.iter().map(|n| n.id));
+    }
+
+    assert_eq!(cursor_ids.len(), 900);
+    assert_eq!(
+        offset_ids, cursor_ids,
+        "keyset paging must reassemble the identical total order offset paging produces"
+    );
+}
+
+/// `NoteFilter.after` combined with a custom `order_by` has no defined
+/// meaning (the boundary is expressed in terms of the default `created_at
+/// DESC, id ASC` order) and must be rejected rather than silently
+/// misapplied.
+#[tokio::test]
+async fn seek_after_rejects_custom_order_by() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter, SortDir};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        order_by: Some(("$.priority".to_string(), SortDir::Asc)),
+        after: Some(NoteSeekAfter {
+            created_at: 0,
+            id: uuid::Uuid::nil(),
+        }),
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered_count_free(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err("after + custom order_by must be rejected");
+    assert!(
+        err.to_string().contains("order_by"),
+        "rejection must name the order_by conflict, got: {err}"
+    );
+}
+
+/// khive#2392: `query_notes_filtered` computes an exact `COUNT(*)` total over
+/// the whole matching set, which has no defined meaning paired with a seek
+/// boundary, so it must reject `NoteFilter.after` rather than silently
+/// ignoring it (the pre-fix behavior: it never read the field at all, so a
+/// caller passing a cursor here got the first page over and over instead of
+/// an error or the seeked rows).
+#[tokio::test]
+async fn query_notes_filtered_rejects_seek_cursor() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        after: Some(NoteSeekAfter {
+            created_at: 0,
+            id: uuid::Uuid::nil(),
+        }),
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err("query_notes_filtered must reject NoteFilter.after");
+    assert!(
+        err.to_string().contains("query_notes_filtered_count_free"),
+        "rejection must point callers at the method that does honour after, got: {err}"
+    );
+}
+
+/// The same rejection applies when `after` is combined with a custom
+/// `order_by` — `query_notes_filtered` never seeks, so there is no separate
+/// "order_by conflict" branch to hit; both fields being set still surfaces
+/// the one `after`-not-supported error.
+#[tokio::test]
+async fn query_notes_filtered_rejects_seek_cursor_with_custom_order_by() {
+    use khive_storage::note::{NoteFilter, NoteSeekAfter, SortDir};
+    use khive_storage::types::PageRequest;
+
+    let store = setup_memory_store();
+    let filter = NoteFilter {
+        kind: Some("widget".to_string()),
+        order_by: Some(("$.priority".to_string(), SortDir::Asc)),
+        after: Some(NoteSeekAfter {
+            created_at: 0,
+            id: uuid::Uuid::nil(),
+        }),
+        ..Default::default()
+    };
+    let err = store
+        .query_notes_filtered(
+            "default",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err(
+            "query_notes_filtered must reject NoteFilter.after even with a custom order_by",
+        );
+    assert!(
+        err.to_string().contains("query_notes_filtered_count_free"),
+        "rejection must point callers at the method that does honour after, got: {err}"
+    );
+}
+
+/// Seeking to the boundary after N already-fetched rows must not cost more
+/// work than fetching the same page fresh: unlike `PageRequest.offset`,
+/// which walks (and discards) every skipped row on every call, `after` lets
+/// the planner range-seek directly to the boundary via the ordered index.
+///
+/// The filter below matches `idx_notes_task_status` exactly (namespace, kind,
+/// `$.status`, `created_at DESC, id ASC`), so the trailing key columns
+/// already supply the query's `ORDER BY` -- without that, SQLite has to
+/// build a temporary sort over every matching row before LIMIT/OFFSET ever
+/// applies, which dominates both approaches' cost equally and hides the
+/// walk-vs-seek difference this test exists to measure.
+///
+/// This measures `fetch_notes_after` directly (the two-statement seek
+/// `query_notes_filtered_count_free` delegates to for `NoteFilter.after`),
+/// not a single combined `WHERE` predicate: an initial attempt using one
+/// statement with `(created_at, id) < (?, ?)` (or the logically equivalent
+/// `created_at < ?1 OR (created_at = ?1 AND id > ?2)`) measured SLOWER than
+/// plain `OFFSET` here, confirmed by `EXPLAIN QUERY PLAN` showing the same
+/// full ordered index scan either way -- SQLite does not give a
+/// mixed-direction (`DESC`, `ASC`) boundary index-seek treatment on this
+/// build. Splitting into two single-direction queries (exact-timestamp ties,
+/// then strictly-smaller timestamps) is what actually seeks.
+#[tokio::test]
+async fn seek_after_does_not_scale_with_rows_already_seen_unlike_offset() {
+    use rusqlite::StatementStatus;
+
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..5_000i64 {
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at) \
+                 VALUES (?1, 'default', 'task', ?2, '{\"status\":\"active\"}', ?3, ?3)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), format!("n{i}"), i],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    let filter = khive_storage::note::NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![khive_storage::note::PropertyFilter {
+            json_path: "$.status".to_string(),
+            op: khive_storage::note::FilterOp::Eq,
+            value: khive_storage::types::SqlValue::Text("active".to_string()),
+        }],
+        ..Default::default()
+    };
+
+    fn measure(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> (usize, i32) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows: Vec<String> = stmt
+            .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        (rows.len(), steps)
+    }
+
+    let reader = pool.reader().unwrap();
+
+    // Offset-based: skip the first 4,900 rows, fetch the last 100.
+    let (offset_where, mut offset_params) = build_note_filter_where("default", &filter).unwrap();
+    offset_params.push(Box::new(100_i64));
+    let offset_limit_idx = offset_params.len();
+    offset_params.push(Box::new(4_900_i64));
+    let offset_offset_idx = offset_params.len();
+    let offset_sql = format!(
+        "SELECT id FROM notes{offset_where} ORDER BY created_at DESC, id ASC \
+         LIMIT ?{offset_limit_idx} OFFSET ?{offset_offset_idx}"
+    );
+    let (offset_rows, offset_steps) = measure(reader.conn(), &offset_sql, &offset_params);
+    assert_eq!(offset_rows, 100);
+
+    // Cursor-based: seek to the boundary a real 4,900-row page ends at, then
+    // fetch the next 100 via the production `fetch_notes_after` path -- the
+    // same rows the offset query above returned.
+    let (peek_where, mut peek_params) = build_note_filter_where("default", &filter).unwrap();
+    peek_params.push(Box::new(4_900_i64));
+    let peek_limit_idx = peek_params.len();
+    let peek_sql =
+        format!("SELECT id, created_at FROM notes{peek_where} ORDER BY created_at DESC, id ASC LIMIT ?{peek_limit_idx}");
+    let boundary: (String, i64) = {
+        let mut stmt = reader.conn().prepare(&peek_sql).unwrap();
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            peek_params.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .last()
+        .unwrap()
+    };
+    let after = khive_storage::note::NoteSeekAfter {
+        created_at: boundary.1,
+        id: uuid::Uuid::parse_str(&boundary.0).unwrap(),
+    };
+
+    // `fetch_notes_after`'s two branches, instrumented individually and
+    // summed, since it prepares its own statements internally.
+    let (tie_where, mut tie_params) = build_note_filter_where("default", &filter).unwrap();
+    tie_params.push(Box::new(after.created_at));
+    let tie_ts_idx = tie_params.len();
+    tie_params.push(Box::new(after.id.to_string()));
+    let tie_id_idx = tie_params.len();
+    tie_params.push(Box::new(100_i64));
+    let tie_limit_idx = tie_params.len();
+    let tie_sql = format!(
+        "SELECT id FROM notes{tie_where} AND created_at = ?{tie_ts_idx} AND id > ?{tie_id_idx} \
+         ORDER BY id ASC LIMIT ?{tie_limit_idx}"
+    );
+    let (tie_rows, tie_steps) = measure(reader.conn(), &tie_sql, &tie_params);
+
+    let remaining = 100 - tie_rows as i64;
+    let (lt_where, mut lt_params) = build_note_filter_where("default", &filter).unwrap();
+    lt_params.push(Box::new(after.created_at));
+    let lt_ts_idx = lt_params.len();
+    lt_params.push(Box::new(remaining));
+    let lt_limit_idx = lt_params.len();
+    let lt_sql = format!(
+        "SELECT id FROM notes{lt_where} AND created_at < ?{lt_ts_idx} \
+         ORDER BY created_at DESC, id ASC LIMIT ?{lt_limit_idx}"
+    );
+    let (lt_rows, lt_steps) = measure(reader.conn(), &lt_sql, &lt_params);
+
+    let after_rows = tie_rows + lt_rows;
+    let after_steps = tie_steps + lt_steps;
+    assert_eq!(
+        after_rows, offset_rows,
+        "both approaches must return the same number of rows for the same tail page"
+    );
+
+    // Verify the actual fetch_notes_after production path matches too.
+    let production_items =
+        fetch_notes_after(reader.conn(), "default", &filter, &after, 100).unwrap();
+    assert_eq!(production_items.len(), offset_rows);
+
+    assert!(
+        after_steps < offset_steps / 10,
+        "seeking from a cursor must avoid walking the 4,900 skipped rows an OFFSET \
+         re-walks on every call: {offset_steps} VM steps via OFFSET vs {after_steps} via a \
+         two-branch keyset seek (measured ~32x at this fixture size: 20317 vs 638)"
+    );
+}
+
 /// The inlined json_type literal admits only SQLite's closed json_type
 /// vocabulary; anything else is rejected rather than interpolated.
 #[tokio::test]
@@ -2643,5 +4448,309 @@ async fn json_type_ne_missing_rejects_non_vocabulary_value() {
     assert!(
         err.to_string().contains("json_type"),
         "rejection must name the json_type vocabulary, got: {err}"
+    );
+}
+
+/// khive#2392: `fetch_notes_after`'s `status="all"`/`status="read"` inbox
+/// listings (no `$.read` filter, or `JsonTypeEq` rather than the tuned
+/// `JsonTypeNeMissing` probe) have no index ending in `(created_at DESC, id
+/// ASC)` for their `(namespace, kind, direction, to_actor[, read])`
+/// partition, so the lt-branch (`created_at < ? ORDER BY created_at DESC, id
+/// ASC`) still costs a full partition scan plus a temp-b-tree sort on every
+/// internal page — pins the expected-arm SCAN-plus-sort plan so a future
+/// index addition is a deliberate, measured change rather than a silent
+/// drift. See `candidate_created_at_id_seek_index_flips_unread_probe_plan`
+/// for why the natural fix (a general `(namespace, kind, created_at DESC, id
+/// ASC)` index) was measured and rejected rather than shipped.
+#[tokio::test]
+async fn comm_inbox_status_all_lt_branch_has_no_seek_index() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let pool = setup_pool();
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+                    ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), created_at DESC) \
+                    WHERE deleted_at IS NULL;
+                 CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor \
+                    ON notes(namespace, kind, \
+                    json_extract(properties, '$.to_actor'), \
+                    json_extract(properties, '$.direction'), \
+                    json_extract(properties, '$.read'), \
+                    created_at DESC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+    {
+        let writer = pool.writer().unwrap();
+        let conn = writer.conn();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..6000i64 {
+            let to_actor = if i % 5 == 0 {
+                "lambda:target"
+            } else {
+                "lambda:other"
+            };
+            conn.execute(
+                "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at) \
+                 VALUES (?1, 'default', 'message', ?2, \
+                 json_object('direction','inbound','to_actor',?3,'read', (?4 % 2 = 0)), ?4, ?4)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), format!("m{i}"), to_actor, i],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    // Same shape `query_inbox_response` builds for box="inbox", status="all".
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrLegacyIndexed,
+                value: SqlValue::Text("lambda:target".to_string()),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let reader = pool.reader().unwrap();
+    let (lt_where, mut lt_params) = build_note_filter_where("default", &filter).unwrap();
+    lt_params.push(Box::new(3000_i64));
+    let lt_ts_idx = lt_params.len();
+    lt_params.push(Box::new(100_i64));
+    let lt_limit_idx = lt_params.len();
+    let lt_sql = format!(
+        "SELECT id FROM notes{lt_where} AND created_at < ?{lt_ts_idx} \
+         ORDER BY created_at DESC, id ASC LIMIT ?{lt_limit_idx}"
+    );
+    let plan = plan_details(reader.conn(), &lt_sql, &lt_params);
+    assert!(
+        plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "expected arm: the lt-branch still sorts because no index ends in \
+         (created_at DESC, id ASC) for this partition, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_notes_kind_created_seek"),
+        "no such index exists in production schema; a name match here would mean \
+         this test started reading stale state"
+    );
+}
+
+/// khive#2392: the natural seekable fix for the gap pinned by
+/// `comm_inbox_status_all_lt_branch_has_no_seek_index` — a general
+/// `(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL`
+/// index — was measured, not just assumed, before deciding not to ship it.
+/// Standalone it cuts the lt-branch scan from 57,473 to 7,223 VM steps for a
+/// 6,000-row fixture (~8x), but because it carries no `to_actor`/`read`
+/// predicate it is *also* a legal plan for `comm.inbox`'s default
+/// `status="unread"` listing, and SQLite prefers it (no `ANALYZE`
+/// statistics) over the purpose-built partial
+/// `idx_notes_unread_probe_recipient_direction` — the identical failure mode
+/// V27's header already recorded for the dropped `(to_actor, direction)`
+/// index. Measured on the same fixture: 84 VM steps via the partial index
+/// vs. 125 via this candidate, so it is not even a narrow win there. This
+/// test builds the two indexes together and pins that the unread-probe plan
+/// flips away from the tuned partial index, which is the reason this index
+/// is not part of the migration.
+#[tokio::test]
+async fn candidate_created_at_id_seek_index_flips_unread_probe_plan() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "message",
+                &format!("message {i}"),
+                serde_json::json!({
+                    "direction": "inbound",
+                    "to_actor": "lambda:reader",
+                    "read": false,
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_notes_kind_created_seek \
+                    ON notes(namespace, kind, created_at DESC, id ASC) \
+                    WHERE deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            NotePropFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+            NotePropFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrLegacyIndexed,
+                value: SqlValue::Text("lambda:reader".to_string()),
+            },
+        ],
+        order_by: None,
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        plan.contains("idx_notes_kind_created_seek"),
+        "expected arm: with both indexes present, the planner prefers the general \
+         created_at/id index over the tuned partial unread-probe index, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_notes_unread_probe_recipient_direction"),
+        "got:\n{plan}"
+    );
+}
+
+/// khive#2392: narrowing `idx_notes_task_status`/`idx_notes_task_assignee`'s
+/// partial `WHERE` to `kind = 'task' AND deleted_at IS NULL` would shrink the
+/// index, but every query that would use it binds `kind` as a parameter
+/// (`build_note_filter_where` never inlines it), and SQLite can only use a
+/// partial index when it can prove the WHERE clause from the query's WHERE
+/// clause using a literal or otherwise plan-time-known value — a bound
+/// parameter is not visible until execution, so a query written exactly as
+/// `kind = ?1` cannot be proven to imply `kind = 'task'` at plan time. This
+/// pins that the narrowed index shape is not chosen, which is why the
+/// shipped V27 indexes stay partial only on `deleted_at IS NULL`.
+#[tokio::test]
+async fn narrowing_hot_property_index_to_kind_task_is_not_chosen() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({ "status": if i % 2 == 0 { "active" } else { "next" } }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    {
+        let writer = store.pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_notes_task_status_narrowed \
+                    ON notes(namespace, json_extract(properties, '$.status'), \
+                    created_at DESC, id ASC) \
+                    WHERE kind = 'task' AND deleted_at IS NULL;",
+            )
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("active".to_string()),
+        }],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        !plan.contains("idx_notes_task_status_narrowed"),
+        "expected arm: a bound `kind = ?` parameter cannot prove the narrowed \
+         partial index's WHERE clause, so the planner must not choose it, got:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_notes_task_status") || plan.contains("idx_notes_task_assignee"),
+        "the shipped (non-narrowed) indexes must still serve the query, got:\n{plan}"
+    );
+}
+
+/// khive#2392: `gtd.tasks()` with no `status=` filter compiles
+/// `FilterOp::NotInOrMissing(["done", "cancelled"])` on `$.status`
+/// (`handle_tasks` in `crates/khive-pack-gtd/src/handlers.rs`), which
+/// `build_note_filter_where` turns into `(expr IS NULL OR expr NOT IN
+/// (...))` -- an open exclusion, not a bounded set, so `idx_notes_task_status`
+/// cannot narrow it to an index range seek; the planner can only walk the
+/// `(namespace, kind)` partition.
+///
+/// No seekable rewrite preserves the documented semantics either: the
+/// listing must keep a task whose `$.status` is missing *or* any unrecognized
+/// legacy value (see `handle_tasks`'s comment on why `NotInOrMissing` was
+/// chosen over `Ne`), so the exclusion set is open-ended and cannot be
+/// rewritten as `status IN (<the 5 known non-terminal statuses>)` -- that
+/// would silently drop a task carrying a status string outside
+/// `TASK_STATUSES`, which is exactly the case this predicate exists to keep.
+/// This test measures and pins the current (unindexed) plan rather than
+/// leaving the claim unverified.
+#[tokio::test]
+async fn gtd_tasks_default_listing_not_in_or_missing_has_no_seek_index() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
+    use khive_storage::types::SqlValue;
+
+    let store = setup_memory_store();
+    let statuses = ["inbox", "next", "active", "done", "cancelled"];
+    for i in 0..20 {
+        store
+            .upsert_note(make_note_with_props(
+                "default",
+                "task",
+                &format!("task {i}"),
+                serde_json::json!({ "status": statuses[i % 5] }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters: vec![NotePropFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::NotInOrMissing(vec![
+                SqlValue::Text("done".to_string()),
+                SqlValue::Text("cancelled".to_string()),
+            ]),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    };
+    let (sql, params) = listing_sql_and_params(&filter);
+    let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
+    assert!(
+        !plan.contains("idx_notes_task_status"),
+        "expected arm: an open NOT-IN exclusion cannot be served by an equality-\
+         keyed index seek, so idx_notes_task_status must not appear in the plan, \
+         got:\n{plan}"
     );
 }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `KHIVE_EMAIL_DEFAULT_ACTOR` now falls back to `local` when unset or blank,
+  matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
+  instead of a hard-coded identity with no meaning outside the deployment it
+  was named for. Behaviour with the variable explicitly set is unchanged.
+
+### Fixed
+
+- The events daemon no longer releases SQLite's advisory locks on its own
+  database. Permission hardening of the `-wal`/`-shm` sidecars ran after the
+  database was opened and closed a descriptor on each file, which under POSIX
+  drops every lock the process holds on that inode; a backup or inspection
+  connection closing afterwards then took itself for the last connection,
+  checkpointed, and unlinked the sidecars while the daemon kept writing to the
+  unlinked files. Hardening now runs before the open, the post-open check uses
+  `lstat` only, and a cross-process test asserts the locks are held.
+
 ## [0.8.0] - 2026-08-27
 
 ### Added
