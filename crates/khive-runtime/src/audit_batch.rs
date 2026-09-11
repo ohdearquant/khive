@@ -650,6 +650,19 @@ impl AuditBatch {
     /// ([`AuditTerminalReason::ResolutionDeadlineExpired`]) so a stalled
     /// store cannot retain this caller, its request slot, and its audit-lane
     /// waiter forever (khive#2331).
+    ///
+    /// The two deadlines therefore mean different things to the caller, and
+    /// callers key on the difference. Admission expiry means the row is
+    /// enqueued and this seam keeps waiting; the generation commits it
+    /// independently, so a dispatch that reaches it reports its committed
+    /// result and counts the row as unresolved. Resolution expiry means the
+    /// caller waited for the real outcome and never received one: the commit
+    /// is unconfirmed, not proven absent. That is returned as a terminal
+    /// reason and the dispatch propagates it as a structured
+    /// committed-outcome error carrying the domain result, with no retryable
+    /// context, for every verb rather than only for the receipt verb. Never
+    /// replay the handler or re-enqueue the row on it; the original driver
+    /// work continues on its own.
     pub(crate) async fn submit_until_resolved(
         &self,
         row: PreparedAuditRow,

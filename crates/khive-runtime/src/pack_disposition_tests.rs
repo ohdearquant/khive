@@ -279,6 +279,7 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
         let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let project_id = uuid::Uuid::new_v4();
         let unresolved_before = crate::pack::audit_admission_unresolved_obligation_count();
+        let propagated_before = crate::pack::audit_obligation_append_failure_count();
         let mut dispatch = tokio::spawn({
             let registry = registry.clone();
             let notes = notes.clone();
@@ -330,43 +331,55 @@ async fn disposition_audit_deadline_keeps_one_write_and_one_late_audit_row() {
             .expect("audit deadline returns without waiting for the store release")
             .expect("dispatch task joins");
         assert!(audit_was_uncommitted);
-        // The domain write committed and its audit row is enqueued; the
-        // generation commits that row on its own, so the dispatch reports the
-        // committed result. Only the git.digest receipt stays strict: there the
-        // audit row is the receipt the caller is promised.
-        let domain_result = if verb == "git.digest" {
-            let error = response.unwrap_err();
-            assert_eq!(error.disposition(), DomainDisposition::Committed);
-            assert!(error.source().retryable_failure_context().is_none());
-            let RuntimeError::AuditObligation {
-                failure,
-                domain_result,
-            } = error.into_source()
-            else {
-                panic!("expired receipt must retain the canonical domain result");
-            };
-            assert_eq!(failure.wire_code(), "resolution_deadline_expired");
-            assert_eq!(
-                failure.reason,
-                crate::AuditObligationReason::Terminal(
-                    crate::audit_batch::AuditTerminalReason::ResolutionDeadlineExpired
-                )
-            );
-            domain_result
-        } else {
-            response
-                .expect("a committed write whose audit row is enqueued reports success")
-                .result
+        // Past the RESOLUTION deadline both verbs answer the same way, and
+        // that is the contract this branch changes. The admission deadline
+        // elapsing still means "enqueued, probably fine, report the committed
+        // result", because the generation commits the row independently. The
+        // resolution deadline elapsing means the caller waited for the real
+        // outcome and never got one: the audit commit is unconfirmed, not
+        // proven absent. A success there would tell the caller the record
+        // exists when nobody knows whether it does, so the dispatch returns a
+        // structured committed-outcome error instead, for every verb rather
+        // than only for the receipt verb.
+        let error = response.unwrap_err();
+        assert_eq!(error.disposition(), DomainDisposition::Committed);
+        // No retryable context, in either verb: the domain effect committed, so
+        // a retry would write twice. This is the assertion that separates "the
+        // caller is told something went wrong" from "the caller is invited to
+        // do it again".
+        assert!(error.source().retryable_failure_context().is_none());
+        let RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } = error.into_source()
+        else {
+            panic!("an expired resolution wait must retain the canonical domain result");
         };
+        assert_eq!(failure.wire_code(), "resolution_deadline_expired");
+        assert_eq!(
+            failure.reason,
+            crate::AuditObligationReason::Terminal(
+                crate::audit_batch::AuditTerminalReason::ResolutionDeadlineExpired
+            )
+        );
         assert_eq!(domain_result["project_id"], serde_json::json!(project_id));
         assert_eq!(domain_result["count"], 1);
-        if verb != "git.digest" {
-            assert_eq!(
-                crate::pack::audit_admission_unresolved_obligation_count(),
-                unresolved_before + 1,
-                "a degraded write counts on the unresolved-obligation counter"
-            );
-        }
+        // The counter split is part of the contract, not bookkeeping. An
+        // expired resolution wait propagates as the dispatch's own error, so it
+        // belongs on the propagated-obligation counter; the unresolved counter
+        // is for rows a SUCCEEDED dispatch left enqueued past the admission
+        // deadline, and nothing here succeeded. Asserting the second counter
+        // did NOT move is what keeps the two facts from collapsing into one.
+        assert_eq!(
+            crate::pack::audit_obligation_append_failure_count(),
+            propagated_before + 1,
+            "an expired resolution wait propagates as the dispatch's own error"
+        );
+        assert_eq!(
+            crate::pack::audit_admission_unresolved_obligation_count(),
+            unresolved_before,
+            "the unresolved counter is for succeeded dispatches, and this one did not succeed"
+        );
         let id = domain_result["id"].as_str().unwrap().parse().unwrap();
         assert!(notes.get_note(id).await.unwrap().is_some());
         assert_eq!(notes.count_notes("local", None).await.unwrap(), 1);
