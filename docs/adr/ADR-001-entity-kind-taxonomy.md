@@ -116,6 +116,10 @@ Clearing an explicit column therefore makes any retained legacy string eligible
 again. Search, endpoint validation, and other exact-column filter consumers do
 not opt into this listing compatibility rule.
 
+This rule is a bridge, not a second canonical field: it is retired by a later amendment once
+the legacy population (rows with a null `entity_type` and a string `properties.type`, the
+count issue 2559 measures) reads zero after backfill.
+
 #### Registry contract
 
 The `EntityTypeRegistry` governs which `entity_type` values are valid for each `EntityKind`:
