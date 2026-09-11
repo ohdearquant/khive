@@ -85,17 +85,6 @@ def test_round_trip_through_fake_parser(args):
     assert parsed_args == args
 
 
-def test_old_daemon_shaped_string_refused_by_fake(rest_server, api_key):
-    httpx = pytest.importorskip("httpx")
-    response = httpx.post(
-        f"{rest_server.url}/v1/request",
-        json={"ops": '[{"tool": "whoami", "args": {}}]'},
-        headers={"Authorization": f"ApiKey {api_key}"},
-    )
-    assert response.status_code == 400
-    assert response.json() == {"error": "unknown verb: Missing 'verb' field in JSON"}
-
-
 def test_dsl_text_passes_through_untouched():
     assert render_dsl("whoami()") == "whoami()"
     chain = "whoami() | stats()"
@@ -110,6 +99,20 @@ def test_dsl_string_elements_render_verbatim_beside_dicts():
         ("whoami", {}),
         ("search", {"query": "x"}),
     ]
+
+
+def test_empty_string_element_in_list_raises_transport_error():
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl([""])
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["", op("stats")])
+
+
+def test_whitespace_only_string_element_in_list_raises_transport_error():
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["  \t\n  "])
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl(["  \t\n  ", "whoami()"])
 
 
 def test_mixed_dsl_string_and_op_dict_pack_verb_accepted():
@@ -326,3 +329,66 @@ def test_prev_reference_outside_a_chain_is_rejected():
         parse_dsl("update(id=$prev.id)")
     with pytest.raises(DslParseError):
         parse_dsl("[update(id=$prev.id), other()]")
+
+
+# -- wire-invalid renders ----------------------------------------------------
+#
+# `render_dsl` must reject a call it cannot legally hand to the request
+# parser, rather than returning wire-invalid text for a transport to send.
+# Each case below is rejected identically by the Rust grammar
+# (`parser_impl.rs`) and by the offline fake (`_dsl_fake.py`), pinning the
+# renderer to the same decision both make.
+
+
+def test_invalid_argument_name_raises_transport_error():
+    with pytest.raises(TransportError, match="bad-name"):
+        render_dsl([{"tool": "verb", "args": {"bad-name": 1}}])
+
+
+def test_non_string_argument_name_raises_transport_error():
+    with pytest.raises(TransportError, match="must be a string"):
+        render_dsl([{"tool": "verb", "args": {1: 2}}])
+
+
+def test_empty_operation_list_raises_transport_error():
+    with pytest.raises(TransportError, match="empty"):
+        render_dsl([])
+
+
+# `dispatch.rs::RESERVED_ENVELOPE_ARGS` (`khive_types::pack`), mirrored in
+# `khive.dsl._RESERVED_ENVELOPE_ARGS` — kept as one list here so a change to
+# either drifts this test instead of silently under-covering the set.
+_RESERVED_ENVELOPE_ARG_NAMES = ("presentation", "presentation_per_op")
+
+
+@pytest.mark.parametrize("name", _RESERVED_ENVELOPE_ARG_NAMES)
+def test_reserved_envelope_argument_name_raises_transport_error(name):
+    with pytest.raises(TransportError, match=name):
+        render_dsl([{"tool": "stats", "args": {name: "table"}}])
+
+
+def test_triple_segment_tool_name_raises_transport_error():
+    with pytest.raises(TransportError, match="a.b.c"):
+        render_dsl([{"tool": "a.b.c", "args": {}}])
+
+
+def test_tool_name_starting_with_digit_raises_transport_error():
+    with pytest.raises(TransportError, match="1x"):
+        render_dsl([{"tool": "1x", "args": {}}])
+
+
+def test_render_stops_at_the_byte_cap_before_rendering_later_entries():
+    # Two 600 KiB entries already exceed the 1 MiB request cap. The third entry
+    # is unrenderable, so reaching it would raise a different error: the cap
+    # must fire first, proving later entries are never rendered or joined.
+    big = "x" * (600 * 1024)
+    ops = [op("blob.put", bytes=big), op("blob.put", bytes=big), {"tool": 42}]
+    with pytest.raises(TransportError, match="exceeds 1048576 bytes after 2 of 3"):
+        render_dsl(ops)
+
+
+def test_render_under_the_byte_cap_still_joins_every_entry():
+    small = "x" * 1024
+    rendered = render_dsl([op("blob.put", bytes=small), op("blob.put", bytes=small)])
+    assert rendered.startswith("[blob.put(") and rendered.endswith(")]")
+    assert rendered.count("blob.put(") == 2

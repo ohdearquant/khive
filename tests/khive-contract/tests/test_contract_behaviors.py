@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession
+from khive_contract.client import KhiveMcpSession, error_text
 
 VERBS_UNDER_TEST = {"create", "link", "query"}
 
@@ -108,7 +108,7 @@ def test_gql_property_projection_invalid_column_error(
     assert not first.get("ok", False), (
         "RETURN a.bogus must produce an error, not a success"
     )
-    err = first.get("error", "")
+    err = error_text(first)
     assert err, "Error message must be non-empty"
     assert "bogus" in err, (
         f"Error must name the offending property 'bogus': {err!r}"

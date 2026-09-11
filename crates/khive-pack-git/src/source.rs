@@ -18,15 +18,16 @@ pub enum DigestSource {
     /// An absolute local path known to contain a `.git` entry (directory or,
     /// for worktrees, a `gitdir:` pointer file).
     Local(PathBuf),
-    /// A remote `https://` URL to clone/fetch into the scratch cache.
+    /// A remote `https://` URL, cloned/fetched only when commits are requested.
     Remote {
         /// Canonical form used as the cache key (trailing `/` and `.git`
         /// suffix stripped) — same URL always maps to the same cache slot.
         canonical: String,
         /// Parse-time hint for a syntactic `github.com/<owner>/<repo>` URL.
-        /// This is not a capability decision: after cloning, the ingest core
-        /// uses source-bound `gh repo view <owner/repo>` and trusts only its successful
-        /// `nameWithOwner` result before issue/PR ingestion (#1617).
+        /// This is not a capability decision: the ingest core uses
+        /// source-bound `gh repo view <owner/repo>` and trusts only its
+        /// successful `nameWithOwner` result before issue/PR ingestion
+        /// (#1617), whether or not a commit clone was requested.
         gh_slug: Option<(String, String)>,
     },
 }

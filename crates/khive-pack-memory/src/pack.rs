@@ -14,7 +14,7 @@ use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Vi
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
+use crate::ann::{new_shared_for_role, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -43,11 +43,22 @@ impl MemoryPack {
     ///
     /// See `crates/khive-pack-memory/docs/api/pack-integration.md`.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the memory
+    /// index from the full corpus. The serving factory passes the daemon role:
+    /// a corpus build is minutes of CPU and a segment rewrite every other reader
+    /// on the index root must absorb, so a short-lived client serves what is
+    /// persisted and leaves the build to the daemon. Direct constructions —
+    /// admin reindex, benches, tests — build, because building is what they are
+    /// for.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
-            ann: new_shared(),
+            ann: new_shared_for_role(builds_corpus_indexes),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
             recall_state: Mutex::new(BalancedRecallState::new(10_000)),
             brain_profile,
@@ -91,6 +102,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: true,
                 description: "Memory content to store.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "key",
+                param_type: "string",
+                required: false,
+                description: "Immutable operation key, at most 512 UTF-8 bytes and no NUL (empty is allowed). Unique among live memories in the write namespace. Replay returns key_conflict with existing_id; pin the original namespace when reconciling across actors.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -185,14 +203,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10).",
+                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100). Takes priority over limit.",
+                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -291,6 +309,20 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: false,
                 description: "Tag filter mode: \"any\" (OR, default) or \"all\" (AND). Only applies when tags is non-empty.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "exclude_tags",
+                param_type: "array",
+                required: false,
+                description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_source_id",
+                param_type: "boolean",
+                required: false,
+                description: "When true every hit carries source_id: the UUID the memory annotates (its source_id at remember time), or null when it has none. Default false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -405,7 +437,10 @@ impl khive_runtime::PackFactory for MemoryPackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(MemoryPack::new(runtime))
+        Box::new(MemoryPack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 }
 
@@ -571,6 +606,7 @@ mod recall_future_footprint_tests {
     use khive_runtime::{Namespace, VerbRegistryBuilder};
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn deadline_wrapper_does_not_embed_the_recall_pipeline() {
         // Measure on an explicitly roomy stack so the regression reports the
         // historical inline footprint instead of aborting the test process.
@@ -853,6 +889,7 @@ mod ann_route_tests {
     /// See `crates/khive-pack-memory/docs/api/ann-lifecycle.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn recall_second_call_uses_warm_ann_route() {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-route-")
@@ -1092,6 +1129,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn prune_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1122,6 +1160,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1149,6 +1188,7 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);
@@ -1178,6 +1218,7 @@ mod note_mutation_hook_tests {
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
     async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let (registry, ann) = build_note_hook_registry(&rt);

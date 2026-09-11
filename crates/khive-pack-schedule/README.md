@@ -12,9 +12,12 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 | `schedule.agenda`   | List upcoming events; MCP also reports process-local ticker liveness    |
 | `schedule.cancel`   | Cancel a scheduled event                                                |
 
-`at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`.
-Cron expressions are rejected because the pending-events executor cannot advance
-them; accepted recurrence never degrades silently to one-shot delivery.
+`at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`, an
+interval from the previous trigger as `every:<N><s|m|h|d>` (for example `every:15m`),
+or a five-field cron expression evaluated in UTC (for example `0 9 * * 1`). Creation
+and the pending-events executor share one parser (`repeat.rs`), so anything else is
+rejected at creation and accepted recurrence never degrades silently to one-shot
+delivery. A recurrence fires no sooner than the daemon's next drain pass.
 
 ## Semantics
 

@@ -50,6 +50,10 @@ impl khive_runtime::PackFactory for FormalPackFactory {
         &["kg"]
     }
 
+    fn intentionally_verbless(&self) -> bool {
+        true
+    }
+
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(FormalPack::new(runtime))
     }

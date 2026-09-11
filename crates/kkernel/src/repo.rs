@@ -710,6 +710,7 @@ async fn dispatch_single(server: &KhiveMcpServer, tool: &str, args: Value) -> Re
         .context("serialize repository-showcase operation")?;
     let raw = server
         .dispatch_request_local(RequestParams {
+            plan: None,
             ops,
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,

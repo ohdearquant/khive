@@ -46,6 +46,7 @@ tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+serial_test = { workspace = true }
 
 [[bench]]
 name = "knowledge_bench"

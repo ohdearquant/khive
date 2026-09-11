@@ -99,3 +99,118 @@ def test_single_quote_escape_rejected():
 def test_invalid_argument_name_rejected():
     with pytest.raises(DslParseError):
         parse_dsl("verb(1x=2)")
+
+
+def test_object_value_resolves_prev_reference_inside_a_chain():
+    # An object value is parsed through the same recursive value grammar as
+    # a top-level argument, not decoded as one JSON blob, so a bare `$prev`
+    # reference inside an object is promoted exactly as it is at the top
+    # level.
+    [_first, (verb, args)] = parse_dsl('first() | second(properties={"id": $prev.id})')
+    assert verb == "second"
+    assert args == {"properties": {"id": PrevRef("id")}}
+
+
+def test_object_value_string_with_raw_newline_decodes():
+    [_first, (verb, args)] = parse_dsl('first() | second(properties={"note": "line1\nline2"})')
+    assert verb == "second"
+    assert args == {"properties": {"note": "line1\nline2"}}
+
+
+def test_object_value_nesting_matches_top_level_array_and_object_grammar():
+    [_first, (verb, args)] = parse_dsl('first() | second(properties={"a": [1, {"b": $prev.id}]})')
+    assert verb == "second"
+    assert args == {"properties": {"a": [1, {"b": PrevRef("id")}]}}
+
+
+def test_object_value_prev_reference_rejected_outside_a_chain():
+    # `in_chain=False` outside a chain: a $prev reference nested inside an
+    # object argument is rejected there too, matching the top-level rule.
+    with pytest.raises(DslParseError):
+        parse_dsl('verb(properties={"b": $prev.id})')
+
+
+def test_object_key_must_be_a_quoted_string():
+    with pytest.raises(DslParseError):
+        parse_dsl("verb(properties={a: 1})")
+
+
+def test_non_ascii_digit_prev_index_stays_a_literal_string():
+    # Python's `str.isdigit()` accepts non-ASCII digits (Arabic-indic `١`);
+    # the Rust source requires `char::is_ascii_digit`, so this must stay a
+    # literal string, never a PrevRef, both as a bare reference and as a
+    # quoted one.
+    assert parse_dsl('verb(x="$prev[١]")') == [("verb", {"x": "$prev[١]"})]
+    with pytest.raises(DslParseError):
+        parse_dsl("first() | second(x=$prev[١])")
+
+
+def test_trailing_comma_in_argument_list_rejected():
+    with pytest.raises(DslParseError):
+        parse_dsl("verb(x=1,)")
+
+
+def test_duplicate_argument_name_rejected():
+    with pytest.raises(DslParseError):
+        parse_dsl("verb(x=1,x=2)")
+
+
+@pytest.mark.parametrize(
+    ("text", "variant"),
+    [
+        ("", "Empty"),
+        ("[v() | w()]", "MixedSeparators"),
+        ("[v(), ]", "TrailingComma"),
+        ("v(a=1, a=2)", "DuplicateArg"),
+        ("v(a={, b=1)", "UnexpectedChar"),
+        ("v(a={", "UnexpectedEof"),
+        ("v(a=1", "UnclosedCall"),
+    ],
+)
+def test_variant_names_the_mirrored_error_class(text, variant):
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl(text)
+    assert exc_info.value.variant == variant
+
+
+def test_an_unclassified_rejection_carries_no_variant():
+    # A quoted key that runs off the end is rejected, but at an arm the fake
+    # does not mirror, so it claims no class (see the module docstring).
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl('v(a={"k"')
+    assert exc_info.value.variant is None
+
+
+def test_empty_batch_rejected_as_empty_batch():
+    # `dispatch.rs::parse_batch` reports `[]` as `EmptyBatch`; the fake must not
+    # hand a test server an empty parallel batch the real parser refuses.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl("[]")
+    assert exc_info.value.variant == "EmptyBatch"
+
+
+def test_whitespace_after_pack_dot_tolerated():
+    # `parser_impl.rs::parse_op` reads the verb after the dot through
+    # `parse_identifier`, which skips ASCII whitespace first.
+    assert parse_dsl('blob. put(bytes="x")') == [("blob.put", {"bytes": "x"})]
+    assert parse_dsl('blob.\tput(bytes="x")') == [("blob.put", {"bytes": "x"})]
+
+
+def test_whitespace_after_prev_path_dot_tolerated():
+    # `parser_impl.rs::parse_prev_ref` reads each path segment through
+    # `parse_identifier`, so `$prev. id` names the same path as `$prev.id`.
+    ops = parse_dsl("a() | b(id=$prev. id)")
+    assert ops[1] == ("b", {"id": PrevRef("id")})
+
+
+@pytest.mark.parametrize("spelling", ["1e9999", "-1e9999", "1.5e400"])
+def test_out_of_range_number_rejected_as_invalid_value(spelling):
+    # serde_json refuses a float spelling that overflows f64; `json.loads`
+    # would silently produce infinity instead.
+    with pytest.raises(DslParseError) as exc_info:
+        parse_dsl(f"verb(x={spelling})")
+    assert exc_info.value.variant == "InvalidValue"
+
+
+def test_in_range_large_exponent_still_accepted():
+    assert parse_dsl("verb(x=1e300)") == [("verb", {"x": 1e300})]

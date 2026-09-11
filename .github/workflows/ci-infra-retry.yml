@@ -5,6 +5,10 @@ name: CI infra retry
 # failures are deliberately excluded: a green retry must not hide a flake.
 # If matrix fail-fast cancelled a sibling, rerun the whole workflow so that
 # cancellation cannot leave main red after the failed job recovers.
+# A declined retry fails this job. This workflow only runs after a failed CI
+# attempt, so a green check here would sit beside a red CI on the same commit
+# and read as a pass to anyone scanning the check list; a red one names the
+# failed jobs and the reason no retry was made.
 on:
   workflow_run:
     workflows: [CI]
@@ -132,7 +136,9 @@ jobs:
               echo "Run ${RUN_ID} had ${failed_count} failed leaf job(s), ${infra_count} setup-only leaf failure(s), ${gate_infra_count}/${gate_failed_count} setup-only CI gate failure(s), and ${cancelled_count} cancelled leaf job(s)."
               echo "Failed jobs: ${failed_names:-none}."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "No automatic retry: ${failed_count} failed leaf job(s), ${infra_count} setup-only. Failed jobs: ${failed_names:-none}."
+            echo "CI stays red on this commit; this job fails so the check list says so."
+            exit 1
           fi
 
           if [ "$cancelled_count" -eq 0 ]; then

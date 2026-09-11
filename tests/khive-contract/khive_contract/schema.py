@@ -27,7 +27,24 @@ REQUEST_ENVELOPE_SCHEMA: dict[str, Any] = {
                     "ok": {"type": "boolean"},
                     "tool": {"type": "string"},
                     "result": {},
-                    "error": {"type": "string"},
+                    # A per-op error is an object carrying `message` beside its
+                    # disposition fields. The daemon text protocol still sends a
+                    # bare string, so both shapes validate here.
+                    "error": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "required": ["message"],
+                                "properties": {
+                                    "message": {"type": "string"},
+                                    "kind": {"type": "string"},
+                                    "domain_disposition": {"type": "string"},
+                                    "domain_result": {},
+                                },
+                            },
+                        ]
+                    },
                 },
             },
         }

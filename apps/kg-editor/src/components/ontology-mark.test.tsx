@@ -24,9 +24,13 @@ describe("OntologyLegend", () => {
       )
     );
 
-    expect(entityMarks.filter(Boolean)).toHaveLength(9);
-    expect(noteMarks.filter(Boolean)).toHaveLength(5);
-    expect(relationMarks.filter(Boolean)).toHaveLength(17);
+    // Derived from the vocabularies themselves: the claim is that every
+    // member renders a mark, which a literal restates and then goes stale on
+    // the next member. A missing mark still fails, because the query for it
+    // returns null and drops out of the filter.
+    expect(entityMarks.filter(Boolean)).toHaveLength(ENTITY_KINDS.length);
+    expect(noteMarks.filter(Boolean)).toHaveLength(NOTE_KINDS.length);
+    expect(relationMarks.filter(Boolean)).toHaveLength(EDGE_RELATIONS.length);
     expect(container.querySelectorAll(".ontology-derived-mark")).toHaveLength(
       1,
     );
@@ -61,6 +65,6 @@ describe("OntologyLegend", () => {
     ).toHaveClass("ontology-mark-dim");
     expect(
       container.querySelectorAll(".ontology-kind-mark[data-kind]"),
-    ).toHaveLength(14);
+    ).toHaveLength(ENTITY_KINDS.length + NOTE_KINDS.length);
   });
 });

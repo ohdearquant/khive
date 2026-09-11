@@ -10,7 +10,8 @@ render this internal form to DSL text before sending it (see `khive.dsl`) —
 the JSON form never reaches khive-cloud's wire.
 
 Args are pruned of `None` values so optional parameters genuinely stay
-absent instead of arriving as JSON nulls.
+absent instead of arriving as JSON nulls. Stream append preserves explicitly
+supplied record and fence nulls because field presence is part of that contract.
 """
 
 from __future__ import annotations
@@ -20,7 +21,13 @@ from typing import Any
 
 
 def op(tool: str, **args: Any) -> dict[str, Any]:
-    return {"tool": tool, "args": {k: v for k, v in args.items() if v is not None}}
+    # A stream record may be JSON null. A supplied fence (even null) must
+    # reach the server so input validation cannot be bypassed.
+    preserve_null = {"record", "fence"} if tool == "stream.append" else set()
+    return {
+        "tool": tool,
+        "args": {k: v for k, v in args.items() if v is not None or k in preserve_null},
+    }
 
 
 def encode(ops: list[dict[str, Any]]) -> str:

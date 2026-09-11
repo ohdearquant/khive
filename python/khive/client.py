@@ -69,14 +69,20 @@ def _note_from_wire(row: dict[str, Any]) -> Note:
     return Note.model_validate(row)
 
 
-def _page(raw: Any, parse: Any) -> Page:
+def _page(raw: Any, parse: Any, *, cursor_key: str) -> Page:
     if isinstance(raw, dict):
-        items = raw.get("items", raw.get("results", []))
-        total = raw.get("total")
-        next_offset = raw.get("next_offset")
-    else:
-        items, total, next_offset = raw or [], None, None
-    return Page(items=[parse(x) for x in items], total=total, next_offset=next_offset)
+        items = raw.get("items", raw.get(cursor_key, raw.get("results", [])))
+        return Page(
+            items=[parse(x) for x in items],
+            total=raw.get("total"),
+            next_offset=raw.get("next_offset"),
+            next_after=raw.get("next_after"),
+            scan_incomplete=raw.get("scan_incomplete"),
+            requested_limit=raw.get("requested_limit"),
+            effective_limit=raw.get("effective_limit"),
+            limit_clamped=raw.get("limit_clamped"),
+        )
+    return Page(items=[parse(x) for x in raw or []])
 
 
 class Khive:
@@ -97,9 +103,7 @@ class Khive:
     ) -> None:
         if transport is None:
             transport = SocketTransport(socket_path)
-        self.session = Session(
-            transport, namespace=namespace, actor_id=actor_id, timeout=timeout
-        )
+        self.session = Session(transport, namespace=namespace, actor_id=actor_id, timeout=timeout)
         self.entities = _Entities(self)
         self.notes = _Notes(self)
         self.graph = _Graph(self)
@@ -114,14 +118,11 @@ class Khive:
     def batch(self, ops: list[dict[str, Any]]) -> list[OpResult]:
         """Like `raw`, but raises `BatchError` if any op failed."""
         results = self.session.request(encode(ops))
-        failures = [
-            (i, r.get("tool", "?"), str(r.get("error")))
-            for i, r in enumerate(results)
-            if not r.get("ok")
-        ]
+        parsed = [OpResult.model_validate(r) for r in results]
+        failures = [(i, r.tool, r.error) for i, r in enumerate(parsed) if not r.ok]
         if failures:
             raise BatchError(results, failures)
-        return [OpResult.model_validate(r) for r in results]
+        return parsed
 
     # -- database-wide reads ----------------------------------------------
 
@@ -154,7 +155,9 @@ class Khive:
         kind: str = "entity",
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        raw = _one(self.session.request(encode([op("search", kind=kind, query=query, limit=limit)])))
+        raw = _one(
+            self.session.request(encode([op("search", kind=kind, query=query, limit=limit)]))
+        )
         if isinstance(raw, dict):
             return raw.get("items", raw.get("results", []))
         return raw or []
@@ -200,7 +203,7 @@ class _Entities:
                 encode([op("list", kind=kind, limit=limit, offset=offset, **filters)])
             )
         )
-        return _page(raw, Entity.model_validate)
+        return _page(raw, Entity.model_validate, cursor_key="entities")
 
     def update(self, id: str, **patch: Any) -> Entity:
         raw = _one(self._db.session.request(encode([op("update", id=id, **patch)])))
@@ -219,7 +222,15 @@ class _Notes:
     def __init__(self, db: Khive) -> None:
         self._db = db
 
-    def create(self, note: Note | None = None, /, **fields: Any) -> Note:
+    def create(
+        self,
+        note: Note | None = None,
+        /,
+        *,
+        fence: dict[str, Any] | list[dict[str, Any]] | None = None,
+        embed: bool | None = None,
+        **fields: Any,
+    ) -> Note:
         n = note or Note(**fields)
         # subject rides in properties until the daemon grows the column.
         props = {**n.properties, "subject": n.subject} if n.subject else (n.properties or None)
@@ -231,6 +242,9 @@ class _Notes:
                             "create",
                             kind=n.kind,
                             content=n.content,
+                            key=n.key,
+                            fence=fence,
+                            embed=embed,
                             properties=props or None,
                             tags=n.tags or None,
                         )
@@ -244,8 +258,10 @@ class _Notes:
         return _note_from_wire(_one(self._db.session.request(encode([op("get", id=id)]))))
 
     def list(self, *, kind: str = "note", limit: int | None = None, **filters: Any) -> Page:
-        raw = _one(self._db.session.request(encode([op("list", kind=kind, limit=limit, **filters)])))
-        return _page(raw, _note_from_wire)
+        raw = _one(
+            self._db.session.request(encode([op("list", kind=kind, limit=limit, **filters)]))
+        )
+        return _page(raw, _note_from_wire, cursor_key="notes")
 
 
 class _Graph:
@@ -317,9 +333,7 @@ class _Graph:
     ) -> Any:
         return _one(
             self._db.session.request(
-                encode(
-                    [op("neighbors", node_id=node_id, direction=direction, relations=relations)]
-                )
+                encode([op("neighbors", node_id=node_id, direction=direction, relations=relations)])
             )
         )
 
@@ -353,7 +367,7 @@ class _Graph:
         raw = _one(
             self._db.session.request(encode([op("list", kind="edge", limit=limit, **filters)]))
         )
-        return _page(raw, _edge_from_wire)
+        return _page(raw, _edge_from_wire, cursor_key="edges")
 
     # -- incidence-aware reads (client-side PROTOTYPE) ---------------------
     # The target engine computes these as an incidence join server-side:

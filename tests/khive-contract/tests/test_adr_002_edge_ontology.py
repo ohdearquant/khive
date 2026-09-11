@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, KhiveOperationError
+from khive_contract.client import KhiveMcpSession, KhiveOperationError, error_text
 from khive_contract.fixtures import EDGE_RELATIONS
 
 VERBS_UNDER_TEST = {"create", "link", "get", "list", "neighbors", "delete"}
@@ -106,7 +106,7 @@ def test_invalid_relation_reports_closed_relation_set(
     assert results, "Expected results in envelope"
     first = results[0]
     assert not first.get("ok", False), "Expected per-op error for invalid relation"
-    err = first.get("error", "")
+    err = error_text(first)
     assert err, "Error message must be non-empty"
     assert "invented_by" in err, f"Error must name offending relation 'invented_by': {err!r}"
 
@@ -163,7 +163,7 @@ def test_hard_delete_cascades_incident_edges_soft_delete_preserves(
                                                                           "namespace": temp_namespace}}])
     first_e1 = envelope_e1["results"][0]
     assert not first_e1.get("ok", False), "Outbound edge should be gone after hard-delete"
-    assert "not found" in first_e1.get("error", "").lower(), (
+    assert "not found" in error_text(first_e1).lower(), (
         f"Expected not-found error for outbound edge, got: {first_e1.get('error')!r}"
     )
 
@@ -171,7 +171,7 @@ def test_hard_delete_cascades_incident_edges_soft_delete_preserves(
                                                                           "namespace": temp_namespace}}])
     first_e2 = envelope_e2["results"][0]
     assert not first_e2.get("ok", False), "Inbound edge should be gone after hard-delete"
-    assert "not found" in first_e2.get("error", "").lower(), (
+    assert "not found" in error_text(first_e2).lower(), (
         f"Expected not-found error for inbound edge, got: {first_e2.get('error')!r}"
     )
 
@@ -224,7 +224,7 @@ def test_annotates_requires_note_source_and_cascades_on_hard_delete(
     ])
     first = envelope["results"][0]
     assert not first.get("ok", False), "entity→entity annotates must fail"
-    err = first.get("error", "")
+    err = error_text(first)
     assert "note" in err.lower(), f"Error must mention 'note' (ADR-002 constraint): {err!r}"
     assert "annotates" in err.lower(), f"Error must mention 'annotates': {err!r}"
 
@@ -276,7 +276,7 @@ def test_annotates_requires_note_source_and_cascades_on_hard_delete(
                                                                             "namespace": temp_namespace}}])
     first_edge = envelope_edge["results"][0]
     assert not first_edge.get("ok", False), "annotates edge must be cascade-deleted"
-    assert "not found" in first_edge.get("error", "").lower(), (
+    assert "not found" in error_text(first_edge).lower(), (
         f"annotates edge must be cascade-deleted when target hard-deleted; "
         f"got: {first_edge.get('error')!r}"
     )

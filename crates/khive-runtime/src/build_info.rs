@@ -1,5 +1,8 @@
 //! Compile-time identity for the source and build that produced this runtime.
 
+/// Package version shared by runtime diagnostics and lightweight identity probes.
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(test)]
 #[path = "build_info_support.rs"]
 mod build_info_support;

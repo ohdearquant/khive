@@ -76,6 +76,36 @@ through `RuntimeConfig::gate` when `[gate]` is absent.
 `load_with_roots`, `crates/khive-runtime/src/engine_config.rs`, the `load`
 family starting around line 298.)
 
+### Brain read scope
+
+Brain event counts, profile resolution, and binding listing default to the
+authorized caller's actor scope. An explicit foreign `actor` must be in the
+caller's visible namespace set; adding a visible namespace does not widen the
+default actor scope.
+
+The optional `[brain]` table grants selected actor ids permission to request
+aggregate event counts:
+
+```toml
+[brain]
+fleet_readers = []
+# To permit a named aggregate reader instead:
+# fleet_readers = ["service:metrics"]
+```
+
+`fleet_readers` is a list of strings (`Vec<String>`), defaulting to empty when the
+table or key is absent. Entries are exact actor ids, not display names, namespace
+patterns, or stored event actor prefixes. The empty list grants no caller access
+to `brain.event_counts(all_actors=true)`. A listed caller must still explicitly
+request `all_actors=true`; its ordinary requests remain scoped to itself.
+
+The serving process's resolved configuration controls this permission. Changing a
+client-local list does not grant access on an already-running daemon. Unknown keys
+inside `[brain]` fail startup. This setting does not enroll callers with the Gate,
+widen their namespace visibility, or grant an aggregate mode to profile resolution
+or binding listing. See the [brain API reference](guide/api-reference.md#brainevent_counts--assertive)
+for actor-filter and anonymous-caller behavior.
+
 ### The naming wrinkle: `khive.toml` vs `config.toml`
 
 The two accepted filenames are not interchangeable at every tier, and this
@@ -128,12 +158,13 @@ path   = "~/.khive/khive.db"
 name   = "sessions"
 kind   = "sqlite"
 path   = "~/.khive/sessions.db"
+served_kinds = ["note", "event"]
 
 [packs.session]
 backend = "sessions"
 ```
 
-The full field reference (`name`, `kind`, `path`, `read_only`, and the
+The full field reference (`name`, `kind`, `path`, `served_kinds`, `read_only`, and the
 currently-rejected `cache_mb` / `journal_mode` fields) and the pack-routing
 model (which packs default to `main`, how a custom pack binds a backend, the
 `main`-backend requirement, canonical-path deduplication, and cross-backend

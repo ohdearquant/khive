@@ -5,7 +5,10 @@
 # an entire memory corpus as JSONL onto a public PR.
 #
 # Modes:
-#   default (no args)    — inspect staged files (git diff --cached); use in pre-commit
+#   default (no args)    — inspect staged files (git diff --cached); use in pre-commit.
+#                          Reads the staged blobs from the index, never the working
+#                          tree: a staged file that was since deleted or rewritten on
+#                          disk is judged by what the commit will contain.
 #   --all                — scan entire working tree; use in CI
 #
 # Rules:
@@ -27,12 +30,23 @@ BENCH_RE='(^|/)(bench|benches|benchmark|benchmarks|criterion)(/|$)|bench.*result
 SHOWCASE_GOLDEN_RE='^(docs/schemas/examples/khive-repo-v1-khive\.json|apps/kg-editor/public/showcase/khive-repo-v1-khive\.json)$'
 SHOWCASE_MAX_JSON_KB=8192
 
+MODE=tree
 fail=0
+
+# Byte size of the object the mode judges: the staged blob in pre-commit mode, the
+# working-tree file in --all mode. Prints nothing and returns non-zero when unreadable.
+object_bytes() {
+  if [ "$MODE" = staged ]; then
+    git cat-file -s ":$1" 2>/dev/null
+  else
+    wc -c < "$1"
+  fi
+}
 
 check_file() {
   local f="$1"
-  [ -f "$f" ] || return 0
-  local base lower size_kb
+  [ "$MODE" = staged ] || [ -f "$f" ] || return 0
+  local base lower bytes size_kb
   base="$(basename "$f")"
   lower="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
 
@@ -46,7 +60,12 @@ check_file() {
     *.json)
       printf '%s' "$base" | grep -qE "^(${LOCKFILES})$" && return 0
       printf '%s' "$lower" | grep -qE "$BENCH_RE" && return 0
-      size_kb=$(( ($(wc -c < "$f") + 1023) / 1024 ))
+      if ! bytes=$(object_bytes "$f") || [ -z "$bytes" ]; then
+        echo "BLOCKED: $f — staged JSON could not be read from the index." >&2
+        fail=1
+        return 0
+      fi
+      size_kb=$(( (bytes + 1023) / 1024 ))
       # ADR-147 requires one canonical public golden and its byte-identical browser
       # asset. Keep this exception exact and below the renderer's closed 8 MiB cap;
       # the KG Studio contract job validates both JSON shape and byte parity.
@@ -71,7 +90,8 @@ if [ "${1:-}" = "--all" ]; then
     check_file "$f"
   done < <(git ls-files && git ls-files --others --exclude-standard)
 else
-  # Pre-commit mode: staged files only
+  # Pre-commit mode: staged files only, judged from the index
+  MODE=staged
   while IFS= read -r f; do
     check_file "$f"
   done < <(git diff --cached --name-only --diff-filter=ACMR)

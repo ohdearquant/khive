@@ -26,7 +26,7 @@ use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_state
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
-use khive_db::stores::text::insert_document_statement;
+use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
@@ -288,6 +288,15 @@ pub struct NoteSearchHit {
     pub source: crate::SearchSource,
     pub title: Option<String>,
     pub snippet: Option<String>,
+}
+
+/// Result of [`KhiveRuntime::search_notes_outcome`]: the fused hits — text
+/// hits alone when the vector arm failed — plus the vector arm's error, if
+/// any. Mirrors [`crate::HybridSearchOutcome`] for the note substrate.
+#[derive(Clone, Debug)]
+pub struct NoteSearchOutcome {
+    pub hits: Vec<NoteSearchHit>,
+    pub vector_error: Option<String>,
 }
 
 /// Re-insert hyphens at canonical UUID positions (8-4-4-4-12) into a
@@ -1854,6 +1863,7 @@ impl KhiveRuntime {
     }
 
     /// List entities visible to the token, optionally filtered by kind and entity_type.
+    /// A null entity_type falls back to a string properties.type for filtering only.
     ///
     /// When the token carries a multi-namespace visible set, entities from all
     /// visible namespaces are returned. When the visible set is `[primary]`
@@ -1880,6 +1890,7 @@ impl KhiveRuntime {
                 Some(t) => vec![t.to_string()],
                 None => vec![],
             },
+            legacy_entity_type_fallback: true,
             namespaces: ns_strs,
             ..Default::default()
         };
@@ -1936,6 +1947,7 @@ impl KhiveRuntime {
             entity_types: entity_type
                 .map(|value| vec![value.to_string()])
                 .unwrap_or_default(),
+            legacy_entity_type_fallback: true,
             tags_any: tags_any.to_vec(),
             namespaces: token
                 .visible_namespaces()
@@ -3665,20 +3677,21 @@ impl KhiveRuntime {
             let fts_result: RuntimeResult<()> = if fts_inject {
                 Err(RuntimeError::Internal("injected FTS failure".to_string()))
             } else {
-                match self.text_for_notes(token) {
-                    Ok(fts) => fts
-                        .upsert_document(note_fts_document(&note))
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                }
+                let statements =
+                    khive_db::stores::text::delete_document_statements("fts_notes", ns, note.id)
+                        .into_iter()
+                        .chain(khive_db::stores::text::insert_document_statements(
+                            "fts_notes",
+                            &note_fts_document(&note),
+                        ))
+                        .collect();
+                self.apply_note_index_revision(&note, statements)
+                    .await
+                    .map(|_| ())
             };
 
             if let Err(e) = fts_result {
-                // Best-effort compensation — ignore cleanup errors.
-                if let Ok(store) = self.notes(token) {
-                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                }
+                self.compensate_note_creation(&note).await;
                 return Err(e);
             }
         }
@@ -3742,30 +3755,14 @@ impl KhiveRuntime {
             let single_model_result: RuntimeResult<()> = match vec_result {
                 Ok(outcome) => {
                     embedding_report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                ns,
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                            .map_err(RuntimeError::from),
-                        Err(e) => Err(e),
-                    }
+                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                        .await
+                        .map(|_| ())
                 }
                 Err(e) => Err(e),
             };
             if let Err(e) = single_model_result {
-                // Compensate note row + FTS.
-                if let Ok(store) = self.notes(token) {
-                    let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                }
-                if let Ok(fts) = self.text_for_notes(token) {
-                    let _ = fts.delete_document(ns, note.id).await;
-                }
+                self.compensate_note_creation(&note).await;
                 return Err(e);
             }
         } else if !embed_model_names.is_empty() {
@@ -3802,49 +3799,20 @@ impl KhiveRuntime {
             let outcomes = match drain_embed_join_set(join_set, embed_model_names.len()).await {
                 Ok(outcomes) => outcomes,
                 Err(e) => {
-                    // Compensate note row + FTS (no vectors inserted yet).
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
-                    }
+                    self.compensate_note_creation(&note).await;
                     return Err(e);
                 }
             };
             // TODO(P2): parallelize vector inserts
-            let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
                 embedding_report.observe(&outcome);
-                let insert_result = match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => vs
-                        .insert(
-                            note.id,
-                            SubstrateKind::Note,
-                            ns,
-                            "note.content",
-                            vec![outcome.vector],
-                        )
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                };
+                let insert_result = self
+                    .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                    .await;
                 if let Err(e) = insert_result {
-                    // Compensate note row + FTS + already-inserted vectors.
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
-                    }
-                    for m in &inserted_models {
-                        if let Ok(vs) = self.vectors_for_model(token, m) {
-                            let _ = vs.delete(note.id).await;
-                        }
-                    }
+                    self.compensate_note_creation(&note).await;
                     return Err(e);
                 }
-                inserted_models.push(model_name.clone());
             }
         }
 
@@ -3915,19 +3883,11 @@ impl KhiveRuntime {
             match link_result {
                 Ok(edge) => created_edges.push(edge.id.into()),
                 Err(e) => {
-                    // Best-effort compensation — ignore cleanup errors.
-                    for edge_id in created_edges {
-                        let _ = self.delete_edge(token, edge_id, true).await;
-                    }
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
-                    }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
-                    }
-                    for model_name in &embed_model_names {
-                        if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                            let _ = vs.delete(note.id).await;
+                    // Preserve newer revisions and their edges. Successful
+                    // removal still uses canonical edge cleanup and its audits.
+                    if self.compensate_note_creation(&note).await {
+                        for edge_id in created_edges {
+                            let _ = self.delete_edge(token, edge_id, true).await;
                         }
                     }
                     return Err(e);
@@ -3955,7 +3915,7 @@ impl KhiveRuntime {
             // Fast path: single namespace — use the dedicated query_notes method.
             let page = self
                 .notes(token)?
-                .query_notes(
+                .query_notes_count_free(
                     token.namespace().as_str(),
                     kind,
                     PageRequest {
@@ -3976,7 +3936,7 @@ impl KhiveRuntime {
         };
         let page = self
             .notes(token)?
-            .query_notes_filtered(
+            .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
@@ -4080,6 +4040,68 @@ impl KhiveRuntime {
         tags_any: &[String],
         properties_filter: Option<&serde_json::Value>,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
+        let (hits, _vector_error) = self
+            .search_notes_inner(
+                token,
+                query_text,
+                query_vector,
+                limit,
+                note_kind,
+                include_superseded,
+                tags_any,
+                properties_filter,
+                false,
+            )
+            .await?;
+        Ok(hits)
+    }
+
+    /// Coordinator fan-out variant of [`Self::search_notes`]: the text arm
+    /// still fails loud, but a vector-arm failure after a successful text leg
+    /// is captured instead of discarding the text hits — mirrors
+    /// [`Self::hybrid_search_outcome`]'s contract for the entity substrate.
+    /// Reserved for `SubstrateCoordinator::fan_out_search_with_visibility`;
+    /// every other caller keeps the fail-loud [`Self::search_notes`] contract.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_notes_outcome(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+    ) -> RuntimeResult<NoteSearchOutcome> {
+        let (hits, vector_error) = self
+            .search_notes_inner(
+                token,
+                query_text,
+                None,
+                limit,
+                note_kind,
+                include_superseded,
+                tags_any,
+                properties_filter,
+                true,
+            )
+            .await?;
+        Ok(NoteSearchOutcome { hits, vector_error })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_notes_inner(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        note_kind: Option<&str>,
+        include_superseded: bool,
+        tags_any: &[String],
+        properties_filter: Option<&serde_json::Value>,
+        tolerate_vector_error: bool,
+    ) -> RuntimeResult<(Vec<NoteSearchHit>, Option<String>)> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
         let visible_ns: Vec<String> = token
@@ -4145,15 +4167,25 @@ impl KhiveRuntime {
         )?;
 
         // Vector search filtered to notes.
+        let mut vector_error: Option<String> = None;
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            self.vector_search(
-                token,
-                query_vector,
-                Some(query_text),
-                candidates,
-                Some(SubstrateKind::Note),
-            )
-            .await?
+            match self
+                .vector_search(
+                    token,
+                    query_vector,
+                    Some(query_text),
+                    candidates,
+                    Some(SubstrateKind::Note),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) if tolerate_vector_error => {
+                    vector_error = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             vec![]
         };
@@ -4168,7 +4200,7 @@ impl KhiveRuntime {
 
         let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], vector_error));
         }
 
         // Fetch each candidate note individually to get salience and apply
@@ -4263,7 +4295,7 @@ impl KhiveRuntime {
 
         hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
         hits.truncate(limit as usize);
-        Ok(hits)
+        Ok((hits, vector_error))
     }
 
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
@@ -4707,6 +4739,10 @@ impl KhiveRuntime {
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(true),
             Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::NoteConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
                 ..
             }) => Ok(false),
@@ -4751,6 +4787,9 @@ impl KhiveRuntime {
                 None => return Ok(false),
             }
         };
+        if let Some(error) = self.stream_member_error(&note).await? {
+            return Err(error);
+        }
         let mode = if hard {
             DeleteMode::Hard
         } else {
@@ -6290,28 +6329,29 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut fts_statement =
-                    insert_document_statement("fts_entities", &entity_fts_document(entity));
-                if injected_failure_index == Some(index) {
-                    fts_statement = SqlStatement {
+                let fts_statements: Vec<SqlStatement> = if injected_failure_index == Some(index) {
+                    vec![SqlStatement {
                         sql: "INSERT INTO __khive_create_many_injected_failure__ DEFAULT VALUES"
                             .to_string(),
                         params: vec![],
                         label: Some("fts-insert-injected-failure".to_string()),
-                    };
-                }
+                    }]
+                } else {
+                    // Order-sensitive pair — see `insert_document_statements`'s
+                    // adjacency contract.
+                    insert_document_statements("fts_entities", &entity_fts_document(entity)).into()
+                };
+                let mut statements = vec![PlanStatement {
+                    statement: entity_upsert_statement(entity),
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }];
+                statements.extend(fts_statements.into_iter().map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }));
                 AtomicOpPlan::AddEntity(AddEntityPlan {
                     entity_id: entity.id,
-                    statements: vec![
-                        PlanStatement {
-                            statement: entity_upsert_statement(entity),
-                            guard: Some(AffectedRowGuard::exactly(1)),
-                        },
-                        PlanStatement {
-                            statement: fts_statement,
-                            guard: None,
-                        },
-                    ],
+                    statements,
                     post_commit: PostCommitEffect::None,
                 })
             })
