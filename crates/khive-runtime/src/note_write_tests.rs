@@ -18,6 +18,53 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
 const MODEL: &str = "note-version-test";
 
+#[test]
+fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
+    use crate::note_write::NoteFences;
+
+    let entries: Vec<NoteFence> = (0..100)
+        .map(|index| NoteFence {
+            key: format!("fence-cap/{index}"),
+            kind: "head".into(),
+            expected_version: 1,
+        })
+        .collect();
+    let at_cap = NoteFences::Many(entries.clone());
+    at_cap.validate().unwrap();
+    serde_json::from_value::<NoteFences>(serde_json::to_value(&at_cap).unwrap()).unwrap();
+
+    let mut over_cap = entries;
+    over_cap.push(NoteFence {
+        key: "fence-cap/100".into(),
+        kind: "head".into(),
+        expected_version: 1,
+    });
+    for malformed in [false, true] {
+        let mut entries = over_cap.clone();
+        if malformed {
+            entries[0].expected_version = 0;
+        }
+        let fences = NoteFences::Many(entries);
+        let error = fences.validate().unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+        for message in [
+            error.to_string(),
+            serde_json::from_value::<NoteFences>(serde_json::to_value(&fences).unwrap())
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("at most 100 entries"), "{message}");
+            assert!(message.contains("sent 101"), "{message}");
+        }
+    }
+    let malformed = json!(vec![serde_json::Value::Null; 101]);
+    let message = serde_json::from_value::<NoteFences>(malformed)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("at most 100 entries"), "{message}");
+    assert!(message.contains("sent 101"), "{message}");
+}
+
 #[tokio::test]
 async fn ordered_fences_observe_prior_write_in_same_transaction() {
     let (runtime, token, _) = fixture();

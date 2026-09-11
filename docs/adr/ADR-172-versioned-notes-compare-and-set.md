@@ -469,6 +469,16 @@ Clarification (2026-09-10): the once-per-`(kind, key)` target rule applies indep
 fence list and to the keyed-write members of [ADR-174 A1.1](ADR-174-ordered-streams-append.md); it does
 not expand the batch-wide `fence`, which deliberately remains object-only.
 
+Cardinality bound (2026-09-10, #2507): an ordered fence list admits at most **100 entries**.
+An oversized list is `invalid_input`, naming both the cap and the count sent in its message,
+before interpreting any fence entry or requesting a writer. The same bound applies to
+singleton note `create`, note `update`, `stream.append`, and each `stream.batch` append
+member, in both atomic and per-member modes. Every append member's shape is validated before
+any member transaction starts, so an oversized later member cannot leave earlier writes.
+Exactly 100 entries remains valid subject to the existing shape and fence checks. The cap
+matches ADR-174's 100 observed-entry allowance: both lists add keyed reads while holding the
+writer. This is a per-list limit, not a new aggregate limit across batch members.
+
 The Python client accepts a dictionary or list of dictionaries and preserves entry order. Its generic
 `stream.append` builder preserves explicitly supplied null so the server can reject it.
 
@@ -478,6 +488,10 @@ refusal, unchanged lease rows, and malformed-input domain-population controls. T
 must distinguish a check before transaction admission from one inside the admitted writer transaction,
 including another process renewing a lease at that boundary. Checking only the first entry or omitting
 `index` must each fail their corresponding list control.
+The cardinality controls include exactly 100 distinct entries, 101 entries, an oversized list
+with a malformed first entry, unchanged writer-acquisition counters on refusal, and a later
+oversized append member in both batch modes. Disabling the cap or moving it below entry
+interpretation must make the corresponding over-limit control fail.
 
 Append members of `stream.batch` accept the same optional object or non-empty
 list in their own `fence` field. In atomic mode, every member fence is checked in
