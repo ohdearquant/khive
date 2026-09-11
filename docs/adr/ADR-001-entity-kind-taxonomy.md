@@ -558,3 +558,31 @@ behavior, and provenance semantics that cannot be represented as `base_kind + en
 - `FromStr`: accepts base kind names + short aliases (`art`, `svc`). Subtype tokens resolve
   through the registry, not `FromStr`.
 - SQL: `entity_type TEXT NULL` column, indexed with `(namespace, kind, entity_type)`.
+
+## Amendment (2026-09-10): `research_report` is a Document genre
+
+On a production store, 700 entities carry `properties.type = "research-report"` on
+`Document`, the single largest value the registry does not know. It is not ad-hoc:
+a research report is an authored communicative work with a stable shape, and the
+Document column already carries its neighbours `report`, `specification` and
+`documentation`.
+
+| Kind         | Added             |
+| ------------ | ----------------- |
+| **Document** | `research_report` |
+
+No alias is needed. Normalization turns the stored hyphen into an underscore
+before lookup, so `research-report` resolves to the canonical name.
+
+It stays kind-scoped. The same spelling on `Concept` is still refused, which is
+the arm that keeps this from becoming a free-floating tag.
+
+A note for the next reader counting unregistered values: `adr` on `Document` is
+already registered, by the `git` pack rather than by this table
+(`GIT_ENTITY_TYPES`). A census run against `EntityTypeRegistry::builtin()` alone
+will report 682 `document:adr` rows as unregistered and be wrong; the runtime
+registry is the builtin table composed with every loaded pack's `ENTITY_TYPES`.
+
+This amendment exists so the legacy backfill has one pass rather than two. It
+converts the largest remaining unregistered group on a real store from residue
+into rows a backfill can promote through the normal write path, with validation.
