@@ -881,6 +881,23 @@ fn build_note_filter_where(
                     "CASE WHEN {type_expr} = 'text' THEN {expr} ELSE ?{n} END = ?{n}"
                 ));
             }
+            FilterOp::TextInOrNonText(values) => {
+                let expr = json_extract_expr(&pf.json_path);
+                let type_expr = json_type_expr(&pf.json_path);
+                let mut placeholders = Vec::with_capacity(values.len());
+                for value in values {
+                    params.push(sql_value_param(value)?);
+                    placeholders.push(format!("?{}", params.len()));
+                }
+                let text_match = if placeholders.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("{expr} IN ({})", placeholders.join(", "))
+                };
+                conditions.push(format!(
+                    "CASE WHEN {type_expr} = 'text' THEN {text_match} ELSE 1 END"
+                ));
+            }
             FilterOp::JsonTypeEq => {
                 let type_expr = json_type_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
@@ -965,6 +982,7 @@ fn build_note_filter_where(
                     FilterOp::EqOrMissing
                     | FilterOp::EqOrMissingIndexed
                     | FilterOp::TextEqOrNonText
+                    | FilterOp::TextInOrNonText(_)
                     | FilterOp::JsonTypeEq
                     | FilterOp::JsonTypeMissing
                     | FilterOp::JsonTypeMissingOrNullIndexed
