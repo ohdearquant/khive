@@ -264,8 +264,8 @@ than a refusal**, because a refusal is information and this is not.
    matching rule or to the default, and the source it names changes accordingly.
 5. `tool.policy_delete` on a triple with no live row refuses; it does not report success.
 6. `tool.policy_delete` with a pattern that would match several stored rules retires only an exact
-   stored match, and refuses when none exists. Control: two rules, `lambda:*`/`t.x` and
-   `lambda:a`/`t.x`, and deleting `lambda:*`/`t.x` leaves the second untouched.
+   stored match, and refuses when none exists. Control: two rules, `svc:*`/`t.x` and
+   `svc:a`/`t.x`, and deleting `svc:*`/`t.x` leaves the second untouched.
 7. Two rules of equal specificity but different patterns still resolve by `created_at ASC, id ASC`,
    unchanged by this amendment, and the tie still carries `deny` over `ask` over `allow`.
 8. Mutation control, stated before running: making the upsert insert a second row instead of
