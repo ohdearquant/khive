@@ -879,7 +879,28 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
+        self.prepare_guarded_entity_update(token, id, patch, None, &[])
+            .await
+    }
+
+    async fn prepare_guarded_entity_update(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        expected: Option<&Entity>,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
+        if !remove_properties.is_empty() {
+            let removals = Value::Object(
+                remove_properties
+                    .iter()
+                    .map(|key| ((*key).to_string(), Value::Null))
+                    .collect(),
+            );
+            crate::secret_gate::reject_reserved_secret_gate_property(Some(&removals))?;
+        }
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
         }
@@ -893,10 +914,22 @@ impl KhiveRuntime {
             crate::secret_gate::check_tags(tags)?;
         }
         let store = self.entities(token)?;
-        let mut entity = store
-            .get_entity(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+        let mut entity = store.get_entity(id).await?.ok_or_else(|| {
+            if expected.is_some() {
+                stale_entity_snapshot_error(id)
+            } else {
+                RuntimeError::NotFound(format!("entity {id}"))
+            }
+        })?;
+        if let Some(expected) = expected {
+            let actual = serde_json::to_value(&entity)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            let expected = serde_json::to_value(expected)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            if actual != expected {
+                return Err(stale_entity_snapshot_error(id));
+            }
+        }
         let expected_updated_at = entity.updated_at;
         let expected_deleted_at = entity.deleted_at;
         #[cfg(test)]
@@ -936,6 +969,15 @@ impl KhiveRuntime {
             entity.properties = merged;
             changed_fields.push("properties");
         }
+        if let Some(Value::Object(properties)) = entity.properties.as_mut() {
+            let mut removed = false;
+            for key in remove_properties {
+                removed |= properties.remove(*key).is_some();
+            }
+            if removed && !changed_fields.contains(&"properties") {
+                changed_fields.push("properties");
+            }
+        }
         if let Some(tags) = patch.tags {
             entity.tags = tags;
             changed_fields.push("tags");
@@ -944,6 +986,16 @@ impl KhiveRuntime {
             reindex_required |= entity.entity_type != entity_type;
             entity.entity_type = entity_type;
             changed_fields.push("entity_type");
+        }
+
+        if expected.is_some() && changed_fields.is_empty() {
+            return Ok((
+                entity,
+                reindex_required,
+                changed_fields,
+                expected_updated_at,
+                expected_deleted_at,
+            ));
         }
 
         // `updated_at` is also the optimistic-concurrency revision for
@@ -989,6 +1041,63 @@ impl KhiveRuntime {
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
+        self.persist_prepared_entity_update(
+            token,
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        )
+        .await
+    }
+
+    /// Apply an admin patch only if the entity still matches the full read snapshot.
+    /// Property removals apply after the normal merge and preserve all other keys.
+    /// Missing keys alone are a no-op; reserved runtime-owned keys cannot be removed.
+    /// A changed, deleted, or missing entity returns a conflict without writing.
+    pub async fn update_entity_if_unchanged(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<Entity> {
+        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
+            self.prepare_guarded_entity_update(
+                token,
+                expected.id,
+                patch,
+                Some(expected),
+                remove_properties,
+            )
+            .await?;
+        if changed_fields.is_empty() {
+            return Ok(entity);
+        }
+        Ok(self
+            .persist_prepared_entity_update(
+                token,
+                entity,
+                reindex_required,
+                changed_fields,
+                expected_updated_at,
+                expected_deleted_at,
+            )
+            .await?
+            .0)
+    }
+
+    async fn persist_prepared_entity_update(
+        &self,
+        token: &NamespaceToken,
+        entity: Entity,
+        reindex_required: bool,
+        changed_fields: Vec<&'static str>,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        let id = entity.id;
         let store = self.entities(token)?;
         let persisted = store
             .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
@@ -4137,6 +4246,28 @@ mod tests {
         KhiveRuntime::memory().unwrap()
     }
 
+    async fn entity_update_events(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+    ) -> Vec<khive_storage::event::Event> {
+        runtime
+            .events(token)
+            .unwrap()
+            .query_events(
+                khive_storage::event::EventFilter {
+                    kinds: vec![EventKind::EntityUpdated],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap()
+            .items
+    }
+
     fn outbound_message_note() -> Note {
         let mut note = Note::new("local", "message", "hello");
         note.properties = Some(serde_json::json!({"direction": "outbound"}));
@@ -4961,6 +5092,315 @@ mod tests {
         assert_eq!(updated.name, "OriginalName");
         assert_eq!(updated.description.as_deref(), Some("new desc"));
         assert_eq!(updated.properties, Some(serde_json::json!({"k":"v"})));
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_removes_properties_after_merge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "LegacyEcho",
+                Some("keep description"),
+                Some(serde_json::json!({
+                    "type": " Concept ",
+                    "nested": {"items": [1, {"value": null}], "keep": true},
+                    "label": "verbatim"
+                })),
+                vec!["keep-tag".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"type": "also remove", "added": 7})),
+                    ..Default::default()
+                },
+                &["type", "absent", "type"],
+            )
+            .await
+            .expect("remove only the requested key after merging");
+
+        let mut expected = entity.clone();
+        expected.properties = Some(serde_json::json!({
+            "nested": {"items": [1, {"value": null}], "keep": true},
+            "label": "verbatim",
+            "added": 7
+        }));
+        assert!(updated.updated_at > entity.updated_at);
+        expected.updated_at = updated.updated_at;
+        assert_eq!(serde_json::json!(updated), serde_json::json!(expected));
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(expected)
+        );
+        let events = entity_update_events(&rt, &tok).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            serde_json::json!(["properties"])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_missing_removals_are_no_op() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        for properties in [
+            None,
+            Some(serde_json::json!({"keep": [true, null]})),
+            Some(serde_json::json!(["not an object"])),
+        ] {
+            let entity = rt
+                .create_entity(&tok, "concept", None, "NoRemoval", None, properties, vec![])
+                .await
+                .unwrap();
+            let unchanged = rt
+                .update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["absent"])
+                .await
+                .unwrap();
+            assert_eq!(serde_json::json!(unchanged), serde_json::json!(entity));
+            assert_eq!(
+                serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+                serde_json::json!(entity)
+            );
+        }
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_stale_full_snapshot() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "StaleBackfill",
+                None,
+                Some(serde_json::json!({"type": "concept", "keep": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        for field in ["properties", "entity_type", "deleted_at", "updated_at"] {
+            let mut stale = entity.clone();
+            match field {
+                "properties" => stale.properties = Some(serde_json::json!({"type": "algorithm"})),
+                "entity_type" => stale.entity_type = Some("algorithm".to_string()),
+                "deleted_at" => stale.deleted_at = Some(entity.updated_at),
+                "updated_at" => stale.updated_at -= 1,
+                _ => unreachable!(),
+            }
+            let error = rt
+                .update_entity_if_unchanged(
+                    &tok,
+                    &stale,
+                    EntityPatch {
+                        entity_type: Some(Some("algorithm".to_string())),
+                        ..Default::default()
+                    },
+                    &["type"],
+                )
+                .await
+                .expect_err("every stale snapshot field must refuse before edits");
+            assert!(
+                matches!(error, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+                "{field}: {error}"
+            );
+            assert_eq!(
+                serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+                serde_json::json!(entity),
+                "{field}"
+            );
+        }
+
+        let store = rt.entities(&tok).unwrap();
+        store
+            .delete_entity(entity.id, khive_storage::types::DeleteMode::Soft)
+            .await
+            .unwrap();
+        let tombstone = store
+            .get_entity_including_deleted(entity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = rt
+            .update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["type"])
+            .await
+            .expect_err("a deleted candidate must not be resurrected");
+        assert!(
+            matches!(error, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+            "{error}"
+        );
+        assert_eq!(
+            serde_json::json!(store
+                .get_entity_including_deleted(entity.id)
+                .await
+                .unwrap()
+                .unwrap()),
+            serde_json::json!(tombstone)
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_concurrent_writer_after_snapshot_check() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "RacingBackfill",
+                None,
+                Some(serde_json::json!({"type": "concept", "keep": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (guarded, normal) = tokio::join!(
+            race_seam::AFTER_READ_BARRIER.scope(
+                Arc::clone(&barrier),
+                rt.update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["type"]),
+            ),
+            race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                rt.update_entity(
+                    &tok,
+                    entity.id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"normal_writer": true})),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        );
+        assert_eq!(
+            usize::from(guarded.is_ok()) + usize::from(normal.is_ok()),
+            1
+        );
+        let (winner, refused) = match (guarded, normal) {
+            (Ok(winner), Err(refused)) | (Err(refused), Ok(winner)) => (winner, refused),
+            results => panic!("exactly one writer must win: {results:?}"),
+        };
+        assert!(
+            matches!(refused, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+            "{refused}"
+        );
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(winner)
+        );
+        assert_eq!(entity_update_events(&rt, &tok).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_normalizes_type_with_installed_validator() {
+        let rt = rt();
+        let composed = khive_types::EntityTypeRegistry::with_extra([khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "backfill_test_report",
+            aliases: &["field_report"],
+        }]);
+        rt.install_entity_type_validator(Arc::new(move |kind, raw| {
+            let kind = kind
+                .parse::<khive_types::EntityKind>()
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+            composed
+                .resolve(kind, raw)
+                .map(|resolved| resolved.entity_type)
+                .map_err(RuntimeError::from)
+        }));
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "LegacySubtype",
+                None,
+                Some(serde_json::json!({"type": " Field-Report ", "keep": [1, 2]})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let updated = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch {
+                    entity_type: Some(Some(" Field-Report ".to_string())),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+            .expect("normal write validation resolves pack-supplied aliases");
+        assert_eq!(updated.entity_type.as_deref(), Some("backfill_test_report"));
+        assert_eq!(updated.properties, entity.properties);
+        assert_eq!(
+            rt.get_entity(&tok, entity.id).await.unwrap().entity_type,
+            updated.entity_type
+        );
+        let error = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &updated,
+                EntityPatch {
+                    entity_type: Some(Some("not_registered".to_string())),
+                    ..Default::default()
+                },
+                &["type"],
+            )
+            .await
+            .expect_err("invalid subtype refuses the entire patch and removal");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(updated)
+        );
+        let events = entity_update_events(&rt, &tok).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            serde_json::json!(["entity_type"])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_reserved_property_removal() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "ReservedRemoval", None, None, vec![])
+            .await
+            .unwrap();
+        let error = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch::default(),
+                &[crate::secret_gate::RESERVED_SECRET_GATE_KEY],
+            )
+            .await
+            .expect_err("removal must share the reserved-property write validator");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(entity)
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
     }
 
     #[tokio::test]

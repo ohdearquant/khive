@@ -508,6 +508,11 @@ impl EntityTypeRegistry {
         Self::new(defs)
     }
 
+    /// Definitions in this composed registry, including canonical names and aliases.
+    pub fn definitions(&self) -> &[EntityTypeDef] {
+        &self.defs
+    }
+
     /// Boot-time collision check across the composed registry `with_extra`
     /// builds: built-in defs plus every caller-supplied `(owner, def)` extra.
     ///

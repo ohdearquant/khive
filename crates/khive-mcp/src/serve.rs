@@ -2215,7 +2215,8 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
-fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
+/// Reject conflicting access modes without opening any configured database.
+pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
     let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
@@ -2558,6 +2559,7 @@ fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
     }
 }
 
+/// An identity-bound database target, shared by one-database admin commands.
 /// The `kkernel reindex` database target as
 /// [`validate_reindex_db_target_with_source`] resolved it: the canonical path
 /// reindex must open, plus the filesystem identity observed at validation
@@ -2572,6 +2574,30 @@ pub struct ValidatedReindexTarget {
     /// string, which may still name a symlink.
     pub path: PathBuf,
     identity: Option<FileIdentity>,
+}
+
+/// Capture an existing regular database file without opening SQLite or creating paths.
+/// Callers must open the returned canonical path and reverify its identity immediately
+/// before a writable open, using [`reverify_reindex_target_identity`].
+pub fn capture_existing_database_target(
+    path: &std::path::Path,
+) -> anyhow::Result<ValidatedReindexTarget> {
+    let path = canonical_path_no_side_effects(path)?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("database {} must already exist", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "database {} is not a regular file",
+        path.display()
+    );
+    let identity = file_identity(&path);
+    #[cfg(unix)]
+    anyhow::ensure!(
+        identity.is_some(),
+        "cannot capture database identity for {}",
+        path.display()
+    );
+    Ok(ValidatedReindexTarget { path, identity })
 }
 
 /// Re-stat a validated reindex target and refuse if its filesystem identity
@@ -3001,6 +3027,34 @@ async fn prepare_configured_storage_topology(
     })
 }
 
+/// Resolve one pack's declared backend using the serving route: an explicit
+/// `[packs.<name>]` assignment wins, otherwise the pack uses `main`.
+/// This inspects configuration only and never opens a backend.
+pub fn resolve_pack_backend_config<'a>(
+    khive_cfg: &'a KhiveConfig,
+    pack_name: &str,
+) -> anyhow::Result<(&'a BackendConfig, bool)> {
+    let (backend_name, no_embed) = match khive_cfg.packs.get(pack_name) {
+        Some(pack) => (pack.backend.as_str(), pack.no_embed),
+        None => (BackendId::MAIN, false),
+    };
+    let mut matching = khive_cfg
+        .backends
+        .iter()
+        .filter(|backend| backend.name == backend_name);
+    let backend = matching.next().ok_or_else(|| {
+        let defined = khive_cfg.backends.iter().map(|backend| backend.name.as_str()).collect::<Vec<_>>().join(", ");
+        anyhow::anyhow!(
+            "absent backend route: [packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
+        )
+    })?;
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "ambiguous backend route: [packs.{pack_name}].backend = {backend_name:?} has duplicate backend names"
+    );
+    Ok((backend, no_embed))
+}
+
 async fn build_registry_for_multi_backend_inner(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -3031,19 +3085,13 @@ async fn build_registry_for_multi_backend_inner(
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let (backend_name, backend, no_embed) = match khive_cfg.packs.get(pack_name.as_str()) {
-            None => (BackendId::MAIN, main_backend.clone(), false),
-            Some(pack_cfg) => {
-                let backend_name = pack_cfg.backend.as_str();
-                let backend = backends.get(backend_name).cloned().ok_or_else(|| {
-                    let defined = backends.keys().cloned().collect::<Vec<_>>().join(", ");
-                    anyhow::anyhow!(
-                        "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
-                    )
-                })?;
-                (backend_name, backend, pack_cfg.no_embed)
-            }
-        };
+        let (backend_config, no_embed) = resolve_pack_backend_config(khive_cfg, pack_name)?;
+        let backend_name = backend_config.name.as_str();
+        let backend = backends.get(backend_name).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "resolved backend {backend_name:?} for pack {pack_name:?} was not prepared"
+            )
+        })?;
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::parse(backend_name)?;
         if no_embed {
@@ -4504,6 +4552,49 @@ fn apply_config_pack_selection(
 mod tests {
     use super::*;
     use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
+
+    #[test]
+    fn pack_backend_config_uses_main_or_explicit_assignment() {
+        let mut config: KhiveConfig = toml::from_str(
+            "[[backends]]\nname = 'main'\npath = 'main.db'\n\
+             [[backends]]\nname = 'other'\npath = 'other.db'\n\
+             [packs.kg]\nbackend = 'other'\nno_embed = true\n",
+        )
+        .unwrap();
+        let (backend, no_embed) = resolve_pack_backend_config(&config, "kg").unwrap();
+        assert_eq!(backend.name, "other");
+        assert!(no_embed);
+        config.packs.clear();
+        let (backend, no_embed) = resolve_pack_backend_config(&config, "kg").unwrap();
+        assert_eq!(backend.name, "main");
+        assert!(!no_embed);
+    }
+
+    #[test]
+    fn pack_backend_config_refuses_missing_and_duplicate_routes() {
+        let mut config: KhiveConfig = toml::from_str(
+            "[[backends]]\nname = 'main'\npath = 'main.db'\n\
+             [packs.kg]\nbackend = 'missing'\n",
+        )
+        .unwrap();
+        let error = resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("absent backend route:"), "{error}");
+        assert!(error.contains("defined backends: main"), "{error}");
+        config.packs.clear();
+        config.backends.push(config.backends[0].clone());
+        let error = resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("ambiguous backend route:"), "{error}");
+        assert!(error.contains("duplicate backend names"), "{error}");
+        config.backends.clear();
+        assert!(resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string()
+            .starts_with("absent backend route:"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn schema_prepare_waits_for_gc_owner_off_the_async_worker() {
