@@ -104,7 +104,14 @@ DELAY=10  # seconds to wait for crates.io index between publishes
 echo ""
 echo "--- Publish ladder guard (CRATES membership vs cargo metadata) ---"
 METADATA_JSON=$(mktemp)
-trap 'rm -f "$METADATA_JSON"' EXIT
+SEMVER_LOG=""
+cleanup_publish_temp() {
+    rm -f "$METADATA_JSON"
+    if [[ -n "$SEMVER_LOG" ]]; then
+        rm -f "$SEMVER_LOG"
+    fi
+}
+trap cleanup_publish_temp EXIT
 cargo metadata --no-deps --format-version=1 >"$METADATA_JSON"
 if ! check_crates_ladder "$METADATA_JSON" "${CRATES[@]}"; then
     exit 1
@@ -117,10 +124,11 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # version bump. This runs at the publish boundary — where the version actually
 # bumps — because mid-cycle on a fixed dev version the check is permanently red
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
-# `make publish-dry` validates SemVer before any real publish. The exclude list
-# (crates with no crates.io baseline yet) lives in scripts/lib/semver_excludes.txt
-# (#568) — also consumed by .github/workflows/release.yml's semver-gate job, so
-# the two gates cannot drift out of sync with each other.
+# `make publish-dry` validates SemVer before any real publish. The shared exclude
+# list covers pre-1.0 surfaces still moving under active development, including
+# some crates that already have a crates.io baseline. Its full policy lives in
+# scripts/lib/semver_excludes.txt (#568), also consumed by release.yml so the two
+# gates cannot drift out of sync with each other.
 echo ""
 echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -128,13 +136,42 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
     exit 1
 fi
+SEMVER_CHECKER_VERSION=$(cargo-semver-checks --version 2>&1)
+RUSTC_VERSION=$(rustc --version)
+if ! python3 "$SCRIPT_DIR/lib/semver_gate.py" check-version "$SEMVER_CHECKER_VERSION"; then
+    echo "       Upgrade with: cargo install cargo-semver-checks --locked --force" >&2
+    exit 1
+fi
+echo "    Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION"
 SEMVER_EXCLUDE_ARGS=()
 while IFS= read -r crate; do
     [[ "$crate" =~ ^[[:space:]]*(#|$) ]] && continue
     SEMVER_EXCLUDE_ARGS+=(--exclude "$crate")
 done <"$SCRIPT_DIR/lib/semver_excludes.txt"
-cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}"
-echo "    SemVer gate OK"
+SEMVER_LOG=$(mktemp)
+set +e
+set -o pipefail
+CARGO_TERM_COLOR=never cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}" 2>&1 | tee "$SEMVER_LOG"
+SEMVER_STATUS=${PIPESTATUS[0]}
+set +o pipefail
+set -e
+if ((SEMVER_STATUS != 0)); then
+    case "$SEMVER_STATUS" in
+        100)
+            echo "ERROR: SemVer API violations reported (checker exit 100)." >&2
+            ;;
+        101)
+            echo "ERROR: cargo-semver-checks could not complete (checker exit 101)." >&2
+            echo "       This is a checker/toolchain/build/network failure, not a clean API result." >&2
+            echo "       Toolchain: $SEMVER_CHECKER_VERSION; $RUSTC_VERSION" >&2
+            ;;
+        *)
+            echo "ERROR: cargo-semver-checks failed with unexpected exit $SEMVER_STATUS." >&2
+            ;;
+    esac
+    exit "$SEMVER_STATUS"
+fi
+python3 "$SCRIPT_DIR/lib/semver_gate.py" summarize "$SEMVER_LOG"
 
 for crate in "${CRATES[@]}"; do
     echo ""

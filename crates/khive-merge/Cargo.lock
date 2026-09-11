@@ -1233,6 +1233,7 @@ dependencies = [
  "khive-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

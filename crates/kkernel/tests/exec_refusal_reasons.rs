@@ -179,7 +179,7 @@ fn secret_gate_refusal_has_stable_token_and_json_reason() {
     assert_refusal_once(output, "gate-refusal");
     let response = stdout_json(output);
     assert_eq!(response["results"][3]["reason"], "gate-refusal");
-    assert!(response["results"][3]["error"]
+    assert!(response["results"][3]["error"]["message"]
         .as_str()
         .is_some_and(|error| error.contains("write blocked")));
 }
@@ -349,7 +349,7 @@ fn unknown_verb_has_stable_token_and_json_reason() {
     assert_refusal_once(output, "verb-refused");
     let response = stdout_json(output);
     assert_eq!(response["results"][2]["reason"], "verb-refused");
-    assert!(response["results"][2]["error"]
+    assert!(response["results"][2]["error"]["message"]
         .as_str()
         .is_some_and(|error| error.contains("unknown verb")));
 }

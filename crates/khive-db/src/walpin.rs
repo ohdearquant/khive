@@ -194,6 +194,13 @@ pub enum WalpinPidHealth {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WalpinReport {
     pub entries: Vec<WalpinPidHealth>,
+    /// The bounded directory walk stopped before every entry was inspected.
+    pub sidecar_listing_truncated: bool,
+    /// Trusted stale producer temps that a housekeeping pass would remove.
+    pub cleanup_would_reap: usize,
+    /// Producer temps actually removed by this pass. Diagnostics always
+    /// report zero because their enumeration purpose is non-destructive.
+    pub orphan_temps_reaped: usize,
 }
 
 impl WalpinReport {
@@ -303,6 +310,28 @@ fn windows_owner_dacl_is_restricted(
         && dacl_protected
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ProducerTempKind {
+    Heartbeat,
+    Beacon,
+}
+
+/// Parse only temp names emitted by this module. Unrecognized hidden files
+/// remain outside both cleanup and the retained ordinary-entry budget.
+#[cfg(unix)]
+fn producer_temp_identity(name: &str) -> Option<(u32, ProducerTempKind)> {
+    let inner = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (pid, record_kind) = inner.split_once('.')?;
+    let pid = pid.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+    let kind = match record_kind {
+        "json" => ProducerTempKind::Heartbeat,
+        "beacon" => ProducerTempKind::Beacon,
+        _ => return None,
+    };
+    Some((pid, kind))
+}
+
 /// Unix sidecar internals (ADR-091 Amendment 2: handle-bound
 /// filesystem operations). The sidecar directory is opened exactly once per
 /// call with `O_DIRECTORY | O_NOFOLLOW`, validated (type/mode/owner) on that
@@ -343,6 +372,95 @@ mod unix_impl {
         unsafe { libc::geteuid() }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only seam for `remove_if_same`'s documented residual race:
+        /// POSIX gives no way to force a second process to replace a file at
+        /// the exact instant between the device/inode recheck and the
+        /// unlink, so a test runs arbitrary code from here instead,
+        /// synchronously, on the thread already inside `remove_if_same`.
+        static REMOVE_IF_SAME_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_remove_if_same_race_hook(hook: impl FnOnce() + 'static) {
+        REMOVE_IF_SAME_RACE_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn take_remove_if_same_race_hook() -> Option<Box<dyn FnOnce()>> {
+        REMOVE_IF_SAME_RACE_HOOK.with(|cell| cell.borrow_mut().take())
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only seam for a `readdir()` read failure mid-walk: forcing a
+        /// real directory read to fail from a portable unit test isn't
+        /// practical, so this one-shot override makes `list_names`'s next
+        /// loop iteration observe a NULL entry with this errno already set,
+        /// exactly as a genuine failed `readdir()` would leave it — the
+        /// downstream `readdir_null_is_error` branch that decides Err vs.
+        /// end-of-directory runs unmodified against the forced state.
+        static LIST_NAMES_READDIR_FAULT: std::cell::Cell<Option<libc::c_int>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_list_names_readdir_fault(errno: libc::c_int) {
+        LIST_NAMES_READDIR_FAULT.with(|cell| cell.set(Some(errno)));
+    }
+
+    fn take_list_names_readdir_fault() -> Option<libc::c_int> {
+        #[cfg(test)]
+        {
+            LIST_NAMES_READDIR_FAULT.with(|cell| cell.take())
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: `__error` returns this thread's errno cell; obtaining the
+        // pointer has no preconditions beyond running on a thread.
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: see the macOS arm above; `__errno_location` is the
+        // Linux/glibc equivalent thread-local errno accessor.
+        unsafe { libc::__errno_location() }
+    }
+
+    /// Zero `errno` on the current thread. `readdir` never clears `errno`
+    /// itself on success, so this must run immediately before each call for
+    /// the NULL-return ambiguity below to be resolvable afterward.
+    fn clear_errno() {
+        // SAFETY: `errno_location` returns a valid, live thread-local
+        // `c_int` cell for the duration of this call.
+        unsafe { *errno_location() = 0 };
+    }
+
+    fn current_errno() -> libc::c_int {
+        // SAFETY: see `clear_errno`.
+        unsafe { *errno_location() }
+    }
+
+    /// Whether a NULL `readdir` return denotes a genuine read error rather
+    /// than end-of-directory: POSIX overloads NULL for both and the only
+    /// distinguishing signal is `errno`, which stays `0` at end-of-directory
+    /// because the loop clears it immediately before every call. Split out
+    /// so a test can drive both branches directly — forcing a real `readdir`
+    /// to fail mid-walk from a portable unit test isn't practical, so this
+    /// pure predicate is the seam.
+    pub(super) fn readdir_null_is_error(errno: libc::c_int) -> bool {
+        errno != 0
+    }
+
     fn path_cstring(path: &Path) -> io::Result<CString> {
         CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io_other(format!("path {path:?} contains an interior NUL byte")))
@@ -372,6 +490,17 @@ mod unix_impl {
     }
 
     pub(super) struct SidecarDirHandle(fs::File);
+
+    /// One opened, validated regular entry plus the filesystem identity used
+    /// to make a later unlink race-safe. Ownership is checked before this is
+    /// constructed (see `read_checked_entry`), so every `CheckedEntry` is
+    /// already known to belong to `current_uid()`.
+    pub(super) struct CheckedEntry {
+        pub(super) body: Vec<u8>,
+        pub(super) mtime: SystemTime,
+        device: u64,
+        inode: u64,
+    }
 
     impl SidecarDirHandle {
         fn raw(&self) -> RawFd {
@@ -868,20 +997,21 @@ mod unix_impl {
             Ok(())
         }
 
-        /// Read `name`'s contents plus its owner uid and mtime. `Ok(None)`
-        /// for a missing entry (raced away between listing and reading).
-        /// Refuses symlinks, non-regular files, and oversized entries: the
+        /// Read `name`'s contents plus its mtime. `Ok(None)` for a missing
+        /// entry (raced away between listing and reading). Refuses symlinks,
+        /// non-owned files, non-regular files, and oversized entries: the
         /// open carries `O_NONBLOCK` so a FIFO planted at the entry's name
         /// can never block this call waiting for a peer, the opened fd is
-        /// `fstat`'d and must be a regular file before any byte is read,
-        /// and the read itself is bounded — a same-uid process must not be
-        /// able to stall or balloon checkpoint-time enumeration. Owner uid
-        /// and mtime come from the same `fstat`, so every trust decision is
-        /// made against the exact object that was read.
-        pub(super) fn read_checked(
-            &self,
-            name: &str,
-        ) -> io::Result<Option<(Vec<u8>, u32, SystemTime)>> {
+        /// `fstat`'d and must be a regular file owned by `current_uid()`
+        /// before any byte is read, and the read itself is bounded — a
+        /// same-uid process must not be able to stall or balloon
+        /// checkpoint-time enumeration. Ownership is checked against the
+        /// same `fstat` that classifies the file, and BEFORE its contents
+        /// are read, via `io::ErrorKind::PermissionDenied` — never folded
+        /// into the generic untrusted-entry error, so a caller can route a
+        /// non-owned (or otherwise uninspectable) entry to a distinct
+        /// degraded-evidence outcome instead of silently skipping it.
+        pub(super) fn read_checked_entry(&self, name: &str) -> io::Result<Option<CheckedEntry>> {
             use std::os::unix::fs::MetadataExt;
 
             if self.stat_entry(name)?.is_none() {
@@ -913,6 +1043,12 @@ mod unix_impl {
                     "walpin sidecar entry {name:?} is not a regular file"
                 )));
             }
+            if meta.uid() != current_uid() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("walpin sidecar entry {name:?} is not owned by the current user"),
+                ));
+            }
             if meta.len() > MAX_SIDECAR_ENTRY_BYTES {
                 return Err(io_other(format!(
                     "walpin sidecar entry {name:?} exceeds {MAX_SIDECAR_ENTRY_BYTES} bytes"
@@ -928,24 +1064,89 @@ mod unix_impl {
                 )));
             }
             let mtime = SystemTime::UNIX_EPOCH + Duration::new(meta.mtime().max(0) as u64, 0);
-            Ok(Some((buf, meta.uid(), mtime)))
+            Ok(Some(CheckedEntry {
+                body: buf,
+                mtime,
+                device: meta.dev(),
+                inode: meta.ino(),
+            }))
+        }
+
+        pub(super) fn read_checked(&self, name: &str) -> io::Result<Option<(Vec<u8>, SystemTime)>> {
+            Ok(self
+                .read_checked_entry(name)?
+                .map(|entry| (entry.body, entry.mtime)))
+        }
+
+        /// Remove `name` only while it still denotes the exact regular file
+        /// opened and classified by `read_checked_entry`. A producer that
+        /// replaces its temp before this recheck runs therefore wins: the
+        /// new inode is retained instead of being unlinked under a stale
+        /// verdict.
+        ///
+        /// This closes the wide races (stale content lingering, a symlink
+        /// swapped in) but not every one: POSIX has no delete-if-still-
+        /// this-inode primitive for a plain file, so the recheck above and
+        /// the `unlinkat` below are two separate syscalls, and a replacement
+        /// landing in the instant between them is still a plain name lookup
+        /// that `unlinkat` will happily remove. A producer that loses this
+        /// narrow race observes its own `rename` fail because the temp it
+        /// just wrote is already gone; every writer here already treats a
+        /// missing temp as a transient failure to retry on the next tick
+        /// (see `write_heartbeat`'s and `write_beacon`'s callers), never as
+        /// data loss, so this is the outcome such a producer must tolerate,
+        /// not a race this function actually closes.
+        pub(super) fn remove_if_same(
+            &self,
+            name: &str,
+            expected: &CheckedEntry,
+        ) -> io::Result<bool> {
+            let Some(current) = self.stat_entry(name)? else {
+                return Ok(false);
+            };
+            if is_symlink_mode(current.st_mode) || (current.st_mode & libc::S_IFMT) != libc::S_IFREG
+            {
+                return Err(io_other(format!(
+                    "refusing to remove replaced walpin sidecar entry {name:?}"
+                )));
+            }
+            // st_dev is u64 on Linux and i32 on macOS; widening first keeps the
+            // conversion real on both targets.
+            let current_device = u64::try_from(i128::from(current.st_dev)).unwrap_or(u64::MAX);
+            let current_inode = current.st_ino;
+            if current_device != expected.device || current_inode != expected.inode {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            if let Some(hook) = take_remove_if_same_race_hook() {
+                hook();
+            }
+            self.unlink_tolerant(name)?;
+            Ok(true)
         }
 
         /// List entry names via `fdopendir` on a DUPLICATE of this fd (the
         /// original stays owned by `self`) — never re-resolves the
         /// directory by path.
-        /// List up to `max` non-hidden entry names, plus whether more
-        /// remained. Bounding happens HERE, at the `readdir` loop, so
+        /// List up to `max` non-hidden entry names and up to `max` recognized
+        /// producer temp names, plus whether more remained. Bounding happens
+        /// HERE, at the `readdir` loop, so
         /// directory content cannot inflate either the allocation or the
         /// iteration work done by an enumeration pass — a truncated listing
-        /// is reported to the caller, never silently clipped. Dot-names
-        /// (`.`, `..`, in-flight `.<pid>.*.tmp` temp files) are skipped —
-        /// by inspecting the first raw byte, before any allocation — so
-        /// junk temp entries cannot consume the retained-name budget ahead
-        /// of real records; they still count toward the raw scan bound
-        /// (`RAW_SCAN_FACTOR * max`), and exhausting either bound reports
-        /// truncation.
-        pub(super) fn list_names(&self, max: usize) -> io::Result<(Vec<String>, bool)> {
+        /// is reported to the caller, never silently clipped. Unrecognized
+        /// dot-names are skipped; the producer-owned
+        /// `.<pid>.(json|beacon).tmp` forms are retained in their own bounded
+        /// lane so housekeeping can reap proven crash residue without letting
+        /// junk consume the ordinary record budget. Every entry still counts
+        /// toward the raw `RAW_SCAN_FACTOR * max` scan bound. A `readdir`
+        /// read error mid-walk is distinguished from ordinary end-of-
+        /// directory via `errno` (cleared before every call) and returned as
+        /// `Err`, never folded into a `truncated: false` listing that would
+        /// let a caller believe it saw every entry when it did not.
+        pub(super) fn list_names(
+            &self,
+            max: usize,
+        ) -> io::Result<(Vec<String>, Vec<String>, bool)> {
             // SAFETY: duplicates a live, open fd; the duplicate is uniquely
             // owned by this call and handed to `fdopendir` below.
             let dup_fd = unsafe { libc::dup(self.raw()) };
@@ -964,11 +1165,31 @@ mod unix_impl {
             let raw_scan_limit = max.saturating_mul(RAW_SCAN_FACTOR).max(max);
             let mut raw_scanned: usize = 0;
             let mut names = Vec::new();
+            let mut producer_temps = Vec::new();
             let mut truncated = false;
             loop {
-                // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
-                let entry = unsafe { libc::readdir(dirp) };
+                // `readdir` leaves `errno` untouched on EOF; clearing it
+                // here is what makes that observable as distinct from an
+                // error below.
+                clear_errno();
+                let entry = if let Some(errno) = take_list_names_readdir_fault() {
+                    // SAFETY: sets the same thread-local errno cell a
+                    // genuine failed `readdir()` would have set.
+                    unsafe { *errno_location() = errno };
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: `dirp` is a valid, open `DIR*` for this whole loop.
+                    unsafe { libc::readdir(dirp) }
+                };
                 if entry.is_null() {
+                    if readdir_null_is_error(current_errno()) {
+                        let err = io::Error::last_os_error();
+                        // SAFETY: `dirp` is still open and owned by this
+                        // call; this is the one closedir on the error path,
+                        // matching the one closedir on the `Ok` path below.
+                        unsafe { libc::closedir(dirp) };
+                        return Err(err);
+                    }
                     break;
                 }
                 if raw_scanned == raw_scan_limit {
@@ -977,10 +1198,21 @@ mod unix_impl {
                 }
                 raw_scanned += 1;
                 // SAFETY: `d_name` is NUL-terminated, so its first byte is
-                // always in bounds; hidden names are rejected on this raw
-                // byte before any allocation happens for them.
+                // always in bounds.
                 let first = unsafe { *(*entry).d_name.as_ptr() };
                 if first == b'.' as libc::c_char {
+                    // SAFETY: the entry remains valid until the next readdir;
+                    // copy only a recognized bounded producer-temp name.
+                    let candidate = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    if super::producer_temp_identity(&candidate).is_some() {
+                        if producer_temps.len() == max {
+                            truncated = true;
+                            break;
+                        }
+                        producer_temps.push(candidate);
+                    }
                     continue;
                 }
                 if names.len() == max {
@@ -996,7 +1228,7 @@ mod unix_impl {
             }
             // SAFETY: `dirp` was successfully opened above and not yet closed.
             unsafe { libc::closedir(dirp) };
-            Ok((names, truncated))
+            Ok((names, producer_temps, truncated))
         }
     }
 
@@ -2911,6 +3143,20 @@ pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<Walpin
     )
 }
 
+/// Read-only sidecar classification for operator diagnostics. It shares the
+/// attribution path's handle-bound trust checks and work bounds but never
+/// unlinks a regular entry or producer temp, even when the evidence proves it
+/// stale. The returned report states what housekeeping would reap.
+#[cfg(unix)]
+pub(crate) fn inspect_live(dir: &Path, sweep_interval: Duration) -> io::Result<WalpinReport> {
+    enumerate_live_bounded(
+        dir,
+        sweep_interval,
+        MAX_SIDECAR_ENTRIES,
+        EnumerationPurpose::Diagnostics,
+    )
+}
+
 /// Run the ordinary-tick, bounded sidecar housekeeping pass.
 ///
 /// This uses the same trust checks, liveness classification, and
@@ -2962,6 +3208,9 @@ enum EnumerationPurpose {
     /// residue may be removed; uncertain evidence stays available for a later
     /// attribution pass.
     Housekeeping,
+    /// Operator diagnostics: classify and reconcile without deleting any
+    /// sidecar evidence.
+    Diagnostics,
 }
 
 #[cfg(unix)]
@@ -2969,6 +3218,119 @@ impl EnumerationPurpose {
     fn removes_uncertain_evidence(self) -> bool {
         self == Self::Attribution
     }
+
+    fn removes_dead_or_reused_evidence(self) -> bool {
+        self != Self::Diagnostics
+    }
+
+    fn removes_orphan_temps(self) -> bool {
+        self != Self::Diagnostics
+    }
+}
+
+/// The outcome of examining one producer-temp candidate against its recorded
+/// identity. Liveness alone never licenses a reap: a malformed or mismatched
+/// dead-PID temp is exactly the evidence a later TRUNCATE-no-progress
+/// attribution pass needs, so it must survive cleanup as `Untrusted`, never
+/// fall through to `Reap`.
+#[cfg(unix)]
+enum OrphanTempVerdict {
+    /// Not old enough yet, not owned by us, or a live producer still holding
+    /// a matching identity — no report, ordinary in-flight state.
+    Skip,
+    /// Confirmed dead-PID or PID-reused evidence, identity verified against
+    /// the filename.
+    Reap(unix_impl::CheckedEntry),
+    /// Old enough to act on, but the body does not parse for its recorded
+    /// kind or its recorded identity does not match the filename — retained
+    /// and reported regardless of whether the named PID is alive or dead.
+    Untrusted(&'static str),
+}
+
+// A live producer's `proc_pidinfo`/`/proc` lookup can fail for reasons that
+// have nothing to do with the temp's trustworthiness (a permission boundary
+// on a shared host, a `/proc` mount restriction) — forcing that outcome from
+// a portable test isn't practical, so this thread-local one-shot override is
+// the seam.
+#[cfg(all(unix, test))]
+thread_local! {
+    static STALE_ORPHAN_TEMP_START_TIME_OVERRIDE: std::cell::Cell<Option<Option<i64>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn set_stale_orphan_temp_start_time_override(value: Option<i64>) {
+    STALE_ORPHAN_TEMP_START_TIME_OVERRIDE.with(|cell| cell.set(Some(value)));
+}
+
+#[cfg(unix)]
+fn stale_orphan_temp_actual_start(pid: u32) -> Option<i64> {
+    #[cfg(test)]
+    if let Some(overridden) = STALE_ORPHAN_TEMP_START_TIME_OVERRIDE.with(|cell| cell.take()) {
+        return overridden;
+    }
+    process_start_time_secs(pid)
+}
+
+#[cfg(unix)]
+fn stale_orphan_temp(
+    handle: &unix_impl::SidecarDirHandle,
+    name: &str,
+    pid: u32,
+    kind: ProducerTempKind,
+    now: i64,
+    stale_after_secs: i64,
+) -> io::Result<OrphanTempVerdict> {
+    let entry = match handle.read_checked_entry(name) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Ok(OrphanTempVerdict::Skip),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(OrphanTempVerdict::Untrusted(
+                "refused: producer temp not owned by current user",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let modified_at = entry
+        .mtime
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    if now.saturating_sub(modified_at) <= stale_after_secs {
+        return Ok(OrphanTempVerdict::Skip);
+    }
+
+    let recorded_identity = match kind {
+        ProducerTempKind::Heartbeat => serde_json::from_slice::<WalpinHeartbeat>(&entry.body)
+            .ok()
+            .map(|record| (record.pid, record.started_at)),
+        ProducerTempKind::Beacon => serde_json::from_slice::<WalpinBeacon>(&entry.body)
+            .ok()
+            .map(|record| (record.pid, record.started_at)),
+    };
+    let Some((recorded_pid, recorded_start)) = recorded_identity else {
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp body does not parse as its recorded kind",
+        ));
+    };
+    if recorded_pid != pid {
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp identity does not match its filename",
+        ));
+    }
+
+    if !is_process_alive(pid) {
+        return Ok(OrphanTempVerdict::Reap(entry));
+    }
+    let Some(actual_start) = stale_orphan_temp_actual_start(pid) else {
+        return Ok(OrphanTempVerdict::Untrusted(
+            "refused: producer temp process start time unavailable",
+        ));
+    };
+    if epoch_abs_diff(actual_start, recorded_start) > START_TIME_EPSILON_SECS {
+        return Ok(OrphanTempVerdict::Reap(entry));
+    }
+    Ok(OrphanTempVerdict::Skip)
 }
 
 #[cfg(unix)]
@@ -3006,12 +3368,41 @@ fn enumerate_live_bounded(
     // listing contributes one sentinel `Unknown` marker below — the
     // unlisted entries were never read, and the census stays inconclusive
     // rather than exonerating.
-    let (names, truncated) = handle.list_names(max_entries)?;
+    let (names, producer_temps, truncated) = handle.list_names(max_entries)?;
     if truncated {
         unknown.push((
             CAP_SENTINEL_PID,
             "refused: sidecar entry count exceeds enumeration cap",
         ));
+    }
+    let mut cleanup_would_reap = 0usize;
+    let mut orphan_temps_reaped = 0usize;
+    for name in producer_temps {
+        let Some((pid, kind)) = producer_temp_identity(&name) else {
+            continue;
+        };
+        match stale_orphan_temp(&handle, &name, pid, kind, now, fallback_window_secs) {
+            Ok(OrphanTempVerdict::Reap(entry)) => {
+                cleanup_would_reap = cleanup_would_reap.saturating_add(1);
+                if purpose.removes_orphan_temps() {
+                    match handle.remove_if_same(&name, &entry) {
+                        Ok(true) => orphan_temps_reaped = orphan_temps_reaped.saturating_add(1),
+                        Ok(false) => unknown.push((
+                            pid,
+                            "producer temp changed while orphan cleanup was in progress",
+                        )),
+                        Err(_) => unknown
+                            .push((pid, "refused: producer temp changed to an untrusted entry")),
+                    }
+                }
+            }
+            Ok(OrphanTempVerdict::Skip) => {}
+            Ok(OrphanTempVerdict::Untrusted(reason)) => unknown.push((pid, reason)),
+            Err(_) => unknown.push((
+                pid,
+                "refused: untrusted producer temp (symlink, non-regular, or oversized)",
+            )),
+        }
     }
     for name in names {
         let is_heartbeat = name.ends_with(".json");
@@ -3030,9 +3421,13 @@ fn enumerate_live_bounded(
         // content read, and contributes `Unknown` rather than being
         // silently dropped — the entry's health is unestablished, not
         // exonerating.
-        let (body, owner_uid, mtime) = match handle.read_checked(&name) {
+        let (body, mtime) = match handle.read_checked(&name) {
             Ok(Some(v)) => v,
             Ok(None) => continue, // raced away between listing and reading
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                unknown.push((pid, "refused: sidecar entry not owned by current user"));
+                continue;
+            }
             Err(_) => {
                 unknown.push((
                     pid,
@@ -3041,10 +3436,6 @@ fn enumerate_live_bounded(
                 continue;
             }
         };
-        if owner_uid != unix_impl::current_uid() {
-            unknown.push((pid, "refused: sidecar entry not owned by current user"));
-            continue;
-        }
         let mtime_secs = mtime
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -3054,7 +3445,9 @@ fn enumerate_live_bounded(
             let heartbeat: WalpinHeartbeat = match serde_json::from_slice(&body) {
                 Ok(hb) => hb,
                 Err(_) => {
-                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                    if purpose.removes_uncertain_evidence()
+                        || (purpose.removes_dead_or_reused_evidence() && !is_process_alive(pid))
+                    {
                         let _ = handle.unlink_tolerant(&name);
                     }
                     wedged.insert(pid);
@@ -3086,7 +3479,9 @@ fn enumerate_live_bounded(
                     || actual_start.is_some_and(|actual| {
                         epoch_abs_diff(actual, heartbeat.started_at) > START_TIME_EPSILON_SECS
                     });
-                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                if purpose.removes_uncertain_evidence()
+                    || (purpose.removes_dead_or_reused_evidence() && positively_dead_or_reused)
+                {
                     let _ = handle.unlink_tolerant(&name);
                 } else {
                     wedged.insert(pid);
@@ -3123,7 +3518,9 @@ fn enumerate_live_bounded(
             let beacon: WalpinBeacon = match serde_json::from_slice(&body) {
                 Ok(b) => b,
                 Err(_) => {
-                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                    if purpose.removes_uncertain_evidence()
+                        || (purpose.removes_dead_or_reused_evidence() && !is_process_alive(pid))
+                    {
                         let _ = handle.unlink_tolerant(&name);
                     }
                     wedged.insert(pid);
@@ -3153,7 +3550,9 @@ fn enumerate_live_bounded(
                     || actual_start.is_some_and(|actual| {
                         epoch_abs_diff(actual, beacon.started_at) > START_TIME_EPSILON_SECS
                     });
-                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                if purpose.removes_uncertain_evidence()
+                    || (purpose.removes_dead_or_reused_evidence() && positively_dead_or_reused)
+                {
                     let _ = handle.unlink_tolerant(&name);
                 } else {
                     wedged.insert(pid);
@@ -3200,7 +3599,12 @@ fn enumerate_live_bounded(
         entries.push(WalpinPidHealth::Unknown { pid, reason });
     }
 
-    Ok(WalpinReport { entries })
+    Ok(WalpinReport {
+        entries,
+        sidecar_listing_truncated: truncated,
+        cleanup_would_reap,
+        orphan_temps_reaped,
+    })
 }
 
 /// Restores a possibly-unset env var on drop, including on panic — so an
@@ -3744,6 +4148,192 @@ mod tests {
             !report.fully_attributed(),
             "an enumeration cut short by hidden entries can never claim full attribution"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_reaps_only_stale_producer_temps_with_dead_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        let dead_pid = 2_000_000_000;
+        let stale_dead = dir.join(format!(".{dead_pid}.beacon.tmp"));
+        fs::write(&stale_dead, serde_json::to_vec(&beacon(dead_pid)).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale_dead)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let fresh_dead = dir.join(format!(".{}.json.tmp", dead_pid + 1));
+        fs::write(
+            &fresh_dead,
+            serde_json::to_vec(&heartbeat(dead_pid + 1)).unwrap(),
+        )
+        .unwrap();
+
+        let live_pid = std::process::id();
+        let stale_live = dir.join(format!(".{live_pid}.beacon.tmp"));
+        fs::write(&stale_live, serde_json::to_vec(&beacon(live_pid)).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale_live)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(report.orphan_temps_reaped, 1);
+        assert!(
+            !stale_dead.exists(),
+            "a stale dead-producer temp must be reaped"
+        );
+        assert!(fresh_dead.exists(), "a fresh temp may still be in flight");
+        assert!(
+            stale_live.exists(),
+            "a live producer's temp must never be reaped"
+        );
+    }
+
+    /// A live producer's identity check depends on reading its process start
+    /// time; when that read fails (a permission boundary, a `/proc`
+    /// restriction) the temp's trustworthiness is simply unestablished, not
+    /// exonerated. It must surface as `Unknown` degraded evidence — the same
+    /// contract already enforced for a non-owned producer temp — rather than
+    /// being silently skipped, which would let diagnostics report `Complete`
+    /// while untrusted residue sits in the sidecar directory.
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_reports_a_live_producer_temp_whose_start_time_is_unreadable_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        let live_pid = std::process::id();
+        let stale_live = dir.join(format!(".{live_pid}.beacon.tmp"));
+        fs::write(&stale_live, serde_json::to_vec(&beacon(live_pid)).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale_live)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        set_stale_orphan_temp_start_time_override(None);
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.orphan_temps_reaped, 0,
+            "identity that could not be verified is never trustworthy reap evidence"
+        );
+        assert!(
+            stale_live.exists(),
+            "an uninspectable producer temp must be retained, not silently dropped"
+        );
+        let unknown: Vec<u32> = report.unknown_pids().collect();
+        assert!(
+            unknown.contains(&live_pid),
+            "a live producer temp whose start time cannot be read must be reported as \
+             Unknown, not silently skipped: {unknown:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_retains_and_reports_malformed_or_mismatched_dead_producer_temps() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        let malformed_pid = 2_000_000_010;
+        let malformed = dir.join(format!(".{malformed_pid}.beacon.tmp"));
+        fs::write(&malformed, b"not valid json").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&malformed)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let mismatched_pid = 2_000_000_020;
+        let mismatched = dir.join(format!(".{mismatched_pid}.beacon.tmp"));
+        fs::write(
+            &mismatched,
+            serde_json::to_vec(&beacon(mismatched_pid + 1)).unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&mismatched)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.orphan_temps_reaped, 0,
+            "neither a malformed nor a mismatched dead-PID temp is trustworthy reap evidence"
+        );
+        assert!(
+            malformed.exists(),
+            "a malformed dead-PID temp must survive cleanup as unknown evidence"
+        );
+        assert!(
+            mismatched.exists(),
+            "a dead-PID temp whose recorded identity does not match its filename must survive \
+             cleanup as unknown evidence"
+        );
+        let unknown: Vec<u32> = report.unknown_pids().collect();
+        assert!(
+            unknown.contains(&malformed_pid),
+            "malformed evidence must be reported, not silently dropped: {unknown:?}"
+        );
+        assert!(
+            unknown.contains(&mismatched_pid),
+            "mismatched evidence must be reported, not silently dropped: {unknown:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn housekeeping_refuses_a_symlinked_producer_temp_without_touching_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+        let target = root.path().join("forensic-evidence.json");
+        fs::write(&target, b"keep me").unwrap();
+        let link = dir.join(".2000000000.beacon.tmp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(report.orphan_temps_reaped, 0);
+        assert_eq!(fs::read(&target).unwrap(), b"keep me");
+        assert!(link.is_symlink(), "suspicious evidence must be retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_inspection_classifies_dead_residue_without_deleting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let mut dead = beacon(2_000_000_000);
+        dead.started_at = 1;
+        write_beacon(&dir, &dead).unwrap();
+        let path = beacon_path(&dir, dead.pid);
+
+        let report = inspect_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(report.unknown_pids().collect::<Vec<_>>(), vec![dead.pid]);
+        assert!(
+            path.exists(),
+            "diagnostics must never delete sidecar evidence"
+        );
+        assert_eq!(report.orphan_temps_reaped, 0);
     }
 
     #[cfg(unix)]
@@ -4405,6 +4995,119 @@ mod tests {
         assert!(
             report.unknown_pids().any(|p| p == 999_999_942),
             "an oversized entry must classify its PID as unknown: {report:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn readdir_null_is_error_distinguishes_eof_from_a_real_read_error() {
+        assert!(
+            !unix_impl::readdir_null_is_error(0),
+            "errno == 0 after a NULL readdir means ordinary end-of-directory"
+        );
+        assert!(
+            unix_impl::readdir_null_is_error(libc::EIO),
+            "a nonzero errno after a NULL readdir means the walk failed mid-stream"
+        );
+    }
+
+    /// The predicate test above only proves `readdir_null_is_error` itself
+    /// distinguishes EOF from a real error; it never drives `list_names` or
+    /// its production caller, so a regression at the actual call site (e.g.
+    /// folding a read error into an ordinary `break`) would leave that test
+    /// green. Forcing a real `readdir()` to fail mid-walk isn't practical
+    /// from a portable unit test, so this drives the fault through the
+    /// test-only seam and asserts the error reaches `enumerate_live`,
+    /// exactly as a genuine directory-read error must — never silently
+    /// reported as a complete-but-truncated listing.
+    #[test]
+    #[cfg(unix)]
+    fn readdir_failure_mid_walk_propagates_from_list_names_to_enumerate_live() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+
+        unix_impl::set_list_names_readdir_fault(libc::EIO);
+        let err = enumerate_live(&dir, Duration::from_secs(5)).expect_err(
+            "a readdir failure mid-walk must propagate as an error, never be folded into a \
+             truncated-but-otherwise-complete listing",
+        );
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    /// `remove_if_same`'s device/inode recheck and its `unlinkat` are two
+    /// separate syscalls; nothing closes the gap between them. This test
+    /// drives that exact gap via the test-only hook (forcing a real second
+    /// process to land in a few-instruction window isn't something a
+    /// portable unit test can do) and asserts the DOCUMENTED outcome: the
+    /// replacement that lands there is removed too, because `unlinkat`
+    /// operates on whatever now sits at the name, not on the inode that was
+    /// checked.
+    #[test]
+    #[cfg(unix)]
+    fn remove_if_same_a_replacement_landing_in_the_recheck_to_unlink_window_is_still_removed() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        ensure_sidecar_dir(&dir).unwrap();
+        let handle = unix_impl::SidecarDirHandle::open_or_create(&dir).unwrap();
+
+        let name = ".999999999.beacon.tmp";
+        fs::write(dir.join(name), b"stale evidence").unwrap();
+        let expected = handle
+            .read_checked_entry(name)
+            .unwrap()
+            .expect("the stale file must be readable and checked");
+        let expected_inode = fs::metadata(dir.join(name)).unwrap().ino();
+
+        let replacement_path = dir.join(name);
+        let replacement_tmp_path = dir.join(".999999999.beacon.tmp.replacement");
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_writer = std::sync::Arc::clone(&hook_ran);
+        let replacement_inode = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let replacement_inode_writer = std::sync::Arc::clone(&replacement_inode);
+        unix_impl::set_remove_if_same_race_hook(move || {
+            // A genuine replacement swaps in a NEW inode via write-then-
+            // rename: `fs::write`-ing the existing name in place would only
+            // truncate the SAME inode the recheck already verified, proving
+            // nothing about the recheck-to-unlink race this test targets.
+            fs::write(
+                &replacement_tmp_path,
+                b"a producer's brand-new in-flight write",
+            )
+            .unwrap();
+            let new_inode = fs::metadata(&replacement_tmp_path).unwrap().ino();
+            fs::rename(&replacement_tmp_path, &replacement_path).unwrap();
+            replacement_inode_writer.store(new_inode, std::sync::atomic::Ordering::SeqCst);
+            hook_ran_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let removed = handle
+            .remove_if_same(name, &expected)
+            .expect("remove_if_same must not error when a replacement lands mid-call");
+
+        assert!(
+            hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the race hook must actually run inside remove_if_same for this test to prove \
+             anything about the recheck-to-unlink window"
+        );
+        assert_ne!(
+            replacement_inode.load(std::sync::atomic::Ordering::SeqCst),
+            expected_inode,
+            "the hook must swap in a genuinely different inode, not rewrite the checked \
+             one in place, or this test cannot distinguish the race from an ordinary \
+             same-inode removal"
+        );
+        assert!(
+            removed,
+            "remove_if_same reports success because the name-based unlink always succeeds, \
+             even though what it removed is no longer the inode it verified"
+        );
+        assert!(
+            !dir.join(name).exists(),
+            "a replacement landing in the recheck-to-unlink window is removed too — the \
+             documented residual race, not one this function actually closes"
         );
     }
 

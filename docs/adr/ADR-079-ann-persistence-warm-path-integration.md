@@ -734,7 +734,18 @@ never to serving a stale-but-adopted index.
 
 File-replacement safety: `save_atomic` stages and renames; a previously established mapping pins
 the old inode (POSIX) until the old index Arc drops, so in-flight queries on the prior map never
-observe torn bytes.
+observe torn bytes. Each new file-backed commit appends a random publication nonce to the
+backward-compatible extended commit trailer. Its digest therefore changes on every successful
+rotation, even when all index content and watermarks are identical.
+
+Long-lived memory and knowledge packs poll the commit identities of installed mmap bridges every
+five seconds. A changed identity is rechecked and loaded under the consumer's existing local
+publication lock plus `.bridge-checkpoint.lock`; successful validation atomically swaps the bridge
+and drops the old mmap owner. A changed generation that fails validation is evicted and rebuilt on
+demand rather than retaining deleted-but-open predecessor files. This bounds predecessor mapping
+lifetime independently of request traffic and independently of the optional stdio idle-session
+timeout (#2081). The watcher owns only the database ANN root and a weak pack-state reference
+between ticks and exits on daemon shutdown or state drop.
 
 ### `ann_rebuild_threshold` default — why 20%
 

@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Publish khive npm packages: platform binaries + main package.
+# Publish khive npm packages: platform binaries + main package + CLI alias.
 #
 # Usage:
-#   ./npm-publish.sh              # publish all (platform packages first, then main)
+#   ./npm-publish.sh              # publish all (platforms, main, then CLI alias)
 #   ./npm-publish.sh --dry-run    # show what would be published without uploading
 #
 # Prerequisites:
@@ -14,7 +14,8 @@ set -euo pipefail
 #
 # The script publishes platform packages BEFORE the main package because
 # the main package lists them as optionalDependencies — npm resolves them
-# at install time, so they must already exist on the registry.
+# at install time, so they must already exist on the registry. The CLI alias
+# publishes last because it depends on `khive` at the exact same version.
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -25,6 +26,16 @@ fi
 cd "$(dirname "$0")/.."
 
 VERSION=$(jq -r .version npm/package.json)
+ALIAS_VERSION=$(jq -r .version npm/cli-alias/package.json)
+ALIAS_KHIVE_VERSION=$(jq -r .dependencies.khive npm/cli-alias/package.json)
+if [[ "$ALIAS_VERSION" != "$VERSION" ]]; then
+    echo "ERROR: npm/cli-alias version ${ALIAS_VERSION} does not match khive ${VERSION}" >&2
+    exit 1
+fi
+if [[ "$ALIAS_KHIVE_VERSION" != "$VERSION" ]]; then
+    echo "ERROR: @khive-ai/cli depends on khive ${ALIAS_KHIVE_VERSION}, expected ${VERSION}" >&2
+    exit 1
+fi
 echo "Publishing khive v${VERSION} to npm..."
 
 # Platform packages — publish each one that has binaries in bin/.
@@ -93,5 +104,35 @@ else
 fi
 
 echo ""
+echo "--- CLI alias ---"
+# The skip requires the published alias to carry the exact khive dependency,
+# so a rerun repairs a missing alias and refuses a mismatched one. Only a
+# confirmed missing package or version counts as absent; any other lookup
+# failure stops the script rather than publishing blind.
+if ALIAS_LOOKUP=$(npm view "@khive-ai/cli@${VERSION}" dependencies.khive 2>&1); then
+    PUBLISHED_ALIAS_KHIVE="$ALIAS_LOOKUP"
+elif [[ "$ALIAS_LOOKUP" == *E404* ]]; then
+    PUBLISHED_ALIAS_KHIVE=""
+else
+    echo "ERROR: could not look up @khive-ai/cli@${VERSION} on npm: ${ALIAS_LOOKUP}" >&2
+    exit 1
+fi
+if [[ "$PUBLISHED_ALIAS_KHIVE" == "$VERSION" ]]; then
+    echo "  @khive-ai/cli@${VERSION} already on npm with khive ${VERSION} — skipping"
+elif [[ -n "$PUBLISHED_ALIAS_KHIVE" ]]; then
+    echo "ERROR: @khive-ai/cli@${VERSION} on npm depends on khive ${PUBLISHED_ALIAS_KHIVE}, expected ${VERSION}" >&2
+    exit 1
+else
+    if $DRY_RUN; then
+        echo "  [dry-run] would publish @khive-ai/cli@${VERSION}"
+    else
+        echo "  Publishing @khive-ai/cli@${VERSION}..."
+        (cd npm/cli-alias && npm publish --access public)
+        echo "  Published @khive-ai/cli@${VERSION}"
+    fi
+fi
+
+echo ""
 echo "=== Done ==="
 echo "Verify: npm view khive@${VERSION}"
+echo "Verify: npm view @khive-ai/cli@${VERSION}"

@@ -92,6 +92,19 @@ Results sort deterministically by descending score with stable tie behavior. Opt
 
 Superseded candidates are suppressed by inbound `supersedes` graph edges, with the archive-compatible property shortcut as a secondary route. The inbound-edge lookup walks stable storage pages to exhaustion, so multiple superseders of one candidate cannot hide an edge targeting another candidate. MMR reduces near-duplicate prefixes, and the token budget bounds aggregate response text. Both token-budget factors must be positive and their effective character-budget product must be representable; invalid configurations fail before retrieval. Default responses are arrays; when the budget removes candidates, surviving results carry `truncated: true`. When the budget removes every ranked candidate, the default response becomes `{ "results": [], "truncated": true }` so the cutoff stays distinguishable from a genuine no-match, which remains an unadorned empty array.
 
+## Slow-request stage telemetry
+
+Every completed recall taking at least ten seconds emits the unconditional
+`memory.recall exceeded slow-request threshold` warning. Alongside total and
+result-shape metadata it always names `embed_ms`, `fts_ms`, `ann_ms`,
+`fresh_tail_ms`, and `hydrate_ms`; no profiling environment flag is required.
+The fields are wall-time attribution, not an additive critical path: FTS and
+the vector arm run concurrently, and concurrent embedding models contribute
+the maximum ANN and fresh-tail duration. Sequential handler-level widening
+rounds and their hydration passes are accumulated. The opt-in
+`KHIVE_RECALL_PROFILE` stream remains available for higher-volume local
+profiling and is not required for this production warning.
+
 ## Subhandlers
 
 The dotted subhandlers expose individual pipeline stages for composition and diagnostics:

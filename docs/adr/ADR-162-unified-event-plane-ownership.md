@@ -94,6 +94,26 @@ the append boundary, is left to the implementing decision. Naming the gap is the
 rule stated only at the verb surface reads as satisfied while the surface that actually
 persists the row is unguarded.
 
+> **Implementation status and call-site inventory (2026-08-30):** The
+> attribution construction gap is closed for the current in-process append
+> surface. Ordinary runtime and pack code obtains a token-scoped
+> `EventStore` from `KhiveRuntime::events`; its decorator overwrites namespace
+> and actor from the sealed `NamespaceToken` on singleton, batch, preflight,
+> and idempotent-batch append paths. Brain feedback, proposal-projection, and
+> atomic KG-plan paths that must append inside a larger SQL transaction instead
+> take an `EventAttribution` whose private fields can only be derived from that
+> token, then stamp before the direct insert. Dispatch-audit constructors form
+> the other request-caused
+> group: they derive both fields from the resolved `GateRequest` for each
+> dispatch, while `VerbRegistryBuilder::with_runtime_event_store` supplies
+> the undecorated sink internally so one registry can retain per-request
+> identity. The remaining direct writers are runtime-owned background work:
+> channel lifecycle, checkpoint, and phase events use their fixed daemon
+> principal, and pending-schedule failures use verified immutable creator
+> provenance. Split/transport stores only forward already-stamped events.
+> Direct storage-backend access and custom raw `EventStore` injection remain
+> composition-root authority, not a caller-facing runtime capability.
+
 This forbids caller-composed events, not caller-supplied content inside runtime-composed
 ones. A verb whose arguments carry caller-supplied data — a feedback signal, a judgment, a
 payload — may have that data recorded in the event the runtime composes for the operation:
@@ -280,11 +300,12 @@ sole input.
 - Event classes carrying caller-supplied content acquire a stated content obligation (§1)
   instead of an unbounded permission, and the obligation attaches when the class is defined
   rather than after an incident.
-- Two rules land as obligations against code that does not satisfy them yet: attribution
-  stamped rather than accepted at the `EventStore` boundary (§1), and typed gate
-  unavailability held distinct from denial (§4, via ADR-160 phase 0). Both are labelled as
-  conformance gaps rather than described as current behaviour, so a reader can separate what
-  the plane guarantees today from what it is committed to.
+- Attribution is stamped from sealed runtime context for every current request-caused
+  in-process append path (§1); the explicit inventory above makes trusted background and
+  composition-root paths auditable rather than treating every trait holder as equivalent.
+- Typed gate unavailability held distinct from denial (§4, via ADR-160 phase 0) remains a
+  conformance obligation; it is labelled as a gap rather than described as current behaviour,
+  so a reader can separate what the plane guarantees today from what it is committed to.
 - Two contract questions are visibly open with owners and gates, rather than implicitly
   decided by whatever the first implementation happens to do.
 

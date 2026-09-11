@@ -1,4 +1,4 @@
--- V22: index unread notes by recipient for exact comm inbox counts.
+-- V22: index unread notes by recipient for bounded comm inbox counts.
 --
 -- The fresh-database baseline carries this index in schema.sql. This numbered
 -- migration upgrades databases that already recorded V21 before the index was

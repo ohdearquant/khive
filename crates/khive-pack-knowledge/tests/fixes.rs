@@ -11,7 +11,7 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
@@ -1734,6 +1734,8 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     use std::sync::Arc;
 
     KhiveRuntime::new(RuntimeConfig {
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -1749,6 +1751,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime with default embedder")
 }
@@ -2412,6 +2415,8 @@ mod embed_failure_tests {
     /// with the given fake.
     fn rt_with_fake(fake: impl EmbedderProvider + 'static) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2427,6 +2432,7 @@ mod embed_failure_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         // Override the lattice provider with our fake — same key, last-writer wins.
@@ -2601,6 +2607,8 @@ mod embed_failure_tests {
         let secondary_calls = Arc::new(AtomicUsize::new(0));
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2616,6 +2624,7 @@ mod embed_failure_tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(FixedVecProvider {
@@ -2918,6 +2927,8 @@ mod ann_bypass_regression {
 
     fn rt_with_correct_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -2933,6 +2944,7 @@ mod ann_bypass_regression {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -3376,10 +3388,10 @@ async fn explicit_domain_ids_compose_includes_draft_member_atoms() {
 
 fn pack_with_events(rt: KhiveRuntime) -> Fixture {
     let rt_clone = rt.clone();
-    let tok = rt.authorize(Namespace::local()).expect("local token");
-    let event_store = rt.events(&tok).expect("event store");
     let mut builder = VerbRegistryBuilder::new();
-    builder.with_event_store(event_store);
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("configure trusted runtime audit store");
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
@@ -3392,6 +3404,7 @@ fn pack_with_events(rt: KhiveRuntime) -> Fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn stats_total_events_counts_knowledge_verbs() {
     let f = pack_with_events(rt());
 
@@ -3518,6 +3531,8 @@ mod edit_inline_reembed {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3533,6 +3548,7 @@ mod edit_inline_reembed {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(EmbedProvider);
@@ -3924,6 +3940,8 @@ mod ann_type_filter_regression {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3939,6 +3957,7 @@ mod ann_type_filter_regression {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -4331,6 +4350,8 @@ mod compose_explain_sections {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -4346,6 +4367,7 @@ mod compose_explain_sections {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("runtime");
         rt.register_embedder(UnitVecProvider);

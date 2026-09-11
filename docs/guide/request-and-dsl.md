@@ -84,6 +84,47 @@ separate `request` calls or make that result the immediate predecessor.
 batches reject it. A failed chain operation prevents subsequent operations
 from running; completed operations are not rolled back.
 
+## Check syntax without executing
+
+Set `plan=true` on the MCP envelope to parse the same `ops` text and inspect
+the loaded verb catalog without dispatching any operation:
+
+```text
+request(ops="create(kind=\"note\", content=\"draft\") | get(id=$prev.id)", plan=true)
+```
+
+A successful parse returns `parsed: true`, `mode`, `stage_count`, and `stages`.
+Each stage reports its `index`, `verb`, `pack`, `known`, normalized `args`, and
+unresolved `prev_refs`. An unknown verb still parses, with `known: false` and
+`pack: null`. References stay as literal strings; paths in `prev_refs` retain
+the parser's representation. Both outcomes include `limits` with `max_ops`,
+`max_depth`, and `max_input_len` in bytes. A syntax error returns `parsed: false`
+and the ordinary parser error text, with no `stages`.
+
+Planning accepts `ops` alone. Supplying `presentation`, `presentation_per_op`,
+`format`, `format_per_op`, `save_to`, or `request_id` beside `plan=true`, even
+as `null`, produces `invalid_params` naming the field. A plan does not grant
+permission, check a lease, or guarantee that a reference will resolve.
+
+The CLI and Python client return the same object:
+
+```sh
+kkernel exec --plan 'create(kind="note", content="draft") | get(id=$prev.id)'
+```
+
+```python
+from khive import Session
+
+plan = Session().plan('create(kind="note", content="draft") | get(id=$prev.id)')
+```
+
+These two clients require an already-running daemon at protocol version 5 with
+matching configuration. The CLI accepts `--db` and `--config` to select that
+configuration. It exits successfully for either parse outcome; transport or
+envelope failures exit nonzero. It never starts a daemon or opens a local store
+for planning. Older daemons refuse the protocol version before dispatch, so a
+plan cannot silently execute as an ordinary request.
+
 ## Read the result envelope
 
 By default, `request` returns a `results` array and an aggregate `summary`
@@ -111,15 +152,32 @@ For example, a parallel batch can return:
 
 A failure in a parallel batch does not stop its siblings. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
-the summary records their count in `aborted`.
+the summary records their count in `aborted`. A daemon frame-budget omission
+(below) is decided after the whole request has already run, so it never
+triggers this abort — any later chain entry already executed and is reported
+with its real outcome.
 
 A successful multi-backend search can still be incomplete when one backend is
 unavailable. In that case the search entry includes `"partial": true` and a
 `"missing_backends": [...]` list plus bounded `"backend_errors": {...}` causes
 beside `result`. Check this operation-level advisory even when `ok` and the
 aggregate request `status` report success. It survives batch/chain execution,
-presentation modes, and daemon frame-budget omission. A degraded empty result
-instead carries the same diagnostics inside `error.kind="search_incomplete"`.
+presentation modes, and daemon frame-budget handling. If any successful result
+cannot fit the daemon response frame, that entry becomes an explicit
+`error.kind="response_frame_budget_exceeded"` failure with `retryable: false`
+— reissuing the identical request overflows the identical budget identically,
+so this is never advertised as a pace-and-retry condition. The entry instead
+carries `recoverable`: for a read-only `Assertive` verb with no persisted
+side effect of its own, `recoverable: "reduce_result_size"` — narrow the
+verb's `limit` or result size and reissue it. Every other verb — including a
+handful of `Assertive` verbs that schedule their own persisted write on every
+dispatch, such as `memory.recall`'s serve-ledger accounting — already
+committed its effect (or, for an unregistered verb name, cannot be proven
+not to have), so the entry instead carries `executed: true` and
+`recoverable: "read_outcome"` — read the outcome back rather than reissue
+the operation. The batch summary is updated, so a discarded page is never
+counted as succeeded. A degraded empty result instead carries the same
+diagnostics inside `error.kind="search_incomplete"`.
 
 The inline `results`/`summary` envelope is the default. Set the optional
 `save_to` parameter to sink the full results to a JSONL file instead; `request`
@@ -132,7 +190,7 @@ and its export-destination restriction.
 
 An invalid DSL string never reaches a verb handler. Lexing and parsing failures
 such as unterminated strings, malformed JSON, too many operations, or invalid
-use of `$prev` are reported by MCP as an `invalid_params` RPC error. Correct
+use of `$prev` are reported by ordinary MCP requests as an `invalid_params` RPC error. Correct
 the `ops` string and submit the request again.
 
 Once the DSL parses, validation or execution failures from an individual verb
