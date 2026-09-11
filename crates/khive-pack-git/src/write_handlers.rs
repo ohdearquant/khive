@@ -12,6 +12,11 @@
 //! configuration, resolved by `crate::write_policy` against the operator's
 //! `[git_write]` allowlist (ADR-108 Amendment).
 //!
+//! Both enforcement points run before the repository is touched: the
+//! ADR-180 use policy (`tool.check`, consulted by `checked_policy`) and then
+//! the `[git_write]` allowlist. The first is operator-configurable and the
+//! second is not, and a write proceeds only when both permit it (#2572).
+//!
 //! `enforce_write_policy` returns the **canonical** repo path on success, and
 //! every git invocation for that call uses it from that point on — never the
 //! raw caller-supplied `repo` (ADR-108 review r2 High finding: reusing the
@@ -36,10 +41,11 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::event::Event;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
+use crate::local_handlers::checked_policy;
 use crate::write_argv::{build_add_argv, build_commit_argv, validate_repo_path, GitArgError};
 use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
@@ -295,11 +301,43 @@ impl GitPack {
     pub(crate) async fn handle_commit(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let repo = self
             .parse_audited_repo(token, "git.commit", &params)
             .await?;
+
+        // #2572: every other git verb, including the `tree` form of this one,
+        // refuses unless `tool.check` answers `allow`; the `paths` form consulted
+        // only the `[git_write]` allowlist below. An operator who allowlisted a
+        // repository and then restricted `git.*` through policy got reads that
+        // honoured the restriction and a write that ignored it, which is the
+        // permissive direction on the one verb in the set that mutates a
+        // repository. The decision is taken before the repo lock and before any
+        // git process starts, and a denial is audited like the allowlist denial.
+        //
+        // When the policy surface itself is unreachable — the tool pack is not
+        // loaded at all — this form keeps committing, which is the behaviour
+        // `arm30_tool_pack_absence_refuses_tree_commit_but_preserves_legacy_paths`
+        // pins deliberately: the `tree` form refuses there and the `paths` form
+        // does not. That asymmetry is a compatibility decision, not part of this
+        // fix; the `[git_write]` allowlist is still enforced below either way.
+        if let Ok(decision) = checked_policy(registry, token, "git.commit").await {
+            if decision["decision"] != "allow" {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.commit",
+                        &repo,
+                        None,
+                        EventOutcome::Denied,
+                        RuntimeError::InvalidInput("policy_denied".into()),
+                    )
+                    .await);
+            }
+        }
+
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let CommitPreflight {
@@ -386,6 +424,30 @@ impl GitPack {
         }
     }
 
+    /// Legacy unit-test convenience: the production dispatch path supplies the
+    /// real registry, which is where `git.commit`'s use-policy decision comes
+    /// from (#2572).
+    #[cfg(test)]
+    pub(crate) async fn handle_commit_fixture(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let registry = self.fixture_registry();
+        self.handle_commit(token, &registry, params).await
+    }
+
+    #[cfg(test)]
+    fn fixture_registry(&self) -> khive_runtime::VerbRegistry {
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(self.runtime().clone()));
+        builder.register(khive_pack_tool::ToolPack::new(self.runtime().clone()));
+        builder
+            .with_runtime_event_store(self.runtime())
+            .expect("fixture audit store");
+        builder.build().expect("fixture registry")
+    }
+
     #[cfg(test)]
     pub(crate) async fn handle_branch(
         &self,
@@ -394,13 +456,7 @@ impl GitPack {
     ) -> Result<Value, RuntimeError> {
         // Legacy unit tests call this crate-private convenience directly; production
         // dispatch always supplies the actual registry and its per-pack backends.
-        let mut builder = khive_runtime::VerbRegistryBuilder::new();
-        builder.register(khive_pack_kg::KgPack::new(self.runtime().clone()));
-        builder.register(khive_pack_tool::ToolPack::new(self.runtime().clone()));
-        builder
-            .with_runtime_event_store(self.runtime())
-            .expect("fixture audit store");
-        let registry = builder.build().expect("fixture registry");
+        let registry = self.fixture_registry();
         self.handle_local(token, &registry, "git.branch", params)
             .await
     }
