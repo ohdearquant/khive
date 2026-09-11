@@ -135,8 +135,8 @@ fn parse_paths_param(params: &Value) -> Result<Vec<String>, RuntimeError> {
 /// credential config is not). Unit-test builds override both config sources
 /// below so handler tests remain hermetic; that override is not compiled into
 /// production builds.
-fn run_git(repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
-    let mut command = Command::new("git");
+fn run_git(program: &Path, repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
+    let mut command = Command::new(program);
     command
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
@@ -164,8 +164,9 @@ fn run_git(repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
 /// writes to is whatever is checked out — so this is what
 /// `enforce_write_policy` checks the allowlist against for that verb.
 /// Errors (e.g. detached HEAD) surface as an ordinary handler error.
-fn current_branch(repo: &Path) -> Result<String, RuntimeError> {
+fn current_branch(program: &Path, repo: &Path) -> Result<String, RuntimeError> {
     let out = run_git(
+        program,
         repo,
         &[
             "symbolic-ref".to_string(),
@@ -206,11 +207,15 @@ struct CommitPreflight {
     commit_argv: Vec<String>,
 }
 
-fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WritePreflightError> {
+fn prepare_commit(
+    program: &Path,
+    repo: &Path,
+    params: &Value,
+) -> Result<CommitPreflight, WritePreflightError> {
     validate_repo_path(repo)
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, None))?;
-    let branch = current_branch(repo).map_err(WritePreflightError::runtime)?;
+    let branch = current_branch(program, repo).map_err(WritePreflightError::runtime)?;
     let message = params
         .get("message")
         .and_then(Value::as_str)
@@ -307,6 +312,32 @@ impl GitPack {
         let repo = self
             .parse_audited_repo(token, "git.commit", &params)
             .await?;
+        if let Err(failure) = crate::local_handlers::validate_keys(
+            &params,
+            &[
+                "repo",
+                "message",
+                "paths",
+                "author",
+                "session_id",
+                "branch",
+                "expected_head",
+            ],
+        ) {
+            return Err(self
+                .audit_early_failure(
+                    token,
+                    "git.commit",
+                    &repo,
+                    None,
+                    EventOutcome::Denied,
+                    RuntimeError::InvalidInput(
+                        failure.detail.unwrap_or_else(|| failure.reason.into()),
+                    ),
+                )
+                .await);
+        }
+        let program = self.runtime().config().git_write.git_program();
 
         // #2572: every other git verb, including the `tree` form of this one,
         // refuses unless `tool.check` answers `allow`; the `paths` form consulted
@@ -344,7 +375,7 @@ impl GitPack {
             branch,
             add_argv,
             commit_argv,
-        } = match prepare_commit(&repo, &params) {
+        } = match prepare_commit(program, &repo, &params) {
             Ok(preflight) => preflight,
             Err(failure) => {
                 return Err(self
@@ -379,10 +410,11 @@ impl GitPack {
 
         let exec: Result<String, RuntimeError> = (|| {
             if let Some(add_argv) = &add_argv {
-                run_git(&canonical_repo, add_argv)?;
+                run_git(program, &canonical_repo, add_argv)?;
             }
-            run_git(&canonical_repo, &commit_argv)?;
+            run_git(program, &canonical_repo, &commit_argv)?;
             let sha = run_git(
+                program,
                 &canonical_repo,
                 &["rev-parse".to_string(), "HEAD".to_string()],
             )?

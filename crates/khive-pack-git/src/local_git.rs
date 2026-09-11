@@ -48,8 +48,8 @@ const HARDENING: &[&str] = &[
 /// modified that its own `git status` calls clean. Reading a repository must not run its code.
 const FILTER_NEUTRALIZED: &[&str] = &["clean", "smudge", "process"];
 
-fn filter_overrides(repo: &Path) -> Vec<String> {
-    let mut command = base_command();
+fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
+    let mut command = base_command(program);
     command
         .arg("-C")
         .arg(repo)
@@ -169,8 +169,8 @@ pub(crate) struct DiffResult {
 ///
 /// Split out so the config READ that enumerates filter drivers runs under the same hardening as
 /// the operation it is hardening, without recursing into the enumeration it exists to feed.
-fn base_command() -> Command {
-    let mut command = Command::new("git");
+fn base_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
     // Inherited GIT_DIR, index/object paths, config injection, and identities
     // must not redirect an operation away from the caller's authorized repo.
     command.env_clear();
@@ -193,8 +193,13 @@ fn base_command() -> Command {
     command
 }
 
-fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Command {
-    let mut command = base_command();
+fn git_command(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    identity: Option<(&str, &str)>,
+) -> Command {
+    let mut command = base_command(program);
     if let Some((name, email)) = identity {
         command
             .env("GIT_AUTHOR_NAME", name)
@@ -204,7 +209,7 @@ fn git_command(repo: &Path, argv: &[&str], identity: Option<(&str, &str)>) -> Co
     }
     // Every invocation, not only the ones known today to convert content: a verb added later that
     // reads or writes the worktree inherits this rather than having to remember it.
-    for setting in filter_overrides(repo) {
+    for setting in filter_overrides(program, repo) {
         command.arg("-c").arg(setting);
     }
     command.arg("-C").arg(repo).args(argv);
@@ -265,16 +270,19 @@ fn cas_refused(argv: &[&str], stderr: &[u8]) -> bool {
 }
 
 fn run_git(
+    program: &Path,
     repo: &Path,
     argv: &[&str],
     input: Option<&[u8]>,
     identity: Option<(&str, &str)>,
     ref_effect: bool,
 ) -> Result<Vec<u8>> {
-    run_git_output(repo, argv, input, identity, ref_effect, None).map(|output| output.stdout)
+    run_git_output(program, repo, argv, input, identity, ref_effect, None)
+        .map(|output| output.stdout)
 }
 
 fn run_git_output(
+    program: &Path,
     repo: &Path,
     argv: &[&str],
     input: Option<&[u8]>,
@@ -283,7 +291,7 @@ fn run_git_output(
     allowed_exit: Option<i32>,
 ) -> Result<GitOutput> {
     let operation = argv.first().copied().unwrap_or("operation");
-    let mut command = git_command(repo, argv, identity);
+    let mut command = git_command(program, repo, argv, identity);
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -369,12 +377,18 @@ where
         .map_err(|_| LocalGitError::after_start(operation, ref_effect))?
 }
 
-async fn run_async(repo: &Path, argv: &[&str], input: Option<Vec<u8>>) -> Result<Vec<u8>> {
+async fn run_async(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    input: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let argv: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        run_git(&repo, &args, input.as_deref(), None, false)
+        run_git(&program, &repo, &args, input.as_deref(), None, false)
     })
     .await
     .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
@@ -415,9 +429,10 @@ fn branch_ref(branch: &str) -> Result<String> {
     Ok(format!("refs/heads/{branch}"))
 }
 
-fn resolve_commit_sync(repo: &Path, reference: &str) -> Result<String> {
+fn resolve_commit_sync(program: &Path, repo: &Path, reference: &str) -> Result<String> {
     let reference = checked_ref(reference)?;
     oid_output(&run_git(
+        program,
         repo,
         &["rev-parse", "--verify", "--end-of-options", &reference],
         None,
@@ -426,8 +441,9 @@ fn resolve_commit_sync(repo: &Path, reference: &str) -> Result<String> {
     )?)
 }
 
-fn require_direct_ref(repo: &Path, reference: &str) -> Result<()> {
+fn require_direct_ref(program: &Path, repo: &Path, reference: &str) -> Result<()> {
     let output = run_git_output(
+        program,
         repo,
         &["symbolic-ref", "--quiet", "--no-recurse", reference],
         None,
@@ -444,19 +460,20 @@ fn require_direct_ref(repo: &Path, reference: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn resolve_commit(repo: &Path, reference: &str) -> Result<String> {
+pub(crate) async fn resolve_commit(program: &Path, repo: &Path, reference: &str) -> Result<String> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let reference = reference.to_string();
     blocking("rev-parse", false, move || {
-        resolve_commit_sync(&repo, &reference)
+        resolve_commit_sync(&program, &repo, &reference)
     })
     .await
 }
 
-fn branch_head_sync(repo: &Path, branch: &str) -> Result<String> {
+fn branch_head_sync(program: &Path, repo: &Path, branch: &str) -> Result<String> {
     let reference = branch_ref(branch)?;
-    require_direct_ref(repo, &reference)?;
-    resolve_commit_sync(repo, &reference).map_err(|error| {
+    require_direct_ref(program, repo, &reference)?;
+    resolve_commit_sync(program, repo, &reference).map_err(|error| {
         if error.code() == "git_failed" {
             LocalGitError::new(
                 "expected_head_mismatch",
@@ -468,10 +485,14 @@ fn branch_head_sync(repo: &Path, branch: &str) -> Result<String> {
     })
 }
 
-pub(crate) async fn branch_head(repo: &Path, branch: &str) -> Result<String> {
+pub(crate) async fn branch_head(program: &Path, repo: &Path, branch: &str) -> Result<String> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let branch = branch.to_string();
-    blocking("rev-parse", false, move || branch_head_sync(&repo, &branch)).await
+    blocking("rev-parse", false, move || {
+        branch_head_sync(&program, &repo, &branch)
+    })
+    .await
 }
 
 #[derive(Debug)]
@@ -530,22 +551,24 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
 }
 
 pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) -> Result<Checkout> {
+    let program = rt.config().git_write.git_program();
     let reference = checked_ref(reference)?;
     let commit = oid_output(
         &run_async(
+            program,
             repo,
             &["rev-parse", "--verify", "--end-of-options", &reference],
             None,
         )
         .await?,
     )?;
-    let listing = run_async(repo, &["ls-tree", "-r", "-z", &commit], None).await?;
+    let listing = run_async(program, repo, &["ls-tree", "-r", "-z", &commit], None).await?;
     // Validate every mode and path before producing any manifest entries.
     let listed = parse_listing(&listing)?;
     let store = tree::blob_store(rt)?;
     let mut entries = Vec::with_capacity(listed.len());
     for entry in listed {
-        let bytes = run_async(repo, &["cat-file", "blob", &entry.oid], None).await?;
+        let bytes = run_async(program, repo, &["cat-file", "blob", &entry.oid], None).await?;
         let content_ref = store.put(bytes).await?;
         entries.push(TreeEntry {
             path: entry.path,
@@ -592,6 +615,7 @@ pub(crate) async fn write_manifest_tree(
     repo: &Path,
     manifest_ref: &str,
 ) -> Result<String> {
+    let program = rt.config().git_write.git_program();
     let entries = tree::load(rt, manifest_ref).await?;
     tree::verify_blobs(rt, &entries).await?;
     let store = tree::blob_store(rt)?;
@@ -605,6 +629,7 @@ pub(crate) async fn write_manifest_tree(
             .await?;
         let oid = oid_output(
             &run_async(
+                program,
                 repo,
                 &["hash-object", "-w", "--no-filters", "--stdin"],
                 Some(bytes),
@@ -644,8 +669,15 @@ pub(crate) async fn write_manifest_tree(
         let entries = directories
             .remove(&path)
             .expect("directory came from the same map");
-        let oid =
-            oid_output(&run_async(repo, &["mktree", "-z"], Some(mktree_input(&entries))).await?)?;
+        let oid = oid_output(
+            &run_async(
+                program,
+                repo,
+                &["mktree", "-z"],
+                Some(mktree_input(&entries)),
+            )
+            .await?,
+        )?;
         if path.is_empty() {
             return Ok(oid);
         }
@@ -667,6 +699,7 @@ pub(crate) async fn write_manifest_tree(
 }
 
 fn create_commit_sync(
+    program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
@@ -691,6 +724,7 @@ fn create_commit_sync(
         }
     }
     oid_output(&run_git(
+        program,
         repo,
         &["commit-tree", git_tree, "-p", parent, "-m", message],
         None,
@@ -700,6 +734,7 @@ fn create_commit_sync(
 }
 
 pub(crate) async fn create_commit(
+    program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
@@ -707,6 +742,7 @@ pub(crate) async fn create_commit(
     author_name: &str,
     author_email: &str,
 ) -> Result<String> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let git_tree = git_tree.to_string();
     let parent = parent.to_string();
@@ -715,6 +751,7 @@ pub(crate) async fn create_commit(
     let author_email = author_email.to_string();
     blocking("commit-tree", false, move || {
         create_commit_sync(
+            &program,
             &repo,
             &git_tree,
             &parent,
@@ -740,6 +777,7 @@ fn receipt_marker(receipt_id: &str) -> Result<String> {
 }
 
 fn update_branch_sync(
+    program: &Path,
     repo: &Path,
     branch: &str,
     new: &str,
@@ -756,9 +794,10 @@ fn update_branch_sync(
     validate_oid(expected, "expected_head")?;
     let reference = branch_ref(branch)?;
     let marker = receipt_marker(receipt_id)?;
-    require_direct_ref(repo, &reference)?;
+    require_direct_ref(program, repo, &reference)?;
     // A symref installed after inspection must never redirect the ref-store write.
     run_git(
+        program,
         repo,
         &[
             "update-ref",
@@ -778,30 +817,33 @@ fn update_branch_sync(
 }
 
 pub(crate) async fn update_branch(
+    program: &Path,
     repo: &Path,
     branch: &str,
     new: &str,
     expected: &str,
     receipt_id: &str,
 ) -> Result<()> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let branch = branch.to_string();
     let new = new.to_string();
     let expected = expected.to_string();
     let receipt_id = receipt_id.to_string();
     blocking("update-ref", true, move || {
-        update_branch_sync(&repo, &branch, &new, &expected, &receipt_id)
+        update_branch_sync(&program, &repo, &branch, &new, &expected, &receipt_id)
     })
     .await
 }
 
 pub(crate) async fn create_branch_ref(
+    program: &Path,
     repo: &Path,
     branch: &str,
     new: &str,
     receipt_id: &str,
 ) -> Result<()> {
-    update_branch(repo, branch, new, ZERO_OID, receipt_id).await
+    update_branch(program, repo, branch, new, ZERO_OID, receipt_id).await
 }
 
 fn parse_operation_recorded(bytes: &[u8], new_sha: &str, marker: &str) -> Result<bool> {
@@ -837,6 +879,7 @@ fn parse_operation_recorded(bytes: &[u8], new_sha: &str, marker: &str) -> Result
 /// SHA equal to or an ancestor of the named ref's current head. This is not a
 /// claim of crash-atomicity for the ref backend.
 pub(crate) async fn operation_recorded(
+    program: &Path,
     repo: &Path,
     branch: &str,
     new_sha: &str,
@@ -845,11 +888,13 @@ pub(crate) async fn operation_recorded(
     validate_oid(new_sha, "new head")?;
     let reference = branch_ref(branch)?;
     let marker = receipt_marker(receipt_id)?;
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let new_sha = new_sha.to_string();
     blocking("reflog", false, move || {
-        require_direct_ref(&repo, &reference)?;
+        require_direct_ref(&program, &repo, &reference)?;
         let exists = run_git_output(
+            &program,
             &repo,
             &["reflog", "exists", &reference],
             None,
@@ -861,6 +906,7 @@ pub(crate) async fn operation_recorded(
             return Ok(false);
         }
         let bytes = run_git(
+            &program,
             &repo,
             &[
                 "reflog",
@@ -884,13 +930,14 @@ pub(crate) async fn operation_recorded(
         if !parse_operation_recorded(&bytes, &new_sha, &marker)? {
             return Ok(false);
         }
-        require_direct_ref(&repo, &reference)?;
+        require_direct_ref(&program, &repo, &reference)?;
         // Resolve the head once, then make the ancestry query against immutable IDs.
-        let head = resolve_commit_sync(&repo, &reference)?;
+        let head = resolve_commit_sync(&program, &repo, &reference)?;
         if head.eq_ignore_ascii_case(&new_sha) {
             return Ok(true);
         }
         let ancestry = run_git_output(
+            &program,
             &repo,
             &["merge-base", "--is-ancestor", &new_sha, &head],
             None,
@@ -947,6 +994,7 @@ pub(crate) async fn diff(
     base: &str,
     head: &str,
 ) -> Result<DiffResult> {
+    let program = rt.config().git_write.git_program();
     let scratch;
     let (working_repo, left, right) = match input_kind {
         "commits" => {
@@ -954,6 +1002,7 @@ pub(crate) async fn diff(
             let head_ref = checked_ref(head)?;
             let left = oid_output(
                 &run_async(
+                    program,
                     repo,
                     &["rev-parse", "--verify", "--end-of-options", &base_ref],
                     None,
@@ -962,6 +1011,7 @@ pub(crate) async fn diff(
             )?;
             let right = oid_output(
                 &run_async(
+                    program,
                     repo,
                     &["rev-parse", "--verify", "--end-of-options", &head_ref],
                     None,
@@ -978,6 +1028,7 @@ pub(crate) async fn diff(
                     LocalGitError::new("scratch_error", "could not create scratch repository")
                 })?;
             run_async(
+                program,
                 scratch.path(),
                 &["init", "--bare", "--template=", "--object-format=sha1"],
                 None,
@@ -995,6 +1046,7 @@ pub(crate) async fn diff(
         }
     };
     let bytes = run_async(
+        program,
         working_repo,
         &[
             "diff-tree",
@@ -1010,6 +1062,7 @@ pub(crate) async fn diff(
     )
     .await?;
     let numstat = run_async(
+        program,
         working_repo,
         &[
             "diff-tree",
@@ -1034,12 +1087,19 @@ pub(crate) async fn diff(
     })
 }
 
-pub(crate) async fn is_ancestor(repo: &Path, base: &str, head: &str) -> Result<bool> {
+pub(crate) async fn is_ancestor(
+    program: &Path,
+    repo: &Path,
+    base: &str,
+    head: &str,
+) -> Result<bool> {
     validate_oid(base, "base")?;
     validate_oid(head, "head")?;
+    let program = program.to_path_buf();
     let (repo, base, head) = (repo.to_path_buf(), base.to_string(), head.to_string());
     blocking("merge-base", false, move || {
         Ok(run_git_output(
+            &program,
             &repo,
             &["merge-base", "--is-ancestor", &base, &head],
             None,
@@ -1053,10 +1113,12 @@ pub(crate) async fn is_ancestor(repo: &Path, base: &str, head: &str) -> Result<b
     .await
 }
 
-pub(crate) async fn object_directory(repo: &Path) -> Result<std::path::PathBuf> {
+pub(crate) async fn object_directory(program: &Path, repo: &Path) -> Result<std::path::PathBuf> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     blocking("rev-parse", false, move || {
         let bytes = run_git(
+            &program,
             &repo,
             &["rev-parse", "--git-path", "objects"],
             None,
@@ -1074,6 +1136,7 @@ pub(crate) async fn object_directory(repo: &Path) -> Result<std::path::PathBuf> 
 }
 
 pub(crate) async fn record_push_marker(
+    program: &Path,
     repo: &Path,
     branch: &str,
     sha: &str,
@@ -1082,13 +1145,15 @@ pub(crate) async fn record_push_marker(
     validate_oid(sha, "pushed head")?;
     let reference = branch_ref(branch)?;
     let marker = receipt_marker(receipt_id)?;
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     let sha = sha.to_string();
     blocking("reflog", false, move || {
-        require_direct_ref(&repo, &reference)?;
+        require_direct_ref(&program, &repo, &reference)?;
         // update-ref suppresses reflog writes for an unchanged SHA. An explicit
         // reflog write records acknowledgement without changing any source ref.
         run_git(
+            &program,
             &repo,
             &["reflog", "write", &reference, &sha, &sha, &marker],
             None,
@@ -1100,13 +1165,22 @@ pub(crate) async fn record_push_marker(
     .await
 }
 
-pub(crate) async fn push_marker_support(repo: &Path) -> Result<(String, bool)> {
+pub(crate) async fn push_marker_support(program: &Path, repo: &Path) -> Result<(String, bool)> {
+    let program = program.to_path_buf();
     let repo = repo.to_path_buf();
     blocking("reflog", false, move || {
-        let version = run_git(&repo, &["--version"], None, None, false)?;
+        let version = run_git(&program, &repo, &["--version"], None, None, false)?;
         let version = String::from_utf8(version)
             .map_err(|_| LocalGitError::new("git_output", "invalid Git version"))?;
-        let help = run_git_output(&repo, &["reflog", "-h"], None, None, false, Some(129))?;
+        let help = run_git_output(
+            &program,
+            &repo,
+            &["reflog", "-h"],
+            None,
+            None,
+            false,
+            Some(129),
+        )?;
         Ok((
             version.trim().to_owned(),
             String::from_utf8_lossy(&help.stdout).contains("git reflog write "),
@@ -1146,7 +1220,12 @@ pub(crate) struct StatusResult {
 /// already in the hardened environment, so this refreshes nothing and takes no index lock: the
 /// working tree and the index are byte-identical before and after. `total` counts every entry git
 /// reported, so `total == 0` is a whole-repository claim even when `entries` was capped by `limit`.
-pub(crate) async fn status(repo: &Path, untracked: &str, limit: usize) -> Result<StatusResult> {
+pub(crate) async fn status(
+    program: &Path,
+    repo: &Path,
+    untracked: &str,
+    limit: usize,
+) -> Result<StatusResult> {
     let untracked_arg = match untracked {
         "no" | "normal" | "all" => format!("--untracked-files={untracked}"),
         _ => {
@@ -1157,6 +1236,7 @@ pub(crate) async fn status(repo: &Path, untracked: &str, limit: usize) -> Result
         }
     };
     let bytes = run_async(
+        program,
         repo,
         &[
             "status",
@@ -1289,7 +1369,7 @@ fn parse_status(bytes: &[u8], limit: usize) -> Result<StatusResult> {
 /// performed, because git would rewrite configuration in place and the caller would read success.
 /// `--template=` is passed so the new repository inherits no sample hooks, which keeps ADR-182
 /// Amendment 2 item 4 true of a repository this pack created.
-pub(crate) async fn init(repo: &Path, branch: &str) -> Result<String> {
+pub(crate) async fn init(program: &Path, repo: &Path, branch: &str) -> Result<String> {
     validate_ref_name("branch", branch)
         .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
     if !repo.is_dir() {
@@ -1310,7 +1390,13 @@ pub(crate) async fn init(repo: &Path, branch: &str) -> Result<String> {
     // receipt that is wrong, and this call must not delete a `.git` it may not have created (the
     // check above is a moment earlier, and `git init` is idempotent over an existing repository),
     // so the outcome is reported as unestablished with the path that has to be looked at.
-    let created = run_async(repo, &["init", "-q", "--template=", "-b", branch], None).await;
+    let created = run_async(
+        program,
+        repo,
+        &["init", "-q", "--template=", "-b", branch],
+        None,
+    )
+    .await;
     let partial = |error: LocalGitError| {
         if !repo.join(".git").exists() {
             return error;
@@ -1329,11 +1415,11 @@ pub(crate) async fn init(repo: &Path, branch: &str) -> Result<String> {
         }
     };
     created.map_err(partial)?;
-    resolve_head_branch(repo).await.map_err(partial)
+    resolve_head_branch(program, repo).await.map_err(partial)
 }
 
-async fn resolve_head_branch(repo: &Path) -> Result<String> {
-    let bytes = run_async(repo, &["symbolic-ref", "--short", "HEAD"], None).await?;
+async fn resolve_head_branch(program: &Path, repo: &Path) -> Result<String> {
+    let bytes = run_async(program, repo, &["symbolic-ref", "--short", "HEAD"], None).await?;
     Ok(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
@@ -1353,6 +1439,7 @@ pub(crate) struct LogEntry {
 /// main-command option and so precedes the subcommand; it stops a caller-supplied path from being
 /// read as a glob or a magic pathspec.
 pub(crate) async fn log(
+    program: &Path,
     repo: &Path,
     reference: &str,
     limit: usize,
@@ -1379,7 +1466,7 @@ pub(crate) async fn log(
         argv.push("--");
         argv.push(path);
     }
-    let bytes = run_async(repo, &argv, None).await?;
+    let bytes = run_async(program, repo, &argv, None).await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| LocalGitError::new("git_failed", "git log emitted a non-UTF-8 record"))?;
     let mut entries = Vec::new();
@@ -1416,9 +1503,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("fixture directory");
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).expect("repo directory");
-        run_async(&repo, &["init", "-q", "--template="], None)
-            .await
-            .expect("initialize fixture");
+        run_async(
+            Path::new("git"),
+            &repo,
+            &["init", "-q", "--template="],
+            None,
+        )
+        .await
+        .expect("initialize fixture");
         std::fs::write(repo.join("file.txt"), b"file contents\n").expect("file");
         std::fs::create_dir(repo.join("dir")).expect("directory");
         std::fs::write(repo.join("dir/nested.txt"), b"nested contents\n").expect("nested file");
@@ -1429,11 +1521,11 @@ mod tests {
         ] {
             symlink(OsStr::from_bytes(target), repo.join(path)).expect("symlink");
         }
-        run_async(&repo, &["add", "--all"], None)
+        run_async(Path::new("git"), &repo, &["add", "--all"], None)
             .await
             .expect("index fixture");
         let original = oid_output(
-            &run_async(&repo, &["write-tree"], None)
+            &run_async(Path::new("git"), &repo, &["write-tree"], None)
                 .await
                 .expect("original tree"),
         )
@@ -1449,7 +1541,7 @@ mod tests {
         rt.install_blob_store(std::sync::Arc::new(blobs))
             .expect("install blob store");
         let store = tree::blob_store(&rt).expect("blob store");
-        let listing = run_async(&repo, &["ls-files", "-s", "-z"], None)
+        let listing = run_async(Path::new("git"), &repo, &["ls-files", "-s", "-z"], None)
             .await
             .expect("index listing");
         let mut entries = Vec::new();
@@ -1473,9 +1565,14 @@ mod tests {
                 mode => panic!("unexpected index mode {mode}"),
             };
             let path = std::str::from_utf8(&record[tab + 1..]).unwrap();
-            let bytes = run_async(&repo, &["cat-file", "blob", fields[1]], None)
-                .await
-                .expect("index blob");
+            let bytes = run_async(
+                Path::new("git"),
+                &repo,
+                &["cat-file", "blob", fields[1]],
+                None,
+            )
+            .await
+            .expect("index blob");
             if mode == 120000 {
                 assert_eq!(
                     bytes,
@@ -1497,6 +1594,7 @@ mod tests {
             .expect("write manifest tree");
         assert_eq!(roundtrip, original);
         let diff = run_async(
+            Path::new("git"),
             &repo,
             &[
                 "diff-tree",
