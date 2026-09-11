@@ -1199,7 +1199,7 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
 
     let (reached_rx, proceed_tx) =
         page_snapshot_seam::install(query.operation(), namespace.clone());
-    let query_task = {
+    let mut query_task = {
         let store = Arc::clone(&store);
         let namespace = namespace.clone();
         let filters = filters.clone();
@@ -1208,10 +1208,45 @@ async fn assert_filtered_count_partitions_share_snapshot(query: SnapshotCountQue
         )
     };
 
-    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
-        .await
-        .expect("waiting for the count snapshot seam must not panic")
-        .expect("count query must reach the seam after its first partition");
+    // Hang protection only: query outcomes, not expected scheduling latency,
+    // determine whether the seam precondition succeeds.
+    let mut seam_task = tokio::task::spawn_blocking(move || {
+        reached_rx.recv_timeout(std::time::Duration::from_secs(60))
+    });
+    tokio::select! {
+        reached = &mut seam_task => {
+            if !matches!(&reached, Ok(Ok(()))) {
+                page_snapshot_seam::uninstall();
+                drop(proceed_tx);
+                query_task.abort();
+                let query_outcome = query_task.await;
+                if matches!(
+                    &reached,
+                    Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout))
+                ) {
+                    panic!(
+                        "precondition timeout: {query:?} count snapshot seam exceeded its 60s hang watchdog; \
+                         query outcome after cleanup: {query_outcome:?}"
+                    );
+                }
+                panic!(
+                    "precondition: {query:?} count snapshot seam waiter failed; \
+                     seam outcome: {reached:?}; query outcome after cleanup: {query_outcome:?}"
+                );
+            }
+        }
+        outcome = &mut query_task => {
+            page_snapshot_seam::uninstall();
+            drop(proceed_tx);
+            // Uninstall drops the sender if the query never entered the hook,
+            // so the blocking waiter must also finish before this test exits.
+            let seam_outcome = seam_task.await;
+            panic!(
+                "precondition: {query:?} count query completed while waiting for its snapshot seam; \
+                 query outcome: {outcome:?}; seam outcome: {seam_outcome:?}"
+            );
+        }
+    }
 
     let writer = pool.writer().unwrap();
     writer

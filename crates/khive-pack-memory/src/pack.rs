@@ -1119,10 +1119,11 @@ mod note_mutation_hook_tests {
             .await
             .expect("warm recall");
 
+        ann::wait_until_warm_idle(ann, &mutation_hook_ann_key()).await;
         assert!(
             ann::is_current(ann, &mutation_hook_ann_key()).await,
-            "sanity: warm-up recall must leave the ANN cache current before \
-             the mutation under test"
+            "precondition: completed ANN warm-up must leave the cache current \
+             before testing mutation invalidation"
         );
         id
     }
