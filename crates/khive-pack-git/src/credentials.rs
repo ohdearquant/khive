@@ -28,6 +28,19 @@ impl fmt::Display for CredentialError {
 
 impl std::error::Error for CredentialError {}
 
+/// The refusal payload an `actor_unmapped` receipt carries (ADR-182 Amendment 10).
+/// `table` and `key` name what was consulted, not what was missing, because the
+/// reason covers two states: no row for the label, and a row whose resolution
+/// failed. Membership in the table is the only question that separates them, so it
+/// is asked here rather than carried out of the resolver.
+pub(crate) fn actor_refusal(config: &GitWriteSectionConfig, actor: &str) -> serde_json::Value {
+    serde_json::json!({"refusal": {
+        "table": "git_write.actors",
+        "key": actor,
+        "cause": if config.actors.contains_key(actor) { "resolver" } else { "absent" },
+    }})
+}
+
 pub(crate) async fn resolve_actor(
     config: &GitWriteSectionConfig,
     actor: &str,
