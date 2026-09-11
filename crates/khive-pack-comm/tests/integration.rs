@@ -2171,6 +2171,72 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
     );
 }
 
+/// #2564: a third party who asks by 8-char prefix must not learn the resolved
+/// uuid from the refusal. The prefix is the caller's own input; the remaining 28
+/// characters are not, and printing them confirms both that a message exists and
+/// exactly which one.
+#[tokio::test]
+async fn issue2564_third_party_refusal_does_not_disclose_the_resolved_id() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (_registry_b, rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for B's eyes only" }),
+        )
+        .await
+        .expect("A sends to B");
+
+    let local_tok = rt_b.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("inbound copy addressed to lambda:b must exist");
+    let prefix = inbound_id[..8].to_string();
+    let tail = inbound_id[8..].to_string();
+
+    for verb in ["comm.read", "comm.reply"] {
+        let mut args = serde_json::json!({ "id": prefix });
+        if verb == "comm.reply" {
+            args["content"] = serde_json::json!("attempted reply");
+        }
+        let error = registry_c
+            .dispatch(verb, args)
+            .await
+            .expect_err("#2564: a third party must be refused")
+            .to_string();
+        assert!(
+            !error.contains(&tail),
+            "#2564: {verb} refusal must not disclose the resolved uuid; got {error:?}"
+        );
+        assert!(
+            !error.contains(&inbound_id),
+            "#2564: {verb} refusal must not print the full id; got {error:?}"
+        );
+        assert!(
+            error.contains("lambda:c")
+                && !error.contains("lambda:a")
+                && !error.contains("lambda:b"),
+            "#2564: the refusal names only the caller's own actor; got {error:?}"
+        );
+    }
+}
+
 /// The anonymous/"local" single-actor deployment (no actor.id configured) must keep working: caller and to_actor both resolve to "local", so the equality check passes.
 #[tokio::test]
 async fn t87_anonymous_local_single_actor_read_still_works() {
@@ -11158,7 +11224,9 @@ async fn i1387_atomic_mark_read_reuses_addressee_validation_before_mutation() {
         .await
         .expect_err("A cannot mark B's inbound delivery state");
     let error = error.to_string();
-    assert!(error.contains("read: message"));
+    // #2564 reworded this refusal so it no longer echoes the resolved id; the
+    // assertion still pins the error to the read-path addressee check.
+    assert!(error.contains("read: that message is not addressed"));
     assert!(error.contains("lambda:a"));
     assert!(!error.contains("lambda:b"));
 
