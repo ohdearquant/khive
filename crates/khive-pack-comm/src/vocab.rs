@@ -605,7 +605,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
                       Unlike comm.inbox, the actor is not inferred from the caller — pass it \
-                      explicitly via the required `actor` param (khive #93).",
+                      explicitly via the required `actor` param (khive #93). A `since_us` the \
+                      store cannot have issued is discarded and the page comes from the \
+                      baseline; the response then carries `cursor_reset: true` (khive #2400).",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -620,7 +622,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 name: "since_us",
                 param_type: "integer",
                 required: false,
-                description: "Opaque cursor round-tripped from a previous comm.probe response's cursor_us; only messages committed after it are returned. Omit for a baseline-first probe. Not a computable timestamp.",
+                description: "Opaque cursor round-tripped from a previous comm.probe response's cursor_us; only messages committed after it are returned. Omit for a baseline-first probe. Not a computable timestamp: a microsecond clock reading exceeds any cursor this store has issued, so it is discarded and the response carries cursor_reset: true.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
