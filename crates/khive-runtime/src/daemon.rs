@@ -2362,19 +2362,11 @@ async fn socket_speaks_khived_protocol(sock: &std::path::Path, expected_config_i
         && resp.served_config_id.as_deref() == Some(expected_config_id)
 }
 
-/// Check whether `pid_file`/`sock` already name a live, responsive daemon and,
-/// if not, remove the stale rendezvous files so the caller may bind fresh.
-///
-/// Returns `Some(pid)` when a live incumbent answered on `sock` — the caller
-/// must not clean up or bind, and must refuse to start rather than silently
-/// deferring (#1874: a quiet `Ok(())` here is exactly what let two detached
-/// daemons coexist on one store). Returns `None` when the rendezvous was
-/// stale (or absent) and has been cleared, so the caller may proceed.
-#[cfg(unix)]
 /// What owns the daemon PID file, from the point of view of a process that wants
 /// to start. A live owner is never cleaned up: a draining incumbent closes its
 /// listener before it releases writers, so an unanswered socket is ambiguous and
 /// deleting its PID file is how two daemons end up on one store.
+#[cfg(unix)]
 enum Incumbent {
     /// A live process that answered the khived protocol on the socket.
     Serving(u32),
@@ -2384,6 +2376,14 @@ enum Incumbent {
     Stale,
 }
 
+/// Check whether `pid_file`/`sock` already name a live daemon and, if not,
+/// remove the stale rendezvous files so the caller may bind fresh.
+///
+/// Both live outcomes mean the caller must not bind and must refuse to start
+/// rather than silently deferring (#1874: a quiet `Ok(())` here is exactly what
+/// let two detached daemons coexist on one store). Only `Stale` clears the
+/// rendezvous and lets the caller proceed.
+#[cfg(unix)]
 async fn cleanup_stale_daemon(
     sock: &std::path::Path,
     pid_file: &std::path::Path,

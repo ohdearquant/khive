@@ -2651,6 +2651,7 @@ dependencies = [
  "khive-gate-rego",
  "khive-query",
  "khive-request",
+ "khive-runtime",
  "khive-score",
  "khive-storage",
  "khive-types",
