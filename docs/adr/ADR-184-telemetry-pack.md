@@ -322,13 +322,26 @@ deployment whose loaded pack set excludes telemetry needs no telemetry table and
 clean. A deployment that loads the pack and omits the key fails, naming the key. The absent-pack
 case and the present-but-incomplete case are different states and only the second is an error.
 
-**A1.2 — `coverage` describes what the read could see, never what history meant.** D5 replaces the
-ring's `gap` with a read-time `coverage`. It reports the window the read actually covered and where
-its visibility ended. It does not classify past absences: a window with no rows says there are no
-rows in it, and must not report them as dropped by policy. The current carrier table describes the
-configuration in force now, and inferring from it what happened to an event that was never recorded
-is a fabrication with a plausible shape. Where a past classification matters, it is readable only
-from events that were recorded.
+**A1.2 — `coverage` carries two facts and labels which is which. This one amends D5 and arm 10
+rather than clarifying them.** D5 defined `coverage` as the requested kinds whose configured carrier
+is ephemeral _and which therefore have no stored rows_. The second half of that is an inference from
+the current table to the contents of the past, and it is wrong whenever the table has changed: a kind
+that was durable last week and is ephemeral today has stored rows, and reporting it as empty because
+of policy is a fabrication with a plausible shape.
+
+`coverage` therefore carries both facts, each labelled for what it is. The window the read actually
+covered and where its visibility ended, which is a statement about this read. And separately, the
+requested kinds whose carrier is ephemeral **in the configuration in force now**, which is a
+statement about configuration and never a statement about the rows. A caller that wants to know what
+happened to a particular past event reads the events that were recorded; no field here answers that
+question and none of them should look like it does.
+
+D5 and acceptance arm 10 are amended to this content. Arm 10 keeps its requirement that
+`coverage.ephemeral` names exactly the requested kinds whose current carrier is ephemeral, and gains
+the arm that separates the two readings: a kind whose carrier is ephemeral now but which has stored
+rows from an earlier configuration must appear in `coverage.ephemeral` **and** have its stored rows
+returned by the same read. A `coverage` implemented as "no rows because policy" cannot pass both
+halves, which is what makes the pair worth running.
 
 **A1.3 — the pinned head buys reproducibility, not atomicity.** D6 pins a head so that a count and a
 subsequent read agree. It does not make the read a snapshot. A concurrent hard delete removes rows
@@ -357,6 +370,12 @@ matching on the wrong one.
     in one test, because the shapes are easy to conflate and only the pair shows they differ.
 19. An `unknown` outcome's `error` is byte-identical to the structured error the append layer
     produced, asserted by equality against the source value rather than by matching a message.
+20. **Arm 10's separating half, stated here because it amends arm 10 rather than adding to it.** A
+    kind is emitted while its carrier is durable, the configuration is then changed to make that kind
+    ephemeral, and one read over a window spanning both returns the stored rows AND lists the kind in
+    `coverage.ephemeral`. A second kind, ephemeral throughout, appears in `coverage.ephemeral` with no
+    rows, as the control in the same test. An implementation that treats `coverage.ephemeral` as
+    "empty by policy" passes the second and fails the first.
 
 ## References
 
