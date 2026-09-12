@@ -380,7 +380,10 @@ async fn the_echo_is_present_when_the_caller_named_no_zone() {
     // a reader still could not tell a deliberate anchor from a fallen-back one.
     let pack = pack(rt());
     let resp = pack
-        .dispatch("gtd.assign", json!({"title": "unzoned due", "due": "2026-06-01"}))
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "unzoned due", "due": "2026-06-01"}),
+        )
         .await
         .expect("a due with no timezone must still be accepted");
     let echoed = resp["due_timezone"]
