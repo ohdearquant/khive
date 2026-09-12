@@ -1,5 +1,7 @@
 //! Brain state persistence — snapshot upsert and namespace-scoped reload.
 
+use crate::sql::sql;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -268,7 +270,7 @@ async fn append_brain_event_on_writer(
 
     writer
         .execute(SqlStatement {
-            sql: "INSERT INTO brain_event_log (profile_id, namespace, event_kind, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
+            sql: sql!("brain_event_log_insert").into(),
             params: vec![
                 SqlValue::Text(profile_id.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -297,7 +299,7 @@ async fn upsert_snapshot_on_writer(
 
     writer
         .execute(SqlStatement {
-            sql: "INSERT INTO brain_profile_snapshots (profile_id, namespace, snapshot_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(profile_id, namespace) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at".into(),
+            sql: sql!("brain_profile_snapshot_upsert").into(),
             params: vec![
                 SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -787,7 +789,7 @@ async fn load_latest_snapshot_on_reader<R: SqlReader + ?Sized>(
 ) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT snapshot_json, updated_at FROM brain_profile_snapshots WHERE profile_id = ?1 AND namespace = ?2 ORDER BY updated_at DESC LIMIT 1".into(),
+            sql: sql!("brain_profile_snapshot_latest").into(),
             params: vec![
                 SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -832,8 +834,7 @@ async fn load_snapshot_version_on_reader<R: SqlReader + ?Sized>(
 ) -> Result<Option<i64>, RuntimeError> {
     let row = reader
         .query_scalar(SqlStatement {
-            sql: "SELECT updated_at FROM brain_profile_snapshots WHERE profile_id = ?1 AND namespace = ?2"
-                .into(),
+            sql: sql!("brain_profile_snapshot_version").into(),
             params: vec![
                 SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -1041,11 +1042,7 @@ async fn load_events_since_with_window(
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id, profile_id, event_kind, payload, created_at \
-                  FROM brain_event_log \
-                  WHERE namespace = ?1 AND created_at > ?2 \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("brain_event_log_since").into(),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(since_us),

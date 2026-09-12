@@ -187,19 +187,28 @@ pub(super) mod traverse_progress_seam {
     }
 }
 
+/// Memory-backed store with the substrate tables seeded.
+///
+/// The edge counts probe `entities`/`notes` for endpoint tombstones, so a database
+/// holding the graph DDL alone can no longer answer them. That shape is test-only:
+/// production applies one schema to one connection (`Backend::open`), and the guarded
+/// edge insert already reads those two tables.
+/// The graph DDL plus the minimal `entities`/`notes` tables the edge counts probe for
+/// endpoint tombstones, applied together because a database holding one without the other
+/// cannot answer those counts. That split is test-only: production applies one schema to
+/// one connection, and the guarded edge insert already reads both tables.
+fn apply_test_schema(conn: &rusqlite::Connection) {
+    conn.execute_batch(GRAPH_DDL).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+         CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+         CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY);",
+    )
+    .unwrap();
+}
+
 fn setup_memory_store() -> SqlGraphStore {
-    let config = PoolConfig {
-        path: None,
-        ..PoolConfig::default()
-    };
-    let pool = Arc::new(ConnectionPool::new(config).unwrap());
-
-    {
-        let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
-    }
-
-    SqlGraphStore::new_scoped(pool, false, "default")
+    setup_memory_store_with_substrates().1
 }
 
 /// File-backed store plus an attribution view unique to this test. Cleanup
@@ -218,7 +227,7 @@ fn setup_file_store_with_origin_view() -> (
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     let identity = match pool.origin() {
         khive_storage::tx_registry::TxOrigin::Database(identity) => identity,
@@ -242,15 +251,7 @@ fn setup_memory_store_with_substrates() -> (Arc<ConnectionPool>, SqlGraphStore) 
 
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
-        writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-            )
-            .unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
@@ -266,6 +267,44 @@ fn insert_live_entity(pool: &ConnectionPool, id: Uuid) {
             rusqlite::params![id.to_string()],
         )
         .unwrap();
+}
+
+fn soft_delete_entity(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    let changed = writer
+        .conn()
+        .execute(
+            "UPDATE entities SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![id.to_string(), Utc::now().timestamp_micros()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "soft delete must have tombstoned a row");
+}
+
+fn insert_note(pool: &ConnectionPool, id: Uuid, deleted: bool) {
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "INSERT INTO notes (id, deleted_at) VALUES (?1, ?2)",
+            rusqlite::params![
+                id.to_string(),
+                deleted.then(|| Utc::now().timestamp_micros())
+            ],
+        )
+        .unwrap();
+}
+
+fn soft_delete_note(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    let changed = writer
+        .conn()
+        .execute(
+            "UPDATE notes SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![id.to_string(), Utc::now().timestamp_micros()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "soft delete must have tombstoned a note row");
 }
 
 fn hard_delete_entity(pool: &ConnectionPool, id: Uuid) {
@@ -310,7 +349,7 @@ async fn edge_pages_run_when_sqlite_count_is_denied() {
     );
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     // Pooled-reader mode lets the authorizer below observe the exact
     // connection used by both the control count and the page queries.
@@ -732,15 +771,7 @@ async fn observed_batch_upsert_later_refusal_preserves_earlier_replacement() {
             );
             {
                 let writer = pool.writer().unwrap();
-                writer.conn().execute_batch(GRAPH_DDL).unwrap();
-                writer
-                    .conn()
-                    .execute_batch(
-                        "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-                    )
-                    .unwrap();
+                apply_test_schema(writer.conn());
             }
             let store = SqlGraphStore::new_scoped(Arc::clone(&pool), is_file_backed, "default");
             assert_eq!(
@@ -935,6 +966,108 @@ async fn test_count_edges() {
     assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 5);
 }
 
+/// A soft delete leaves incident edges in place, so an edge can outlive its endpoint. Every
+/// reader that walks the graph hydrates endpoints and cannot reach such an edge, so the
+/// counts must not report it either.
+///
+/// The fixture is built so that one plausible wrong implementation fails each arm: an
+/// implementation that ignores endpoints fails the drop; one that excludes an endpoint
+/// merely for being absent from `entities`/`notes` fails the ghost arm; one that checks
+/// only `source_id` fails the inbound arm; one that checks only entities fails the note
+/// arm. The live pair is the control, and it is read in the same pass that produces each
+/// absence.
+#[tokio::test]
+async fn edge_counts_skip_edges_whose_endpoint_is_tombstoned() {
+    let (pool, store) = setup_memory_store_with_substrates();
+
+    let (out_src, out_dst) = (Uuid::new_v4(), Uuid::new_v4());
+    let (in_src, in_dst) = (Uuid::new_v4(), Uuid::new_v4());
+    let (live_src, live_dst) = (Uuid::new_v4(), Uuid::new_v4());
+    for id in [out_src, out_dst, in_src, in_dst, live_src, live_dst] {
+        insert_live_entity(&pool, id);
+    }
+    let (note_live, note_doomed) = (Uuid::new_v4(), Uuid::new_v4());
+    insert_live_entity(&pool, note_live);
+    insert_note(&pool, note_doomed, false);
+    // Endpoints this database holds in neither table: a different substrate's ids. Absence
+    // is not a tombstone, so these stay counted.
+    let (ghost_a, ghost_b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    for edge in [
+        make_edge(out_src, out_dst, EdgeRelation::Contains, 1.0),
+        make_edge(in_src, in_dst, EdgeRelation::Contains, 1.0),
+        make_edge(live_src, live_dst, EdgeRelation::Contains, 1.0),
+        make_edge(note_doomed, note_live, EdgeRelation::Annotates, 1.0),
+        make_edge(ghost_a, ghost_b, EdgeRelation::DependsOn, 1.0),
+    ] {
+        store.upsert_edge(edge).await.unwrap();
+    }
+
+    let namespaces = vec!["default".to_string()];
+
+    assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 5);
+    let pre: HashMap<_, _> = store
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        pre.get(&EdgeRelation::Contains),
+        Some(&3),
+        "pre-state: all three entity-to-entity edges are counted"
+    );
+
+    // Outbound endpoint, then inbound endpoint, then a note endpoint. After each, the live
+    // pair and the ghost pair must still be there.
+    soft_delete_entity(&pool, out_src);
+    assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 4);
+
+    soft_delete_entity(&pool, in_dst);
+    assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 3);
+
+    soft_delete_note(&pool, note_doomed);
+    assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 2);
+
+    let by_relation: HashMap<_, _> = store
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        by_relation.get(&EdgeRelation::Contains),
+        Some(&1),
+        "only the live entity pair survives; got {by_relation:?}"
+    );
+    assert_eq!(
+        by_relation.get(&EdgeRelation::DependsOn),
+        Some(&1),
+        "an endpoint absent from both tables is not a tombstone; got {by_relation:?}"
+    );
+    assert_eq!(
+        by_relation.get(&EdgeRelation::Annotates),
+        None,
+        "the note endpoint's tombstone removes its edge; got {by_relation:?}"
+    );
+
+    // The namespace-scoped variants answer the same question and must agree.
+    assert_eq!(
+        store
+            .count_edges_in_namespaces(&namespaces, EdgeFilter::default())
+            .await
+            .unwrap(),
+        2
+    );
+    let scoped: HashMap<_, _> = store
+        .count_edges_by_relation_in_namespaces(&namespaces)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(scoped, by_relation, "scoped and unscoped counts must agree");
+}
+
 #[tokio::test]
 async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
     let config = PoolConfig {
@@ -942,11 +1075,7 @@ async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
     let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-b");
 
@@ -1023,11 +1152,7 @@ async fn query_edges_in_namespaces_offset_paging_exceeds_sqlite_variable_limit()
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-a");
     let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-b");
 
@@ -1097,11 +1222,7 @@ async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
 
     let mut edge_a1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
@@ -1976,7 +2097,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     let secondary_identity = match pool.origin() {
         khive_storage::tx_registry::TxOrigin::Database(id) => id,
@@ -4265,7 +4386,7 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
@@ -4323,7 +4444,7 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = Arc::new(SqlGraphStore::new_scoped(
@@ -4830,15 +4951,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
-        writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-            )
-            .unwrap();
+        apply_test_schema(writer.conn());
     }
     assert!(
         pool.writer_task_handle().unwrap().is_none(),
@@ -4978,7 +5091,7 @@ fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphS
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
         let now = Utc::now().timestamp_micros();
         for i in 0..good {
             writer

@@ -80,7 +80,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         category: VerbCategory::Commissive,
         params: &[
             ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "embed", param_type: "bool", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "boolean", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based).", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
@@ -176,7 +176,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "atomic",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Bulk path only. When true (default), all items succeed or \
                               none are written. When false, items are attempted individually \
@@ -185,7 +185,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "verbose",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Bulk path only. When true, the response includes the full \
                               entity objects in an `entities` array.",
@@ -217,7 +217,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "include_deleted",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description:
                     "If true, return soft-deleted entities (with deleted_at populated). Default false. \
@@ -431,14 +431,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "read",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Filter messages by read status (kind=\"message\" only): true = read, false = unread.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "delivered",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Filter messages by delivery status (kind=\"message\" only): true = delivered, false = undelivered (missing or null delivered_at).",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -468,7 +468,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         params: &[
             ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based).", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "embed", param_type: "bool", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "embed", param_type: "boolean", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
@@ -580,7 +580,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "hard",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "If true, permanently remove with edge cascade (default false = soft delete).",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -634,14 +634,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "dry_run",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "If true, return the planned summary without mutating records or emitting an event.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "force",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "If true, bypass entity merge safety guards; the caller accepts responsibility for the merge.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -706,7 +706,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "include_superseded",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -837,7 +837,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "resurrect",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Allow this singleton link to restore an existing soft-deleted \
                               natural-key edge (default false). Explicit restoration returns \
@@ -846,7 +846,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "verbose",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Bulk mode only. When true, include successfully written edges and \
                               each row's mutation (created | updated | resurrected) in an edges \
@@ -865,7 +865,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "atomic",
-                param_type: "bool",
+                param_type: "boolean",
                 required: false,
                 description: "Bulk mode only. When true (default), all entries succeed or none \
                               are written. When false, entries are attempted individually and \
@@ -1147,7 +1147,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
             ParamDef {
                 name: "reviewers",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Actor IDs requested as reviewers. Default: empty list.",
                 resolution_mode: IdResolutionMode::NotApplicable,

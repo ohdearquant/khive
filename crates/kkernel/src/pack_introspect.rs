@@ -230,6 +230,74 @@ mod tests {
         );
     }
 
+    /// The vocabulary is closed: one spelling per type, and the exact set is
+    /// written down here.
+    ///
+    /// The test above asks whether every spelling maps to something. This one
+    /// asks the harder question, whether the set is the one we meant, and it
+    /// fails in both directions. A new spelling shows up in `unexpected`; a
+    /// spelling that stops being declared shows up in `retired`. The second half
+    /// is the load-bearing one: without it a duplicate can be reintroduced the
+    /// moment someone renames the last site that used the survivor, which is how
+    /// two spellings of boolean came to live in the same verb.
+    ///
+    /// Five entries below are not scalar type names and are deliberately left
+    /// as they are rather than renamed into the list: `array` declares no element
+    /// type, `JSON value` declares no type at all, and `object or array of
+    /// object`, `string | array<string>` and `string|null` are unions. Each of
+    /// them needs a decision about the parameter rather than a rename, so they
+    /// are recorded as the remainder instead of being quietly regularised.
+    #[test]
+    #[serial]
+    fn the_param_type_vocabulary_is_closed_to_one_spelling_per_type() {
+        const DECLARED: &[&str] = &[
+            "JSON value",
+            "array",
+            "array of object",
+            "array of string",
+            "array of uuid",
+            "boolean",
+            "integer",
+            "number",
+            "object",
+            "object or array of object",
+            "string",
+            "string | array<string>",
+            "string|null",
+            "uuid",
+        ];
+
+        let (registry, _runtime) = build_registry().expect("introspection registry");
+        let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        let mut declared = 0usize;
+        for handler in registry.all_verbs() {
+            for param in handler.params {
+                declared += 1;
+                seen.insert(param.param_type);
+            }
+        }
+        assert!(
+            declared > 0,
+            "no parameters were declared anywhere: an empty population cannot \
+             certify a closed vocabulary"
+        );
+
+        let expected: std::collections::BTreeSet<&str> = DECLARED.iter().copied().collect();
+        let unexpected: Vec<&str> = seen.difference(&expected).copied().collect();
+        let retired: Vec<&str> = expected.difference(&seen).copied().collect();
+        assert!(
+            unexpected.is_empty(),
+            "undeclared parameter type spellings are in use (of {declared} declarations): \
+             {unexpected:?}. Add the spelling to DECLARED only after checking it is not \
+             another way to write one already there"
+        );
+        assert!(
+            retired.is_empty(),
+            "DECLARED lists spellings nothing declares any more: {retired:?}. Remove them \
+             here and from the schema map, so the map stays total over what exists"
+        );
+    }
+
     /// A derived schema must not reject a call the dispatcher accepts.
     ///
     /// `help` is accepted on every verb and `namespace` is resolved for every
