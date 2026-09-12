@@ -427,7 +427,7 @@ sentence:
    have may ship as a component compiled to WebAssembly, loaded and driven by the native
    binary.
 
-The two are consistent because every blocker listed above is about the kernel's hot path.
+The two are consistent because every constraint listed above is about the kernel's hot path.
 Trigram indexing, vector search and embedding inference stay native and in-process. A guest
 component does not run that path. It runs its own work, pays guest cost for its own work
 only, and reaches the host solely through typed imports the host grants.
