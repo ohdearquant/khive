@@ -1047,6 +1047,70 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     Value::Object(out)
 }
 
+/// Name a JSON value's type the way a caller's schema names it.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Refuse a value for a parameter this pack declares as an object.
+///
+/// `param_type` is a promise to the caller and nothing was checking it. It is
+/// rendered into the JSON schema handed to a model and then never compared
+/// against the argument that arrives, so `properties: "not-an-object"` was
+/// accepted and persisted, and every later reader found a string where the
+/// schema said map. For an agent that is worse than a refusal: a success
+/// return gives it nothing to correct on, so it proceeds believing the write
+/// landed in the shape it intended.
+///
+/// Absent and explicit null are not type errors. Null is how a caller clears
+/// the field on the update path, and absent means unchanged.
+pub(crate) fn require_object_param(value: Option<&Value>, param: &str) -> Result<(), RuntimeError> {
+    match value {
+        None | Some(Value::Null) | Some(Value::Object(_)) => Ok(()),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{param} must be an object; got {}",
+            json_type_name(other)
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod param_contract_tests {
+    use super::*;
+
+    #[test]
+    fn an_object_parameter_refuses_every_non_object_and_names_what_it_got() {
+        // The shape that was accepted and persisted.
+        let err = require_object_param(Some(&json!("not-an-object")), "properties")
+            .expect_err("a string is not an object");
+        let message = err.to_string();
+        assert!(message.contains("properties"), "{message}");
+        assert!(message.contains("string"), "names what arrived: {message}");
+
+        // An array is the near miss a caller is most likely to send next, so it
+        // must be refused by type rather than by a map-specific probe.
+        assert!(require_object_param(Some(&json!([1, 2])), "properties").is_err());
+        assert!(require_object_param(Some(&json!(7)), "properties").is_err());
+        assert!(require_object_param(Some(&json!(true)), "properties").is_err());
+    }
+
+    #[test]
+    fn absent_and_explicit_null_are_not_type_errors() {
+        // Absent means unchanged and null is how the update path clears a field;
+        // an implementation that refuses anything that is not an object breaks both.
+        require_object_param(None, "properties").expect("absent is allowed");
+        require_object_param(Some(&Value::Null), "properties").expect("null is allowed");
+        require_object_param(Some(&json!({"a": 1})), "properties").expect("an object is allowed");
+    }
+}
+
 #[cfg(test)]
 mod note_projection_tests {
     use super::*;
