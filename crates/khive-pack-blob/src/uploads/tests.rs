@@ -715,7 +715,27 @@ async fn read_only_runtime_refuses_every_upload_operation_without_mutation() {
         packs: vec!["kg".into()],
         ..RuntimeConfig::no_embeddings()
     };
-    drop(KhiveRuntime::new(config.clone()).unwrap());
+    let writable = KhiveRuntime::new(config.clone()).unwrap();
+    let pool = writable.backend().pool_arc();
+    // This constructor only prepares the schema synchronously and has no
+    // embedding models to register. Prove that no standalone writer task
+    // was spawned and no pool owner survives, rather than assuming drop
+    // settles arbitrary runtime clones or detached writer tasks.
+    assert!(!pool.writer_task_join_was_stored());
+    let pool_lifetime = Arc::downgrade(&pool);
+    drop(pool);
+    drop(writable);
+    assert!(pool_lifetime.upgrade().is_none());
+
+    // The pool drops its writer before its readers, so closed connections
+    // can still leave WAL sidecars. Let SQLite checkpoint and settle them
+    // on one explicitly closed connection; never unlink uncheckpointed WAL.
+    let settled = rusqlite::Connection::open(config.db_path.as_ref().unwrap()).unwrap();
+    let mode: String = settled
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    settled.close().unwrap();
     let runtime = KhiveRuntime::new_readonly(config).unwrap();
     assert!(runtime.is_read_only());
     let mut readonly = manager_with_store(runtime, f.store.clone());
