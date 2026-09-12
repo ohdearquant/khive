@@ -20,6 +20,7 @@ use super::common::{
     parse_event_kind, parse_event_outcome, parse_event_substrate, remap_note_status,
     resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json, GetParams,
 };
+use crate::sql::sql;
 use crate::KgPack;
 
 impl KgPack {
@@ -283,11 +284,7 @@ impl KgPack {
         let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
         let row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                      payload_schema_version, profile_state_version, duration_us, target_id, \
-                      session_id, aggregate_kind, aggregate_id, created_at \
-                      FROM events WHERE id = ?1 LIMIT 1"
-                    .to_string(),
+                sql: sql!("events_find_by_id").to_string(),
                 params: vec![SqlValue::Text(id.to_string())],
                 label: Some("events.get_unfiltered_by_id".into()),
             })
@@ -343,17 +340,13 @@ impl KgPack {
 
         let (sql_str, params) = if Uuid::from_str(raw_id).is_ok() {
             (
-                "SELECT proposal_id FROM proposals_open \
-                 WHERE proposal_id = ?1 AND namespace = ?2 LIMIT 1"
-                    .to_string(),
+                sql!("proposals_find_by_id").to_string(),
                 vec![SqlValue::Text(raw_id.to_string()), SqlValue::Text(ns)],
             )
         } else if raw_id.len() >= 8 && raw_id.chars().all(|c| c.is_ascii_hexdigit()) {
             let pattern = format!("{}%", hex_prefix_to_uuid_pattern(raw_id));
             (
-                "SELECT proposal_id FROM proposals_open \
-                 WHERE proposal_id LIKE ?1 AND namespace = ?2 LIMIT 2"
-                    .to_string(),
+                sql!("proposals_find_by_prefix").to_string(),
                 vec![SqlValue::Text(pattern), SqlValue::Text(ns)],
             )
         } else {

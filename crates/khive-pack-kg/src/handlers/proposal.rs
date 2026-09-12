@@ -17,6 +17,7 @@ use super::common::{
     deser, to_json, ListProposalsParams, ProposeParams, ReviewParams, WithdrawParams,
 };
 use crate::apply_worker::has_multi_step_compound;
+use crate::sql::sql;
 use crate::KgPack;
 
 use khive_runtime::micros_to_iso;
@@ -39,9 +40,7 @@ impl KgPack {
             let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
             let rows = reader
                 .query_all(SqlStatement {
-                    sql: "SELECT proposal_id FROM proposals_open \
-                          WHERE proposal_id LIKE ?1 AND namespace = ?2 LIMIT 2"
-                        .to_string(),
+                    sql: sql!("proposals_find_by_prefix").to_string(),
                     params: vec![SqlValue::Text(pattern), SqlValue::Text(ns)],
                     label: Some("proposals_open.resolve_prefix".into()),
                 })
@@ -161,9 +160,7 @@ impl KgPack {
             let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
             let parent_row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT status FROM proposals_open \
-                          WHERE proposal_id = ?1 AND namespace = ?2"
-                        .to_string(),
+                    sql: sql!("proposals_read_parent_status").to_string(),
                     params: vec![
                         SqlValue::Text(parent_uuid.to_string()),
                         SqlValue::Text(ns.clone()),
@@ -255,9 +252,7 @@ impl KgPack {
 
         let row = reader
             .query_row(SqlStatement {
-                sql: "SELECT proposer, status FROM proposals_open \
-                      WHERE proposal_id = ?1 AND namespace = ?2"
-                    .to_string(),
+                sql: sql!("proposals_read_proposer_status").to_string(),
                 params: vec![
                     SqlValue::Text(proposal_id.to_string()),
                     SqlValue::Text(ns.clone()),
@@ -389,9 +384,7 @@ impl KgPack {
 
         let row = reader
             .query_row(SqlStatement {
-                sql: "SELECT proposer, status FROM proposals_open \
-                      WHERE proposal_id = ?1 AND namespace = ?2"
-                    .to_string(),
+                sql: sql!("proposals_read_proposer_status").to_string(),
                 params: vec![
                     SqlValue::Text(proposal_id.to_string()),
                     SqlValue::Text(ns.clone()),
@@ -496,55 +489,41 @@ impl KgPack {
         let limit = i64::from(effective);
         let offset = p.offset.unwrap_or(0) as i64;
 
-        let mut sql_str = "\
-            SELECT proposal_id, proposer, title, status, created_at, updated_at, \
-                   expiry, last_decision, review_count, approve_count, reject_count \
-            FROM proposals_open \
-            WHERE namespace = ?1"
-            .to_string();
-        let mut sql_params: Vec<SqlValue> = vec![SqlValue::Text(ns)];
-        let mut param_idx = 2usize;
-
-        if let Some(status) = &p.status {
-            sql_str.push_str(&format!(" AND status = ?{param_idx}"));
-            sql_params.push(SqlValue::Text(status.clone()));
-            param_idx += 1;
-        }
-
-        if let Some(proposer) = &p.proposer {
-            sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
-            sql_params.push(SqlValue::Text(proposer.clone()));
-            param_idx += 1;
+        let proposer_filter = if let Some(proposer) = &p.proposer {
+            Some(proposer.clone())
         } else {
             let actor_filter = p
                 .actor
                 .as_deref()
                 .unwrap_or_else(|| token.actor().id.as_str());
             if actor_filter != "*" {
-                sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
-                sql_params.push(SqlValue::Text(actor_filter.to_owned()));
-                param_idx += 1;
+                Some(actor_filter.to_owned())
+            } else {
+                None
             }
-        }
+        };
 
-        sql_str.push_str(&format!(
-            // #1671: `proposal_id` tiebreak makes the offset page order a
-            // deterministic total order across rows that share an
-            // `updated_at` timestamp. Offset paging can still duplicate or
-            // skip rows under concurrent inserts/deletes/updates — the
-            // tiebreak only removes tie-order instability, same caveat as
-            // the entity/graph/note sweeps.
-            " ORDER BY updated_at DESC, proposal_id DESC LIMIT ?{param_idx} OFFSET ?{}",
-            param_idx + 1
-        ));
-        sql_params.push(SqlValue::Integer(limit));
-        sql_params.push(SqlValue::Integer(offset));
+        // #1671: `proposal_id` tiebreak makes the offset page order a
+        // deterministic total order across rows that share an
+        // `updated_at` timestamp. Offset paging can still duplicate or
+        // skip rows under concurrent inserts/deletes/updates — the
+        // tiebreak only removes tie-order instability, same caveat as
+        // the entity/graph/note sweeps.
+        let sql_params = vec![
+            SqlValue::Text(ns),
+            p.status.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+            proposer_filter
+                .map(SqlValue::Text)
+                .unwrap_or(SqlValue::Null),
+            SqlValue::Integer(limit),
+            SqlValue::Integer(offset),
+        ];
 
         let sql = self.runtime.sql();
         let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
         let rows = reader
             .query_all(SqlStatement {
-                sql: sql_str,
+                sql: sql!("proposals_list").to_string(),
                 params: sql_params,
                 label: Some("proposals_open.list".into()),
             })
