@@ -96,10 +96,10 @@ impl KgPack {
         }
 
         // Secret gate: scan all caller-supplied text before constructing/appending events.
-        khive_runtime::secret_gate::check(&p.title)?;
-        khive_runtime::secret_gate::check(&p.description)?;
-        khive_runtime::secret_gate::check_tags(&p.reviewers)?;
-        khive_runtime::secret_gate::check_json(&p.changeset)?;
+        khive_runtime::secret_gate::check_at(&p.title, "proposal", "title")?;
+        khive_runtime::secret_gate::check_at(&p.description, "proposal", "description")?;
+        khive_runtime::secret_gate::check_tags_at(&p.reviewers, "proposal", "reviewers")?;
+        khive_runtime::secret_gate::check_json_at(&p.changeset, "proposal", "changeset")?;
 
         // Error-shape split: only identifier-validation failures carry the
         // full-UUID hint. Detection matches on Id128's OWN ParseIdError
@@ -308,7 +308,7 @@ impl KgPack {
 
         // Secret gate: scan caller-supplied comment before constructing/appending events.
         if let Some(ref c) = p.comment {
-            khive_runtime::secret_gate::check(c)?;
+            khive_runtime::secret_gate::check_at(c, "review", "comment")?;
         }
 
         let payload = ProposalReviewedPayload {
@@ -439,7 +439,7 @@ impl KgPack {
 
         // Secret gate: scan rationale before constructing the event payload.
         if let Some(ref rationale) = p.rationale {
-            khive_runtime::secret_gate::check(rationale)?;
+            khive_runtime::secret_gate::check_at(rationale, "proposal", "rationale")?;
         }
 
         let payload = ProposalWithdrawnPayload {

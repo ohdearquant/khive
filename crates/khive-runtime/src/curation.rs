@@ -902,16 +902,16 @@ impl KhiveRuntime {
             crate::secret_gate::reject_reserved_secret_gate_property(Some(&removals))?;
         }
         if let Some(ref name) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "entity", "name")?;
         }
         if let Some(Some(ref desc)) = patch.description {
-            crate::secret_gate::check(desc)?;
+            crate::secret_gate::check_at(desc, "entity", "description")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "entity", "properties")?;
         }
         if let Some(ref tags) = patch.tags {
-            crate::secret_gate::check_tags(tags)?;
+            crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
         }
         let store = self.entities(token)?;
         let mut entity = store.get_entity(id).await?.ok_or_else(|| {
@@ -1248,7 +1248,7 @@ impl KhiveRuntime {
         validation: EntityMergeValidation,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -1626,13 +1626,13 @@ impl KhiveRuntime {
         }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
-            crate::secret_gate::check(content)?;
+            crate::secret_gate::check_at(content, "note", "content")?;
         }
         if let Some(Some(ref name)) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "note", "name")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "note", "properties")?;
         }
 
         reject_pack_managed_schedule_mutation(&note, "update")?;
@@ -2107,9 +2107,13 @@ impl KhiveRuntime {
             ));
         }
 
-        crate::secret_gate::check_json(&serde_json::json!({
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "last_error": &last_error,
+            }),
+            "message",
+            "last_error",
+        )?;
 
         let snapshot = self.outbound_message(token, id).await?;
         let props = snapshot.properties.as_ref().and_then(Value::as_object);
@@ -2174,10 +2178,14 @@ impl KhiveRuntime {
         delivered_at: String,
         transport_message_id: Option<String>,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "delivered_at": &delivered_at,
-            "transport_message_id": &transport_message_id,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "delivered_at": &delivered_at,
+                "transport_message_id": &transport_message_id,
+            }),
+            "message",
+            "delivery",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2219,10 +2227,14 @@ impl KhiveRuntime {
         failed_at: String,
         last_error: String,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "failed_at": &failed_at,
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "failed_at": &failed_at,
+                "last_error": &last_error,
+            }),
+            "message",
+            "delivery",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2290,7 +2302,7 @@ impl KhiveRuntime {
         reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(

@@ -2560,10 +2560,10 @@ pub(crate) async fn handle_heartbeat(
         _ => unreachable!("outcome already validated above"),
     }
 
-    khive_runtime::secret_gate::check_json(&props)?;
+    khive_runtime::secret_gate::check_json_at(&props, "channel", "properties")?;
 
     let content = format!("channel heartbeat: {}:{}", p.channel_kind, p.channel_slug);
-    khive_runtime::secret_gate::check(&content)?;
+    khive_runtime::secret_gate::check_at(&content, "channel", "content")?;
 
     let created_at = existing
         .as_ref()

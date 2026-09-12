@@ -63,8 +63,11 @@ pub struct SecretMatch {
     pub trigger: Option<&'static str>,
     /// `first6...N` — the first 6 chars of the match followed by the total length.
     pub masked: String,
-    /// Which record and field the match came from, when the caller scanned a
-    /// batch. `None` for a single-record scan, where the caller already knows.
+    /// Which record and field the match came from. `None` only where the
+    /// caller scanned exactly one string and nothing else, so there is one
+    /// candidate. A single-record verb that scans several fields still needs
+    /// this: the writer sees one refusal and cannot tell whether it was the
+    /// name, the content, a tag or a property that matched.
     pub location: Option<String>,
 }
 
@@ -138,7 +141,7 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
     Ok(())
 }
 
-/// Name the record and field a batch-loop refusal came from.
+/// Name the scope and field a refusal came from.
 ///
 /// A batch verb scans each record and returns on the first refusal, so the
 /// caller gets ONE error for N records. Without this the error names only the
@@ -146,6 +149,10 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
 /// in whichever sibling record refused, and every other record in the call is
 /// rejected with it (khive #2605). Pass through anything that is not a gate
 /// refusal unchanged — this adds identity, it does not reclassify.
+///
+/// `scope` is a record label for a batch (`notes[2]`) and the verb for a
+/// single-record write (`comm.send`). Both answer the same question, which is
+/// where in the submitted payload the writer should look.
 pub fn locate<T>(result: RuntimeResult<T>, record: &str, field: &str) -> RuntimeResult<T> {
     result.map_err(|error| match error {
         RuntimeError::SecretDetected(matched) => RuntimeError::SecretDetected(SecretMatch {
@@ -154,6 +161,23 @@ pub fn locate<T>(result: RuntimeResult<T>, record: &str, field: &str) -> Runtime
         }),
         other => other,
     })
+}
+
+/// `check` that names where it looked. `scope` is the verb for a single-record
+/// write, a record label inside a batch.
+pub fn check_at(content: &str, scope: &str, field: &str) -> RuntimeResult<()> {
+    locate(check(content), scope, field)
+}
+
+/// `check_json` that names where it looked. The location is the field holding
+/// the JSON, not the path of the string leaf that matched inside it.
+pub fn check_json_at(value: &serde_json::Value, scope: &str, field: &str) -> RuntimeResult<()> {
+    locate(check_json(value), scope, field)
+}
+
+/// `check_tags` that names where it looked.
+pub fn check_tags_at(tags: &[String], scope: &str, field: &str) -> RuntimeResult<()> {
+    locate(check_tags(tags), scope, field)
 }
 
 // ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────

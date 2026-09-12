@@ -1492,14 +1492,14 @@ impl KhiveRuntime {
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan name, description, structured properties, and tags.
-        crate::secret_gate::check(name)?;
+        crate::secret_gate::check_at(name, "entity", "name")?;
         if let Some(d) = description {
-            crate::secret_gate::check(d)?;
+            crate::secret_gate::check_at(d, "entity", "description")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "entity", "properties")?;
         }
-        crate::secret_gate::check_tags(&tags)?;
+        crate::secret_gate::check_tags_at(&tags, "entity", "tags")?;
         let ns = token.namespace().as_str();
         let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
@@ -3502,12 +3502,12 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check(content)?;
+        crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
-            crate::secret_gate::check(n)?;
+            crate::secret_gate::check_at(n, "note", "name")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "note", "properties")?;
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3635,12 +3635,12 @@ impl KhiveRuntime {
         let properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan content, optional name, and structured properties.
-        crate::secret_gate::check(content)?;
+        crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
-            crate::secret_gate::check(n)?;
+            crate::secret_gate::check_at(n, "note", "name")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "note", "properties")?;
         }
         // `embedding_content` is a caller-supplied alternate vector-embedding
         // input: it must be a non-empty proper prefix of `content` (never a
@@ -3658,7 +3658,7 @@ impl KhiveRuntime {
                     "embedding_content must be a proper prefix of content".into(),
                 ));
             }
-            crate::secret_gate::check(ec)?;
+            crate::secret_gate::check_at(ec, "note", "embedding_content")?;
         }
         let ns = token.namespace().as_str();
 
@@ -6333,7 +6333,8 @@ impl KhiveRuntime {
         // Includes entity-type validation via the pack-installed validator when available.
         // Any validation failure here guarantees zero rows are written.
         let mut entities = Vec::with_capacity(specs.len());
-        for spec in &specs {
+        for (index, spec) in specs.iter().enumerate() {
+            let record = format!("entity[{index}]");
             self.validate_entity_kind(&spec.kind)?;
             // Validate entity_type at the runtime layer via pack-installed callback.
             // When no validator is installed (bare runtime, unit tests without packs),
@@ -6345,14 +6346,14 @@ impl KhiveRuntime {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
             crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
-            crate::secret_gate::check(&spec.name)?;
+            crate::secret_gate::check_at(&spec.name, &record, "name")?;
             if let Some(d) = &spec.description {
-                crate::secret_gate::check(d)?;
+                crate::secret_gate::check_at(d, &record, "description")?;
             }
             if let Some(ref p) = spec.properties {
-                crate::secret_gate::check_json(p)?;
+                crate::secret_gate::check_json_at(p, &record, "properties")?;
             }
-            crate::secret_gate::check_tags(&spec.tags)?;
+            crate::secret_gate::check_tags_at(&spec.tags, &record, "tags")?;
 
             let mut entity =
                 Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
@@ -13475,6 +13476,106 @@ mod tests {
     }
 
     // entity_type validated at runtime layer when validator is installed.
+    /// A gate refusal has to name the field it fired on, and the arms differ only in
+    /// WHICH field carries the credential-shaped token. An implementation that named a
+    /// constant location, or named the record and not the field, fails both arms; one
+    /// that named the field and not the batch position fails the first.
+    #[tokio::test]
+    async fn create_many_secret_refusal_names_the_record_and_field() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let token_span = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let clean = |name: &str| EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: None,
+            name: name.into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        };
+
+        let err = rt
+            .create_many(&tok, vec![clean("FirstIsClean"), clean(token_span)])
+            .await
+            .expect_err("a credential-shaped name must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("entity[1].name"),
+            "the refusal must name the offending record and field"
+        );
+
+        let mut second = clean("SecondIsClean");
+        second.description = Some(format!("{token_span} sitting in a description"));
+        let err = rt
+            .create_many(&tok, vec![clean("FirstIsClean"), second])
+            .await
+            .expect_err("a credential-shaped description must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("entity[1].description"),
+            "same record, different field: the field half of the location must move"
+        );
+
+        let count = rt.count_entities(&tok, None).await.unwrap();
+        assert_eq!(count, 0, "a rejected batch must leave no entity behind");
+    }
+
+    /// The single-record path needs this as much as the batch path: one write, several
+    /// scanned fields, and before this the writer was told only that something in the
+    /// payload matched.
+    #[tokio::test]
+    async fn create_note_secret_refusal_names_the_field() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let token_span = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                Some(token_span),
+                "content with nothing credential-shaped in it",
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("a credential-shaped name must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(matched.location.as_deref(), Some("note.name"));
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                Some("a clean name"),
+                &format!("{token_span} sitting in the content"),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("a credential-shaped content must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("note.content"),
+            "the location must follow the field that actually matched"
+        );
+    }
+
     #[tokio::test]
     async fn create_many_rejects_unknown_entity_type_when_validator_installed() {
         let rt = rt();
