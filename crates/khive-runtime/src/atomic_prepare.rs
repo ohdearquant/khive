@@ -641,7 +641,7 @@ pub async fn prepare_add_note(
 /// Mirrors `khive-pack-kg::handlers::update::reject_inapplicable_fields`: a
 /// hard `InvalidInput` when a caller passes a field that does not apply to
 /// the resolved substrate (e.g. `salience` on an entity, or
-/// `description`/`tags` on a note). That function has no dependency edge
+/// `description` on a note). That function has no dependency edge
 /// back to `khive-runtime`, so its exact field-applicability check list and
 /// error message shape are reimplemented here rather than imported: same
 /// pattern as `optional_string_patch` above. Presence is checked directly on
@@ -680,8 +680,6 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
         "note" => {
             let bad = if present("description") {
                 Some("description")
-            } else if present("tags") {
-                Some("tags")
             } else if present("relation") {
                 Some("relation")
             } else if present("weight") {
@@ -693,7 +691,10 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
             } else {
                 None
             };
-            (bad, "name, content, salience, decay_factor, properties")
+            (
+                bad,
+                "name, content, salience, decay_factor, properties, tags",
+            )
         }
         // `update` admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`, so
         // this arm must reject entity/note-only fields (e.g. `name`) on an
@@ -789,6 +790,9 @@ async fn prepare_note_update_plan_from_snapshot(
     validate_note_update_expected_kind(&note, expected_kind)?;
 
     reject_inapplicable_update_fields(args, "note")?;
+    let mut normalized_args = args.clone();
+    crate::curation::normalize_note_update_tags(&mut normalized_args)?;
+    let args = &normalized_args;
     let name = optional_string_patch(args, "name")?;
     let content = optional_str(args, "content").map(str::to_string);
     let properties = optional_properties(args, "properties")?;
@@ -2160,9 +2164,8 @@ mod tests {
         assert_eq!(updated.tags, vec!["keep-tag"]);
     }
 
-    /// Symmetric note-substrate case: `description` and `tags` are
-    /// entity-only fields; passing either for a note must be rejected the
-    /// same way update.rs rejects them.
+    /// Symmetric note-substrate case: `description` is entity-only and
+    /// must be rejected the same way update.rs rejects it.
     #[tokio::test]
     async fn atomic_update_note_rejects_entity_only_field_description() {
         let runtime = scratch_runtime();
@@ -2208,6 +2211,190 @@ mod tests {
             outcome,
             crate::atomic_runner::AtomicRunOutcome::Committed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn atomic_update_note_tags_replace_preserve_clear_and_override_nested_tags() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "tagged note");
+        note.properties = Some(json!({"tags": ["old"], "keep": {"value": 1}}));
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        for (mut args, expected_tags) in [
+            (
+                json!({"tags": ["new", "shared"], "properties": {"tags": ["nested"], "added": true}}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"name": "renamed note", "properties": {"omitted": true}}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"tags": null, "properties": null}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"tags": [], "properties": {"tags": ["nested-after-clear"]}}),
+                json!([]),
+            ),
+            (
+                json!({"tags": ["after-null-properties"], "properties": null}),
+                json!(["after-null-properties"]),
+            ),
+        ] {
+            args["id"] = json!(note_id.to_string());
+            let original_args = args.clone();
+            let plan = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect("valid atomic note tags patch");
+            assert_eq!(
+                args, original_args,
+                "preparation must not mutate caller args"
+            );
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("atomic note update");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+            let updated = runtime
+                .notes(&token)
+                .expect("notes store")
+                .get_note(note_id)
+                .await
+                .expect("read note")
+                .expect("note exists");
+            let properties = updated.properties.expect("note properties");
+            assert_eq!(properties["tags"], expected_tags);
+            assert_eq!(properties["keep"], json!({"value": 1}));
+            assert_eq!(properties["added"], json!(true));
+            assert_eq!(updated.content, "tagged note");
+            if original_args.get("name").is_some() {
+                assert_eq!(updated.name.as_deref(), Some("renamed note"));
+                assert_eq!(properties["omitted"], json!(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_update_entity_tags_keep_replace_preserve_and_clear_semantics() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "tagged entity");
+        entity.tags = vec!["old".to_string()];
+        entity.properties = Some(json!({"keep": true}));
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+        for (mut args, expected_tags) in [
+            (json!({"tags": ["new", "shared"]}), json!(["new", "shared"])),
+            (json!({"name": "renamed entity"}), json!(["new", "shared"])),
+            (json!({"tags": null}), json!(["new", "shared"])),
+            (json!({"tags": []}), json!([])),
+        ] {
+            args["id"] = json!(entity_id.to_string());
+            let plan = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect("valid atomic entity tags patch");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("atomic entity update");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+            let updated = runtime
+                .get_entity(&token, entity_id)
+                .await
+                .expect("read entity");
+            assert_eq!(json!(updated.tags), expected_tags);
+            assert_eq!(updated.properties, Some(json!({"keep": true})));
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_update_note_invalid_tags_leave_snapshot_unchanged() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "unchanged note");
+        note.properties = Some(json!({"tags": ["keep"], "other": true}));
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+        let before = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note exists");
+
+        for (mut args, expected_error) in [
+            (
+                json!({"tags": "invalid"}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": ["valid", 1]}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": {"nested": true}}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": ["valid"], "properties": []}),
+                "properties must be an object",
+            ),
+            (
+                json!({"tags": [], "properties": "invalid"}),
+                "properties must be an object",
+            ),
+            (
+                json!({"tags": "invalid", "description": "entity field"}),
+                "field 'description' is not valid for a note",
+            ),
+        ] {
+            args["id"] = json!(note_id.to_string());
+            args["content"] = json!("must not persist");
+            let error = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect_err("invalid tags patch must not produce a plan");
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(ref message) if message.contains(expected_error)),
+                "unexpected error: {error:?}"
+            );
+            let after = runtime
+                .notes(&token)
+                .expect("notes store")
+                .get_note(note_id)
+                .await
+                .expect("read note")
+                .expect("note exists");
+            assert_eq!(after, before);
+        }
     }
 
     /// Updating a note's content inside an atomic unit must, after commit,

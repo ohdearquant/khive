@@ -72,8 +72,6 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
         KindSpec::Note { .. } => {
             let bad = if p.description.is_some() {
                 Some("description")
-            } else if p.tags.is_some() {
-                Some("tags")
             } else if p.relation.is_some() {
                 Some("relation")
             } else if p.weight.is_some() {
@@ -83,7 +81,10 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             } else {
                 None
             };
-            (bad, "name, content, salience, decay_factor, properties")
+            (
+                bad,
+                "name, content, salience, decay_factor, properties, tags",
+            )
         }
         KindSpec::Edge => {
             let bad = if p.name.is_some() {
