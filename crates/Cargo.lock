@@ -2156,6 +2156,7 @@ dependencies = [
  "blake3",
  "inventory",
  "khive-db",
+ "khive-request",
  "khive-runtime",
  "khive-storage",
  "khive-types",
@@ -2163,6 +2164,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

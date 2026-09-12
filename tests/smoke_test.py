@@ -287,7 +287,7 @@ def main():
         # `kkernel code-ingest` admin CLI, never this MCP verb surface);
         # workspace (#873) contributes zero verbs, adding only the
         # `workspace` entity kind and `contains` endpoint rules; blob
-        # contributes three verbs (blob.put / blob.get / blob.stat, ADR-111)
+        # contributes seven verbs (put/get/stat and begin/put_part/commit/abort, ADR-173)
         # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # The kg pack also carries its one documented sub-namespace,
@@ -300,8 +300,8 @@ def main():
         # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 129, (
-            f"expected 129 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 133, (
+            f"expected 133 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -313,7 +313,7 @@ def main():
             f"git.commit/git.branch/git.push (ADR-108); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs; "
-            f"blob contributes blob.put/blob.get/blob.stat per ADR-111; "
+            f"blob contributes put/get/stat and begin/put_part/commit/abort per ADR-173; "
             f"brain.mark_turn is the per-actor work-unit marker; "
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "

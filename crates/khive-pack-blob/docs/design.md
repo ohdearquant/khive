@@ -2,17 +2,20 @@
 
 ## Purpose
 
-`khive-pack-blob` exposes the runtime's installed content-addressed blob service through three MCP
-verbs: `blob.put`, `blob.get`, and `blob.stat`. It is a thin wire adapter over `BlobStore` and
+`khive-pack-blob` exposes the runtime's installed content-addressed blob service through seven MCP
+verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob.commit` and
+`blob.abort`. It adapts `BlobStore` and
 `BlobHydrator`; it does not implement a storage backend, schema, or graph vocabulary.
 
 ## Key types and modules
 
-- `BlobPack` holds the `KhiveRuntime` used to resolve the installed store and shared hydrator.
-- `pack.rs` declares the three agent-visible verbs, inventory-registers the factory, and dispatches
+- `BlobPack` holds the runtime and one shared upload manager. The daemon obtains that same
+  manager from the registered pack instance; constructing another pack would lose the upload map.
+- `pack.rs` declares the seven agent-visible verbs, inventory-registers the factory, and dispatches
   calls to `handlers.rs`.
 - `handlers.rs` validates base64 payloads, strict content references and optional ranges, enforces
   memory/wire bounds, and shapes verb responses.
+- `uploads.rs` owns sequential part accounting, incremental hashing, tail retries and expiry.
 - `ContentRef` is the canonical lowercase-hex BLAKE3 identity supplied by `khive-storage`.
 - `vocab.rs` contributes no entity or note kinds; typed artifact/reference modeling is a separate
   layer.
@@ -39,5 +42,39 @@ verbs: `blob.put`, `blob.get`, and `blob.stat`. It is a thin wire adapter over `
   verification because it never reads the content.
 - `blob.put` is unavailable on a read-only runtime. Reads remain available when a store is
   installed.
-- Physical deletion and orphan sweeping remain administrator-only operations and are not pack
-  verbs.
+- Deleting committed objects and sweeping unreferenced committed objects remain administrator-only
+  operations. Upload abort and expiry remove only staging.
+
+## Staged uploads
+
+`blob.begin(size, content_ref?)` returns `{upload_id, part_limit, next_index}`. If the
+optional reference already exists, it returns `{content_ref, size}` without creating
+staging. `blob.put_part(upload_id, index, bytes)` accepts base64 parts in order and
+returns `{next_index, received_bytes}`. The returned `part_limit` derives from the
+live request-parser and frame caps, minus an 8192-byte request reserve, scaled by 3/4.
+
+An identical resend of the last part is acknowledged without changing bytes, hash,
+index or activity time. An altered tail retry aborts the upload. Crossing declared
+size also aborts. A successful append records activity from before backend I/O,
+so a slow sync cannot make the pack clock newer than an already expiring stage.
+Cancelled or failed backend writes invalidate the record; cleanup failures retain
+an unusable record for the next sweep to retry.
+
+`blob.commit(upload_id)` requires exactly the declared length, verifies an optional
+expected reference, and calls the backend's shared publication routine. It returns
+`{content_ref, size}` and consumes the id. `blob.abort(upload_id)` removes staging
+and returns `{aborted: true}`; unknown or consumed ids report unknown upload.
+
+The four upload verbs are Declaration verbs; existing `blob.put` remains Commissive.
+All mutations refuse on a read-only runtime. Upload ids are capabilities: the
+originating actor is retained for attribution, not an ownership restriction.
+There is no upload journal and a restarted daemon answers unknown upload.
+
+Only the daemon starts the upload sweep component. Each tick expires pack records
+and calls backend `sweep_uploads` for orphan staging, using the same idle policy as
+the verbs. Failures warn and retry on the next tick. The component joins the existing
+daemon cancellation and drain path. `KHIVE_BLOB_UPLOAD_IDLE_SECS` defaults to 3600;
+`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS` defaults to 600. Both accept positive integer
+seconds; invalid values use the default with a warning. The first tick is delayed
+by the interval. The filesystem stages below `.uploads/`, which object GC ignores.
+Backends without staged-upload support return Unsupported from the storage contract.
