@@ -184,6 +184,176 @@ fn secret_gate_refusal_has_stable_token_and_json_reason() {
         .is_some_and(|error| error.contains("write blocked")));
 }
 
+struct StreamPolicyOutputs {
+    ordinary: Vec<Output>,
+    atomic_update: Output,
+    atomic_delete: Output,
+    sequence_conflict: Output,
+    metadata: Output,
+}
+
+fn stream_policy_outputs() -> &'static StreamPolicyOutputs {
+    static OUTPUTS: OnceLock<StreamPolicyOutputs> = OnceLock::new();
+    OUTPUTS.get_or_init(|| {
+        let home = TempDir::new().expect("stream policy fixture home");
+        let db = home.path().join("stream-policy.sqlite");
+        let db = db.to_string_lossy().into_owned();
+        let identity = ["--actor", "lambda:test"];
+        let seed = run_exec_at_db(
+            &home,
+            r#"[stream.append(stream="immutable", record="first", embed=false), stream.append(stream="immutable", record="second", embed=false)]"#,
+            "kg",
+            &db,
+            &identity,
+            &[],
+            false,
+        );
+        assert!(seed.status.success(), "seed stderr={}", stderr(&seed));
+        let seeded = stdout_json(&seed);
+        assert_eq!(seeded["summary"]["succeeded"], 2, "seed={seeded}");
+        let id = seeded["results"][0]["result"]["id"]
+            .as_str()
+            .expect("first stream member id");
+        let other_id = seeded["results"][1]["result"]["id"]
+            .as_str()
+            .expect("second stream member id");
+        // The batch overlap guard runs before stream membership checks.
+        // Separate invocations let every forbidden write reach its own guard.
+        let ordinary = [
+            format!(r#"update(id="{id}", content="changed")"#),
+            format!(r#"update(id="{id}", properties={{"tags":["changed"]}})"#),
+            format!(r#"delete(id="{id}")"#),
+            format!(r#"delete(id="{id}", hard=true)"#),
+            format!(r#"merge(kind="note", into_id="{id}", from_id="{other_id}")"#),
+        ]
+        .into_iter()
+        .map(|ops| run_exec_at_db(&home, &ops, "kg", &db, &identity, &[], false))
+        .collect();
+        let atomic_update = run_ops_file(
+            &home,
+            "stream-policy-update.jsonl",
+            &format!(
+                "{}\n",
+                serde_json::json!({"tool":"update", "args":{"id":id,"content":"changed"}})
+            ),
+            "kg",
+            &db,
+            &identity,
+            &["--atomic"],
+            false,
+        );
+        let atomic_delete = run_ops_file(
+            &home,
+            "stream-policy-delete.jsonl",
+            &format!(
+                "{}\n",
+                serde_json::json!({"tool":"delete", "args":{"id":id,"hard":true}})
+            ),
+            "kg",
+            &db,
+            &identity,
+            &["--atomic"],
+            false,
+        );
+        let sequence_conflict = run_exec_at_db(
+            &home,
+            r#"stream.append(stream="immutable", record="third", expected_seq=999, embed=false)"#,
+            "kg",
+            &db,
+            &identity,
+            &[],
+            false,
+        );
+        let metadata = run_exec_at_db(
+            &home,
+            &format!(r#"update(id="{id}", name="display", salience=0.7)"#),
+            "kg",
+            &db,
+            &identity,
+            &[],
+            false,
+        );
+        StreamPolicyOutputs {
+            ordinary,
+            atomic_update,
+            atomic_delete,
+            sequence_conflict,
+            metadata,
+        }
+    })
+}
+
+#[test]
+fn stream_policy_refusal_has_stable_token_and_json_reason() {
+    let outputs = &stream_policy_outputs().ordinary;
+    let responses: Vec<_> = outputs.iter().map(stdout_json).collect();
+    assert_eq!(responses.len(), 5);
+    // Establish the intended cause for every case before checking the token.
+    // A failure from batch overlap or argument validation is not this witness.
+    for response in &responses {
+        assert_eq!(response["summary"]["total"], 1, "response={response}");
+        assert_eq!(response["summary"]["failed"], 1, "response={response}");
+        let entry = &response["results"][0];
+        assert_eq!(entry["error"]["kind"], "conflict", "entry={entry}");
+        assert_eq!(entry["error"]["details"]["reason"], "stream_member");
+    }
+    for (output, response) in outputs.iter().zip(responses) {
+        let entry = &response["results"][0];
+        assert_eq!(entry["reason"], "policy-refusal", "entry={entry}");
+        assert_refusal_once(output, "policy-refusal");
+        assert_refusal_count(output, "gate-refusal", 0);
+    }
+}
+
+#[test]
+fn atomic_stream_policy_refusals_have_stable_token_and_json_reason() {
+    let scenarios = stream_policy_outputs();
+    let outputs = [&scenarios.atomic_update, &scenarios.atomic_delete];
+    let responses: Vec<_> = outputs.iter().map(|output| stdout_json(output)).collect();
+    for (output, response) in outputs.iter().zip(&responses) {
+        assert!(!output.status.success());
+        assert_eq!(response["summary"]["total"], 1, "response={response}");
+        let entry = &response["results"][0];
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("conflict: stream entries are immutable")),
+            "entry={entry}"
+        );
+    }
+    for (output, response) in outputs.into_iter().zip(responses) {
+        assert_eq!(
+            response["results"][0]["reason"], "policy-refusal",
+            "response={response}"
+        );
+        assert_refusal_once(output, "policy-refusal");
+        assert_refusal_count(output, "gate-refusal", 0);
+    }
+}
+
+#[test]
+fn stream_sequence_conflict_is_not_a_policy_refusal() {
+    let output = &stream_policy_outputs().sequence_conflict;
+    let response = stdout_json(output);
+    let entry = &response["results"][0];
+    assert_eq!(entry["error"]["kind"], "conflict", "response={response}");
+    assert_eq!(entry["error"]["details"]["reason"], "seq_conflict");
+    assert!(entry.get("reason").is_none(), "entry={entry}");
+    assert!(!stderr(output).contains("kkernel-refusal:"));
+}
+
+#[test]
+fn stream_metadata_update_is_allowed_without_policy_refusal() {
+    let output = &stream_policy_outputs().metadata;
+    assert!(output.status.success(), "stderr={}", stderr(output));
+    let response = stdout_json(output);
+    let entry = &response["results"][0];
+    assert_eq!(entry["ok"], true, "response={response}");
+    assert_eq!(entry["result"]["name"], "display");
+    assert!(entry.get("reason").is_none());
+    assert!(!stderr(output).contains("kkernel-refusal:"));
+}
+
 #[test]
 fn strict_batch_failure_has_stable_token_and_json_reason() {
     let output = classified_batch_output();

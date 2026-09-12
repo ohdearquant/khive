@@ -26,17 +26,20 @@ pub enum RefusalReason {
     ParseError,
     /// The requested verb was unknown or was not loaded.
     VerbRefused,
+    /// A write was refused by the immutable stream record policy.
+    PolicyRefusal,
 }
 
 impl RefusalReason {
     /// Every currently defined reason, in documentation order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::AnonymousActor,
         Self::ExpectActorMismatch,
         Self::GateRefusal,
         Self::StrictOpFailure,
         Self::ParseError,
         Self::VerbRefused,
+        Self::PolicyRefusal,
     ];
 
     /// Exact machine token written to stderr and JSON envelopes.
@@ -48,6 +51,7 @@ impl RefusalReason {
             Self::StrictOpFailure => "strict-op-failure",
             Self::ParseError => "parse-error",
             Self::VerbRefused => "verb-refused",
+            Self::PolicyRefusal => "policy-refusal",
         }
     }
 
@@ -60,6 +64,7 @@ impl RefusalReason {
             "strict-op-failure" => Some(Self::StrictOpFailure),
             "parse-error" => Some(Self::ParseError),
             "verb-refused" => Some(Self::VerbRefused),
+            "policy-refusal" => Some(Self::PolicyRefusal),
             _ => None,
         }
     }
@@ -86,6 +91,7 @@ impl core::str::FromStr for RefusalReason {
                     "strict-op-failure",
                     "parse-error",
                     "verb-refused",
+                    "policy-refusal",
                 ],
             )
         })
@@ -108,6 +114,7 @@ mod tests {
                 "strict-op-failure",
                 "parse-error",
                 "verb-refused",
+                "policy-refusal",
             ]
         );
         for (reason, token) in RefusalReason::ALL.into_iter().zip(tokens) {
@@ -116,16 +123,20 @@ mod tests {
         }
         assert_eq!(RefusalReason::from_token("Gate-Refusal"), None);
         assert_eq!(RefusalReason::from_token("gate_refusal"), None);
+        assert_eq!(RefusalReason::from_token("Policy-Refusal"), None);
+        assert_eq!(RefusalReason::from_token("policy_refusal"), None);
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn serde_uses_the_machine_token() {
-        let encoded = serde_json::to_string(&RefusalReason::GateRefusal).unwrap();
-        assert_eq!(encoded, "\"gate-refusal\"");
-        assert_eq!(
-            serde_json::from_str::<RefusalReason>(&encoded).unwrap(),
-            RefusalReason::GateRefusal
-        );
+        for reason in RefusalReason::ALL {
+            let encoded = serde_json::to_string(&reason).unwrap();
+            assert_eq!(encoded, alloc::format!("\"{}\"", reason.as_str()));
+            assert_eq!(
+                serde_json::from_str::<RefusalReason>(&encoded).unwrap(),
+                reason
+            );
+        }
     }
 }

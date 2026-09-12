@@ -619,6 +619,7 @@ impl DispatchFailure {
         let reason = match &error {
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
+            error if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
             _ => None,
         };
         Self {

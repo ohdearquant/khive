@@ -305,6 +305,7 @@ fn classify_atomic_preflight(
 fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReason> {
     match error.downcast_ref::<RuntimeError>() {
         Some(RuntimeError::SecretDetected(_)) => Some(RefusalReason::GateRefusal),
+        Some(error) if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
         _ => None,
     }
 }

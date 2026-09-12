@@ -189,10 +189,11 @@ added, but an existing token's spelling and meaning never change.
 | `strict-op-failure`     | `--strict` observed at least one otherwise-unclassified failed or aborted operation. |
 | `parse-error`           | The operation expression or JSONL operation failed to parse.                         |
 | `verb-refused`          | The requested verb is unknown or is not loaded.                                      |
+| `policy-refusal`        | A write was refused by the immutable stream record policy.                           |
 
 For a multi-failure batch, stderr contains one line per classified failed or
-aborted operation. A specific dispatch reason (`gate-refusal` or
-`verb-refused`) takes precedence over the aggregate `strict-op-failure` reason
+aborted operation. A specific dispatch reason (`gate-refusal`, `verb-refused`, or
+`policy-refusal`) takes precedence over the aggregate `strict-op-failure` reason
 for that entry. An invocation-level actor refusal emits one line and returns
 the same normal `results`/`summary` JSON shape over every parsed operation
 without dispatching. Those failed rows and the `summary.failed` count describe
@@ -246,7 +247,11 @@ non-zero without an aborted one.
 Atomic ops-file preflight and prepare failures use the real per-operation
 `results` shape: an unknown or unloaded verb receives `verb-refused`, while a
 known verb that is merely ineligible for `--atomic` remains unclassified.
-Secret-gate failures during atomic prepare receive `gate-refusal`. An atomic
+Secret-gate failures during atomic prepare receive `gate-refusal`. Immutable
+stream record refusals receive `policy-refusal` during ordinary dispatch and
+atomic prepare. This classification does not cover ordinary sequence
+precondition conflicts or raw SQL trigger failures, and does not establish a
+domain-commit disposition. An atomic
 rollback passed with `--strict` receives `strict-op-failure` on each
 not-committed result without changing the atomic path's existing process-exit
 semantics. Ordinary validation, transport, storage, and authorization-gate
