@@ -1254,6 +1254,10 @@ impl PackMetadataRegistry {
         self.registry.all_handlers_with_names()
     }
 
+    pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
+        self.registry.all_verbs()
+    }
+
     pub fn pack_names(&self) -> Vec<&str> {
         self.registry.pack_names()
     }
