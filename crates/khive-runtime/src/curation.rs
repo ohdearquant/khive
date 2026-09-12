@@ -2184,7 +2184,7 @@ impl KhiveRuntime {
                 "transport_message_id": &transport_message_id,
             }),
             "message",
-            "delivery",
+            "delivered",
         )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
@@ -2233,7 +2233,7 @@ impl KhiveRuntime {
                 "last_error": &last_error,
             }),
             "message",
-            "delivery",
+            "failed",
         )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(

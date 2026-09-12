@@ -150,9 +150,10 @@ pub fn check_tags(tags: &[String]) -> RuntimeResult<()> {
 /// rejected with it (khive #2605). Pass through anything that is not a gate
 /// refusal unchanged — this adds identity, it does not reclassify.
 ///
-/// `scope` is a record label for a batch (`notes[2]`) and the verb for a
-/// single-record write (`comm.send`). Both answer the same question, which is
-/// where in the submitted payload the writer should look.
+/// `record` names the record the field belongs to, as the caller submitted it:
+/// `entity`, `note`, `task`, `proposal`, `message`, indexed when it came from a
+/// batch (`note[2]`). It answers where in the submitted payload the writer
+/// should look, which is the question a refused writer actually asks.
 pub fn locate<T>(result: RuntimeResult<T>, record: &str, field: &str) -> RuntimeResult<T> {
     result.map_err(|error| match error {
         RuntimeError::SecretDetected(matched) => RuntimeError::SecretDetected(SecretMatch {
@@ -163,21 +164,21 @@ pub fn locate<T>(result: RuntimeResult<T>, record: &str, field: &str) -> Runtime
     })
 }
 
-/// `check` that names where it looked. `scope` is the verb for a single-record
-/// write, a record label inside a batch.
-pub fn check_at(content: &str, scope: &str, field: &str) -> RuntimeResult<()> {
-    locate(check(content), scope, field)
+/// `check` that names where it looked. `record` is the record noun the caller
+/// submitted, indexed inside a batch; `field` is the field of it that was scanned.
+pub fn check_at(content: &str, record: &str, field: &str) -> RuntimeResult<()> {
+    locate(check(content), record, field)
 }
 
 /// `check_json` that names where it looked. The location is the field holding
 /// the JSON, not the path of the string leaf that matched inside it.
-pub fn check_json_at(value: &serde_json::Value, scope: &str, field: &str) -> RuntimeResult<()> {
-    locate(check_json(value), scope, field)
+pub fn check_json_at(value: &serde_json::Value, record: &str, field: &str) -> RuntimeResult<()> {
+    locate(check_json(value), record, field)
 }
 
 /// `check_tags` that names where it looked.
-pub fn check_tags_at(tags: &[String], scope: &str, field: &str) -> RuntimeResult<()> {
-    locate(check_tags(tags), scope, field)
+pub fn check_tags_at(tags: &[String], record: &str, field: &str) -> RuntimeResult<()> {
+    locate(check_tags(tags), record, field)
 }
 
 // ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
