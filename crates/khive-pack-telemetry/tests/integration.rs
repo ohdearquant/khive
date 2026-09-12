@@ -140,33 +140,13 @@ async fn ephemeral_kind_is_accepted_but_absent_from_stream() {
 }
 
 #[tokio::test]
-async fn dispatch_refusal_append_refusal_and_ephemeral_policy_have_distinct_shapes() {
+async fn dispatch_refusal_secret_blocked_append_and_ephemeral_policy_have_distinct_shapes() {
     let mut config = config();
     config.channels[0].failure_posture = TelemetryFailurePosture::Gap;
     let (registry, runtime) = registry(config);
     let recorded = emit(&registry, "run.started", json!({"control":true})).await;
     assert_eq!(recorded["outcome"], "recorded");
-
-    // Exhaust the scratch stream's sequence space so the real append closure
-    // refuses before its first write, without injecting a fabricated error.
-    let access = runtime.sql();
-    let mut writer = access.writer().await.unwrap();
-    assert_eq!(
-        writer
-            .execute(SqlStatement {
-                sql: "UPDATE note_streams SET seq = ?1 WHERE namespace = ?2 AND stream = ?3".into(),
-                params: vec![
-                    SqlValue::Integer(i64::MAX),
-                    SqlValue::Text("local".into()),
-                    SqlValue::Text("events".into())
-                ],
-                label: Some("telemetry_test_exhausted_sequence".into()),
-            })
-            .await
-            .unwrap(),
-        1
-    );
-    drop(writer);
+    let before = existing_read(&registry, "events").await;
 
     // Namespace validation happens before the pack is reached.
     let refused = registry
@@ -185,7 +165,16 @@ async fn dispatch_refusal_append_refusal_and_ephemeral_policy_have_distinct_shap
     let error = khive_runtime::runtime_error_value(refused.into_source(), disposition);
     assert!(error.get("outcome").is_none());
 
-    let incident = emit(&registry, "run.started", json!({"incident":true})).await;
+    // Synthetic detector input, not key material. The append's real note
+    // preparation rejects this payload before storage; no ledger guards change.
+    // Split the header as in the secret-gate unit fixtures.
+    let synthetic_header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+    let incident = emit(
+        &registry,
+        "run.started",
+        json!({"synthetic_secret_shape":synthetic_header}),
+    )
+    .await;
     let policy = emit(&registry, "turn.delta", json!({"policy":true})).await;
     for result in [&incident, &policy] {
         assert_eq!(result["outcome"], "dropped");
@@ -194,8 +183,14 @@ async fn dispatch_refusal_append_refusal_and_ephemeral_policy_have_distinct_shap
     }
     assert_eq!(incident["carrier"], "durable");
     assert!(incident["error"].is_object());
+    assert!(incident["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("pem-private-key"));
     assert_eq!(policy["carrier"], "ephemeral");
     assert!(policy.get("error").is_none());
+    assert_eq!(existing_read(&registry, "events").await, before);
+    let access = runtime.sql();
     let mut reader = access.reader().await.unwrap();
     assert!(matches!(
         reader
@@ -830,6 +825,7 @@ async fn coverage_reports_current_policy_without_hiding_historical_durable_rows(
         mixed["coverage"]["ephemeral"],
         json!(["run.started", "turn.delta"])
     );
+    assert_eq!(mixed["coverage"]["classification_scope"], "requested_kinds");
     assert_eq!(mixed["events"].as_array().unwrap().len(), 1);
     assert_eq!(mixed["events"][0]["id"], stored["receipt_id"]);
     let durable = after

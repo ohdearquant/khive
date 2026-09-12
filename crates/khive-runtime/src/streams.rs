@@ -1509,10 +1509,34 @@ mod batch_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::{allocate_sequence, SequenceRefusal};
     use crate::atomic_prepare::{prepare_delete, prepare_update};
     use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
     use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError};
     use serde_json::{json, Value};
+
+    #[test]
+    fn allocate_sequence_exhaustion_preserves_head_at_checked_add_boundary() {
+        // Overflow is logically possible, but no bounded real-store fixture
+        // reaches it: stream_gap requires consecutive inserts from 1, and
+        // ledger UPDATE/DELETE are forbidden. Supply the head at this unit
+        // boundary instead of fabricating an exhausted persisted stream.
+        let mut head = i64::MAX - 1;
+        assert!(matches!(
+            allocate_sequence(&mut head, None),
+            Ok(seq) if seq == i64::MAX
+        ));
+        assert_eq!(head, i64::MAX);
+        assert!(matches!(
+            allocate_sequence(&mut head, None),
+            Err(SequenceRefusal::Exhausted)
+        ));
+        assert_eq!(
+            head,
+            i64::MAX,
+            "refused allocation must not advance the head"
+        );
+    }
 
     #[tokio::test]
     async fn stream_atomic_metadata_cas_preserves_record_and_refuses_stale_plan() {
