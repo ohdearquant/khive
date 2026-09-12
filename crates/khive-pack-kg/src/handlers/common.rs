@@ -417,10 +417,63 @@ pub(crate) fn flatten_get_result(substrate: &str, mut inner: Value) -> Result<Va
     }
 }
 
+/// Longest derived label a note projection will emit before truncating.
+const DERIVED_LABEL_MAX_CHARS: usize = 120;
+
+/// First non-empty line of `content`, trimmed and length-capped, for use as a
+/// label when a note has no name. Returns `None` for content that is entirely
+/// whitespace, because an empty label is worse than an absent one.
+fn derive_label(content: &str) -> Option<String> {
+    let line = content.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut out: String = line.chars().take(DERIVED_LABEL_MAX_CHARS).collect();
+    if line.chars().count() > DERIVED_LABEL_MAX_CHARS {
+        out.push('\u{2026}');
+    }
+    Some(out)
+}
+
 pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
     let Some(obj) = note_value.as_object_mut() else {
         return note_value;
     };
+
+    // Notes carry their tags inside `properties.tags`: the notes table has no tags
+    // column, and the tag filter matches with a JSON extract on that path. So a note
+    // returned from create, get or list reported no tags at all while being findable
+    // by them. Lift the stored value to the top level so the record reports what the
+    // filter reads. An explicit top-level `tags` already on the value wins, and a
+    // `properties.tags` that is not an array is left where it is rather than
+    // promoted into a shape callers would have to re-check.
+    if !obj.contains_key("tags") {
+        if let Some(tags) = obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("tags"))
+            .filter(|t| t.is_array())
+            .cloned()
+        {
+            obj.insert("tags".to_string(), tags);
+        }
+    }
+
+    // A note's name is optional and nothing defaults it, so a listing keyed on
+    // `name` renders blank rows for notes that carry full paragraphs. Emit a label
+    // that is always present: the name when there is one, the first line of content
+    // otherwise. The `name` column itself is untouched, so the projection never
+    // invents a title that the record does not have.
+    let label = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            obj.get("content")
+                .and_then(Value::as_str)
+                .and_then(derive_label)
+        });
+    if let Some(label) = label {
+        obj.insert("display_name".to_string(), Value::String(label));
+    }
     let lifecycle_status = obj
         .get("properties")
         .and_then(Value::as_object)
@@ -992,4 +1045,97 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     // the field's absence (#1168, #1247).
     out.insert("truncated".to_string(), json!(result.truncated));
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod note_projection_tests {
+    use super::*;
+
+    fn note(value: serde_json::Value) -> serde_json::Map<String, Value> {
+        remap_note_status(value)
+            .as_object()
+            .expect("projection returns an object for an object input")
+            .clone()
+    }
+
+    #[test]
+    fn projection_reports_the_tags_the_filter_matches_on() {
+        // Stored shape: notes have no tags column, so the tags a caller passed live
+        // under `properties.tags`, which is also the path the tag filter extracts.
+        let out = note(json!({
+            "kind": "observation",
+            "content": "body",
+            "properties": {"tags": ["fleet-incident", "merge-safety"]},
+        }));
+        assert_eq!(
+            out.get("tags"),
+            Some(&json!(["fleet-incident", "merge-safety"])),
+            "a note must report the tags it is findable by"
+        );
+
+        // A non-array value is left where it is: promoting it would hand callers a
+        // `tags` field they still have to type-check.
+        let out = note(json!({
+            "kind": "observation",
+            "content": "body",
+            "properties": {"tags": "fleet-incident,merge-safety"},
+        }));
+        assert_eq!(out.get("tags"), None, "only an array is lifted");
+
+        // An explicit top-level value wins over the stored one, so a substrate that
+        // does carry its own tags column is never overwritten by this projection.
+        let out = note(json!({
+            "kind": "observation",
+            "content": "body",
+            "tags": ["explicit"],
+            "properties": {"tags": ["stored"]},
+        }));
+        assert_eq!(out.get("tags"), Some(&json!(["explicit"])));
+    }
+
+    #[test]
+    fn projection_labels_a_nameless_note_from_its_first_content_line() {
+        // A name is optional and nothing defaults it, so this is the common shape.
+        let out = note(json!({
+            "kind": "observation",
+            "name": Value::Null,
+            "content": "\n  A review status in a mutable flag is a side effect.\nSecond line.",
+        }));
+        assert_eq!(
+            out.get("display_name"),
+            Some(&json!(
+                "A review status in a mutable flag is a side effect."
+            )),
+            "the label is the first non-empty line, trimmed"
+        );
+        assert_eq!(
+            out.get("name"),
+            Some(&Value::Null),
+            "the stored name is untouched: the projection labels, it does not title"
+        );
+
+        // With a name, the label is that name. An implementation that always derives
+        // from content fails here.
+        let out = note(json!({"kind": "observation", "name": "Real title", "content": "body"}));
+        assert_eq!(out.get("display_name"), Some(&json!("Real title")));
+
+        // A whitespace-only name is as blank as a null one. An implementation testing
+        // only for null fails here.
+        let out = note(json!({"kind": "observation", "name": "   ", "content": "derived"}));
+        assert_eq!(out.get("display_name"), Some(&json!("derived")));
+
+        // Whitespace-only content yields no label rather than an empty one.
+        let out = note(json!({"kind": "observation", "name": Value::Null, "content": "   \n\n"}));
+        assert_eq!(out.get("display_name"), None);
+
+        // A long first line is capped and marked, so a listing column stays readable.
+        let long = "x".repeat(DERIVED_LABEL_MAX_CHARS + 10);
+        let out = note(json!({"kind": "observation", "name": Value::Null, "content": long}));
+        let label = out
+            .get("display_name")
+            .and_then(Value::as_str)
+            .expect("a long line still yields a label");
+        assert_eq!(label.chars().count(), DERIVED_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('\u{2026}'), "got {label}");
+    }
 }
