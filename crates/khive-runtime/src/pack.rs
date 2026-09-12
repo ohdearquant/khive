@@ -24,8 +24,8 @@ use serde_json::Value;
 
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
-    NoteLifecycleSpec, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
-    RESERVED_ENVELOPE_ARGS,
+    NoteLifecycleSpec, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef,
+    VerbCategory, VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -160,7 +160,8 @@ fn identifier_resolution_help() -> Value {
 ///
 /// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
 /// are NOT part of the core substrate schema (entities, notes, edges, events).
-/// Applied at boot via `StorageBackend::apply_schema` / `apply_pack_schema_plan`.
+/// Applied at boot via `StorageBackend::apply_pack_ddl_statements_with_columns`,
+/// together with [`PackRuntime::schema_column_additions`].
 ///
 /// Core substrate tables evolve through versioned migrations. Pack schema is
 /// strictly for pack-auxiliary tables (e.g. GTD lifecycle audit, memory index).
@@ -319,6 +320,16 @@ pub trait PackRuntime: Send + Sync {
     /// robustness in test contexts that create fresh in-memory databases.
     fn schema_plan(&self) -> SchemaPlan {
         SchemaPlan::empty()
+    }
+
+    /// Nullable-column upgrades for this pack's auxiliary tables.
+    ///
+    /// Must equal `Pack::SCHEMA_COLUMN_ADDITIONS`. The backend validates and
+    /// adds missing columns on existing tables before applying the full schema
+    /// plan, then validates every declared column. Both steps share the plan's
+    /// transaction. Defaults to empty for packs with no auxiliary upgrades.
+    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
+        &[]
     }
 
     /// Domain-specific validation rules contributed by this pack.
@@ -3414,9 +3425,23 @@ impl VerbRegistry {
     /// Returns one `SchemaPlan` per pack. Callers (typically the runtime
     /// bootstrap) apply each plan to the pack's assigned backend. Empty plans
     /// are included so the caller can iterate uniformly; callers that want to
-    /// skip empty plans should check `plan.is_empty()`.
+    /// skip empty plans should check `plan.is_empty()`. Schema application must
+    /// use [`Self::all_schema_plans_with_columns`] to retain column upgrades.
     pub fn all_schema_plans(&self) -> Vec<SchemaPlan> {
         self.packs.iter().map(|p| p.schema_plan()).collect()
+    }
+
+    /// Schema plans paired with the same owning pack's nullable-column upgrades.
+    ///
+    /// Callers applying plans directly must pass both entries to
+    /// `StorageBackend::apply_pack_ddl_statements_with_columns`.
+    pub fn all_schema_plans_with_columns(
+        &self,
+    ) -> Vec<(SchemaPlan, &'static [PackColumnAddition])> {
+        self.packs
+            .iter()
+            .map(|pack| (pack.schema_plan(), pack.schema_column_additions()))
+            .collect()
     }
 
     /// Invoke `PackRuntime::register_embedders` on every registered pack.
@@ -3573,12 +3598,13 @@ impl VerbRegistry {
     /// This is the centralized startup hook that replaced the previous lazy
     /// per-pack self-bootstrap pattern. Each pack's `SchemaPlan` carries
     /// idempotent `CREATE TABLE IF NOT EXISTS` DDL; calling this more than once
-    /// is safe. Empty plans are skipped.
+    /// is safe. Plans with neither SQL nor column upgrades are skipped.
     ///
     /// Errors from individual plans are logged via `tracing::warn!` and not
     /// propagated so that a single pack's schema failure does not prevent the
     /// rest from loading. Callers that need hard-failure semantics should call
-    /// `all_schema_plans()` and apply each plan individually.
+    /// [`Self::all_schema_plans_with_columns`] and apply each complete plan
+    /// individually.
     pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
         if backend.is_read_only() {
             tracing::info!(
@@ -3586,11 +3612,13 @@ impl VerbRegistry {
             );
             return;
         }
-        for plan in self.all_schema_plans() {
-            if plan.is_empty() {
+        for (plan, additions) in self.all_schema_plans_with_columns() {
+            if plan.is_empty() && additions.is_empty() {
                 continue;
             }
-            if let Err(e) = backend.apply_pack_ddl_statements(plan.statements) {
+            if let Err(e) =
+                backend.apply_pack_ddl_statements_with_columns(plan.statements, additions)
+            {
                 tracing::warn!(
                     pack = plan.pack,
                     error = %e,
@@ -3604,7 +3632,9 @@ impl VerbRegistry {
     ///
     /// Returns `(pack_name, SchemaPlan)` pairs for every registered pack.
     /// Used by the multi-backend boot path to apply each plan to the pack's
-    /// assigned backend rather than a single shared backend.
+    /// assigned backend rather than a single shared backend. Direct schema
+    /// application must use [`Self::all_schema_plans_with_columns`] so column
+    /// upgrades are retained.
     pub fn all_schema_plans_named(&self) -> Vec<(&'static str, SchemaPlan)> {
         self.packs
             .iter()
@@ -3617,8 +3647,8 @@ impl VerbRegistry {
 
     /// Apply pack-auxiliary schema plans using a per-pack backend map.
     ///
-    /// For each `(pack_name, plan)` returned by `all_schema_plans_named()`,
-    /// applies the plan to `backend_for_pack[pack_name]` when present,
+    /// For each plan and its owning pack's column additions, applies the full
+    /// plan to `backend_for_pack[plan.pack]` when present,
     /// falling back to `default_backend` for any pack not in the map.
     ///
     /// Returns an error when two packs on the same backend declare the same
@@ -3636,10 +3666,11 @@ impl VerbRegistry {
         // Backend identity is the raw pointer of the underlying connection pool Arc.
         let mut claimed: HashMap<(*const (), String), &'static str> = HashMap::new();
 
-        for (pack_name, plan) in self.all_schema_plans_named() {
-            if plan.is_empty() {
+        for (plan, additions) in self.all_schema_plans_with_columns() {
+            if plan.is_empty() && additions.is_empty() {
                 continue;
             }
+            let pack_name = plan.pack;
             let backend = backend_for_pack
                 .get(pack_name)
                 .copied()
@@ -3666,6 +3697,28 @@ impl VerbRegistry {
                 }
             }
 
+            for addition in additions {
+                let table_name = addition.table.to_ascii_lowercase();
+                let key = (backend_ptr, table_name.clone());
+                match claimed.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(pack_name);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        let prior_pack = *entry.get();
+                        // A pack's full CREATE and its upgrades declare the
+                        // same table; this is one ownership claim.
+                        if prior_pack != pack_name {
+                            return Err(crate::PackSchemaCollisionError {
+                                pack_a: prior_pack,
+                                pack_b: pack_name,
+                                table: table_name,
+                            });
+                        }
+                    }
+                }
+            }
+
             if backend.is_read_only() {
                 tracing::info!(
                     pack = pack_name,
@@ -3675,7 +3728,7 @@ impl VerbRegistry {
             }
 
             backend
-                .apply_pack_ddl_statements(plan.statements)
+                .apply_pack_ddl_statements_with_columns(plan.statements, additions)
                 .map_err(|e| crate::PackSchemaCollisionError {
                     pack_a: pack_name,
                     pack_b: pack_name,
@@ -13238,6 +13291,7 @@ mod help_tests {
     struct SchemaPack {
         pack_name: &'static str,
         statements: &'static [&'static str],
+        column_additions: &'static [PackColumnAddition],
     }
 
     impl Pack for SchemaPack {
@@ -13267,6 +13321,9 @@ mod help_tests {
                 statements: self.statements,
             }
         }
+        fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
+            self.column_additions
+        }
         async fn dispatch(
             &self,
             verb: &str,
@@ -13286,10 +13343,12 @@ mod help_tests {
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "alpha",
             statements: &["CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "beta",
             statements: &[],
+            column_additions: &[],
         }));
         let reg = builder.build().expect("registry builds");
 
@@ -13338,6 +13397,7 @@ mod help_tests {
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "routed",
             statements: &["CREATE TABLE IF NOT EXISTS t_routed (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         let reg = builder.build().expect("registry builds");
 
@@ -13388,6 +13448,7 @@ mod help_tests {
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "unmapped",
             statements: &["CREATE TABLE IF NOT EXISTS t_unmapped (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         let reg = builder.build().expect("registry builds");
 
@@ -13423,10 +13484,12 @@ mod help_tests {
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "pack_alpha",
             statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "pack_beta",
             statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         let registry = builder.build().expect("registry builds");
 
@@ -13468,10 +13531,12 @@ mod help_tests {
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "pack_alpha",
             statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         builder.register_boxed(Box::new(SchemaPack {
             pack_name: "pack_beta",
             statements: &["CREATE TABLE IF NOT EXISTS collision_table (id INTEGER PRIMARY KEY)"],
+            column_additions: &[],
         }));
         let registry = builder.build().expect("registry builds");
         let writes_before = backend.pool().writer_acquisition_snapshot();
@@ -13499,5 +13564,177 @@ mod help_tests {
             writes_before,
             "read-only collision validation must not acquire a writer"
         );
+    }
+
+    fn column_schema_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER, revision TEXT)"],
+            column_additions: &[PackColumnAddition {
+                table: "t_alpha",
+                column: "revision",
+                affinity: PackColumnAffinity::Text,
+            }],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "beta",
+            statements: &["CREATE TABLE IF NOT EXISTS t_beta (id INTEGER, epoch INTEGER)"],
+            column_additions: &[PackColumnAddition {
+                table: "t_beta",
+                column: "epoch",
+                affinity: PackColumnAffinity::Integer,
+            }],
+        }));
+        builder.build().expect("registry builds")
+    }
+
+    fn seed_column_schema(backend: &khive_db::StorageBackend) {
+        backend
+            .apply_pack_ddl_statements(&[
+                "CREATE TABLE t_alpha (id INTEGER)",
+                "CREATE TABLE t_beta (id INTEGER)",
+            ])
+            .expect("legacy schemas");
+    }
+
+    fn column_schema_count(backend: &khive_db::StorageBackend, table: &str, column: &str) -> i64 {
+        backend
+            .pool()
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM pragma_table_xinfo(?1, 'main') WHERE name = ?2",
+                [table, column],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn pack_column_upgrades_preserve_owner_metadata_and_apply_on_shared_backend() {
+        let backend = khive_db::StorageBackend::memory().unwrap();
+        seed_column_schema(&backend);
+        let registry = column_schema_registry();
+        let plans = registry.all_schema_plans_with_columns();
+        assert_eq!(plans.len(), 2);
+        let (_, alpha_columns) = plans.iter().find(|(plan, _)| plan.pack == "alpha").unwrap();
+        assert_eq!(alpha_columns[0].table, "t_alpha");
+        assert_eq!(alpha_columns[0].affinity, PackColumnAffinity::Text);
+        let (_, beta_columns) = plans.iter().find(|(plan, _)| plan.pack == "beta").unwrap();
+        assert_eq!(beta_columns[0].table, "t_beta");
+        assert_eq!(beta_columns[0].affinity, PackColumnAffinity::Integer);
+
+        registry.apply_schema_plans(&backend);
+        registry.apply_schema_plans(&backend);
+        assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 1);
+        assert_eq!(column_schema_count(&backend, "t_beta", "epoch"), 1);
+    }
+
+    #[test]
+    fn pack_column_upgrades_follow_assigned_backend_and_default_fallback() {
+        let default_backend = khive_db::StorageBackend::memory().unwrap();
+        let alpha_backend = khive_db::StorageBackend::memory().unwrap();
+        seed_column_schema(&default_backend);
+        seed_column_schema(&alpha_backend);
+        let registry = column_schema_registry();
+        let backend_map = HashMap::from([("alpha", &alpha_backend)]);
+
+        registry
+            .apply_schema_plans_with_map(&backend_map, &default_backend)
+            .unwrap();
+        registry
+            .apply_schema_plans_with_map(&backend_map, &default_backend)
+            .unwrap();
+        assert_eq!(
+            column_schema_count(&alpha_backend, "t_alpha", "revision"),
+            1
+        );
+        assert_eq!(
+            column_schema_count(&default_backend, "t_alpha", "revision"),
+            0
+        );
+        assert_eq!(column_schema_count(&default_backend, "t_beta", "epoch"), 1);
+        assert_eq!(column_schema_count(&alpha_backend, "t_beta", "epoch"), 0);
+    }
+
+    #[test]
+    fn pack_column_upgrades_skip_read_only_backends_without_acquiring_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only_column_schema.db");
+        {
+            let writable = khive_db::StorageBackend::sqlite(&path).unwrap();
+            writable.prepare_core_schema().unwrap();
+            seed_column_schema(&writable);
+        }
+        #[cfg(unix)]
+        khive_storage::test_support::freeze_snapshot_sidecars(&path);
+        let backend = khive_db::StorageBackend::sqlite_read_only(&path).unwrap();
+        let registry = column_schema_registry();
+        let writes_before = backend.pool().writer_acquisition_snapshot();
+
+        registry.apply_schema_plans(&backend);
+        registry
+            .apply_schema_plans_with_map(&HashMap::new(), &backend)
+            .unwrap();
+
+        assert_eq!(backend.pool().writer_acquisition_snapshot(), writes_before);
+        assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
+        assert_eq!(column_schema_count(&backend, "t_beta", "epoch"), 0);
+    }
+
+    #[test]
+    fn pack_column_upgrades_reject_cross_pack_addition_ownership_collision() {
+        let backend = khive_db::StorageBackend::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "alpha",
+            statements: &["CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER)"],
+            column_additions: &[],
+        }));
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "beta",
+            statements: &[],
+            column_additions: &[PackColumnAddition {
+                table: "t_alpha",
+                column: "revision",
+                affinity: PackColumnAffinity::Text,
+            }],
+        }));
+        let registry = builder.build().unwrap();
+        let error = registry
+            .apply_schema_plans_with_map(&HashMap::new(), &backend)
+            .unwrap_err();
+        assert_eq!(error.pack_a, "alpha");
+        assert_eq!(error.pack_b, "beta");
+        assert_eq!(error.table, "t_alpha");
+        assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
+    }
+
+    #[test]
+    fn pack_column_upgrades_do_not_hide_duplicate_create_claims() {
+        let backend = khive_db::StorageBackend::memory().unwrap();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(SchemaPack {
+            pack_name: "alpha",
+            statements: &[
+                "CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER, revision TEXT)",
+                "CREATE TABLE IF NOT EXISTS t_alpha (id INTEGER, revision TEXT)",
+            ],
+            column_additions: &[PackColumnAddition {
+                table: "t_alpha",
+                column: "revision",
+                affinity: PackColumnAffinity::Text,
+            }],
+        }));
+        let registry = builder.build().unwrap();
+        let error = registry
+            .apply_schema_plans_with_map(&HashMap::new(), &backend)
+            .unwrap_err();
+        assert_eq!(error.pack_a, "alpha");
+        assert_eq!(error.pack_b, "alpha");
+        assert_eq!(error.table, "t_alpha");
+        assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
     }
 }

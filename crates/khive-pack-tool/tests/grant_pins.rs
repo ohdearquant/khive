@@ -426,7 +426,7 @@ async fn grant_resolves_a_registration_beyond_the_old_registry_list_cap() {
 }
 
 #[tokio::test]
-async fn migrated_and_direct_bootstrap_grant_schemas_and_triggers_agree() {
+async fn runtime_and_direct_bootstrap_grant_schemas_and_triggers_agree() {
     let f = Fixture::new();
     let direct = khive_db::StorageBackend::memory().unwrap();
     direct.apply_pack_ddl_statements(&[
@@ -434,20 +434,23 @@ async fn migrated_and_direct_bootstrap_grant_schemas_and_triggers_agree() {
     ]).unwrap();
     for _ in 0..2 {
         direct
-            .apply_pack_ddl_statements(&khive_pack_tool::vocab::TOOL_SCHEMA_PLAN_STMTS)
+            .apply_pack_ddl_statements_with_columns(
+                &khive_pack_tool::vocab::TOOL_SCHEMA_PLAN_STMTS,
+                &khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS,
+            )
             .unwrap();
     }
     for sql in [
         "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('tool_grants') ORDER BY cid",
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='tool_grants_invalidate_on_registry_insert'",
     ] {
-        let mut migrated_reader = f.rt.sql().reader().await.unwrap();
+        let mut runtime_reader = f.rt.sql().reader().await.unwrap();
         let mut direct_reader = direct.sql().reader().await.unwrap();
         let statement = || SqlStatement { sql:sql.into(), params:vec![], label:None };
-        let migrated = migrated_reader.query_all(statement()).await.unwrap();
+        let runtime_rows = runtime_reader.query_all(statement()).await.unwrap();
         let bootstrapped = direct_reader.query_all(statement()).await.unwrap();
-        assert!(!migrated.is_empty(), "{sql}");
-        assert_eq!(serde_json::to_value(migrated).unwrap(), serde_json::to_value(bootstrapped).unwrap(), "{sql}");
+        assert!(!runtime_rows.is_empty(), "{sql}");
+        assert_eq!(serde_json::to_value(runtime_rows).unwrap(), serde_json::to_value(bootstrapped).unwrap(), "{sql}");
     }
 }
 

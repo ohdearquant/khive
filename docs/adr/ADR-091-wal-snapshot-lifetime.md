@@ -1746,8 +1746,10 @@ provided SQL writer. There is no process, filesystem, network, embedding or othe
 subsystem work inside the transaction.
 
 The registration-insert invalidation trigger runs as SQL inside the existing entity
-write owner. V34 and the pack bootstrap install it and perform marker-only legacy
-backfill inside their existing migration/auxiliary-DDL owners. Those statements may
+write owner. The tool pack bootstrap installs it and performs marker-only legacy
+backfill inside its auxiliary-DDL owner, after guarded nullable-column additions in
+that same writer transaction. The core migration chain does not install tool tables.
+Those statements may
 scan matching registry/grant rows; this entry claims SQL-only work, not a population-
 independent bound on SQLite execution time.
 

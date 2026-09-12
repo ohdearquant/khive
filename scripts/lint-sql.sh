@@ -91,7 +91,7 @@ finally:
 
 # Related fragments share a database only within their own directory. A pack's
 # sorted table/index fragments see prior DDL; unrelated packs never see each other.
-# The tool-pack trigger requires the core entities and migrated grants tables.
+# The tool-pack trigger requires core entities; its own fragments create grants.
 fragment_groups = {}
 for path in others:
     fragment_groups.setdefault(os.path.dirname(path), []).append(path)
@@ -100,12 +100,7 @@ for directory in sorted(fragment_groups):
     try:
         fixtures = []
         if directory.replace(os.sep, "/").endswith("/khive-pack-tool/sql"):
-            # Exclude the core copy so CREATE TRIGGER IF NOT EXISTS must execute
-            # the pack's trigger body instead of finding an installed trigger.
-            fixtures = [
-                path for path in chain
-                if os.path.basename(path) != "tool-grant-invalidation.sql"
-            ]
+            fixtures = chain
         for path in fixtures + sorted(fragment_groups[directory]):
             with open(path) as fh:
                 sql = fh.read()

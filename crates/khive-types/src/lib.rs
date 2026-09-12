@@ -63,8 +63,8 @@ pub use note::{Note, NoteStatus};
 pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteKindSpec, NoteLifecycleSpec,
-    Pack, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
-    RESERVED_ENVELOPE_ARGS,
+    Pack, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};

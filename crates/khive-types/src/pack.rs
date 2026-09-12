@@ -356,6 +356,32 @@ pub struct NoteKindSpec {
     pub lifecycle: NoteLifecycleSpec,
 }
 
+/// SQLite storage type for a nullable pack-auxiliary column addition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackColumnAffinity {
+    /// A nullable `TEXT` column with no default or primary key.
+    Text,
+    /// A nullable `INTEGER` column with no default or primary key.
+    Integer,
+}
+
+/// An idempotent nullable-column addition to a pack-owned auxiliary table.
+///
+/// Identifiers must use ASCII letters, digits, or underscores and cannot start
+/// with a digit. Existing columns must match the declared type and have no
+/// default, primary key, generated expression, or `NOT NULL` constraint. A
+/// compatible partial upgrade completes without changing existing column values.
+/// The pack's full create-table DDL must also include every declared column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackColumnAddition {
+    /// Pack-owned auxiliary table in the backend's main schema.
+    pub table: &'static str,
+    /// Column to add when absent from an existing table.
+    pub column: &'static str,
+    /// Exact declared SQLite type required for this column.
+    pub affinity: PackColumnAffinity,
+}
+
 /// DDL statements the pack needs applied to the auxiliary schema.
 ///
 /// Pack-auxiliary tables use idempotent `CREATE TABLE IF NOT EXISTS`; they are
@@ -454,6 +480,14 @@ pub trait Pack {
     /// The runtime applies them once at registration time.  Defaults to
     /// `None` so packs with no auxiliary schema cost nothing.
     const SCHEMA_PLAN: Option<PackSchemaPlan> = None;
+
+    /// Nullable-column upgrades for this pack's auxiliary tables.
+    ///
+    /// The backend validates and adds missing columns on existing tables before
+    /// applying [`Self::SCHEMA_PLAN`], then validates the final schema. The
+    /// entire plan is transactional. Absent tables are created only by the
+    /// pack's full DDL, so unloaded packs do not acquire auxiliary tables.
+    const SCHEMA_COLUMN_ADDITIONS: &'static [PackColumnAddition] = &[];
 
     /// Validation rule IDs contributed by this pack.
     ///

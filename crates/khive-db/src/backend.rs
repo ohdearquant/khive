@@ -16,6 +16,8 @@ use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse, text, vectors};
 
+mod pack_schema;
+
 fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
@@ -335,20 +337,35 @@ impl StorageBackend {
     /// non-versioned. Use `apply_schema` with a `ServiceSchemaPlan` when version
     /// tracking is needed.
     ///
-    /// This method is lower-level than `PackRuntime::schema_plan()` — the
-    /// runtime bootstrap calls `pack.schema_plan().statements` and passes the
-    /// slice here. The `SchemaPlan` type lives in `khive-runtime` (above this
-    /// crate in the dep chain); this method accepts a plain `&[&'static str]`
-    /// to avoid a circular dependency.
+    /// Plans declaring nullable-column upgrades must use
+    /// [`Self::apply_pack_ddl_statements_with_columns`]. The runtime supplies
+    /// the SQL slice and column metadata separately because its `SchemaPlan`
+    /// type lives above this crate in the dependency chain.
     pub fn apply_pack_ddl_statements(
         &self,
         statements: &[&'static str],
     ) -> Result<(), SqliteError> {
+        self.apply_pack_ddl_statements_with_columns(statements, &[])
+    }
+
+    /// Apply a pack's nullable-column upgrades and idempotent SQL atomically.
+    ///
+    /// Missing columns are added only to existing tables; the full SQL plan
+    /// creates fresh tables. Existing columns and the final schema must match
+    /// the declarations. Schema inspection, additions, and SQL all run under
+    /// one writer transaction, including rollback if any later step fails.
+    pub fn apply_pack_ddl_statements_with_columns(
+        &self,
+        statements: &[&'static str],
+        additions: &[khive_types::PackColumnAddition],
+    ) -> Result<(), SqliteError> {
         let writer = self.pool.try_writer()?;
         writer.transaction(|conn| {
+            pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
                 conn.execute_batch(stmt)?;
             }
+            pack_schema::validate_columns(conn, additions)?;
             Ok(())
         })
     }

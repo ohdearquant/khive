@@ -5,10 +5,14 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
-use khive_types::{EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack, PackSchemaPlan};
+use khive_types::{
+    EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan,
+};
 
 use crate::handlers;
-use crate::vocab::{ENTITY_TYPES, PACK_NAME, TOOL_HANDLERS, TOOL_SCHEMA_PLAN_STMTS};
+use crate::vocab::{
+    ENTITY_TYPES, PACK_NAME, TOOL_HANDLERS, TOOL_SCHEMA_COLUMN_ADDITIONS, TOOL_SCHEMA_PLAN_STMTS,
+};
 
 pub struct ToolPack {
     runtime: KhiveRuntime,
@@ -35,6 +39,7 @@ impl Pack for ToolPack {
         pack: PACK_NAME,
         statements: &TOOL_SCHEMA_PLAN_STMTS,
     });
+    const SCHEMA_COLUMN_ADDITIONS: &'static [PackColumnAddition] = &TOOL_SCHEMA_COLUMN_ADDITIONS;
 }
 
 struct ToolPackFactory;
@@ -90,6 +95,10 @@ impl PackRuntime for ToolPack {
             pack: PACK_NAME,
             statements: &TOOL_SCHEMA_PLAN_STMTS,
         }
+    }
+
+    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
+        <Self as Pack>::SCHEMA_COLUMN_ADDITIONS
     }
 
     async fn dispatch(
