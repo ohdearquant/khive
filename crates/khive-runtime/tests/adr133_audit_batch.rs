@@ -66,8 +66,7 @@ impl EventStore for FakeStore {
         Ok(BatchWriteSummary {
             attempted: n,
             affected: n,
-            failed: 0,
-            first_error: String::new(),
+            ..BatchWriteSummary::default()
         })
     }
     async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
@@ -450,6 +449,36 @@ async fn d1_supervisor_panic_fails_waiters_before_background_baseline() {
     assert_eq!(result, Err(AuditTerminalReason::DriverPanicked));
     let metrics = batch.metrics_snapshot();
     assert_eq!(metrics.flush_failures, 1);
+    assert!(
+        metrics.degraded,
+        "a flush failure leaves rows out of the audit trail, so the lifetime flag must read true"
+    );
+    assert_eq!(metrics.degraded_rows, 0);
+}
+
+#[serial]
+#[tokio::test]
+async fn d8_exhausted_commit_retries_set_the_lifetime_degraded_flag() {
+    let store = FakeStore::new();
+    store.fail_next.store(8, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::StoreFailure));
+    let metrics = batch.metrics_snapshot();
+    assert_eq!(metrics.flush_failures, 1);
+    assert!(
+        metrics.degraded,
+        "a generation that failed to flush leaves its rows out of the audit trail"
+    );
+    assert_eq!(
+        metrics.degraded_rows, 0,
+        "an obligation row released with an error is not a degraded pure-observability row"
+    );
 }
 
 #[serial]
@@ -586,6 +615,7 @@ async fn audit_delta_rejects_regressed_counters() {
         committed_rows: 5,
         store_batch_calls: 1,
         per_generation: vec![],
+        outstanding_abandoned_appends: 0,
     };
     let mut after = before.clone();
     after.submitted_rows = 4;
@@ -801,3 +831,11 @@ async fn admission_deadline_expired_row_stays_enqueued() {
 
     drop(occupant);
 }
+
+// `submit_until_resolved` is `pub(crate)` — only `khive-runtime`'s own
+// `pack.rs` call sites reach it, so it cannot be exercised directly from this
+// external test binary. Its `ResolutionDeadlineExpired` bound (khive#2331) is
+// covered end-to-end, through those call sites, by
+// `write_verb_gives_up_after_resolution_deadline_when_store_never_returns`
+// and `concurrent_write_verbs_all_give_up_after_resolution_deadline` in
+// `tests/read_verb_admission_exhaustion.rs`.

@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use khive_runtime::daemon::MAX_FRAME_BYTES;
 use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::blob::ContentRef;
-use khive_storage::BlobStore;
+use khive_storage::{BlobStore, UploadId};
+
+use crate::uploads::UploadManager;
 
 /// Ceiling on the size of any object this verb surface will hydrate into
 /// memory, on either the write path (`blob.put`'s decoded size) or the read
@@ -27,7 +29,7 @@ use khive_storage::BlobStore;
 /// bound is what makes put/get behavior backend-independent: an object this
 /// surface accepts against an `FsBlobStore` install must also fit through an
 /// `S3BlobStore` install without a surprise rejection on `put`.
-const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Reserve for the JSON envelope around `bytes` in a `blob.get` response
 /// (`content_ref`, `size`, `range`, field names, and braces/quoting) —
@@ -45,7 +47,16 @@ fn max_returnable_raw_bytes() -> u64 {
     frame_budget * 3 / 4
 }
 
-fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
+/// Room for upload call fields inside the request parser's ops string.
+pub const REQUEST_RESERVE: u64 = 8192;
+
+/// Maximum decoded part that fits the live parser and daemon frame budgets.
+pub fn max_request_part_raw_bytes() -> u64 {
+    let budget = khive_request::MAX_OPS_INPUT_LEN.min(MAX_FRAME_BYTES) as u64;
+    budget.saturating_sub(REQUEST_RESERVE) * 3 / 4
+}
+
+pub(crate) fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
     runtime.blob_store().ok_or_else(|| {
         RuntimeError::Unconfigured(
             "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
@@ -81,6 +92,98 @@ fn parse_content_ref(params: &Value, verb: &str) -> Result<ContentRef, RuntimeEr
     let raw = required_str(params, "content_ref", verb)?;
     ContentRef::from_hex(raw)
         .map_err(|e| RuntimeError::InvalidInput(format!("{verb}: invalid content_ref: {e}")))
+}
+
+fn parse_upload_id(params: &Value, verb: &str) -> Result<UploadId, RuntimeError> {
+    UploadId::from_hex(required_str(params, "upload_id", verb)?)
+        .map_err(|error| RuntimeError::InvalidInput(format!("{verb}: {error}")))
+}
+
+fn required_u64(params: &Value, field: &str, verb: &str) -> Result<u64, RuntimeError> {
+    params.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        RuntimeError::InvalidInput(format!("{verb}: {field} must be a non-negative integer"))
+    })
+}
+
+pub(crate) async fn handle_begin(
+    uploads: &UploadManager,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let size = required_u64(&params, "size", "blob.begin")?;
+    let reference = match params.get("content_ref") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(parse_content_ref(&params, "blob.begin")?),
+    };
+    uploads
+        .begin(
+            size,
+            reference,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
+        .await
+}
+
+pub(crate) async fn handle_put_part(
+    uploads: &UploadManager,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let id = parse_upload_id(&params, "blob.put_part")?;
+    let index = required_u64(&params, "index", "blob.put_part")?;
+    let b64 = params.get("bytes").and_then(Value::as_str).ok_or_else(|| {
+        RuntimeError::InvalidInput("blob.put_part requires \"bytes\" (base64)".into())
+    })?;
+    let limit = max_request_part_raw_bytes();
+    // Permit one extra decoded byte so the boundary is decided on raw
+    // length; bound larger inputs before allocating a decoded buffer.
+    if b64.len() as u64 > limit.saturating_mul(4) / 3 + 4 {
+        // Validate without allocating the oversized decoded object. Only
+        // the final quartet may contain padding; decode it with the same
+        // engine to check canonical padding bits and obtain the exact size.
+        let encoded = b64.as_bytes();
+        if encoded.len() % 4 != 0 {
+            return Err(RuntimeError::InvalidInput(
+                "blob.put_part: invalid base64 length".into(),
+            ));
+        }
+        let (prefix, suffix) = encoded.split_at(encoded.len() - 4);
+        if !prefix
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/'))
+        {
+            return Err(RuntimeError::InvalidInput(
+                "blob.put_part: invalid base64 alphabet or padding".into(),
+            ));
+        }
+        let mut tail = [0; 3];
+        let tail_len = BASE64.decode_slice(suffix, &mut tail).map_err(|error| {
+            RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
+        })?;
+        let decoded_len = (prefix.len() / 4 * 3 + tail_len) as u64;
+        return uploads.reject_oversized_part(&id, index, decoded_len).await;
+    }
+    let bytes = BASE64.decode(b64).map_err(|error| {
+        RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
+    })?;
+    uploads.put_part(&id, index, bytes).await
+}
+
+pub(crate) async fn handle_commit(
+    uploads: &UploadManager,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    uploads
+        .commit(&parse_upload_id(&params, "blob.commit")?)
+        .await
+}
+
+pub(crate) async fn handle_abort(
+    uploads: &UploadManager,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    uploads
+        .abort(&parse_upload_id(&params, "blob.abort")?)
+        .await
 }
 
 /// Strictly parse an optional `range` field into `(offset, length)`.

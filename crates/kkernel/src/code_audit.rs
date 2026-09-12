@@ -9,6 +9,8 @@
 //! `memory.remember`. Interpreting a signal as a defect is a separate,
 //! human-approved step outside this pipeline.
 
+use crate::sql::sql;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -194,109 +196,22 @@ pub struct AuditReport {
 
 const SCHEMA_VERSION: u32 = 1;
 
-// Every SQL query template this command runs against the read-only map
-// database. Kept as Rust string constants rather than `.sql` files: the
-// workspace's `lint-sql.sh` treats every `.sql` file outside the
-// `khive-db` migration chain as a standalone DDL fragment it replays into a
-// fresh in-memory database, which rejects query-only SQL that assumes an
-// existing `entities`/`graph_edges` schema.
-
-const SQL_PROJECT_NAMES: &str = "
-SELECT id, name FROM entities
-WHERE kind = 'project' AND deleted_at IS NULL
-ORDER BY name;
-";
-
-const SQL_INGEST_COVERAGE: &str = "
-SELECT id, name, properties FROM entities
-WHERE kind = 'project' AND deleted_at IS NULL
-ORDER BY name;
-";
-
-const SQL_MODULES_FOR_PROJECT: &str = "
-SELECT id, properties FROM entities
-WHERE entity_type = 'module' AND deleted_at IS NULL
-  AND json_extract(properties,'$.source_project') = ?1
-ORDER BY id;
-";
-
-const SQL_FAN_IN: &str = "
-SELECT e.source_id AS source_id, e.target_id AS target_id
-FROM graph_edges e
-JOIN entities t ON t.id = e.target_id
-WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL AND t.entity_type = 'module'
-ORDER BY e.target_id, e.source_id;
-";
-
-const SQL_MODULE_NAMES: &str = "
-SELECT id, name FROM entities WHERE entity_type = 'module' AND deleted_at IS NULL;
-";
-
-const SQL_PROJECT_EDGES: &str = "
-SELECT e.id AS id, e.source_id AS source_id, e.target_id AS target_id,
-       s.name AS source_name, t.name AS target_name, e.metadata AS metadata
-FROM graph_edges e
-JOIN entities s ON s.id = e.source_id
-JOIN entities t ON t.id = e.target_id
-WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
-  AND s.kind = 'project' AND t.kind = 'project'
-ORDER BY e.source_id, e.target_id, e.id;
-";
+const SQL_PROJECT_NAMES: &str = sql!("code_audit_projects_list");
+const SQL_INGEST_COVERAGE: &str = sql!("code_audit_projects_ingest_coverage");
+const SQL_MODULES_FOR_PROJECT: &str = sql!("code_audit_modules_for_project");
+const SQL_FAN_IN: &str = sql!("code_audit_module_edges_fan_in");
+const SQL_MODULE_NAMES: &str = sql!("code_audit_modules_list");
+const SQL_PROJECT_EDGES: &str = sql!("code_audit_project_edges");
 
 // `import` is the only evidence kind the import scanner emits; every other
 // `dependency_kinds` value is a manifest declaration section name (Cargo
 // sections, npm `devDependencies`/`peerDependencies`/`optionalDependencies`,
 // Python `optional-dependencies:<group>` — the group suffix is open-ended,
 // so declarations cannot be enumerated in a fixed allowlist).
-const SQL_MANIFEST_IMPORT_MISMATCH: &str = "
-SELECT e.id AS id, s.name AS source_name, t.name AS target_name
-FROM graph_edges e
-JOIN entities s ON s.id = e.source_id
-JOIN entities t ON t.id = e.target_id
-WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
-  AND EXISTS (
-    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value = 'import'
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value <> 'import'
-  )
-ORDER BY e.source_id, e.target_id, e.id;
-";
-
-const SQL_MODULE_EDGES: &str = "
-SELECT e.id AS id, e.source_id AS source_id, e.target_id AS target_id,
-       s.name AS source_name, t.name AS target_name
-FROM graph_edges e
-JOIN entities s ON s.id = e.source_id
-JOIN entities t ON t.id = e.target_id
-WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
-  AND s.entity_type = 'module' AND t.entity_type = 'module'
-ORDER BY e.source_id, e.target_id, e.id;
-";
-
-const SQL_ZERO_IN_EDGE: &str = "
-SELECT m.id AS id, m.name AS name,
-       json_extract(m.properties,'$.source_project') AS source_project
-FROM entities m
-WHERE m.entity_type = 'module' AND m.deleted_at IS NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM graph_edges e
-    WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL AND e.target_id = m.id
-  )
-ORDER BY m.name, m.id;
-";
-
-const SQL_DUPLICATE_CONTENT_HASH: &str = "
-SELECT json_extract(properties, '$.content_hash') AS content_hash,
-       group_concat(id) AS ids,
-       count(*) AS c
-FROM entities
-WHERE entity_type = 'module' AND deleted_at IS NULL
-  AND json_extract(properties, '$.content_hash') IS NOT NULL
-GROUP BY content_hash
-HAVING c > 1
-ORDER BY content_hash;
-";
+const SQL_MANIFEST_IMPORT_MISMATCH: &str = sql!("code_audit_manifest_import_mismatches");
+const SQL_MODULE_EDGES: &str = sql!("code_audit_module_edges");
+const SQL_ZERO_IN_EDGE: &str = sql!("code_audit_modules_without_in_edges");
+const SQL_DUPLICATE_CONTENT_HASH: &str = sql!("code_audit_modules_duplicate_content_hash");
 
 /// Every SQL query template this command runs, in a fixed order — hashed
 /// into `query_bundle_sha256` so a report can be tied back to the exact
@@ -370,7 +285,7 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     }
     let (policy, policy_bytes) = load_policy(&request.policy_path)?;
     let policy_sha256 = hex_sha256(&policy_bytes);
-    let query_bundle_sha256 = hex_sha256(QUERY_BUNDLE.concat().as_bytes());
+    let query_bundle_sha256 = query_bundle_sha256();
 
     let backend = StorageBackend::sqlite_read_only(&request.map_db).map_err(|e| {
         let msg = e.to_string();
@@ -554,7 +469,7 @@ const EDGES_METADATA_REQUIRED_COLUMNS: &[&str] = &["id", "metadata"];
 async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
     let table_rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT name FROM sqlite_master WHERE type='table'".to_string(),
+            sql: sql!("schema_tables_list").to_string(),
             params: vec![],
             label: Some("code-audit table inventory".to_string()),
         })
@@ -603,9 +518,14 @@ async fn inspect_schema(reader: &mut dyn SqlReader) -> Result<SchemaCaps> {
 }
 
 async fn table_columns(reader: &mut dyn SqlReader, table: &str) -> Result<BTreeSet<String>> {
+    let statement = match table {
+        "entities" => sql!("schema_entities_columns"),
+        "graph_edges" => sql!("schema_graph_edges_columns"),
+        _ => anyhow::bail!("unsupported code-audit schema table {table:?}"),
+    };
     let col_rows = reader
         .query_all(SqlStatement {
-            sql: format!("PRAGMA table_info({table})"),
+            sql: statement.to_string(),
             params: vec![],
             label: Some(format!("code-audit {table} column inventory")),
         })
@@ -1343,6 +1263,11 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn query_bundle_sha256() -> String {
+    let bundle = format!("\n{}\n", QUERY_BUNDLE.join("\n\n"));
+    hex_sha256(bundle.as_bytes())
+}
+
 fn render_markdown(report: &AuditReport) -> String {
     let mut out = String::new();
     out.push_str("# kkernel code-audit report\n\n");
@@ -1384,6 +1309,14 @@ mod tests {
     use std::path::Path;
 
     use khive_storage::{SqlWriter, StorageResult};
+
+    #[test]
+    fn query_bundle_hash_is_stable() {
+        assert_eq!(
+            query_bundle_sha256(),
+            "50b550789f13d5408752582015650d1fb805e23c4acb1803e9a9df1cd404c9ee"
+        );
+    }
 
     #[test]
     fn normalized_dependency_scopes_are_canonical_with_legacy_fallback() {

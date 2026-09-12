@@ -84,6 +84,47 @@ separate `request` calls or make that result the immediate predecessor.
 batches reject it. A failed chain operation prevents subsequent operations
 from running; completed operations are not rolled back.
 
+## Check syntax without executing
+
+Set `plan=true` on the MCP envelope to parse the same `ops` text and inspect
+the loaded verb catalog without dispatching any operation:
+
+```text
+request(ops="create(kind=\"note\", content=\"draft\") | get(id=$prev.id)", plan=true)
+```
+
+A successful parse returns `parsed: true`, `mode`, `stage_count`, and `stages`.
+Each stage reports its `index`, `verb`, `pack`, `known`, normalized `args`, and
+unresolved `prev_refs`. An unknown verb still parses, with `known: false` and
+`pack: null`. References stay as literal strings; paths in `prev_refs` retain
+the parser's representation. Both outcomes include `limits` with `max_ops`,
+`max_depth`, and `max_input_len` in bytes. A syntax error returns `parsed: false`
+and the ordinary parser error text, with no `stages`.
+
+Planning accepts `ops` alone. Supplying `presentation`, `presentation_per_op`,
+`format`, `format_per_op`, `save_to`, or `request_id` beside `plan=true`, even
+as `null`, produces `invalid_params` naming the field. A plan does not grant
+permission, check a lease, or guarantee that a reference will resolve.
+
+The CLI and Python client return the same object:
+
+```sh
+kkernel exec --plan 'create(kind="note", content="draft") | get(id=$prev.id)'
+```
+
+```python
+from khive import Session
+
+plan = Session().plan('create(kind="note", content="draft") | get(id=$prev.id)')
+```
+
+These two clients require an already-running daemon at protocol version 5 with
+matching configuration. The CLI accepts `--db` and `--config` to select that
+configuration. It exits successfully for either parse outcome; transport or
+envelope failures exit nonzero. It never starts a daemon or opens a local store
+for planning. Older daemons refuse the protocol version before dispatch, so a
+plan cannot silently execute as an ordinary request.
+
 ## Read the result envelope
 
 By default, `request` returns a `results` array and an aggregate `summary`
@@ -149,7 +190,7 @@ and its export-destination restriction.
 
 An invalid DSL string never reaches a verb handler. Lexing and parsing failures
 such as unterminated strings, malformed JSON, too many operations, or invalid
-use of `$prev` are reported by MCP as an `invalid_params` RPC error. Correct
+use of `$prev` are reported by ordinary MCP requests as an `invalid_params` RPC error. Correct
 the `ops` string and submit the request again.
 
 Once the DSL parses, validation or execution failures from an individual verb

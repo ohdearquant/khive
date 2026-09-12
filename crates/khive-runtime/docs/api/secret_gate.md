@@ -10,13 +10,17 @@ module doc-comment carries only a concise summary and points here.
 
 Allowlist (false-positive suppression) — **all of the following are prose-context exemptions,
 not unconditional passes: a credential trigger word in the surrounding window dominates, with
-exactly two narrow trigger-context exceptions (file paths and VCS revisions, defined below),
-both of which run only after the reconstruction checks and only outside credential-value syntax
-per the clause-label guard.** A UUID or a sha-prefixed content hash sitting directly beside
+narrow trigger-context exceptions for file paths, VCS revisions, and recognizable LaTeX fragments
+(defined below). The path and revision exceptions run only after the reconstruction checks and
+outside credential-value syntax; the LaTeX exception rejects credential-shaped inner runs and
+direct credential labels. Bare Git-length hex values use a separate line-local trigger rule,
+gated by the clause-label guard, which changes only which trigger context applies and never
+fragment reconstruction.** A UUID or a sha-prefixed content hash sitting directly beside
 "api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
 through to explicit detection instead of being silently allowed.
 
-- Pure hex strings (sha256, git SHA) — passed when not near a trigger.
+- Pure hex strings (sha256, git SHA) — passed when not near a trigger in their applicable context.
+  Bare 40-hex values use the line-local rule below; other lengths retain the cross-line window.
 - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
 - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI hashes, npm lockfile
   integrity) — passed when not near a trigger and not preceded by a known-vendor prefix. Bare
@@ -83,8 +87,11 @@ through to explicit detection instead of being silently allowed.
   credential-value syntax (see the clause-label guard below).
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
   marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
-  one token) is treated as a public VCS coordinate near a trigger word, again only outside
-  credential-value syntax. The exemption is a _flag over the hex-credential-shape checks only_,
+  one token), embedded as the revision segment of a canonical repository URL (`/blob/`, `/tree/`,
+  `/commit/`, or `/commits/`), or used as the exact value of an HTML `href` is treated as a public
+  VCS coordinate near a trigger word. URL and `href` forms are still refused when their immediate
+  field label is credential-shaped; ordinary marker forms retain the broader clause-label guard.
+  The exemption is a _flag over the hex-credential-shape checks only_,
   never an early skip of the whole check sequence. For the bare-marker form (`commit <hex>`) the
   exempt hex value is a plain alphanumeric token, so it still participates in fragment
   reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
@@ -98,8 +105,19 @@ through to explicit detection instead of being silently allowed.
   guard below disables the exemption and the shape checks fire directly. The bare marker word
   itself (form `commit <hex>`) is skipped entirely — a fixed English marker word is not
   attacker-controlled credential material. Generic `hash`/`sha256` prose does not rescue a token.
+- LaTeX fragments (trigger-context, narrow): dense mathematical notation is exempt only when the
+  token contains an alphabetic control sequence plus several structural LaTeX characters
+  (`\\`, braces, superscript, or subscript syntax). The exemption is refused when an immediate
+  field label names a credential, when a normalized credential-length hex value is present, or
+  when any embedded alphanumeric run is itself long and high-entropy. This admits formulas in
+  prose such as `key estimate uses \\operatorname{softmax}` without letting decorative LaTeX wrap
+  an opaque credential. Exact public RFC or vendor test-vector values deliberately remain
+  fail-closed when they have a blocked secret shape: publication alone is not mechanically
+  distinguishable from a live credential. Such corpora need a separate, audited exemption
+  contract or a human-reviewed ingestion path.
 
-Both narrow exemptions above are gated by a **clause-label guard** (`has_clause_credential_label`):
+The path and ordinary-marker VCS exemptions above are gated by a **clause-label guard**
+(`has_clause_credential_label`):
 the exemption is refused when the candidate carries an inline credential shape
 (`api_key=<value>`) or when a credential label is reachable by walking backwards through the
 current clause. The walk steps over connector words that commonly sit between a label and its
@@ -165,6 +183,19 @@ this value's label. The other accepted participle residual remains: `api key upd
 near-trigger rule. Ordering remains significant: `updated api key: <hex>` blocks because the walk
 meets the trigger first.
 
+The surrounding `near_trigger` scan still uses the bounded `TRIGGER_WINDOW`, but each side is
+trimmed to the candidate's current sentence before trigger matching. `;`, `!`, `?`, a blank line,
+or a period followed by a non-alphanumeric byte ends that context; a single newline deliberately
+does not, so the common assignment shape `api key:\n<value>` remains blocked. This prevents a
+detector name or other credential vocabulary in an earlier sentence from supplying trigger
+context to an unrelated identifier on a later line. Inline assignment/label checks on the
+candidate itself remain independent of the surrounding window.
+
+Caller guidance names those same effective boundaries: move a non-secret candidate into a
+separate sentence or paragraph, or express a source hash as an explicit commit/revision reference.
+It does not recommend merely moving a value to its own line because a single newline intentionally
+does not change the predicate.
+
 Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
 pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
@@ -200,6 +231,45 @@ credential-config compounds keep firing: `SECRET_KEY=...` (Django/Flask-style co
 `auth_token=...`, `session_secret_...`, `signing_key=...` all match on the `secret`/`key`/`auth`
 half. This is implemented by parameterizing the boundary rule (`contains_word`'s
 `underscore_is_word_char` argument) rather than sharing one rule between the two callers.
+
+## Bare Git-length hex context and refusal diagnostics (2026-09-10)
+
+A standalone token of exactly 40 ASCII hex digits after delimiter stripping uses its own physical
+line as trigger context,
+within the existing 120-byte radius on either side. CR, LF, and CRLF delimit lines. The radius is
+in bytes, snapped to UTF-8 boundaries, not 120 Unicode characters. The candidate itself remains
+excluded from context. A trigger on a different line does not label this bare value, with one
+conservative exception: the immediately preceding line contributes its trigger if its last
+non-whitespace character is `:` or `=`. Indentation and outer backticks around the value do not
+remove that association. A blank intervening line breaks it; a preceding line without a delimiter
+does not contribute. The existing radius still bounds the previous-line check.
+
+Examples: `auth changes`, then `ready`, then a bare 40-hex revision is allowed, as is a trigger
+more than 120 bytes away. Direct `sha:` / `commit` references retain their existing guarded
+exemption. `token: <40hex>` on one line and `token:` or `token=` followed immediately by a newline
+and the value remain blocked. Any genuine trigger on the same line still counts, including one
+after the value. Tokens with a `0x`/`0X` prefix do not qualify. An anchor with multiple fragments in the existing
+bounded bridge retains full-window context for checking and masking, so the line-local rule
+cannot leave one fragment visible. Bridgeability also crosses newlines and admits alphanumeric
+neighbors of at least eight characters, so `auth changes`, then `completed`, then a bare revision
+retains the conservative block: the line-local exception is for isolated candidates, and cannot
+classify a bridgeable neighbor as prose. Inline assignments, separator-bearing tokens, pure
+32/64/128-hex values, UUIDs, base64 values, provider prefixes and entropy thresholds retain their
+existing rules. A caller can therefore place a real bare 40-hex credential on a different line
+without an immediate delimited label and pass this heuristic; this is the explicit ambiguity
+tradeoff for unmarked Git revisions, not proof that an allowed value is public.
+
+The public `SecretMatch` includes `trigger: Option<&'static str>`. Layer-2 detections carry a
+canonical trigger selected by the same context helper used for detection; UUID diagnostics use
+the narrower credential-label predicate. Selection is deterministic: context before the token,
+then after it, then inline labels, then a previous-line assignment label; within a context the
+existing trigger-table order wins, not nearest distance. Compound labels may report their bare
+trigger component when that component matches the existing word-boundary rule. Only names from
+the closed trigger vocabulary are returned; no source window is copied. Known-prefix rules have
+no trigger. Caller-visible refusals name the detector and, when present, `near '<trigger>'`, then
+existing guidance. They show no candidate text, even its first six characters. The existing
+`masked` field remains a bounded internal excerpt; typed error classification and masking spans
+are unchanged. `check` and `mask_secrets` share the same detection context.
 
 ## find_prefix_token
 
@@ -256,6 +326,74 @@ needs:
 
 CJK/accented prose always counts as a boundary in both modes (only ASCII alphanumerics — plus
 underscore when `underscore_is_word_char` is `true` — are treated as word characters).
+
+## Named redaction surfaces
+
+ADR-115 Amendment 2 declares three permanent mask-only surfaces through the public
+`RedactionSurface` enum and `redaction_surface_contract`:
+
+- `GitIngest` stores masked commit/issue/pull-request entity and note fields.
+- `SessionMirror` stores masked `session_messages.text`, `session_messages.raw`, `sessions.cwd`,
+  `sessions.git_branch`, and `sessions.slug` projections — the latter covers every parsed
+  title/slug field (ChatGPT export `title`, Claude Code `slug`, claude.ai export `name`/`summary`),
+  not just the message body columns. `cwd`/`git_branch` are session-keyed, not message-keyed:
+  `session_messages` carries no columns of its own for them.
+- `McpDiagnostic` returns a bounded masked diagnostic and has no durable stored target. Backend
+  error message masking and backend-id/key masking both go through `mask_bounded`
+  (see [Bounded masking](#bounded-masking) below): the masker's own input is capped to
+  `MASK_WINDOW_CHARS` (4,096) BEFORE masking runs, not the full, untruncated text — cost scales with
+  the window, never with the caller's raw input length. A token straddling the window boundary,
+  including every fragment of a bridged multi-fragment credential chained to it, is dropped rather
+  than echoed unmasked; see [Bounded masking](#bounded-masking) for why. The kkernel coordinator's
+  pre-MCP diagnostic logging (`bounded_backend_cause_for_log`, `bounded_backend_id_for_log` in
+  `crates/kkernel/src/coordinator/dispatch.rs`) is also a named `McpDiagnostic` caller, applying the
+  same bounded-window masking before the same backend cause/id text reaches a log record ahead of
+  the MCP wire boundary.
+
+Each call site uses `mask_for_redaction_surface`. Every contract has mode `PermanentMaskOnly`, no
+stamp property, and no atomic exemption-success event. The wrapper has no manifest input and cannot
+return an exemption outcome. The Git and session surfaces persist only their masked values; MCP
+diagnostics are response data and are not durable records. Adding an admission mode is an ADR-level
+contract change, not a caller-selectable sensitivity option. `redaction_surface_contract` sources its
+`final_stored_target` strings from the `GIT_INGEST_STORED_TARGET` and `SESSION_MIRROR_STORED_TARGET`
+constants, and the contract test compares against those same constants rather than a second copy of
+the prose.
+
+## Bounded masking
+
+`mask_bounded(surface, text, window_chars, output_cap_chars)` is what every diagnostic-boundary
+caller (MCP backend error/key masking, the kkernel coordinator's pre-MCP logging) actually calls,
+not `mask_for_redaction_surface` directly. It caps the masker's own input to `window_chars` BEFORE
+masking runs — `MASK_WINDOW_CHARS` (4,096) for every current caller — so scan cost is bounded by the
+window regardless of the caller's raw input length, then caps the masked output to
+`output_cap_chars` (`output_cap_chars` is clamped to `window_chars` in every build, not just under
+`debug_assert!`, so a misconfigured call site cannot cap tighter than it windows).
+
+A window cut mid-token would let a masker that never saw the token's terminating shape emit the
+token's visible prefix unmasked, so any token straddling the boundary is dropped whole — back to
+the last whitespace inside the window — rather than masked. The same drop extends to a chain of
+`bridge_fragment_chain`-reconstructible fragments straddling the boundary, not just the one token
+touching it: the gap between two fragments is deliberately unbounded in byte length (see
+[Bridge fragment reconstruction](#bridge-fragment-reconstruction)), so no finite forward lookahead
+past the window can guarantee seeing every fragment of a chain that starts before the cut. Instead
+of scanning past the boundary, `mask_bounded` walks BACKWARD from it — over data already inside the
+window, so this adds no lookahead and stays bounded by `window_chars` alone — dropping every further
+bridge-fragment-shaped token chained to the one already removed, within the same
+`MAX_BRIDGE_FRAGMENTS`/`MAX_BRIDGE_GLUE_TOKENS` budgets `bridge_fragment_chain` itself uses.
+
+This walk runs on every truncated window, regardless of whether the window itself carries
+trigger-word context. The entropy detector's own bridge reconstruction (see
+[Bridge fragment reconstruction](#bridge-fragment-reconstruction)) admits a trigger word from either
+side of a fragment chain, so a credential such as `<frag> <frag> <frag> is the api key for ...` is
+reconstructed and masked by the unbounded masker even though its only trigger sits after the last
+fragment. A window cut inside that fragment chain may never contain the trigger at all — it can sit
+past the boundary, in text `mask_bounded` has already decided to discard — so gating the backward
+walk on an in-window trigger check leaves exactly that case unprotected: no visible trigger, no
+walk, and any whole fragments already read into the window leak. The walk cannot distinguish a
+genuine chained fragment from an unrelated fragment-shaped word sitting at the tail of an
+untriggered window either; the trade this makes is dropping that word too rather than risking a
+leaked credential fragment. The cost is bounded: at most `MAX_BRIDGE_FRAGMENTS - 1` tokens of a tail
+that `mask_bounded` has already decided to truncate.
 
 ## mask_secrets
 
@@ -318,7 +456,8 @@ For each token, in order:
    which require an exact shape match. This is a small bounded iteration over separator positions
    in one token, not an allocation-heavy scan. Off-trigger, a UUID or content hash is allowlisted
    outright.
-2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests). Trigger-adjacent hex
+2. **Pure hex off-trigger** is allowlisted (git SHA, checksum digests), using the line-local rule
+   above for bare 40-hex values. Trigger-adjacent hex
    requires an explicit VCS coordinate marker (`commit`, `revision`, `rev`, `sha`) to earn the
    same exemption, and only when the surrounding clause carries no credential label (`api key
    value is commit <hex>` is a labeled credential wearing a marker, not a VCS citation). The
@@ -345,7 +484,10 @@ For each token, in order:
    credential hex payload split into multiple runs each individually below `MIN_ENTROPY_LEN`
    (e.g. two 20-char hex runs joined by `/`). Concatenating consecutive pure-hex runs (dropping
    separators) and re-checking the combined length against `HEX_CREDENTIAL_LENGTHS` closes this
-   without widening the allowlist.
+   without widening the allowlist. `normalized_hex_credential_span` returns the corresponding
+   raw span from the first contributing hex run through the last, so the masked excerpt and
+   redaction are derived from the matched candidate rather than a nearby token used to anchor the
+   reconstruction.
 6. **Multi-fragment bridge (issue #1062, Unicode variant).** A non-ASCII separator (e.g. U+200B)
    is a tokenizer delimiter, so it splits the payload into separate tokens instead of leaving it
    inside one — the concatenation check above never sees the halves together. Bridging only one
@@ -375,11 +517,11 @@ For each token, in order:
    being residual. See the `allows_seven_way_hex_split_beyond_fragment_cap_documented_limitation`
    and `allows_six_way_sub_floor_hex_split_documented_limitation` tests.
 
-   The bridged chain is checked two ways: `contains_normalized_hex_credential` over fragments
-   joined by a plain space (a non-alphanumeric separator, so it accumulates only genuinely
-   adjacent hex runs the same way it does for one token's internal `/`-split runs), and
-   separately the fragments concatenated WITHOUT a separator against the same whole-token entropy
-   decision a single-token high-entropy candidate must clear — this catches a
+   The bridged chain is checked two ways: `normalized_hex_credential_span` over the raw text from
+   the first real fragment through the last (non-alphanumeric gaps separate runs, and a non-hex
+   alphanumeric run resets accumulation), and separately the fragments concatenated WITHOUT a
+   separator against the same whole-token entropy decision a single-token high-entropy candidate
+   must clear — this catches a
    base64/base64url-shaped credential split by the same delimiter mechanism, which isn't pure hex
    so the hex-length check alone misses it. A vcs-exempt anchor skips reconstruction from itself
    (else the chain would re-accumulate the anchor's own legitimate 40-hex and re-flag every

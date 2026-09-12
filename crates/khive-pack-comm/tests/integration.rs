@@ -1065,6 +1065,8 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id: uuid_a,
             namespace: ns.clone(),
             kind: "message".into(),
@@ -1084,6 +1086,8 @@ async fn test_short_id_collision_errors_clearly() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id: uuid_b,
             namespace: ns.clone(),
             kind: "message".into(),
@@ -1546,6 +1550,8 @@ async fn test_reply_marks_directionless_legacy_original() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
             kind: "message".into(),
@@ -1605,6 +1611,8 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
 
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: token.namespace().as_str().to_string(),
             kind: "message".into(),
@@ -2161,6 +2169,72 @@ async fn t87_non_addressee_read_rejected_and_stays_unread() {
         Some(true),
         "#87: addressee read must return read:true; got {ok}"
     );
+}
+
+/// #2564: a third party who asks by 8-char prefix must not learn the resolved
+/// uuid from the refusal. The prefix is the caller's own input; the remaining 28
+/// characters are not, and printing them confirms both that a message exists and
+/// exactly which one.
+#[tokio::test]
+async fn issue2564_third_party_refusal_does_not_disclose_the_resolved_id() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (_registry_b, rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "for B's eyes only" }),
+        )
+        .await
+        .expect("A sends to B");
+
+    let local_tok = rt_b.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt_b
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let inbound_id = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .map(|n| n.id.as_hyphenated().to_string())
+        .expect("inbound copy addressed to lambda:b must exist");
+    let prefix = inbound_id[..8].to_string();
+    let tail = inbound_id[8..].to_string();
+
+    for verb in ["comm.read", "comm.reply"] {
+        let mut args = serde_json::json!({ "id": prefix });
+        if verb == "comm.reply" {
+            args["content"] = serde_json::json!("attempted reply");
+        }
+        let error = registry_c
+            .dispatch(verb, args)
+            .await
+            .expect_err("#2564: a third party must be refused")
+            .to_string();
+        assert!(
+            !error.contains(&tail),
+            "#2564: {verb} refusal must not disclose the resolved uuid; got {error:?}"
+        );
+        assert!(
+            !error.contains(&inbound_id),
+            "#2564: {verb} refusal must not print the full id; got {error:?}"
+        );
+        assert!(
+            error.contains("lambda:c")
+                && !error.contains("lambda:a")
+                && !error.contains("lambda:b"),
+            "#2564: the refusal names only the caller's own actor; got {error:?}"
+        );
+    }
 }
 
 /// The anonymous/"local" single-actor deployment (no actor.id configured) must keep working: caller and to_actor both resolve to "local", so the equality check passes.
@@ -3537,6 +3611,9 @@ fn build_crossns_registry(
     allowed_outbound: Vec<Namespace>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -3552,6 +3629,7 @@ fn build_crossns_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: allowed_outbound,
         actor_id: None,
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4479,6 +4557,9 @@ fn build_actor_registry(
     actor_id: &str,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4494,6 +4575,7 @@ fn build_actor_registry(
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor_id.to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4775,6 +4857,9 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
 
     let backend = shared_backend();
     let config = RuntimeConfig {
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4790,6 +4875,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some("lambda:tenant-x".to_string()),
+        exec: Default::default(),
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -4892,6 +4978,9 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 
     // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
     let config_anon = RuntimeConfig {
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -4907,6 +4996,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None, // anonymous
+        exec: Default::default(),
     };
     let rt_anon = KhiveRuntime::from_backend(backend, config_anon);
     let mut builder_anon = VerbRegistryBuilder::new();
@@ -5898,6 +5988,8 @@ async fn ingest_routing_reply_routes_to_original_sender() {
         let now = chrono::Utc::now().timestamp_micros();
         let thread_uuid = uuid::Uuid::new_v4();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -5961,6 +6053,8 @@ async fn ingest_routing_reply_correlates_bracket_free_in_reply_to() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6082,6 +6176,8 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6154,6 +6250,8 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = khive_storage::note::Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -6267,6 +6365,8 @@ async fn plant_message_note(
     let now = chrono::Utc::now().timestamp_micros();
     let id = uuid::Uuid::new_v4();
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: "local".into(),
         kind: "message".into(),
@@ -7090,6 +7190,8 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let note = Note {
+            version: 1,
+            key: None,
             id: outbound_id,
             namespace: "local".into(),
             kind: "message".into(),
@@ -7182,6 +7284,8 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: root_id,
                 namespace: "local".into(),
                 kind: "message".into(),
@@ -7209,6 +7313,8 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
             .expect("seed legacy outbound root");
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: legacy_child_id,
                 namespace: "local".into(),
                 kind: "message".into(),
@@ -7406,6 +7512,8 @@ async fn thread_includes_root_message_without_thread_id_property() {
         let store = rt.notes(&token).expect("notes store");
         let now = chrono::Utc::now().timestamp_micros();
         let root_note = Note {
+            version: 1,
+            key: None,
             id: root_id,
             namespace: "local".into(),
             kind: "message".into(),
@@ -7428,6 +7536,8 @@ async fn thread_includes_root_message_without_thread_id_property() {
         store.upsert_note(root_note).await.expect("upsert root");
 
         let child_note = Note {
+            version: 1,
+            key: None,
             id: uuid::Uuid::new_v4(),
             namespace: "local".into(),
             kind: "message".into(),
@@ -7891,6 +8001,8 @@ async fn plant_healthy_channel_rows(rt: &KhiveRuntime, count: usize) {
         .map(|index| {
             let slug = format!("heartbeat-{index:03}");
             Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
                 kind: "channel_health".to_string(),
@@ -8136,6 +8248,8 @@ async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
         let now = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: "local".to_string(),
                 kind: "channel_health".to_string(),
@@ -8447,6 +8561,8 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
             let store = rt.notes(&token).expect("notes store");
             let now = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
+                key: None,
                 id: uuid::Uuid::new_v4(),
                 namespace: ns.to_string(),
                 kind: "channel_health".to_string(),
@@ -8971,6 +9087,8 @@ async fn insert_thread_message(
     let store = rt.notes(&token).expect("notes store");
     store
         .upsert_note(khive_storage::note::Note {
+            version: 1,
+            key: None,
             id,
             namespace: ns.to_string(),
             kind: "message".into(),
@@ -10515,6 +10633,8 @@ async fn insert_i1422_message(
     }
     store
         .upsert_note(Note {
+            version: 1,
+            key: None,
             id,
             namespace: "local".to_string(),
             kind: "message".to_string(),
@@ -11108,7 +11228,9 @@ async fn i1387_atomic_mark_read_reuses_addressee_validation_before_mutation() {
         .await
         .expect_err("A cannot mark B's inbound delivery state");
     let error = error.to_string();
-    assert!(error.contains("read: message"));
+    // #2564 reworded this refusal so it no longer echoes the resolved id; the
+    // assertion still pins the error to the read-path addressee check.
+    assert!(error.contains("read: that message is not addressed"));
     assert!(error.contains("lambda:a"));
     assert!(!error.contains("lambda:b"));
 
@@ -13118,4 +13240,132 @@ async fn sent_box_long_poll_wakes_after_concurrent_send() {
         Some("send wakes the sent box")
     );
     assert_eq!(sent["messages"][0]["direction"].as_str(), Some("outbound"));
+}
+
+/// khive#2390: `query_inbox_response`'s `has_post_filter` branch (any of
+/// `from_prefix` / `exclude_from_actor` / `before` / `subject_contains` /
+/// `content_contains`) used to re-issue its internal store fetch with a
+/// growing `OFFSET` on every iteration, re-walking every earlier row on
+/// every page. It now carries a `(created_at, id)` keyset cursor between
+/// iterations instead. 300 messages, one in six rejected by `from_prefix`,
+/// forces at least two internal 200-row store fetches to collect the 250
+/// accepted matches, exercising the cursor handoff across that boundary.
+/// This pins the observable contract the rewrite must not change: the same
+/// rows, in the same order, with the same `has_more`/`next_offset`
+/// bookkeeping a naive offset scan would have produced.
+#[tokio::test]
+async fn i2390_inbox_post_filter_keyset_paging_matches_offset_semantics_beyond_page_cap() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let base_micros = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+
+    // Every 6th sequence is rejected by `from_prefix`; the rest match. Newer
+    // (higher) sequences get a later `created_at`, so the default
+    // `created_at DESC` order lists sequence 300 first (if accepted) down to 1.
+    let mut expected_accepted_desc: Vec<u32> = Vec::new();
+    for sequence in 1..=300u32 {
+        let accepted = sequence % 6 != 0;
+        let from_actor = if accepted {
+            format!("team:accept:{sequence}")
+        } else {
+            format!("team:reject:{sequence}")
+        };
+        insert_i1422_message(
+            &runtime,
+            sequence,
+            base_micros + i64::from(sequence) * 1_000_000,
+            &from_actor,
+            "lambda:reader",
+            None,
+            &format!("message {sequence}"),
+        )
+        .await;
+        if accepted {
+            expected_accepted_desc.push(sequence);
+        }
+    }
+    expected_accepted_desc.reverse();
+    assert_eq!(expected_accepted_desc.len(), 250);
+
+    let expected_id = |sequence: u32| {
+        uuid::Uuid::from_u128((u128::from(sequence) << 96) | u128::from(sequence)).to_string()
+    };
+
+    let expected_all: Vec<String> = expected_accepted_desc
+        .iter()
+        .map(|s| expected_id(*s))
+        .collect();
+
+    // One call at the caller-visible limit cap (200) forces the internal
+    // loop to fetch a full PAGE_SIZE=200 batch of raw rows -- containing a
+    // mix of accepted and rejected messages -- and keep going past it to
+    // fill the requested 200 accepted matches, exercising the cursor
+    // handoff between store fetches. This alone would have caught an
+    // off-by-one there.
+    let all = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 200, "from_prefix": "team:accept:" }),
+        )
+        .await
+        .expect("wide post-filtered inbox succeeds");
+    let all_ids: Vec<String> = all["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|m| m["full_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        all_ids,
+        expected_all[..200],
+        "post-filtered listing must return exactly the accepted rows, in created_at DESC order"
+    );
+    assert_eq!(all["has_more"], true);
+    assert_eq!(all["next_offset"], 200);
+
+    // Now the same population, paged externally in chunks of 100, must
+    // reproduce the identical partition an offset-based scan would have
+    // produced -- including the exact `has_more` boundary.
+    let mut collected: Vec<String> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({
+                    "status": "all",
+                    "limit": 100,
+                    "from_prefix": "team:accept:",
+                    "offset": offset,
+                }),
+            )
+            .await
+            .expect("paged post-filtered inbox succeeds");
+        let page_ids: Vec<String> = page["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["full_id"].as_str().unwrap().to_string())
+            .collect();
+        let expected_slice = &expected_all[collected.len()..(collected.len() + page_ids.len())];
+        assert_eq!(
+            page_ids, expected_slice,
+            "page at offset={offset} must match the corresponding offset-paging slice"
+        );
+        assert_eq!(page["offset"], offset);
+        collected.extend(page_ids);
+
+        let has_more = page["has_more"].as_bool().expect("has_more is a bool");
+        if !has_more {
+            assert!(page["next_offset"].is_null());
+            break;
+        }
+        offset = page["next_offset"].as_u64().expect("next_offset present");
+    }
+    assert_eq!(
+        collected, expected_all,
+        "paging in 100-row chunks must reassemble the exact same total order as one wide call"
+    );
 }

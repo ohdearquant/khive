@@ -1,6 +1,6 @@
 """Direct coverage for the transport-shared envelope normalization functions
 in `khive.envelope` — decoding, envelope-shape rejection, minimal aborted
-entries, per-entry `OpResult` validation, and per-op error flattening."""
+entries, per-entry `OpResult` validation, and per-op error preservation."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from khive.envelope import (
     _decode_json_text,
     _envelope_from_payload,
     _is_minimal_aborted_entry,
-    _stringify_op_errors,
     _validate_envelope_results,
+    _validate_op_errors,
 )
 from khive.errors import TransportError
 
@@ -103,50 +103,50 @@ def test_validate_envelope_results_rejects_entry_missing_tool():
         _validate_envelope_results({"results": [{"ok": True}]}, _SENTINEL_URL)
 
 
-def test_stringify_op_errors_code_and_message():
+def test_validate_op_errors_code_and_message():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": "x", "message": "m"}}]}
-    out = _stringify_op_errors(envelope, "url")
-    assert out["results"][0]["error"] == "x: m"
+    out = _validate_op_errors(envelope, "url")
+    assert out["results"][0]["error"] == {"code": "x", "message": "m"}
 
 
-def test_stringify_op_errors_message_only():
+def test_validate_op_errors_message_only():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"message": "m"}}]}
-    out = _stringify_op_errors(envelope, "url")
-    assert out["results"][0]["error"] == "m"
+    out = _validate_op_errors(envelope, "url")
+    assert out["results"][0]["error"] == {"message": "m"}
 
 
-def test_stringify_op_errors_non_string_code_raises():
+def test_validate_op_errors_non_string_code_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": 1, "message": "m"}}]}
     with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
-        _stringify_op_errors(envelope, _SENTINEL_URL)
+        _validate_op_errors(envelope, _SENTINEL_URL)
 
 
-def test_stringify_op_errors_non_string_message_raises():
+def test_validate_op_errors_non_string_message_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": "x", "message": 1}}]}
     with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
-        _stringify_op_errors(envelope, _SENTINEL_URL)
+        _validate_op_errors(envelope, _SENTINEL_URL)
 
 
-def test_stringify_op_errors_missing_message_raises():
+def test_validate_op_errors_missing_message_raises():
     envelope = {"results": [{"ok": False, "tool": "v", "error": {"code": "x"}}]}
     with pytest.raises(TransportError, match=f"{re.escape(_SENTINEL_URL)}.*index 0"):
-        _stringify_op_errors(envelope, _SENTINEL_URL)
+        _validate_op_errors(envelope, _SENTINEL_URL)
 
 
-def test_stringify_op_errors_non_dict_envelope_returned_unchanged():
-    assert _stringify_op_errors([1, 2, 3], "url") == [1, 2, 3]
-    assert _stringify_op_errors(None, "url") is None
+def test_validate_op_errors_non_dict_envelope_returned_unchanged():
+    assert _validate_op_errors([1, 2, 3], "url") == [1, 2, 3]
+    assert _validate_op_errors(None, "url") is None
 
 
-def test_stringify_op_errors_skips_non_dict_entry():
+def test_validate_op_errors_skips_non_dict_entry():
     envelope = {"results": [42, "also-not-a-dict"]}
-    out = _stringify_op_errors(envelope, "url")
+    out = _validate_op_errors(envelope, "url")
     assert out["results"] == [42, "also-not-a-dict"]
 
 
-def test_stringify_op_errors_leaves_string_error_alone():
+def test_validate_op_errors_leaves_string_error_alone():
     envelope = {"results": [{"ok": False, "tool": "v", "error": "already a string"}]}
-    out = _stringify_op_errors(envelope, "url")
+    out = _validate_op_errors(envelope, "url")
     assert out["results"][0]["error"] == "already a string"
 
 
@@ -161,7 +161,7 @@ def test_chain_abort_envelope_through_both_steps():
             {"ok": False, "aborted": True},
         ]
     }
-    stringified = _stringify_op_errors(envelope, "url")
-    validated = _validate_envelope_results(stringified, "url")
+    checked = _validate_op_errors(envelope, "url")
+    validated = _validate_envelope_results(checked, "url")
     assert validated["results"][1] == {"ok": False, "aborted": True, "tool": ""}
-    assert validated["results"][0]["error"] == "unknown_verb: no such verb"
+    assert validated["results"][0]["error"] == {"code": "unknown_verb", "message": "no such verb"}

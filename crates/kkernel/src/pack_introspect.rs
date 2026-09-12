@@ -1,7 +1,7 @@
 //! `kkernel pack list` and `kkernel pack handler` — introspection over
 //! registered packs.
 //!
-//! Both subcommands operate on a `VerbRegistry` built from the active pack
+//! Both subcommands operate on a `PackMetadataRegistry` built from the discoverable pack
 //! set. They return data — JSON for machines, a table for humans — without
 //! invoking any handler.
 //!
@@ -9,7 +9,7 @@
 //! module consumes whatever is registered and prints it.
 
 use anyhow::{anyhow, Context, Result};
-use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder, Visibility};
+use khive_runtime::pack::{PackMetadataRegistry, PackRegistry, VerbRegistryBuilder, Visibility};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde::Serialize;
 
@@ -72,7 +72,7 @@ pub struct PackInfo {
 /// without any security benefit — an operator must be able to introspect a
 /// strict-mode deployment. See `enforce_strict_actor_mode` in
 /// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
-fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
+fn build_registry() -> Result<(PackMetadataRegistry, KhiveRuntime)> {
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-introspect")
@@ -88,11 +88,11 @@ fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
         .collect();
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow!("pack {n:?} declared in inventory but factory missing"))?;
-    let registry = builder.build().context("building VerbRegistry")?;
+    let registry = builder.build_metadata().context("building pack metadata")?;
     Ok((registry, runtime))
 }
 
-fn pack_info_from_registry(registry: &VerbRegistry, name: &str) -> Option<PackInfo> {
+fn pack_info_from_registry(registry: &PackMetadataRegistry, name: &str) -> Option<PackInfo> {
     // pack_verbs returns None if name isn't registered — gate everything off it.
     let verbs = registry.pack_verbs(name)?;
     Some(PackInfo {
@@ -152,8 +152,185 @@ pub fn pack_handler(name: &str) -> Result<Option<PackInfo>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{build_registry, list_packs, pack_handler, VerbInfo, VerbVisibility};
     use serial_test::serial;
+
+    /// Every MCP-callable verb must publish a real `input_schema`.
+    ///
+    /// `params[].type` is a documentation string in eighteen spellings, most of
+    /// which are not JSON Schema types, so a bridged model has nothing it can
+    /// parse unless a schema is published beside it. Before the derivation only
+    /// the git pack published one.
+    #[test]
+    #[serial]
+    fn every_callable_verb_publishes_an_input_schema() {
+        let (registry, _runtime) = build_registry().expect("introspection registry");
+        // `all_verbs_with_names` pairs each handler with its PACK's name, so
+        // the verb name comes off the handler itself.
+        let callable: Vec<&str> = registry
+            .all_verbs()
+            .into_iter()
+            .filter(|h| !matches!(h.visibility, khive_types::Visibility::Subhandler))
+            .map(|h| h.name)
+            .collect();
+        assert!(
+            !callable.is_empty(),
+            "no callable verbs found: the registry is empty and this test would \
+             otherwise pass by having nothing to check"
+        );
+
+        let mut missing = Vec::new();
+        for verb in &callable {
+            let help = registry.describe_verb(verb).expect("describe_verb");
+            if help["input_schema"]["type"] != serde_json::json!("object") {
+                missing.push(*verb);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} callable verbs publish no object input_schema: {:?}",
+            missing.len(),
+            callable.len(),
+            missing
+        );
+    }
+
+    /// The spelling map is total over what the tree actually declares.
+    ///
+    /// This is the arm that fires the day someone adds a nineteenth spelling.
+    /// The map has no wildcard arm on purpose: a default would silently give a
+    /// new spelling whatever the fallback happened to be, which rebuilds the
+    /// defect one verb at a time instead of all at once.
+    #[test]
+    #[serial]
+    fn every_declared_param_spelling_maps_to_a_schema_type() {
+        let (registry, _runtime) = build_registry().expect("introspection registry");
+        let mut declared = 0usize;
+        let mut unmapped: Vec<String> = Vec::new();
+        for handler in registry.all_verbs() {
+            for param in handler.params {
+                declared += 1;
+                if khive_runtime::input_schema::json_schema_type(param.param_type).is_none() {
+                    unmapped.push(format!(
+                        "{}.{} = {:?}",
+                        handler.name, param.name, param.param_type
+                    ));
+                }
+            }
+        }
+        assert!(
+            declared > 0,
+            "no parameters were declared anywhere: the walk found nothing and \
+             an empty population cannot certify a total map"
+        );
+        assert!(
+            unmapped.is_empty(),
+            "{} declared parameters have no schema mapping (of {declared}): {unmapped:?}",
+            unmapped.len()
+        );
+    }
+
+    /// The vocabulary is closed: one spelling per type, and the exact set is
+    /// written down here.
+    ///
+    /// The test above asks whether every spelling maps to something. This one
+    /// asks the harder question, whether the set is the one we meant, and it
+    /// fails in both directions. A new spelling shows up in `unexpected`; a
+    /// spelling that stops being declared shows up in `retired`. The second half
+    /// is the load-bearing one: without it a duplicate can be reintroduced the
+    /// moment someone renames the last site that used the survivor, which is how
+    /// two spellings of boolean came to live in the same verb.
+    ///
+    /// Five entries below are not scalar type names and are deliberately left
+    /// as they are rather than renamed into the list: `array` declares no element
+    /// type, `JSON value` declares no type at all, and `object or array of
+    /// object`, `string | array<string>` and `string|null` are unions. Each of
+    /// them needs a decision about the parameter rather than a rename, so they
+    /// are recorded as the remainder instead of being quietly regularised.
+    #[test]
+    #[serial]
+    fn the_param_type_vocabulary_is_closed_to_one_spelling_per_type() {
+        const DECLARED: &[&str] = &[
+            "JSON value",
+            "array",
+            "array of object",
+            "array of string",
+            "array of uuid",
+            "boolean",
+            "integer",
+            "number",
+            "object",
+            "object or array of object",
+            "string",
+            "string | array<string>",
+            "string|null",
+            "uuid",
+        ];
+
+        let (registry, _runtime) = build_registry().expect("introspection registry");
+        let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        let mut declared = 0usize;
+        for handler in registry.all_verbs() {
+            for param in handler.params {
+                declared += 1;
+                seen.insert(param.param_type);
+            }
+        }
+        assert!(
+            declared > 0,
+            "no parameters were declared anywhere: an empty population cannot \
+             certify a closed vocabulary"
+        );
+
+        let expected: std::collections::BTreeSet<&str> = DECLARED.iter().copied().collect();
+        let unexpected: Vec<&str> = seen.difference(&expected).copied().collect();
+        let retired: Vec<&str> = expected.difference(&seen).copied().collect();
+        assert!(
+            unexpected.is_empty(),
+            "undeclared parameter type spellings are in use (of {declared} declarations): \
+             {unexpected:?}. Add the spelling to DECLARED only after checking it is not \
+             another way to write one already there"
+        );
+        assert!(
+            retired.is_empty(),
+            "DECLARED lists spellings nothing declares any more: {retired:?}. Remove them \
+             here and from the schema map, so the map stays total over what exists"
+        );
+    }
+
+    /// A derived schema must not reject a call the dispatcher accepts.
+    ///
+    /// `help` is accepted on every verb and `namespace` is resolved for every
+    /// verb whether or not it is declared, so a derived schema that closed
+    /// `additionalProperties` would turn working calls into driver-side
+    /// refusals. The git pack's hand-authored schemas DO close it, correctly,
+    /// because they enumerate their own surface; that contrast is the control
+    /// here, and it also proves a pack-supplied schema still wins.
+    #[test]
+    #[serial]
+    fn derived_schemas_stay_open_while_authored_ones_keep_their_own_shape() {
+        let (registry, _runtime) = build_registry().expect("introspection registry");
+
+        let authored = registry.describe_verb("git.push").expect("git.push help");
+        assert_eq!(
+            authored["input_schema"]["additionalProperties"],
+            serde_json::json!(false),
+            "the git pack's hand-authored schema must be published unchanged"
+        );
+
+        let derived = registry.describe_verb("get").expect("get help");
+        assert_eq!(
+            derived["input_schema"]["additionalProperties"],
+            serde_json::json!(true),
+            "a derived schema must stay open: it describes the declarations, not \
+             the full set of arguments dispatch accepts"
+        );
+        assert_eq!(
+            derived["input_schema"]["properties"]["help"]["type"],
+            serde_json::json!("boolean"),
+            "every derived schema declares help, which every verb accepts"
+        );
+    }
 
     /// Regression: introspection registry construction MUST succeed under
     /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` with the `comm` pack registered and
@@ -198,6 +375,16 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_metadata_requires_no_declared_carrier() {
+        let (registry, runtime) = build_registry().expect("metadata does not activate telemetry");
+        assert_eq!(runtime.config().telemetry.default_carrier, None);
+        assert_eq!(registry.pack_requires("telemetry"), Some(&["kg"][..]));
+        assert!(registry.has_verb("telemetry.emit"));
+        assert!(registry.describe_verb("telemetry.channels").is_ok());
+        assert!(registry.has_verb("stream.read"));
+    }
+
+    #[test]
     fn list_packs_returns_at_least_kg() {
         let packs = list_packs().expect("list_packs succeeds");
         assert!(!packs.is_empty(), "at least one pack must register");
@@ -219,13 +406,15 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 20 verbs: 11 base + propose/review/withdraw (3) + verbs
+        // kg pack ships 24 verbs: 11 base + propose/review/withdraw (3) + verbs
         // + stats (2) + context (1, ADR-089) + resolve (1) + whoami (1)
-        // + db_diagnostics (1, ADR-091)
+        // + db_diagnostics (1, ADR-091) + stream.append/read/stat/batch (4,
+        // ADR-174 section 2 and Amendment 1: registered by kg because the
+        // entries are its notes)
         assert_eq!(
             info.verbs.len(),
-            20,
-            "kg pack must expose 20 verbs; got {}: {:?}",
+            24,
+            "kg pack must expose 24 verbs; got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );

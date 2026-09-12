@@ -711,6 +711,72 @@ async fn query_events_filters_by_observed() {
 }
 
 #[tokio::test]
+async fn link_events_project_edge_referents_and_observed_matches_any_role() {
+    let store = setup_memory_store();
+    let edge_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_id,
+        "mutation": "created"
+    }));
+    let event_id = event.id;
+    store.append_event(event).await.unwrap();
+
+    for observed in [source_id, target_id, edge_id] {
+        let page = store
+            .query_events(
+                EventFilter {
+                    observed: vec![observed],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, event_id);
+    }
+
+    let pool = Arc::clone(&store.pool);
+    let edge_id = edge_id.to_string();
+    let row = tokio::task::spawn_blocking(move || {
+        let guard = pool.reader().unwrap();
+        guard
+            .conn()
+            .query_row(
+                "SELECT referent_kind, role, position FROM event_observations \
+                 WHERE event_id = ?1 AND entity_id = ?2",
+                rusqlite::params![event_id.to_string(), edge_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(row, ("edge".to_string(), "target".to_string(), 2));
+}
+
+#[tokio::test]
 async fn query_events_filters_by_selected() {
     let store = setup_memory_store();
     let entity_id = Uuid::new_v4();

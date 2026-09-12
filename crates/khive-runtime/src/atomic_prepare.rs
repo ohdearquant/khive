@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
-use khive_storage::{AttachmentSubstrate, EdgeRelation, SqlStatement};
+use khive_storage::{AttachmentSubstrate, EdgeRelation, EdgeUpsertDisposition, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -45,14 +45,14 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{
-    edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
+    edge_hard_delete_statement, edge_insert_new_guarded_by_endpoints_statement,
+    edge_link_replace_if_unchanged_and_endpoints_exist_statement,
     edge_replace_if_unchanged_statement, edge_soft_delete_statement,
     edge_symmetric_absorb_or_update_inplace_statement, edge_symmetric_delete_if_conflict_statement,
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
-    note_hard_delete_statement, note_replace_if_unchanged_statement, note_soft_delete_statement,
-    note_upsert_statement,
+    note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
 };
 use khive_db::stores::text::{delete_document_statements, insert_document_statements};
 
@@ -401,8 +401,9 @@ async fn push_index_purge_statements(
 /// lifecycle event after their row mutation: `update_entity` ->
 /// `EntityUpdated`, `delete_entity` -> `EntityDeleted`, `delete_note` ->
 /// `NoteDeleted`, `update_edge` -> `EdgeUpdated`, `delete_edge` ->
-/// `EdgeDeleted`. `update_note` and `link` append no event and must never
-/// call this. See `docs/api/atomic_prepare.md#event_append_statements` for why
+/// `EdgeDeleted`, `link` -> `LinkCreated`/`EdgeUpdated`, and
+/// `update_note` -> `NoteUpdated`. See
+/// `docs/api/atomic_prepare.md#event_append_statements` for why
 /// this is a `PlanStatement` rather than a `PostCommitEffect`.
 ///
 /// Invariant: returned statements are unguarded — appended after the plan's
@@ -412,7 +413,7 @@ async fn push_index_purge_statements(
 /// describes strengthens canonical's guarantee: the non-atomic handlers write
 /// the event in a separate transaction, ordered but not atomic with the row
 /// mutation.
-fn event_append_statements(
+pub(crate) fn event_append_statements(
     token: &NamespaceToken,
     namespace: &str,
     verb: &str,
@@ -523,14 +524,14 @@ pub async fn prepare_add_entity(
     let properties = optional_properties(args, "properties")?;
     let tags = optional_tags(args)?.unwrap_or_default();
 
-    crate::secret_gate::check(name)?;
+    crate::secret_gate::check_at(name, "entity", "name")?;
     if let Some(ref d) = description {
-        crate::secret_gate::check(d)?;
+        crate::secret_gate::check_at(d, "entity", "description")?;
     }
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "entity", "properties")?;
     }
-    crate::secret_gate::check_tags(&tags)?;
+    crate::secret_gate::check_tags_at(&tags, "entity", "tags")?;
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let ns = token.namespace().as_str();
@@ -591,12 +592,12 @@ pub async fn prepare_add_note(
     // (threaded in by the apply worker), not the proposer's.
     let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
-    crate::secret_gate::check(content)?;
+    crate::secret_gate::check_at(content, "note", "content")?;
     if let Some(ref n) = name {
-        crate::secret_gate::check(n)?;
+        crate::secret_gate::check_at(n, "note", "name")?;
     }
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "note", "properties")?;
     }
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
@@ -623,9 +624,13 @@ pub async fn prepare_add_note(
     }
 
     Ok(AtomicOpPlan::AddNote(AddNotePlan {
+        note_guard: None,
         note_id: note.id,
         statements,
-        post_commit: PostCommitEffect::ReindexNote { note_id: note.id },
+        post_commit: PostCommitEffect::ReindexNote {
+            note_id: note.id,
+            version: note.version,
+        },
     }))
 }
 
@@ -636,7 +641,7 @@ pub async fn prepare_add_note(
 /// Mirrors `khive-pack-kg::handlers::update::reject_inapplicable_fields`: a
 /// hard `InvalidInput` when a caller passes a field that does not apply to
 /// the resolved substrate (e.g. `salience` on an entity, or
-/// `description`/`tags` on a note). That function has no dependency edge
+/// `description` on a note). That function has no dependency edge
 /// back to `khive-runtime`, so its exact field-applicability check list and
 /// error message shape are reimplemented here rather than imported: same
 /// pattern as `optional_string_patch` above. Presence is checked directly on
@@ -645,6 +650,15 @@ pub async fn prepare_add_note(
 /// semantics.
 fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeResult<()> {
     let o = obj(args)?;
+    if substrate != "note"
+        && ["expected_version", "embed", "fence"]
+            .iter()
+            .any(|field| o.contains_key(*field))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "expected_version, embed and fence apply only to notes".into(),
+        ));
+    }
     let present = |k: &str| o.get(k).is_some_and(|v| !v.is_null());
     let (bad_field, valid): (Option<&str>, &str) = match substrate {
         "entity" => {
@@ -666,8 +680,6 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
         "note" => {
             let bad = if present("description") {
                 Some("description")
-            } else if present("tags") {
-                Some("tags")
             } else if present("relation") {
                 Some("relation")
             } else if present("weight") {
@@ -679,7 +691,10 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
             } else {
                 None
             };
-            (bad, "name, content, salience, decay_factor, properties")
+            (
+                bad,
+                "name, content, salience, decay_factor, properties, tags",
+            )
         }
         // `update` admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`, so
         // this arm must reject entity/note-only fields (e.g. `name`) on an
@@ -775,40 +790,50 @@ async fn prepare_note_update_plan_from_snapshot(
     validate_note_update_expected_kind(&note, expected_kind)?;
 
     reject_inapplicable_update_fields(args, "note")?;
+    let mut normalized_args = args.clone();
+    crate::curation::normalize_note_update_tags(&mut normalized_args)?;
+    let args = &normalized_args;
     let name = optional_string_patch(args, "name")?;
     let content = optional_str(args, "content").map(str::to_string);
     let properties = optional_properties(args, "properties")?;
     let salience = optional_f64_patch(args, "salience")?;
     let decay_factor = optional_f64_patch(args, "decay_factor")?;
-    let expected_updated_at = note.updated_at;
-    let expected_deleted_at = note.deleted_at;
-
-    let (note, text_changed) = runtime
-        .prepare_update_note_from_snapshot(
+    let options = crate::note_write::NoteWriteOptions {
+        expected_version: obj(args)?
+            .get("expected_version")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_i64().ok_or_else(|| {
+                    RuntimeError::InvalidInput("expected_version must be an integer".into())
+                })
+            })
+            .transpose()?,
+        fence: obj(args)?
+            .get("fence")
+            .map(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|error| RuntimeError::InvalidInput(format!("invalid fence: {error}")))
+            })
+            .transpose()?,
+        embed: obj(args)?
+            .get("embed")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_bool()
+                    .ok_or_else(|| RuntimeError::InvalidInput("embed must be boolean".into()))
+            })
+            .transpose()?,
+        key: None,
+    };
+    let (_, plan) = runtime
+        .prepare_versioned_note_update(
             token,
             note,
-            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties),
+            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties)
+                .with_write_options(options),
         )
         .await?;
-
-    let post_commit = if text_changed {
-        PostCommitEffect::ReindexNote { note_id: id }
-    } else {
-        PostCommitEffect::None
-    };
-    Ok(AtomicOpPlan::Update(UpdatePlan {
-        target_id: id,
-        statements: vec![PlanStatement {
-            statement: note_replace_if_unchanged_statement(
-                &note,
-                expected_updated_at,
-                expected_deleted_at,
-            ),
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }],
-        post_commit,
-        edge_natural_key: None,
-    }))
+    Ok(AtomicOpPlan::Update(plan))
 }
 
 /// Build an atomic update plan from the exact note snapshot already supplied
@@ -827,14 +852,6 @@ pub async fn prepare_update_from_note_snapshot(
              or use merge() if this is a deduplication correction"
                 .into(),
         ));
-    }
-    let current = runtime
-        .notes(token)?
-        .get_note(note.id)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(format!("note {}", note.id)))?;
-    if current != note {
-        return Err(crate::curation::stale_note_snapshot_error(note.id));
     }
     prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
 }
@@ -979,6 +996,9 @@ pub async fn prepare_update_entity_plan(
         PostCommitEffect::None
     };
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        note_vector_purge: None,
+        note_embedding_inheritance: None,
+        note_guard: None,
         target_id: id,
         statements,
         post_commit,
@@ -1022,7 +1042,7 @@ async fn prepare_update_edge(
     let properties = optional_properties(args, "properties")?;
 
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "edge", "properties")?;
     }
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
@@ -1184,6 +1204,9 @@ async fn prepare_update_edge(
     )?);
 
     Ok(AtomicOpPlan::Update(UpdatePlan {
+        note_vector_purge: None,
+        note_embedding_inheritance: None,
+        note_guard: None,
         target_id: id,
         statements,
         post_commit: PostCommitEffect::None,
@@ -1354,6 +1377,9 @@ pub async fn prepare_delete(
                 Some(AtomicDeleteKind::Edge) => {
                     return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
+            }
+            if let Some(error) = runtime.stream_member_error(&note).await? {
+                return Err(error);
             }
             let namespace = note.namespace.clone();
             // Storage parity: `note_soft_delete_statement`/
@@ -1548,6 +1574,15 @@ async fn prepare_link(
     let relation = parse_edge_relation(require_str(args, "relation")?)?;
     let weight = optional_f64(args, "weight")?.unwrap_or(1.0);
     let metadata = obj(args)?.get("metadata").cloned();
+    let resurrect = match obj(args)?.get("resurrect") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "resurrect must be a boolean, got: {other}"
+            )))
+        }
+    };
 
     // Top-level `dependency_kind` param merges into `metadata`: only fills
     // the key when metadata doesn't already carry one. Calls the same
@@ -1585,41 +1620,102 @@ async fn prepare_link(
     }
 
     validate_edge_metadata(relation, metadata.as_ref())?;
-    let edge_id = Uuid::new_v4();
     let namespace = token.namespace().as_str().to_string();
-    let now = chrono::Utc::now().timestamp_micros();
-    let metadata_str = metadata.map(|m| serde_json::to_string(&m).unwrap_or_default());
+    let previous = runtime
+        .get_edge_by_natural_key_including_deleted(
+            token,
+            &namespace,
+            canon_source,
+            canon_target,
+            relation,
+        )
+        .await?;
+    if let Some(edge) = previous.as_ref() {
+        if edge.deleted_at.is_some() && !resurrect {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edge natural key is soft-deleted; pass resurrect=true to link explicitly: {}",
+                Uuid::from(edge.id)
+            )));
+        }
+    }
 
-    // The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` shape is
-    // load-bearing (see `LinkPlan`'s own doc comment): it re-probes both
-    // endpoints inside the transaction, closing the intra-batch hazard
-    // where an earlier op in the same atomic unit, e.g. `delete(X, hard)`,
-    // could invalidate this op's prepare-time endpoint validation before
-    // commit. The conflict-arm SET list shares the same
-    // `EDGE_NATURAL_KEY_CONFLICT_SET` text `edge_upsert_statement`
-    // (canonical `link`'s builder) uses, so the two cannot silently diverge
-    // (a prior bug: this atomic literal never set
-    // `target_backend = excluded.target_backend`, so a re-link of an edge
-    // carrying a cross-backend `target_backend` stamp behaved differently
-    // under `--atomic`).
-    let statement = edge_insert_guarded_by_endpoints_statement(
-        &namespace,
-        edge_id,
-        canon_source,
-        canon_target,
-        relation,
-        weight,
-        now,
-        metadata_str.as_deref(),
+    let disposition = match previous.as_ref() {
+        None => EdgeUpsertDisposition::Created,
+        Some(edge) if edge.deleted_at.is_some() => EdgeUpsertDisposition::Resurrected,
+        Some(_) => EdgeUpsertDisposition::Updated,
+    };
+    let edge_id = previous
+        .as_ref()
+        .map(|edge| Uuid::from(edge.id))
+        .unwrap_or_else(Uuid::new_v4);
+    let now = previous.as_ref().map_or_else(
+        || chrono::Utc::now().timestamp_micros(),
+        |edge| {
+            chrono::Utc::now()
+                .timestamp_micros()
+                .max(edge.updated_at.timestamp_micros().saturating_add(1))
+        },
     );
+    let metadata_str = metadata
+        .as_ref()
+        .map(|value| serde_json::to_string(value).unwrap_or_default());
+
+    // The guarded mutation closes both atomic seams: endpoints are re-probed
+    // inside the transaction, and the natural-key row must still match the
+    // prepare snapshot. That makes the disposition used below truthful.
+    let statement = match previous.as_ref() {
+        None => edge_insert_new_guarded_by_endpoints_statement(
+            &namespace,
+            edge_id,
+            canon_source,
+            canon_target,
+            relation,
+            weight,
+            now,
+            metadata_str.as_deref(),
+        ),
+        Some(edge) => edge_link_replace_if_unchanged_and_endpoints_exist_statement(
+            edge,
+            weight,
+            now,
+            metadata_str.as_deref(),
+        ),
+    };
+    let mut statements = vec![PlanStatement {
+        statement,
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    let kind = match disposition {
+        EdgeUpsertDisposition::Created => EventKind::LinkCreated,
+        EdgeUpsertDisposition::Updated | EdgeUpsertDisposition::Resurrected => {
+            EventKind::EdgeUpdated
+        }
+    };
+    statements.extend(event_append_statements(
+        token,
+        &namespace,
+        "link",
+        kind,
+        SubstrateKind::Entity,
+        edge_id,
+        serde_json::json!({
+            "id": edge_id,
+            "namespace": namespace,
+            "mutation": disposition.name(),
+            "source_id": canon_source,
+            "target_id": canon_target,
+            "relation": relation,
+            "weight": weight,
+            "metadata": metadata,
+            "previous": previous,
+        }),
+    )?);
 
     Ok(AtomicOpPlan::Link(LinkPlan {
         source_id: canon_source,
         target_id: canon_target,
-        statement: PlanStatement {
-            statement,
-            guard: Some(AffectedRowGuard::exactly(1)),
-        },
+        statements,
+        disposition,
     }))
 }
 
@@ -1754,6 +1850,9 @@ pub async fn apply_post_commit_effects_with_report(
     for effect in effects.into_effects() {
         match effect {
             PostCommitEffect::None => {}
+            PostCommitEffect::NoteChanged { note_id, kind } => {
+                runtime.fire_note_mutation_hook(&kind, note_id).await;
+            }
             PostCommitEffect::ReindexEntity { entity_id } => {
                 if let Some(entity) = runtime.entities(token)?.get_entity(entity_id).await? {
                     let truncation = runtime.reindex_entity(token, &entity).await?;
@@ -1763,11 +1862,22 @@ pub async fn apply_post_commit_effects_with_report(
                     });
                 }
             }
-            PostCommitEffect::ReindexNote { note_id } => {
+            PostCommitEffect::ReindexNote { note_id, version } => {
                 if let Some(note) = runtime.notes(token)?.get_note(note_id).await? {
+                    if note.version != version {
+                        continue;
+                    }
                     let truncation = runtime.reindex_note(token, &note).await?;
+                    if runtime
+                        .notes(token)?
+                        .get_note(note_id)
+                        .await?
+                        .is_none_or(|current| current.version != version)
+                    {
+                        continue;
+                    }
                     embedding_outcomes.push(PostCommitEmbeddingOutcome {
-                        effect: PostCommitEffect::ReindexNote { note_id },
+                        effect: PostCommitEffect::ReindexNote { note_id, version },
                         truncation,
                     });
                     // This handler calls `reindex_note` directly, bypassing
@@ -2054,9 +2164,8 @@ mod tests {
         assert_eq!(updated.tags, vec!["keep-tag"]);
     }
 
-    /// Symmetric note-substrate case: `description` and `tags` are
-    /// entity-only fields; passing either for a note must be rejected the
-    /// same way update.rs rejects them.
+    /// Symmetric note-substrate case: `description` is entity-only and
+    /// must be rejected the same way update.rs rejects it.
     #[tokio::test]
     async fn atomic_update_note_rejects_entity_only_field_description() {
         let runtime = scratch_runtime();
@@ -2104,6 +2213,190 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn atomic_update_note_tags_replace_preserve_clear_and_override_nested_tags() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "tagged note");
+        note.properties = Some(json!({"tags": ["old"], "keep": {"value": 1}}));
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        for (mut args, expected_tags) in [
+            (
+                json!({"tags": ["new", "shared"], "properties": {"tags": ["nested"], "added": true}}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"name": "renamed note", "properties": {"omitted": true}}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"tags": null, "properties": null}),
+                json!(["new", "shared"]),
+            ),
+            (
+                json!({"tags": [], "properties": {"tags": ["nested-after-clear"]}}),
+                json!([]),
+            ),
+            (
+                json!({"tags": ["after-null-properties"], "properties": null}),
+                json!(["after-null-properties"]),
+            ),
+        ] {
+            args["id"] = json!(note_id.to_string());
+            let original_args = args.clone();
+            let plan = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect("valid atomic note tags patch");
+            assert_eq!(
+                args, original_args,
+                "preparation must not mutate caller args"
+            );
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("atomic note update");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+            let updated = runtime
+                .notes(&token)
+                .expect("notes store")
+                .get_note(note_id)
+                .await
+                .expect("read note")
+                .expect("note exists");
+            let properties = updated.properties.expect("note properties");
+            assert_eq!(properties["tags"], expected_tags);
+            assert_eq!(properties["keep"], json!({"value": 1}));
+            assert_eq!(properties["added"], json!(true));
+            assert_eq!(updated.content, "tagged note");
+            if original_args.get("name").is_some() {
+                assert_eq!(updated.name.as_deref(), Some("renamed note"));
+                assert_eq!(properties["omitted"], json!(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_update_entity_tags_keep_replace_preserve_and_clear_semantics() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut entity = khive_storage::Entity::new("local", "concept", "tagged entity");
+        entity.tags = vec!["old".to_string()];
+        entity.properties = Some(json!({"keep": true}));
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+        for (mut args, expected_tags) in [
+            (json!({"tags": ["new", "shared"]}), json!(["new", "shared"])),
+            (json!({"name": "renamed entity"}), json!(["new", "shared"])),
+            (json!({"tags": null}), json!(["new", "shared"])),
+            (json!({"tags": []}), json!([])),
+        ] {
+            args["id"] = json!(entity_id.to_string());
+            let plan = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect("valid atomic entity tags patch");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("atomic entity update");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+            let updated = runtime
+                .get_entity(&token, entity_id)
+                .await
+                .expect("read entity");
+            assert_eq!(json!(updated.tags), expected_tags);
+            assert_eq!(updated.properties, Some(json!({"keep": true})));
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_update_note_invalid_tags_leave_snapshot_unchanged() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "unchanged note");
+        note.properties = Some(json!({"tags": ["keep"], "other": true}));
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+        let before = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note exists");
+
+        for (mut args, expected_error) in [
+            (
+                json!({"tags": "invalid"}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": ["valid", 1]}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": {"nested": true}}),
+                "tags must be an array of strings",
+            ),
+            (
+                json!({"tags": ["valid"], "properties": []}),
+                "properties must be an object",
+            ),
+            (
+                json!({"tags": [], "properties": "invalid"}),
+                "properties must be an object",
+            ),
+            (
+                json!({"tags": "invalid", "description": "entity field"}),
+                "field 'description' is not valid for a note",
+            ),
+        ] {
+            args["id"] = json!(note_id.to_string());
+            args["content"] = json!("must not persist");
+            let error = prepare_update(&runtime, &token, &args, None)
+                .await
+                .expect_err("invalid tags patch must not produce a plan");
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(ref message) if message.contains(expected_error)),
+                "unexpected error: {error:?}"
+            );
+            let after = runtime
+                .notes(&token)
+                .expect("notes store")
+                .get_note(note_id)
+                .await
+                .expect("read note")
+                .expect("note exists");
+            assert_eq!(after, before);
+        }
+    }
+
     /// Updating a note's content inside an atomic unit must, after commit,
     /// leave the note recallable via FTS under its new content and its
     /// vector row refreshed: parity with the non-atomic
@@ -2136,7 +2429,7 @@ mod tests {
         let plan = prepare_update(
             &runtime,
             &token,
-            &json!({"id": note_id.to_string(), "content": updated_content}),
+            &json!({"id": note_id.to_string(), "content": updated_content, "embed": true}),
             None,
         )
         .await
@@ -2151,7 +2444,10 @@ mod tests {
         };
         assert_eq!(
             post_commit.as_slice(),
-            &[PostCommitEffect::ReindexNote { note_id }],
+            &[PostCommitEffect::ReindexNote {
+                note_id,
+                version: 2
+            }],
             "content change must schedule exactly one ReindexNote post-commit effect"
         );
 
@@ -2162,7 +2458,10 @@ mod tests {
         assert_eq!(embedding_outcomes.len(), 1);
         assert_eq!(
             embedding_outcomes[0].effect,
-            PostCommitEffect::ReindexNote { note_id }
+            PostCommitEffect::ReindexNote {
+                note_id,
+                version: 2
+            }
         );
         assert_eq!(embedding_outcomes[0].truncation.truncated, 1);
         assert!(embedding_outcomes[0].truncation.discarded_bytes > 0);
@@ -2594,7 +2893,7 @@ mod tests {
                 AtomicOpPlan::Link(p) => p,
                 other => panic!("expected an AtomicOpPlan::Link, got {other:?}"),
             };
-            match link_plan.statement.statement.params.last() {
+            match link_plan.statements[0].statement.params.last() {
                 Some(SqlValue::Text(s)) => s.clone(),
                 other => panic!("expected the metadata param to be SqlValue::Text, got {other:?}"),
             }
@@ -2792,9 +3091,8 @@ mod tests {
         assert!(deleted_at.is_none());
     }
 
-    /// Atomic `link` of a soft-deleted triple must resurrect it
-    /// (`deleted_at = NULL`), matching `upsert_edge`'s natural-key
-    /// `ON CONFLICT ... DO UPDATE SET deleted_at = NULL`.
+    /// Atomic `link` refuses a soft-deleted triple by default and only
+    /// resurrects it when the caller opts in explicitly.
     #[tokio::test]
     async fn atomic_link_of_soft_deleted_triple_resurrects_it() {
         let runtime = scratch_runtime();
@@ -2857,9 +3155,7 @@ mod tests {
             "row must be soft-deleted before the resurrect attempt"
         );
 
-        // Re-link the same triple: must resurrect (deleted_at -> NULL), not
-        // fail on the UNIQUE constraint of the still-present soft-deleted row.
-        let plan_relink = prepare_link(
+        let refusal = prepare_link(
             &runtime,
             &token,
             &json!({
@@ -2870,7 +3166,29 @@ mod tests {
             }),
         )
         .await
-        .expect("prepare resurrecting link");
+        .expect_err("implicit resurrection must be refused at prepare time");
+        assert!(matches!(
+            refusal,
+            RuntimeError::InvalidInput(message) if message.contains("resurrect=true")
+        ));
+        let (_, weight, _, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(weight, Some(1.0), "refusal must preserve the tombstone");
+        assert!(deleted_at.is_some());
+
+        let plan_relink = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+                "weight": 0.75,
+                "resurrect": true,
+            }),
+        )
+        .await
+        .expect("prepare explicitly resurrecting link");
         let outcome_relink =
             crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan_relink])
                 .await
@@ -4625,11 +4943,16 @@ mod tests {
         }
     }
 
-    /// Parity boundary: atomic `update` of a note must append no event:
-    /// canonical `update_note` never calls `append_event` (unlike
-    /// `update_entity`, which always does).
+    /// Parity boundary: an atomic `update` of a note appends exactly one
+    /// `NoteUpdated` event, because this path and canonical `update_note` build
+    /// their plan through the same `prepare_versioned_note_update`, which is
+    /// where the event statements are added.
+    ///
+    /// This test used to assert the opposite. That was a faithful record of a
+    /// gap rather than a contract: notes were the substrate that recorded no
+    /// update at all, so the parity it certified was parity with nothing.
     #[tokio::test]
-    async fn atomic_update_note_appends_no_event() {
+    async fn atomic_update_note_appends_its_domain_event() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -4668,20 +4991,27 @@ mod tests {
             )
             .await
             .expect("query_events");
-        assert!(
-            page.items.iter().all(|e| e.target_id != Some(note_id)),
-            "update_note must append no event; found: {:?}",
-            page.items
-                .iter()
-                .filter(|e| e.target_id == Some(note_id))
-                .collect::<Vec<_>>()
+        let for_note: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.target_id == Some(note_id))
+            .collect();
+        assert_eq!(
+            for_note.len(),
+            1,
+            "an atomic note update must append exactly one event; found: {for_note:?}"
         );
+        assert_eq!(for_note[0].kind, EventKind::NoteUpdated);
+        assert_eq!(for_note[0].substrate, SubstrateKind::Note);
+        assert_eq!(for_note[0].verb, "update");
+        assert_eq!(for_note[0].payload["id"], json!(note_id));
+        assert_eq!(for_note[0].payload["text_changed"], json!(true));
     }
 
-    /// Parity boundary: atomic `link` must append no event: canonical
-    /// `link` never calls `append_event`.
+    /// Atomic `link` commits its mutation and event-plane observation in the
+    /// same unit.
     #[tokio::test]
-    async fn atomic_link_appends_no_event() {
+    async fn atomic_link_appends_created_event_with_edge_observation() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -4724,16 +5054,30 @@ mod tests {
         let event_store = runtime.events(&token).expect("event store");
         let page = event_store
             .query_events(
-                khive_storage::EventFilter::default(),
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::LinkCreated],
+                    ..khive_storage::EventFilter::default()
+                },
                 khive_storage::types::PageRequest::default(),
             )
             .await
             .expect("query_events");
-        assert!(
-            page.items.is_empty(),
-            "link must append no event; found: {:?}",
-            page.items
-        );
+        assert_eq!(page.items.len(), 1, "link must append one created event");
+        let event = &page.items[0];
+        assert_eq!(event.payload["mutation"], "created");
+        let edge_id = event.target_id.expect("link event targets its edge");
+        let observed = event_store
+            .query_events(
+                khive_storage::EventFilter {
+                    observed: vec![edge_id],
+                    ..khive_storage::EventFilter::default()
+                },
+                khive_storage::types::PageRequest::default(),
+            )
+            .await
+            .expect("query observed edge");
+        assert_eq!(observed.items.len(), 1);
+        assert_eq!(observed.items[0].id, event.id);
     }
 
     // ------------------------------------------------------------------
@@ -4916,7 +5260,10 @@ mod tests {
             post_commit.as_slice(),
             &[
                 PostCommitEffect::ReindexEntity { entity_id },
-                PostCommitEffect::ReindexNote { note_id },
+                PostCommitEffect::ReindexNote {
+                    note_id,
+                    version: 1
+                },
             ],
             "prepare-derived effects must reach the committed token unchanged"
         );

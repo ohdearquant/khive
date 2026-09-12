@@ -8,6 +8,7 @@ import {
   Eye,
   FileText,
   FolderKanban,
+  GitCommitHorizontal,
   Lightbulb,
   type IconComponent,
   Package,
@@ -47,6 +48,7 @@ const iconComponents = {
   "circle-help": CircleHelp,
   signpost: Signpost,
   bookmark: Bookmark,
+  "git-commit": GitCommitHorizontal,
   circle: Circle,
 } satisfies Record<OntologyIconName, IconComponent>;
 

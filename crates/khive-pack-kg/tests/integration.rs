@@ -93,12 +93,12 @@ fn list_items(response: &Value) -> &[Value] {
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
 // db_diagnostics (ADR-091 operator surface).
 #[test]
-fn pack_verbs_returns_twenty() {
+fn pack_verbs_returns_twenty_four() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        20,
-        "KgPack must expose exactly 20 verbs (19 previous + db_diagnostics)"
+        24,
+        "KgPack must expose exactly 24 verbs including ordered streams"
     );
 }
 
@@ -127,6 +127,10 @@ fn pack_verbs_names_are_correct() {
         "resolve",
         "whoami",
         "db_diagnostics",
+        "stream.append",
+        "stream.batch",
+        "stream.read",
+        "stream.stat",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -4256,8 +4260,122 @@ async fn update_entity_without_kind_resolves_from_uuid() {
     );
 }
 
-/// A property-only historical type can be promoted into the indexed
-/// `entity_type` column without replacing any unrelated entity fields.
+#[tokio::test]
+async fn list_entity_type_legacy_fallback_covers_tagged_offset_and_cursor_pages() {
+    let pack = pack();
+    let mut created = Vec::new();
+    for (name, entity_type, tags) in [
+        ("LegacyListedType", None, json!(["visible"])),
+        ("ColumnListedType", Some("algorithm"), json!(["visible"])),
+        ("UntaggedLegacyType", None, json!([])),
+        (
+            "ColumnOverridesLegacyType",
+            Some("technique"),
+            json!(["visible"]),
+        ),
+    ] {
+        let row = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": name, "entity_type": entity_type,
+                    "properties": {"type": "algorithm"}, "tags": tags,
+                    "skip_dedup_check": true
+                }),
+            )
+            .await
+            .expect("create type fixture");
+        created.push(row["id"].as_str().expect("entity id").to_string());
+    }
+
+    for tags in [None, Some(json!([])), Some(json!(["visible"]))] {
+        let mut expected = vec![created[0].clone(), created[1].clone()];
+        if tags != Some(json!(["visible"])) {
+            expected.push(created[2].clone());
+        }
+        expected.sort_unstable();
+        let mut params = json!({"kind": "entity", "entity_type": "algorithm", "limit": 1});
+        if let Some(tags) = tags {
+            params["tags"] = tags;
+        }
+        let mut offset_ids = Vec::new();
+        for offset in 0..expected.len() {
+            let mut page_params = params.clone();
+            page_params["offset"] = json!(offset);
+            let page = pack
+                .dispatch("list", page_params)
+                .await
+                .expect("offset page");
+            let items = list_items(&page);
+            assert_eq!(items.len(), 1, "{page}");
+            assert_eq!(page["limit_clamped"], false);
+            offset_ids.push(items[0]["id"].as_str().unwrap().to_string());
+        }
+        offset_ids.sort_unstable();
+        assert_eq!(offset_ids, expected);
+
+        let mut cursor_ids = Vec::new();
+        let mut after = json!("");
+        for index in 0..expected.len() {
+            let mut page_params = params.clone();
+            page_params["after"] = after;
+            let page = pack
+                .dispatch("list", page_params)
+                .await
+                .expect("cursor page");
+            let items = page["entities"].as_array().expect("cursor entities");
+            assert_eq!(items.len(), 1, "{page}");
+            cursor_ids.push(items[0]["id"].as_str().unwrap().to_string());
+            after = page["next_after"].clone();
+            assert_eq!(after.is_null(), index + 1 == expected.len(), "{page}");
+        }
+        cursor_ids.sort_unstable();
+        assert_eq!(cursor_ids, expected);
+    }
+    let legacy = pack
+        .dispatch("get", json!({"id": created[0]}))
+        .await
+        .expect("get historical entity");
+    assert!(legacy["entity_type"].is_null());
+    assert_eq!(legacy["properties"], json!({"type": "algorithm"}));
+}
+
+#[tokio::test]
+async fn search_entity_type_remains_exact_column_filter() {
+    let pack = pack();
+    let mut typed_id = Value::Null;
+    for (name, entity_type) in [
+        ("TypedFilterWitness legacy", None),
+        ("TypedFilterWitness column", Some("algorithm")),
+    ] {
+        let created = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": name, "entity_type": entity_type,
+                    "properties": {"type": "algorithm"}, "skip_dedup_check": true
+                }),
+            )
+            .await
+            .expect("create search control");
+        if entity_type.is_some() {
+            typed_id = created["id"].clone();
+        }
+    }
+    let found = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "TypedFilterWitness", "entity_type": "algorithm"}),
+        )
+        .await
+        .expect("search with exact type filter");
+    let hits = found.as_array().expect("search hits");
+    assert_eq!(hits.len(), 1, "{found}");
+    assert_eq!(hits[0]["id"], typed_id);
+}
+
+/// Promoting a historical property type keeps its listing membership and
+/// preserves unrelated fields while populating the canonical column.
 #[tokio::test]
 async fn update_entity_type_promotes_property_type_into_typed_listing() {
     let pack = pack();
@@ -4292,10 +4410,13 @@ async fn update_entity_type_promotes_property_type_into_typed_listing() {
         )
         .await
         .expect("typed list before backfill must succeed");
-    assert!(
-        list_items(&before).iter().all(|item| item["id"] != id),
-        "a property-only historical type must not satisfy the column-backed filter"
-    );
+    let before_items = list_items(&before);
+    assert_eq!(before_items.len(), 1);
+    assert_eq!(before_items[0]["id"], id);
+    assert!(before_items[0]["entity_type"].is_null());
+    let stored_before = pack.dispatch("get", json!({"id": id})).await.unwrap();
+    assert!(stored_before["entity_type"].is_null());
+    assert_eq!(stored_before["properties"], created["properties"]);
 
     let updated = pack
         .dispatch("update", json!({"id": id, "entity_type": "algorithm"}))
@@ -8661,6 +8782,91 @@ async fn list_proposals_status_filter() {
         !has_withdrawn,
         "#393 list-filter: withdrawn proposal {pid_withdrawn} must not appear in list(status=open); items: {list_open}"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_proposals_actor_filter_and_explicit_proposer_precedence() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+
+    let fixture_for = |actor: &str| {
+        let mut builder = VerbRegistryBuilder::new();
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("configure trusted runtime audit store");
+        builder.with_actor_id(Some(actor.to_string()));
+        builder.register(KgPack::new(rt.clone()));
+        Fixture {
+            registry: builder.build().expect("registry build must succeed"),
+        }
+    };
+
+    let alice = fixture_for("alice");
+    let bob = fixture_for("bob");
+    let alice_id = alice
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Alice proposal",
+                "description": "Owned by Alice",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Alice proposal must succeed")["id"]
+        .as_str()
+        .expect("Alice proposal id")
+        .to_string();
+    let bob_id = bob
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Bob proposal",
+                "description": "Owned by Bob",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Bob proposal must succeed")["id"]
+        .as_str()
+        .expect("Bob proposal id")
+        .to_string();
+
+    let default_items = alice
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("default proposal list must succeed");
+    let default_items = list_items(&default_items);
+    assert!(default_items.iter().any(|item| item["id"] == alice_id));
+    assert!(!default_items.iter().any(|item| item["id"] == bob_id));
+
+    let all_items = alice
+        .dispatch("list", json!({"kind": "proposal", "actor": "*"}))
+        .await
+        .expect("unscoped proposal list must succeed");
+    let all_items = list_items(&all_items);
+    assert!(all_items.iter().any(|item| item["id"] == alice_id));
+    assert!(all_items.iter().any(|item| item["id"] == bob_id));
+
+    let explicit_items = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "alice", "proposer": "bob"}),
+        )
+        .await
+        .expect("explicit proposer list must succeed");
+    let explicit_items = list_items(&explicit_items);
+    assert!(!explicit_items.iter().any(|item| item["id"] == alice_id));
+    assert!(explicit_items.iter().any(|item| item["id"] == bob_id));
+
+    let empty_status = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "*", "status": ""}),
+        )
+        .await
+        .expect("empty status filter must remain a real filter");
+    assert!(list_items(&empty_status).is_empty());
 }
 
 /// Negative path: withdraw on an applied proposal must fail.
@@ -14699,6 +14905,8 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
     // Option, regardless of whether the caller is the runtime or a direct
     // khive-db user — they come straight off the pool.
     for field in [
+        "writer_task_begin_busy",
+        "writer_task_begin_busy_absorbed",
         "writer_task_request_failures",
         "writer_task_side_effects_unknown",
     ] {
@@ -14809,4 +15017,118 @@ async fn update_empty_string_property_survives_agent_echo_and_readback() {
         json!(""),
         "Agent readback must retain the same empty-string value: {agent_readback}"
     );
+}
+
+/// A parameter this pack declares as an object must refuse a scalar rather than
+/// store it. The declared type is rendered into the schema a caller is handed and
+/// was never compared against the argument that arrived, so a string persisted and
+/// every later reader found a string where the schema promised a map. The success
+/// return is the harm: an agent has nothing to correct on.
+#[tokio::test]
+async fn create_refuses_a_scalar_where_properties_declares_an_object() {
+    let pack = pack();
+
+    let error = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "ObjectParamScalar",
+                "properties": "not-an-object"
+            }),
+        )
+        .await
+        .expect_err("a string properties must be refused, not stored");
+    assert!(
+        is_invalid_input(&error),
+        "must be an input refusal, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("properties") && message.contains("object"),
+        "the refusal must name the parameter and the expected shape: {message}"
+    );
+
+    // Control in the same test: the identical call with a real object succeeds, so
+    // the refusal is about the shape and not about the field being present at all.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "concept",
+            "name": "ObjectParamControl",
+            "properties": {"domain": "inference"}
+        }),
+    )
+    .await
+    .expect("an object properties must still be accepted");
+
+    // A batch names the offending item rather than the batch, since one error is
+    // returned for N records.
+    let error = pack
+        .dispatch(
+            "create",
+            json!({"items": [
+                {"kind": "entity", "entity_kind": "concept", "name": "BatchOk",
+                 "properties": {"domain": "inference"}},
+                {"kind": "entity", "entity_kind": "concept", "name": "BatchBad",
+                 "properties": "not-an-object"}
+            ]}),
+        )
+        .await
+        .expect_err("a scalar properties inside a batch must be refused");
+    assert!(
+        error.to_string().contains("items[1]"),
+        "the refusal must name which item: {error}"
+    );
+}
+
+/// `min_score` is documented as a 0.0-1.0 floor and neither end was enforced: a
+/// floor above the range was honoured and returned an empty result a caller
+/// cannot tell from "no such record", and a negative floor was silently clamped,
+/// so the value passed was not the value that ran.
+#[tokio::test]
+async fn search_refuses_a_score_floor_outside_the_declared_range() {
+    let pack = pack();
+    for name in ["ScoreFloorOne", "ScoreFloorTwo"] {
+        pack.dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": name}),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Load-bearing control: the rows ARE findable at a sane floor. Without this the
+    // empty result at an out-of-range floor could be an empty corpus.
+    let hits = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "ScoreFloor", "min_score": 0.0, "limit": 10}),
+        )
+        .await
+        .expect("a floor inside the range must be accepted");
+    assert!(
+        !hits.as_array().expect("array").is_empty(),
+        "control: the rows must be findable at a sane floor"
+    );
+
+    for floor in [json!(7), json!(-3), json!(1.5)] {
+        let error = pack
+            .dispatch(
+                "search",
+                json!({"kind": "entity", "query": "ScoreFloor", "min_score": floor, "limit": 10}),
+            )
+            .await
+            .expect_err("a floor outside 0.0-1.0 must be refused, not honoured");
+        assert!(
+            is_invalid_input(&error),
+            "must be an input refusal, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("min_score"),
+            "the refusal must name the parameter: {error}"
+        );
+    }
 }

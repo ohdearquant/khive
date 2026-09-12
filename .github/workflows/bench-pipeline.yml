@@ -63,9 +63,12 @@ jobs:
       # if same-cluster vectors stop being more similar than cross-cluster ones,
       # the vector leg degenerates to noise and the per-leg floor is meaningless.
       - name: Test bench-embedder clustering invariant
+        shell: bash
         run: |
           set -euo pipefail
-          cargo test -p khive-mcp --features bench-embedder bench_embedder
+          # Floor 1 detects empty selection without pinning the suite size.
+          cargo test -p khive-mcp --features bench-embedder bench_embedder 2>&1 | tee "$RUNNER_TEMP/bench_embedder.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bench_embedder.log" 1
 
       # Build the bench binary (bench-embedder injects FNV-1a, no lattice model download)
       - name: Build kkernel (bench-embedder feature)

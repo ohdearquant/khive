@@ -10,7 +10,7 @@ mod gate;
 mod obligation;
 mod request;
 
-pub use actor::ActorRef;
+pub use actor::{ActorRef, RUNTIME_STAMPED_ACTOR_KINDS};
 pub use audit::{AuditDecision, AuditEvent};
 pub use context::GateContext;
 pub use decision::GateDecision;

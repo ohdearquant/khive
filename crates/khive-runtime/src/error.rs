@@ -9,6 +9,158 @@ use uuid::Uuid;
 /// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
+/// What this dispatch boundary can establish about its own domain operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainDisposition {
+    /// The handler returned its canonical success value before a later failure.
+    Committed,
+    /// The operation was refused before its handler was invoked.
+    NotCommitted,
+    /// The handler failed, so its domain effects are not established here.
+    Unknown,
+}
+
+impl DomainDisposition {
+    /// Stable wire spelling, shared by request and daemon envelopes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::NotCommitted => "not_committed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// An unchanged runtime error with provenance from one dispatch boundary.
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct DispatchError {
+    #[source]
+    source: RuntimeError,
+    disposition: DomainDisposition,
+}
+
+impl DispatchError {
+    pub(crate) fn new(source: RuntimeError, disposition: DomainDisposition) -> Self {
+        Self {
+            source,
+            disposition,
+        }
+    }
+
+    pub(crate) fn before_dispatch(source: RuntimeError) -> Self {
+        Self::new(source, DomainDisposition::NotCommitted)
+    }
+
+    pub(crate) fn after_handler(source: RuntimeError, domain_succeeded: bool) -> Self {
+        Self::new(
+            source,
+            if domain_succeeded {
+                DomainDisposition::Committed
+            } else {
+                DomainDisposition::Unknown
+            },
+        )
+    }
+
+    /// Borrow the original error without changing its classification.
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    /// Read provenance belonging to this dispatch, not to a nested operation.
+    pub fn disposition(&self) -> DomainDisposition {
+        self.disposition
+    }
+
+    /// Separate the original error from its dispatch provenance.
+    pub fn into_parts(self) -> (RuntimeError, DomainDisposition) {
+        (self.source, self.disposition)
+    }
+
+    /// Compatibility path for callers that consume runtime errors directly.
+    pub fn into_source(self) -> RuntimeError {
+        self.source
+    }
+}
+
+/// Typed cause of a post-dispatch audit or durable-receipt failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditObligationReason {
+    /// The audit batch reported one of its closed terminal outcomes.
+    Terminal(crate::audit_batch::AuditTerminalReason),
+    /// Receipt setup failed before submission produced a terminal outcome.
+    GitDigestReceiptFailure,
+}
+
+/// An obligation failure preserves its typed cause and any storage source.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct AuditObligationFailure {
+    /// Machine-readable terminal or receipt-setup cause.
+    pub reason: AuditObligationReason,
+    /// Domain verb whose post-dispatch obligation failed.
+    pub verb: String,
+    /// Stable caller-visible explanation; excludes the canonical domain value.
+    pub message: String,
+    #[source]
+    source: Option<khive_storage::StorageError>,
+}
+
+impl AuditObligationFailure {
+    /// Preserve a terminal audit outcome without parsing its display text.
+    pub fn new(verb: impl Into<String>, reason: crate::audit_batch::AuditTerminalReason) -> Self {
+        let verb = verb.into();
+        Self {
+            message: format!("audit obligation commit failed for verb {verb:?}: {reason:?}"),
+            verb,
+            reason: AuditObligationReason::Terminal(reason),
+            source: None,
+        }
+    }
+
+    pub(crate) fn from_store(verb: &str, source: khive_storage::StorageError) -> Self {
+        let mut failure = Self::new(verb, crate::audit_batch::AuditTerminalReason::StoreFailure);
+        failure.message = format!("audit obligation commit failed for verb {verb:?}: {source}");
+        failure.source = Some(source);
+        failure
+    }
+
+    pub(crate) fn git_digest_receipt(branch: &'static str) -> Self {
+        Self {
+            reason: AuditObligationReason::GitDigestReceiptFailure,
+            verb: "git.digest".into(),
+            message: format!("git_digest_receipt_persist_failed: {branch}; git.digest writes may have committed, but no durable success receipt was confirmed; inspect ingest state before retrying"),
+            source: None,
+        }
+    }
+
+    /// Closed wire-code mapping: a new batch terminal reason requires an arm.
+    pub const fn wire_code(&self) -> &'static str {
+        use crate::audit_batch::AuditTerminalReason;
+        match self.reason {
+            AuditObligationReason::Terminal(reason) => match reason {
+                AuditTerminalReason::PreflightRejected => "preflight_rejected",
+                AuditTerminalReason::AdmissionClosed => "admission_closed",
+                AuditTerminalReason::QueueAdmissionExhausted => "queue_admission_exhausted",
+                AuditTerminalReason::AdmissionDeadlineExpired => "admission_deadline_expired",
+                AuditTerminalReason::ResolutionDeadlineExpired => "resolution_deadline_expired",
+                AuditTerminalReason::IdentityConflict => "identity_conflict",
+                AuditTerminalReason::StoreFailure => "store_failure",
+                AuditTerminalReason::IdempotencyUnsupported => "idempotency_unsupported",
+                AuditTerminalReason::DriverPanicked => "driver_panicked",
+                AuditTerminalReason::DriverCancelled => "driver_cancelled",
+                AuditTerminalReason::DriverJoinLost => "driver_join_lost",
+                AuditTerminalReason::DriverExitedInconsistent => "driver_exited_inconsistent",
+                AuditTerminalReason::DriverAppendAbandoned => "driver_append_abandoned",
+                AuditTerminalReason::StoreWedged => "store_wedged",
+            },
+            AuditObligationReason::GitDigestReceiptFailure => "git_digest_receipt_failure",
+        }
+    }
+}
+
 /// Stable ADR-135 F6 stage and wire code for a finite-wait pooled writer
 /// checkout that expires before SQLite executes.
 pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
@@ -286,16 +438,87 @@ impl std::error::Error for CircularPackDependency {}
 
 /// All errors produced by the khive-runtime layer.
 ///
+/// Where the `GateDenied` audit row of a refused dispatch ended up.
+///
+/// A refusal reaches the caller whatever happens to its audit row; this value
+/// says whether the row the caller could cite exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialAuditOutcome {
+    /// The row committed, or an identical row was already present, and
+    /// `audit_event_id` on the refusal names it.
+    Committed,
+    /// The row was built and submitted but did not commit; the audit
+    /// obligation wire code says why.
+    NotCommitted(&'static str),
+    /// No event store is configured, so no row was written.
+    NoStore,
+    /// The refusal comes from a path that writes no audit row (namespace
+    /// authorization, channel policy).
+    NotAudited,
+}
+
+impl DenialAuditOutcome {
+    /// Closed wire spelling: `committed`, `not_committed:<code>`, `no_store`,
+    /// `not_audited`.
+    pub fn wire_code(&self) -> String {
+        match self {
+            Self::Committed => "committed".to_string(),
+            Self::NotCommitted(code) => format!("not_committed:{code}"),
+            Self::NoStore => "no_store".to_string(),
+            Self::NotAudited => "not_audited".to_string(),
+        }
+    }
+}
+
+/// What a refused dispatch can cite: the `GateDenied` audit row's id when
+/// one committed, and where the row ended up otherwise. Boxed on the error
+/// so a refusal does not widen every `Result<_, RuntimeError>` in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialReceipt {
+    /// The audit row's event id when `audit_outcome` is `Committed`.
+    pub audit_event_id: Option<uuid::Uuid>,
+    /// Whether the row the caller could cite exists.
+    pub audit_outcome: DenialAuditOutcome,
+}
+
+impl DenialReceipt {
+    /// The refusal's path writes no audit row.
+    pub fn not_audited() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NotAudited,
+        }
+    }
+
+    /// No event store is configured, so no row was written.
+    pub fn no_store() -> Self {
+        Self {
+            audit_event_id: None,
+            audit_outcome: DenialAuditOutcome::NoStore,
+        }
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// The domain handler succeeded, but its post-dispatch obligation did not.
+    #[error("{failure}")]
+    AuditObligation {
+        /// Typed reason and source of the obligation failure.
+        #[source]
+        failure: Box<AuditObligationFailure>,
+        /// Exact canonical value held after the domain handler succeeded.
+        domain_result: serde_json::Value,
+    },
+
     #[error("storage: {0}")]
     Storage(#[from] khive_storage::StorageError),
 
     #[error("sqlite: {0}")]
-    Sqlite(#[from] khive_db::SqliteError),
+    Sqlite(khive_db::SqliteError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -388,8 +611,16 @@ pub enum RuntimeError {
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
     /// `GateDecision::Deny`. The pack is never invoked. The `reason` field
     /// carries the deny message produced by the gate implementation.
+    ///
+    /// `receipt` carries the id of the `GateDenied` audit row when one
+    /// committed, so the caller can cite the refusal, and says whether such
+    /// a row exists.
     #[error("permission denied for verb {verb:?}: {reason}")]
-    PermissionDenied { verb: String, reason: String },
+    PermissionDenied {
+        verb: String,
+        reason: String,
+        receipt: Box<DenialReceipt>,
+    },
 
     /// The configured gate could not produce an authorization decision.
     ///
@@ -457,7 +688,8 @@ pub enum RuntimeError {
     #[error("cross-namespace write denied: cannot write to remote namespace {namespace:?}")]
     CrossNamespaceWrite { namespace: String },
 
-    /// A remote fetch failed (network error, authentication failure, etc.).
+    /// Remote cache setup or repair failed. Producers redact the source and
+    /// sanitize diagnostics before constructing this wire-visible error.
     #[error("remote fetch error for remote={remote:?}: {message}")]
     RemoteFetchError { remote: String, message: String },
 
@@ -504,7 +736,38 @@ pub enum RuntimeError {
     },
 }
 
+impl From<khive_db::SqliteError> for RuntimeError {
+    fn from(error: khive_db::SqliteError) -> Self {
+        match error {
+            khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
+            error => Self::Sqlite(error),
+        }
+    }
+}
+
 impl RuntimeError {
+    /// Whether the immutable stream record policy refused this write.
+    ///
+    /// Only the structured runtime marker establishes this class. Ordinary
+    /// conflicts, caller sequence preconditions, and raw storage failures do
+    /// not acquire a refusal classification from their rendered messages.
+    /// These membership guards refuse before applying the requested domain write.
+    pub fn is_stream_policy_refusal(&self) -> bool {
+        matches!(self, Self::Khive(error)
+            if error.kind() == khive_types::ErrorKind::Conflict
+                && error.details().and_then(|details| details.get("reason"))
+                    == Some("stream_member"))
+    }
+
+    /// A gate refusal from a path that writes no audit row.
+    pub fn permission_denied(verb: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::PermissionDenied {
+            verb: verb.into(),
+            reason: reason.into(),
+            receipt: Box::new(DenialReceipt::not_audited()),
+        }
+    }
+
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
@@ -526,6 +789,7 @@ impl RuntimeError {
     /// Stable top-level variant name used by typed policy classifiers.
     const fn variant_name(&self) -> &'static str {
         match self {
+            Self::AuditObligation { .. } => "AuditObligation",
             Self::Storage(_) => "Storage",
             Self::Sqlite(_) => "Sqlite",
             Self::Query(_) => "Query",
@@ -770,6 +1034,62 @@ impl From<khive_types::KhiveError> for RuntimeError {
 }
 
 #[cfg(test)]
+mod stream_policy_refusal_tests {
+    use super::RuntimeError;
+    use khive_types::{Details, KhiveError};
+
+    #[test]
+    fn stream_policy_refusal_uses_structured_kind_and_marker() {
+        let policy = RuntimeError::Khive(
+            KhiveError::conflict("changed diagnostic wording")
+                .with_details(Details::new([("reason", "stream_member")])),
+        );
+        assert!(policy.is_stream_policy_refusal());
+
+        let wrong_kind = RuntimeError::Khive(
+            KhiveError::invalid_input("stream entries are immutable")
+                .with_details(Details::new([("reason", "stream_member")])),
+        );
+        assert!(!wrong_kind.is_stream_policy_refusal());
+    }
+
+    #[test]
+    fn stream_policy_refusal_excludes_other_conflicts_and_message_lookalikes() {
+        for marker in [
+            None,
+            Some("seq_conflict"),
+            Some("key_conflict"),
+            Some("version_conflict"),
+            Some("fence_conflict"),
+            Some("identity_conflict"),
+            Some("expired"),
+            Some("live_until_unreadable"),
+            Some("key_ambiguous"),
+            Some("unknown_op"),
+            Some("stream_member_extra"),
+        ] {
+            let mut error = KhiveError::conflict("stream entries are immutable");
+            if let Some(marker) = marker {
+                error = error.with_details(Details::new([("reason", marker)]));
+            }
+            assert!(
+                !RuntimeError::Khive(error).is_stream_policy_refusal(),
+                "unrelated conflict marker {marker:?}"
+            );
+        }
+
+        let internal = RuntimeError::Internal("conflict: stream entries are immutable".into());
+        assert!(!internal.is_stream_policy_refusal());
+        let driver = RuntimeError::Storage(khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Sql,
+            "inline.execute",
+            std::io::Error::other("stream_member"),
+        ));
+        assert!(!driver.is_stream_policy_refusal());
+    }
+}
+
+#[cfg(test)]
 mod channel_ingest_failure_class_tests {
     use super::{ChannelIngestFailureClass, RuntimeError};
     use crate::secret_gate::SecretMatch;
@@ -779,11 +1099,15 @@ mod channel_ingest_failure_class_tests {
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
         let first = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: None,
             masked: "first-rendering".to_string(),
+            location: None,
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
+            trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
+            location: None,
         });
 
         assert_ne!(first.to_string(), second.to_string());

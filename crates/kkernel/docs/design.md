@@ -58,10 +58,11 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 20 bare verb names (no dot prefix): `create`, `get`,
+- The kg substrate pack owns 24 verbs: the bare names (no dot prefix) `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,
   `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
-  (ADR-089), `whoami`, `db_diagnostics` (ADR-091).
+  (ADR-089), `whoami`, `db_diagnostics` (ADR-091), plus its one documented
+  sub-namespace, `stream.append` / `stream.read` / `stream.stat` (ADR-174 §2).
 - Every other pack must prefix verbs with `<pack>.` (e.g. `memory.recall`).
 - Sub-variants use underscore, not nested dots: `memory.recall_embed`, not
   `memory.recall.embed`.
@@ -115,7 +116,8 @@
 ### Proposal lifecycle (ADR-046)
 
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
-  20 kg-substrate bare verbs. These are validated by the contract test.
+  23 kg-substrate verbs (the bare names plus the `stream` sub-namespace). These are
+  validated by the contract test.
 
 ### Serial non-atomic ops-file dispatch (ADR-099 Amendment 4)
 
@@ -189,8 +191,12 @@ replay.
 Preflight and prepare failures cross back to `exec.rs` as a typed `AtomicExecFailure` containing
 the unchanged terminal message plus a result envelope over the real ops-file entries. The shared
 refusal annotator emits `verb-refused` for unknown/unloaded preflight entries,
-`gate-refusal` for typed secret-gate prepare failures, and `strict-op-failure` for otherwise
+`gate-refusal` for typed secret-gate prepare failures, `policy-refusal` for structured
+immutable stream record refusals, and `strict-op-failure` for otherwise
 unclassified rollback entries when the operator supplied `--strict`.
+The structured immutable stream policy guard also stamps
+`domain_disposition: "not_committed"` beside the atomic result's string `error`,
+because prepare refused before the atomic unit applied any domain write.
 
 Before prepare, the atomic runtime installs the same aggregate pack edge rules as canonical
 server startup. Before each task-note `update` plan is built, the boundary invokes

@@ -16,11 +16,26 @@ import json
 import subprocess
 import sys
 import os
+import tempfile
 
-BINARY = os.environ.get(
-    "KKERNEL_BINARY",
-    os.path.join(os.path.dirname(__file__), "..", "crates", "target", "release", "kkernel"),
-)
+from kkernel_binary import resolve_binary_path
+
+BINARY = resolve_binary_path()
+
+# The child must not inherit this host's khive: a HOME that carries a
+# ~/.khive config points the binary at a configured daemon, and a KHIVE_*
+# setting in the parent shell (packs, embedding models, output format) changes
+# what the smoke exercises. Mirrors smoke_child_env in smoke_test.py: drop every
+# KHIVE_* variable, give the child an empty HOME, and forbid the daemon path so
+# the in-memory store under test is the one that answers.
+_SMOKE_HOME = tempfile.TemporaryDirectory(prefix="khive-brain-smoke-home-")
+
+
+def smoke_child_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KHIVE_")}
+    env["HOME"] = _SMOKE_HOME.name
+    env["KHIVE_NO_DAEMON"] = "1"
+    return env
 
 request_id = 0
 
@@ -92,7 +107,13 @@ def call_verb_expect_error(proc, name, args):
         raise RuntimeError(
             f"expected {name} to fail but it succeeded: {first.get('result')}"
         )
-    return first.get("error", "<no error string>")
+    err = first.get("error", "")
+    # Since the runtime started preserving domain outcomes, a per-op error is a
+    # structured object ({"kind", "message", "domain_disposition", ...}); the
+    # assertions below read its message text.
+    if isinstance(err, dict):
+        err = str(err.get("message") or err)
+    return err
 
 
 def spawn_brain_proc():
@@ -110,6 +131,7 @@ def spawn_brain_proc():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=smoke_child_env(),
     )
     send(proc, "initialize", {
         "protocolVersion": "2024-11-05",
@@ -307,21 +329,25 @@ def brain_smoke():
 
         # ── 11. bind + bindings ────────────────────────────────────────────────
         try:
+            identity = call_verb(proc, "whoami", {})
+            binding_actor = identity["actor_id"] if identity["actor_kind"] == "actor" else (
+                f"{identity['actor_kind']}:{identity['actor_id']}"
+            )
             bind_result = call_verb(proc, "brain.bind", {
                 "profile_id": "balanced-recall-v1",
-                "actor": "test-actor",
+                "actor": binding_actor,
                 "consumer_kind": "recall",
             })
             assert bind_result.get("bound") is True, f"bind must return bound=true: {bind_result}"
-            assert bind_result.get("actor") == "test-actor", f"actor mismatch: {bind_result}"
+            assert bind_result.get("actor") == binding_actor, f"actor mismatch: {bind_result}"
 
             bindings = call_verb(proc, "brain.bindings", {})
             rows = bindings.get("bindings", [])
             found = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
+                r.get("actor") == binding_actor and r.get("consumer_kind") == "recall"
                 for r in rows
             )
-            assert found, f"test-actor/recall binding must appear in bindings: {rows}"
+            assert found, f"{binding_actor}/recall binding must appear in bindings: {rows}"
             ok(f"bind + bindings — binding appears in listing")
         except Exception as e:
             fail("bind + bindings", e)
@@ -329,7 +355,7 @@ def brain_smoke():
         # ── 12. unbind ────────────────────────────────────────────────────────
         try:
             unbind_result = call_verb(proc, "brain.unbind", {
-                "actor": "test-actor",
+                "actor": binding_actor,
                 "consumer_kind": "recall",
             })
             removed = unbind_result.get("unbound", 0)
@@ -338,7 +364,7 @@ def brain_smoke():
             bindings_after = call_verb(proc, "brain.bindings", {})
             rows_after = bindings_after.get("bindings", [])
             still_there = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
+                r.get("actor") == binding_actor and r.get("consumer_kind") == "recall"
                 for r in rows_after
             )
             assert not still_there, (

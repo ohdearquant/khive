@@ -1,52 +1,30 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-08-30c)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30c)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
 
-## Amendment (2026-08-30): honest lexical fallback and score provenance
-
-A genuine FTS miss yields an empty lexical candidate set. It no longer falls back to a
-bounded scan ordered by atom creation time: corpus recency is not query evidence, and treating
-those newest rows as a lexical rank source lets reciprocal-rank fusion manufacture relevance
-for zero-overlap queries. The cheap raw-FTS existence probe remains so a miss can be distinguished
-from a lexical match removed by kind/status eligibility. ANN-only retrieval remains available when
-an embedder and index can supply it.
-
-`knowledge.search` adds backward-compatible provenance fields:
-
-- Top-level `candidate_provenance.lexical` is `matched`, `exact_name`, `no_match`, `filtered`,
-  `partial_timeout`, or `timed_out`.
-- Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
-  evidence and no returned result has lexical evidence; otherwise it is `none`.
-- Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and
-  `ann`, `embedding_rerank` (whether a successful dense rerank transformed the score),
-  `normalization: "s_over_s_plus_1"`, and `calibrated: false`.
-
-Search scores are request-relative ranking values. After lexical/ANN fusion and optional
-embedding rerank, the score is monotonically squashed with `s / (s + 1)` and receives the
-existing status multiplier. It is not a probability, a cross-query comparable measure, or an
-absolute presence signal. The former `0.46`/`0.42` bands predated the squash and are retired;
-callers use response-local rank together with candidate and per-hit provenance. `min_score`
-continues to apply to the final returned score.
-
 ## Amendment (2026-08-30c): indexed exact-name recovery for short queries
 
-A query whose every token falls below the minimum scoreable term length (e.g. "AI") never
-reaches FTS as anything but the raw phrase, which the trigram tokenizer cannot match below
-three characters. Such a query was unreachable without ANN even when an atom with that exact
-name existed. `candidate_provenance.lexical: "exact_name"` covers this case: when the lexical
-FTS stage produces no candidates and no query token was scoreable, `knowledge.search` probes
-the unique `(namespace, slug)` index with the query normalized through the pack's own slug
-convention (the same one `knowledge.edit`'s import path uses), recovering the atom when FTS
-could not. A caller-chosen slug that departs from that convention stays outside this probe's
-reach — it is a narrower guarantee than a general name index would give, not a substring match.
-A role prefix on the query is scored but never searched, so the probe reads the raw query: a
-role-qualified short query reaches the same recovery path. A read-deadline expiry inside the
-probe reports `timed_out`, the same degradation contract as every other lexical-stage timeout.
+A query such as `AI` has no scoreable term, and the trigram FTS tokenizer cannot match
+a phrase below three characters. When a completed lexical pass finds no match and the raw
+query contains no scoreable non-stopword term, `knowledge.search` probes the unique
+`(namespace, slug)` index using the same slug normalization as the pack's import path.
+An eligible hit reports `candidate_provenance.lexical: "exact_name"` with lexical score
+provenance. This is an exact normalized-slug lookup, not a general name index or substring
+search: an atom with a caller-chosen slug outside the import convention remains outside
+this guarantee. A role prefix affects scoring but cannot suppress the raw-query probe.
+
+The probe runs after FTS retrieval, using the same reader and remaining lexical-stage
+deadline. It retains namespace, live-row, status, and atom/domain eligibility; an existing
+ineligible slug reports `filtered`. An expired probe reports `timed_out` and the existing
+lexical degradation flags, with an internal `exact_name_probe` timing phase. It does not reset
+the stage budget, rerun a timed-out pass, or change public timeout-detail redaction. Exact-name
+hits then follow the existing fusion, score normalization, status multiplier, and final
+`min_score` gates.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -275,10 +253,38 @@ namespace-agnostic. Returns 404 if not found.
 #### `knowledge.list` — paginated listing
 
 ```
-list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {results: [...], total: N, limit, offset}
+list(
+  type?: "atom"|"domain",
+  limit?: 20,
+  offset?: 0,
+  after?: <full-uuid|"">,
+  fields?: [<field>, ...]
+) → {results: [...], limit, order, total?, offset?, next_after?}
 ```
 
-Default type is `atom`. Limit capped at 500.
+Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
+declared total order of `created_at DESC, id DESC`.
+
+Completeness-sensitive consumers use keyset mode: pass `after=""` on the first
+request, then round-trip each non-null `next_after` full UUID. Cursor pages seek
+by `created_at ASC, id ASC`; `after` and `offset` are mutually exclusive. This is
+a live traversal rather than an MVCC snapshot. Inserts whose key is behind an
+already-issued boundary belong to a fresh walk, while inserts ahead of the
+boundary may extend the current walk. Existing rows are not shifted, skipped,
+or duplicated by those inserts. A cursor remains usable if its row is
+soft-deleted, but a missing, wrong-type, or out-of-namespace cursor fails.
+Callers must retain the same type and status filters for the whole walk.
+The walk is complete when `next_after` is null. Cursor pages carry no `total`:
+counting the namespace is a full scan per page and cannot signal completion.
+Offset pages keep `total`.
+
+`fields` is a strict, non-empty response projection. Atom fields are `id`,
+`namespace`, `slug`, `name`, `content`, `tags`, `properties`, `status`,
+`source_uri`, `source_type`, `finalized`, `kind`, `created_at`, and `updated_at`.
+Domain fields are `id`, `namespace`, `slug`, `name`, `description`, `tags`,
+`members`, `kind`, `created_at`, and `updated_at`. Projection is applied at the
+SQL boundary: `fields=["id","slug"]` selects no atom content, apart from hidden
+`id`/`created_at` pagination keys that are not rendered unless requested.
 
 #### `knowledge.delete_atoms` — soft delete
 
@@ -328,7 +334,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {lexical, fallback}}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {...}}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
@@ -367,12 +373,34 @@ retrieval path goes through the same status gate.
 same default exclusion. There is no `include_drafts` override on `suggest` — domain atoms in
 draft state should not drive agent composition.
 
-**Score interpretation (amended 2026-08-30)**: scores are request-relative hybrid ranking
-values, not calibrated relevance probabilities or absolute presence signals. Use result rank
-together with `candidate_provenance` and each result's `score_provenance`; do not apply fixed
-numeric bands across queries. A true lexical miss returns no lexical candidates instead of
-ranking the newest corpus rows, though a healthy ANN leg may still return explicitly labeled
-ANN-only results.
+**Search score interpretation**: scores are request-relative ranking values, not calibrated
+relevance probabilities or absolute presence signals. Use result rank together with
+`candidate_provenance` and each result's `score_provenance`; no fixed numeric band establishes
+relevance across queries.
+
+Every `knowledge.search` result carries `score_provenance` with these fields:
+
+- `sources`: a stable-order subset of `["lexical", "ann"]`. A hit present in both candidate
+  sources retains both labels after RRF fusion.
+- `embedding_rerank`: whether a successful embedding rerank transformed this hit's score.
+- `normalization`: `"s_over_s_plus_1"`. Search applies the monotonic `s / (s + 1)` squash to
+  the score before the status multiplier and final `min_score` filter.
+- `calibrated`: `false`.
+
+The response's `candidate_provenance.lexical` records the lexical candidate-stage outcome:
+`matched` for eligible FTS candidates, `exact_name` for indexed short-query recovery,
+`no_match` for no lexical match in the caller's namespace,
+`filtered` for matches removed by eligibility, `partial_timeout` when a timed-out fetch retains
+eligible candidates or decomposed passes mix completion and timeout, and `timed_out` when a
+fetch times out with no retained candidates (or every decomposed pass does so).
+Completed empty terms alone do not make a fetch partial. These states supplement the
+lexical timeout diagnostics.
+
+`candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and no
+returned hit has lexical evidence; otherwise it is `none`, including for an empty result.
+A genuine lexical miss returns no lexical candidates instead of ranking unrelated recent
+corpus rows. A healthy ANN leg can still supply explicitly labeled ANN-only results. Bounded
+eligibility recovery for actual FTS matches remains part of lexical candidate retrieval.
 
 #### `knowledge.compose` — namespace-consistent briefing composition
 

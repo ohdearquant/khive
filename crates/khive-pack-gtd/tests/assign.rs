@@ -338,3 +338,90 @@ async fn assign_due_natural_language_rejected() {
         "expected ISO-8601 error; got: {msg}"
     );
 }
+
+// The zone a deadline is anchored in is a property of whose deadline it is, and
+// the configured display timezone is one process-wide value serving every caller.
+// A caller may name the zone; the answer always echoes the one that was used.
+
+#[tokio::test]
+async fn a_caller_supplied_timezone_anchors_the_date_and_is_echoed() {
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "zoned due", "due": "2026-06-01", "timezone": "America/New_York"}),
+        )
+        .await
+        .expect("a caller-supplied IANA zone must be accepted");
+
+    assert_eq!(
+        resp["due_timezone"].as_str(),
+        Some("America/New_York"),
+        "the answer must say which zone it anchored in"
+    );
+    let due = resp["due"].as_str().expect("due must be a string");
+    let parsed = chrono::DateTime::parse_from_rfc3339(due)
+        .unwrap_or_else(|e| panic!("due not RFC 3339: {due} - {e}"));
+    // Read the calendar date in the named zone, never after converting to UTC:
+    // the whole point is that the caller's date survives.
+    assert_eq!(
+        parsed
+            .with_timezone(&"America/New_York".parse::<chrono_tz::Tz>().unwrap())
+            .date_naive(),
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        "got {due}"
+    );
+}
+
+#[tokio::test]
+async fn the_echo_is_present_when_the_caller_named_no_zone() {
+    // This is the arm that makes the echo useful. If the field only appeared when
+    // the caller supplied a zone, the defaulted case would be an absence again and
+    // a reader still could not tell a deliberate anchor from a fallen-back one.
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "unzoned due", "due": "2026-06-01"}),
+        )
+        .await
+        .expect("a due with no timezone must still be accepted");
+    let echoed = resp["due_timezone"]
+        .as_str()
+        .expect("the echo must be present on the defaulted path too");
+    echoed
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or_else(|_| panic!("the echo must be a resolvable IANA zone, got {echoed}"));
+}
+
+#[tokio::test]
+async fn an_unknown_timezone_is_refused_and_names_the_value() {
+    let pack = pack(rt());
+    let error = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "bad zone", "due": "2026-06-01", "timezone": "Mars/Olympus"}),
+        )
+        .await
+        .expect_err("an unresolvable zone must be refused, not silently defaulted");
+    let message = error.to_string();
+    assert!(
+        message.contains("Mars/Olympus") && message.contains("timezone"),
+        "the refusal must name the parameter and the value: {message}"
+    );
+}
+
+#[tokio::test]
+async fn no_due_means_no_echo() {
+    // The echo describes a deadline. A task without one must not grow a field
+    // implying it has a deadline anchored somewhere.
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch("gtd.assign", json!({"title": "no due at all"}))
+        .await
+        .expect("a task without a due must still be created");
+    assert!(
+        resp.get("due_timezone").is_none() || resp["due_timezone"].is_null(),
+        "got {resp}"
+    );
+}

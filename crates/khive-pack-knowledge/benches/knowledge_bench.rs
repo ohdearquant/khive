@@ -19,6 +19,9 @@ use khive_types::Namespace;
 
 fn build_runtime() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
+        mounts: Vec::new(),
+        brain: Default::default(),
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
@@ -34,6 +37,7 @@ fn build_runtime() -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: None,
+        exec: Default::default(),
     })
     .expect("runtime")
 }

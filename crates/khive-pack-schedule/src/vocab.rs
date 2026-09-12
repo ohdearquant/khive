@@ -46,14 +46,14 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "repeat",
                 param_type: "string",
                 required: false,
-                description: "Recurrence: \"daily\" | \"weekly\" | \"monthly\". Cron expressions are rejected because the executor cannot advance them safely.",
+                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "schedule.schedule",
-        description: "Schedule a future verb dispatch. NESTED-ACTION EXAMPLE (issue #110): \
+        description: "Schedule a future verb dispatch. NESTED-ACTION EXAMPLE: \
                        schedule.schedule(action=\"schedule.remind(content=\\\"renew the \
                        domain\\\", at=\\\"2027-06-01T09:00:00Z\\\")\", \
                        at=\"2027-05-25T09:00:00Z\") — the OUTER `at` (2027-05-25) is when \
@@ -98,7 +98,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "repeat",
                 param_type: "string",
                 required: false,
-                description: "Recurrence: \"daily\" | \"weekly\" | \"monthly\". Cron expressions are rejected because the executor cannot advance them safely.",
+                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

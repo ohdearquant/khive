@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::EdgeFilter;
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
@@ -27,10 +27,11 @@ use crate::scoring::{
 use crate::MemoryPack;
 
 use super::common::{
-    compute_score, deser, fuse_candidates, make_pipeline, note_matches_tags, plog, plog_n,
-    recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams, RecallParams,
-    TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
-    DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
+    compute_score, deser, fuse_candidates, make_pipeline, note_has_any_tag, note_matches_tags,
+    plog, plog_n, recall_candidate_count, to_json, validate_memory_type, RecallCandidateParams,
+    RecallParams, RecallStageTimings, TextSnippetPolicy, DEFAULT_DECAY_EPISODIC,
+    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
+    RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
 /// Bounded storage page for inbound supersession checks. This is deliberately
@@ -58,6 +59,35 @@ fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, Runt
                 "memory.recall effective character budget overflows platform size".to_string(),
             )
         })
+}
+
+fn emit_slow_recall_warning(
+    total_ms: u64,
+    timings: &RecallStageTimings,
+    result_count: usize,
+    query_bytes: usize,
+    ann_degraded: bool,
+    budget_capped: bool,
+    is_verbose: bool,
+) {
+    if total_ms < RECALL_SLOW_THRESHOLD_MS {
+        return;
+    }
+    tracing::warn!(
+        total_ms,
+        threshold_ms = RECALL_SLOW_THRESHOLD_MS,
+        embed_ms = timings.embed_ms(),
+        fts_ms = timings.fts_ms(),
+        ann_ms = timings.ann_ms(),
+        fresh_tail_ms = timings.fresh_tail_ms(),
+        hydrate_ms = timings.hydrate_ms(),
+        result_count,
+        query_bytes,
+        ann_degraded,
+        budget_capped,
+        is_verbose,
+        "memory.recall exceeded slow-request threshold"
+    );
 }
 
 async fn load_brain_profile(
@@ -189,13 +219,16 @@ impl MemoryPack {
             normalize_min_score(raw).map_err(RuntimeError::from)?
         };
 
+        // `limit` and `top_k` agree on zero: both mean no hits. A caller that
+        // computes a limit which reaches zero gets an empty page, never a
+        // single result smuggled in by a lower clamp.
         let limit = if let Some(k) = p.top_k {
             k.min(crate::scoring::MAX_RECALL_LIMIT)
         } else {
             p.limit
                 .map(|v| v as usize)
                 .unwrap_or(10)
-                .clamp(1, crate::scoring::MAX_RECALL_LIMIT)
+                .min(crate::scoring::MAX_RECALL_LIMIT)
         };
         let limit_u32 = u32::try_from(limit).unwrap_or(u32::MAX);
 
@@ -300,6 +333,7 @@ impl MemoryPack {
         // pointer at both await sites so its state is not inlined into this
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
+        let mut recall_stage_timings = RecallStageTimings::default();
         let mut candidates = Box::pin(self.collect_recall_candidates(
             query_trimmed,
             token,
@@ -314,8 +348,11 @@ impl MemoryPack {
             },
         ))
         .await?;
+        recall_stage_timings.add_retrieval_round(candidates.timings);
+        let hydrate_started = Instant::now();
         let (mut memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
+        recall_stage_timings.add_hydration(hydrate_started.elapsed());
 
         // Widening must count only candidates the created_at window can keep:
         // the window predicate runs post-fusion, so counting raw candidates
@@ -390,8 +427,11 @@ impl MemoryPack {
                 },
             ))
             .await?;
+            recall_stage_timings.add_retrieval_round(candidates.timings);
+            let hydrate_started = Instant::now();
             (memory_ids, notes_by_id) =
                 self.load_memory_candidate_notes(token, &candidates).await?;
+            recall_stage_timings.add_hydration(hydrate_started.elapsed());
             eligible_count = count_eligible(&candidates, &notes_by_id);
         }
         let candidate_limit = current_candidate_limit;
@@ -452,6 +492,8 @@ impl MemoryPack {
         };
 
         let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        // Needed on both the empty and non-empty completion paths.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -471,11 +513,22 @@ impl MemoryPack {
                     serve_attribution,
                     target_ids: Vec::new(),
                     latency_us: recall_start.elapsed().as_micros() as i64,
+                    ann_degraded,
+                    ann_degraded_reason: ann_degraded_reason.clone(),
                 },
             );
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
             }
+            emit_slow_recall_warning(
+                recall_start.elapsed().as_millis() as u64,
+                &recall_stage_timings,
+                0,
+                query_trimmed.len(),
+                ann_degraded,
+                false,
+                is_verbose,
+            );
             // #1657: an empty degraded response is a third state — surface the
             // marker here too, otherwise a bare [] is indistinguishable from a
             // genuine no-match.
@@ -554,9 +607,6 @@ impl MemoryPack {
 
         let recall_pipeline = make_pipeline(&cfg);
 
-        // Only verbose responses pay for the second default-weight score.
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
-
         let mut ranked: Vec<ScoredNote> = Vec::new();
         for hit in &fused {
             let id = hit.entity_id;
@@ -589,6 +639,11 @@ impl MemoryPack {
             }
             if let Some(filter_tags) = p.tags.as_ref().filter(|tags| !tags.is_empty()) {
                 if !note_matches_tags(note.properties.as_ref(), filter_tags, p.tag_mode) {
+                    continue;
+                }
+            }
+            if let Some(excluded) = p.exclude_tags.as_ref().filter(|tags| !tags.is_empty()) {
+                if note_has_any_tag(note.properties.as_ref(), excluded) {
                     continue;
                 }
             }
@@ -839,6 +894,31 @@ impl MemoryPack {
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
+        // Source provenance is the memory's `annotates` edge (never a property);
+        // read it only when asked, one edge query per returned hit.
+        let mut source_ids: HashMap<Uuid, Option<String>> = HashMap::new();
+        if p.include_source_id.unwrap_or(false) {
+            for id in ranked.iter().map(|sn| sn.id) {
+                let source = self
+                    .runtime
+                    .neighbors_with_query(
+                        &effective_token,
+                        id,
+                        NeighborQuery {
+                            direction: Direction::Out,
+                            relations: Some(vec![EdgeRelation::Annotates]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .map(|hit| hit.node_id.to_string());
+                source_ids.insert(id, source);
+            }
+        }
+
         let mut results: Vec<Value> = ranked
             .into_iter()
             .map(|sn| {
@@ -861,6 +941,9 @@ impl MemoryPack {
                     "memory_type": sn.resolved_memory_type,
                     "created_at": micros_to_iso(sn.note.created_at),
                 });
+                if let Some(source) = source_ids.get(&sn.id) {
+                    result["source_id"] = json!(source);
+                }
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }
@@ -919,6 +1002,8 @@ impl MemoryPack {
                 serve_attribution,
                 target_ids,
                 latency_us: recall_start.elapsed().as_micros() as i64,
+                ann_degraded,
+                ann_degraded_reason: ann_degraded_reason.clone(),
             },
         );
 
@@ -944,21 +1029,15 @@ impl MemoryPack {
         // whose total handler time crosses the threshold, regardless of whether
         // KHIVE_RECALL_PROFILE is set, so a slow-but-completing recall leaves
         // daemon-side evidence even when nobody opted into per-stage profiling.
-        {
-            let total_ms = recall_start.elapsed().as_millis() as u64;
-            if total_ms >= RECALL_SLOW_THRESHOLD_MS {
-                tracing::warn!(
-                    total_ms,
-                    threshold_ms = RECALL_SLOW_THRESHOLD_MS,
-                    result_count = results.len(),
-                    query_bytes = query_trimmed.len(),
-                    ann_degraded,
-                    budget_capped,
-                    is_verbose,
-                    "memory.recall exceeded slow-request threshold"
-                );
-            }
-        }
+        emit_slow_recall_warning(
+            recall_start.elapsed().as_millis() as u64,
+            &recall_stage_timings,
+            results.len(),
+            query_trimmed.len(),
+            ann_degraded,
+            budget_capped,
+            is_verbose,
+        );
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             // Raw global ANN diagnostics MUST use the same hydrated namespace filter as results.
@@ -1068,6 +1147,8 @@ impl MemoryPack {
             serve_attribution,
             target_ids,
             latency_us,
+            ann_degraded,
+            ann_degraded_reason,
         } = fields;
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
@@ -1121,6 +1202,8 @@ impl MemoryPack {
                     query_class,
                     target_ids,
                     latency_us,
+                    ann_degraded,
+                    ann_degraded_reason,
                 },
             )
             .await;
@@ -1136,6 +1219,13 @@ struct RecallServeFields<'a> {
     serve_attribution: ServeAttribution,
     target_ids: Vec<String>,
     latency_us: i64,
+    /// #836: at least one vector leg was served FTS-only for this recall. The
+    /// response envelope already distinguishes this from a genuine no-match;
+    /// the event plane could not, so it is carried through here.
+    ann_degraded: bool,
+    /// Reason captured at the failure site, `None` when the recall was not
+    /// degraded.
+    ann_degraded_reason: Option<String>,
 }
 
 /// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
@@ -1149,6 +1239,8 @@ struct RecallExecutedFields {
     query_class: String,
     target_ids: Vec<String>,
     latency_us: i64,
+    ann_degraded: bool,
+    ann_degraded_reason: Option<String>,
 }
 
 /// Append best-effort recall telemetry without affecting the recall response.
@@ -1173,6 +1265,8 @@ async fn emit_recall_executed_event(
         query_class,
         target_ids,
         latency_us,
+        ann_degraded,
+        ann_degraded_reason,
     } = fields;
     let store = match rt.events(token) {
         Ok(store) => store,
@@ -1187,7 +1281,12 @@ async fn emit_recall_executed_event(
         }
     };
     let result_count = target_ids.len();
-    let payload = json!({
+    // A degraded recall that returns nothing is a different state from a
+    // genuine no-match, and both serve `result_count: 0`. The response
+    // envelope has carried that distinction since #1657; without these two
+    // fields the event plane collapses them into one row, so a count of
+    // recalls cannot tell a configuration problem from an empty corpus.
+    let mut payload = json!({
         "actor": actor,
         "served_by_profile_id": served_by_profile_id,
         "serve_attribution": serve_attribution,
@@ -1198,7 +1297,13 @@ async fn emit_recall_executed_event(
         "candidates": target_ids.clone(),
         "selected": target_ids,
         "latency_us": latency_us,
+        "degraded": ann_degraded,
     });
+    if ann_degraded {
+        payload["degraded_reason"] =
+            json!(ann_degraded_reason
+                .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string()));
+    }
     let event = khive_storage::Event::new(
         token.namespace().as_str(),
         "memory.recall",
@@ -1317,6 +1422,67 @@ mod tests {
         fn enter(&self, _: &tracing::span::Id) {}
 
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `limit=0` returns no hits, the same as `top_k=0`; a lower clamp of one
+    /// used to turn it into a single hit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_limit_zero_returns_no_hits_like_top_k_zero() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+        for i in 0..3 {
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                &format!("limit zero probe note {i}"),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let hits_for = |params: serde_json::Value| {
+            let registry = &registry;
+            async move {
+                let out = registry
+                    .dispatch("memory.recall", params)
+                    .await
+                    .expect("recall dispatch");
+                match out {
+                    serde_json::Value::Array(items) => items.len(),
+                    serde_json::Value::Object(map) => map
+                        .get("results")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    _ => panic!("unexpected recall shape"),
+                }
+            }
+        };
+
+        let control =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 2})).await;
+        assert_eq!(
+            control, 2,
+            "limit=2 is the control and must return two hits"
+        );
+        let by_top_k =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "top_k": 0})).await;
+        assert_eq!(by_top_k, 0, "top_k=0 returns no hits");
+        let by_limit =
+            hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 0})).await;
+        assert_eq!(by_limit, 0, "limit=0 returns no hits, the same as top_k=0");
     }
 
     /// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
@@ -1541,6 +1707,142 @@ mod tests {
                 "normal recall must not carry a degraded marker, got: {r:?}"
             );
         }
+    }
+
+    /// A degraded recall and a clean recall must be distinguishable on the
+    /// EVENT plane, not only in the response envelope. Both serve a caller
+    /// successfully, so a consumer counting recalls sees two identical rows
+    /// unless the degradation is carried into the payload. Fails on
+    /// `63f1f78d1`, where `recall_executed` carried no degradation field at
+    /// all and the two arms below produced byte-identical markers.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_executed_event_carries_the_degradation() {
+        const MODEL: &str = "recall-degraded-event-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "degraded event plane recall marker seeded note";
+        const DEGRADED_QUERY: &str = "degraded event plane recall";
+        const CLEAN_QUERY: &str = "event plane recall marker";
+
+        let rt = memory_runtime_with_fresh_tail(true);
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let key = crate::ann::AnnKey::new(MODEL);
+        let held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": DEGRADED_QUERY,
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("degraded recall must still serve");
+        drop(held);
+
+        // The control arm, in the same test and against the same store: an
+        // uncontended recall must produce the OPPOSITE marker, otherwise the
+        // assertion below passes on a field that is simply always true.
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": CLEAN_QUERY,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("uncontended recall must serve");
+
+        // Both emissions are fired off the response path via
+        // `track_background_task`, so poll for the pair rather than assume
+        // they have landed.
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if page.items.len() >= 2 {
+                events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "both recalls must emit a recall_executed event, got: {events:?}"
+        );
+
+        let find = |q: &str| {
+            events
+                .iter()
+                .find(|e| e.payload["query"] == serde_json::json!(q))
+                .unwrap_or_else(|| panic!("no recall_executed event for query {q:?}: {events:?}"))
+        };
+
+        let degraded = find(DEGRADED_QUERY);
+        assert_eq!(
+            degraded.payload["degraded"],
+            serde_json::json!(true),
+            "a degraded recall must say so on the event plane, got: {:?}",
+            degraded.payload
+        );
+        let reason = degraded.payload["degraded_reason"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("degraded event must carry a reason: {:?}", degraded.payload)
+            });
+        assert!(
+            !reason.is_empty(),
+            "the degradation reason must be the failure-site string, not an empty placeholder"
+        );
+
+        let clean = find(CLEAN_QUERY);
+        assert_eq!(
+            clean.payload["degraded"],
+            serde_json::json!(false),
+            "an uncontended recall must not be reported as degraded, got: {:?}",
+            clean.payload
+        );
+        assert_eq!(
+            clean.payload["degraded_reason"],
+            serde_json::Value::Null,
+            "a clean recall carries no reason at all, got: {:?}",
+            clean.payload
+        );
     }
 
     /// #1477: an exceptional fresh-tail skip (here, the runtime's exact leg is
@@ -4739,6 +5041,90 @@ mod tests {
         (registry, local_id_1, local_id_2, bench_id)
     }
 
+    /// A bound actor that remembers an episodic memory recalls it on the same
+    /// identity without naming a namespace: the actor namespace joins the
+    /// default read set where the token is minted (ADR-007 Rev 4 Rule 3b), so
+    /// the write scope of `memory.remember` and the read scope of
+    /// `memory.recall` agree for one identity. An anonymous caller keeps
+    /// exactly `local`, and an explicit `namespace=local` stays precise.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn bound_actor_recalls_its_episodic_memory_without_a_namespace_param() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+        let identity = || khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: Some("lambda:probe".to_string()),
+            visible_namespaces: vec![],
+            ..Default::default()
+        };
+        let remembered = registry
+            .dispatch_with_identity(
+                "memory.remember",
+                json!({
+                    "content": "bound actor probe term episodic arm",
+                    "memory_type": "episodic",
+                    "tags": ["bound-actor-run"],
+                }),
+                Some(identity()),
+            )
+            .await
+            .expect("memory.remember as the bound actor");
+        let id = remembered["id"].as_str().expect("id").to_string();
+        let recall = json!({
+            "query": "bound actor probe term",
+            "tags": ["bound-actor-run"],
+            "limit": 10,
+        });
+        let has = |result: &Value| {
+            result
+                .as_array()
+                .map(|hits| hits.iter().any(|h| h["id"].as_str() == Some(id.as_str())))
+                .unwrap_or(false)
+        };
+
+        let mut result = Value::Null;
+        for _ in 0..300 {
+            result = registry
+                .dispatch_with_identity("memory.recall", recall.clone(), Some(identity()))
+                .await
+                .expect("memory.recall as the bound actor");
+            if has(&result) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            has(&result),
+            "the bound actor must recall its own episodic memory with no namespace param: {result:?}"
+        );
+
+        // Controls run after the positive arm so the index is warm: an absence
+        // below is scope, not consistency.
+        let anonymous = registry
+            .dispatch("memory.recall", recall.clone())
+            .await
+            .expect("memory.recall anonymous");
+        assert!(
+            !has(&anonymous),
+            "an anonymous caller keeps exactly the local read set: {anonymous:?}"
+        );
+        let mut precise = recall.clone();
+        precise["namespace"] = json!("local");
+        let scoped = registry
+            .dispatch_with_identity("memory.recall", precise, Some(identity()))
+            .await
+            .expect("memory.recall namespace=local as the bound actor");
+        assert!(
+            !has(&scoped),
+            "an explicit namespace=local is a precise scope, never widened: {scoped:?}"
+        );
+    }
+
     /// With no override, recall uses exactly the caller token's visible namespaces.
     #[tokio::test]
     #[serial(background_tasks)]
@@ -6057,6 +6443,48 @@ mod tests {
             assert!(
                 super::RECALL_SLOW_THRESHOLD_MS < 30_000,
                 "threshold must fire before the default 30s recall_deadline_ms budget expires"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_slow_recall_warning_names_every_retrieval_stage() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: Arc::clone(&buffer),
+        };
+        let timings = super::RecallStageTimings::from_millis_for_test(11, 22, 33, 44, 55);
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::emit_slow_recall_warning(
+                super::RECALL_SLOW_THRESHOLD_MS,
+                &timings,
+                7,
+                9,
+                false,
+                true,
+                false,
+            );
+        });
+
+        let events = buffer.lock().unwrap();
+        let warning = events
+            .iter()
+            .find(|event| {
+                event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+            })
+            .unwrap_or_else(|| panic!("expected completed slow-recall warning, got {events:?}"));
+        for (field, expected) in [
+            ("embed_ms", "11"),
+            ("fts_ms", "22"),
+            ("ann_ms", "33"),
+            ("fresh_tail_ms", "44"),
+            ("hydrate_ms", "55"),
+        ] {
+            assert_eq!(
+                warning.fields.get(field).map(String::as_str),
+                Some(expected),
+                "missing or incorrect {field}: {warning:?}"
             );
         }
     }

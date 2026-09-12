@@ -17,12 +17,35 @@ CREATE TABLE IF NOT EXISTS notes (
     properties   TEXT,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
-    deleted_at   INTEGER
+    deleted_at   INTEGER,
+    key          TEXT,
+    version      INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TRIGGER IF NOT EXISTS bump_note_version
+AFTER UPDATE ON notes
+WHEN NEW.version = OLD.version
+BEGIN
+    UPDATE notes SET version = OLD.version + 1 WHERE id = NEW.id;
+END;
 
 CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
+
+-- Fresh/direct-store counterpart of migration 028 (ADR-179).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
+    ON notes(namespace, kind, key)
+    WHERE key IS NOT NULL AND deleted_at IS NULL;
+
+-- Full recipient index for read/all inbox listings (migration V33). Create it
+-- before the same-key unread partial index to preserve unread plan selection.
+CREATE INDEX IF NOT EXISTS idx_notes_message_recipient_direction
+    ON notes(namespace, kind,
+             ifnull(json_extract(properties, '$.to_actor'), ''),
+             json_extract(properties, '$.direction'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
 
 -- Partial index for the unread-message probe (comm unread badge + inbox
 -- unread listing/count projection). Its WHERE clause is the exact predicate the
@@ -48,6 +71,23 @@ CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction
     WHERE (json_type(properties, '$.read') IS NULL
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
+
+-- Hot property-path indexes for GTD task listing (status/assignee) -- see
+-- sql/027-notes-hot-property-indexes.sql for the full rationale, the note
+-- that each key expression must match its `FilterOp`'s compiled SQL
+-- byte-for-byte, and why a similarly-shaped comm recipient/direction index
+-- was dropped from this change.
+CREATE INDEX IF NOT EXISTS idx_notes_task_status
+    ON notes(namespace, kind,
+             json_extract(properties, '$.status'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_notes_task_assignee
+    ON notes(namespace, kind,
+             json_extract(properties, '$.assignee'),
+             created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
 
 -- Durable, non-reusing sequence for notes (khive #827). Kept in sync with
 -- `sql/007-notes-seq.sql` (the versioned-migration copy) — see that file for

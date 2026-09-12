@@ -529,6 +529,14 @@ impl KhiveRuntime {
         &self.config
     }
 
+    /// Whether this runtime selects the vector arm for a hybrid search —
+    /// true exactly when a default embedding model is configured. Single
+    /// source of truth for the policy every fan-out and single-backend
+    /// dispatch path uses to report `arm_participation`/`vector_selected`.
+    pub fn vector_arm_selected(&self) -> bool {
+        self.config.embedding_model.is_some()
+    }
+
     /// Return the immutable ADR-118 fresh-tail serving policy captured when
     /// this runtime was constructed.
     pub fn ann_fresh_tail_enabled(&self) -> bool {
@@ -616,8 +624,10 @@ impl KhiveRuntime {
         let build_hash = crate::build_info::BUILD_INFO
             .is_stamped()
             .then_some(crate::build_info::BUILD_INFO.source_revision);
-        let build =
-            khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
+        let build = khive_db::diagnostics::BuildIdentity::from_env(
+            crate::build_info::PACKAGE_VERSION,
+            build_hash,
+        );
 
         khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
@@ -835,35 +845,34 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         model_name: &str,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
+        let (model_name, dims) = self.vector_model_metadata(model_name)?;
+        Ok(self.backend.vectors_for_namespace(
+            &sanitize_key(&model_name),
+            &model_name,
+            dims,
+            token.namespace().as_str(),
+        )?)
+    }
+
+    /// Resolve the storage identity and declared dimensions together so guarded
+    /// SQL publication agrees with VectorStore, including built-in aliases.
+    pub(crate) fn vector_model_metadata(&self, model_name: &str) -> RuntimeResult<(String, usize)> {
+        let registry = self
+            .embedder_registry
+            .read()
+            .map_err(|_| crate::RuntimeError::Internal("embedder registry lock poisoned".into()))?;
         if let Some(model) = parse_embedding_model_alias(model_name) {
             // Only proceed via the lattice path if this model is actually in the
             // registry; otherwise fall through to the custom-provider path.
             let key = model.to_string();
-            let in_registry = self
-                .embedder_registry
-                .read()
-                .map(|reg| reg.contains(&key))
-                .unwrap_or(false);
-            if in_registry {
-                return self.vectors_for_embedding_model(token, model);
+            if registry.contains(&key) {
+                return Ok((key, model.dimensions()));
             }
         }
-        let dims = {
-            let registry = self.embedder_registry.read().map_err(|_| {
-                crate::RuntimeError::Internal("embedder registry lock poisoned".into())
-            })?;
-            registry
-                .get_provider(model_name)
-                .map(|p| p.dimensions())
-                .ok_or_else(|| crate::RuntimeError::UnknownModel(model_name.to_string()))?
-        };
-        let model_key = sanitize_key(model_name);
-        Ok(self.backend.vectors_for_namespace(
-            &model_key,
-            model_name,
-            dims,
-            token.namespace().as_str(),
-        )?)
+        registry
+            .get_provider(model_name)
+            .map(|provider| (model_name.to_owned(), provider.dimensions()))
+            .ok_or_else(|| crate::RuntimeError::UnknownModel(model_name.to_string()))
     }
 
     /// Get a namespace-scoped vector store for a pack-owned immutable identity.
@@ -1065,15 +1074,12 @@ impl KhiveRuntime {
                 Ok(NamespaceToken::mint_authorized(ns, actor))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %ns.as_str(),
@@ -1141,22 +1147,19 @@ impl KhiveRuntime {
                     match self.config.gate.check(&extra_req) {
                         Ok(ref extra_decision) if extra_decision.is_allow() => {}
                         Ok(khive_gate::GateDecision::Deny { reason }) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!(
                                     "visibility namespace {:?} denied: {reason}",
                                     extra.as_str()
                                 ),
-                            });
+                            ));
                         }
                         Ok(_) => {
-                            return Err(crate::RuntimeError::PermissionDenied {
-                                verb: "authorize".to_string(),
-                                reason: format!(
-                                    "visibility namespace {:?} denied by gate",
-                                    extra.as_str()
-                                ),
-                            });
+                            return Err(crate::RuntimeError::permission_denied(
+                                "authorize",
+                                format!("visibility namespace {:?} denied by gate", extra.as_str()),
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1178,15 +1181,12 @@ impl KhiveRuntime {
                 ))
             }
             Ok(khive_gate::GateDecision::Deny { reason }) => {
-                Err(crate::RuntimeError::PermissionDenied {
-                    verb: "authorize".to_string(),
-                    reason,
-                })
+                Err(crate::RuntimeError::permission_denied("authorize", reason))
             }
-            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
-                verb: "authorize".to_string(),
-                reason: "gate denied".to_string(),
-            }),
+            Ok(_) => Err(crate::RuntimeError::permission_denied(
+                "authorize",
+                "gate denied",
+            )),
             Err(e) => {
                 tracing::warn!(
                     namespace = %primary.as_str(),
@@ -2109,6 +2109,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2124,6 +2127,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
         let data_dir = rt
@@ -2142,6 +2146,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar_path = dir.path().join("main.db.events.db");
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: Some(crate::events_split::EventsSplitConfig {
@@ -2160,6 +2167,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
 
@@ -2200,6 +2208,9 @@ mod tests {
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2215,6 +2226,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert!(rt.backend_data_dir().is_none());
@@ -2225,6 +2237,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2240,6 +2255,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -2254,6 +2270,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_runtime.db");
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2269,6 +2288,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         {
             let writable = KhiveRuntime::new(base.clone()).expect("create migrated snapshot");
@@ -2314,6 +2334,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("explicit_read_only_runtime.db");
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2329,6 +2352,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -2461,6 +2485,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_blob_seam.db");
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
@@ -2476,6 +2503,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             events_split: None,
+            exec: Default::default(),
         };
         KhiveRuntime::new(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -2695,6 +2723,9 @@ mod tests {
             );
 
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                telemetry: Default::default(),
+                mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
@@ -2710,6 +2741,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             };
 
             let tilde_cfg = make_config(tilde_anchor.clone());
@@ -2743,6 +2775,9 @@ mod tests {
     fn from_backend_uses_provided_backend() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -2758,6 +2793,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -2943,7 +2979,11 @@ mod tests {
         // needed, so its verbs are live in default deployments too (only an
         // in-memory backend leaves them unconfigured).
         assert!(cfg.packs.contains(&"blob".to_string()));
-        assert_eq!(cfg.packs.len(), 12);
+        // tool loads by default: the registry, discovery and use-policy verbs
+        // (ADR-180) are live in default deployments.
+        assert!(cfg.packs.contains(&"tool".to_string()));
+        assert!(cfg.packs.contains(&"exec".to_string()));
+        assert_eq!(cfg.packs.len(), 14);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
@@ -2993,6 +3033,9 @@ mod tests {
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3008,6 +3051,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3021,6 +3065,9 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3036,6 +3083,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -3057,6 +3105,9 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3072,6 +3123,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3085,6 +3137,9 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3100,6 +3155,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -3131,6 +3187,9 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_display_timezone_overrides_base() {
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3146,6 +3205,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig {
             display: crate::engine_config::DisplaySectionConfig {
@@ -3164,6 +3224,9 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_display_timezone_keeps_base() {
         let base = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: "Asia/Tokyo".parse().unwrap(),
             events_split: None,
@@ -3179,6 +3242,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
         let cfg = KhiveConfig::default(); // no [display] section
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -3311,7 +3375,11 @@ mod tests {
 
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
+            exec: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
@@ -3391,6 +3459,9 @@ mod tests {
         let secondary_arc = migrated_memory_backend();
 
         let main_config = RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
@@ -3406,6 +3477,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         };
 
         let rt_main = KhiveRuntime::from_backend(main_arc.clone(), main_config);
@@ -3531,6 +3603,9 @@ mod tests {
         let rt_from = KhiveRuntime::from_backend(
             backend,
             RuntimeConfig {
+                telemetry: Default::default(),
+                mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
@@ -3546,6 +3621,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             },
         );
         // from_backend with backend_id="lore" and no core_backend: core() returns

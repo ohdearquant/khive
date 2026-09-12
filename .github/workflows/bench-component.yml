@@ -14,11 +14,11 @@ on:
       timeout_minutes:
         description: >-
           Job timeout in minutes. Components whose bench-target compile is
-          heavier than the default budget (packs: ~16m compile alone) pass a
-          larger value so the Criterion step keeps its full 10-minute bound.
+          heavier than the default budget pass a larger value. Reserve ten
+          minutes for Criterion and five for setup, termination and publishing.
         required: false
         type: number
-        default: 20
+        default: 30
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,16 +47,30 @@ jobs:
           key: component-${{ inputs.component }}
 
       - name: Compile-check this component's bench targets
+        id: compile
+        continue-on-error: true
         working-directory: crates
         env:
           COMPONENT_CRATES: ${{ inputs.crates }}
+          COMPONENT_JOB_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -euo pipefail
+          compile_seconds=$(( (COMPONENT_JOB_MINUTES - 15) * 60 ))
+          test "$compile_seconds" -gt 0
+          rm -rf target/criterion
           pkg_args=()
           for crate in $COMPONENT_CRATES; do pkg_args+=(-p "$crate"); done
-          cargo bench "${pkg_args[@]}" --all-targets --no-run
+          echo "phase=compile start=$(date -u +%FT%TZ) timeout_seconds=$compile_seconds" | tee -a ../component-phases.log
+          SECONDS=0
+          rc=0
+          timeout --kill-after=30s "$compile_seconds" cargo bench "${pkg_args[@]}" --benches --no-run || rc=$?
+          echo "phase=compile elapsed_seconds=$SECONDS exit_code=$rc" | tee -a ../component-phases.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then echo "::warning::Component compile failed or timed out (exit $rc)"; fi
+          exit "$rc"
 
       - name: Run Criterion benches (quick profile, bounded to 10 minutes)
+        if: steps.compile.outcome == 'success'
         working-directory: crates
         env:
           COMPONENT_CRATES: ${{ inputs.crates }}
@@ -66,7 +80,14 @@ jobs:
           set -euo pipefail
           pkg_args=()
           for crate in $COMPONENT_CRATES; do pkg_args+=(-p "$crate"); done
-          timeout 600 cargo bench "${pkg_args[@]}" --benches -- --quick || true
+          echo "phase=criterion start=$(date -u +%FT%TZ) timeout_seconds=600" | tee -a ../component-phases.log
+          SECONDS=0
+          rc=0
+          # Bound the whole pass, including every benchmark child. TERM alone
+          # can leave timeout waiting forever for a benchmark that ignores it.
+          timeout --kill-after=30s 600 cargo bench "${pkg_args[@]}" --benches -- --quick || rc=$?
+          echo "phase=criterion elapsed_seconds=$SECONDS exit_code=$rc" | tee -a ../component-phases.log
+          if [ "$rc" -ne 0 ]; then echo "::warning::Criterion pass failed or timed out (exit $rc); retaining partial estimates"; fi
 
       - name: Record component trend ledger entry
         id: record
@@ -93,7 +114,9 @@ jobs:
 
       - name: Write step summary
         if: always()
-        run: cat /tmp/components-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        run: |
+          cat component-phases.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat /tmp/components-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
       - name: Upload raw Criterion output
         if: always()
@@ -101,6 +124,7 @@ jobs:
         with:
           name: bench-track-${{ inputs.component }}-${{ github.run_id }}
           path: |
+            component-phases.log
             crates/target/criterion
             bench-data/components.jsonl
           retention-days: 90

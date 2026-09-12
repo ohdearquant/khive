@@ -108,6 +108,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "Task body. Stored as properties.description and mirrored into the task's content; read back on the task record and by gtd.tasks/gtd.next.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "status",
                 param_type: "string",
                 required: false,
@@ -134,7 +141,17 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "due",
                 param_type: "string",
                 required: false,
-                description: "Due date (ISO-8601).",
+                description: "Due date (ISO-8601). A date-only value is anchored to the earliest \
+                              instant of that local date in `timezone`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "timezone",
+                param_type: "string",
+                required: false,
+                description: "IANA zone name (e.g. \"America/New_York\") the date-only `due` is \
+                              anchored in. Defaults to the server's configured display timezone. \
+                              The zone actually used is echoed back as `due_timezone`.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -173,7 +190,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum tasks to return (default 10, silently clamped to 200 — issue #744: a `limit` above 200 is capped without a separate signal in the response).",
+                // MAINTENANCE, deliberately kept out of the description: khive #744.
+                description: "Maximum tasks to return (default 10). A `limit` above 200 is \
+                              capped to 200 without a separate signal in the response.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -203,7 +222,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID or unique 8+ hex prefix of the task to complete. By-ID resolution is namespace-agnostic (ADR-007).",
+                // MAINTENANCE, deliberately kept out of the description: ADR-007.
+                description: "Full UUID or unique 8+ hex prefix of the task to complete. \
+                              By-ID resolution is namespace-agnostic.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
@@ -223,15 +244,19 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
         ],
     },
     // Assertive: retrieves filtered task listing
+    // MAINTENANCE, deliberately kept out of the description: the `filter_excluded`
+    // signal and the default-filter rule are khive #96.
     HandlerDef {
         name: "gtd.tasks",
         description: "List tasks filtered by status, assignee, priority. DEFAULT (no `status` \
-                       given): excludes terminal statuses (done, cancelled) so the default \
+                       given): includes canonical open states and the legacy missing/non-text \
+                       inbox fallback; excludes terminal and unrecognized stored statuses so the default \
                        listing shows only active work. Pass status=\"done\" or \
                        status=\"cancelled\" explicitly to see completed/cancelled tasks — an \
                        empty result under the default filter does NOT mean the task doesn't \
                        exist; the response carries `filter_excluded` when the default filter \
-                       is the reason the result is empty (issue #96).",
+                       is the reason the result is empty. Inspect legacy records \
+                       through list(kind=\"task\"); they are not silently rewritten.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -263,7 +288,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum results (default 20, silently clamped to 200 — issue #744: a `limit` above 200 is capped without a separate signal in the response).",
+                // MAINTENANCE, deliberately kept out of the description: khive #744.
+                description: "Maximum results (default 20). A `limit` above 200 is capped to \
+                              200 without a separate signal in the response.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -286,7 +313,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID or unique 8+ hex prefix of the task to transition. By-ID resolution is namespace-agnostic (ADR-007).",
+                // MAINTENANCE, deliberately kept out of the description: ADR-007.
+                description: "Full UUID or unique 8+ hex prefix of the task to transition. \
+                              By-ID resolution is namespace-agnostic.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {

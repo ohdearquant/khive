@@ -851,3 +851,46 @@ that context under `writer_task_request_failed` or `writer_task_terminated`, wit
 `request_state`, `task_terminated`, and `retryable` fields. Events protocol v3 carries a tagged
 request-failed versus task-terminated disposition, so `TransactionRolledBack` cannot be
 reconstructed as a terminal writer error merely because it crossed the daemon socket.
+
+## Amendment 6 (2026-08-29): Bounded pre-execution BEGIN retry
+
+The writer task absorbs a small, bounded number of the retry-safe refusals
+classified by Amendment 4. A transaction-wrapped request makes at most three
+total `BEGIN IMMEDIATE` attempts, with fixed 5 ms and 10 ms backoffs after the
+first two busy/locked refusals. The attempts share one acquisition budget: the
+connection's configured SQLite `busy_timeout`, measured from the first
+attempt. Before each retry the task subtracts the time already spent and
+lowers the connection's `busy_timeout` to the remainder; a busy/locked refusal
+that arrives with no budget left surfaces immediately instead of retrying.
+Persistent contention is therefore bounded to one busy-timeout window plus
+15 ms of explicit backoff, never three windows. When a retry lowered the
+timeout, the configured value is restored on the connection before the next
+request is dequeued. A non-busy BEGIN error is never retried.
+
+The retry loop is immediately around `BEGIN IMMEDIATE`, before the task
+transfers the request's `FnOnce` operation closure to execution. Success runs
+that closure exactly once. Exhaustion runs it zero times and preserves the
+Amendment 4 `StorageError::WriterTaskBusy` result and runtime/MCP fields:
+`writer_task_begin_busy`, `retryable: true`,
+`operation: "writer_task_begin"`, no admission scope, and no admission retry
+hint. Request-body failures, COMMIT, ROLLBACK, top-level operations, and every
+ambiguous or terminal path remain single-pass and are never replayed.
+
+Observability distinguishes absorbed from surfaced refusals without changing
+the existing counter's meaning. `writer_task_begin_busy` keeps counting every
+busy/locked `BEGIN IMMEDIATE` refusal, whether or not another internal attempt
+follows it, so a nonzero value reflects total contention regardless of retry
+policy. `writer_task_begin_busy_absorbed` counts the subset of those refusals
+that was followed by another internal attempt; the refusals surfaced to the
+caller are the difference between the two. Both are published as concrete
+`u64` values under `db_diagnostics.writer_contention`.
+
+## Amendment 7 (2026-08-30): Preserve classifiable batch refusal evidence
+
+ADR-005's #2079 amendment adds bounded per-item `errors`, complete
+`error_counts`, and explicit truncation metadata to `BatchWriteSummary` while
+retaining its four legacy fields. The writer task's generic typed reply path
+continues to carry the summary value itself, so these fields cross queue-on
+and queue-off execution unchanged. No writer-task adapter may reconstruct a
+summary from aggregate counters or `first_error`, because doing so would erase
+the store's refusal classification and retryability decision.

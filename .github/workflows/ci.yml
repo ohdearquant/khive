@@ -103,9 +103,10 @@ jobs:
     # so any slow runner day converted a green run into a timeout cancellation.
     timeout-minutes: 70
     strategy:
-      # A fast failure cancels the sibling OS to control runner cost. The tradeoff
-      # is that a macOS-only failure may need a second run after Linux is fixed.
-      fail-fast: true
+      # Every shard runs to completion so one head reports every arm. With
+      # fail-fast on, the first red shard cancelled its siblings and the Clippy
+      # step on the Linux shard did not run whenever another arm was red first.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         # The workspace test suite is nextest-partitioned 2-way per OS (see the
@@ -126,6 +127,10 @@ jobs:
       # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
       # `ld terminated with signal 7 [Bus error]`, e.g. run 28604091732).
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The model cache below is load-bearing, not an optimisation: with this
+      # set, a phase whose model is missing fails naming the directory instead
+      # of fetching from huggingface.co.
+      LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
@@ -157,6 +162,43 @@ jobs:
           # of the job; the first to finish wins and the second is a no-op
           # (actions/cache skips saving over an existing key), which is fine.
           key: line-tables
+      # EMBEDDING MODEL CACHE. The embedder fetches its weights from
+      # huggingface.co the first time it is built. Fetching per run made this
+      # workflow depend on a third-party CDN's rate limiter, which on
+      # 2026-09-12 answered 429 twelve times in one job and reddened unrelated
+      # pull requests. Restore the cache, fill it only on a miss, and then run
+      # every test phase with LATTICE_OFFLINE set (see the job env above) so the
+      # cache is load-bearing: a phase that would have fetched fails at once,
+      # naming the directory it expected, instead of reaching the network.
+      #
+      # The key carries the locked lattice-inference version because that crate
+      # owns both the cache layout and the checksum set the files are verified
+      # against, so a version change is the event that can invalidate a cache
+      # entry. There is no upstream revision to pin: the crate resolves against
+      # the repository's main branch.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
       - uses: denoland/setup-deno@v2
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         with:
@@ -170,6 +212,23 @@ jobs:
       - name: Install khive-contract scan dependency (Linux)
         if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
         run: |
+          # The runner image carries third-party apt lists this job needs
+          # nothing from, and `apt-get update` exits 100 when any one of them
+          # serves a bad index. Google's chrome list did exactly that on
+          # 2026-09-09 (Hash Sum mismatch) and reddened every full-suite
+          # shard. ripgrep comes from the Ubuntu archive, so disable that list
+          # instead of retrying into the same mismatch. apt reads only .list
+          # and .sources files, so a renamed copy is inert, and the Ubuntu
+          # archive itself lives in ubuntu.sources and is untouched. A different
+          # third-party list failing this way needs its own line here, by
+          # name: this is deliberately not a blanket sweep of the directory.
+          for f in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources; do
+            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
+          done
+          # Print what still points at the chrome repo: empty is the pass, a
+          # non-empty line says the rename missed a filename this does not know.
+          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
           sudo apt-get update
           sudo apt-get install --yes ripgrep
           rg --version
@@ -269,6 +328,74 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
 
+  khive-py:
+    name: Python client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      KKERNEL: ${{ github.workspace }}/crates/target/debug/kkernel
+      PYTHONPATH: ${{ github.workspace }}/python
+      TMPDIR: /tmp
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          key: line-tables
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      # EMBEDDING MODEL CACHE. The embedder fetches its weights from
+      # huggingface.co the first time it is built. Fetching per run made this
+      # workflow depend on a third-party CDN's rate limiter, which on
+      # 2026-09-12 answered 429 twelve times in one job and reddened unrelated
+      # pull requests. Restore the cache, fill it only on a miss, and then run
+      # every test phase with LATTICE_OFFLINE set (see the job env above) so the
+      # cache is load-bearing: a phase that would have fetched fails at once,
+      # naming the directory it expected, instead of reaching the network.
+      #
+      # The key carries the locked lattice-inference version because that crate
+      # owns both the cache layout and the checksum set the files are verified
+      # against, so a version change is the event that can invalidate a cache
+      # entry. There is no upstream revision to pin: the crate resolves against
+      # the repository's main branch.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      - name: No-stub placeholder scan (before any cargo)
+        run: scripts/ci.sh no-stubs-scan
+      - name: Build debug kkernel
+        run: cargo build --manifest-path crates/Cargo.toml --locked -p kkernel --bin kkernel
+      - name: Install dependencies and run Python tests
+        # pytest exits nonzero when no tests are collected; no separate floor is needed.
+        run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' --with 'blake3>=1' pytest python/tests
+
   kg-editor:
     name: KG Studio (Next.js)
     runs-on: ubuntu-latest
@@ -315,6 +442,20 @@ jobs:
         run: |
           printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\nDPkg::Lock::Timeout "120";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-download-timeouts
+          # The timeouts above bound a stalled mirror. They do not bound a
+          # mirror that answers promptly with a bad index: that fails
+          # `apt-get update` for the whole run, and the retry on the
+          # dependency step re-reads the same index, so the retry cannot
+          # clear it. The browser OS dependencies come from the Ubuntu
+          # archive and Playwright ships its own chromium build, so nothing
+          # in this job needs Google's chrome list.
+          for f in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources; do
+            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
+          done
+          # Print what still points at the chrome repo: empty is the pass, a
+          # non-empty line says the rename missed a filename this does not know.
+          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -368,6 +509,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Scan whole tree for corpus files
         run: bash scripts/check-json-data.sh --all
+      - name: Guard fixture test (staged blobs judged from the index)
+        run: bash scripts/tests/check-json-data-test.sh
 
   secret-scan:
     name: Secret scan (gitleaks)
@@ -687,17 +830,25 @@ jobs:
       # Pinned to an immutable digest (H3 fix round 2), matching the repo's
       # own supply-chain-pin convention (see the `supply-chain` job above).
       # Resolved 2026-07-16 from the `minio/minio:latest` manifest list via
-      # `registry-1.docker.io`'s `Docker-Content-Digest` response header
-      # (`docker.io/v2/minio/minio/manifests/latest`). Both the server
-      # container below and the `mc` client image in the next step pin the
-      # same digest.
+      # `registry-1.docker.io`'s `Docker-Content-Digest` response header. Both
+      # the server container below and the `mc` client image in the next step
+      # pin the same digest.
+      #
+      # The registry moved to quay.io on 2026-09-11: Docker Hub now answers
+      # `minio/minio` with 401 insufficient_scope for anonymous pulls, by tag
+      # and by this digest alike, while the same request against
+      # `library/alpine` still succeeds. quay.io serves this exact digest, so
+      # the image content is unchanged and the pin still identifies one
+      # immutable manifest. Symptom before the move: `pull access denied for
+      # minio/minio`, exit 125, which fails this job and therefore the
+      # aggregate CI gate on every pull request that touches the blob store.
       - name: Start pinned MinIO
         if: steps.changed.outputs.run == 'true'
         run: |
           docker run -d --name khive-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=khive-ci \
             -e MINIO_ROOT_PASSWORD=khive-ci-secret \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
@@ -712,7 +863,7 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           docker run --rm --network host --entrypoint /bin/sh \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e -c \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e -c \
             "mc alias set ci http://127.0.0.1:9000 khive-ci khive-ci-secret && \
              mc mb --ignore-existing ci/khive-blob-conformance"
       - name: Shared BlobStore conformance suite against MinIO
@@ -756,12 +907,20 @@ jobs:
       # including tests outside the `walpin` module; it is not the full suite.
       # Keep this still-new lane fast; widen alongside the `cargo check` step above.
       - name: khive-db walpin Windows FFI tests
-        run: cargo test -p khive-db --lib walpin
+        shell: bash
+        run: |
+          # Floor 1 detects empty selection without pinning the suite size.
+          cargo test -p khive-db --lib walpin 2>&1 | tee "$RUNNER_TEMP/walpin.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/walpin.log" 1
       # ADR-160 Phase 1: compile-only coverage cannot validate the Windows
       # no-reparse, handle-pinned bounded blob read. Keep this lane focused on
       # one normal-path test until the broader Windows suite is affordable.
       - name: khive-db bounded blob read Windows test
-        run: cargo test -p khive-db --lib bounded_verified_get_accepts_exact_and_portable_maximum_limits
+        shell: bash
+        run: |
+          # Floor 1 detects empty selection without pinning the suite size.
+          cargo test -p khive-db --lib bounded_verified_get_accepts_exact_and_portable_maximum_limits 2>&1 | tee "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log" 1
 
   coverage-measurement:
     name: Coverage measurement (advisory)
@@ -775,6 +934,9 @@ jobs:
     outputs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
+    env:
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
       # `cargo llvm-cov --workspace` is the disk-heaviest command in CI: it
@@ -802,6 +964,41 @@ jobs:
       - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-llvm-cov
+      # EMBEDDING MODEL CACHE. The embedder fetches its weights from
+      # huggingface.co the first time it is built. Fetching per run made this
+      # workflow depend on a third-party CDN's rate limiter, which on
+      # 2026-09-12 answered 429 twelve times in one job and reddened unrelated
+      # pull requests. Restore the cache, fill it only on a miss, and then run
+      # every test phase with LATTICE_OFFLINE set (see the job env above) so the
+      # cache is load-bearing: a phase that would have fetched fails at once,
+      # naming the directory it expected, instead of reaching the network.
+      #
+      # The key carries the locked lattice-inference version because that crate
+      # owns both the cache layout and the checksum set the files are verified
+      # against, so a version change is the event that can invalidate a cache
+      # entry. There is no upstream revision to pin: the crate resolves against
+      # the repository's main branch.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
       - name: Compute coverage
         id: compute_coverage
         continue-on-error: true
@@ -884,6 +1081,7 @@ jobs:
     needs:
       - automerge-push-guard
       - ci
+      - khive-py
       - kg-editor
       - supply-chain
       - data-leak-guard

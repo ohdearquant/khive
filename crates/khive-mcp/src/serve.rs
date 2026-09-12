@@ -140,17 +140,24 @@ pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json:
 /// the same database file at the same time — see
 /// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
+        crate::daemon::capture_bridge_executable();
+    }
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     // #667: in daemon mode, failing to acquire the boot guard must abort
     // before `build_server` runs migrations/FTS DDL unguarded — see
     // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
     // lock (dropped right after construction below).
+    if args.daemon {
+        khive_runtime::daemon::mark_warm_index_host();
+    }
     #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
@@ -2087,7 +2094,7 @@ pub async fn serve_server(
         tracing::warn!(
             generation,
             "bridge self-heal: this process is a resumed generation of an \
-             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+             in-place re-exec triggered by bridge self-heal"
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
@@ -2208,7 +2215,8 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
-fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
+/// Reject conflicting access modes without opening any configured database.
+pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
     let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
@@ -2518,6 +2526,189 @@ pub fn reject_conflicting_db_override_with_source(
         return Ok(());
     }
     Err(DatabaseOverrideConflict::new(other, backends.len(), config_source).into())
+}
+
+/// Filesystem identity of a reindex target, captured so a symlink retargeted
+/// or a file replaced in place between validation and open can be told apart
+/// from the declared file validation actually checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // The standard library exposes no stable file-identity accessor off
+        // unix (the Windows volume-serial and file-index accessors are
+        // unstable), so the pre-open re-check degrades to path-level
+        // validation there. This crate's non-unix lane is compile-checked
+        // only.
+        let _ = path;
+        None
+    }
+}
+
+/// An identity-bound database target, shared by one-database admin commands.
+/// The `kkernel reindex` database target as
+/// [`validate_reindex_db_target_with_source`] resolved it: the canonical path
+/// reindex must open, plus the filesystem identity observed at validation
+/// time (`None` when the file did not exist yet).
+///
+/// [`reverify_reindex_target_identity`] re-derives this identity immediately
+/// before open so a symlink retargeted, or the declared file replaced in
+/// place, after validation is refused instead of silently followed.
+#[derive(Debug, Clone)]
+pub struct ValidatedReindexTarget {
+    /// Canonical path reindex must open — never the raw `--db`/`KHIVE_DB`
+    /// string, which may still name a symlink.
+    pub path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+/// Capture an existing regular database file without opening SQLite or creating paths.
+/// Callers must open the returned canonical path and reverify its identity immediately
+/// before a writable open, using [`reverify_reindex_target_identity`].
+pub fn capture_existing_database_target(
+    path: &std::path::Path,
+) -> anyhow::Result<ValidatedReindexTarget> {
+    let path = canonical_path_no_side_effects(path)?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("database {} must already exist", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "database {} is not a regular file",
+        path.display()
+    );
+    let identity = file_identity(&path);
+    #[cfg(unix)]
+    anyhow::ensure!(
+        identity.is_some(),
+        "cannot capture database identity for {}",
+        path.display()
+    );
+    Ok(ValidatedReindexTarget { path, identity })
+}
+
+/// Re-stat a validated reindex target and refuse if its filesystem identity
+/// no longer matches what validation observed.
+///
+/// This is what actually binds the checked identity to the file reindex
+/// opens: a symlink retargeted after validation still resolves `target.path`
+/// to the same canonical (already symlink-free) path, so pinning the open to
+/// `target.path` defeats that redirect by construction; a declared file
+/// replaced in place (e.g. another database renamed over it) keeps the same
+/// path string but changes `(device, inode)`, which this call catches.
+///
+/// The gap this does not close: a parent directory replaced in the sliver of
+/// time between this call returning and the underlying SQLite `open()`
+/// syscall. No API the sqlite binding used here exposes reaches an
+/// already-open file descriptor's identity, so that final window stays open.
+pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
+    let observed = file_identity(&target.path);
+    if observed != target.identity {
+        anyhow::bail!(
+            "kkernel reindex target {} changed identity between validation and open \
+             (validated {:?}, now {:?}); refusing to open a file that may no longer be \
+             the declared backend",
+            target.path.display(),
+            target.identity,
+            observed,
+        );
+    }
+    Ok(())
+}
+
+/// Validate the single database selected by `kkernel reindex` against a
+/// declared multi-backend topology.
+///
+/// Unlike MCP/exec's override guard, reindex is deliberately a one-database
+/// maintenance command and may target any declared SQLite backend, not only
+/// `main`. Once `[[backends]]` exists it must name that target explicitly:
+/// falling through to the ordinary single-backend default can rebuild an
+/// unrelated file while leaving the intended backend's indexes stale.
+///
+/// Returns `None` when no `[[backends]]` are declared — reindex keeps its
+/// ordinary single-backend `--db` behavior and there is no declared identity
+/// to bind. Returns `Some` with the canonical path and filesystem identity of
+/// the matched backend otherwise; the caller must open exactly that path and
+/// call [`reverify_reindex_target_identity`] immediately before doing so.
+pub fn validate_reindex_db_target_with_source(
+    db_target: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<Option<ValidatedReindexTarget>> {
+    if backends.is_empty() {
+        return Ok(None);
+    }
+
+    let declared_targets = backends
+        .iter()
+        .filter_map(|backend| {
+            (backend.kind == BackendKind::Sqlite)
+                .then_some(backend.path.as_ref())
+                .flatten()
+                .map(|path| format!("{}={}", backend.name, path.display()))
+        })
+        .collect::<Vec<_>>();
+    let declared_summary = if declared_targets.is_empty() {
+        "<none>".to_string()
+    } else {
+        declared_targets.join(", ")
+    };
+    let source_suffix = config_source
+        .map(|path| format!(" The selected config is {}.", path.display()))
+        .unwrap_or_default();
+
+    let Some(db_target) = db_target.filter(|target| *target != ":memory:") else {
+        anyhow::bail!(
+            "kkernel reindex requires an explicit persistent --db / KHIVE_DB target when \
+             [[backends]] is declared; choose one declared SQLite backend path \
+             ({declared_summary}).{source_suffix}"
+        );
+    };
+
+    let target = canonical_path_no_side_effects(&khive_runtime::expand_tilde(
+        std::path::Path::new(db_target),
+    ))?;
+    for backend in backends {
+        if backend.kind != BackendKind::Sqlite {
+            continue;
+        }
+        let Some(path) = backend.path.as_ref() else {
+            continue;
+        };
+        if canonical_path_no_side_effects(&khive_runtime::expand_tilde(path))? == target {
+            if backend.read_only {
+                anyhow::bail!(
+                    "kkernel reindex database target {db_target:?} matches declared backend \
+                     {name:?}, which is read_only; reindex always writes, so a read-only \
+                     backend cannot be reindexed.{source_suffix}",
+                    name = backend.name,
+                );
+            }
+            return Ok(Some(ValidatedReindexTarget {
+                identity: file_identity(&target),
+                path: target,
+            }));
+        }
+    }
+
+    anyhow::bail!(
+        "kkernel reindex database target {db_target:?} is not a path declared in \
+         [[backends]]; refusing to rebuild an unowned file. Declared SQLite backend \
+         paths: {declared_summary}.{source_suffix}"
+    )
 }
 
 /// Validate a database override and normalize a redundant concrete override
@@ -2836,6 +3027,34 @@ async fn prepare_configured_storage_topology(
     })
 }
 
+/// Resolve one pack's declared backend using the serving route: an explicit
+/// `[packs.<name>]` assignment wins, otherwise the pack uses `main`.
+/// This inspects configuration only and never opens a backend.
+pub fn resolve_pack_backend_config<'a>(
+    khive_cfg: &'a KhiveConfig,
+    pack_name: &str,
+) -> anyhow::Result<(&'a BackendConfig, bool)> {
+    let (backend_name, no_embed) = match khive_cfg.packs.get(pack_name) {
+        Some(pack) => (pack.backend.as_str(), pack.no_embed),
+        None => (BackendId::MAIN, false),
+    };
+    let mut matching = khive_cfg
+        .backends
+        .iter()
+        .filter(|backend| backend.name == backend_name);
+    let backend = matching.next().ok_or_else(|| {
+        let defined = khive_cfg.backends.iter().map(|backend| backend.name.as_str()).collect::<Vec<_>>().join(", ");
+        anyhow::anyhow!(
+            "absent backend route: [packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
+        )
+    })?;
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "ambiguous backend route: [packs.{pack_name}].backend = {backend_name:?} has duplicate backend names"
+    );
+    Ok((backend, no_embed))
+}
+
 async fn build_registry_for_multi_backend_inner(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -2866,19 +3085,13 @@ async fn build_registry_for_multi_backend_inner(
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
     for pack_name in pack_names {
-        let (backend_name, backend, no_embed) = match khive_cfg.packs.get(pack_name.as_str()) {
-            None => (BackendId::MAIN, main_backend.clone(), false),
-            Some(pack_cfg) => {
-                let backend_name = pack_cfg.backend.as_str();
-                let backend = backends.get(backend_name).cloned().ok_or_else(|| {
-                    let defined = backends.keys().cloned().collect::<Vec<_>>().join(", ");
-                    anyhow::anyhow!(
-                        "[packs.{pack_name}].backend = {backend_name:?} references an unknown backend; defined backends: {defined}"
-                    )
-                })?;
-                (backend_name, backend, pack_cfg.no_embed)
-            }
-        };
+        let (backend_config, no_embed) = resolve_pack_backend_config(khive_cfg, pack_name)?;
+        let backend_name = backend_config.name.as_str();
+        let backend = backends.get(backend_name).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "resolved backend {backend_name:?} for pack {pack_name:?} was not prepared"
+            )
+        })?;
         let mut rt_config = base_config.clone();
         rt_config.backend_id = BackendId::parse(backend_name)?;
         if no_embed {
@@ -2976,6 +3189,8 @@ async fn build_registry_for_multi_backend_inner(
         &mut builder,
     )
     .map_err(|e| anyhow::anyhow!("pack registration: {e}"))?;
+
+    khive_mounts::register_mounts(&default_runtime, &mut builder).await?;
 
     let registry = builder
         .build()
@@ -3270,7 +3485,8 @@ pub async fn build_server_with_explicit_namespace(
                 .then(|| runtime.clone()),
         );
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        let server = KhiveMcpServer::new(runtime)
+        let server = KhiveMcpServer::new_with_mounts(runtime)
+            .await
             .map(|s| s.with_default_output_format(fmt))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok((server, schedule_rt));
@@ -4336,6 +4552,49 @@ fn apply_config_pack_selection(
 mod tests {
     use super::*;
     use khive_runtime::{BlobConfig, Namespace, StorageSectionConfig};
+
+    #[test]
+    fn pack_backend_config_uses_main_or_explicit_assignment() {
+        let mut config: KhiveConfig = toml::from_str(
+            "[[backends]]\nname = 'main'\npath = 'main.db'\n\
+             [[backends]]\nname = 'other'\npath = 'other.db'\n\
+             [packs.kg]\nbackend = 'other'\nno_embed = true\n",
+        )
+        .unwrap();
+        let (backend, no_embed) = resolve_pack_backend_config(&config, "kg").unwrap();
+        assert_eq!(backend.name, "other");
+        assert!(no_embed);
+        config.packs.clear();
+        let (backend, no_embed) = resolve_pack_backend_config(&config, "kg").unwrap();
+        assert_eq!(backend.name, "main");
+        assert!(!no_embed);
+    }
+
+    #[test]
+    fn pack_backend_config_refuses_missing_and_duplicate_routes() {
+        let mut config: KhiveConfig = toml::from_str(
+            "[[backends]]\nname = 'main'\npath = 'main.db'\n\
+             [packs.kg]\nbackend = 'missing'\n",
+        )
+        .unwrap();
+        let error = resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("absent backend route:"), "{error}");
+        assert!(error.contains("defined backends: main"), "{error}");
+        config.packs.clear();
+        config.backends.push(config.backends[0].clone());
+        let error = resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("ambiguous backend route:"), "{error}");
+        assert!(error.contains("duplicate backend names"), "{error}");
+        config.backends.clear();
+        assert!(resolve_pack_backend_config(&config, "kg")
+            .unwrap_err()
+            .to_string()
+            .starts_with("absent backend route:"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn schema_prepare_waits_for_gc_owner_off_the_async_worker() {
@@ -5763,6 +6022,7 @@ id = "lambda:project-actor"
         // kg round-trip: create an entity on the main backend.
         let kg_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="concept", name="MultiBackendTestEntity")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -5787,6 +6047,7 @@ id = "lambda:project-actor"
         // comm round-trip: send a message on the secondary backend.
         let comm_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="multi-backend-test")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -5850,6 +6111,7 @@ id = "lambda:project-actor"
 
         let send_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="adr-124 multi-backend boot probe")"#
                     .to_string(),
                 presentation: None,
@@ -5875,6 +6137,7 @@ id = "lambda:project-actor"
 
         let get_before_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -5892,6 +6155,7 @@ id = "lambda:project-actor"
 
         let update_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(
                     r#"update(id="{full_id}", properties={{"from_actor": "forged-actor"}})"#
                 ),
@@ -5912,9 +6176,9 @@ id = "lambda:project-actor"
             "update forging `from_actor` on a message note must be refused on a served \
              multi-backend instance; response: {update_resp}"
         );
-        let error_msg = update_json["results"][0]["error"]
+        let error_msg = update_json["results"][0]["error"]["message"]
             .as_str()
-            .unwrap_or_default();
+            .expect("error.message is text");
         assert!(
             error_msg.contains("from_actor"),
             "refusal error must name `from_actor`; got: {error_msg}"
@@ -5922,6 +6186,7 @@ id = "lambda:project-actor"
 
         let get_after_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -6003,6 +6268,7 @@ id = "lambda:project-actor"
 
         let send_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"comm.send(to="local", content="adr-124 boot-occupancy actor probe")"#
                     .to_string(),
                 presentation: None,
@@ -6028,6 +6294,7 @@ id = "lambda:project-actor"
 
         let get_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: format!(r#"get(id="{full_id}")"#),
                 presentation: None,
                 presentation_per_op: None,
@@ -6044,6 +6311,7 @@ id = "lambda:project-actor"
 
         let create_resp = server
             .dispatch_request_local(RequestParams {
+                plan: None,
                 ops: r#"create(kind="message", content="adr-124 boot-occupancy create probe", properties={"from_actor": "forged-actor"})"#
                     .to_string(),
                 presentation: None,
@@ -7840,6 +8108,7 @@ region = "us-east-1"
             async move {
                 let resp = server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: None,
                         presentation_per_op: None,
@@ -9055,6 +9324,7 @@ region = "us-east-1"
             async move {
                 server
                     .dispatch_request_local(RequestParams {
+                        plan: None,
                         ops,
                         presentation: None,
                         presentation_per_op: None,
@@ -10167,6 +10437,33 @@ backend = "schedule-backend"
             schedule_rt.is_none(),
             "a writable main backend must not enable schedule when schedule's own backend is read-only"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn client_role_never_starts_the_blob_upload_component() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().expect("blob directory");
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        runtime
+            .install_blob_store(std::sync::Arc::new(
+                khive_db::stores::blob::FsBlobStore::new(directory.path().to_path_buf(), 0)
+                    .expect("blob store"),
+            ))
+            .expect("install blob store");
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_blob::BlobPack::new(runtime));
+        let server = KhiveMcpServer::from_registry(builder.build().expect("blob registry"));
+        assert!(server.blob_upload_manager().is_some());
+
+        for argv in [vec!["mcp"], vec!["mcp", "--transport", "http"]] {
+            let args = Args::parse_from(argv);
+            assert_eq!(
+                start_daemon_components_if_daemon(&args, &server, None),
+                0,
+                "only --daemon may start the upload sweeper, even with an admitted manager"
+            );
+        }
     }
 
     #[test]
@@ -11892,8 +12189,7 @@ backend = "kg-backend"
                 Ok(khive_storage::BatchWriteSummary {
                     attempted: n,
                     affected: n,
-                    failed: 0,
-                    first_error: String::new(),
+                    ..khive_storage::BatchWriteSummary::default()
                 })
             }
 

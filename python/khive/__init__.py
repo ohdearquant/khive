@@ -6,42 +6,86 @@ wire contract.
 """
 
 from .client import Khive
+from .cloud import cloud
 from .errors import (
+    AuthError,
+    BadRequest,
     BatchError,
     ConfigMismatch,
     FrameTooLarge,
+    HttpError,
     KhiveError,
     OperationError,
     ProtocolMismatch,
+    RateLimited,
     RequestRejected,
+    ServerError,
     TransportError,
+    http_op_error_code,
 )
-from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
+from .models import (
+    Attachment,
+    Edge,
+    EdgeRelation,
+    Embedding,
+    Entity,
+    Incidence,
+    Note,
+    OpError,
+    OpResult,
+    Page,
+    RecallHit,
+    RecallOutcome,
+)
 from .ops import encode, op
-from .transport import Session, SocketTransport, Transport
+from .transport import (
+    AsyncHttpTransport,
+    AsyncSession,
+    AsyncSocketTransport,
+    HttpTransport,
+    Session,
+    SocketTransport,
+    Transport,
+)
 
 __all__ = [
+    "AsyncHttpTransport",
+    "AsyncSession",
+    "AsyncSocketTransport",
+    "Attachment",
+    "AuthError",
+    "BadRequest",
     "BatchError",
     "ConfigMismatch",
     "Edge",
     "EdgeRelation",
+    "Embedding",
     "Entity",
     "FrameTooLarge",
+    "HttpError",
+    "HttpTransport",
     "Incidence",
     "Khive",
     "KhiveError",
     "Note",
+    "OpError",
     "OpResult",
     "OperationError",
     "Page",
     "ProtocolMismatch",
+    "RateLimited",
+    "RecallHit",
+    "RecallOutcome",
     "RequestRejected",
+    "ServerError",
     "Session",
     "SocketTransport",
     "Transport",
     "TransportError",
+    "cloud",
     "encode",
+    "http_op_error_code",
     "op",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

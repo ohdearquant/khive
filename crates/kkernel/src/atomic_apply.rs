@@ -69,6 +69,11 @@ impl AtomicExecFailure {
                     });
                     if let Some(reason) = failure.reason {
                         entry["reason"] = json!(reason.as_str());
+                        // This structured policy guard failed during prepare,
+                        // before any operation in the atomic unit was applied.
+                        if reason == RefusalReason::PolicyRefusal {
+                            entry["domain_disposition"] = json!("not_committed");
+                        }
                     }
                     entry
                 } else {
@@ -229,6 +234,16 @@ fn atomic_failure_error(
     anyhow::Error::new(AtomicExecFailure::new(ops, message, failures))
 }
 
+fn atomic_preparation_pack_names(cfg: &RuntimeConfig) -> Vec<String> {
+    PackRegistry::discovered_names()
+        .into_iter()
+        // Telemetry contributes no vocabulary or mutation hooks to atomic preparation.
+        // Loading it only when requested preserves all other discovered pack hooks.
+        .filter(|name| *name != "telemetry" || cfg.packs.iter().any(|pack| pack == "telemetry"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Build a metadata-only in-memory registry for exactly the configured pack
 /// set. Atomic admissibility must run before the target database is opened,
 /// but classifying `verb-refused` requires the same loaded-vs-known distinction
@@ -305,6 +320,7 @@ fn classify_atomic_preflight(
 fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReason> {
     match error.downcast_ref::<RuntimeError>() {
         Some(RuntimeError::SecretDetected(_)) => Some(RefusalReason::GateRefusal),
+        Some(error) if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
         _ => None,
     }
 }
@@ -391,10 +407,7 @@ pub(crate) async fn execute_atomic_ops_file(
     // Dropped right after `KhiveRuntime::new` returns rather than held for the
     // whole atomic run: the race this closes is cold-boot schema init, not the
     // prepare/commit passes below.
-    let pack_names: Vec<String> = PackRegistry::discovered_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let pack_names = atomic_preparation_pack_names(&cfg);
     let boot_guard = crate::exec::acquire_local_construction_guard(&cfg)?;
     let namespace = cfg.default_namespace.clone();
     let runtime = KhiveRuntime::new(cfg).context("build in-process runtime for --atomic")?;
@@ -403,7 +416,8 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
-    // ADR-099 B3: a `VerbRegistry` built from the full discovered pack set,
+    // ADR-099 B3: all discovered vocabulary and hooks, excluding only unrequested
+    // telemetry (which contributes neither), remain in the executable registry,
     // reusing the REAL runtime just constructed above (via
     // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
     // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
@@ -570,12 +584,16 @@ pub(crate) async fn execute_atomic_ops_file(
             failure,
         } => {
             let error_message = describe_failure(&failure);
+            let error_value = match &failure {
+                AtomicOpFailure::NoteConflict(conflict) => json!(conflict.clone().into_error()),
+                _ => json!(error_message),
+            };
             let results: Vec<Value> = ops
                 .iter()
                 .enumerate()
                 .map(|(idx, op)| {
                     if idx == failed_op_index {
-                        json!({"ok": false, "tool": op.tool, "op_index": idx, "error": error_message})
+                        json!({"ok": false, "tool": op.tool, "op_index": idx, "error": error_value})
                     } else {
                         json!({"ok": false, "tool": op.tool, "op_index": idx, "error": "not applied: whole atomic unit rolled back"})
                     }
@@ -634,6 +652,7 @@ async fn apply_gtd_audit_post_commit_effects(
 
 fn describe_failure(failure: &AtomicOpFailure) -> String {
     match failure {
+        AtomicOpFailure::NoteConflict(conflict) => conflict.clone().into_error().to_string(),
         AtomicOpFailure::GuardFailed {
             statement_label,
             expected,
@@ -786,6 +805,10 @@ async fn prepare_one(
                     .and_then(Value::as_f64)
                     .unwrap_or(1.0),
                 metadata: resolved.get("metadata").cloned(),
+                resurrect: resolved
+                    .get("resurrect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             registry
                 .validate_link_hooks(runtime, token, std::slice::from_ref(&spec))
@@ -1124,6 +1147,9 @@ async fn build_op_result(
                     obj.insert("target_id".to_string(), orig_target);
                 }
             }
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("mutation".to_string(), json!(p.disposition().name()));
+            }
             Ok(raw)
         }
         // Canonical shapes: handlers.rs:1030-1037 (idempotent no-op) /
@@ -1375,7 +1401,10 @@ mod validate_atomic_args_tests {
     #[test]
     fn atomic_update_result_uses_matching_post_commit_truncation_outcome() {
         let note_id = Uuid::new_v4();
-        let effect = PostCommitEffect::ReindexNote { note_id };
+        let effect = PostCommitEffect::ReindexNote {
+            note_id,
+            version: 2,
+        };
         let outcomes = vec![khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
             effect: effect.clone(),
             truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
@@ -1403,7 +1432,10 @@ mod validate_atomic_args_tests {
     #[test]
     fn atomic_duplicate_update_effect_aggregates_later_truncation_outcome() {
         let note_id = Uuid::new_v4();
-        let effect = PostCommitEffect::ReindexNote { note_id };
+        let effect = PostCommitEffect::ReindexNote {
+            note_id,
+            version: 2,
+        };
         let outcomes = vec![
             khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
                 effect: effect.clone(),
@@ -1547,6 +1579,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn atomic_preparation_keeps_discovered_hooks_without_activating_unrequested_telemetry() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into()],
+            brain_profile: None,
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        assert_eq!(runtime.config().telemetry.default_carrier, None);
+        let names = atomic_preparation_pack_names(runtime.config());
+        let discovered = PackRegistry::discovered_names();
+        assert!(discovered.contains(&"telemetry"));
+        for name in &discovered {
+            assert_eq!(
+                names.iter().any(|selected| selected == name),
+                *name != "telemetry"
+            );
+        }
+        let registry = full_registry(&runtime);
+        assert!(registry.all_note_kinds().contains(&"task"));
+        assert!(registry.all_note_kinds().contains(&"memory"));
+        assert!(!registry.has_verb("telemetry.emit"));
+        assert!(registry.has_verb("gtd.transition"));
+        let (preflight, _runtime) = build_atomic_preflight_registry(runtime.config())
+            .expect("unrequested telemetry needs no declaration");
+        assert!(preflight.has_verb("create"));
+
+        let mut configured = runtime.config().clone();
+        configured.packs.push("telemetry".into());
+        assert!(atomic_preparation_pack_names(&configured)
+            .iter()
+            .any(|name| name == "telemetry"));
+        let error = build_atomic_preflight_registry(&configured)
+            .err()
+            .expect("requested telemetry requires its declared default");
+        assert!(format!("{error:#}").contains("telemetry.default_carrier"));
+        configured.telemetry.default_carrier = Some(khive_runtime::TelemetryCarrier::Ephemeral);
+        let (preflight, _runtime) = build_atomic_preflight_registry(&configured)
+            .expect("requested telemetry has its declared default");
+        assert!(preflight.has_verb("telemetry.emit"));
+    }
+
+    #[test]
+    fn telemetry_atomic_exemption_has_no_vocabulary_hooks_or_admissible_verbs() {
+        use khive_types::Pack;
+        type Telemetry = khive_pack_telemetry::TelemetryPack;
+        assert!(Telemetry::ENTITY_KINDS.is_empty());
+        assert!(Telemetry::NOTE_KINDS.is_empty());
+        assert!(Telemetry::EDGE_RULES.is_empty());
+        assert!(Telemetry::ENTITY_TYPES.is_empty());
+        let implementation = include_str!("../../khive-pack-telemetry/src/pack.rs")
+            .split_once("impl PackRuntime for TelemetryPack {")
+            .expect("telemetry runtime implementation")
+            .1;
+        let implementation = implementation.split("\n}\n").next().unwrap();
+        let mut methods = Vec::new();
+        for line in implementation.lines() {
+            let method = line
+                .strip_prefix("    fn ")
+                .or_else(|| line.strip_prefix("    async fn "));
+            if let Some(method) = method {
+                methods.push(method.split('(').next().unwrap());
+            }
+        }
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            [
+                "dispatch",
+                "entity_kinds",
+                "handlers",
+                "name",
+                "note_kinds",
+                "requires",
+                "validate_config"
+            ],
+            "new runtime hooks require reconsidering the atomic telemetry exemption"
+        );
+        let cfg = RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into(), "telemetry".into()],
+            telemetry: khive_runtime::TelemetryConfig {
+                default_carrier: Some(khive_runtime::TelemetryCarrier::Ephemeral),
+                ..khive_runtime::TelemetryConfig::default()
+            },
+            ..RuntimeConfig::no_embeddings()
+        };
+        for handler in Telemetry::HANDLERS {
+            let ops = vec![OpsFileEntry {
+                tool: handler.name.into(),
+                args: json!({}),
+            }];
+            assert!(!classify_atomic_preflight(&ops, &cfg).unwrap().is_empty());
+        }
+    }
+
     /// Seed a live GTD task note directly (bypassing `gtd.assign`'s handler,
     /// which lives one crate over) with the flat properties shape
     /// `load_task`/`task_status` expect: `kind = "task"`,
@@ -1573,10 +1702,7 @@ mod tests {
 
     fn full_registry(runtime: &KhiveRuntime) -> VerbRegistry {
         let mut builder = VerbRegistryBuilder::new();
-        let pack_names: Vec<String> = PackRegistry::discovered_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let pack_names = atomic_preparation_pack_names(runtime.config());
         PackRegistry::register_packs(&pack_names, runtime.clone(), &mut builder)
             .expect("register packs");
         builder.build().expect("registry")
@@ -2115,6 +2241,71 @@ mod tests {
         assert_eq!(task_properties(&persisted)["status"], "inbox");
     }
 
+    #[tokio::test]
+    async fn atomic_version_only_change_then_stale_noop_rolls_back_whole_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (stale_noop, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.transition",
+            &json!({"id": task_id.to_string(), "status": "inbox"}),
+        )
+        .await
+        .unwrap();
+        // Equal-value DML preserves the timestamp and status, but its trigger
+        // advances version. Only the revision predicate catches this change.
+        let equal_update = AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
+            task_id,
+            vec![PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE notes SET content=content WHERE id=?1".into(),
+                    params: vec![SqlValue::Text(task_id.to_string())],
+                    label: Some("equal-value-note-update".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            false,
+            PostCommitEffect::None,
+        ));
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![equal_update, stale_noop],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AtomicRunOutcome::RolledBack {
+                    failed_op_index: 1,
+                    failure: AtomicOpFailure::GuardFailed { observed: 0, .. },
+                }
+            ),
+            "stale version must invalidate the no-op: {outcome:?}"
+        );
+        let after = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
     /// A deletion earlier in the unit must likewise invalidate a no-op that
     /// was prepared while the task still existed. The no-op's assertion is
     /// what forces the delete to roll back as part of the whole unit.
@@ -2514,6 +2705,14 @@ mod tests {
             .expect("read task")
             .expect("task exists");
         assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            after.version, before.version,
+            "a same-status assertion must not mutate the note revision"
+        );
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
         assert!(task_properties(&after).get("transition_note").is_none());
     }
 

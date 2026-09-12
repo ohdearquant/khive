@@ -46,10 +46,17 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
 pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.send",
-        description: "Send a message, optionally threaded.",
+        description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "to",
                 param_type: "string",
@@ -114,10 +121,31 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.inbox",
-        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox.",
+        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "All-of exact, case-sensitive matches on properties.tags, in either box before offset and limit. An empty array adds no restriction.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Exact native record kind in either box before offset and limit. Comm sends and replies both have kind=message; application tags are separate.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "thread_id",
+                param_type: "uuid",
+                required: false,
+                description: "Full thread UUID matched against properties.thread_id in either box before offset and limit. Alternate UUID spellings are canonicalized; short prefixes are rejected.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
+            },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
@@ -275,6 +303,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "id",
                 param_type: "string",
@@ -533,7 +568,10 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.health",
-        description: "Read-only per-channel health snapshot (khive #606, #1383, #1472). Returns \
+        // MAINTENANCE, deliberately kept out of the description: the surface and its
+        // namespace resolution are specified in khive #606, #877, #917, #1383 and #1472,
+        // and the namespace escape hatch is ADR-007 Rev 6 Rule 3.
+        description: "Read-only per-channel health snapshot. Returns \
                        daemon-persisted heartbeat rows plus exact channel identities found on \
                        live quarantine notes. Every channel entry includes `quarantined_count`; \
                        the response also includes namespace-wide `quarantined_count` and \
@@ -548,15 +586,15 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                        null for legacy/malformed rows and known failure/backoff state. This is \
                        not a computed healthy bool; overall \
                        health judgment belongs to the caller. Reads from the caller's injected \
-                       namespace (khive #877) — `token.namespace()`, the same explicit \
-                       `namespace=` escape / \"local\" default every other comm verb resolves \
-                       (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \
+                       namespace — `token.namespace()`, the same explicit \
+                       `namespace=` escape / \"local\" default every other comm verb \
+                       resolves. An unscoped call defaults to \"local\", matching \
                        the namespace heartbeat rows are persisted under; a call with an \
                        explicit non-local `namespace=` sees only that namespace's rows, never \
                        \"local\"'s. The response carries a `namespace` field naming the \
                        namespace actually read, so `role: \"client\"` means no heartbeat rows \
                        exist under THAT namespace (even if quarantine-only channels exist), not \
-                       necessarily that no daemon exists anywhere. `comm.heartbeat` (khive #917) \
+                       necessarily that no daemon exists anywhere. `comm.heartbeat` \
                        persists under the caller's dispatch-authorized namespace, so a \
                        non-local `namespace=` scope returns that namespace's rows once an \
                        authorized per-tenant writer has run. Without a heartbeat it may still \
@@ -566,11 +604,24 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         category: khive_types::VerbCategory::Assertive,
         params: &[],
     },
+    // MAINTENANCE, deliberately kept out of the description: the explicit-actor
+    // requirement is khive #93 and the cursor_reset signal is khive #2400.
     HandlerDef {
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Selects the earliest 100 unseen messages by commit sequence, then displays \
+                      that page by created_at ascending. cursor_us advances only through rows \
+                      actually returned and never below the honored caller cursor; an empty page \
+                      does not advance it. Round-trip the cursor to drain larger bursts. The page \
+                      and count share one SQL statement's snapshot, scoped to live inbound messages \
+                      with the exact actor and namespace. stale_unread_count is capped at 1000: \
+                      smaller values are exact, and 1000 means at least 1000. It counts unread rows \
+                      strictly older than the cutoff independently of the arrival cursor. Only \
+                      JSON boolean true in properties.read marks a message read. \
                       Unlike comm.inbox, the actor is not inferred from the caller — pass it \
-                      explicitly via the required `actor` param (khive #93).",
+                      explicitly via the required `actor` param. A `since_us` the \
+                      store cannot have issued is discarded and the page comes from the \
+                      baseline; the response then carries `cursor_reset: true`.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -585,7 +636,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                 name: "since_us",
                 param_type: "integer",
                 required: false,
-                description: "Opaque cursor round-tripped from a previous comm.probe response's cursor_us; only messages committed after it are returned. Omit for a baseline-first probe. Not a computable timestamp.",
+                description: "Opaque cursor round-tripped from a previous comm.probe response's cursor_us; only messages committed after it are returned. Omit for a baseline-first probe. Not a computable timestamp: a microsecond clock reading exceeds any cursor this store has issued, so it is discarded and the response carries cursor_reset: true.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

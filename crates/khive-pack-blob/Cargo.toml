@@ -9,23 +9,26 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Blob verb pack — thin MCP verbs (put/get/stat) over the existing BlobStore CAS"
+description = "Blob verb pack — content-addressed reads and staged uploads"
 
 [dependencies]
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
+khive-request = { version = "0.8.0", path = "../khive-request" }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 base64 = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
 khive-db = { version = "0.8.0", path = "../khive-db" }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
 
 [[test]]
 name = "integration"
