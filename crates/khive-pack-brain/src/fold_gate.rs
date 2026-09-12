@@ -11,6 +11,8 @@
 //! See `crates/khive-pack-brain/docs/api/fold-gate.md` for the full mass
 //! invariant, concurrency proof, why the decay math runs in Rust not SQL, and
 //! the scorer-dedup atomicity argument.
+use crate::sql::sql;
+
 use khive_runtime::{EventAttribution, RuntimeError};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -332,9 +334,7 @@ async fn claim_dedup_within_tx(
 ) -> Result<bool, RuntimeError> {
     let rows_affected = writer
         .execute(SqlStatement {
-            sql: "INSERT OR IGNORE INTO brain_scorer_dedup \
-                  (scorer_run_id, serve_ledger_id, claimed_at) \
-                  VALUES (?1, ?2, ?3)"
+            sql: sql!("brain_scorer_dedup_claim")
                 .into(),
             params: vec![
                 SqlValue::Text(scorer_run_id.to_string()),
@@ -361,8 +361,7 @@ async fn fold_within_tx(
 ) -> Result<FoldGateOutcome, RuntimeError> {
     let row = writer
         .query_row(SqlStatement {
-            sql: "SELECT mass, last_event_at FROM brain_implicit_mass \
-                  WHERE profile_id = ?1 AND namespace = ?2 AND target_id = ?3"
+            sql: sql!("brain_implicit_mass_read")
                 .into(),
             params: vec![
                 SqlValue::Text(profile_id.to_string()),
@@ -407,13 +406,7 @@ async fn fold_within_tx(
 
     writer
         .execute(SqlStatement {
-            sql: "INSERT INTO brain_implicit_mass \
-                  (profile_id, namespace, target_id, mass, last_event_at, last_effective_weight) \
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                  ON CONFLICT(profile_id, namespace, target_id) \
-                  DO UPDATE SET mass = excluded.mass, \
-                                last_event_at = excluded.last_event_at, \
-                                last_effective_weight = excluded.last_effective_weight"
+            sql: sql!("brain_implicit_mass_upsert")
                 .into(),
             params: vec![
                 SqlValue::Text(profile_id.to_string()),

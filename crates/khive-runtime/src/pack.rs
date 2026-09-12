@@ -7943,6 +7943,140 @@ pub(crate) mod tests {
     /// `src/`, integration tests live under `tests/`. Anything outside those
     /// two directories per crate (benches, examples) never runs as `cargo
     /// test` and is out of scope for this census.
+    /// SQL text belongs in `sql/<name>.sql`, reached through each crate's `sql!`
+    /// macro, not in a Rust string literal. This is the burn-down instrument for that
+    /// move: a crate is added to `CONVERTED` by the pull request that extracts it, and
+    /// from then on the workspace refuses to take a statement back into Rust.
+    ///
+    /// What it can and cannot see, said plainly because the answer is load-bearing.
+    /// It selects by SPELLING: a string literal whose first word is a SQL verb. It
+    /// therefore cannot see a statement assembled from fragments, one returned by a
+    /// helper, or one built at runtime. Its population is code that COMPILES into the
+    /// crate, which means `#[cfg(test)]` module bodies are stripped along with
+    /// `tests/` and `benches/` — a test that stands a fixture table up inline is out
+    /// of scope for this program. The must-match control below is what keeps those
+    /// limits honest: an unconverted crate has to trip the same predicate in the same
+    /// pass, or the detector is broken rather than the tree clean.
+    #[test]
+    fn converted_crates_keep_their_sql_out_of_rust() {
+        /// Crates whose statements live in `sql/`. One pull request adds one name.
+        const CONVERTED: &[&str] = &["khive-pack-brain"];
+        /// A crate known to still hold SQL in Rust, used only to prove the detector
+        /// fires. When this one is converted, move the control to another unconverted
+        /// crate rather than deleting it.
+        const STILL_INLINE: &str = "khive-db";
+
+        fn strip_test_modules(text: &str) -> String {
+            let bytes = text.as_bytes();
+            let mut out = String::with_capacity(text.len());
+            let mut cursor = 0usize;
+            while let Some(found) = text[cursor..].find("#[cfg(test)]") {
+                let start = cursor + found;
+                // Only a `mod` item is stripped; `#[cfg(test)]` on a `use` or a `fn`
+                // leaves nothing to brace-match.
+                let after = &text[start..];
+                let Some(brace_rel) = after.find('{') else {
+                    out.push_str(&text[cursor..]);
+                    return out;
+                };
+                if !after[..brace_rel].contains("mod ") {
+                    out.push_str(&text[cursor..start + brace_rel]);
+                    cursor = start + brace_rel;
+                    continue;
+                }
+                out.push_str(&text[cursor..start]);
+                let mut depth = 0usize;
+                let mut i = start + brace_rel;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cursor = i;
+            }
+            out.push_str(&text[cursor..]);
+            out
+        }
+
+        fn sql_literals(text: &str) -> Vec<String> {
+            const VERBS: [&str; 9] = [
+                "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER ",
+                "PRAGMA ", "REPLACE ",
+            ];
+            let mut found = Vec::new();
+            for (index, _) in text.match_indices('"') {
+                let rest = &text[index + 1..];
+                let upper: String = rest.chars().take(8).collect::<String>().to_uppercase();
+                if let Some(verb) = VERBS.iter().find(|v| upper.starts_with(**v)) {
+                    let snippet: String = rest.chars().take(60).collect();
+                    found.push(format!("{verb}… {snippet}"));
+                }
+            }
+            found
+        }
+
+        let sources = workspace_rust_sources();
+        assert!(
+            !sources.is_empty(),
+            "the workspace source walk returned nothing, so this census read no code"
+        );
+
+        let mut scanned_files = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut control_hits = 0usize;
+        for (path, text) in &sources {
+            let display = path.display().to_string();
+            if display.contains("/tests/") || display.contains("/benches/") {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name == "tests.rs" || file_name.ends_with("_tests.rs") {
+                continue;
+            }
+            let production = strip_test_modules(text);
+            if display.contains(&format!("/{STILL_INLINE}/")) {
+                control_hits += sql_literals(&production).len();
+                continue;
+            }
+            let Some(crate_name) = CONVERTED
+                .iter()
+                .find(|name| display.contains(&format!("/{name}/")))
+            else {
+                continue;
+            };
+            scanned_files += 1;
+            for literal in sql_literals(&production) {
+                offenders.push(format!("{crate_name} {}: {literal}", path.display()));
+            }
+        }
+
+        assert!(
+            control_hits > 0,
+            "must-match control: {STILL_INLINE} still holds SQL in Rust, so a detector \
+             finding none there is broken and its clean reading of {CONVERTED:?} means nothing"
+        );
+        assert!(
+            scanned_files > 0,
+            "no source file matched {CONVERTED:?}; the crate names in that list are how this \
+             census finds its population, so an empty match reads clean for the wrong reason"
+        );
+        assert!(
+            offenders.is_empty(),
+            "SQL text belongs in sql/<name>.sql behind that crate's sql! macro; \
+             {} offender(s) across {scanned_files} file(s): {offenders:#?}",
+            offenders.len()
+        );
+    }
+
     fn workspace_rust_sources() -> Vec<(std::path::PathBuf, String)> {
         let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
