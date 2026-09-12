@@ -321,16 +321,21 @@ def test_search_min_score_filters_all_below_threshold(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """search(kind="entity", min_score=2.0) returns empty results for any real entity.
+    """search(kind="entity", min_score=1.0) returns empty results for any real entity.
 
     Source: crates/kkernel/src/coordinator/tests.rs
       t7c_multi_backend_search_min_score_applied
 
-    RRF scores for any real hit are always <= 1/(60+1) ~= 0.016.  A min_score
-    of 2.0 is above any achievable RRF score.  If the coordinator or handler
-    ignores min_score, the seeded entity would be returned and this test fails.
-    An empty result proves min_score is applied (search.rs line 138,
-    score_floor = p.min_score.unwrap_or(0.0).max(0.0)).
+    RRF scores for any real hit are always <= 1/(60+1) ~= 0.016, so a floor of
+    1.0 is above any achievable score.  If the coordinator or handler ignores
+    min_score, the seeded entity would be returned and this test fails; an empty
+    result proves the floor is applied.
+
+    This port previously used 2.0, which is outside the documented 0.0-1.0 range
+    and was only accepted because the range was unenforced.  Its own Rust source
+    uses 1.0.  The intent, a floor above every achievable score, is expressible
+    inside the contract, so the out-of-range value bought nothing and hid the
+    fact that the range was a promise with nothing behind it.
     """
     ns = temp_namespace
 
@@ -355,13 +360,13 @@ def test_search_min_score_filters_all_below_threshold(
     hits = khive_session.verb("search", {
         "kind": "entity",
         "query": "cft7c_minscore_probe",
-        "min_score": 2.0,
+        "min_score": 1.0,
         "namespace": ns,
     })
 
     assert isinstance(hits, list), f"search must return a list; got {type(hits)}"
     assert hits == [], (
-        "min_score=2.0 must exclude all results (no real RRF score can reach 2.0); "
+        "min_score=1.0 must exclude all results (no real RRF score can reach 1.0); "
         f"got {len(hits)} hit(s): {hits}"
     )
 
