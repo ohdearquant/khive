@@ -648,7 +648,7 @@ impl KhiveRuntime {
                     "embedding_content must be a non-empty proper prefix of content".into(),
                 ));
             }
-            crate::secret_gate::check(prefix)?;
+            crate::secret_gate::check_at(prefix, "note", "embedding_content")?;
         }
         let mut candidate =
             khive_storage::note::Note::new(token.namespace().as_str(), kind, content);

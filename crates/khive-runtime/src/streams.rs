@@ -1050,9 +1050,11 @@ impl KhiveRuntime {
                             self.validate_note_kind(&fence.kind)?;
                         }
                     }
-                    crate::secret_gate::check(
+                    crate::secret_gate::check_at(
                         &serde_json::to_string(&spec.record)
                             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
+                        &format!("member[{index}]"),
+                        "record",
                     )?;
                 }
                 StreamBatchMember::Write(spec) => {
@@ -1075,12 +1077,18 @@ impl KhiveRuntime {
                             spec.key, spec.kind,
                         )));
                     }
-                    crate::secret_gate::check(
+                    crate::secret_gate::check_at(
                         &serde_json::to_string(&spec.doc)
                             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
+                        &format!("member[{index}]"),
+                        "doc",
                     )?;
                     if let Some(tags) = &spec.tags {
-                        crate::secret_gate::check_json(&json!({"tags": tags}))?;
+                        crate::secret_gate::check_json_at(
+                            &json!({"tags": tags}),
+                            &format!("member[{index}]"),
+                            "tags",
+                        )?;
                     }
                 }
                 StreamBatchMember::Refused(_) => {}

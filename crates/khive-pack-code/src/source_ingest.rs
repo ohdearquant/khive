@@ -632,12 +632,12 @@ async fn get_entity_opt(
 /// never set `description`, so this is additive and does not change their
 /// gate coverage.
 fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
-    secret_gate::check(&entity.name)?;
+    secret_gate::check_at(&entity.name, "entity", "name")?;
     if let Some(description) = &entity.description {
-        secret_gate::check(description)?;
+        secret_gate::check_at(description, "entity", "description")?;
     }
     if let Some(properties) = &entity.properties {
-        secret_gate::check_json(properties)?;
+        secret_gate::check_json_at(properties, "entity", "properties")?;
     }
     Ok(())
 }
