@@ -772,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(config_ledger)]
     fn blob_upload_roster_uses_the_registered_manager_and_requires_an_available_store() {
         let runtime = KhiveRuntime::memory().expect("runtime");
         let unavailable = blob_server(runtime);
