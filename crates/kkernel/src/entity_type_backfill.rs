@@ -4,6 +4,8 @@
 //! full preimage against the writable store; it never blindly replaces a row
 //! changed since the scan. Stop other writers while taking the filesystem copy.
 
+use crate::sql::sql;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -144,11 +146,14 @@ fn validate_args(args: &EntityTypeBackfillArgs) -> Result<()> {
 
 async fn nullable_count(runtime: &KhiveRuntime, namespace: &str) -> Result<u64> {
     let mut reader = runtime.sql().reader().await?;
-    match reader.query_scalar(SqlStatement {
-        sql: "SELECT COUNT(*) FROM entities WHERE namespace = ?1 AND deleted_at IS NULL AND entity_type IS NULL".into(),
-        params: vec![SqlValue::Text(namespace.into())],
-        label: Some("entity-type-backfill nullable census".into()),
-    }).await? {
+    match reader
+        .query_scalar(SqlStatement {
+            sql: sql!("entities_untyped_count").into(),
+            params: vec![SqlValue::Text(namespace.into())],
+            label: Some("entity-type-backfill nullable census".into()),
+        })
+        .await?
+    {
         Some(SqlValue::Integer(count)) if count >= 0 => Ok(count as u64),
         _ => bail!("entity-type-backfill census did not return a nonnegative integer"),
     }

@@ -1,5 +1,7 @@
 //! kkernel — khive admin/management library.
 
+mod sql;
+
 mod atomic_apply;
 pub mod cli;
 pub mod code_audit;

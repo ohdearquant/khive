@@ -9,6 +9,8 @@
 //! `--dry-run` runs the same validation and existence checks but performs
 //! no writes.
 
+use crate::sql::sql;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -632,7 +634,7 @@ async fn dry_run_report(
     for entity in &batch.entities {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM entities WHERE id = ?1".to_string(),
+                sql: sql!("entities_exists").to_string(),
                 params: vec![SqlValue::Uuid(entity.id)],
                 label: Some("code-ingest dry-run entity existence".to_string()),
             })
@@ -647,7 +649,7 @@ async fn dry_run_report(
     for note in &batch.notes {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM notes WHERE id = ?1".to_string(),
+                sql: sql!("notes_exists").to_string(),
                 params: vec![SqlValue::Uuid(note.id)],
                 label: Some("code-ingest dry-run note existence".to_string()),
             })
@@ -662,7 +664,7 @@ async fn dry_run_report(
     for edge in &batch.edges {
         let row = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT 1 FROM graph_edges WHERE id = ?1".to_string(),
+                sql: sql!("graph_edges_exists").to_string(),
                 params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
                 label: Some("code-ingest dry-run edge existence".to_string()),
             })
