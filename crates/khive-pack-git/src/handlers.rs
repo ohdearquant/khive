@@ -22,6 +22,7 @@ use crate::source::{
     canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
     repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
+use crate::sql::sql;
 use crate::GitPack;
 
 /// Recover the typed error when a digest ingest/resolution failure chain
@@ -531,11 +532,7 @@ async fn find_projects_by_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_slug')=?2 \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_by_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -572,12 +569,7 @@ async fn find_projects_by_legacy_repo_url(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_slug') IS NULL \
-                  AND json_extract(properties,'$.repo_url')=?2 \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_by_legacy_repo_url_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(repo_url.to_string()),
@@ -610,14 +602,7 @@ async fn find_projects_without_canonical_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, json_extract(properties,'$.repo_url') AS repo_url \
-                  FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug') IS NULL \
-                       OR json_extract(properties,'$.repo_slug')<>?2) \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_without_canonical_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -657,13 +642,7 @@ async fn find_soft_deleted_projects_without_canonical_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
-                  FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NOT NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug') IS NULL \
-                       OR json_extract(properties,'$.repo_slug')<>?2)"
-                .into(),
+            sql: sql!("soft_deleted_projects_without_canonical_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -774,11 +753,7 @@ async fn find_orphaned_anchor(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, deleted_at FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug')=?2 \
-                       OR json_extract(properties,'$.repo_url')=?3)"
-                .into(),
+            sql: sql!("orphaned_projects_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -834,12 +809,7 @@ async fn find_orphaned_anchor(
     for dead_project_id in dead_project_ids {
         let count = r
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM notes n \
-                      JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
-                      WHERE n.namespace = ?1 AND n.deleted_at IS NULL \
-                      AND n.kind IN ('commit', 'issue', 'pull_request') \
-                      AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
-                    .into(),
+                sql: sql!("orphaned_project_notes_count").into(),
                 params: vec![
                     SqlValue::Text(token.namespace().as_str().to_string()),
                     SqlValue::Text(dead_project_id.to_string()),

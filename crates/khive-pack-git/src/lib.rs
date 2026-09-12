@@ -31,6 +31,8 @@
 //! `kkernel git-ingest` remains the unbounded, all-kinds admin CLI path over
 //! the same shared `ingest::run_ingest` core.
 
+mod sql;
+
 #[cfg(test)]
 mod backend_policy_tests;
 pub mod cache;
