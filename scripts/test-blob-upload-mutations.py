@@ -3,14 +3,20 @@
 
 Requires an isolated clean checkout, an explicit native CARGO_TARGET_DIR and
 Python pytest/pydantic/blake3 dependencies. Use a fresh --out outside the checkout.
---case all runs ADR-173's four
-mutation operators. --case owner additionally proves daemon cleanup ownership
-by leaving the timer and heartbeat alive while suppressing its sweep call.
+--case all runs all five controls, including daemon cleanup ownership.
+--case owner runs that control alone, leaving the timer and heartbeat alive
+while suppressing its sweep call. Rustup selects the pinned toolchain explicitly.
 Every case retains raw logs and rebuilds the restored source before succeeding.
+
+Run with Python dependencies in the same interpreter:
+uv run --no-project --with 'pytest>=8' --with 'pydantic>=2.7' --with 'blake3>=1' \
+python scripts/test-blob-upload-mutations.py --root CHECKOUT --head REVISION \
+--binary TARGET/debug/kkernel --out FRESH_DIRECTORY
 """
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,18 +25,26 @@ import subprocess
 import sys
 
 
+CASES = ("tail", "expiry", "sweep", "publisher", "owner")
+
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--case", choices=["all", "tail", "expiry", "sweep", "publisher", "owner"], default="all")
+    parser.add_argument("--case", choices=("all", *CASES), default="all")
     args = parser.parse_args()
+    missing = [name for name in ("pytest", "pydantic", "blake3") if importlib.util.find_spec(name) is None]
+    if missing:
+        parser.error(f"missing Python dependencies: {', '.join(missing)}; use the uv command in --help")
     root, binary, out = args.root.resolve(), args.binary.resolve(), args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
@@ -53,7 +67,8 @@ def main():
     target = target_dir.resolve() / "debug" / "kkernel"
     if env.get("CARGO_BUILD_TARGET") or binary != target:
         raise RuntimeError(f"select the native build output {target} with no CARGO_BUILD_TARGET")
-    results = {"head": head, "root": str(root), "target": env["CARGO_TARGET_DIR"], "commands": [], "cases": {}, "status": "INCOMPLETE"}
+    cases = CASES if args.case == "all" else (args.case,)
+    results = {"head": head, "root": str(root), "target": env["CARGO_TARGET_DIR"], "selected_cases": cases, "commands": [], "cases": {}, "status": "INCOMPLETE"}
 
     def persist():
         (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
@@ -72,7 +87,7 @@ def main():
         return text
 
     def build(name):
-        run(name, ["cargo", "+1.95.0", "build", "--manifest-path", "crates/Cargo.toml", "--locked", "-p", "kkernel"], 0)
+        run(name, ["rustup", "run", "1.95.0", "cargo", "build", "--manifest-path", "crates/Cargo.toml", "--locked", "-p", "kkernel"], 0)
         if not binary.is_file():
             raise RuntimeError("selected candidate binary was not produced")
         target = Path(env["CARGO_TARGET_DIR"]).resolve() / "debug" / "kkernel"
@@ -128,7 +143,6 @@ def main():
         end = text.index("        match failure {", start)
         return (text[:start] + "        let _ = store; // backend staging sweep deliberately removed\n" + text[end:]).encode()
 
-    cases = ["tail", "expiry", "sweep", "publisher"] if args.case == "all" else [args.case]
     try:
         for case in cases:
             if case == "publisher":

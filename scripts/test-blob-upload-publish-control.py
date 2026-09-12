@@ -33,7 +33,7 @@ copy = source[start:closing].replace(b"fn publish_blob_at(", b"fn publish_upload
 mutant = original.replace(anchor, b"            publish_upload_copy(\n", 1)
 mutant += b"\n#[cfg(unix)]\n" + copy + b"\n"
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-base = ["cargo", "test", "--manifest-path", "crates/Cargo.toml", "--locked", "-p", "khive-db", "--lib"]
+base = ["rustup", "run", "1.95.0", "cargo", "test", "--manifest-path", "crates/Cargo.toml", "--locked", "-p", "khive-db", "--lib"]
 green = base + ["stores::blob::uploads::tests", "--", "--nocapture"]
 red = base + ["stores::blob::uploads::tests::upload_put_and_commit_share_the_publish_routine", "--", "--exact", "--nocapture"]
 evidence = {"head": head, "original_sha256": hashlib.sha256(original).hexdigest(), "mutant_sha256": hashlib.sha256(mutant).hexdigest()}
