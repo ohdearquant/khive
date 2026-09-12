@@ -552,25 +552,32 @@ async fn settle_writer_drain(
 /// evidence is rejected here exactly as it would be on the shared `create`
 /// verb path, rather than persisting verbatim.
 fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
-    for entity in &batch.entities {
-        secret_gate::check(&entity.name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (index, entity) in batch.entities.iter().enumerate() {
+        let record = format!("entity[{index}]");
+        secret_gate::check_at(&entity.name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(description) = &entity.description {
-            secret_gate::check(description).map_err(|e| anyhow::anyhow!("{e}"))?;
+            secret_gate::check_at(description, &record, "description")
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         if let Some(properties) = &entity.properties {
-            secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
+            secret_gate::check_json_at(properties, &record, "properties")
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        secret_gate::check_tags(&entity.tags).map_err(|e| anyhow::anyhow!("{e}"))?;
+        secret_gate::check_tags_at(&entity.tags, &record, "tags")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    for note in &batch.notes {
-        secret_gate::check(&note.content).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (index, note) in batch.notes.iter().enumerate() {
+        let record = format!("note[{index}]");
+        secret_gate::check_at(&note.content, &record, "content")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(name) = &note.name {
-            secret_gate::check(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            secret_gate::check_at(name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         if let Some(properties) = &note.properties {
-            secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
+            secret_gate::check_json_at(properties, &record, "properties")
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
