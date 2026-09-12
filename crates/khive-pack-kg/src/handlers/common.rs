@@ -466,7 +466,11 @@ pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
         .and_then(Value::as_str)
         .filter(|n| !n.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| obj.get("content").and_then(Value::as_str).and_then(derive_label));
+        .or_else(|| {
+            obj.get("content")
+                .and_then(Value::as_str)
+                .and_then(derive_label)
+        });
     if let Some(label) = label {
         obj.insert("display_name".to_string(), Value::String(label));
     }
@@ -1099,7 +1103,9 @@ mod note_projection_tests {
         }));
         assert_eq!(
             out.get("display_name"),
-            Some(&json!("A review status in a mutable flag is a side effect.")),
+            Some(&json!(
+                "A review status in a mutable flag is a side effect."
+            )),
             "the label is the first non-empty line, trimmed"
         );
         assert_eq!(
