@@ -493,6 +493,36 @@ pub struct NotePatch {
     pub write_options: crate::note_write::NoteWriteOptions,
 }
 
+/// Normalize the public note tag replacement into its stored property before
+/// kind hooks inspect the patch. An explicit list, including an empty one,
+/// wins over properties.tags; omission and null preserve the property patch.
+pub(crate) fn normalize_note_update_tags(args: &mut Value) -> RuntimeResult<()> {
+    let args = args
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("update arguments must be an object".into()))?;
+    let Some(tags) = args.get("tags").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let tags: Vec<String> = serde_json::from_value(tags.clone()).map_err(|error| {
+        RuntimeError::InvalidInput(format!("tags must be an array of strings: {error}"))
+    })?;
+    let mut properties = match args.get("properties") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(properties)) => properties.clone(),
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "properties must be an object".into(),
+            ));
+        }
+    };
+    properties.insert("tags".into(), serde_json::json!(tags));
+    args.insert("properties".into(), Value::Object(properties));
+    // A hook may normalize this property further. Remove the alias so later
+    // preparation cannot overwrite the hook's result by applying it again.
+    args.remove("tags");
+    Ok(())
+}
+
 impl NotePatch {
     /// Construct a `NotePatch` from the public fields only.
     /// Use this from external crates; `kind_status` is set to `None`.

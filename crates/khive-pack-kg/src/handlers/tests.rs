@@ -1742,70 +1742,312 @@ async fn update_edge_symmetric_conflict_returns_tombstoned_survivor_with_deleted
     );
 }
 
-// HIGH regression: update(note_id, tags=[...]) must return an explicit error.
-// Notes have no top-level tags column; tags live in properties["tags"].
-// Before the fix, tags was silently dropped on the note path (the error string
-// even advertised it as valid — making the bug worse for callers following docs).
 #[tokio::test]
-async fn update_note_with_entity_field_tags_returns_error() {
-    use crate::KgPack;
-    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-
-    let note = rt
-        .create_note(
+async fn update_note_tags_replaces_created_tags_and_preserves_unrelated_properties() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
             &token,
-            "observation",
-            None,
-            "note content unchanged",
-            None,
-            None,
-            vec![],
+            json!({
+                "kind": "observation",
+                "content": "note content unchanged",
+                "tags": ["queued", "old"],
+                "properties": {"keep": {"value": 7}},
+            }),
+            &registry,
         )
         .await
         .expect("create note");
+    assert_eq!(note["properties"]["tags"], json!(["queued", "old"]));
 
-    let pack = KgPack::new(rt.clone());
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    let registry = builder.build().expect("registry build");
-
-    let result = pack
+    let updated = pack
         .handle_update(
             &token,
-            json!({ "id": note.id.to_string(), "tags": ["rust", "ml"] }),
+            json!({"id": note["id"], "tags": ["active", "rust"]}),
             &registry,
         )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "update note with entity-only field 'tags' must return an error, got ok"
-    );
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("tags"),
-        "error must name the invalid field 'tags'; got: {err_msg}"
-    );
-    assert!(
-        err_msg.contains("content"),
-        "error must list 'content' as a valid note field; got: {err_msg}"
-    );
-
-    // Confirm note content is unchanged.
-    let unchanged = rt
-        .notes(&token)
-        .unwrap()
-        .get_note(note.id)
         .await
-        .unwrap()
-        .expect("note must still exist");
+        .expect("replace note tags");
+    assert_eq!(updated["properties"]["tags"], json!(["active", "rust"]));
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .expect("read updated note");
     assert_eq!(
-        unchanged.content, "note content unchanged",
-        "note content must be unchanged after rejected update"
+        fetched["properties"],
+        json!({"tags": ["active", "rust"], "keep": {"value": 7}})
     );
+    assert_eq!(fetched["content"], "note content unchanged");
+    assert_eq!(fetched["tags"], json!(["active", "rust"]));
+}
+
+#[tokio::test]
+async fn update_note_omitted_tags_preserves_tags_while_patching_other_fields() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "observation", "content": "before", "tags": ["queued"],
+                "properties": {"keep": 7},
+            }),
+            &registry,
+        )
+        .await
+        .unwrap();
+    pack.handle_update(
+        &token,
+        json!({"id": note["id"], "content": "after", "properties": {"added": true}}),
+        &registry,
+    )
+    .await
+    .expect("update other fields without tags");
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .unwrap();
+    assert_eq!(fetched["content"], "after");
+    assert_eq!(
+        fetched["properties"],
+        json!({"tags": ["queued"], "keep": 7, "added": true})
+    );
+}
+
+#[tokio::test]
+async fn update_note_empty_tags_clears_created_tags() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({"kind": "observation", "content": "clear tags", "tags": ["queued"], "properties": {"keep": 7}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+    pack.handle_update(&token, json!({"id": note["id"], "tags": []}), &registry)
+        .await
+        .expect("clear note tags");
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .unwrap();
+    assert_eq!(fetched["properties"], json!({"tags": [], "keep": 7}));
+    assert_eq!(fetched["tags"], json!([]));
+}
+
+#[tokio::test]
+async fn update_entity_tags_still_replace_preserve_and_clear() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "tagged entity", "tags": ["queued", "old"],
+                "properties": {"keep": 7}, "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .unwrap();
+    for (patch, expected) in [
+        (
+            json!({"id": entity["id"], "tags": ["active"]}),
+            json!(["active"]),
+        ),
+        (
+            json!({"id": entity["id"], "name": "renamed entity"}),
+            json!(["active"]),
+        ),
+        (json!({"id": entity["id"], "tags": []}), json!([])),
+    ] {
+        pack.handle_update(&token, patch, &registry).await.unwrap();
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": entity["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(fetched["tags"], expected);
+        assert_eq!(fetched["properties"], json!({"keep": 7}));
+    }
+}
+
+#[tokio::test]
+async fn update_note_properties_tags_route_still_replaces_and_clears() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({"kind": "observation", "content": "nested tags", "tags": ["queued"], "properties": {"keep": 7}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+    for tags in [json!(["nested"]), json!([])] {
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "properties": {"tags": tags, "added": true}}),
+            &registry,
+        )
+        .await
+        .expect("patch existing properties.tags route");
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": tags, "keep": 7, "added": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_note_top_level_tags_override_properties_tags_including_empty() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    for tags in [json!(["top-level"]), json!([])] {
+        let note = pack
+            .handle_create(
+                &token,
+                json!({"kind": "observation", "content": "conflicting tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                &registry,
+            )
+            .await
+            .unwrap();
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "tags": tags, "properties": {"tags": ["nested"], "added": true}}),
+            &registry,
+        )
+        .await
+        .expect("top-level tags win over nested tags");
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": tags, "keep": 7, "added": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preserved() {
+    use khive_runtime::{
+        KhiveRuntime, KindHook, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry,
+        VerbRegistryBuilder,
+    };
+    use khive_types::{HandlerDef, Pack};
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct TagHook(Mutex<Vec<Value>>);
+
+    #[async_trait::async_trait]
+    impl KindHook for TagHook {
+        async fn prepare_create(
+            &self,
+            _: &KhiveRuntime,
+            _: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn after_create(
+            &self,
+            _: &KhiveRuntime,
+            _: uuid::Uuid,
+            _: &Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn prepare_note_update(
+            &self,
+            _: &KhiveRuntime,
+            _: &NamespaceToken,
+            _: &khive_storage::Note,
+            args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            self.0.lock().unwrap().push(args.clone());
+            args["properties"]["tags"] = json!(["hook-approved"]);
+            args["properties"]["hook_seen"] = json!(true);
+            Ok(())
+        }
+    }
+
+    struct TagHookPack(Arc<TagHook>);
+
+    impl Pack for TagHookPack {
+        const NAME: &'static str = "tag-update-test";
+        const NOTE_KINDS: &'static [&'static str] = &["tag-hook-note"];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait::async_trait]
+    impl PackRuntime for TagHookPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+            (kind == "tag-hook-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+        }
+        async fn dispatch(
+            &self,
+            _: &str,
+            _: Value,
+            _: &VerbRegistry,
+            _: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            unreachable!()
+        }
+    }
+
+    let (rt, token, pack, _) = configured_kg_pack().await;
+    let hook = Arc::new(TagHook::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt));
+    builder.register(TagHookPack(hook.clone()));
+    let registry = builder.build().unwrap();
+    for tags in [json!(["top-level"]), json!([])] {
+        let note = pack
+            .handle_create(
+                &token,
+                json!({"kind": "tag-hook-note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                &registry,
+            )
+            .await
+            .unwrap();
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "tags": tags, "properties": {"tags": ["nested"], "added": true}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let seen = hook.0.lock().unwrap().last().unwrap().clone();
+        assert!(seen.get("tags").is_none());
+        assert_eq!(seen["properties"], json!({"tags": tags, "added": true}));
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": ["hook-approved"], "keep": 7, "added": true, "hook_seen": true})
+        );
+    }
+    assert_eq!(hook.0.lock().unwrap().len(), 2);
 }
 
 // MEDIUM regression: update(entity_id, salience=...) must return an explicit

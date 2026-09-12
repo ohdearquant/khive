@@ -392,25 +392,30 @@ request(ops="stats()")
 
 Patch entity, note, or edge fields. Field set depends on substrate: entities accept
 `name`/`description`/`properties`/`tags`; notes accept
-`name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
+`name`/`content`/`salience`/`decay_factor`/`properties`/`tags`; edges accept
 `relation`/`weight`/`properties`.
 
 Entity/note text updates use the same full-source storage and bounded embedding contract as
 singleton `create`; a successful response includes `warnings` when embedding actually truncated.
 
-| Param          | Type            | Required | Notes                                                                     |
-| -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
-| `id`           | uuid            | yes      | Record to patch.                                                          |
-| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID. |
-| `name`         | string          | no       | Entities and notes.                                                       |
-| `description`  | string          | no       | Entities only.                                                            |
-| `content`      | string          | no       | Notes only (body text).                                                   |
-| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                      |
-| `decay_factor` | number          | no       | Notes only, >= 0.                                                         |
-| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                            |
-| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                      |
-| `properties`   | object          | no       | Shallow-merged in.                                                        |
-| `tags`         | array\<string\> | no       | Replaces the tag list.                                                    |
+| Param          | Type            | Required | Notes                                                                             |
+| -------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
+| `id`           | uuid            | yes      | Record to patch.                                                                  |
+| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
+| `name`         | string          | no       | Entities and notes.                                                               |
+| `description`  | string          | no       | Entities only.                                                                    |
+| `content`      | string          | no       | Notes only (body text).                                                           |
+| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
+| `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
+| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                                    |
+| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
+| `properties`   | object          | no       | Shallow-merged in.                                                                |
+| `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+
+Note tags remain stored and returned in `properties.tags`. Updating that property directly
+also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
+`tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
+as usual.
 
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")

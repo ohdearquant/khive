@@ -462,7 +462,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
                        entities accept name/description/properties/tags/entity_type; notes accept \
-                       name/content/salience/decay_factor/properties; edges accept relation/weight/properties.",
+                       name/content/salience/decay_factor/properties/tags; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -544,7 +544,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Replace tag list.",
+                description: "Replace the tag list on entities or notes; omission preserves it and [] clears it. Note tags are stored in properties.tags, and this parameter takes precedence over properties.tags in the same request, including when empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1732,6 +1732,28 @@ mod tests {
     }
 
     // ── update/help param-documentation regressions ──────────────────────────
+
+    #[test]
+    fn update_params_documents_note_tag_replacement_and_precedence() {
+        let h = find_handler("update");
+        assert!(h
+            .description
+            .contains("name/content/salience/decay_factor/properties/tags"));
+        let tags = h.params.iter().find(|p| p.name == "tags").unwrap();
+        for detail in [
+            "entities or notes",
+            "omission preserves",
+            "[] clears",
+            "properties.tags",
+            "takes precedence",
+            "including when empty",
+        ] {
+            assert!(
+                tags.description.contains(detail),
+                "missing tag contract: {detail}"
+            );
+        }
+    }
 
     /// update.help must document `content` for notes.
     #[test]

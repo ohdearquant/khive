@@ -3230,6 +3230,7 @@ impl VerbRegistry {
         note: &khive_storage::Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        crate::curation::normalize_note_update_tags(args)?;
         if let Some(hook) = self.find_kind_hook(&note.kind) {
             hook.prepare_note_update(runtime, token, note, args).await?;
         }
