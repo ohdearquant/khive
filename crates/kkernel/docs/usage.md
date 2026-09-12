@@ -249,9 +249,11 @@ Atomic ops-file preflight and prepare failures use the real per-operation
 known verb that is merely ineligible for `--atomic` remains unclassified.
 Secret-gate failures during atomic prepare receive `gate-refusal`. Immutable
 stream record refusals receive `policy-refusal` during ordinary dispatch and
-atomic prepare. This classification does not cover ordinary sequence
-precondition conflicts or raw SQL trigger failures, and does not establish a
-domain-commit disposition. An atomic
+atomic prepare. These guards refuse before the domain write and report
+`domain_disposition: "not_committed"`: inside the structured `error` for ordinary
+dispatch, or beside the string `error` on the atomic result entry. This
+classification does not cover ordinary sequence precondition conflicts or raw
+SQL trigger failures. An atomic
 rollback passed with `--strict` receives `strict-op-failure` on each
 not-committed result without changing the atomic path's existing process-exit
 semantics. Ordinary validation, transport, storage, and authorization-gate

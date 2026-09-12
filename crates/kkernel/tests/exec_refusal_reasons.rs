@@ -332,6 +332,35 @@ fn atomic_stream_policy_refusals_have_stable_token_and_json_reason() {
 }
 
 #[test]
+fn stream_policy_refusals_report_not_committed() {
+    for output in &stream_policy_outputs().ordinary {
+        let response = stdout_json(output);
+        let entry = &response["results"][0];
+        assert_eq!(entry["error"]["kind"], "conflict", "entry={entry}");
+        assert_eq!(entry["error"]["details"]["reason"], "stream_member");
+        assert_eq!(
+            entry["error"]["domain_disposition"], "not_committed",
+            "entry={entry}"
+        );
+    }
+}
+
+#[test]
+fn atomic_stream_policy_refusals_report_not_committed() {
+    let scenarios = stream_policy_outputs();
+    for output in [&scenarios.atomic_update, &scenarios.atomic_delete] {
+        let response = stdout_json(output);
+        let entry = &response["results"][0];
+        assert_eq!(entry["reason"], "policy-refusal", "entry={entry}");
+        assert_eq!(response["atomic"]["committed"], false);
+        assert_eq!(
+            entry["domain_disposition"], "not_committed",
+            "entry={entry}"
+        );
+    }
+}
+
+#[test]
 fn stream_sequence_conflict_is_not_a_policy_refusal() {
     let output = &stream_policy_outputs().sequence_conflict;
     let response = stdout_json(output);

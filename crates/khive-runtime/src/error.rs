@@ -751,7 +751,7 @@ impl RuntimeError {
     /// Only the structured runtime marker establishes this class. Ordinary
     /// conflicts, caller sequence preconditions, and raw storage failures do
     /// not acquire a refusal classification from their rendered messages.
-    /// This predicate does not establish a domain-commit disposition.
+    /// These membership guards refuse before applying the requested domain write.
     pub fn is_stream_policy_refusal(&self) -> bool {
         matches!(self, Self::Khive(error)
             if error.kind() == khive_types::ErrorKind::Conflict
