@@ -2383,7 +2383,7 @@ impl BrainPack {
         let p: MarkTurnParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         if let Some(label) = p.label.as_deref() {
-            khive_runtime::secret_gate::check(label)?;
+            khive_runtime::secret_gate::check_at(label, "turn", "label")?;
         }
         let phase = p.label.unwrap_or_else(|| "actor_turn".to_string());
         let actor = format!("{}:{}", token.actor().kind, token.actor().id);
@@ -2459,13 +2459,13 @@ impl BrainPack {
         // Secret gate: scan arbitrary text fields before writing.
         // Wildcard sentinel `*` is safe; real values are scanned.
         if actor != "*" {
-            khive_runtime::secret_gate::check(&actor)?;
+            khive_runtime::secret_gate::check_at(&actor, "binding", "actor")?;
         }
         if namespace != "*" {
-            khive_runtime::secret_gate::check(&namespace)?;
+            khive_runtime::secret_gate::check_at(&namespace, "binding", "namespace")?;
         }
         if consumer_kind != "*" {
-            khive_runtime::secret_gate::check(&consumer_kind)?;
+            khive_runtime::secret_gate::check_at(&consumer_kind, "binding", "consumer_kind")?;
         }
 
         if consumer_kind != "*" {
@@ -2730,10 +2730,10 @@ impl BrainPack {
 
         // Secret gate: scan caller-supplied text before any write.
         // `p_name` is already constrained to [a-zA-Z0-9-]+ and cannot carry a secret.
-        khive_runtime::secret_gate::check(&description)?;
-        khive_runtime::secret_gate::check(&consumer_kind)?;
+        khive_runtime::secret_gate::check_at(&description, "profile", "description")?;
+        khive_runtime::secret_gate::check_at(&consumer_kind, "profile", "consumer_kind")?;
         if let Some(ref seed) = p.seed_priors {
-            khive_runtime::secret_gate::check_json(seed)?;
+            khive_runtime::secret_gate::check_json_at(seed, "profile", "seed_priors")?;
         }
         let seed_priors = p.seed_priors;
 

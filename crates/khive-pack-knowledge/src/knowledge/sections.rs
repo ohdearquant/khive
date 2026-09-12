@@ -677,14 +677,15 @@ fn prepare_import_file(
     let (sections, sections_skipped) = if chunk_strategy == "section" {
         let mut prepared = Vec::new();
         let mut skipped = 0usize;
-        for (section_type, heading, content) in parsed_sections {
+        for (index, (section_type, heading, content)) in parsed_sections.into_iter().enumerate() {
+            let record = format!("section[{index}]");
             if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
             validate_section_content(&content)?;
-            khive_runtime::secret_gate::check(&heading)?;
-            khive_runtime::secret_gate::check(&content)?;
+            khive_runtime::secret_gate::check_at(&heading, &record, "heading")?;
+            khive_runtime::secret_gate::check_at(&content, &record, "content")?;
             prepared.push(PreparedSection {
                 section_type,
                 heading,
@@ -696,15 +697,15 @@ fn prepare_import_file(
         (Vec::new(), 0)
     };
 
-    khive_runtime::secret_gate::check(&slug)?;
-    khive_runtime::secret_gate::check(&name)?;
-    khive_runtime::secret_gate::check_tags(&frontmatter.tags)?;
-    khive_runtime::secret_gate::check(&atom_content)?;
+    khive_runtime::secret_gate::check_at(&slug, "file", "slug")?;
+    khive_runtime::secret_gate::check_at(&name, "file", "name")?;
+    khive_runtime::secret_gate::check_tags_at(&frontmatter.tags, "file", "tags")?;
+    khive_runtime::secret_gate::check_at(&atom_content, "file", "content")?;
     let properties_value = Value::Object(properties.clone());
-    khive_runtime::secret_gate::check_json(&properties_value)?;
+    khive_runtime::secret_gate::check_json_at(&properties_value, "file", "properties")?;
     khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties_value))?;
-    khive_runtime::secret_gate::check(&source_uri)?;
-    khive_runtime::secret_gate::check(source_type)?;
+    khive_runtime::secret_gate::check_at(&source_uri, "file", "source_uri")?;
+    khive_runtime::secret_gate::check_at(source_type, "file", "source_type")?;
 
     Ok(PreparedImportFile {
         slug,
@@ -924,13 +925,14 @@ impl KnowledgeHandlers {
         let mut upserted = 0usize;
         let mut section_results: Vec<Value> = Vec::with_capacity(p.sections.len());
 
-        for su in &p.sections {
+        for (index, su) in p.sections.iter().enumerate() {
+            let record = format!("section[{index}]");
             let stype = parse_section_type(&su.section_type)?;
             validate_section_content(&su.content)?;
             // Secret gate: scan section content and heading before any write.
-            khive_runtime::secret_gate::check(&su.content)?;
+            khive_runtime::secret_gate::check_at(&su.content, &record, "content")?;
             if let Some(ref h) = su.heading {
-                khive_runtime::secret_gate::check(h)?;
+                khive_runtime::secret_gate::check_at(h, &record, "heading")?;
             }
             let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
