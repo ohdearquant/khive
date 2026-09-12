@@ -190,6 +190,11 @@ struct AssignParams {
     status: Option<String>,
     #[serde(default)]
     due: Option<String>,
+    /// IANA zone the date-only `due` anchors in; absent means the configured
+    /// display timezone. Both task entry points read it, or the two would
+    /// disagree about which zone a deadline means.
+    #[serde(default)]
+    timezone: Option<String>,
     #[serde(default)]
     start: Option<String>,
     #[serde(default)]
@@ -1255,6 +1260,7 @@ impl GtdPack {
             priority: p.priority,
             status: p.status,
             due: p.due,
+            timezone: p.timezone,
             start: p.start,
             end: p.end,
             depends_on: p.depends_on,
