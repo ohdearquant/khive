@@ -394,7 +394,7 @@ jobs:
         run: cargo build --manifest-path crates/Cargo.toml --locked -p kkernel --bin kkernel
       - name: Install dependencies and run Python tests
         # pytest exits nonzero when no tests are collected; no separate floor is needed.
-        run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' pytest python/tests
+        run: uv run --no-project --with 'pydantic>=2.7' --with 'pytest>=8' --with 'blake3>=1' pytest python/tests
 
   kg-editor:
     name: KG Studio (Next.js)

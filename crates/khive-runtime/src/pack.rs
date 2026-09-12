@@ -10,6 +10,7 @@
 //! `PackRuntime` mirrors `Pack`'s const associated items as methods for object safety.
 //! Build a [`VerbRegistry`] via `VerbRegistryBuilder::build()`; registration is builder-only.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -226,6 +227,13 @@ use crate::KhiveRuntime;
 pub trait PackRuntime: Send + Sync {
     /// Pack name — must equal `<Self as Pack>::NAME`.
     fn name(&self) -> &str;
+
+    /// Optional instance-owned state for host work outside verb dispatch.
+    /// Return the same shared state used by this pack's handlers. The host
+    /// owns task startup and shutdown; this accessor must not start work.
+    fn host_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 
     /// Validate this pack instance's configuration before it can execute.
     /// Metadata-only construction does not activate packs.
@@ -3426,6 +3434,17 @@ impl VerbRegistry {
         self.packs.iter().map(|p| p.name()).collect()
     }
 
+    /// Borrow a registered pack's shared host state without reconstructing
+    /// that pack. Missing packs, absent state, and type mismatches return None.
+    pub fn pack_host_state<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.packs
+            .iter()
+            .find(|pack| pack.name() == name)?
+            .host_state()?
+            .downcast::<T>()
+            .ok()
+    }
+
     /// Declared dependencies for a registered pack.
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
         self.packs
@@ -4808,6 +4827,69 @@ pub(crate) mod tests {
 
     mod disposition {
         include!("pack_disposition_tests.rs");
+    }
+
+    #[tokio::test]
+    async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones() {
+        struct HostStatePack(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl PackRuntime for HostStatePack {
+            fn name(&self) -> &str {
+                "host_state"
+            }
+            fn host_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+                Some(self.0.clone())
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                &[HandlerDef {
+                    name: "host_state.touch",
+                    description: "shared state fixture",
+                    visibility: Visibility::Verb,
+                    category: VerbCategory::Commissive,
+                    params: &[],
+                }]
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        }
+
+        let state = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(HostStatePack(state.clone())));
+        builder.register(AlphaPack);
+        let registry = builder.build().expect("registry");
+        let host = registry
+            .pack_host_state::<AtomicUsize>("host_state")
+            .expect("registered state");
+        let cloned_host = registry
+            .clone()
+            .pack_host_state::<AtomicUsize>("host_state")
+            .expect("cloned registry state");
+        assert!(Arc::ptr_eq(&state, &host));
+        assert!(Arc::ptr_eq(&host, &cloned_host));
+        registry
+            .dispatch("host_state.touch", serde_json::json!({}))
+            .await
+            .expect("dispatch");
+        assert_eq!(host.load(Ordering::SeqCst), 1);
+        assert!(registry.pack_host_state::<String>("host_state").is_none());
+        assert!(registry.pack_host_state::<AtomicUsize>("missing").is_none());
+        assert!(registry.pack_host_state::<AtomicUsize>("alpha").is_none());
     }
 
     /// Verbs known, by cross-pack source review (#2147/#2217), to have

@@ -2156,13 +2156,16 @@ dependencies = [
  "blake3",
  "inventory",
  "khive-db",
+ "khive-request",
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

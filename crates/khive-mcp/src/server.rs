@@ -1770,6 +1770,12 @@ impl KhiveMcpServer {
         self
     }
 
+    pub(crate) fn blob_upload_manager(
+        &self,
+    ) -> Option<Arc<khive_pack_blob::uploads::UploadManager>> {
+        self.registry.pack_host_state("blob")
+    }
+
     /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
     ///
     /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned

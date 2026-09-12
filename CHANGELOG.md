@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Chunked blob uploads: `blob.begin`, `blob.put_part`, `blob.commit` and
+  `blob.abort` stage an object across sequential parts and publish it under the
+  BLAKE3 reference the completed bytes hash to, so an object larger than one
+  request can be stored without holding it in a single message. Staged uploads
+  are bounded, 128 concurrently and 16 per actor by default, overridable with
+  `KHIVE_BLOB_UPLOAD_MAX_ACTIVE` and `KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR`; a caller
+  past either ceiling is refused by name rather than allowed to accumulate
+  staging entries.
+
 ### Changed
 
 - `KHIVE_EMAIL_DEFAULT_ACTOR` now falls back to `local` when unset or blank,
@@ -24,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpointed, and unlinked the sidecars while the daemon kept writing to the
   unlinked files. Hardening now runs before the open, the post-open check uses
   `lstat` only, and a cross-process test asserts the locks are held.
+
+### Security
+
+- Staged upload filesystem operations are race-free on Unix and are not on other
+  platforms. The Unix paths open relative to a retained root descriptor and
+  refuse to follow symlinks; the non-Unix paths validate and then resolve the
+  same path again, so a local process able to write inside the blob root can
+  substitute a directory, junction or reparse point in that window. The trust
+  boundary is stated accordingly: the blob root, its contents and its ancestors
+  must be writable only by trusted processes, including processes under the same
+  account. A handle-based replacement is follow-up work and needs native coverage
+  on the affected platform before it can be believed.
 
 ## [0.8.0] - 2026-08-27
 
