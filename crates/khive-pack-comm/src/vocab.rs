@@ -568,7 +568,10 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "comm.health",
-        description: "Read-only per-channel health snapshot (khive #606, #1383, #1472). Returns \
+        // MAINTENANCE, deliberately kept out of the description: the surface and its
+        // namespace resolution are specified in khive #606, #877, #917, #1383 and #1472,
+        // and the namespace escape hatch is ADR-007 Rev 6 Rule 3.
+        description: "Read-only per-channel health snapshot. Returns \
                        daemon-persisted heartbeat rows plus exact channel identities found on \
                        live quarantine notes. Every channel entry includes `quarantined_count`; \
                        the response also includes namespace-wide `quarantined_count` and \
@@ -583,15 +586,15 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                        null for legacy/malformed rows and known failure/backoff state. This is \
                        not a computed healthy bool; overall \
                        health judgment belongs to the caller. Reads from the caller's injected \
-                       namespace (khive #877) — `token.namespace()`, the same explicit \
-                       `namespace=` escape / \"local\" default every other comm verb resolves \
-                       (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \
+                       namespace — `token.namespace()`, the same explicit \
+                       `namespace=` escape / \"local\" default every other comm verb \
+                       resolves. An unscoped call defaults to \"local\", matching \
                        the namespace heartbeat rows are persisted under; a call with an \
                        explicit non-local `namespace=` sees only that namespace's rows, never \
                        \"local\"'s. The response carries a `namespace` field naming the \
                        namespace actually read, so `role: \"client\"` means no heartbeat rows \
                        exist under THAT namespace (even if quarantine-only channels exist), not \
-                       necessarily that no daemon exists anywhere. `comm.heartbeat` (khive #917) \
+                       necessarily that no daemon exists anywhere. `comm.heartbeat` \
                        persists under the caller's dispatch-authorized namespace, so a \
                        non-local `namespace=` scope returns that namespace's rows once an \
                        authorized per-tenant writer has run. Without a heartbeat it may still \
@@ -601,6 +604,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         category: khive_types::VerbCategory::Assertive,
         params: &[],
     },
+    // MAINTENANCE, deliberately kept out of the description: the explicit-actor
+    // requirement is khive #93 and the cursor_reset signal is khive #2400.
     HandlerDef {
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
@@ -614,9 +619,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
                       strictly older than the cutoff independently of the arrival cursor. Only \
                       JSON boolean true in properties.read marks a message read. \
                       Unlike comm.inbox, the actor is not inferred from the caller — pass it \
-                      explicitly via the required `actor` param (khive #93). A `since_us` the \
+                      explicitly via the required `actor` param. A `since_us` the \
                       store cannot have issued is discarded and the page comes from the \
-                      baseline; the response then carries `cursor_reset: true` (khive #2400).",
+                      baseline; the response then carries `cursor_reset: true`.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[

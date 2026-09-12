@@ -53,7 +53,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "schedule.schedule",
-        description: "Schedule a future verb dispatch. NESTED-ACTION EXAMPLE (issue #110): \
+        description: "Schedule a future verb dispatch. NESTED-ACTION EXAMPLE: \
                        schedule.schedule(action=\"schedule.remind(content=\\\"renew the \
                        domain\\\", at=\\\"2027-06-01T09:00:00Z\\\")\", \
                        at=\"2027-05-25T09:00:00Z\") — the OUTER `at` (2027-05-25) is when \

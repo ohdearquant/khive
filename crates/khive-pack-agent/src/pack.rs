@@ -55,10 +55,12 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             },
         ],
     },
+    // MAINTENANCE, deliberately kept out of the four descriptions below: the agent
+    // process lifecycle and its transition boundaries are specified in ADR-142 §1.
     HandlerDef {
         name: "agent.observe",
-        description: "Report an agent process record's current fields without changing state \
-                       (ADR-142 §1).",
+        description: "Report an agent process record's current fields without changing \
+                       state.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[ParamDef {
@@ -72,7 +74,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "agent.suspend",
         description: "Transition a running agent process to suspended at a message-yield \
-                       boundary (ADR-142 §1).",
+                       boundary.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
@@ -85,7 +87,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     },
     HandlerDef {
         name: "agent.resume",
-        description: "Transition a suspended agent process back to running (ADR-142 §1).",
+        description: "Transition a suspended agent process back to running.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
@@ -99,7 +101,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "agent.kill",
         description: "Transition an agent process to terminal/killed; a no-op returning the \
-                       current state when already terminal (ADR-142 §1).",
+                       current state when already terminal.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {

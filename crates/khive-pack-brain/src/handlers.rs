@@ -71,19 +71,22 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
+    // MAINTENANCE, deliberately kept out of the description: the event plane is
+    // ADR-103 Stage 1 (#724 Ask A) and the cost_unit stamp is ADR-103 Amendment 1,
+    // landed in PR #927.
     HandlerDef {
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
-            plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
+            plane; feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
             with signal (by_profile_and_signal, for per-seat negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
-            payload.resource.cost_unit (ADR-103 Amendment 1; stamped on every successful verb \
-            dispatch since PR #927) sum into total_cost_unit and cost_unit_by_verb; events with \
-            no resource.cost_unit (pre-Amendment-1 events, or errored/denied dispatches) simply \
+            payload.resource.cost_unit (stamped on every successful verb dispatch) sum into \
+            total_cost_unit and cost_unit_by_verb; events with no resource.cost_unit (events \
+            older than that stamp, or errored/denied dispatches) simply \
             do not contribute. total_cost_unit is omitted, not zero-filled, when no event in the \
             window carries cost_unit. When truncated=true, every scalar total (total, \
             total_cost_unit) is over the fetched page only, same as the other counts_by_* \
@@ -291,7 +294,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
                               or entity the feedback applies to. Prefix resolution is \
-                              namespace-unfiltered under ADR-007.",
+                              searches every namespace you can see.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
@@ -326,14 +329,16 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -342,8 +347,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         name: "brain.auto_feedback",
         description: "Emit caller-attributed feedback for one recall result. Omitting signal \
             records no judgment and emits no feedback event; when signal is present, target_id must \
-            identify exactly one object in results. Keeps memory and brain packs decoupled \
-            (#517).",
+            identify exactly one object in results. Keeps memory and brain packs \
+            decoupled.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
@@ -393,21 +398,25 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Exact feedback namespace override (ADR-007 Rev 6 escape hatch). The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
+                // MAINTENANCE, deliberately kept out of the description: this is the
+                // ADR-007 Rev 6 escape hatch.
+                description: "Exact feedback namespace override. The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -457,6 +466,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             },
         ],
     },
+    // MAINTENANCE, deliberately kept out of the description: this reuses the existing
+    // ADR-103 Stage 1 PhaseStarted/work_class vocabulary rather than adding an EventKind
+    // variant, which is why the work_class is a payload value and not a kind.
     HandlerDef {
         name: "brain.mark_turn",
         description: "Emit a PhaseStarted event (work_class=\"actor_turn\") carrying the \
@@ -464,9 +476,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             callers invoke this once per bounded unit of work (a wake, a turn) so \
             brain.event_counts's counts_by_work_class[\"actor_turn\"], grouped by actor, \
             gives a discipline-ratio denominator (e.g. feedback_explicit / actor_turn) that \
-            is not biased toward whichever actor issues the most raw verb calls. Reuses the \
-            existing ADR-103 Stage 1 PhaseStarted/work_class vocabulary rather than a new \
-            EventKind variant. Best-effort — never fails the caller's turn.",
+            is not biased toward whichever actor issues the most raw verb calls. \
+            Best-effort — never fails the caller's turn.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
