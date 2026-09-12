@@ -39,6 +39,7 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
 /// to a real on-disk model, absent on CI runners.
 fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

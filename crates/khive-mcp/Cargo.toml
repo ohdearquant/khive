@@ -34,6 +34,7 @@ khive-pack-exec = { version = "0.8.0", path = "../khive-pack-exec" }
 khive-pack-git = { version = "0.8.0", path = "../khive-pack-git" }
 khive-pack-code = { version = "0.8.0", path = "../khive-pack-code" }
 khive-pack-web = { version = "0.8.0", path = "../khive-pack-web" }
+khive-pack-telemetry = { version = "0.8.0", path = "../khive-pack-telemetry" }
 khive-pack-blob = { version = "0.8.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.8.0", path = "../khive-pack-moodboard", optional = true }
 khive-pack-workspace = { version = "0.8.0", path = "../khive-pack-workspace" }

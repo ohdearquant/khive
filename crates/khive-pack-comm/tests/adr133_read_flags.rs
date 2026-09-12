@@ -15,6 +15,7 @@ fn file_backed_registry(
     db_path: std::path::PathBuf,
 ) -> (khive_runtime::VerbRegistry, KhiveRuntime) {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

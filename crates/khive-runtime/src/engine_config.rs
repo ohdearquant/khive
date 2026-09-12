@@ -92,6 +92,9 @@ pub enum ConfigError {
     #[error("[exec] {key}: {reason}")]
     InvalidExecConfig { key: String, reason: String },
 
+    #[error("{entry}: {reason}")]
+    InvalidTelemetryConfig { entry: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -767,12 +770,13 @@ pub struct ExecSectionConfig {
 /// - `[gate]`: built-in caller enrollment
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
+/// - `[telemetry]`: stream and channel carrier policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The security-sensitive `[gate]` and `[brain]` tables are closed with
+/// compatibility. The `[gate]`, `[brain]`, and `[telemetry]` tables are closed with
 /// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
@@ -845,6 +849,10 @@ pub struct KhiveConfig {
     /// refuses every `exec.run` until `[exec] read_roots` names a toolchain.
     #[serde(default)]
     pub exec: ExecSectionConfig,
+
+    /// Stream and channel carrier policy. Unclassified kinds default to ephemeral.
+    #[serde(default)]
+    pub telemetry: crate::telemetry_config::TelemetryConfig,
 
     /// Rendering timezone configuration (ADR-169). Absent `timezone` resolves
     /// to the host's local zone at [`RuntimeConfig`](crate::RuntimeConfig)
@@ -1134,6 +1142,7 @@ impl KhiveConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
+        self.telemetry.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
@@ -2910,6 +2919,220 @@ grant_unattributed = false
         let err = KhiveConfig::load(Some(&path)).expect_err("unknown brain key must fail");
         assert!(matches!(err, ConfigError::Parse { .. }));
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn telemetry_missing_default_stays_absent_with_or_without_engines() {
+        use crate::{TelemetryCarrier, TelemetryConfig};
+
+        assert_eq!(KhiveConfig::default().telemetry, TelemetryConfig::default());
+        assert_eq!(
+            in_memory_runtime_config().telemetry,
+            TelemetryConfig::default()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            for telemetry in ["", "[telemetry]\n"] {
+                let path = write_toml(&dir, &format!("{engines}\n{telemetry}"));
+                let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+                let mut base = in_memory_runtime_config();
+                base.telemetry.stream = "previous".to_string();
+                base.telemetry.default_carrier = Some(TelemetryCarrier::Durable);
+                let resolved = crate::runtime_config_from_khive_config(&config, base);
+                assert_eq!(resolved.telemetry, TelemetryConfig::default());
+                assert_eq!(resolved.telemetry.stream, "telemetry");
+                assert_eq!(resolved.telemetry.default_carrier, None);
+                let error = resolved
+                    .telemetry
+                    .validate_activation()
+                    .expect_err("activating telemetry requires the declared default");
+                assert!(error.to_string().contains("telemetry.default_carrier"));
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_table_loads_and_resolves_with_or_without_engines() {
+        use crate::{TelemetryCarrier, TelemetryFailurePosture};
+
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"{engines}
+[telemetry]
+stream = "operations"
+default_carrier = "durable"
+[[telemetry.channels]]
+kinds = ["run.started", "run.completed"]
+carrier = "durable"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["turn.delta", "*.heartbeat"]
+carrier = "ephemeral"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+            assert_eq!(config.telemetry.channels.len(), 2);
+            let resolved =
+                crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+            assert_eq!(resolved.telemetry, config.telemetry);
+            assert_eq!(resolved.telemetry.stream, "operations");
+            for kind in ["run.started", "run.completed"] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Durable);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Gap);
+            }
+            for kind in ["turn.delta", "run.heartbeat", "turn.child.heartbeat"] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Ephemeral);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
+            }
+            for kind in [
+                "unclassified",
+                "heartbeat",
+                "run.notheartbeat",
+                "run.heartbeat.extra",
+            ] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Durable);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_invalid_policy_values_name_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        for (carrier, posture, field, value) in [
+            ("disk", "stop", "carrier", "disk"),
+            ("Durable", "stop", "carrier", "Durable"),
+            ("durable", "ignore", "failure_posture", "ignore"),
+            ("durable", "Stop", "failure_posture", "Stop"),
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["first"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["second"]
+carrier = "{carrier}"
+failure_posture = "{posture}"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("invalid policy must refuse");
+            let message = error.to_string();
+            for expected in ["telemetry.channels[1]", field, value] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+        let path = write_toml(&dir, "[telemetry]\ndefault_carrier = \"disk\"\n");
+        let error = KhiveConfig::load(Some(&path)).expect_err("unknown fallback must refuse");
+        assert!(
+            error.to_string().contains("telemetry.default_carrier"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn telemetry_overlapping_channels_name_both_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for (first, second) in [
+            ("run.started", "run.started"),
+            ("run.heartbeat", "*.heartbeat"),
+            ("*.heartbeat", "run.heartbeat"),
+            ("*.heartbeat", "*.heartbeat"),
+            ("*.heartbeat", "*.child.heartbeat"),
+            ("*.child.heartbeat", "*.heartbeat"),
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["{first}"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["{second}"]
+carrier = "durable"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("overlap must refuse");
+            let message = error.to_string();
+            for expected in [
+                "telemetry.channels[1]",
+                "telemetry.channels[0]",
+                first,
+                second,
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_empty_and_invalid_kind_patterns_name_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        for kinds in [
+            "[]",
+            "[\"\"]",
+            "[\" \"]",
+            "[\"two names\"]",
+            "[\"*\"]",
+            "[\"run.*\"]",
+            "[\"*.\"]",
+            "[\"**.heartbeat\"]",
+            "[\"*.heart*beat\"]",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["first"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = {kinds}
+carrier = "durable"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("invalid kinds must refuse");
+            assert!(
+                error.to_string().contains("telemetry.channels[1]"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_tables_reject_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            "[telemetry]\ndefault_carrrier = \"durable\"\n",
+            "[telemetry.ring]\ncapacity = 4096\n",
+            "[[telemetry.channels]]\nkinds = [\"run\"]\ncarrier = \"durable\"\nfailure_posture = \"stop\"\ncarrrier = \"ephemeral\"\n",
+        ] {
+            let path = write_toml(&dir, content);
+            let error = KhiveConfig::load(Some(&path)).expect_err("unknown key must refuse");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────

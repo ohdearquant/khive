@@ -1,7 +1,7 @@
 //! `kkernel pack list` and `kkernel pack handler` — introspection over
 //! registered packs.
 //!
-//! Both subcommands operate on a `VerbRegistry` built from the active pack
+//! Both subcommands operate on a `PackMetadataRegistry` built from the discoverable pack
 //! set. They return data — JSON for machines, a table for humans — without
 //! invoking any handler.
 //!
@@ -9,7 +9,7 @@
 //! module consumes whatever is registered and prints it.
 
 use anyhow::{anyhow, Context, Result};
-use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder, Visibility};
+use khive_runtime::pack::{PackMetadataRegistry, PackRegistry, VerbRegistryBuilder, Visibility};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde::Serialize;
 
@@ -72,7 +72,7 @@ pub struct PackInfo {
 /// without any security benefit — an operator must be able to introspect a
 /// strict-mode deployment. See `enforce_strict_actor_mode` in
 /// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
-fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
+fn build_registry() -> Result<(PackMetadataRegistry, KhiveRuntime)> {
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-introspect")
@@ -88,11 +88,11 @@ fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
         .collect();
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow!("pack {n:?} declared in inventory but factory missing"))?;
-    let registry = builder.build().context("building VerbRegistry")?;
+    let registry = builder.build_metadata().context("building pack metadata")?;
     Ok((registry, runtime))
 }
 
-fn pack_info_from_registry(registry: &VerbRegistry, name: &str) -> Option<PackInfo> {
+fn pack_info_from_registry(registry: &PackMetadataRegistry, name: &str) -> Option<PackInfo> {
     // pack_verbs returns None if name isn't registered — gate everything off it.
     let verbs = registry.pack_verbs(name)?;
     Some(PackInfo {
@@ -152,7 +152,7 @@ pub fn pack_handler(name: &str) -> Result<Option<PackInfo>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{build_registry, list_packs, pack_handler, VerbInfo, VerbVisibility};
     use serial_test::serial;
 
     /// Every MCP-callable verb must publish a real `input_schema`.
@@ -304,6 +304,16 @@ mod tests {
             "comm pack must be present in introspection registry under strict mode; \
              got: {pack_names:?}"
         );
+    }
+
+    #[test]
+    fn telemetry_metadata_requires_no_declared_carrier() {
+        let (registry, runtime) = build_registry().expect("metadata does not activate telemetry");
+        assert_eq!(runtime.config().telemetry.default_carrier, None);
+        assert_eq!(registry.pack_requires("telemetry"), Some(&["kg"][..]));
+        assert!(registry.has_verb("telemetry.emit"));
+        assert!(registry.describe_verb("telemetry.channels").is_ok());
+        assert!(registry.has_verb("stream.read"));
     }
 
     #[test]

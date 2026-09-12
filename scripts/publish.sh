@@ -77,6 +77,7 @@ CRATES=(
     khive-pack-gtd
     khive-brain-core
     khive-pack-brain
+    khive-pack-telemetry
     khive-pack-memory
     khive-pack-comm
     khive-pack-schedule

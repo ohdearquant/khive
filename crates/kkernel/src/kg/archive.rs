@@ -280,7 +280,9 @@ fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<Vec<String>> {
         .collect();
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
-    let registry = builder.build().context("building import VerbRegistry")?;
+    let registry = builder
+        .build_metadata()
+        .context("building import pack metadata")?;
     let entity_kinds: Vec<String> = registry
         .all_entity_kinds()
         .into_iter()
