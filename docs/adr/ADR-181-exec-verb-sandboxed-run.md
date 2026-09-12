@@ -362,3 +362,26 @@ is killed and its output truncated at the limit). The control is arm 37's shape,
 exceeded by the direct child, which records `cpu_seconds`. The pair is what separates "observation
 is limited to the waited child" from "observation is broken", and an implementation that derives
 the resource from a nonzero exit code passes 37 and must fail 42.
+
+## Amendment 8 (2026-09-12): effective output cap on receipts
+
+Every newly written run receipt, including refusals and failed or truncated runs, carries
+`effective_max_output_bytes`: the resolved unsigned byte cap from `[exec] max_output_bytes`
+for that run. The cap applies independently to stdout and stderr retention, not to their sum
+or to the total output a child may produce. Zero retains no stream bytes. The value is
+captured before preflight, even when the run is refused before any output is produced.
+
+`exec.run`, `exec.receipt` and `exec.runs` expose the same stored value. Historical receipts
+remain readable with the field absent; readers must treat that absence as an unknown cap,
+not infer it from the current configuration or from the retained byte count. No historical
+receipt is rewritten.
+
+The existing `stdout_produced_bytes`, `stderr_produced_bytes`, `stdout_retained_bytes`,
+`stderr_retained_bytes` and capture statuses already distinguish short output from
+truncation. The new field records the configuration that governed retention, including when
+both streams fit below it; it does not change capture behavior or add a run parameter.
+
+Acceptance: small configured caps are preserved on complete and refusal receipts; truncated
+stdout and stderr retain fewer bytes than produced, matching the cap and preserving their
+tails; zero retains no bytes. New receipts round-trip through receipt lookup and listing,
+and decoding an older receipt leaves the unknown cap absent.
