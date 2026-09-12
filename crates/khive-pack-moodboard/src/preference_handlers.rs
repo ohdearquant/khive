@@ -1733,6 +1733,7 @@ mod tests {
 
     fn persistent_runtime_config(db_path: &Path, actor_id: &str) -> RuntimeConfig {
         RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),

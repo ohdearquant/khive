@@ -1940,6 +1940,7 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -1969,6 +1970,7 @@ async fn file_backed_runtime_persists() {
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -2596,6 +2598,7 @@ mod embedder_registry_tests {
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -2754,6 +2757,7 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),

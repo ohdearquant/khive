@@ -227,6 +227,12 @@ pub trait PackRuntime: Send + Sync {
     /// Pack name — must equal `<Self as Pack>::NAME`.
     fn name(&self) -> &str;
 
+    /// Validate this pack instance's configuration before it can execute.
+    /// Metadata-only construction does not activate packs.
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// Note kinds this pack owns — must equal `<Self as Pack>::NOTE_KINDS`.
     fn note_kinds(&self) -> &'static [&'static str];
 
@@ -840,6 +846,20 @@ impl VerbRegistryBuilder {
     /// Returns an error if any declared dependency is missing from the loaded
     /// pack set, or if a circular dependency is detected.
     pub fn build(self) -> Result<VerbRegistry, RuntimeError> {
+        self.build_registry(true)
+    }
+
+    /// Inspect pack metadata without activating any registered pack.
+    /// The result exposes no dispatch, preparation hooks, or serving-registry conversion.
+    pub fn build_metadata(mut self) -> Result<PackMetadataRegistry, RuntimeError> {
+        self.event_store = None;
+        self.dispatch_hook = None;
+        self.resolvers.clear();
+        self.build_registry(false)
+            .map(|registry| PackMetadataRegistry { registry })
+    }
+
+    fn build_registry(self, activate: bool) -> Result<VerbRegistry, RuntimeError> {
         let packs = self.packs;
         let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(packs.len());
         for (idx, pack) in packs.iter().enumerate() {
@@ -966,6 +986,11 @@ impl VerbRegistryBuilder {
         validate_unique_verb_names(&ordered_packs)?;
         validate_unique_entity_types(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        if activate {
+            for pack in &ordered_packs {
+                pack.validate_config()?;
+            }
+        }
 
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
@@ -1202,6 +1227,67 @@ fn find_pack_dependency_cycle(
 impl Default for VerbRegistryBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pack metadata with no executable registry capability.
+///
+/// ```compile_fail
+/// fn dispatch(metadata: &khive_runtime::PackMetadataRegistry) {
+///     metadata.dispatch("telemetry.emit", serde_json::json!({}));
+/// }
+/// ```
+pub struct PackMetadataRegistry {
+    registry: VerbRegistry,
+}
+
+impl PackMetadataRegistry {
+    pub fn has_verb(&self, verb: &str) -> bool {
+        self.registry.has_verb(verb)
+    }
+
+    pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
+        self.registry.describe_verb(verb)
+    }
+
+    pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.registry.all_handlers_with_names()
+    }
+
+    pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
+        self.registry.all_verbs()
+    }
+
+    pub fn pack_names(&self) -> Vec<&str> {
+        self.registry.pack_names()
+    }
+
+    pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_requires(name)
+    }
+
+    pub fn pack_note_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_note_kinds(name)
+    }
+
+    pub fn pack_entity_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_entity_kinds(name)
+    }
+
+    pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
+        self.registry.pack_verbs(name)
+    }
+
+    pub fn all_entity_kinds(&self) -> Vec<&'static str> {
+        self.registry.all_entity_kinds()
+    }
+
+    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+        self.registry.all_note_kinds()
+    }
+
+    pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+        self.registry.all_edge_rules()
     }
 }
 
@@ -3541,7 +3627,7 @@ impl VerbRegistry {
     }
 
     /// Verbs classified [`VerbCategory::Assertive`] that nonetheless schedule
-    /// a persisted write on every successful dispatch, so a caller re-issuing
+    /// can schedule a persisted write on a successful dispatch, so a caller re-issuing
     /// a call in this list after a lost response duplicates that write:
     ///
     /// - `memory.recall` schedules `brain.record_serve`, which inserts a
@@ -3550,13 +3636,16 @@ impl VerbRegistry {
     ///   rather than colliding with the first.
     /// - `search` (the `kg` pack's bare verb) appends a `search_executed`
     ///   event with a freshly generated id and no natural key at all.
+    /// - `telemetry.emit` can append a durable stream record with a fresh
+    ///   identity and sequence, depending on the configured channel policy.
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
     /// storage. Adding a verb here (or removing one because its side effect
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
-    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] = &["memory.recall", "search"];
+    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
+        &["memory.recall", "search", "telemetry.emit"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -4722,7 +4811,8 @@ pub(crate) mod tests {
     }
 
     /// Verbs known, by cross-pack source review (#2147/#2217), to have
-    /// their own durable or accounting-bearing side effect despite being declared
+    /// durable/accounting side effects or telemetry answers that must refuse
+    /// when admission cannot record their audit, despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
     /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
     /// distinguish these from a genuinely side-effect-free read (that is the
@@ -4730,7 +4820,7 @@ pub(crate) mod tests {
     /// so this denylist is the mechanizable guard against silently
     /// reintroducing one of them: a category-only census would stay green if
     /// any name were re-added to the allowlist.
-    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
+    const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
         "db_diagnostics",
         "git.checkout",
         "git.diff",
@@ -4739,6 +4829,10 @@ pub(crate) mod tests {
         "knowledge.search",
         "knowledge.suggest",
         "memory.recall",
+        "telemetry.channels",
+        "telemetry.counts",
+        "telemetry.emit",
+        "telemetry.read",
     ];
 
     /// Classification outcome for one `HandlerDef {` occurrence in pack
@@ -4908,7 +5002,7 @@ pub(crate) mod tests {
     /// that verb.
     ///
     /// This test proves category membership (`VerbCategory::Assertive`),
-    /// pack ownership, non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`],
+    /// pack ownership, non-membership in [`KNOWN_ADMISSION_UNSAFE_VERBS`],
     /// and exhaustive classification of every currently public Assertive
     /// handler. It does NOT prove general effect-purity: an Assertive
     /// handler may still emit its own
@@ -5098,10 +5192,10 @@ pub(crate) mod tests {
                  live declaration says otherwise (found: {live_owner:?})"
             );
         }
-        let incidental: BTreeSet<&str> = KNOWN_INCIDENTAL_WRITE_VERBS.iter().copied().collect();
+        let incidental: BTreeSet<&str> = KNOWN_ADMISSION_UNSAFE_VERBS.iter().copied().collect();
         assert!(
             safe_verbs.is_disjoint(&incidental),
-            "a public Assertive verb cannot be both admission-degrade-safe and an incidental writer: {:?}",
+            "a public Assertive verb cannot be both admission-degrade-safe and admission-unsafe: {:?}",
             safe_verbs.intersection(&incidental).collect::<Vec<_>>()
         );
 
@@ -5323,6 +5417,7 @@ pub(crate) mod tests {
         let sources: &[(&str, &str)] = &[
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
+            ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
         ];
         assert_eq!(
             sources.len(),

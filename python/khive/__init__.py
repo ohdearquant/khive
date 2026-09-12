@@ -38,10 +38,20 @@ from .models import (
     RecallOutcome,
 )
 from .ops import encode, op
-from .transport import AsyncHttpTransport, HttpTransport, Session, SocketTransport, Transport
+from .transport import (
+    AsyncHttpTransport,
+    AsyncSession,
+    AsyncSocketTransport,
+    HttpTransport,
+    Session,
+    SocketTransport,
+    Transport,
+)
 
 __all__ = [
     "AsyncHttpTransport",
+    "AsyncSession",
+    "AsyncSocketTransport",
     "Attachment",
     "AuthError",
     "BadRequest",

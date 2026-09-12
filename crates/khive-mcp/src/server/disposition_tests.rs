@@ -1,13 +1,26 @@
 //! ADR-133 A3: prove dispositions against actual domain storage, not a stand-in vector.
 
-use super::*;
+#[cfg(unix)]
+use super::ForwardFuture;
+use super::{
+    failure_entry, frame_budget_omission, runtime_error_value, DispatchOrigin, KhiveMcpServer,
+};
+use crate::tools::request::RequestParams;
 use khive_runtime::audit_batch::{AuditBatchConfig, AuditBatchControl, AuditTerminalReason};
-use khive_runtime::{AuditObligationFailure, DomainDisposition, Namespace};
+use khive_runtime::{
+    AuditObligationFailure, DomainDisposition, KhiveRuntime, Namespace, RuntimeConfig,
+    RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
 use khive_storage::event::IdempotentEventBatchResult;
 use khive_storage::{
-    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageResult,
+    BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageCapability,
+    StorageResult,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 
 /// Domain handlers keep their real SQLite stores. Only the registry's separate
 /// audit append is rejected, after preflight has accepted the actual audit row.
@@ -1193,8 +1206,10 @@ impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
         syn::visit::visit_expr_struct(self, expr);
     }
     fn visit_expr_match(&mut self, expr: &'ast syn::ExprMatch) {
-        if self.root_function("khive-mcp/src/server.rs", "runtime_error_value")
-            && matches!(expr.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("error"))
+        if self.root_function(
+            "khive-runtime/src/error_projection.rs",
+            "runtime_error_value",
+        ) && matches!(expr.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("error"))
         {
             for arm in &expr.arms {
                 self.classify_runtime_pattern(&arm.pat);
@@ -1236,6 +1251,7 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
         manifest.join("src/server.rs"),
         manifest.join("src/daemon.rs"),
         manifest.join("../khive-runtime/src/daemon.rs"),
+        manifest.join("../khive-runtime/src/error_projection.rs"),
     ];
     let mut emitted = 0;
     let mut runtime_variants = std::collections::BTreeSet::new();
@@ -1319,7 +1335,6 @@ fn a3_constructor_census_rejects_new_raw_sites_and_unclassified_variants() {
         r#"mod added { fn failure_entry() { json!({"ok":false,"error":"lost"}); } }"#,
         r#"fn added() { fn failure_entry() { json!({"ok":false,"error":"lost"}); } }"#,
         r#"fn added() { DaemonResponseFrame { ok: false, error: Some("lost"), error_detail: Some(json!({"message":"lost"})) }; }"#,
-        r#"fn runtime_error_value(error: RuntimeError) { match error { _ => json!("lost") } }"#,
         r#"mod unscanned_envelope_builders;"#,
     ] {
         let mut census = ErrorConstructorCensus {
@@ -1344,6 +1359,25 @@ fn a3_constructor_census_rejects_new_raw_sites_and_unclassified_variants() {
         "scanner must distinguish production constructors from fixtures/domain data"
     );
     assert!(census.constructors_seen > 0);
+}
+
+#[test]
+fn a3_runtime_projection_census_rejects_wildcards_at_the_shared_source() {
+    use syn::visit::Visit;
+    let mut census = ErrorConstructorCensus {
+        source: "khive-runtime/src/error_projection.rs".into(),
+        ..Default::default()
+    };
+    census.visit_file(
+        &syn::parse_file(
+            r#"fn runtime_error_value(error: RuntimeError) { match error { _ => json!("lost") } }"#,
+        )
+        .unwrap(),
+    );
+    assert!(
+        !census.offenders.is_empty(),
+        "shared projection accepted a catch-all"
+    );
 }
 
 #[test]

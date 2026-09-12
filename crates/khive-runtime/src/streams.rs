@@ -4,10 +4,14 @@
 //! such transaction per member, in list order (per-member mode).
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use khive_storage::{
     AtomicUnitOp, Note, SqlAccess, SqlRow, SqlStatement, SqlValue, SqlWriter, StorageCapability,
-    StorageError,
+    StorageError, WriterTaskRequestState,
 };
 use khive_types::{Details, KhiveError};
 use serde::Deserialize;
@@ -29,6 +33,9 @@ use crate::{
     micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
     VerbRegistry,
 };
+
+#[cfg(test)]
+mod append_failure_tests;
 
 fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
     SqlStatement {
@@ -70,6 +77,89 @@ fn write_failure(message: &str) -> StorageError {
         capability: StorageCapability::Notes,
         operation: "stream.append".into(),
         message: message.into(),
+    }
+}
+
+/// What the append path can prove about its own failed append, independently
+/// of an enclosing dispatch or a nested error's wire disposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamAppendDisposition {
+    /// This append either never reached a write or its transaction rolled back.
+    NotCommitted,
+    /// The append may have committed; no absence of a record is asserted.
+    Unknown,
+}
+
+/// An unchanged source error together with evidence local to one append.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct StreamAppendFailure {
+    #[source]
+    source: RuntimeError,
+    disposition: StreamAppendDisposition,
+}
+
+impl StreamAppendFailure {
+    fn not_committed(source: RuntimeError) -> Self {
+        Self {
+            source,
+            disposition: StreamAppendDisposition::NotCommitted,
+        }
+    }
+
+    /// Retain an error when no append-local committedness proof is available.
+    /// This constructor cannot assert that an append was dropped.
+    pub fn unknown(source: RuntimeError) -> Self {
+        Self {
+            source,
+            disposition: StreamAppendDisposition::Unknown,
+        }
+    }
+
+    fn after_submission(source: RuntimeError, refused_before_write: bool) -> Self {
+        let disposition = if let Some(context) = source.writer_task_failure_context() {
+            match context.request_state {
+                WriterTaskRequestState::NotStarted
+                | WriterTaskRequestState::TransactionRolledBack => {
+                    StreamAppendDisposition::NotCommitted
+                }
+                WriterTaskRequestState::SideEffectsUnknown => StreamAppendDisposition::Unknown,
+            }
+        } else if refused_before_write
+            || source.admission_failure_context().is_some()
+            || matches!(
+                &source,
+                RuntimeError::Storage(StorageError::WriterTaskBusy { .. })
+            )
+        {
+            StreamAppendDisposition::NotCommitted
+        } else {
+            StreamAppendDisposition::Unknown
+        };
+        Self {
+            source,
+            disposition,
+        }
+    }
+
+    /// Borrow the original error without rewriting its fields or provenance.
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    /// Evidence about this append, not the enclosing handler's disposition.
+    pub fn disposition(&self) -> StreamAppendDisposition {
+        self.disposition
+    }
+
+    /// Separate the unchanged source from append-local committedness evidence.
+    pub fn into_parts(self) -> (RuntimeError, StreamAppendDisposition) {
+        (self.source, self.disposition)
+    }
+
+    /// Preserve the compatibility error path without an additional wrapper.
+    pub fn into_source(self) -> RuntimeError {
+        self.source
     }
 }
 
@@ -751,10 +841,10 @@ impl KhiveRuntime {
     /// checked before the first write; then notes and ledger rows land in
     /// list order, so appends to one stream take consecutive numbers.
     async fn run_stream_appends(
-        &self,
+        access: &dyn SqlAccess,
         token: &NamespaceToken,
         appends: &[PreparedAppend],
-    ) -> RuntimeResult<BatchOutcome> {
+    ) -> Result<BatchOutcome, StreamAppendFailure> {
         let ns = token.namespace().as_str().to_string();
         let entries: Vec<_> = appends
             .iter()
@@ -768,8 +858,14 @@ impl KhiveRuntime {
                 )
             })
             .collect();
+        // A false flag is never proof: the backend may have accepted a closure
+        // that has not run yet. Only a completed pre-write error sets it true.
+        let refused_before_write = Arc::new(AtomicBool::new(false));
+        let refusal_proof = Arc::clone(&refused_before_write);
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
+                let mut writes_started = false;
+                let result = async {
                 let mut heads: Vec<(String, i64)> = Vec::new();
                 for (stream, _, _, _, _) in &entries {
                     if heads.iter().any(|(known, _)| known == stream) {
@@ -813,6 +909,9 @@ impl KhiveRuntime {
                 for ((stream, _, note_id, statements, _), seq) in
                     entries.into_iter().zip(assigned.iter().copied())
                 {
+                    // Set before invoking the first write, including a write
+                    // whose driver returns an error with ambiguous effects.
+                    writes_started = true;
                     for planned in statements {
                         let affected = writer.execute(planned.statement).await?;
                         if planned
@@ -825,14 +924,28 @@ impl KhiveRuntime {
                     insert_stream_entry(writer, &ns, stream, seq, note_id).await?;
                 }
                 Ok(Box::new(BatchOutcome::Appended(assigned)) as Box<dyn Any + Send>)
+                }.await;
+                if result.is_err() && !writes_started {
+                    refusal_proof.store(true, Ordering::Release);
+                }
+                result
             })
         });
-        let outcome = self
-            .sql()
+        let outcome = access
             .atomic_unit(op)
-            .await?
+            .await
+            .map_err(|source| {
+                StreamAppendFailure::after_submission(
+                    source.into(),
+                    refused_before_write.load(Ordering::Acquire),
+                )
+            })?
             .downcast::<BatchOutcome>()
-            .map_err(|_| RuntimeError::Internal("invalid stream append outcome".into()))?;
+            .map_err(|_| {
+                StreamAppendFailure::unknown(RuntimeError::Internal(
+                    "invalid stream append outcome".into(),
+                ))
+            })?;
         Ok(*outcome)
     }
 
@@ -851,6 +964,37 @@ impl KhiveRuntime {
         embed: Option<bool>,
         embedding_model: Option<String>,
     ) -> RuntimeResult<Value> {
+        self.stream_append_with_outcome(
+            token,
+            stream,
+            record,
+            expected_seq,
+            note_kind,
+            tags,
+            fence,
+            embed,
+            embedding_model,
+        )
+        .await
+        .map_err(StreamAppendFailure::into_source)
+    }
+
+    /// Append once while retaining evidence about the failed append's own
+    /// committedness. The original error remains available for stop semantics
+    /// or the shared structured error projection; this method never retries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_append_with_outcome(
+        &self,
+        token: &NamespaceToken,
+        stream: &str,
+        record: &Value,
+        expected_seq: Option<i64>,
+        note_kind: &str,
+        tags: Option<Vec<String>>,
+        fence: Option<NoteFences>,
+        embed: Option<bool>,
+        embedding_model: Option<String>,
+    ) -> Result<Value, StreamAppendFailure> {
         let spec = StreamAppendSpec {
             stream: stream.to_string(),
             record: record.clone(),
@@ -861,17 +1005,25 @@ impl KhiveRuntime {
             embed,
             embedding_model,
         };
-        let prepared = self.prepare_stream_appends(token, &[&spec]).await?;
-        match self.run_stream_appends(token, &prepared).await? {
+        let prepared = self
+            .prepare_stream_appends(token, &[&spec])
+            .await
+            .map_err(StreamAppendFailure::not_committed)?;
+        let access = self.sql();
+        match Self::run_stream_appends(access.as_ref(), token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
-            BatchOutcome::FenceConflict { conflict } => Err(conflict.into_error().into()),
-            BatchOutcome::Conflict { next } => Err(seq_conflict(
-                stream,
-                expected_seq.expect("only conditional appends conflict"),
-                next,
-                None,
-            )
-            .into()),
+            BatchOutcome::FenceConflict { conflict } => Err(StreamAppendFailure::not_committed(
+                conflict.into_error().into(),
+            )),
+            BatchOutcome::Conflict { next } => Err(StreamAppendFailure::not_committed(
+                seq_conflict(
+                    stream,
+                    expected_seq.expect("only conditional appends conflict"),
+                    next,
+                    None,
+                )
+                .into(),
+            )),
         }
     }
 
@@ -1357,10 +1509,34 @@ mod batch_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{allocate_sequence, SequenceRefusal};
     use crate::atomic_prepare::{prepare_delete, prepare_update};
     use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
-    use crate::{Namespace, NotePatch};
+    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn allocate_sequence_exhaustion_preserves_head_at_checked_add_boundary() {
+        // Overflow is logically possible, but no bounded real-store fixture
+        // reaches it: stream_gap requires consecutive inserts from 1, and
+        // ledger UPDATE/DELETE are forbidden. Supply the head at this unit
+        // boundary instead of fabricating an exhausted persisted stream.
+        let mut head = i64::MAX - 1;
+        assert!(matches!(
+            allocate_sequence(&mut head, None),
+            Ok(seq) if seq == i64::MAX
+        ));
+        assert_eq!(head, i64::MAX);
+        assert!(matches!(
+            allocate_sequence(&mut head, None),
+            Err(SequenceRefusal::Exhausted)
+        ));
+        assert_eq!(
+            head,
+            i64::MAX,
+            "refused allocation must not advance the head"
+        );
+    }
 
     #[tokio::test]
     async fn stream_atomic_metadata_cas_preserves_record_and_refuses_stale_plan() {

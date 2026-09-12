@@ -1143,6 +1143,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),

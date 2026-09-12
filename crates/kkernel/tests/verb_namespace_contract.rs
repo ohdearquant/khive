@@ -149,7 +149,7 @@ fn build_full_registry() -> Vec<(String, String)> {
         .collect();
     PackRegistry::register_packs(&names, runtime, &mut builder)
         .expect("all inventory packs must register cleanly");
-    let registry = builder.build().expect("VerbRegistry build");
+    let registry = builder.build_metadata().expect("pack metadata build");
     registry
         .all_handlers_with_names()
         .into_iter()

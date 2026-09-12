@@ -529,6 +529,7 @@ mod tests {
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -611,6 +612,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -758,6 +760,7 @@ mod tests {
         let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -924,6 +927,7 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
