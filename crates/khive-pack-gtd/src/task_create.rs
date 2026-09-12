@@ -35,6 +35,10 @@ pub(crate) struct TaskCreateInput {
     pub(crate) priority: Option<String>,
     pub(crate) status: Option<String>,
     pub(crate) due: Option<String>,
+    /// IANA zone the date-only `due` is anchored in. Absent means the server's
+    /// configured display timezone, which is one process-wide value serving every
+    /// caller, so it cannot be right for two callers in different zones at once.
+    pub(crate) timezone: Option<String>,
     pub(crate) start: Option<String>,
     pub(crate) end: Option<String>,
     pub(crate) depends_on: Option<Vec<String>>,
@@ -128,6 +132,9 @@ impl TaskCreateInput {
             "due",
             "properties.due",
         )?);
+        let timezone = optional_string_field(args, "timezone", "timezone")?.or(
+            optional_string_field(&properties, "timezone", "properties.timezone")?,
+        );
         let start = optional_string_field(args, "start", "start")?.or(optional_string_field(
             &properties,
             "start",
@@ -163,6 +170,7 @@ impl TaskCreateInput {
                 "priority",
                 "status",
                 "due",
+                "timezone",
                 "start",
                 "end",
                 "depends_on",
@@ -182,6 +190,7 @@ impl TaskCreateInput {
             priority,
             status,
             due,
+            timezone,
             start,
             end,
             depends_on,
@@ -380,10 +389,22 @@ pub(crate) async fn prepare_task_create(
         obj.insert("assignee".into(), json!(assignee));
     }
     if let Some(ref due) = input.due {
-        obj.insert(
-            "due".into(),
-            json!(parse_due(due, runtime.config().display_timezone)?),
-        );
+        // The zone a deadline is anchored in is a property of whose deadline it is,
+        // and the runtime does not know whose. The configured display timezone is a
+        // fact about the host, which is the wrong shape for a process serving many
+        // callers, so the caller may name the zone and the answer echoes which one
+        // was used: without the echo a defaulted anchor and a caller-supplied one
+        // are byte-identical in the record and the ambiguity just moves to the reader.
+        let zone = match input.timezone.as_deref() {
+            None => runtime.config().display_timezone,
+            Some(name) => name.parse::<chrono_tz::Tz>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
+                ))
+            })?,
+        };
+        obj.insert("due".into(), json!(parse_due(due, zone)?));
+        obj.insert("due_timezone".into(), json!(zone.name()));
     }
     if let Some(ref start) = input.start {
         obj.insert("start".into(), json!(start));
