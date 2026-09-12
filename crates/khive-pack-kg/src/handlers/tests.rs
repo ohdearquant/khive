@@ -3023,3 +3023,118 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
         "resolve has no message slot for a merge hint in this interim change; got {result:?}"
     );
 }
+
+// The reason this change exists: before it, a create through the kg verbs left an
+// audit row at the exec layer and no domain event at all, so the event plane could
+// say what left the graph and not what entered it. This walks create, update and
+// delete for both substrates and requires all six domain kinds, each exactly once
+// and each carrying its own record as the target. Audit rows are emitted a layer
+// above the pack registry, so they are outside this test's reach by construction;
+// what is in reach is the half that was missing.
+#[tokio::test]
+async fn every_kg_write_emits_its_domain_event() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "domain-event-arm",
+            }),
+            &registry,
+        )
+        .await
+        .expect("create entity");
+    let entity_id =
+        Uuid::parse_str(entity["id"].as_str().expect("entity id")).expect("entity uuid");
+
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "domain event arm",
+            }),
+            &registry,
+        )
+        .await
+        .expect("create note");
+    let note_id = Uuid::parse_str(note["id"].as_str().expect("note id")).expect("note uuid");
+
+    pack.handle_update(
+        &token,
+        json!({"id": entity_id, "description": "updated by the domain event arm"}),
+        &registry,
+    )
+    .await
+    .expect("update entity");
+    pack.handle_update(
+        &token,
+        json!({"id": note_id, "content": "domain event arm, updated"}),
+        &registry,
+    )
+    .await
+    .expect("update note");
+
+    pack.handle_delete(&token, json!({"id": entity_id}), &registry)
+        .await
+        .expect("delete entity");
+    pack.handle_delete(&token, json!({"id": note_id}), &registry)
+        .await
+        .expect("delete note");
+
+    let page = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 500,
+            },
+        )
+        .await
+        .expect("query every event in the namespace");
+
+    let mut by_kind: BTreeMap<String, Vec<Option<Uuid>>> = BTreeMap::new();
+    for event in &page.items {
+        by_kind
+            .entry(format!("{:?}", event.kind))
+            .or_default()
+            .push(event.target_id);
+    }
+    let census: Vec<(String, usize)> = by_kind
+        .iter()
+        .map(|(kind, targets)| (kind.clone(), targets.len()))
+        .collect();
+
+    for (kind, expected_target) in [
+        (EventKind::EntityCreated, entity_id),
+        (EventKind::EntityUpdated, entity_id),
+        (EventKind::EntityDeleted, entity_id),
+        (EventKind::NoteCreated, note_id),
+        (EventKind::NoteUpdated, note_id),
+        (EventKind::NoteDeleted, note_id),
+    ] {
+        let key = format!("{kind:?}");
+        let targets = by_kind.get(&key).cloned().unwrap_or_default();
+        assert_eq!(
+            targets.len(),
+            1,
+            "expected exactly one {key} event; kind census was {census:?}"
+        );
+        assert_eq!(
+            targets[0],
+            Some(expected_target),
+            "{key} must target the record it describes; kind census was {census:?}"
+        );
+    }
+}

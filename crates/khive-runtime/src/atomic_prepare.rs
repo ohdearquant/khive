@@ -401,8 +401,8 @@ async fn push_index_purge_statements(
 /// lifecycle event after their row mutation: `update_entity` ->
 /// `EntityUpdated`, `delete_entity` -> `EntityDeleted`, `delete_note` ->
 /// `NoteDeleted`, `update_edge` -> `EdgeUpdated`, `delete_edge` ->
-/// `EdgeDeleted`, and `link` -> `LinkCreated`/`EdgeUpdated`. `update_note`
-/// appends no event and must never call this. See
+/// `EdgeDeleted`, `link` -> `LinkCreated`/`EdgeUpdated`, and
+/// `update_note` -> `NoteUpdated`. See
 /// `docs/api/atomic_prepare.md#event_append_statements` for why
 /// this is a `PlanStatement` rather than a `PostCommitEffect`.
 ///
@@ -413,7 +413,7 @@ async fn push_index_purge_statements(
 /// describes strengthens canonical's guarantee: the non-atomic handlers write
 /// the event in a separate transaction, ordered but not atomic with the row
 /// mutation.
-fn event_append_statements(
+pub(crate) fn event_append_statements(
     token: &NamespaceToken,
     namespace: &str,
     verb: &str,

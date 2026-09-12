@@ -1704,6 +1704,30 @@ impl KhiveRuntime {
             }
         }
 
+        // The arrival event, appended only after every compensating step has had
+        // its chance to fire: a create that rolled back returns above and never
+        // reaches here, so the event plane cannot name an entity that does not
+        // exist. Deletes and updates already emitted theirs; creates did not,
+        // which left the audit trail able to say what left the graph and not
+        // what entered it.
+        let event_store = self.events(token)?;
+        let created_event = khive_storage::event::Event::new(
+            entity.namespace.clone(),
+            "create",
+            EventKind::EntityCreated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(entity.id)
+        .with_payload(serde_json::json!({
+            "id": entity.id,
+            "namespace": entity.namespace,
+            "kind": entity.kind,
+        }));
+        event_store.append_event(created_event).await.map_err(|e| {
+            RuntimeError::Internal(format!("create_entity: event store write failed: {e}"))
+        })?;
+
         Ok((entity, embedding_report))
     }
 
@@ -3964,6 +3988,29 @@ impl KhiveRuntime {
                 }
             }
         }
+
+        // Same contract as the entity arrival event above: after compensation,
+        // so a rolled-back create leaves no event. This is the single funnel for
+        // every note create in the product, which is why the memory pack's own
+        // note_created emitter was removed rather than left beside it.
+        let event_store = self.events(token)?;
+        let created_event = khive_storage::event::Event::new(
+            note.namespace.clone(),
+            "create",
+            EventKind::NoteCreated,
+            SubstrateKind::Note,
+            "",
+        )
+        .with_target(note.id)
+        .with_payload(serde_json::json!({
+            "id": note.id,
+            "namespace": note.namespace,
+            "kind": note.kind,
+            "salience": note.salience,
+        }));
+        event_store.append_event(created_event).await.map_err(|e| {
+            RuntimeError::Internal(format!("create_note: event store write failed: {e}"))
+        })?;
 
         Ok((note, embedding_report))
     }
