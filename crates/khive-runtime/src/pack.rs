@@ -7960,7 +7960,12 @@ pub(crate) mod tests {
     #[test]
     fn converted_crates_keep_their_sql_out_of_rust() {
         /// Crates whose statements live in `sql/`. One pull request adds one name.
-        const CONVERTED: &[&str] = &["khive-pack-brain", "khive-pack-kg", "kkernel"];
+        const CONVERTED: &[&str] = &[
+            "khive-pack-brain",
+            "khive-pack-git",
+            "khive-pack-kg",
+            "kkernel",
+        ];
         /// A crate known to still hold SQL in Rust, used only to prove the detector
         /// fires. When this one is converted, move the control to another unconverted
         /// crate rather than deleting it.

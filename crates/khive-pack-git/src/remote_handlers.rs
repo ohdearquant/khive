@@ -12,6 +12,7 @@ use crate::local_handlers::{
 };
 use crate::receipts::{self, Disposition, Receipt};
 use crate::remote_transport::{ApiRequest, PushRequest, RemoteError};
+use crate::sql::sql;
 use crate::write_argv::{validate_ref_name, validate_repo_path};
 use crate::{credentials, local_git, GitPack};
 
@@ -766,11 +767,20 @@ impl GitPack {
             .reader()
             .await
             .map_err(RuntimeError::from)?;
-        let rows = reader.query_all(SqlStatement {
-            sql:"SELECT actor, credential FROM git_receipts WHERE namespace=?1 AND repo=?2 AND verb='git.pr_open' AND disposition != 'not_committed' AND json_extract(result,'$.number')=?3 LIMIT 1001".into(),
-            params:vec![SqlValue::Text(receipt.namespace.clone()),SqlValue::Text(receipt.repo.clone()),SqlValue::Integer(i64::try_from(number).map_err(|_| Failure::invalid("number too large"))?)],
-            label:Some("git_pr_opener".into()),
-        }).await.map_err(RuntimeError::from)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql!("pr_open_receipts_by_number_select").into(),
+                params: vec![
+                    SqlValue::Text(receipt.namespace.clone()),
+                    SqlValue::Text(receipt.repo.clone()),
+                    SqlValue::Integer(
+                        i64::try_from(number).map_err(|_| Failure::invalid("number too large"))?,
+                    ),
+                ],
+                label: Some("git_pr_opener".into()),
+            })
+            .await
+            .map_err(RuntimeError::from)?;
         if rows.len() > 1000 {
             return Err(Failure::refused("opener_evidence_limit"));
         }
@@ -808,17 +818,20 @@ impl GitPack {
             .reader()
             .await
             .map_err(RuntimeError::from)?;
-        let rows = reader.query_all(SqlStatement {
-            sql: "SELECT id, repo, disposition, credential FROM git_receipts \
-                  WHERE namespace=?1 AND verb='git.push' AND disposition IN ('committed','unknown') \
-                  AND lower(json_extract(result,'$.sha'))=?2 AND json_extract(result,'$.ref')=?3 \
-                  AND lower(json_extract(result,'$.remote')) IN (?4,?5) \
-                  ORDER BY rowid DESC LIMIT 1001".into(),
-            params: vec![SqlValue::Text(receipt.namespace.clone()),SqlValue::Text(expected.into()),
-                SqlValue::Text(format!("refs/heads/{branch}")),SqlValue::Text(remote.clone()),
-                SqlValue::Text(format!("{remote}.git"))],
-            label: Some("git_last_pusher".into()),
-        }).await.map_err(RuntimeError::from)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql!("push_receipts_by_head_select").into(),
+                params: vec![
+                    SqlValue::Text(receipt.namespace.clone()),
+                    SqlValue::Text(expected.into()),
+                    SqlValue::Text(format!("refs/heads/{branch}")),
+                    SqlValue::Text(remote.clone()),
+                    SqlValue::Text(format!("{remote}.git")),
+                ],
+                label: Some("git_last_pusher".into()),
+            })
+            .await
+            .map_err(RuntimeError::from)?;
         // No SQL reader is held across local Git process execution.
         drop(reader);
         for row in rows.iter().take(1000) {
