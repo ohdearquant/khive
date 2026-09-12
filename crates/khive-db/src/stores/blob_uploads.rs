@@ -1,5 +1,26 @@
 //! Staged filesystem uploads, sharing the blob root's write ownership and
 //! publication primitives. Hashing and wire-session state belong to the pack.
+//!
+//! # Path resolution is race-free on Unix and not on other platforms
+//!
+//! The Unix arms here open relative to a retained root descriptor with
+//! `openat`-style calls that refuse to follow symlinks, so a path cannot be
+//! swapped between the check and the use. The `cfg(not(unix))` arms cannot do
+//! that yet: they validate with `symlink_metadata` and then let `OpenOptions`,
+//! `remove_file`, `create_dir_all` and `rename` resolve the same path again. A
+//! local process able to write inside the blob root can substitute a directory,
+//! junction or reparse point in that window and redirect the operation outside
+//! the root.
+//!
+//! This is a known limitation, not an oversight, and the API's trust boundary is
+//! written to match: the blob root, its contents and its ancestors must be
+//! writable only by trusted processes, including processes running under the
+//! same account. A handle-based Windows replacement needs native coverage of
+//! concurrent swaps across begin, append, commit, abort and sweep before it can
+//! be believed, and the hosted matrix does not run Windows, so it is follow-up
+//! work rather than something to write blind. The arms are
+//! `UploadContext::directory`, `open_staging` and `commit_staged`; do not narrow
+//! the trust boundary in the documentation without replacing all three.
 
 use super::*;
 
