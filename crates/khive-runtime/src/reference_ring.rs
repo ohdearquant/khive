@@ -231,10 +231,12 @@ fn is_entity_kind_value(v: &str) -> bool {
 ///   a `content` key: the two shapes never overlap, so key presence alone
 ///   is a reliable substrate discriminator.
 /// - `delete` returns a synthetic `{deleted, id, kind}` summary carrying
-///   neither field; its `kind` is the caller-supplied request param verbatim,
-///   which may be absent/ambiguous. Absent or ambiguous `kind` never admits:
-///   a delete admission is a nice-to-have, so skipping is always the safe
-///   choice over guessing.
+///   neither field; its `kind` is the one the handler RESOLVED off the row
+///   before removing it, so a caller who deleted by a bare id or a hex prefix
+///   still names a substrate here. A pack resolver's own delete path can still
+///   answer without one. An absent or unrecognised `kind` never admits: a
+///   delete admission is a nice-to-have, so skipping is always the safe choice
+///   over guessing.
 fn substrate_admits_as_entity(obj: &serde_json::Map<String, Value>) -> bool {
     if matches!(
         obj.get("kind").and_then(Value::as_str),
@@ -360,10 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn ring_admissions_for_delete_uses_echoed_kind_param() {
+    fn ring_admissions_for_delete_uses_resolved_kind() {
         let id = Uuid::new_v4();
         // delete's synthetic summary has neither `content` nor `entity_type`;
-        // it falls back to the caller-echoed `kind` param.
+        // it falls back to `kind`, which the handler resolves off the row it
+        // removed rather than echoing back what the caller typed.
         let entity_delete = json!({"deleted": true, "id": id.to_string(), "kind": "concept"});
         assert_eq!(
             ring_admissions_for("delete", &entity_delete),
@@ -377,6 +380,8 @@ mod tests {
         );
         let note_delete = json!({"deleted": true, "id": id.to_string(), "kind": "observation"});
         assert!(ring_admissions_for("delete", &note_delete).is_empty());
+        // A pack resolver's own delete path answers without a kind. That still
+        // has to skip rather than guess, so the arm stays.
         let unspecified_delete = json!({"deleted": true, "id": id.to_string(), "kind": null});
         assert!(ring_admissions_for("delete", &unspecified_delete).is_empty());
     }
