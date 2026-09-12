@@ -8167,9 +8167,27 @@ pub(crate) mod tests {
                 }
                 let statement =
                     std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+                // A file may open with a header comment saying what it is and where its
+                // authoritative definition lives. A Rust literal carries no such header,
+                // so the round trip has to drop it: otherwise the rendered literal opens
+                // with `--` and the predicate correctly sees no statement, which reads as
+                // a broken census rather than as a file with a preamble.
+                let body = statement
+                    .lines()
+                    .skip_while(|line| {
+                        let start = line.trim_start();
+                        start.is_empty() || start.starts_with("--")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    !body.trim().is_empty(),
+                    "{file:?} holds nothing but comments, so it declares no statement for \
+                     the census to protect"
+                );
                 // A quoted identifier would otherwise close the synthetic literal early
                 // and fail this control for a reason that has nothing to do with it.
-                let statement = statement.trim().replace('"', "\\\"");
+                let statement = body.trim().replace('"', "\\\"");
                 let shapes = [
                     (
                         "one line",
