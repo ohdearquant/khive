@@ -69,6 +69,11 @@ impl AtomicExecFailure {
                     });
                     if let Some(reason) = failure.reason {
                         entry["reason"] = json!(reason.as_str());
+                        // This structured policy guard failed during prepare,
+                        // before any operation in the atomic unit was applied.
+                        if reason == RefusalReason::PolicyRefusal {
+                            entry["domain_disposition"] = json!("not_committed");
+                        }
                     }
                     entry
                 } else {
@@ -315,6 +320,7 @@ fn classify_atomic_preflight(
 fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReason> {
     match error.downcast_ref::<RuntimeError>() {
         Some(RuntimeError::SecretDetected(_)) => Some(RefusalReason::GateRefusal),
+        Some(error) if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
         _ => None,
     }
 }

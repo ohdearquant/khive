@@ -191,8 +191,12 @@ replay.
 Preflight and prepare failures cross back to `exec.rs` as a typed `AtomicExecFailure` containing
 the unchanged terminal message plus a result envelope over the real ops-file entries. The shared
 refusal annotator emits `verb-refused` for unknown/unloaded preflight entries,
-`gate-refusal` for typed secret-gate prepare failures, and `strict-op-failure` for otherwise
+`gate-refusal` for typed secret-gate prepare failures, `policy-refusal` for structured
+immutable stream record refusals, and `strict-op-failure` for otherwise
 unclassified rollback entries when the operator supplied `--strict`.
+The structured immutable stream policy guard also stamps
+`domain_disposition: "not_committed"` beside the atomic result's string `error`,
+because prepare refused before the atomic unit applied any domain write.
 
 Before prepare, the atomic runtime installs the same aggregate pack edge rules as canonical
 server startup. Before each task-note `update` plan is built, the boundary invokes

@@ -18,6 +18,10 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
     let named_disposition = match &error {
+        // An immutable-stream policy refusal is a definite no-write. It is matched by the
+        // shared predicate rather than by a reason string so the two consumers of that
+        // predicate and this projection cannot drift into disagreeing about it.
+        error if error.is_stream_policy_refusal() => Some("not_committed"),
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
             (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
                 Some("not_committed")
