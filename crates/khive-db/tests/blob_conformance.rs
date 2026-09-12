@@ -45,6 +45,36 @@ impl FixtureBlobStore {
     }
 }
 
+#[tokio::test]
+async fn upload_defaults_refuse_for_backends_without_staging() {
+    let store = FixtureBlobStore::default();
+    let id = khive_storage::UploadId::from_bytes(&[1; 16]);
+    let reference = ContentRef::from_hex("a".repeat(64)).unwrap();
+    let failures = [
+        store.begin_upload(1).await.map(|_| ()),
+        store.append_part(&id, vec![1]).await.map(|_| ()),
+        store.commit_upload(&id, &reference).await,
+        store.abort_upload(&id).await,
+        store
+            .sweep_uploads(std::time::Duration::ZERO)
+            .await
+            .map(|_| ()),
+    ];
+    for (result, expected) in failures.into_iter().zip([
+        "begin_upload",
+        "append_part",
+        "commit_upload",
+        "abort_upload",
+        "sweep_uploads",
+    ]) {
+        let StorageError::Unsupported { operation, .. } = result.unwrap_err() else {
+            panic!("expected unsupported staging")
+        };
+        assert_eq!(operation, expected);
+    }
+    assert!(store.objects.lock().unwrap().is_empty());
+}
+
 #[async_trait]
 impl BlobStore for FixtureBlobStore {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {

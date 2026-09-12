@@ -26,7 +26,8 @@ pub mod vectors;
 pub use agent::AgentStore;
 pub use attachment::{Attachment, AttachmentStore, AttachmentSubstrate, NewAttachment};
 pub use blob::{
-    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
+    MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};

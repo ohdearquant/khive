@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 
 use khive_storage::blob::{
-    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
+    MAX_BLOB_WHOLE_BYTES,
 };
 use khive_storage::error::StorageError;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
@@ -32,6 +33,9 @@ use khive_storage::{AtomicUnitOp, SqlAccess, StorageCapability};
 
 use crate::error::SqliteError;
 use uuid::Uuid;
+
+#[path = "blob_uploads.rs"]
+mod uploads;
 
 const ROOT_WRITE_LOCK_FILE: &str = ".khive-blob-write.lock";
 const DATABASE_GC_LOCK_SUFFIX: &str = ".khive-blob-gc.lock";
@@ -691,17 +695,18 @@ fn unlink_entry_at(parent_fd: std::os::unix::io::RawFd, name: &str) -> std::io::
 
 #[cfg(unix)]
 fn rename_entry_at(
-    parent_fd: std::os::unix::io::RawFd,
+    source_fd: std::os::unix::io::RawFd,
     from: &str,
+    destination_fd: std::os::unix::io::RawFd,
     to: &str,
 ) -> std::io::Result<()> {
     let c_from = std::ffi::CString::new(from)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let c_to = std::ffi::CString::new(to)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: both names are NUL-terminated and relative to the same live
-    // shard-directory handle.
-    let rc = unsafe { libc::renameat(parent_fd, c_from.as_ptr(), parent_fd, c_to.as_ptr()) };
+    // SAFETY: both names are NUL-terminated and relative to live directory
+    // handles retained from the same blob root.
+    let rc = unsafe { libc::renameat(source_fd, c_from.as_ptr(), destination_fd, c_to.as_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -917,10 +922,15 @@ where
         ));
     }
 
-    tmp.persist(&target)
-        .map_err(|e| map_io_err(e.error, "put_persist"))?;
+    let temporary = tmp.into_temp_path();
+    publish_blob_path(&temporary, &target)?;
 
     Ok(content_ref)
+}
+
+#[cfg(any(test, not(unix)))]
+fn publish_blob_path(source: &Path, target: &Path) -> StorageResult<()> {
+    fs::rename(source, target).map_err(|error| map_io_err(error, "put_persist"))
 }
 
 #[cfg(any(test, not(unix)))]
@@ -1033,6 +1043,7 @@ fn publish_blob_at(
     root: &fs::File,
     shard1: &fs::File,
     shard2: &fs::File,
+    source: &fs::File,
     temp_name: &str,
     content_ref: &ContentRef,
     publication: &BlobPublication,
@@ -1040,9 +1051,14 @@ fn publish_blob_at(
     use std::os::fd::AsRawFd;
 
     if let Err(error) = publication.step("put_persist", || {
-        rename_entry_at(shard2.as_raw_fd(), temp_name, content_ref.as_str())
+        rename_entry_at(
+            source.as_raw_fd(),
+            temp_name,
+            shard2.as_raw_fd(),
+            content_ref.as_str(),
+        )
     }) {
-        let _ = unlink_entry_at(shard2.as_raw_fd(), temp_name);
+        let _ = unlink_entry_at(source.as_raw_fd(), temp_name);
         return Err(error);
     }
     // A barrier failure after rename leaves a complete but unacknowledged
@@ -1137,6 +1153,7 @@ fn put_blocking_from_root_handle(
     publish_blob_at(
         root_handle,
         &shard1_dir,
+        &shard2_dir,
         &shard2_dir,
         &temp_name,
         &content_ref,
@@ -2539,6 +2556,26 @@ impl FsBlobStore {
 
 #[async_trait]
 impl BlobStore for FsBlobStore {
+    async fn begin_upload(&self, declared_size: u64) -> StorageResult<UploadId> {
+        uploads::begin(self, declared_size).await
+    }
+
+    async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {
+        uploads::append(self, id.clone(), bytes).await
+    }
+
+    async fn commit_upload(&self, id: &UploadId, content_ref: &ContentRef) -> StorageResult<()> {
+        uploads::commit(self, id.clone(), content_ref.clone()).await
+    }
+
+    async fn abort_upload(&self, id: &UploadId) -> StorageResult<()> {
+        uploads::abort(self, id.clone()).await
+    }
+
+    async fn sweep_uploads(&self, idle_for: Duration) -> StorageResult<u64> {
+        uploads::sweep(self, idle_for).await
+    }
+
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
         // OWNED guard, MOVED into the blocking closure below: a guard merely
         // borrowed here and held in this
