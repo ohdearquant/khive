@@ -3102,6 +3102,14 @@ mod tests {
                 isolate(dir.path());
                 std::fs::write(pid_path(), std::process::id().to_string()).unwrap();
                 let (tx, rx) = tokio::sync::watch::channel(false);
+                // The scope below owns `rx` and drops it the moment the request resolves.
+                // That happens at the 60ms reconnect deadline, and on this current-thread
+                // runtime the main future can starve the canceller's 20ms sleep past it, so
+                // the send can land after the last receiver is gone -- and `watch::Sender::
+                // send` reports exactly that as an error. Holding a receiver here keeps the
+                // `unwrap` below a check on the send itself rather than a race against the
+                // thing under test; the extra receiver is inert on the path being measured.
+                let held = tx.subscribe();
                 let canceller = tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     if cancel {
@@ -3121,6 +3129,7 @@ mod tests {
                 assert_eq!(error.data.unwrap()["reason"], "daemon_reconnect_expired");
                 assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
                 canceller.await.unwrap();
+                drop(held);
             }
         }
 
