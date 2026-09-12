@@ -3036,7 +3036,10 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
 // without saying which store they came from fails the substrate assertion; one
 // that returns them without their own kind fails the kind assertion, and kind is
 // what tells a task from an observation.
+// `handle_context` reaches the config-ledger seam, so the workspace census in
+// khive-runtime requires this group. It is the first test in this crate to take it.
 #[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_returns_note_neighbours_and_names_their_substrate() {
     let (rt, token, pack, registry) = configured_kg_pack().await;
 
