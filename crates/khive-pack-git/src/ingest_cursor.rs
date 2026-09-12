@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::sql::sql;
 use crate::GitPack;
 
 const MAX_VALUE_BYTES: i64 = 256 * 1024;
@@ -70,15 +71,22 @@ impl GitPack {
         let checkpoint_kind = format!("{kind}_checkpoint");
         // One SELECT snapshot cannot tear the atomically written pair. Limit
         // materialized value bytes even when a damaged row exceeds writer bounds.
-        let rows = self.runtime().sql().reader().await?.query_all(SqlStatement {
-            sql: "SELECT kind, updated_at, typeof(cursor_value) AS value_type, \
-                  length(CAST(cursor_value AS BLOB)) AS value_bytes, \
-                  CASE WHEN length(CAST(cursor_value AS BLOB)) <= ?4 THEN CAST(cursor_value AS BLOB) END AS value \
-                  FROM git_mirror_cursor WHERE project_id=?1 AND kind IN (?2, ?3)".into(),
-            params: vec![SqlValue::Text(project_id.clone()), SqlValue::Text(kind.into()),
-                SqlValue::Text(checkpoint_kind.clone()), SqlValue::Integer(MAX_VALUE_BYTES)],
-            label: Some("git.ingest_cursor.snapshot".into()),
-        }).await?;
+        let rows = self
+            .runtime()
+            .sql()
+            .reader()
+            .await?
+            .query_all(SqlStatement {
+                sql: sql!("ingest_cursor_snapshot_select").into(),
+                params: vec![
+                    SqlValue::Text(project_id.clone()),
+                    SqlValue::Text(kind.into()),
+                    SqlValue::Text(checkpoint_kind.clone()),
+                    SqlValue::Integer(MAX_VALUE_BYTES),
+                ],
+                label: Some("git.ingest_cursor.snapshot".into()),
+            })
+            .await?;
         let mut cursor = Value::Null;
         let mut checkpoint = Value::Null;
         for row in rows {

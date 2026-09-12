@@ -2,12 +2,11 @@ use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
-pub const RECEIPTS_TABLE_SQL: &str = include_str!("../sql/git_receipts.sql");
-pub const RECEIPTS_ACTOR_INDEX_SQL: &str = include_str!("../sql/git_receipts_actor_index.sql");
-pub const RECEIPTS_SESSION_INDEX_SQL: &str = include_str!("../sql/git_receipts_session_index.sql");
+use crate::sql::sql;
 
-const COLUMNS: &str = "id, namespace, actor, session_id, verb, repo, inputs, gate, policy, \
-    fork_policy, credential, started_at, finished_at, disposition, result, reason";
+pub const RECEIPTS_TABLE_SQL: &str = sql!("git_receipts");
+pub const RECEIPTS_ACTOR_INDEX_SQL: &str = sql!("git_receipts_actor_index");
+pub const RECEIPTS_SESSION_INDEX_SQL: &str = sql!("git_receipts_session_index");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Disposition {
@@ -244,10 +243,7 @@ pub async fn insert(rt: &KhiveRuntime, receipt: &Receipt) -> Result<(), RuntimeE
     let mut writer = rt.sql().writer().await?;
     let changed = writer
         .execute(SqlStatement {
-            sql: format!(
-                "INSERT INTO git_receipts ({COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
-            ),
+            sql: sql!("git_receipts_insert").into(),
             params: vec![
                 SqlValue::Text(receipt.id.clone()),
                 SqlValue::Text(receipt.namespace.clone()),
@@ -282,12 +278,7 @@ pub async fn persist(rt: &KhiveRuntime, receipt: &Receipt) -> Result<(), Runtime
     let mut writer = rt.sql().writer().await?;
     let changed = writer
         .execute(SqlStatement {
-            sql: "UPDATE git_receipts SET gate = ?1, policy = ?2, fork_policy = ?3, \
-                  credential = ?4, finished_at = ?5, disposition = ?6, result = ?7, reason = ?8 \
-                  WHERE id = ?9 AND namespace = ?10 AND actor = ?11 AND disposition = 'unknown' \
-                  AND session_id IS ?12 AND verb = ?13 AND repo = ?14 AND inputs = ?15 \
-                  AND started_at = ?16"
-                .into(),
+            sql: sql!("git_receipts_persist").into(),
             params: vec![
                 SqlValue::Text(receipt.gate.to_string()),
                 json_sql(&receipt.policy),
@@ -329,9 +320,7 @@ pub async fn load_owned(
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: format!(
-                "SELECT {COLUMNS} FROM git_receipts WHERE namespace = ?1 AND actor = ?2 AND id = ?3"
-            ),
+            sql: sql!("git_receipts_owned_select").into(),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(actor.to_string()),
@@ -370,11 +359,7 @@ pub async fn list_owned(
     let rows = reader
         .query_all(SqlStatement {
             // Appended receipts do not shift offsets, even with a regressing clock.
-            sql: format!(
-                "SELECT {COLUMNS} FROM git_receipts WHERE namespace = ?1 AND actor = ?2 \
-                 AND (?3 IS NULL OR repo = ?3) AND (?4 IS NULL OR session_id = ?4) \
-                 ORDER BY rowid ASC LIMIT ?5 OFFSET ?6"
-            ),
+            sql: sql!("git_receipts_owned_list").into(),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(actor.to_string()),
