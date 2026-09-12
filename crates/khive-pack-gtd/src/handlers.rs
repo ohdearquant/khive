@@ -475,6 +475,11 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
         .to_string();
     let assignee = props.get("assignee").cloned().unwrap_or(Value::Null);
     let due = props.get("due").cloned().unwrap_or(Value::Null);
+    // The zone the deadline was anchored in travels with the deadline. Storing it
+    // and not projecting it would leave a reader with the same unreadable instant
+    // the argument exists to fix, so the write path and this projection have to
+    // agree or neither is worth having.
+    let due_timezone = props.get("due_timezone").cloned().unwrap_or(Value::Null);
     let context_entity_id = props
         .get("context_entity_id")
         .cloned()
@@ -489,6 +494,7 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
         "priority": priority,
         "assignee": assignee,
         "due": due,
+        "due_timezone": due_timezone,
         "context_entity_id": context_entity_id,
         "namespace": note.namespace,
         "created_at": ts_to_rfc(note.created_at),
@@ -1782,6 +1788,7 @@ impl GtdPack {
             "priority": task["priority"],
             "assignee": task["assignee"],
             "due": task["due"],
+            "due_timezone": task["due_timezone"],
             "audit_persisted": audit_persisted,
         }))
     }
