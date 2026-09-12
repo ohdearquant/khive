@@ -2560,10 +2560,10 @@ pub(crate) async fn handle_heartbeat(
         _ => unreachable!("outcome already validated above"),
     }
 
-    khive_runtime::secret_gate::check_json(&props)?;
+    khive_runtime::secret_gate::check_json_at(&props, "channel", "properties")?;
 
     let content = format!("channel heartbeat: {}:{}", p.channel_kind, p.channel_slug);
-    khive_runtime::secret_gate::check(&content)?;
+    khive_runtime::secret_gate::check_at(&content, "channel", "content")?;
 
     let created_at = existing
         .as_ref()
@@ -2972,35 +2972,36 @@ pub(crate) struct ProbeMessage {
     pub subject: Option<String>,
 }
 
-/// The single indexed read powering `comm.probe` (ADR-D5). `INDEXED BY
-/// idx_comm_message_to_actor` is a regression fence against silent table scans.
+/// The page and bounded stale count share one SQL snapshot (ADR-D5). The
+/// stale-count index excludes read history and seeks directly below the cutoff.
+/// The shared bounded NoteStore counter cannot express that strict upper bound
+/// or join this statement's snapshot, so this count stays inside the probe.
 /// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, NOT `created_at` or
 /// SQLite `rowid` — both can regress/collide across concurrent writers, VACUUM,
 /// or hard-delete. Do not revert to either. See
 /// crates/khive-pack-comm/docs/api/probe-cursor.md#handlersrsprobe_sql for the full
 /// #780/#827 incident history.
-const PROBE_SQL: &str = "WITH \
+#[doc(hidden)]
+pub const PROBE_SQL: &str = "WITH \
 stats AS ( \
-    SELECT \
-        COALESCE(MAX(notes_seq.seq), 0) AS cursor_us, \
-        COALESCE(SUM( \
-            CASE \
-                WHEN (json_type(notes.properties, '$.read') IS NULL \
-                      OR json_type(notes.properties, '$.read') != 'true') \
-                     AND notes.created_at < ?4 \
-                THEN 1 ELSE 0 \
-            END \
-        ), 0) AS stale_unread_count \
-    FROM notes INDEXED BY idx_comm_message_to_actor \
-    JOIN notes_seq ON notes_seq.note_id = notes.id \
-    WHERE notes.namespace = ?1 \
-      AND notes.kind = 'message' \
-      AND notes.deleted_at IS NULL \
-      AND json_extract(notes.properties, '$.to_actor') = ?2 \
-      AND json_extract(notes.properties, '$.direction') = 'inbound' \
+    SELECT COUNT(*) AS stale_unread_count \
+    FROM ( \
+        SELECT 1 \
+        FROM notes INDEXED BY idx_notes_unread_probe_recipient_direction \
+        WHERE notes.namespace = ?1 \
+          AND notes.kind = 'message' \
+          AND notes.deleted_at IS NULL \
+          AND ifnull(json_extract(notes.properties, '$.to_actor'), '') = ?2 \
+          AND json_extract(notes.properties, '$.direction') = 'inbound' \
+          AND (json_type(notes.properties, '$.read') IS NULL \
+               OR json_type(notes.properties, '$.read') != 'true') \
+          AND notes.created_at < ?4 \
+        LIMIT 1000 \
+    ) AS stale_unread_rows \
 ), \
 new_rows AS ( \
     SELECT \
+        notes_seq.seq AS cursor_us, \
         notes.id, \
         notes.created_at AS created_at_us, \
         COALESCE(json_extract(notes.properties, '$.from_actor'), notes.namespace) AS from_actor, \
@@ -3013,26 +3014,23 @@ new_rows AS ( \
       AND json_extract(notes.properties, '$.to_actor') = ?2 \
       AND json_extract(notes.properties, '$.direction') = 'inbound' \
       AND (?3 IS NULL OR notes_seq.seq > ?3) \
-    ORDER BY notes.created_at DESC \
+    ORDER BY notes_seq.seq ASC \
     LIMIT 100 \
 ) \
 SELECT \
-    stats.cursor_us, \
+    new_rows.cursor_us, \
     stats.stale_unread_count, \
     new_rows.id, \
     new_rows.created_at_us, \
     new_rows.from_actor, \
     new_rows.subject \
 FROM stats \
-LEFT JOIN ( \
-    SELECT * FROM new_rows ORDER BY created_at_us ASC \
-) AS new_rows ON TRUE \
-ORDER BY new_rows.created_at_us ASC";
+LEFT JOIN new_rows ON TRUE \
+ORDER BY new_rows.created_at_us ASC, new_rows.cursor_us ASC";
 
 /// `probe` — strictly read-only poll for new inbound message metadata and a
-/// stale-unread count (ADR-D5). No read-flag mutation, no writes: this is
-/// polled every ~30s by many monitors and must stay a single cheap indexed
-/// query.
+/// stale-unread count capped at 1000 (ADR-D5). No read-flag mutation, no writes:
+/// the earliest unseen sequence page and stale count share one indexed statement.
 pub(crate) async fn handle_probe(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -3135,18 +3133,19 @@ async fn query_probe(
         .await
         .map_err(RuntimeError::Storage)?;
 
-    let mut cursor_us = 0i64;
+    let mut cursor_us = effective_since.unwrap_or(0);
     let mut stale_unread_count = 0i64;
     let mut new_messages = Vec::new();
 
     for row in &rows {
-        if let Some(SqlValue::Integer(v)) = row.get("cursor_us") {
-            cursor_us = *v;
-        }
         if let Some(SqlValue::Integer(v)) = row.get("stale_unread_count") {
             stale_unread_count = *v;
         }
 
+        let message_cursor = match row.get("cursor_us") {
+            Some(SqlValue::Integer(v)) => *v,
+            _ => continue,
+        };
         let id = match row.get("id") {
             Some(SqlValue::Text(s)) => s.clone(),
             _ => continue,
@@ -3170,10 +3169,13 @@ async fn query_probe(
             from_actor,
             subject,
         });
+        // The displayed page is timestamp-ordered, not sequence-ordered. Only
+        // emitted rows advance the cursor; unseen later pages must remain visible.
+        cursor_us = cursor_us.max(message_cursor);
     }
 
     // #827: never let the returned cursor regress below what the caller already
-    // holds (a hard-deleted high-seq row can lower MAX(seq) below a prior cursor).
+    // holds, including an empty page after a high-sequence row was hard-deleted.
     if let Some(floor) = effective_since {
         if cursor_us < floor {
             cursor_us = floor;
@@ -3618,6 +3620,7 @@ mod tests {
 
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -4721,6 +4724,7 @@ mod tests {
 
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),
@@ -4844,6 +4848,7 @@ mod tests {
         ] {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                telemetry: Default::default(),
                 mounts: Vec::new(),
                 brain: Default::default(),
                 git_write: Default::default(),

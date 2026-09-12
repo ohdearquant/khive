@@ -26,7 +26,8 @@ pub mod vectors;
 pub use agent::AgentStore;
 pub use attachment::{Attachment, AttachmentStore, AttachmentSubstrate, NewAttachment};
 pub use blob::{
-    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, MAX_BLOB_WHOLE_BYTES,
+    BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
+    MAX_BLOB_WHOLE_BYTES,
 };
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
@@ -60,18 +61,20 @@ pub use vectors::VectorStore;
 pub use types::{
     BatchWriteError, BatchWriteErrorClass, BatchWriteErrorCount, BatchWriteRetryability,
     BatchWriteSummary, BoundedCount, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter,
-    EdgeSeekPage, EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
-    GuardedWriteOutcome, IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery,
-    OrphanSweepConfig, OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp,
-    SeekCursor, SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit,
-    SparseSearchRequest, SparseVector, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter,
-    TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions,
-    TextSearchRequest, TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget,
-    TraversalOptions, TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord,
-    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
-    DEFAULT_TRAVERSAL_LIMIT, MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS,
-    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
-    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
+    EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest,
+    EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome,
+    IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
+    OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SeekCursor,
+    SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest,
+    SparseVector, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode,
+    TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest,
+    TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget, TraversalOptions,
+    TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit,
+    VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
+    MAX_BATCH_WRITE_ERROR_DETAILS, MAX_BATCH_WRITE_ERROR_MESSAGE_CHARS, MAX_SPARSE_SEARCH_TOP_K,
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
+    MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{

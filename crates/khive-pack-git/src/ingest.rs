@@ -20,6 +20,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
+use crate::sql::sql;
 
 fn mask_git_ingest(text: &str) -> std::borrow::Cow<'_, str> {
     secret_gate::mask_for_redaction_surface(secret_gate::RedactionSurface::GitIngest, text)
@@ -1096,9 +1097,7 @@ async fn find_commit_by_sha(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
-            sql: "SELECT id FROM notes WHERE kind='commit' AND namespace=?1 \
-                  AND deleted_at IS NULL AND json_extract(properties,'$.sha')=?2 LIMIT 1"
-                .into(),
+            sql: sql!("commits_by_sha_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(sha.to_string()),
@@ -1124,10 +1123,7 @@ async fn find_by_number(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
-            sql: "SELECT id FROM notes WHERE kind=?1 AND namespace=?2 \
-                  AND deleted_at IS NULL AND json_extract(properties,'$.number')=?3 \
-                  AND json_extract(properties,'$.project_id')=?4 LIMIT 1"
-                .into(),
+            sql: sql!("notes_by_number_select").into(),
             params: vec![
                 SqlValue::Text(kind.to_string()),
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -1183,14 +1179,7 @@ async fn find_document_for_path(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND (json_extract(properties,'$.source_uri')=?2 OR name=?3 \
-                       OR json_extract(properties,'$.source_uri') LIKE ?4 ESCAPE '\\') \
-                  ORDER BY CASE WHEN json_extract(properties,'$.source_uri')=?2 OR name=?3 \
-                                THEN 0 ELSE 1 END, id \
-                  LIMIT 1"
-                .into(),
+            sql: sql!("documents_by_path_select").into(),
             params: vec![
                 SqlValue::Text(namespace),
                 SqlValue::Text(path.to_string()),
@@ -1217,13 +1206,7 @@ async fn load_code_modules_by_snapshot_path(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
-                  FROM entities WHERE kind='concept' AND entity_type='module' \
-                  AND namespace=?1 AND deleted_at IS NULL \
-                  AND json_type(properties,'$.source_path')='text' \
-                  AND json_extract(properties,'$.source_revision')=?2 \
-                  ORDER BY source_path, id"
-                .into(),
+            sql: sql!("code_modules_by_snapshot_path_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(source_revision.to_string()),
@@ -1279,10 +1262,7 @@ async fn read_commit_checkpoint(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_row(SqlStatement {
-            sql: "SELECT \
-                  (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits') AS cursor, \
-                  (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits_checkpoint') AS progress"
-                .into(),
+            sql: sql!("commit_checkpoint_select").into(),
             params: vec![SqlValue::Text(project_id.to_string())],
             label: Some("git_ingest_read_commit_checkpoint".into()),
         })
@@ -1333,12 +1313,7 @@ async fn write_commit_checkpoint(
     let sql = runtime.sql();
     let mut w = sql.writer().await.map_err(anyhow::Error::new)?;
     w.execute(SqlStatement {
-        sql: "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) \
-              VALUES(?1, 'commits_checkpoint', ?2, ?4), (?1, 'commits', ?3, ?4) \
-              ON CONFLICT(project_id, kind) DO UPDATE SET \
-                cursor_value=excluded.cursor_value, \
-                updated_at=excluded.updated_at"
-            .into(),
+        sql: sql!("commit_checkpoint_upsert").into(),
         params: vec![
             SqlValue::Text(project_id.to_string()),
             SqlValue::Text(progress),
@@ -1415,14 +1390,20 @@ async fn read_page_checkpoint(
     warnings: &mut Vec<String>,
 ) -> Result<PageCheckpoint> {
     // One read snapshot: a concurrent atomic checkpoint cannot tear this pair.
-    let row = runtime.sql().reader().await?.query_row(SqlStatement {
-        sql: "SELECT \
-              (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?2) AS floor, \
-              (SELECT cursor_value FROM git_mirror_cursor WHERE project_id=?1 AND kind=?3) AS progress".into(),
-        params: vec![SqlValue::Text(project_id.to_string()), SqlValue::Text(kind.into()),
-            SqlValue::Text(format!("{kind}_checkpoint"))],
-        label: Some("git_ingest_read_page_checkpoint".into()),
-    }).await?;
+    let row = runtime
+        .sql()
+        .reader()
+        .await?
+        .query_row(SqlStatement {
+            sql: sql!("page_checkpoint_select").into(),
+            params: vec![
+                SqlValue::Text(project_id.to_string()),
+                SqlValue::Text(kind.into()),
+                SqlValue::Text(format!("{kind}_checkpoint")),
+            ],
+            label: Some("git_ingest_read_page_checkpoint".into()),
+        })
+        .await?;
     let floor = match row.as_ref().and_then(|r| r.get("floor")) {
         Some(SqlValue::Text(raw)) => match chrono::DateTime::parse_from_rfc3339(raw) {
             Ok(dt) => Some(
@@ -1469,28 +1450,23 @@ async fn write_page_checkpoint(
 ) -> Result<()> {
     // One statement commits the timestamp and exact acknowledgments together.
     // An undated-only window has no main timestamp row yet.
-    let mut statement = SqlStatement {
-        sql: "INSERT INTO git_mirror_cursor(project_id, kind, cursor_value, updated_at) \
-              VALUES(?1, ?2, ?3, ?4)"
-            .into(),
-        params: vec![
-            SqlValue::Text(project_id.to_string()),
-            SqlValue::Text(format!("{kind}_checkpoint")),
-            SqlValue::Text(serde_json::to_string(checkpoint)?),
-            SqlValue::Integer(Utc::now().timestamp_micros()),
-        ],
+    let mut params = vec![
+        SqlValue::Text(project_id.to_string()),
+        SqlValue::Text(format!("{kind}_checkpoint")),
+        SqlValue::Text(serde_json::to_string(checkpoint)?),
+        SqlValue::Integer(Utc::now().timestamp_micros()),
+    ];
+    let statement_sql = if let Some(floor) = &checkpoint.floor {
+        params.extend([SqlValue::Text(kind.into()), SqlValue::Text(floor.clone())]);
+        sql!("page_checkpoint_with_floor_upsert")
+    } else {
+        sql!("page_checkpoint_without_floor_upsert")
+    };
+    let statement = SqlStatement {
+        sql: statement_sql.into(),
+        params,
         label: Some("git_ingest_write_page_checkpoint".into()),
     };
-    if let Some(floor) = &checkpoint.floor {
-        statement.sql.push_str(", (?1, ?5, ?6, ?4)");
-        statement
-            .params
-            .extend([SqlValue::Text(kind.into()), SqlValue::Text(floor.clone())]);
-    }
-    statement.sql.push_str(
-        " ON CONFLICT(project_id, kind) DO UPDATE SET \
-        cursor_value=excluded.cursor_value, updated_at=excluded.updated_at",
-    );
     runtime.sql().writer().await?.execute(statement).await?;
     Ok(())
 }
@@ -2481,11 +2457,7 @@ async fn count_commit_notes_for_project(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
         .query_scalar(SqlStatement {
-            sql: "SELECT COUNT(*) FROM notes n \
-                  JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
-                  WHERE n.kind = 'commit' AND n.namespace = ?1 AND n.deleted_at IS NULL \
-                  AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
-                .into(),
+            sql: sql!("commit_notes_for_project_count").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(project_id.to_string()),

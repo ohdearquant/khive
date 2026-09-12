@@ -43,6 +43,51 @@ pub const MAX_BLOB_WHOLE_BYTES: u64 = 64 * 1024 * 1024;
 #[serde(transparent)]
 pub struct ContentRef(String);
 
+/// Opaque capability for a backend's staged upload, encoded as 128-bit hex.
+///
+/// This is not a content reference. The caller owns hashing and upload-session
+/// state; retaining this identifier does not make a session restartable.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct UploadId(String);
+
+impl UploadId {
+    /// Construct an identifier from freshly generated random bytes.
+    pub fn from_bytes(bytes: &[u8; 16]) -> Self {
+        Self(hex_encode(bytes))
+    }
+
+    /// Parse exactly 32 lowercase hex characters, never a backend pathname.
+    pub fn from_hex(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("upload_id must be 32 lowercase hex characters".into());
+        }
+        Ok(Self(value))
+    }
+
+    /// Canonical wire spelling.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for UploadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for UploadId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::from_hex(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 impl<'de> Deserialize<'de> for ContentRef {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -164,6 +209,43 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     /// they are now retrievable. Storing byte-identical content more than
     /// once returns the same `ContentRef` and does not re-write the object.
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef>;
+
+    /// Create an empty staging object. The pack keeps the declared size,
+    /// incremental hash, sequence and idle clock. Backends enforce their
+    /// capacity policy on each append. Unsupported backends refuse explicitly.
+    async fn begin_upload(&self, declared_size: u64) -> StorageResult<UploadId> {
+        let _ = declared_size;
+        Err(unsupported_upload("begin_upload"))
+    }
+
+    /// Append and synchronize bytes, returning the total staged length.
+    /// The caller serializes parts and aborts after any uncertain append.
+    async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {
+        let _ = (id, bytes);
+        Err(unsupported_upload("append_part"))
+    }
+
+    /// Publish through the same routine as put, without hashing a second time.
+    /// The caller proves the supplied digest and declared size before invoking
+    /// this method. Success consumes the staging object, including on dedup.
+    async fn commit_upload(&self, id: &UploadId, content_ref: &ContentRef) -> StorageResult<()> {
+        let _ = (id, content_ref);
+        Err(unsupported_upload("commit_upload"))
+    }
+
+    /// Discard staging; an already absent staging object is a successful no-op.
+    async fn abort_upload(&self, id: &UploadId) -> StorageResult<()> {
+        let _ = id;
+        Err(unsupported_upload("abort_upload"))
+    }
+
+    /// Remove visible staging objects idle for at least the given duration.
+    /// This never visits committed objects. Open S3 multipart uploads require
+    /// the deployment's incomplete-multipart lifecycle rule instead.
+    async fn sweep_uploads(&self, idle_for: std::time::Duration) -> StorageResult<u64> {
+        let _ = idle_for;
+        Err(unsupported_upload("sweep_uploads"))
+    }
 
     /// Fetch at most `max_bytes` from `content_ref` and verify its BLAKE3
     /// digest before returning any bytes.
@@ -306,9 +388,39 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
+fn unsupported_upload(operation: &'static str) -> StorageError {
+    StorageError::Unsupported {
+        capability: StorageCapability::Blob,
+        operation: operation.into(),
+        message: "this backend does not support staged uploads".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_id_roundtrips_and_rejects_path_or_noncanonical_input() {
+        let id = UploadId::from_bytes(&[0xab; 16]);
+        assert_eq!(id.as_str(), "ab".repeat(16));
+        assert_eq!(
+            serde_json::from_str::<UploadId>(&serde_json::to_string(&id).unwrap()).unwrap(),
+            id
+        );
+        for invalid in [
+            String::new(),
+            "a".repeat(31),
+            "a".repeat(33),
+            "A".repeat(32),
+            "g".repeat(32),
+            "../outside".into(),
+            "a/b".repeat(11),
+        ] {
+            assert!(UploadId::from_hex(&invalid).is_err());
+            assert!(serde_json::from_value::<UploadId>(serde_json::json!(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn from_hex_accepts_valid_lowercase_digest() {

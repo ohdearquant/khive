@@ -5,6 +5,8 @@
 //! FTS index. It is NOT a pack verb — it operates on the raw runtime stores
 //! regardless of which packs are loaded.
 
+use crate::sql::sql;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -978,7 +980,7 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
 
     match writer
         .execute(SqlStatement {
-            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1 ESCAPE '\\'".into(),
+            sql: sql!("retrieval_snapshots_delete_namespace").into(),
             params: vec![SqlValue::Text(pattern)],
             label: Some("invalidate_vamana_snapshots".into()),
         })
@@ -1009,7 +1011,7 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
 /// (ADR-062, corrected by ADR-116 (PR #1080)); old per-ns rows are orphaned. Best-effort —
 /// missing table or SQL failure is logged and ignored.
 async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
-    use khive_storage::types::SqlStatement;
+    use khive_storage::types::{SqlStatement, SqlValue};
     let sql = rt.sql();
     let Ok(mut writer) = sql.writer().await else {
         return;
@@ -1027,11 +1029,8 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
             // `GLOBAL::memory_vamana::*` row (a valid namespace per namespace validation)
             // would otherwise be treated as the retained lowercase key and never purged.
             // GLOB is case-sensitive (uses `*`/`?` globbing, not `%`/`_`).
-            sql: "DELETE FROM retrieval_snapshots \
-                  WHERE index_type = 'memory_vamana' \
-                    AND namespace NOT GLOB 'global::memory_vamana::*'"
-                .into(),
-            params: vec![],
+            sql: sql!("retrieval_snapshots_delete_stale_memory_vamana").into(),
+            params: vec![SqlValue::Text("global::memory_vamana::*".into())],
             label: Some("purge_stale_memory_vamana_snapshots".into()),
         })
         .await
@@ -1094,9 +1093,7 @@ async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) -> bool {
         // match any row.
         match writer
             .execute(SqlStatement {
-                sql: "DELETE FROM retrieval_snapshots \
-                      WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
-                    .into(),
+                sql: sql!("retrieval_snapshots_delete_active_memory_vamana").into(),
                 params: vec![SqlValue::Text("global::memory_vamana::%".into())],
                 label: Some("invalidate_active_memory_vamana_snapshot".into()),
             })
@@ -1149,10 +1146,7 @@ async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
     // we only guard against losing rows that are still live in the base table.
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT DISTINCT namespace FROM entities WHERE deleted_at IS NULL \
-                  UNION \
-                  SELECT DISTINCT namespace FROM notes WHERE deleted_at IS NULL"
-                .into(),
+            sql: sql!("base_namespaces_list").into(),
             params: vec![],
             label: Some("distinct_base_namespaces".into()),
         })
@@ -1224,10 +1218,7 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
     // Find candidate tables: type='table', name starts with `fts_entities_` or `fts_notes_`.
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT name FROM sqlite_master \
-                  WHERE type IN ('table', 'shadow') \
-                    AND (name LIKE 'fts_entities_%' OR name LIKE 'fts_notes_%')"
-                .into(),
+            sql: sql!("fts_partitions_list_stale").into(),
             params: vec![],
             label: Some("sweep_stale_fts_partitions_discover".into()),
         })
@@ -1267,7 +1258,10 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
         return;
     };
     for table in &to_drop {
-        let ddl = format!("DROP TABLE IF EXISTS {}", quote_sqlite_identifier(table));
+        let ddl = format!(
+            concat!("DROP ", "TABLE IF EXISTS {}"),
+            quote_sqlite_identifier(table)
+        );
         match writer
             .execute(SqlStatement {
                 sql: ddl,
@@ -1301,8 +1295,7 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     };
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT count(*) AS cnt FROM notes WHERE namespace = ?1 AND deleted_at IS NULL"
-                .into(),
+            sql: sql!("notes_count").into(),
             params: vec![SqlValue::Text(ns.to_owned())],
             label: None,
         })

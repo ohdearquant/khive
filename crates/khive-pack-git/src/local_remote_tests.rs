@@ -60,7 +60,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new(remote: impl FnOnce(&Path) -> String, slug: &str) -> Self {
+        Self::with_program(remote, slug, || None).await
+    }
+
+    async fn with_program(
+        remote: impl FnOnce(&Path) -> String,
+        slug: &str,
+        program: impl FnOnce() -> Option<PathBuf>,
+    ) -> Self {
         let env_guard = crate::cache::ENV_MUTEX.lock().await;
+        let program = program();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let platform_repo = dir.path().join("platform");
@@ -112,6 +121,7 @@ impl Fixture {
         let rt = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             git_write: GitWriteSectionConfig {
+                program,
                 allowed: [&repo, &platform_repo, &unmapped_repo]
                     .into_iter()
                     .map(|repo| GitWriteEntryConfig {
@@ -281,12 +291,192 @@ async fn local_file_push_moves_native_ref_without_credentials() {
     assert_eq!(receipt.actor, f.actor);
     assert_eq!(receipt.gate["decision"], "allow");
     assert_eq!(receipt.policy["decision"], "allow");
+    assert!(crate::local_git::operation_recorded(
+        Path::new("git"),
+        &f.repo,
+        "work",
+        &f.head,
+        &receipt.id
+    )
+    .await
+    .unwrap());
+    f.no_credential_read();
+}
+
+#[tokio::test]
+async fn git_program_quoted_path_controls_native_push_and_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("selected git's executable");
+    let marker = dir.path().join("selected-program-calls");
+    let f = Fixture::with_program(file_url, "", || {
+        let native = Command::new("/usr/bin/which").arg("git").output().unwrap();
+        assert!(native.status.success());
+        let native = String::from_utf8(native.stdout).unwrap();
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} \"$@\"\n",
+                quote(marker.to_str().unwrap()),
+                quote(native.trim())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Some(program.clone())
+    })
+    .await;
+    let hook_marker = dir.path().join("destination-hook");
+    let hook = f.bare.join("hooks/update");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\n", hook_marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.call(&f.actor, "git.push", f.push()).await.unwrap();
+    assert_eq!(f.remote_head(), f.head);
+    assert!(!hook_marker.exists());
+    let receipt = f.last(&f.actor).await;
     assert!(
-        crate::local_git::operation_recorded(&f.repo, "work", &f.head, &receipt.id)
+        crate::local_git::operation_recorded(&program, &f.repo, "work", &f.head, &receipt.id)
             .await
             .unwrap()
     );
+    let calls = std::fs::read_to_string(marker).unwrap();
+    for command in [
+        "config -z",
+        "--version",
+        "reflog -h",
+        "init",
+        "ls-remote",
+        " push --porcelain ",
+        "reflog write",
+        "receive-pack",
+    ] {
+        assert!(
+            calls.contains(command),
+            "selected program missed {command}: {calls}"
+        );
+    }
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.starts_with("-c core.hooksPath=/dev/null receive-pack ")),
+        "{calls}"
+    );
     f.no_credential_read();
+}
+
+// The parent changes only a child's environment, never the shared test process.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real Apple and Homebrew Git installations"]
+fn git_program_real_two_git_path_orders() {
+    let old = Path::new("/usr/bin/git");
+    let capable = Path::new("/opt/homebrew/bin/git");
+    for (program, supported) in [(old, false), (capable, true)] {
+        let help = Command::new(program)
+            .args(["reflog", "-h"])
+            .output()
+            .unwrap();
+        let help = format!(
+            "{}{}",
+            String::from_utf8_lossy(&help.stdout),
+            String::from_utf8_lossy(&help.stderr)
+        );
+        assert_eq!(
+            help.contains("reflog write"),
+            supported,
+            "{}: {help}",
+            program.display()
+        );
+    }
+    for (path, first, supported) in [
+        ("/usr/bin:/opt/homebrew/bin:/bin", old, false),
+        ("/opt/homebrew/bin:/usr/bin:/bin", capable, true),
+    ] {
+        for configured in [false, true] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local_remote_tests::git_program_path_order_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PATH", path)
+                .env(
+                    "KHIVE_TEST_GIT_PROGRAM",
+                    if configured {
+                        capable.as_os_str()
+                    } else {
+                        std::ffi::OsStr::new("")
+                    },
+                )
+                .env("KHIVE_TEST_GIT_FIRST", first)
+                .env(
+                    "KHIVE_TEST_GIT_SUPPORTED",
+                    if configured || supported {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .output()
+                .unwrap();
+            let output = format!(
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                child.status.success() && output.contains("git-program-child-verified"),
+                "{path}, configured={configured}: {output}"
+            );
+            println!("{output}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "child of git_program_real_two_git_path_orders"]
+async fn git_program_path_order_child() {
+    let configured = std::env::var_os("KHIVE_TEST_GIT_PROGRAM").expect("parent supplies program");
+    let program = (!configured.is_empty()).then(|| PathBuf::from(configured));
+    let first = std::env::var_os("KHIVE_TEST_GIT_FIRST").expect("parent supplies first Git");
+    let supported = std::env::var("KHIVE_TEST_GIT_SUPPORTED").unwrap() == "true";
+    let selected = program.clone().unwrap_or_else(|| first.into());
+    let expected = Command::new(&selected).arg("--version").output().unwrap();
+    assert!(expected.status.success());
+    let expected = String::from_utf8(expected.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let f = Fixture::with_program(file_url, "", || program).await;
+    let actual =
+        crate::local_git::push_marker_support(f.rt.config().git_write.git_program(), &f.repo)
+            .await
+            .unwrap();
+    assert_eq!(actual, (expected.clone(), supported));
+    if supported {
+        f.call(&f.actor, "git.push", f.push()).await.unwrap();
+        assert_eq!(f.remote_head(), f.head);
+        assert_eq!(f.last(&f.actor).await.disposition, Disposition::Committed);
+    } else {
+        f.refusal("git.push", f.push(), "unsupported_toolchain")
+            .await;
+        assert_eq!(
+            f.last(&f.actor).await.result["toolchain"]["git_version"],
+            expected
+        );
+    }
+    f.no_credential_read();
+    println!(
+        "git-program-child-verified selected={} version={expected} supported={supported}",
+        selected.display()
+    );
 }
 
 #[tokio::test]
@@ -518,7 +708,7 @@ async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentia
     receipt.disposition = Disposition::Unknown;
     receipt.finished_at = None;
     receipts::insert(&f.rt, &receipt).await.unwrap();
-    crate::local_git::record_push_marker(&f.repo, "work", &f.head, &receipt.id)
+    crate::local_git::record_push_marker(Path::new("git"), &f.repo, "work", &f.head, &receipt.id)
         .await
         .unwrap();
     git(&f.bare, &["update-ref", "refs/heads/work", &f.rival]);

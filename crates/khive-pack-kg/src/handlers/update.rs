@@ -72,8 +72,6 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
         KindSpec::Note { .. } => {
             let bad = if p.description.is_some() {
                 Some("description")
-            } else if p.tags.is_some() {
-                Some("tags")
             } else if p.relation.is_some() {
                 Some("relation")
             } else if p.weight.is_some() {
@@ -83,7 +81,10 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             } else {
                 None
             };
-            (bad, "name, content, salience, decay_factor, properties")
+            (
+                bad,
+                "name, content, salience, decay_factor, properties, tags",
+            )
         }
         KindSpec::Edge => {
             let bad = if p.name.is_some() {
@@ -182,6 +183,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params.clone())?;
+        super::common::require_object_param(p.properties.as_ref(), "properties")?;
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
@@ -300,6 +302,7 @@ impl KgPack {
                     .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
                     .await?;
                 let p: UpdateParams = deser(params)?;
+                super::common::require_object_param(p.properties.as_ref(), "properties")?;
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,
@@ -406,31 +409,38 @@ impl KgPack {
                         )));
                     }
                 }
+                // Report the kind the row carries, not the one the caller typed. The row
+                // was read a few lines up to enforce the mismatch guard, so this costs
+                // nothing, and a caller who deleted by a bare id or a hex prefix learns
+                // what it actually removed.
+                let resolved_kind = entity.kind.clone();
                 let deleted = self.runtime.delete_entity(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                )
             }
             KindSpec::Note { specific } => {
+                // Read the row whether or not the caller named a kind. It used to be read
+                // only to enforce the mismatch guard, which meant the response could
+                // report a kind only when the caller had already supplied one.
+                let label = specific.as_deref().unwrap_or("note");
+                let note = if hard {
+                    self.runtime
+                        .get_note_including_deleted(token, id)
+                        .await?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("{} {}", label, p.id)))?
+                } else {
+                    self.runtime
+                        .notes(token)?
+                        .get_note(id)
+                        .await
+                        .map_err(RuntimeError::Storage)?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("{} {}", label, p.id)))?
+                };
                 if let Some(ref expected) = specific {
-                    let note = if hard {
-                        self.runtime
-                            .get_note_including_deleted(token, id)
-                            .await?
-                            .ok_or_else(|| {
-                                RuntimeError::NotFound(format!("{} {}", expected, p.id))
-                            })?
-                    } else {
-                        self.runtime
-                            .notes(token)?
-                            .get_note(id)
-                            .await
-                            .map_err(RuntimeError::Storage)?
-                            .ok_or_else(|| {
-                                RuntimeError::NotFound(format!("{} {}", expected, p.id))
-                            })?
-                    };
                     if note.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
                             "kind mismatch: {} exists with kind '{}', not '{}'",
@@ -438,11 +448,14 @@ impl KgPack {
                         )));
                     }
                 }
+                let resolved_kind = note.kind.clone();
                 let deleted = self.runtime.delete_note(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                )
             }
             KindSpec::Edge => {
                 let deleted = self.runtime.delete_edge(token, id, hard).await?;

@@ -864,6 +864,10 @@ class HarnessEnvironmentTests(unittest.TestCase):
             # An enumerated contract test whose FIRST assertion is equality with
             # the declaration, so the enumeration below it cannot drift silently.
             "crates/khive-runtime/src/runtime.rs",
+            # Same shape: the description scan pairs each pack name with the
+            # handler table it publishes, and its first assertion is that the
+            # names cover built_in_packs() with a declared, checked remainder.
+            "crates/kkernel/tests/descriptions_are_written_for_callers.rs",
         }
         names = {
             "kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge",

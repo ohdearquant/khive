@@ -9,7 +9,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 use crate::{handlers, BlobPack, PACK_NAME};
 
-pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
+pub(crate) static BLOB_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "blob.put",
         description: "Store bytes (base64) in the content-addressed \
@@ -64,6 +64,87 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 3] = [
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
+    HandlerDef {
+        name: "blob.begin",
+        description: "Begin a sequential upload, or return an existing known content reference without staging.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "size",
+                param_type: "integer",
+                required: true,
+                description: "Declared total bytes, at most 64 MiB.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "content_ref",
+                param_type: "string",
+                required: false,
+                description: "Optional BLAKE3 reference; checked at commit, with an existence shortcut at begin.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "blob.put_part",
+        description: "Append a base64 part at next_index; an identical tail retry is acknowledged without appending.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "upload_id",
+                param_type: "string",
+                required: true,
+                description: "32-character lowercase hex upload capability returned by blob.begin.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "index",
+                param_type: "integer",
+                required: true,
+                description: "Zero-based next part index, or the last accepted index for an identical retry.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "bytes",
+                param_type: "string",
+                required: true,
+                description: "Base64 part, decoded length no greater than the returned part_limit.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "blob.commit",
+        description: "Verify declared size and optional reference, then publish the staged object; consumes the upload id.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "upload_id",
+                param_type: "string",
+                required: true,
+                description: "32-character lowercase hex upload capability returned by blob.begin.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "blob.abort",
+        description: "Discard a staged upload and invalidate its process-local capability.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "upload_id",
+                param_type: "string",
+                required: true,
+                description: "32-character lowercase hex upload capability returned by blob.begin.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
 ];
 
 struct BlobPackFactory;
@@ -100,6 +181,14 @@ impl PackRuntime for BlobPack {
         <BlobPack as khive_types::Pack>::REQUIRES
     }
 
+    fn host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        if self.runtime().is_read_only() || self.runtime().blob_store().is_none() {
+            None
+        } else {
+            Some(self.uploads.clone())
+        }
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
@@ -111,6 +200,10 @@ impl PackRuntime for BlobPack {
             "blob.put" => handlers::handle_put(self.runtime(), token, params).await,
             "blob.get" => handlers::handle_get(self.runtime(), token, params).await,
             "blob.stat" => handlers::handle_stat(self.runtime(), token, params).await,
+            "blob.begin" => handlers::handle_begin(&self.uploads, token, params).await,
+            "blob.put_part" => handlers::handle_put_part(&self.uploads, params).await,
+            "blob.commit" => handlers::handle_commit(&self.uploads, params).await,
+            "blob.abort" => handlers::handle_abort(&self.uploads, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "{PACK_NAME} pack does not handle verb {verb:?}"
             ))),

@@ -8784,6 +8784,91 @@ async fn list_proposals_status_filter() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_proposals_actor_filter_and_explicit_proposer_precedence() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+
+    let fixture_for = |actor: &str| {
+        let mut builder = VerbRegistryBuilder::new();
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("configure trusted runtime audit store");
+        builder.with_actor_id(Some(actor.to_string()));
+        builder.register(KgPack::new(rt.clone()));
+        Fixture {
+            registry: builder.build().expect("registry build must succeed"),
+        }
+    };
+
+    let alice = fixture_for("alice");
+    let bob = fixture_for("bob");
+    let alice_id = alice
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Alice proposal",
+                "description": "Owned by Alice",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Alice proposal must succeed")["id"]
+        .as_str()
+        .expect("Alice proposal id")
+        .to_string();
+    let bob_id = bob
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Bob proposal",
+                "description": "Owned by Bob",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Bob proposal must succeed")["id"]
+        .as_str()
+        .expect("Bob proposal id")
+        .to_string();
+
+    let default_items = alice
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("default proposal list must succeed");
+    let default_items = list_items(&default_items);
+    assert!(default_items.iter().any(|item| item["id"] == alice_id));
+    assert!(!default_items.iter().any(|item| item["id"] == bob_id));
+
+    let all_items = alice
+        .dispatch("list", json!({"kind": "proposal", "actor": "*"}))
+        .await
+        .expect("unscoped proposal list must succeed");
+    let all_items = list_items(&all_items);
+    assert!(all_items.iter().any(|item| item["id"] == alice_id));
+    assert!(all_items.iter().any(|item| item["id"] == bob_id));
+
+    let explicit_items = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "alice", "proposer": "bob"}),
+        )
+        .await
+        .expect("explicit proposer list must succeed");
+    let explicit_items = list_items(&explicit_items);
+    assert!(!explicit_items.iter().any(|item| item["id"] == alice_id));
+    assert!(explicit_items.iter().any(|item| item["id"] == bob_id));
+
+    let empty_status = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "*", "status": ""}),
+        )
+        .await
+        .expect("empty status filter must remain a real filter");
+    assert!(list_items(&empty_status).is_empty());
+}
+
 /// Negative path: withdraw on an applied proposal must fail.
 /// propose → approve (auto-applies) → withdraw → expect error mentioning "applied".
 #[tokio::test]
@@ -14932,4 +15017,118 @@ async fn update_empty_string_property_survives_agent_echo_and_readback() {
         json!(""),
         "Agent readback must retain the same empty-string value: {agent_readback}"
     );
+}
+
+/// A parameter this pack declares as an object must refuse a scalar rather than
+/// store it. The declared type is rendered into the schema a caller is handed and
+/// was never compared against the argument that arrived, so a string persisted and
+/// every later reader found a string where the schema promised a map. The success
+/// return is the harm: an agent has nothing to correct on.
+#[tokio::test]
+async fn create_refuses_a_scalar_where_properties_declares_an_object() {
+    let pack = pack();
+
+    let error = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "ObjectParamScalar",
+                "properties": "not-an-object"
+            }),
+        )
+        .await
+        .expect_err("a string properties must be refused, not stored");
+    assert!(
+        is_invalid_input(&error),
+        "must be an input refusal, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("properties") && message.contains("object"),
+        "the refusal must name the parameter and the expected shape: {message}"
+    );
+
+    // Control in the same test: the identical call with a real object succeeds, so
+    // the refusal is about the shape and not about the field being present at all.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "concept",
+            "name": "ObjectParamControl",
+            "properties": {"domain": "inference"}
+        }),
+    )
+    .await
+    .expect("an object properties must still be accepted");
+
+    // A batch names the offending item rather than the batch, since one error is
+    // returned for N records.
+    let error = pack
+        .dispatch(
+            "create",
+            json!({"items": [
+                {"kind": "entity", "entity_kind": "concept", "name": "BatchOk",
+                 "properties": {"domain": "inference"}},
+                {"kind": "entity", "entity_kind": "concept", "name": "BatchBad",
+                 "properties": "not-an-object"}
+            ]}),
+        )
+        .await
+        .expect_err("a scalar properties inside a batch must be refused");
+    assert!(
+        error.to_string().contains("items[1]"),
+        "the refusal must name which item: {error}"
+    );
+}
+
+/// `min_score` is documented as a 0.0-1.0 floor and neither end was enforced: a
+/// floor above the range was honoured and returned an empty result a caller
+/// cannot tell from "no such record", and a negative floor was silently clamped,
+/// so the value passed was not the value that ran.
+#[tokio::test]
+async fn search_refuses_a_score_floor_outside_the_declared_range() {
+    let pack = pack();
+    for name in ["ScoreFloorOne", "ScoreFloorTwo"] {
+        pack.dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": name}),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Load-bearing control: the rows ARE findable at a sane floor. Without this the
+    // empty result at an out-of-range floor could be an empty corpus.
+    let hits = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "ScoreFloor", "min_score": 0.0, "limit": 10}),
+        )
+        .await
+        .expect("a floor inside the range must be accepted");
+    assert!(
+        !hits.as_array().expect("array").is_empty(),
+        "control: the rows must be findable at a sane floor"
+    );
+
+    for floor in [json!(7), json!(-3), json!(1.5)] {
+        let error = pack
+            .dispatch(
+                "search",
+                json!({"kind": "entity", "query": "ScoreFloor", "min_score": floor, "limit": 10}),
+            )
+            .await
+            .expect_err("a floor outside 0.0-1.0 must be refused, not honoured");
+        assert!(
+            is_invalid_input(&error),
+            "must be an input refusal, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("min_score"),
+            "the refusal must name the parameter: {error}"
+        );
+    }
 }

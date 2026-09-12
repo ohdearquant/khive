@@ -9,6 +9,7 @@ pub mod tunable;
 
 mod event;
 mod pack;
+mod sql;
 
 pub(crate) use pack::{apply_dispatch_signal, sync_balanced_recall_record};
 pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};

@@ -10,6 +10,7 @@
 //! `PackRuntime` mirrors `Pack`'s const associated items as methods for object safety.
 //! Build a [`VerbRegistry`] via `VerbRegistryBuilder::build()`; registration is builder-only.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -227,6 +228,19 @@ use crate::KhiveRuntime;
 pub trait PackRuntime: Send + Sync {
     /// Pack name — must equal `<Self as Pack>::NAME`.
     fn name(&self) -> &str;
+
+    /// Optional instance-owned state for host work outside verb dispatch.
+    /// Return the same shared state used by this pack's handlers. The host
+    /// owns task startup and shutdown; this accessor must not start work.
+    fn host_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Validate this pack instance's configuration before it can execute.
+    /// Metadata-only construction does not activate packs.
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 
     /// Note kinds this pack owns — must equal `<Self as Pack>::NOTE_KINDS`.
     fn note_kinds(&self) -> &'static [&'static str];
@@ -851,6 +865,20 @@ impl VerbRegistryBuilder {
     /// Returns an error if any declared dependency is missing from the loaded
     /// pack set, or if a circular dependency is detected.
     pub fn build(self) -> Result<VerbRegistry, RuntimeError> {
+        self.build_registry(true)
+    }
+
+    /// Inspect pack metadata without activating any registered pack.
+    /// The result exposes no dispatch, preparation hooks, or serving-registry conversion.
+    pub fn build_metadata(mut self) -> Result<PackMetadataRegistry, RuntimeError> {
+        self.event_store = None;
+        self.dispatch_hook = None;
+        self.resolvers.clear();
+        self.build_registry(false)
+            .map(|registry| PackMetadataRegistry { registry })
+    }
+
+    fn build_registry(self, activate: bool) -> Result<VerbRegistry, RuntimeError> {
         let packs = self.packs;
         let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(packs.len());
         for (idx, pack) in packs.iter().enumerate() {
@@ -977,6 +1005,11 @@ impl VerbRegistryBuilder {
         validate_unique_verb_names(&ordered_packs)?;
         validate_unique_entity_types(&ordered_packs)?;
         validate_brain_consumer_kinds(&ordered_packs)?;
+        if activate {
+            for pack in &ordered_packs {
+                pack.validate_config()?;
+            }
+        }
 
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
@@ -1213,6 +1246,67 @@ fn find_pack_dependency_cycle(
 impl Default for VerbRegistryBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pack metadata with no executable registry capability.
+///
+/// ```compile_fail
+/// fn dispatch(metadata: &khive_runtime::PackMetadataRegistry) {
+///     metadata.dispatch("telemetry.emit", serde_json::json!({}));
+/// }
+/// ```
+pub struct PackMetadataRegistry {
+    registry: VerbRegistry,
+}
+
+impl PackMetadataRegistry {
+    pub fn has_verb(&self, verb: &str) -> bool {
+        self.registry.has_verb(verb)
+    }
+
+    pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
+        self.registry.describe_verb(verb)
+    }
+
+    pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.registry.all_handlers_with_names()
+    }
+
+    pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
+        self.registry.all_verbs()
+    }
+
+    pub fn pack_names(&self) -> Vec<&str> {
+        self.registry.pack_names()
+    }
+
+    pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_requires(name)
+    }
+
+    pub fn pack_note_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_note_kinds(name)
+    }
+
+    pub fn pack_entity_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.registry.pack_entity_kinds(name)
+    }
+
+    pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
+        self.registry.pack_verbs(name)
+    }
+
+    pub fn all_entity_kinds(&self) -> Vec<&'static str> {
+        self.registry.all_entity_kinds()
+    }
+
+    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+        self.registry.all_note_kinds()
+    }
+
+    pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+        self.registry.all_edge_rules()
     }
 }
 
@@ -1941,8 +2035,27 @@ impl VerbRegistry {
                         "params": params_arr,
                         "identifier_resolution": identifier_resolution_help(),
                     });
+                    // A pack that authored its own schema keeps it; every other
+                    // verb gets one derived from the declarations the runtime
+                    // already holds, so a bridged model has a schema to read
+                    // instead of parsing the prose `params[].type`.
                     if let Some(schema) = pack.input_schema(verb) {
                         envelope["input_schema"] = schema;
+                    } else {
+                        let described: Vec<(String, String)> = params_arr
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p["name"].as_str().unwrap_or_default().to_string(),
+                                    p["description"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect();
+                        if let Some(schema) =
+                            crate::input_schema::derive_input_schema(handler.params, &described)
+                        {
+                            envelope["input_schema"] = schema;
+                        }
                     }
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
@@ -3136,6 +3249,7 @@ impl VerbRegistry {
         note: &khive_storage::Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        crate::curation::normalize_note_update_tags(args)?;
         if let Some(hook) = self.find_kind_hook(&note.kind) {
             hook.prepare_note_update(runtime, token, note, args).await?;
         }
@@ -3330,6 +3444,17 @@ impl VerbRegistry {
     /// Names of packs in topological load order.
     pub fn pack_names(&self) -> Vec<&str> {
         self.packs.iter().map(|p| p.name()).collect()
+    }
+
+    /// Borrow a registered pack's shared host state without reconstructing
+    /// that pack. Missing packs, absent state, and type mismatches return None.
+    pub fn pack_host_state<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.packs
+            .iter()
+            .find(|pack| pack.name() == name)?
+            .host_state()?
+            .downcast::<T>()
+            .ok()
     }
 
     /// Declared dependencies for a registered pack.
@@ -3547,7 +3672,7 @@ impl VerbRegistry {
     }
 
     /// Verbs classified [`VerbCategory::Assertive`] that nonetheless schedule
-    /// a persisted write on every successful dispatch, so a caller re-issuing
+    /// can schedule a persisted write on a successful dispatch, so a caller re-issuing
     /// a call in this list after a lost response duplicates that write:
     ///
     /// - `memory.recall` schedules `brain.record_serve`, which inserts a
@@ -3556,13 +3681,16 @@ impl VerbRegistry {
     ///   rather than colliding with the first.
     /// - `search` (the `kg` pack's bare verb) appends a `search_executed`
     ///   event with a freshly generated id and no natural key at all.
+    /// - `telemetry.emit` can append a durable stream record with a fresh
+    ///   identity and sequence, depending on the configured channel policy.
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
     /// storage. Adding a verb here (or removing one because its side effect
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
-    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] = &["memory.recall", "search"];
+    const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
+        &["memory.recall", "search", "telemetry.emit"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -4755,8 +4883,72 @@ pub(crate) mod tests {
         include!("pack_disposition_tests.rs");
     }
 
+    #[tokio::test]
+    async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones() {
+        struct HostStatePack(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl PackRuntime for HostStatePack {
+            fn name(&self) -> &str {
+                "host_state"
+            }
+            fn host_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+                Some(self.0.clone())
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                &[HandlerDef {
+                    name: "host_state.touch",
+                    description: "shared state fixture",
+                    visibility: Visibility::Verb,
+                    category: VerbCategory::Commissive,
+                    params: &[],
+                }]
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        }
+
+        let state = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_boxed(Box::new(HostStatePack(state.clone())));
+        builder.register(AlphaPack);
+        let registry = builder.build().expect("registry");
+        let host = registry
+            .pack_host_state::<AtomicUsize>("host_state")
+            .expect("registered state");
+        let cloned_host = registry
+            .clone()
+            .pack_host_state::<AtomicUsize>("host_state")
+            .expect("cloned registry state");
+        assert!(Arc::ptr_eq(&state, &host));
+        assert!(Arc::ptr_eq(&host, &cloned_host));
+        registry
+            .dispatch("host_state.touch", serde_json::json!({}))
+            .await
+            .expect("dispatch");
+        assert_eq!(host.load(Ordering::SeqCst), 1);
+        assert!(registry.pack_host_state::<String>("host_state").is_none());
+        assert!(registry.pack_host_state::<AtomicUsize>("missing").is_none());
+        assert!(registry.pack_host_state::<AtomicUsize>("alpha").is_none());
+    }
+
     /// Verbs known, by cross-pack source review (#2147/#2217), to have
-    /// their own durable or accounting-bearing side effect despite being declared
+    /// durable/accounting side effects or telemetry answers that must refuse
+    /// when admission cannot record their audit, despite being declared
     /// `VerbCategory::Assertive` — see [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]'s
     /// doc for why each is excluded. `VerbCategory::Assertive` alone cannot
     /// distinguish these from a genuinely side-effect-free read (that is the
@@ -4764,7 +4956,7 @@ pub(crate) mod tests {
     /// so this denylist is the mechanizable guard against silently
     /// reintroducing one of them: a category-only census would stay green if
     /// any name were re-added to the allowlist.
-    const KNOWN_INCIDENTAL_WRITE_VERBS: &[&str] = &[
+    const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
         "db_diagnostics",
         "git.checkout",
         "git.diff",
@@ -4773,6 +4965,10 @@ pub(crate) mod tests {
         "knowledge.search",
         "knowledge.suggest",
         "memory.recall",
+        "telemetry.channels",
+        "telemetry.counts",
+        "telemetry.emit",
+        "telemetry.read",
     ];
 
     /// Classification outcome for one `HandlerDef {` occurrence in pack
@@ -4942,7 +5138,7 @@ pub(crate) mod tests {
     /// that verb.
     ///
     /// This test proves category membership (`VerbCategory::Assertive`),
-    /// pack ownership, non-membership in [`KNOWN_INCIDENTAL_WRITE_VERBS`],
+    /// pack ownership, non-membership in [`KNOWN_ADMISSION_UNSAFE_VERBS`],
     /// and exhaustive classification of every currently public Assertive
     /// handler. It does NOT prove general effect-purity: an Assertive
     /// handler may still emit its own
@@ -5132,10 +5328,10 @@ pub(crate) mod tests {
                  live declaration says otherwise (found: {live_owner:?})"
             );
         }
-        let incidental: BTreeSet<&str> = KNOWN_INCIDENTAL_WRITE_VERBS.iter().copied().collect();
+        let incidental: BTreeSet<&str> = KNOWN_ADMISSION_UNSAFE_VERBS.iter().copied().collect();
         assert!(
             safe_verbs.is_disjoint(&incidental),
-            "a public Assertive verb cannot be both admission-degrade-safe and an incidental writer: {:?}",
+            "a public Assertive verb cannot be both admission-degrade-safe and admission-unsafe: {:?}",
             safe_verbs.intersection(&incidental).collect::<Vec<_>>()
         );
 
@@ -5357,6 +5553,7 @@ pub(crate) mod tests {
         let sources: &[(&str, &str)] = &[
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
+            ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
         ];
         assert_eq!(
             sources.len(),
@@ -7882,6 +8079,306 @@ pub(crate) mod tests {
     /// `src/`, integration tests live under `tests/`. Anything outside those
     /// two directories per crate (benches, examples) never runs as `cargo
     /// test` and is out of scope for this census.
+    /// SQL text belongs in `sql/<name>.sql`, reached through each crate's `sql!`
+    /// macro, not in a Rust string literal. This is the burn-down instrument for that
+    /// move: a crate is added to `CONVERTED` by the pull request that extracts it, and
+    /// from then on the workspace refuses to take a statement back into Rust.
+    ///
+    /// What it can and cannot see, said plainly because the answer is load-bearing.
+    /// It selects by SPELLING: a string literal whose first word is a SQL verb. It
+    /// therefore cannot see a statement assembled from fragments, one returned by a
+    /// helper, or one built at runtime. Its population is code that COMPILES into the
+    /// crate, which means `#[cfg(test)]` module bodies are stripped along with
+    /// `tests/` and `benches/` — a test that stands a fixture table up inline is out
+    /// of scope for this program. The must-match control below is what keeps those
+    /// limits honest: an unconverted crate has to trip the same predicate in the same
+    /// pass, or the detector is broken rather than the tree clean.
+    #[test]
+    fn converted_crates_keep_their_sql_out_of_rust() {
+        /// Crates whose statements live in `sql/`. One pull request adds one name.
+        const CONVERTED: &[&str] = &[
+            "khive-pack-brain",
+            "khive-pack-git",
+            "khive-pack-kg",
+            "kkernel",
+        ];
+        /// A crate known to still hold SQL in Rust, used only to prove the detector
+        /// fires. When this one is converted, move the control to another unconverted
+        /// crate rather than deleting it.
+        const STILL_INLINE: &str = "khive-db";
+
+        fn strip_test_modules(text: &str) -> String {
+            let bytes = text.as_bytes();
+            let mut out = String::with_capacity(text.len());
+            let mut cursor = 0usize;
+            while let Some(found) = text[cursor..].find("#[cfg(test)]") {
+                let start = cursor + found;
+                // Only a `mod` item is stripped; `#[cfg(test)]` on a `use` or a `fn`
+                // leaves nothing to brace-match.
+                let after = &text[start..];
+                let Some(brace_rel) = after.find('{') else {
+                    out.push_str(&text[cursor..]);
+                    return out;
+                };
+                if !after[..brace_rel].contains("mod ") {
+                    out.push_str(&text[cursor..start + brace_rel]);
+                    cursor = start + brace_rel;
+                    continue;
+                }
+                out.push_str(&text[cursor..start]);
+                let mut depth = 0usize;
+                let mut i = start + brace_rel;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cursor = i;
+            }
+            out.push_str(&text[cursor..]);
+            out
+        }
+
+        /// The body of the Rust string literal whose opening quote is at `open`, or
+        /// `None` if it does not terminate. Escapes are skipped rather than decoded:
+        /// this only has to find the end and hand back text to match against.
+        fn literal_body(text: &str, open: usize) -> Option<&str> {
+            let bytes = text.as_bytes();
+            let mut i = open + 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => return text.get(open + 1..i),
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+
+        /// One line, single-spaced. A statement in Rust wears its line breaks three
+        /// ways — a real newline in a raw string, a `\n` escape, or a backslash line
+        /// continuation — and this scan reads source text, so all three have to read as
+        /// one space before any keyword after the first can be matched. `\n` is two
+        /// characters here, and dropping only the backslash would leave `nFROM`, which
+        /// is exactly how this check first failed its own must-fail control.
+        fn flatten(body: &str) -> String {
+            let mut out = String::with_capacity(body.len());
+            let mut chars = body.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.clone().next() {
+                    // An escape that stands for whitespace: consume both characters.
+                    Some('n' | 't' | 'r') => {
+                        chars.next();
+                        out.push(' ');
+                    }
+                    // A line continuation, or any other escape: the backslash goes,
+                    // what follows is kept and judged on its own.
+                    _ => out.push(' '),
+                }
+            }
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        fn sql_literals(text: &str) -> Vec<String> {
+            // A leading verb alone is a heuristic, and it is wrong often enough to
+            // matter: "insert serve batch" is an error label and "Create a new brain
+            // profile with given name" is a verb description, and both start with a
+            // SQL verb. So a literal has to carry a second structural keyword too, and
+            // both are matched CASE-SENSITIVELY, because every statement in this tree
+            // writes its keywords in upper case and English prose does not.
+            const SHAPES: [(&str, &[&str]); 10] = [
+                // A statement need not start with a verb at all. A common table
+                // expression starts with WITH, and there are a dozen of them in this
+                // workspace, so a census that only knows verbs reads a crate clean while
+                // its largest queries sit in Rust. The second keyword here is the CTE's
+                // own binding, which prose does not write.
+                ("WITH ", &[" AS ("]),
+                ("SELECT ", &[" FROM "]),
+                ("INSERT ", &["INSERT INTO ", "INSERT OR "]),
+                ("UPDATE ", &[" SET "]),
+                ("DELETE ", &["DELETE FROM "]),
+                (
+                    "CREATE ",
+                    &[
+                        "CREATE TABLE",
+                        "CREATE INDEX",
+                        "CREATE UNIQUE",
+                        "CREATE VIEW",
+                        "CREATE VIRTUAL",
+                        "CREATE TRIGGER",
+                    ],
+                ),
+                (
+                    "DROP ",
+                    &["DROP TABLE", "DROP INDEX", "DROP VIEW", "DROP TRIGGER"],
+                ),
+                ("ALTER ", &["ALTER TABLE"]),
+                ("PRAGMA ", &["PRAGMA "]),
+                ("REPLACE ", &["REPLACE INTO "]),
+            ];
+            let mut found = Vec::new();
+            for (index, _) in text.match_indices('"') {
+                let Some(body) = literal_body(text, index) else {
+                    continue;
+                };
+                let flat = flatten(body);
+                let Some((verb, seconds)) = SHAPES.iter().find(|(v, _)| flat.starts_with(*v))
+                else {
+                    continue;
+                };
+                if !seconds.iter().any(|second| flat.contains(second)) {
+                    continue;
+                }
+                let snippet: String = flat.chars().take(70).collect();
+                found.push(format!("{verb}… {snippet}"));
+            }
+            found
+        }
+
+        let sources = workspace_rust_sources();
+        assert!(
+            !sources.is_empty(),
+            "the workspace source walk returned nothing, so this census read no code"
+        );
+
+        let mut scanned_files = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut control_hits = 0usize;
+        for (path, text) in &sources {
+            let display = path.display().to_string();
+            if display.contains("/tests/") || display.contains("/benches/") {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name == "tests.rs" || file_name.ends_with("_tests.rs") {
+                continue;
+            }
+            let production = strip_test_modules(text);
+            if display.contains(&format!("/{STILL_INLINE}/")) {
+                control_hits += sql_literals(&production).len();
+                continue;
+            }
+            let Some(crate_name) = CONVERTED
+                .iter()
+                .find(|name| display.contains(&format!("/{name}/")))
+            else {
+                continue;
+            };
+            scanned_files += 1;
+            for literal in sql_literals(&production) {
+                offenders.push(format!("{crate_name} {}: {literal}", path.display()));
+            }
+        }
+
+        // Must-fail control: take every statement this program has already extracted,
+        // write it back into a Rust literal in each of the three shapes a statement can
+        // take in Rust source, and require the predicate to catch each one. The
+        // must-match control below proves the predicate fires SOMEWHERE; this proves it
+        // fires on exactly the regression the census exists to stop, which is a
+        // converted statement coming home. The escaped-newline shape is not decoration:
+        // an earlier version of `flatten` dropped the backslash and left `nFROM`, and
+        // six of eleven statements would have come back unseen.
+        let mut round_tripped = 0usize;
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("khive-runtime's Cargo.toml lives directly under crates/")
+            .to_path_buf();
+        for crate_name in CONVERTED {
+            let sql_dir = crates_root.join(crate_name).join("sql");
+            let entries = std::fs::read_dir(&sql_dir).unwrap_or_else(|e| {
+                panic!("{crate_name} is on the converted list but {sql_dir:?} is unreadable: {e}")
+            });
+            for entry in entries.filter_map(Result::ok) {
+                let file = entry.path();
+                if file.extension().and_then(|e| e.to_str()) != Some("sql") {
+                    continue;
+                }
+                let statement =
+                    std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+                // A file may open with a header comment saying what it is and where its
+                // authoritative definition lives. A Rust literal carries no such header,
+                // so the round trip has to drop it: otherwise the rendered literal opens
+                // with `--` and the predicate correctly sees no statement, which reads as
+                // a broken census rather than as a file with a preamble.
+                let body = statement
+                    .lines()
+                    .skip_while(|line| {
+                        let start = line.trim_start();
+                        start.is_empty() || start.starts_with("--")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    !body.trim().is_empty(),
+                    "{file:?} holds nothing but comments, so it declares no statement for \
+                     the census to protect"
+                );
+                // A quoted identifier would otherwise close the synthetic literal early
+                // and fail this control for a reason that has nothing to do with it.
+                let statement = body.trim().replace('"', "\\\"");
+                let shapes = [
+                    (
+                        "one line",
+                        statement.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ),
+                    ("escaped newlines", statement.replace('\n', "\\n")),
+                    (
+                        "line continuations",
+                        statement.replace('\n', " \\\n            "),
+                    ),
+                ];
+                for (shape, rendered) in shapes {
+                    let snippet = format!("let statement = \"{rendered}\";");
+                    let seen = sql_literals(&snippet);
+                    assert_eq!(
+                        seen.len(),
+                        1,
+                        "must-fail control: {file:?} written back into Rust as {shape} was \
+                         seen {} time(s), so the census would not notice this statement \
+                         moving home",
+                        seen.len()
+                    );
+                    round_tripped += 1;
+                }
+            }
+        }
+        assert!(
+            round_tripped > 0,
+            "must-fail control ran on nothing: {CONVERTED:?} contributed no .sql files, so \
+             its passing says only that the loop body never executed"
+        );
+
+        assert!(
+            control_hits > 0,
+            "must-match control: {STILL_INLINE} still holds SQL in Rust, so a detector \
+             finding none there is broken and its clean reading of {CONVERTED:?} means nothing"
+        );
+        assert!(
+            scanned_files > 0,
+            "no source file matched {CONVERTED:?}; the crate names in that list are how this \
+             census finds its population, so an empty match reads clean for the wrong reason"
+        );
+        assert!(
+            offenders.is_empty(),
+            "SQL text belongs in sql/<name>.sql behind that crate's sql! macro; \
+             {} offender(s) across {scanned_files} file(s): {offenders:#?}",
+            offenders.len()
+        );
+    }
+
     fn workspace_rust_sources() -> Vec<(std::path::PathBuf, String)> {
         let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

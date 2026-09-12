@@ -10441,6 +10441,33 @@ backend = "schedule-backend"
 
     #[test]
     #[serial_test::serial(config_ledger)]
+    fn client_role_never_starts_the_blob_upload_component() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().expect("blob directory");
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        runtime
+            .install_blob_store(std::sync::Arc::new(
+                khive_db::stores::blob::FsBlobStore::new(directory.path().to_path_buf(), 0)
+                    .expect("blob store"),
+            ))
+            .expect("install blob store");
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_blob::BlobPack::new(runtime));
+        let server = KhiveMcpServer::from_registry(builder.build().expect("blob registry"));
+        assert!(server.blob_upload_manager().is_some());
+
+        for argv in [vec!["mcp"], vec!["mcp", "--transport", "http"]] {
+            let args = Args::parse_from(argv);
+            assert_eq!(
+                start_daemon_components_if_daemon(&args, &server, None),
+                0,
+                "only --daemon may start the upload sweeper, even with an admitted manager"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
     fn client_role_never_starts_the_schedule_component() {
         use clap::Parser;
         let args = Args::parse_from(["mcp"]);

@@ -493,6 +493,36 @@ pub struct NotePatch {
     pub write_options: crate::note_write::NoteWriteOptions,
 }
 
+/// Normalize the public note tag replacement into its stored property before
+/// kind hooks inspect the patch. An explicit list, including an empty one,
+/// wins over properties.tags; omission and null preserve the property patch.
+pub(crate) fn normalize_note_update_tags(args: &mut Value) -> RuntimeResult<()> {
+    let args = args
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("update arguments must be an object".into()))?;
+    let Some(tags) = args.get("tags").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let tags: Vec<String> = serde_json::from_value(tags.clone()).map_err(|error| {
+        RuntimeError::InvalidInput(format!("tags must be an array of strings: {error}"))
+    })?;
+    let mut properties = match args.get("properties") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(properties)) => properties.clone(),
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "properties must be an object".into(),
+            ));
+        }
+    };
+    properties.insert("tags".into(), serde_json::json!(tags));
+    args.insert("properties".into(), Value::Object(properties));
+    // A hook may normalize this property further. Remove the alias so later
+    // preparation cannot overwrite the hook's result by applying it again.
+    args.remove("tags");
+    Ok(())
+}
+
 impl NotePatch {
     /// Construct a `NotePatch` from the public fields only.
     /// Use this from external crates; `kind_status` is set to `None`.
@@ -902,16 +932,16 @@ impl KhiveRuntime {
             crate::secret_gate::reject_reserved_secret_gate_property(Some(&removals))?;
         }
         if let Some(ref name) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "entity", "name")?;
         }
         if let Some(Some(ref desc)) = patch.description {
-            crate::secret_gate::check(desc)?;
+            crate::secret_gate::check_at(desc, "entity", "description")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "entity", "properties")?;
         }
         if let Some(ref tags) = patch.tags {
-            crate::secret_gate::check_tags(tags)?;
+            crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
         }
         let store = self.entities(token)?;
         let mut entity = store.get_entity(id).await?.ok_or_else(|| {
@@ -1248,7 +1278,7 @@ impl KhiveRuntime {
         validation: EntityMergeValidation,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -1626,13 +1656,13 @@ impl KhiveRuntime {
         }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
-            crate::secret_gate::check(content)?;
+            crate::secret_gate::check_at(content, "note", "content")?;
         }
         if let Some(Some(ref name)) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "note", "name")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "note", "properties")?;
         }
 
         reject_pack_managed_schedule_mutation(&note, "update")?;
@@ -2107,9 +2137,13 @@ impl KhiveRuntime {
             ));
         }
 
-        crate::secret_gate::check_json(&serde_json::json!({
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "last_error": &last_error,
+            }),
+            "message",
+            "last_error",
+        )?;
 
         let snapshot = self.outbound_message(token, id).await?;
         let props = snapshot.properties.as_ref().and_then(Value::as_object);
@@ -2174,10 +2208,14 @@ impl KhiveRuntime {
         delivered_at: String,
         transport_message_id: Option<String>,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "delivered_at": &delivered_at,
-            "transport_message_id": &transport_message_id,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "delivered_at": &delivered_at,
+                "transport_message_id": &transport_message_id,
+            }),
+            "message",
+            "delivered",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2219,10 +2257,14 @@ impl KhiveRuntime {
         failed_at: String,
         last_error: String,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "failed_at": &failed_at,
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "failed_at": &failed_at,
+                "last_error": &last_error,
+            }),
+            "message",
+            "failed",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2290,7 +2332,7 @@ impl KhiveRuntime {
         reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(

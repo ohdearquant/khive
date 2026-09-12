@@ -252,7 +252,7 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let now = now_us();
 
-        for atom_in in &p.atoms {
+        for (index, atom_in) in p.atoms.iter().enumerate() {
             let slug = atom_in.slug.trim().to_string();
             if slug.is_empty() {
                 return Err(RuntimeError::InvalidInput(
@@ -268,24 +268,27 @@ impl KnowledgeHandlers {
             };
             validate_atom_content(&content)?;
             // Secret gate: scan all caller-supplied text and structured fields
-            // before any reader/writer is acquired.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&atom_in.name)?;
-            khive_runtime::secret_gate::check(&content)?;
+            // before any reader/writer is acquired. Every refusal is located to the
+            // atom that produced it by POSITION, never by slug: this loop returns ONE
+            // error for the whole batch, the slug is itself a scanned field, and two
+            // atoms may share a slug within one payload (#2605).
+            use khive_runtime::secret_gate;
+            let record = format!("atoms[{index}]");
+            secret_gate::check_at(&slug, &record, "slug")?;
+            secret_gate::check_at(&atom_in.name, &record, "name")?;
+            secret_gate::check_at(&content, &record, "content")?;
             if let Some(ref tags_vec) = atom_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
+                secret_gate::check_tags_at(tags_vec, &record, "tags")?;
             }
             if let Some(ref props) = atom_in.properties {
-                khive_runtime::secret_gate::check_json(props)?;
+                secret_gate::check_json_at(props, &record, "properties")?;
             }
-            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
-                atom_in.properties.as_ref(),
-            )?;
+            secret_gate::reject_reserved_secret_gate_property(atom_in.properties.as_ref())?;
             if let Some(Some(uri)) = &atom_in.source_uri {
-                khive_runtime::secret_gate::check(uri)?;
+                secret_gate::check_at(uri, &record, "source_uri")?;
             }
             if let Some(Some(st)) = &atom_in.source_type {
-                khive_runtime::secret_gate::check(st)?;
+                secret_gate::check_at(st, &record, "source_type")?;
             }
         }
 
@@ -484,8 +487,8 @@ impl KnowledgeHandlers {
             }
             // Secret gate: scan slug and name first (before content-length validation)
             // so security violations short-circuit before business logic errors.
-            khive_runtime::secret_gate::check(&slug)?;
-            khive_runtime::secret_gate::check(&name)?;
+            khive_runtime::secret_gate::check_at(&slug, "domain", "slug")?;
+            khive_runtime::secret_gate::check_at(&name, "domain", "name")?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
@@ -494,12 +497,12 @@ impl KnowledgeHandlers {
                 RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
             })?;
             // Secret gate: scan remaining caller-supplied text.
-            khive_runtime::secret_gate::check(mirror_content)?;
+            khive_runtime::secret_gate::check_at(mirror_content, "domain", "description")?;
             if let Some(ref tags_vec) = domain_in.tags {
-                khive_runtime::secret_gate::check_tags(tags_vec)?;
+                khive_runtime::secret_gate::check_tags_at(tags_vec, "domain", "tags")?;
             }
             if let Some(ref members_vec) = domain_in.members {
-                khive_runtime::secret_gate::check_tags(members_vec)?;
+                khive_runtime::secret_gate::check_tags_at(members_vec, "domain", "members")?;
             }
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();

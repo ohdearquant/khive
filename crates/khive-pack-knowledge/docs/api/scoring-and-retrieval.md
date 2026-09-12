@@ -50,7 +50,7 @@ indexed until a knowledge read path can select or fuse them.
 
 ### Vamana ANN Signal
 
-In parallel with TF-IDF, if a Vamana ANN index is warm (populated via `knowledge.index
+Alongside the TF-IDF signal, if a Vamana ANN index is warm (populated via `knowledge.index
 rebuild_ann=true`), the query embedding is also used for ANN search. ANN hits are fused with
 TF-IDF hits via RRF (Reciprocal Rank Fusion) with $k = 60$:
 
@@ -60,13 +60,21 @@ $$
 
 ### Candidate Admission and Degradation
 
-The FTS leg is a recall stage, not the final ranker. It ORs the de-duplicated non-stop query
-terms, including the scorer's singular/plural expansions, so candidates with matching terms
-separated in their text remain eligible for in-memory TF-IDF scoring. FTS candidates are ordered
-by BM25, with slug as a deterministic tie-break. Deletion, status, and atom/domain kind
-eligibility are applied in SQL before the bounded candidate-window `LIMIT`; ineligible rows
-therefore cannot consume the window and hide eligible rows beyond it. The bounded full-scan
-fallback applies the same pre-limit eligibility rules. Status precedence is resolved once for
+The FTS leg is a recall stage, not the final ranker. It queries each de-duplicated non-stop
+term separately, including the scorer's singular/plural expansions, so matches separated in
+the text remain eligible for TF-IDF scoring. Phase A enumerates bounded rowid windows from the
+index; phase B hydrates them with namespace, deletion, status, and kind eligibility. Widening
+and eligibility-scoped FTS recovery keep an ineligible prefix from hiding real matches, within
+the lexical deadline. A genuine FTS miss contributes no unrelated recent rows.
+
+`knowledge.search` returns per-hit `score_provenance` (lexical/ANN sources, successful
+embedding rerank, `s_over_s_plus_1` normalization, and `calibrated: false`) plus response
+`candidate_provenance`. The latter distinguishes healthy matches, filtered matches, misses,
+and partial or complete lexical timeouts; its `fallback` is `ann` only when returned hits
+have ANN evidence without any lexical evidence. These fields replace fixed numeric score
+bands as retrieval-path evidence, not as a relevance guarantee.
+
+Status precedence is resolved once for
 candidate admission and final scoring: an explicit `exclude_status` excludes exactly that status,
 so `deprecated` remains eligible unless the resolved policy excludes it; default and
 `include_drafts=true` searches continue to exclude deprecated rows.

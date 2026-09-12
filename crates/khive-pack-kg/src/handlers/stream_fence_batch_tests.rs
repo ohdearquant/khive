@@ -19,6 +19,245 @@ fn batch_surface() -> (KhiveRuntime, VerbRegistry) {
 }
 
 #[tokio::test]
+async fn absence_fences_batch_wide_match_aliases_and_preserve_refusal_details() {
+    for state in ["missing", "live", "soft_deleted"] {
+        let mut outcomes = Vec::new();
+        for field in ["expected_version", "version"] {
+            let (rt, registry) = batch_surface();
+            absence_fence_subject(&registry, state).await;
+            let before = population(&rt).await;
+            let result = registry
+                .dispatch(
+                    "stream.batch",
+                    json!({
+                        "fence":fence_version_field("lease/absence", field, Value::Null),
+                        "ops":[
+                            {"op":"append", "stream":"absence-batch", "record":"first"},
+                            {"op":"append", "stream":"absence-batch", "record":"second"}
+                        ]
+                    }),
+                )
+                .await;
+            if state == "live" {
+                let error = reason(result.unwrap_err(), "fence_conflict");
+                assert_eq!(
+                    error["details"],
+                    json!({"reason":"fence_conflict", "key":"lease/absence", "expected_version":"absent", "current_version":"3"})
+                );
+                assert_eq!(population(&rt).await, before);
+                assert_eq!(heads(&registry, &["absence-batch"]).await, vec![0]);
+                outcomes.push(error["details"].clone());
+            } else {
+                let result = result.unwrap_or_else(|error| panic!("{field} {state}: {error}"));
+                assert_eq!(result["committed"], true);
+                assert_eq!(seqs(&result), vec![1, 2]);
+                let read = registry
+                    .dispatch("stream.read", json!({"stream":"absence-batch"}))
+                    .await
+                    .unwrap();
+                let records: Vec<_> = read["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["record"].clone())
+                    .collect();
+                assert_eq!(records, vec![json!("first"), json!("second")]);
+                outcomes.push(json!({"seqs":seqs(&result), "records":records}));
+            }
+        }
+        assert_eq!(outcomes[0], outcomes[1], "canonical and alias: {state}");
+    }
+}
+
+#[tokio::test]
+async fn absence_fences_batch_members_inherit_aliases_and_transaction_placement() {
+    for atomic in [true, false] {
+        for listed in [false, true] {
+            for state in ["missing", "live", "soft_deleted"] {
+                let mut outcomes = Vec::new();
+                for field in ["expected_version", "version"] {
+                    let (rt, registry) = batch_surface();
+                    lease(&registry, "lease/guard").await;
+                    absence_fence_subject(&registry, state).await;
+                    let member = fence_version_field("lease/absence", field, Value::Null);
+                    let fences = if listed {
+                        json!([fence("lease/guard", 1), member])
+                    } else {
+                        member
+                    };
+                    let before = population(&rt).await;
+                    let result = registry.dispatch("stream.batch", json!({"atomic":atomic, "ops":[
+                        {"op":"append", "stream":"absence-member", "record":"before"},
+                        {"op":"append", "stream":"absence-member", "record":"guarded", "fence":fences},
+                        {"op":"append", "stream":"absence-member", "record":"after"}
+                    ]})).await;
+                    if state == "live" {
+                        let mut details = json!({"reason":"fence_conflict", "key":"lease/absence", "expected_version":"absent", "current_version":"3"});
+                        if listed {
+                            details["index"] = json!("1");
+                        }
+                        let actual = if atomic {
+                            details["member"] = json!("1");
+                            let error = reason(result.unwrap_err(), "fence_conflict");
+                            assert_eq!(population(&rt).await, before);
+                            assert_eq!(heads(&registry, &["absence-member"]).await, vec![0]);
+                            error["details"].clone()
+                        } else {
+                            let result = result.unwrap();
+                            assert_eq!(result["committed"], true);
+                            assert_eq!(result["results"][1]["domain_disposition"], "not_committed");
+                            assert_eq!(result["results"][0]["seq"], 1);
+                            assert_eq!(result["results"][2]["seq"], 2);
+                            let read = registry
+                                .dispatch("stream.read", json!({"stream":"absence-member"}))
+                                .await
+                                .unwrap();
+                            assert_eq!(read["entries"].as_array().unwrap().len(), 2);
+                            assert_eq!(read["entries"][0]["record"], "before");
+                            assert_eq!(read["entries"][1]["record"], "after");
+                            result["results"][1]["details"].clone()
+                        };
+                        assert_eq!(actual, details, "{field} atomic={atomic} list={listed}");
+                        outcomes.push(actual);
+                    } else {
+                        let result = result.unwrap_or_else(|error| {
+                            panic!("{field} {state} atomic={atomic} list={listed}: {error}")
+                        });
+                        assert_eq!(result["committed"], true);
+                        assert_eq!(seqs(&result), vec![1, 2, 3]);
+                        let read = registry
+                            .dispatch("stream.read", json!({"stream":"absence-member"}))
+                            .await
+                            .unwrap();
+                        let records: Vec<_> = read["entries"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|entry| entry["record"].clone())
+                            .collect();
+                        assert_eq!(
+                            records,
+                            vec![json!("before"), json!("guarded"), json!("after")]
+                        );
+                        outcomes.push(json!({"seqs":seqs(&result), "records":records}));
+                    }
+                }
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "canonical and alias: {state} atomic={atomic} list={listed}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn absence_fence_parameter_errors_refuse_whole_batches_before_members() {
+    for (top_level, atomic) in [(true, true), (false, true), (false, false)] {
+        for member in [
+            json!({"key":"lease/absence", "kind":"head"}),
+            json!({"key":"lease/absence", "kind":"head", "expected_version":null, "version":null}),
+            json!({"key":"lease/absence", "kind":"head", "version":null, "extra":true}),
+            fence_version_field("lease/absence", "version", json!("1")),
+            fence_version_field("lease/absence", "version", json!(0)),
+            fence_version_field("lease/absence", "expected_version", json!(-1)),
+        ] {
+            for listed in [false, true] {
+                if top_level && listed {
+                    continue;
+                }
+                let (rt, registry) = batch_surface();
+                let before = population(&rt).await;
+                let fences = if listed {
+                    json!([member])
+                } else {
+                    member.clone()
+                };
+                let mut args = json!({"atomic":atomic, "ops":[
+                    {"op":"append", "stream":"absence-invalid", "record":"before"},
+                    {"op":"append", "stream":"absence-invalid", "record":"invalid"}
+                ]});
+                if top_level {
+                    args["fence"] = fences;
+                } else {
+                    args["ops"][1]["fence"] = fences;
+                }
+                let error = registry.dispatch("stream.batch", args).await.unwrap_err();
+                let RuntimeError::InvalidInput(message) = error else {
+                    panic!("parameter refusal: {error:?}")
+                };
+                assert!(message.contains("fence"), "{message}");
+                assert!(
+                    !message.contains("Shape") && !message.contains("untagged enum"),
+                    "{message}"
+                );
+                if member.get("expected_version").is_none() && member.get("version").is_none() {
+                    assert!(
+                        message
+                            .contains("fence requires expected_version (positive integer or null)"),
+                        "{message}"
+                    );
+                }
+                assert_eq!(population(&rt).await, before);
+                assert_eq!(heads(&registry, &["absence-invalid"]).await, vec![0]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn batch_null_fence_and_observed_version_spelling_remain_distinct() {
+    let (rt, registry) = batch_surface();
+    lease(&registry, "lease/absence").await;
+    let result = registry
+        .dispatch(
+            "stream.batch",
+            json!({"fence":null, "ops":[
+                {"op":"append", "stream":"null-fence", "record":"before"},
+                {"op":"append", "stream":"null-fence", "record":"refused", "expected_seq":9},
+                {"op":"append", "stream":"null-fence", "record":"after"}
+            ]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["results"][0]["seq"], 1);
+    assert_eq!(result["results"][1]["details"]["reason"], "seq_conflict");
+    assert_eq!(result["results"][2]["seq"], 2);
+    let before = population(&rt).await;
+    for observed in [
+        json!({"key":"missing", "kind":"head"}),
+        json!({"key":"missing", "kind":"head", "expected_version":null}),
+        json!({"key":"missing", "kind":"head", "version":null, "expected_version":null}),
+    ] {
+        let error = registry
+            .dispatch(
+                "stream.batch",
+                json!({"atomic":true, "observed":[observed], "ops":[
+                    {"op":"append", "stream":"observed-invalid", "record":true}
+                ]}),
+            )
+            .await
+            .unwrap_err();
+        let RuntimeError::InvalidInput(message) = error else {
+            panic!("observed parameter refusal: {error:?}")
+        };
+        if observed.get("version").is_none() {
+            assert!(
+                message.contains("observed entry 0 requires version (positive integer or null)"),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.contains("unknown field") && message.contains("expected_version"),
+                "{message}"
+            );
+        }
+        assert_eq!(population(&rt).await, before);
+    }
+    assert_eq!(heads(&registry, &["observed-invalid"]).await, vec![0]);
+}
+
+#[tokio::test]
 async fn ordered_fences_batch_commits_objects_and_lists() {
     for atomic in [true, false] {
         let (_, registry) = batch_surface();

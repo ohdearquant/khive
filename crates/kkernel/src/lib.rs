@@ -1,5 +1,7 @@
 //! kkernel — khive admin/management library.
 
+mod sql;
+
 mod atomic_apply;
 pub mod cli;
 pub mod code_audit;
@@ -54,6 +56,7 @@ mod _pack_links {
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    use khive_pack_telemetry::TelemetryPack as _;
     use khive_pack_tool::ToolPack as _;
     use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;

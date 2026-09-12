@@ -143,14 +143,16 @@ pub enum IdResolutionMode {
 /// a single verb parameter. Stored as a `&'static` slice on [`HandlerDef`] so
 /// the registry can return it without any allocation at call time.
 ///
-/// The `param_type` field is a free-form string (e.g. `"string"`, `"uuid"`,
-/// `"bool"`, `"integer"`, `"string | null"`) — it is documentation-only and
-/// not used for validation.
+/// The `param_type` field is drawn from a closed vocabulary (e.g. `"string"`,
+/// `"uuid"`, `"boolean"`, `"integer"`), asserted as an exact set by a
+/// registry-wide test. It does not validate the argument, but it is not
+/// documentation-only either: the runtime derives each verb's published JSON
+/// Schema from it, so an unmapped spelling withholds that verb's schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParamDef {
     /// Parameter name as used in the DSL (e.g. `"id"`, `"kind"`, `"query"`).
     pub name: &'static str,
-    /// Free-form type hint for documentation (e.g. `"string"`, `"uuid"`, `"bool"`).
+    /// Type hint from the closed vocabulary (e.g. `"string"`, `"uuid"`, `"boolean"`).
     pub param_type: &'static str,
     /// Whether the caller must supply this parameter.
     pub required: bool,

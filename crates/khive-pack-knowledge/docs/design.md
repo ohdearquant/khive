@@ -107,14 +107,13 @@
   a real candidate — this fallback trades the bounded-cost guarantee for correctness on the rare
   term pathological enough to exhaust the ceiling. Its enumeration can stop once enough eligible
   rows have been found; the independent stage deadline still bounds a long ineligible prefix.
-- When no term produces an eligible row, the empty-result fallback (a bounded, namespace-filtered
-  full scan of `knowledge_atoms` ordered by recency) is gated on namespace-scoped evidence only: a
-  chunked `SELECT 1 FROM knowledge_atoms WHERE rowid IN (...) AND namespace = ?1 LIMIT 1` over the
-  rowids every term's phase A already fetched, never a second, unscoped `fts_knowledge` probe. An
-  unscoped probe is a cross-namespace existence oracle — a caller in namespace A whose term exists
-  only in namespace B would see the fallback suppressed (empty result) exactly as for a term that
-  exists nowhere, while a caller whose term genuinely matches nothing still falls through to the
-  fallback's rows; the two cases must be indistinguishable by response shape.
+- A genuine lexical miss returns no candidates; unrelated recent rows are never used as a
+  fallback. Empty candidates are classified as `filtered` versus `no_match` using namespace-scoped
+  evidence. The first membership probe reuses the bounded phase-A rowids. If no local match is
+  visible and a term's window was full, a namespace-only FTS existence query checks beyond the
+  window, so a foreign prefix cannot change a local filtered match into `no_match`. Its `LIMIT 1`
+  bounds returned rows, not scanned work; the same lexical deadline bounds a long prefix or an
+  absent local match. Positive eligible matches and fully enumerated misses need no extra query.
 - Both `PHASE_A_WIDEN_CEILING` and `LEXICAL_STAGE_BUDGET_MS` (below) have test-only overrides
   (`with_phase_a_widen_ceiling_override`, `with_lexical_stage_budget_override_ms`) implemented as
   `tokio::task_local!` values scoped to the calling task, mirroring
@@ -148,7 +147,7 @@
   waiting and cleanup. Neither is an attribution of deadline expiry versus cancellation.
   Healthy responses omit the list. Public phases are `reader_open` and `term_frequency`, whose
   entry does not depend on corpus contents. The later `phase_a_rowids`, `phase_b_hydration`,
-  `eligibility_fallback`, `namespace_membership`, and `recent_fallback` records are operator-only:
+  `eligibility_fallback`, `namespace_membership`, and `namespace_existence` records are operator-only:
   their reachability can change with foreign-index matches even when local results do not.
   Responses with only operator-only records retain both booleans and omit the details list.
   The public list can omit records and is not a complete execution ledger, even when non-empty.

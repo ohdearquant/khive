@@ -513,6 +513,8 @@ impl MemoryPack {
                     serve_attribution,
                     target_ids: Vec::new(),
                     latency_us: recall_start.elapsed().as_micros() as i64,
+                    ann_degraded,
+                    ann_degraded_reason: ann_degraded_reason.clone(),
                 },
             );
             if let Ok(mut state) = self.recall_state.lock() {
@@ -1000,6 +1002,8 @@ impl MemoryPack {
                 serve_attribution,
                 target_ids,
                 latency_us: recall_start.elapsed().as_micros() as i64,
+                ann_degraded,
+                ann_degraded_reason: ann_degraded_reason.clone(),
             },
         );
 
@@ -1143,6 +1147,8 @@ impl MemoryPack {
             serve_attribution,
             target_ids,
             latency_us,
+            ann_degraded,
+            ann_degraded_reason,
         } = fields;
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
@@ -1196,6 +1202,8 @@ impl MemoryPack {
                     query_class,
                     target_ids,
                     latency_us,
+                    ann_degraded,
+                    ann_degraded_reason,
                 },
             )
             .await;
@@ -1211,6 +1219,13 @@ struct RecallServeFields<'a> {
     serve_attribution: ServeAttribution,
     target_ids: Vec<String>,
     latency_us: i64,
+    /// #836: at least one vector leg was served FTS-only for this recall. The
+    /// response envelope already distinguishes this from a genuine no-match;
+    /// the event plane could not, so it is carried through here.
+    ann_degraded: bool,
+    /// Reason captured at the failure site, `None` when the recall was not
+    /// degraded.
+    ann_degraded_reason: Option<String>,
 }
 
 /// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
@@ -1224,6 +1239,8 @@ struct RecallExecutedFields {
     query_class: String,
     target_ids: Vec<String>,
     latency_us: i64,
+    ann_degraded: bool,
+    ann_degraded_reason: Option<String>,
 }
 
 /// Append best-effort recall telemetry without affecting the recall response.
@@ -1248,6 +1265,8 @@ async fn emit_recall_executed_event(
         query_class,
         target_ids,
         latency_us,
+        ann_degraded,
+        ann_degraded_reason,
     } = fields;
     let store = match rt.events(token) {
         Ok(store) => store,
@@ -1262,7 +1281,12 @@ async fn emit_recall_executed_event(
         }
     };
     let result_count = target_ids.len();
-    let payload = json!({
+    // A degraded recall that returns nothing is a different state from a
+    // genuine no-match, and both serve `result_count: 0`. The response
+    // envelope has carried that distinction since #1657; without these two
+    // fields the event plane collapses them into one row, so a count of
+    // recalls cannot tell a configuration problem from an empty corpus.
+    let mut payload = json!({
         "actor": actor,
         "served_by_profile_id": served_by_profile_id,
         "serve_attribution": serve_attribution,
@@ -1273,7 +1297,13 @@ async fn emit_recall_executed_event(
         "candidates": target_ids.clone(),
         "selected": target_ids,
         "latency_us": latency_us,
+        "degraded": ann_degraded,
     });
+    if ann_degraded {
+        payload["degraded_reason"] =
+            json!(ann_degraded_reason
+                .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string()));
+    }
     let event = khive_storage::Event::new(
         token.namespace().as_str(),
         "memory.recall",
@@ -1677,6 +1707,142 @@ mod tests {
                 "normal recall must not carry a degraded marker, got: {r:?}"
             );
         }
+    }
+
+    /// A degraded recall and a clean recall must be distinguishable on the
+    /// EVENT plane, not only in the response envelope. Both serve a caller
+    /// successfully, so a consumer counting recalls sees two identical rows
+    /// unless the degradation is carried into the payload. Fails on
+    /// `63f1f78d1`, where `recall_executed` carried no degradation field at
+    /// all and the two arms below produced byte-identical markers.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_executed_event_carries_the_degradation() {
+        const MODEL: &str = "recall-degraded-event-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "degraded event plane recall marker seeded note";
+        const DEGRADED_QUERY: &str = "degraded event plane recall";
+        const CLEAN_QUERY: &str = "event plane recall marker";
+
+        let rt = memory_runtime_with_fresh_tail(true);
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let key = crate::ann::AnnKey::new(MODEL);
+        let held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": DEGRADED_QUERY,
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("degraded recall must still serve");
+        drop(held);
+
+        // The control arm, in the same test and against the same store: an
+        // uncontended recall must produce the OPPOSITE marker, otherwise the
+        // assertion below passes on a field that is simply always true.
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": CLEAN_QUERY,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("uncontended recall must serve");
+
+        // Both emissions are fired off the response path via
+        // `track_background_task`, so poll for the pair rather than assume
+        // they have landed.
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if page.items.len() >= 2 {
+                events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "both recalls must emit a recall_executed event, got: {events:?}"
+        );
+
+        let find = |q: &str| {
+            events
+                .iter()
+                .find(|e| e.payload["query"] == serde_json::json!(q))
+                .unwrap_or_else(|| panic!("no recall_executed event for query {q:?}: {events:?}"))
+        };
+
+        let degraded = find(DEGRADED_QUERY);
+        assert_eq!(
+            degraded.payload["degraded"],
+            serde_json::json!(true),
+            "a degraded recall must say so on the event plane, got: {:?}",
+            degraded.payload
+        );
+        let reason = degraded.payload["degraded_reason"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("degraded event must carry a reason: {:?}", degraded.payload)
+            });
+        assert!(
+            !reason.is_empty(),
+            "the degradation reason must be the failure-site string, not an empty placeholder"
+        );
+
+        let clean = find(CLEAN_QUERY);
+        assert_eq!(
+            clean.payload["degraded"],
+            serde_json::json!(false),
+            "an uncontended recall must not be reported as degraded, got: {:?}",
+            clean.payload
+        );
+        assert_eq!(
+            clean.payload["degraded_reason"],
+            serde_json::Value::Null,
+            "a clean recall carries no reason at all, got: {:?}",
+            clean.payload
+        );
     }
 
     /// #1477: an exceptional fresh-tail skip (here, the runtime's exact leg is

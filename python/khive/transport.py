@@ -24,6 +24,7 @@ is daemon-defined; a `version_mismatch` is a hard error naming both sides.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -107,6 +108,69 @@ class SocketTransport(Transport):
         buf = bytearray()
         while len(buf) < n:
             chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise TransportError(f"connection closed after {len(buf)} of {n} bytes")
+            buf.extend(chunk)
+        return bytes(buf)
+
+
+class AsyncSocketTransport:
+    """`SocketTransport`'s awaited twin: same socket, same framing, no thread blocked.
+
+    Deliberately not a `Transport` subclass. That ABC declares a synchronous
+    `round_trip`, and a coroutine returned where a dict is expected fails far
+    from the call that caused it. `AsyncSession` takes this shape instead.
+
+    The framing below must stay identical to `SocketTransport`'s: same 4-byte
+    big-endian prefix, same cap enforced in both directions. It is duplicated
+    rather than shared because the sync side reads a `socket` and this side
+    reads a `StreamReader`, and an abstraction over those two would be longer
+    than either.
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else default_socket_path()
+
+    async def round_trip(self, frame: dict[str, Any], timeout: float) -> dict[str, Any]:
+        payload = json.dumps(frame).encode("utf-8")
+        if len(payload) > MAX_FRAME_BYTES:
+            raise FrameTooLarge(f"request frame is {len(payload)} bytes; cap is {MAX_FRAME_BYTES}")
+        try:
+            raw = await asyncio.wait_for(self._exchange(payload), timeout)
+        except TimeoutError as exc:
+            raise TransportError(f"khived at {self.path}: timed out after {timeout}s") from exc
+        except OSError as exc:
+            raise TransportError(f"khived at {self.path}: {exc}") from exc
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except ValueError as exc:
+            raise TransportError(f"undecodable response frame ({len(raw)} bytes)") from exc
+
+    async def _exchange(self, payload: bytes) -> bytes:
+        reader, writer = await asyncio.open_unix_connection(str(self.path))
+        try:
+            writer.write(struct.pack(">I", len(payload)) + payload)
+            await writer.drain()
+            header = await self._read_exact(reader, 4)
+            (length,) = struct.unpack(">I", header)
+            if length > MAX_FRAME_BYTES:
+                raise FrameTooLarge(f"response frame of {length} bytes exceeds {MAX_FRAME_BYTES}")
+            return await self._read_exact(reader, length)
+        finally:
+            writer.close()
+            # A closed-but-undrained writer leaves the connection in the event
+            # loop's hands; the daemon serves one request per connection, so an
+            # abandoned half-closed socket is a real leak under a hot loop.
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    @staticmethod
+    async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = await reader.read(n - len(buf))
             if not chunk:
                 raise TransportError(f"connection closed after {len(buf)} of {n} bytes")
             buf.extend(chunk)
@@ -423,7 +487,134 @@ class AsyncHttpTransport:
         await self.aclose()
 
 
-class Session:
+class _SessionCore:
+    """State and the non-IO half of the request path, shared by both sessions.
+
+    `Session` drives it synchronously and `AsyncSession` awaits its transport;
+    everything that DECIDES anything lives here, so the two cannot classify the
+    same response differently. That is the property worth the extra class: a
+    refusal raised on one path and absorbed on the other would be invisible to
+    any test that exercises only one of them.
+    """
+
+    def __init__(
+        self,
+        transport: Transport | None = None,
+        *,
+        namespace: str | None = None,
+        actor_id: str | None = None,
+        visible_namespaces: list[str] | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        """`namespace` is this session's DEFAULT namespace for every op it sends.
+
+        It used to default to `"local"` and reach only the request frame, which
+        the registry does not read as an op argument, so a session constructed
+        with a namespace sent every op unscoped and silently answered about the
+        caller's own namespace instead. The value now falls through to each op
+        that does not name one of its own, which is what the argument reads as.
+        An explicit per-op `namespace=` still wins. `None` means "send no
+        namespace argument", the behaviour of a session that names none.
+        """
+        self.transport = transport or SocketTransport()
+        self.namespace = namespace
+        self.actor_id = actor_id
+        self.visible_namespaces = visible_namespaces or []
+        self.timeout = timeout
+        self._config_id: str | None = None
+
+
+    # -- shared with AsyncSession -----------------------------------------
+    #
+    # These two carry every classification decision on the request path: which
+    # responses are refusals, which are protocol failures, and what a success
+    # decodes to. They take no IO, so both the synchronous driver above and the
+    # awaited one below reach the same verdict on the same bytes. Keeping them
+    # here rather than inlining is what stops the two paths from drifting: a
+    # refusal absorbed on one side and raised on the other is invisible to any
+    # test that exercises only one of them.
+
+    def _request_frame(self, ops_json: str) -> dict[str, Any]:
+        return self._base_frame() | {
+            "ops": ops_json,
+            "config_id": self._config_id,
+        }
+
+    def _decode_results(self, response: dict[str, Any]) -> list[dict[str, Any]]:
+        """Classify one response frame. Raises on refusal; decodes on success."""
+        if response.get("config_mismatch"):
+            # Reached only after the caller already spent its one re-handshake.
+            raise ConfigMismatch(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
+        if not response.get("ok"):
+            raise RequestRejected(
+                str(response.get("error")),
+                error_detail=_validate_frame_error_detail(response, "daemon"),
+            )
+        raw = response.get("result")
+        parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
+        envelope = _envelope_from_payload(parsed, "daemon")
+        return _validate_envelope_results(envelope, "daemon")["results"]
+
+
+    def _plan_frame(self) -> dict[str, Any]:
+        return {
+            "ops": "",
+            # Required by the frame codec; the plan path never resolves identity.
+            "namespace": "",
+            "config_id": self._config_id or "",
+            "protocol_version": PROTOCOL_VERSION,
+        }
+
+    def _op_namespace(self, namespace: str | None) -> str | None:
+        """Resolve one op's namespace: the op's own if it named one, else the
+        session's default, else None so no argument is sent at all."""
+        return namespace if namespace is not None else self.namespace
+
+    def _base_frame(self) -> dict[str, Any]:
+        return {
+            "ops": "",
+            # Verbose passes canonical JSON through unchanged: full ISO-8601
+            # timestamps, no humanized fields ("0s ago"), no redundancy
+            # pre-pass. The compact/agent renderings are for humans and
+            # agents reading text; a typed client needs the machine contract.
+            "presentation": "verbose",
+            "format": "json",
+            # The frame's namespace is an identity field, not a scope: it has
+            # always been a string here, so an unset session keeps sending
+            # "local" and the wire contract is unchanged by the default move.
+            "namespace": self.namespace or "local",
+            "actor_id": self.actor_id,
+            "visible_namespaces": self.visible_namespaces,
+            "config_id": self._config_id or "",
+            "protocol_version": PROTOCOL_VERSION,
+            "from_wire": False,
+        }
+
+    @staticmethod
+    def _check_version(response: dict[str, Any]) -> None:
+        if response.get("version_mismatch"):
+            message = str(response.get("error") or "")
+            detail = _validate_frame_error_detail(response, "daemon")
+            fields = detail.model_dump(exclude_unset=True) if detail is not None else {}
+            fields.pop("domain_result", None)
+            fields.update(
+                kind="protocol",
+                code="version_mismatch",
+                message=message,
+                domain_disposition="unknown",
+            )
+            raise ProtocolMismatch(
+                PROTOCOL_VERSION,
+                int(response.get("daemon_protocol_version") or 0),
+                message,
+                OpError.model_validate(fields),
+            )
+
+
+class Session(_SessionCore):
     """A configured lane to one daemon: transport + identity + adopted config.
 
     Performs the version/config handshake lazily on the first request and
@@ -431,22 +622,6 @@ class Session:
     under a different config, the next request comes back `config_mismatch`
     and the session re-handshakes once before failing.
     """
-
-    def __init__(
-        self,
-        transport: Transport | None = None,
-        *,
-        namespace: str = "local",
-        actor_id: str | None = None,
-        visible_namespaces: list[str] | None = None,
-        timeout: float = 30.0,
-    ) -> None:
-        self.transport = transport or SocketTransport()
-        self.namespace = namespace
-        self.actor_id = actor_id
-        self.visible_namespaces = visible_namespaces or []
-        self.timeout = timeout
-        self._config_id: str | None = None
 
     # -- handshake ---------------------------------------------------------
 
@@ -477,10 +652,7 @@ class Session:
         """Send one ops payload; return the per-op result list."""
         if self._config_id is None:
             self.handshake()
-        frame = self._base_frame() | {
-            "ops": ops_json,
-            "config_id": self._config_id,
-        }
+        frame = self._request_frame(ops_json)
         response = self.transport.round_trip(frame, timeout or self.timeout)
         self._check_version(response)
         if response.get("config_mismatch"):
@@ -489,20 +661,7 @@ class Session:
             frame["config_id"] = self._config_id
             response = self.transport.round_trip(frame, timeout or self.timeout)
             self._check_version(response)
-            if response.get("config_mismatch"):
-                raise ConfigMismatch(
-                    str(response.get("error")),
-                    error_detail=_validate_frame_error_detail(response, "daemon"),
-                )
-        if not response.get("ok"):
-            raise RequestRejected(
-                str(response.get("error")),
-                error_detail=_validate_frame_error_detail(response, "daemon"),
-            )
-        raw = response.get("result")
-        parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
-        envelope = _envelope_from_payload(parsed, "daemon")
-        return _validate_envelope_results(envelope, "daemon")["results"]
+        return self._decode_results(response)
 
     def remember(
         self,
@@ -536,7 +695,7 @@ class Session:
                         source_id=source_id,
                         tags=tags,
                         embedding_model=embedding_model,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -577,7 +736,7 @@ class Session:
                         thread_id=thread_id,
                         tags=tags,
                         self_send=self_send,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -611,7 +770,7 @@ class Session:
                         content=content,
                         idempotency_key=idempotency_key,
                         tags=tags,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -671,7 +830,7 @@ class Session:
                         full_content=full_content,
                         profile_id=profile_id,
                         embedding_model=embedding_model,
-                        namespace=namespace,
+                        namespace=self._op_namespace(namespace),
                     )
                 ]
             ),
@@ -717,48 +876,87 @@ class Session:
         parsed = _decode_json_text(raw, "daemon") if isinstance(raw, str) else raw
         return _plan_from_payload(parsed, "daemon")
 
-    def _plan_frame(self) -> dict[str, Any]:
-        return {
-            "ops": "",
-            # Required by the frame codec; the plan path never resolves identity.
-            "namespace": "",
-            "config_id": self._config_id or "",
-            "protocol_version": PROTOCOL_VERSION,
-        }
 
-    def _base_frame(self) -> dict[str, Any]:
-        return {
-            "ops": "",
-            # Verbose passes canonical JSON through unchanged: full ISO-8601
-            # timestamps, no humanized fields ("0s ago"), no redundancy
-            # pre-pass. The compact/agent renderings are for humans and
-            # agents reading text; a typed client needs the machine contract.
-            "presentation": "verbose",
-            "format": "json",
-            "namespace": self.namespace,
-            "actor_id": self.actor_id,
-            "visible_namespaces": self.visible_namespaces,
-            "config_id": self._config_id or "",
-            "protocol_version": PROTOCOL_VERSION,
-            "from_wire": False,
-        }
+class AsyncSession(_SessionCore):
+    """`Session`'s awaited twin over the local daemon socket.
 
-    @staticmethod
-    def _check_version(response: dict[str, Any]) -> None:
-        if response.get("version_mismatch"):
-            message = str(response.get("error") or "")
-            detail = _validate_frame_error_detail(response, "daemon")
-            fields = detail.model_dump(exclude_unset=True) if detail is not None else {}
-            fields.pop("domain_result", None)
-            fields.update(
-                kind="protocol",
-                code="version_mismatch",
-                message=message,
-                domain_disposition="unknown",
+    Same handshake, same one re-handshake on `config_mismatch`, same refusal
+    classes, because all of that lives in `_SessionCore` and neither driver
+    owns a copy. What differs is only who waits: this one yields to the event
+    loop instead of blocking the calling thread, which is what a caller already
+    inside a loop needs.
+
+    Local socket only, by design. The cloud transport is already awaitable
+    (`AsyncHttpTransport`), and a session that silently accepted either would
+    have to reconcile two lifecycles: this one closes nothing, an HTTP client
+    must be closed. `aclose` here exists so that stays true if that changes.
+    """
+
+    def __init__(
+        self,
+        transport: AsyncSocketTransport | None = None,
+        *,
+        namespace: str | None = None,
+        actor_id: str | None = None,
+        visible_namespaces: list[str] | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        super().__init__(
+            transport or AsyncSocketTransport(),
+            namespace=namespace,
+            actor_id=actor_id,
+            visible_namespaces=visible_namespaces,
+            timeout=timeout,
+        )
+
+    async def ahandshake(self) -> str:
+        """Learn the daemon's protocol version and adopt its config id."""
+        response = await self.transport.round_trip(
+            self._base_frame() | {"metrics_only": True}, self.timeout
+        )
+        self._check_version(response)
+        served = response.get("served_config_id")
+        if not served:
+            raise ConfigMismatch(
+                "daemon did not report a config id; it predates this client's protocol"
             )
-            raise ProtocolMismatch(
-                PROTOCOL_VERSION,
-                int(response.get("daemon_protocol_version") or 0),
-                message,
-                OpError.model_validate(fields),
-            )
+        self._config_id = served
+        return served
+
+    async def ametrics(self) -> dict[str, Any]:
+        response = await self.transport.round_trip(
+            self._base_frame() | {"metrics_only": True}, self.timeout
+        )
+        self._check_version(response)
+        return response.get("metrics") or {}
+
+    async def arequest(
+        self, ops_json: str, *, timeout: float | None = None
+    ) -> list[dict[str, Any]]:
+        """Send one ops payload; return the per-op result list."""
+        if self._config_id is None:
+            await self.ahandshake()
+        frame = self._request_frame(ops_json)
+        response = await self.transport.round_trip(frame, timeout or self.timeout)
+        self._check_version(response)
+        if response.get("config_mismatch"):
+            # One re-handshake: the daemon restarted under a new config.
+            await self.ahandshake()
+            frame["config_id"] = self._config_id
+            response = await self.transport.round_trip(frame, timeout or self.timeout)
+            self._check_version(response)
+        return self._decode_results(response)
+
+    async def aclose(self) -> None:
+        """No-op today: the socket transport opens one connection per request.
+
+        Present so callers can write the `async with` they would write for any
+        other client, and so adding a pooled transport later does not change
+        their code.
+        """
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()

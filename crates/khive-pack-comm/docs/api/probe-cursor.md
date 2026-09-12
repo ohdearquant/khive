@@ -6,10 +6,33 @@ spanning `handlers.rs` and `vocab.rs`.
 
 ## `handlers.rs::PROBE_SQL`
 
-The single indexed read powering `comm.probe` (ADR-D5). `INDEXED BY
-idx_comm_message_to_actor` is a regression fence: if a custom bootstrap skips
-comm schema-plan application, this query fails loudly instead of silently
-degrading to a table scan.
+The page and stale unread count are computed by one SQL statement in the same
+snapshot. Both are scoped to live inbound `message` notes in the caller's
+namespace whose `to_actor` exactly equals the requested actor. Missing or null
+recipients do not enter this probe through the inbox's legacy visibility rules.
+
+Page selection takes the first 100 matching rows with `notes_seq.seq` above
+the honored caller cursor, ordered by sequence ascending. The returned cursor
+is the maximum sequence among those returned rows, floored by the honored
+caller cursor. An empty page does not advance the cursor; an empty baseline
+returns zero. This lets callers drain bursts larger than 100 messages without
+advancing past rows they have not received (#2595). The selected page is then
+ordered by `created_at` ascending for display.
+
+`stale_unread_count` is `min(exact stale unread count, 1000)`: values below
+1000 are exact, and 1000 means at least 1000. It is independent of the arrival
+cursor and page limit. Staleness uses the strict predicate `created_at < cutoff`,
+where the default cutoff is 20 minutes before the probe. A note is unread unless
+`json_type(properties, '$.read')` is `true`; absent, null, and non-boolean values
+remain unread. The count uses the existing partial
+`idx_notes_unread_probe_recipient_direction` index and limits qualifying rows
+before aggregation. This bounds the stale count's work without claiming a bound
+on all page-selection work.
+
+The storage helper `count_notes_filtered_bounded_in_snapshot` is not used here:
+its filter has no before-cutoff predicate, and a separate count invocation would
+not share this statement's snapshot with the returned page. `comm.inbox`'s
+unread-count partitions and contract are unchanged.
 
 `cursor_us`/`since_us` are keyed on `notes_seq.seq`, not SQLite `rowid` and
 not `created_at` (#780, #827):
@@ -50,12 +73,15 @@ as `notes_seq` grows — a fixed ceiling would eventually reset a legitimate
 high sequence value to baseline, contradicting `comm.probe`'s opaque
 round-trip contract.
 
-`query_probe`'s cursor clamp: never let the returned cursor regress below what
-the caller already holds (#827) — if the message that previously held the
-highest `notes_seq.seq` was hard-deleted since the last probe, `MAX(seq)`
-over the remaining rows can be smaller than a cursor already handed out.
-Clamping in Rust, rather than in SQL, keeps the single indexed query a pure
-aggregate with no extra branch.
+An above-high-water cursor is discarded before page selection, and the response
+reports `cursor_reset: true` (#2400). The marker is absent when no cursor was
+supplied or the supplied cursor was honored. The global durable high-water mark
+validates a supplied cursor; it does not advance the page cursor.
+
+`query_probe` retains the caller-cursor floor (#827): deleting a previously
+returned message must not make a later cursor regress. The floor uses the
+honored cursor after any reset. It also preserves the cursor when the next
+page is empty, independently of the maximum sequence in the remaining corpus.
 
 `ProbeParams` is a public polling contract (khive #667 daemon hardening
 slice) — its shape is frozen; see the comm pack README.

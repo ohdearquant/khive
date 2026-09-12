@@ -315,7 +315,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {...}}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
@@ -354,8 +354,33 @@ retrieval path goes through the same status gate.
 same default exclusion. There is no `include_drafts` override on `suggest` — domain atoms in
 draft state should not drive agent composition.
 
-**Score bands** (observed in production): `score >= 0.46` reliably on-target,
-`0.42 <= score < 0.46` mixed quality, `score < 0.42` mostly off-target.
+**Search score interpretation**: scores are request-relative ranking values, not calibrated
+relevance probabilities or absolute presence signals. Use result rank together with
+`candidate_provenance` and each result's `score_provenance`; no fixed numeric band establishes
+relevance across queries.
+
+Every `knowledge.search` result carries `score_provenance` with these fields:
+
+- `sources`: a stable-order subset of `["lexical", "ann"]`. A hit present in both candidate
+  sources retains both labels after RRF fusion.
+- `embedding_rerank`: whether a successful embedding rerank transformed this hit's score.
+- `normalization`: `"s_over_s_plus_1"`. Search applies the monotonic `s / (s + 1)` squash to
+  the score before the status multiplier and final `min_score` filter.
+- `calibrated`: `false`.
+
+The response's `candidate_provenance.lexical` records the lexical candidate-stage outcome:
+`matched` for eligible candidates, `no_match` for no lexical match in the caller's namespace,
+`filtered` for matches removed by eligibility, `partial_timeout` when a timed-out fetch retains
+eligible candidates or decomposed passes mix completion and timeout, and `timed_out` when a
+fetch times out with no retained candidates (or every decomposed pass does so).
+Completed empty terms alone do not make a fetch partial. These states supplement the
+lexical timeout diagnostics.
+
+`candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and no
+returned hit has lexical evidence; otherwise it is `none`, including for an empty result.
+A genuine lexical miss returns no lexical candidates instead of ranking unrelated recent
+corpus rows. A healthy ANN leg can still supply explicitly labeled ANN-only results. Bounded
+eligibility recovery for actual FTS matches remains part of lexical candidate retrieval.
 
 #### `knowledge.compose` — namespace-consistent briefing composition
 

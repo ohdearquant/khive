@@ -2084,6 +2084,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-telemetry",
  "khive-pack-tool",
  "khive-pack-web",
  "khive-pack-workspace",
@@ -2155,13 +2156,16 @@ dependencies = [
  "blake3",
  "inventory",
  "khive-db",
+ "khive-request",
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2491,6 +2495,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-pack-telemetry"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "inventory",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "khive-pack-template"
 version = "0.8.0"
 dependencies = [
@@ -2816,6 +2837,7 @@ dependencies = [
  "khive-pack-moodboard",
  "khive-pack-schedule",
  "khive-pack-session",
+ "khive-pack-telemetry",
  "khive-pack-tool",
  "khive-pack-web",
  "khive-pack-workspace",

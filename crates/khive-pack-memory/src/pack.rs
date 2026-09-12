@@ -217,14 +217,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by ADR-104 posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15%-under-ADR-104 range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
+                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -287,7 +287,8 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Serving-profile override (ADR-104 §4): short-circuits binding resolution so the named profile's state serves this request; stamped and ledgered like a resolved profile. Unknown ids error.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-104 §4.
+                description: "Serving-profile override: short-circuits binding resolution so the named profile's state serves this request; stamped and ledgered like a resolved profile. Unknown ids error.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -329,7 +330,9 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Exact-match read-namespace override (ADR-007 Rev 6 escape hatch). When absent, reads the caller's default visible namespace set (unchanged default behavior). When present, scopes the candidate fetch to exactly this namespace; invalid values are rejected.",
+                // MAINTENANCE, deliberately kept out of the description: this is the
+                // ADR-007 Rev 6 escape hatch.
+                description: "Exact-match read-namespace override. When absent, reads the caller's default visible namespace set (unchanged default behavior). When present, scopes the candidate fetch to exactly this namespace; invalid values are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -379,7 +382,9 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Commissive: curation prune of low-salience or expired memories
     HandlerDef {
         name: "memory.prune",
-        description: "Soft-delete memories below a salience threshold and/or past expires_at. Curation-layer operation per ADR-014.",
+        // MAINTENANCE, deliberately kept out of the description: ADR-014 defines the
+        // curation layer this verb belongs to.
+        description: "Soft-delete memories below a salience threshold and/or past expires_at. A curation-layer operation.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

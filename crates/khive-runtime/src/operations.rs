@@ -12,9 +12,10 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow, SqlStatement, SqlValue,
-    TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
+    DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
+    EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedEdgeUpsertOutcome,
+    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow,
+    SqlStatement, SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{
     Attachment, AttachmentSubstrate, Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter,
@@ -1491,14 +1492,14 @@ impl KhiveRuntime {
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan name, description, structured properties, and tags.
-        crate::secret_gate::check(name)?;
+        crate::secret_gate::check_at(name, "entity", "name")?;
         if let Some(d) = description {
-            crate::secret_gate::check(d)?;
+            crate::secret_gate::check_at(d, "entity", "description")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "entity", "properties")?;
         }
-        crate::secret_gate::check_tags(&tags)?;
+        crate::secret_gate::check_tags_at(&tags, "entity", "tags")?;
         let ns = token.namespace().as_str();
         let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
@@ -1702,6 +1703,30 @@ impl KhiveRuntime {
                 inserted_models.push(model_name.clone());
             }
         }
+
+        // The arrival event, appended only after every compensating step has had
+        // its chance to fire: a create that rolled back returns above and never
+        // reaches here, so the event plane cannot name an entity that does not
+        // exist. Deletes and updates already emitted theirs; creates did not,
+        // which left the audit trail able to say what left the graph and not
+        // what entered it.
+        let event_store = self.events(token)?;
+        let created_event = khive_storage::event::Event::new(
+            entity.namespace.clone(),
+            "create",
+            EventKind::EntityCreated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(entity.id)
+        .with_payload(serde_json::json!({
+            "id": entity.id,
+            "namespace": entity.namespace,
+            "kind": entity.kind,
+        }));
+        event_store.append_event(created_event).await.map_err(|e| {
+            RuntimeError::Internal(format!("create_entity: event store write failed: {e}"))
+        })?;
 
         Ok((entity, embedding_report))
     }
@@ -2522,6 +2547,28 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
+        self.link_observed(
+            token, source_id, target_id, relation, weight, metadata, false,
+        )
+        .await
+        .map(|result| result.edge)
+    }
+
+    /// Observable form of [`Self::link`]. Live natural-key conflicts retain
+    /// the accepted replace semantics, while tombstones require the explicit
+    /// `resurrect` opt-in. The returned preimage and disposition are derived
+    /// inside the graph writer transaction and drive the lifecycle event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_observed(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        resurrect: bool,
+    ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
@@ -2568,43 +2615,28 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        match self.graph(token)?.upsert_edge_guarded(edge).await? {
-            khive_storage::GuardedWriteOutcome::Written => {}
-            khive_storage::GuardedWriteOutcome::Refused(missing) => {
+        let result = match self
+            .graph(token)?
+            .upsert_edge_guarded_observed(EdgeUpsertRequest { edge, resurrect })
+            .await?
+        {
+            GuardedEdgeUpsertOutcome::Written(result) => result,
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::MissingEndpoints(missing)) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
                     entry_index: None,
                     missing_source: missing.source.then_some(source_id),
                     missing_target: missing.target.then_some(target_id),
                 }));
             }
-        }
-
-        // Read back the persisted row by natural key so the returned
-        // edge ID is always the one stored in the database, not the locally
-        // generated UUID that was displaced by an ON CONFLICT DO UPDATE.
-        // Under parallel calls for the same triple, every caller now returns
-        // the same persisted edge ID — the winner's insert or the updated row.
-        let persisted = self
-            .list_edges(
-                token,
-                crate::curation::EdgeListFilter {
-                    source_id: Some(source_id),
-                    target_id: Some(target_id),
-                    relations: vec![relation],
-                    ..Default::default()
-                },
-                1,
-                0,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                crate::RuntimeError::Internal(format!(
-                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
-                ))
-            })?;
-        Ok(persisted)
+            GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::ResurrectionRequired { edge }) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edge {} is soft-deleted; pass resurrect=true to link explicitly",
+                    edge.id
+                )))
+            }
+        };
+        self.append_link_mutation_event(token, &result).await?;
+        Ok(result)
     }
 
     /// Write an edge with an explicit `target_backend` stamp (ADR-029 D3).
@@ -2624,6 +2656,35 @@ impl KhiveRuntime {
         metadata: Option<serde_json::Value>,
         target_backend: Option<String>,
     ) -> RuntimeResult<Edge> {
+        self.link_with_target_backend_observed(
+            token,
+            source_id,
+            target_id,
+            relation,
+            weight,
+            metadata,
+            target_backend,
+            false,
+        )
+        .await
+        .map(|result| result.edge)
+    }
+
+    /// Policy-aware cross-backend form of [`Self::link_observed`]. Endpoint
+    /// validation remains the coordinator's responsibility; mutation
+    /// classification and tombstone handling stay inside the source store.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_with_target_backend_observed(
+        &self,
+        token: &NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        target_backend: Option<String>,
+        resurrect: bool,
+    ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
         validate_edge_metadata(relation, metadata.as_ref())?;
@@ -2642,28 +2703,61 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
-        let persisted = self
-            .list_edges(
-                token,
-                crate::curation::EdgeListFilter {
-                    source_id: Some(source_id),
-                    target_id: Some(target_id),
-                    relations: vec![relation],
-                    ..Default::default()
-                },
-                1,
-                0,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                crate::RuntimeError::Internal(format!(
-                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
-                ))
+        let result = self
+            .graph(token)?
+            .upsert_edge_observed(EdgeUpsertRequest { edge, resurrect })
+            .await
+            .map_err(|error| {
+                if matches!(error, khive_storage::StorageError::Conflict { .. }) {
+                    RuntimeError::InvalidInput(format!(
+                        "edge natural key is soft-deleted; pass resurrect=true to link explicitly: {error}"
+                    ))
+                } else {
+                    error.into()
+                }
             })?;
-        Ok(persisted)
+        self.append_link_mutation_event(token, &result).await?;
+        Ok(result)
+    }
+
+    async fn append_link_mutation_event(
+        &self,
+        token: &NamespaceToken,
+        result: &EdgeUpsertResult,
+    ) -> RuntimeResult<()> {
+        let kind = match result.disposition {
+            EdgeUpsertDisposition::Created => EventKind::LinkCreated,
+            EdgeUpsertDisposition::Updated | EdgeUpsertDisposition::Resurrected => {
+                EventKind::EdgeUpdated
+            }
+        };
+        let edge_id = Uuid::from(result.edge.id);
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        let event = khive_storage::event::Event::new(
+            result.edge.namespace.clone(),
+            "link",
+            kind,
+            SubstrateKind::Entity,
+            actor,
+        )
+        .with_target(edge_id)
+        .with_payload(serde_json::json!({
+            "id": edge_id,
+            "namespace": result.edge.namespace,
+            "mutation": result.disposition.name(),
+            "source_id": result.edge.source_id,
+            "target_id": result.edge.target_id,
+            "relation": result.edge.relation,
+            "weight": result.edge.weight,
+            "metadata": result.edge.metadata,
+            "previous": result.previous,
+        }));
+        self.events(token)?
+            .append_event(event)
+            .await
+            .map_err(|error| {
+                RuntimeError::Internal(format!("link: lifecycle event write failed: {error}"))
+            })
     }
 
     /// Returns `true` if `id` resolves to a live substrate record in the
@@ -3432,12 +3526,12 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Note>> {
         self.validate_note_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check(content)?;
+        crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
-            crate::secret_gate::check(n)?;
+            crate::secret_gate::check_at(n, "note", "name")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "note", "properties")?;
         }
         if !allow_transport_owned_message_properties && kind == "message" {
             if let Some(key) = properties
@@ -3565,12 +3659,12 @@ impl KhiveRuntime {
         let properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         // Secret gate: scan content, optional name, and structured properties.
-        crate::secret_gate::check(content)?;
+        crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
-            crate::secret_gate::check(n)?;
+            crate::secret_gate::check_at(n, "note", "name")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, "note", "properties")?;
         }
         // `embedding_content` is a caller-supplied alternate vector-embedding
         // input: it must be a non-empty proper prefix of `content` (never a
@@ -3588,7 +3682,7 @@ impl KhiveRuntime {
                     "embedding_content must be a proper prefix of content".into(),
                 ));
             }
-            crate::secret_gate::check(ec)?;
+            crate::secret_gate::check_at(ec, "note", "embedding_content")?;
         }
         let ns = token.namespace().as_str();
 
@@ -3894,6 +3988,29 @@ impl KhiveRuntime {
                 }
             }
         }
+
+        // Same contract as the entity arrival event above: after compensation,
+        // so a rolled-back create leaves no event. This is the single funnel for
+        // every note create in the product, which is why the memory pack's own
+        // note_created emitter was removed rather than left beside it.
+        let event_store = self.events(token)?;
+        let created_event = khive_storage::event::Event::new(
+            note.namespace.clone(),
+            "create",
+            EventKind::NoteCreated,
+            SubstrateKind::Note,
+            "",
+        )
+        .with_target(note.id)
+        .with_payload(serde_json::json!({
+            "id": note.id,
+            "namespace": note.namespace,
+            "kind": note.kind,
+            "salience": note.salience,
+        }));
+        event_store.append_event(created_event).await.map_err(|e| {
+            RuntimeError::Internal(format!("create_note: event store write failed: {e}"))
+        })?;
 
         Ok((note, embedding_report))
     }
@@ -6176,6 +6293,19 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         specs: Vec<LinkSpec>,
     ) -> RuntimeResult<Vec<Edge>> {
+        self.link_many_observed(token, specs)
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.edge).collect())
+    }
+
+    /// Observed all-or-nothing bulk link upsert. Every row carries its own
+    /// create/update/resurrection disposition, and every tombstone policy is
+    /// preflighted inside the same writer transaction before any mutation.
+    pub async fn link_many_observed(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<Vec<EdgeUpsertResult>> {
         if specs.is_empty() {
             return Ok(vec![]);
         }
@@ -6191,58 +6321,39 @@ impl KhiveRuntime {
         // entry's index and its missing endpoint(s) come from the guard's own
         // in-transaction pre-check (`GuardedBatchOutcome::refused`), not a
         // post-hoc re-read of the batch after the write already failed.
+        let requests = edges
+            .into_iter()
+            .zip(specs.iter())
+            .map(|(edge, spec)| EdgeUpsertRequest {
+                edge,
+                resurrect: spec.resurrect,
+            })
+            .collect();
         let outcome = self
             .graph(token)?
-            .upsert_edges_guarded(edges.clone())
+            .upsert_edges_guarded_observed(requests)
             .await?;
-        if let Some(refusal) = outcome.refused {
-            return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
-                entry_index: Some(refusal.entry_index),
-                missing_source: refusal
-                    .missing
-                    .source
-                    .then_some(edges[refusal.entry_index].source_id),
-                missing_target: refusal
-                    .missing
-                    .target
-                    .then_some(edges[refusal.entry_index].target_id),
-            }));
+        if let Some(refusal) = outcome.refusal {
+            return match refusal.reason {
+                EdgeUpsertRefusal::MissingEndpoints(missing) => {
+                    Err(RuntimeError::GuardedWriteFailed(guarded_link_batch_failure(
+                        &specs[refusal.entry_index],
+                        refusal.entry_index,
+                        missing,
+                    )))
+                }
+                EdgeUpsertRefusal::ResurrectionRequired { edge } => {
+                    Err(RuntimeError::InvalidInput(format!(
+                        "batch entry {} targets soft-deleted edge {}; pass resurrect=true for that link",
+                        refusal.entry_index, edge.id
+                    )))
+                }
+            };
         }
-        if outcome.summary.affected != edges.len() as u64 {
-            return Err(RuntimeError::NotFound(format!(
-                "link_many: one or more edge endpoints no longer exist at write time: {}",
-                outcome.summary.first_error
-            )));
+        for row in &outcome.rows {
+            self.append_link_mutation_event(token, row).await?;
         }
-
-        // Read back each persisted edge by natural key so callers always
-        // receive the stored row ID, not the pre-upsert generated UUID.
-        let mut persisted = Vec::with_capacity(edges.len());
-        for edge in &edges {
-            let row = self
-                .list_edges(
-                    token,
-                    crate::curation::EdgeListFilter {
-                        source_id: Some(edge.source_id),
-                        target_id: Some(edge.target_id),
-                        relations: vec![edge.relation],
-                        ..Default::default()
-                    },
-                    1,
-                    0,
-                )
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    crate::RuntimeError::Internal(format!(
-                        "upsert_edges succeeded but natural-key lookup for ({}, {}, {}) returned nothing",
-                        edge.source_id, edge.target_id, edge.relation.as_str()
-                    ))
-                })?;
-            persisted.push(row);
-        }
-        Ok(persisted)
+        Ok(outcome.rows)
     }
 
     /// Create a batch of entities atomically.
@@ -6269,7 +6380,8 @@ impl KhiveRuntime {
         // Includes entity-type validation via the pack-installed validator when available.
         // Any validation failure here guarantees zero rows are written.
         let mut entities = Vec::with_capacity(specs.len());
-        for spec in &specs {
+        for (index, spec) in specs.iter().enumerate() {
+            let record = format!("entity[{index}]");
             self.validate_entity_kind(&spec.kind)?;
             // Validate entity_type at the runtime layer via pack-installed callback.
             // When no validator is installed (bare runtime, unit tests without packs),
@@ -6281,14 +6393,14 @@ impl KhiveRuntime {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
             crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
-            crate::secret_gate::check(&spec.name)?;
+            crate::secret_gate::check_at(&spec.name, &record, "name")?;
             if let Some(d) = &spec.description {
-                crate::secret_gate::check(d)?;
+                crate::secret_gate::check_at(d, &record, "description")?;
             }
             if let Some(ref p) = spec.properties {
-                crate::secret_gate::check_json(p)?;
+                crate::secret_gate::check_json_at(p, &record, "properties")?;
             }
-            crate::secret_gate::check_tags(&spec.tags)?;
+            crate::secret_gate::check_tags_at(&spec.tags, &record, "tags")?;
 
             let mut entity =
                 Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
@@ -6374,6 +6486,22 @@ impl KhiveRuntime {
     }
 }
 
+fn guarded_link_batch_failure(
+    spec: &LinkSpec,
+    entry_index: usize,
+    missing: khive_storage::MissingEndpoints,
+) -> GuardedWriteFailure {
+    // Storage flags describe the canonical edge built from this spec, not the
+    // caller's potentially reversed spelling of a symmetric relation.
+    let (source_id, target_id) =
+        canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
+    GuardedWriteFailure {
+        entry_index: Some(entry_index),
+        missing_source: missing.source.then_some(source_id),
+        missing_target: missing.target.then_some(target_id),
+    }
+}
+
 /// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
 /// and [`KhiveRuntime::link_many`].
 #[derive(Clone, Debug)]
@@ -6384,6 +6512,7 @@ pub struct LinkSpec {
     pub relation: EdgeRelation,
     pub weight: f64,
     pub metadata: Option<serde_json::Value>,
+    pub resurrect: bool,
 }
 
 /// Fully specified entity creation request — input to [`KhiveRuntime::create_many`].
@@ -10066,6 +10195,7 @@ mod tests {
                 relation: EdgeRelation::Extends,
                 weight: 1.0,
                 metadata: None,
+                resurrect: false,
             },
             LinkSpec {
                 namespace: None,
@@ -10074,6 +10204,7 @@ mod tests {
                 relation: EdgeRelation::Extends,
                 weight: 1.0,
                 metadata: None,
+                resurrect: false,
             },
         ];
 
@@ -10121,6 +10252,69 @@ mod tests {
             "link_many's guarded batch must be all-or-nothing: the live A-B edge \
              must not have been persisted alongside the doomed A-X edge"
         );
+    }
+
+    #[tokio::test]
+    async fn link_many_reverse_symmetric_refusal_reports_canonical_missing_endpoint() {
+        for relation in [EdgeRelation::CompetesWith, EdgeRelation::ComposedWith] {
+            for delete_source in [true, false] {
+                let rt = rt();
+                let tok = NamespaceToken::local();
+                let a = rt
+                    .create_entity(&tok, "concept", None, "A", None, None, vec![])
+                    .await
+                    .unwrap();
+                let b = rt
+                    .create_entity(&tok, "concept", None, "B", None, None, vec![])
+                    .await
+                    .unwrap();
+                let (source_id, target_id) = (a.id.min(b.id), a.id.max(b.id));
+                let spec = LinkSpec {
+                    namespace: None,
+                    source_id: target_id,
+                    target_id: source_id,
+                    relation,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                };
+                assert!(spec.source_id > spec.target_id);
+                let edge = rt.build_edge(&tok, &spec).await.unwrap();
+                assert_eq!((edge.source_id, edge.target_id), (source_id, target_id));
+
+                let deleted_id = if delete_source { source_id } else { target_id };
+                assert!(rt.delete_entity(&tok, deleted_id, true).await.unwrap());
+                let outcome = rt
+                    .graph(&tok)
+                    .unwrap()
+                    .upsert_edges_guarded_observed(vec![EdgeUpsertRequest {
+                        edge,
+                        resurrect: false,
+                    }])
+                    .await
+                    .unwrap();
+                assert!(outcome.rows.is_empty());
+                let refusal = outcome.refusal.expect("the deleted endpoint must refuse");
+                let EdgeUpsertRefusal::MissingEndpoints(missing) = refusal.reason else {
+                    panic!("expected a missing-endpoint refusal");
+                };
+                assert_eq!(missing.source, delete_source);
+                assert_eq!(missing.target, !delete_source);
+
+                let failure = guarded_link_batch_failure(&spec, refusal.entry_index, missing);
+                assert_eq!(failure.entry_index, Some(0));
+                assert_eq!(failure.missing_source, delete_source.then_some(deleted_id));
+                assert_eq!(
+                    failure.missing_target,
+                    (!delete_source).then_some(deleted_id)
+                );
+                assert!(rt
+                    .list_edges(&tok, EdgeListFilter::default(), 10, 0)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
     }
 
     // ---- hard-delete row + incident-edge purge is ONE transaction ----
@@ -13041,6 +13235,7 @@ mod tests {
                 relation: EdgeRelation::Extends,
                 weight: 1.0,
                 metadata: None,
+                resurrect: false,
             },
             LinkSpec {
                 namespace: None,
@@ -13049,6 +13244,7 @@ mod tests {
                 relation: EdgeRelation::Enables,
                 weight: 1.0,
                 metadata: None,
+                resurrect: false,
             },
         ];
         let edges = rt.link_many(&tok, specs).await.unwrap();
@@ -13231,6 +13427,7 @@ mod tests {
             relation: EdgeRelation::Extends,
             weight: 1.0,
             metadata: None,
+            resurrect: false,
         };
 
         // First call — creates the edge.
@@ -13326,6 +13523,106 @@ mod tests {
     }
 
     // entity_type validated at runtime layer when validator is installed.
+    /// A gate refusal has to name the field it fired on, and the arms differ only in
+    /// WHICH field carries the credential-shaped token. An implementation that named a
+    /// constant location, or named the record and not the field, fails both arms; one
+    /// that named the field and not the batch position fails the first.
+    #[tokio::test]
+    async fn create_many_secret_refusal_names_the_record_and_field() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let token_span = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let clean = |name: &str| EntityCreateSpec {
+            kind: "concept".into(),
+            entity_type: None,
+            name: name.into(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        };
+
+        let err = rt
+            .create_many(&tok, vec![clean("FirstIsClean"), clean(token_span)])
+            .await
+            .expect_err("a credential-shaped name must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("entity[1].name"),
+            "the refusal must name the offending record and field"
+        );
+
+        let mut second = clean("SecondIsClean");
+        second.description = Some(format!("{token_span} sitting in a description"));
+        let err = rt
+            .create_many(&tok, vec![clean("FirstIsClean"), second])
+            .await
+            .expect_err("a credential-shaped description must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("entity[1].description"),
+            "same record, different field: the field half of the location must move"
+        );
+
+        let count = rt.count_entities(&tok, None).await.unwrap();
+        assert_eq!(count, 0, "a rejected batch must leave no entity behind");
+    }
+
+    /// The single-record path needs this as much as the batch path: one write, several
+    /// scanned fields, and before this the writer was told only that something in the
+    /// payload matched.
+    #[tokio::test]
+    async fn create_note_secret_refusal_names_the_field() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let token_span = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                Some(token_span),
+                "content with nothing credential-shaped in it",
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("a credential-shaped name must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(matched.location.as_deref(), Some("note.name"));
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                Some("a clean name"),
+                &format!("{token_span} sitting in the content"),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("a credential-shaped content must fail the secret gate");
+        let RuntimeError::SecretDetected(matched) = err else {
+            panic!("expected SecretDetected, got {err:?}");
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("note.content"),
+            "the location must follow the field that actually matched"
+        );
+    }
+
     #[tokio::test]
     async fn create_many_rejects_unknown_entity_type_when_validator_installed() {
         let rt = rt();

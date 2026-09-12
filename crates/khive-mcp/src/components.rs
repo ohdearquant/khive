@@ -7,8 +7,8 @@
 //! shutdown. External components register at link time through `inventory`
 //! (ADR-119 Amendment 1), so a distribution binary's components participate
 //! without this crate naming any of them. The host additionally contributes
-//! the dynamic `schedule-tick` registration when its resolved pack set carries
-//! a schedule runtime (ADR-119 Amendment 4); a plain core build still has an
+//! dynamic `schedule-tick` and `blob-upload-sweep` registrations when their
+//! resolved packs supply writable state; a plain core build still has an
 //! empty external inventory.
 //!
 //! Supervision joins the daemon's existing shutdown path: every supervisor
@@ -152,6 +152,44 @@ fn schedule_component_registration(
                 interval,
             ))
         }),
+    }
+}
+
+const BLOB_UPLOAD_COMPONENT_NAME: &str = "blob-upload-sweep";
+
+fn blob_upload_component_registration(
+    manager: Arc<khive_pack_blob::uploads::UploadManager>,
+) -> ComponentRegistration {
+    ComponentRegistration {
+        name: BLOB_UPLOAD_COMPONENT_NAME,
+        restart: RestartClass::OnFailure,
+        max_restarts: 5,
+        backoff_initial_ms: 1_000,
+        backoff_max_ms: 60_000,
+        shutdown_timeout_ms: 5_000,
+        start: Arc::new(move |ctx| Box::pin(blob_upload_sweep_loop(manager.clone(), ctx))),
+    }
+}
+
+async fn blob_upload_sweep_loop(
+    manager: Arc<khive_pack_blob::uploads::UploadManager>,
+    ctx: HostContext,
+) -> Result<(), ComponentError> {
+    let interval = manager.sweep_interval();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+        match manager.sweep().await {
+            Ok(_) => ctx.heartbeat(),
+            Err(error) => {
+                tracing::warn!(%error, "blob upload sweep failed; retrying at the next tick");
+            }
+        }
     }
 }
 
@@ -328,15 +366,14 @@ pub fn start_daemon_components(server: &KhiveMcpServer) -> usize {
     start_daemon_components_with_schedule(server, None)
 }
 
-/// Start the linked daemon components plus the host-owned schedule drain when
-/// the daemon resolved the `schedule` pack. The schedule component is dynamic
-/// because it must capture that exact pack runtime; reconstructing a runtime
-/// here can point the drain at a different backend (ADR-106, PR #782).
+/// Start linked components and the host-owned schedule and upload loops.
+/// Dynamic registrations capture the exact registered pack state; rebuilding
+/// a pack here would lose its in-memory state or use another backend.
 pub(crate) fn start_daemon_components_with_schedule(
     server: &KhiveMcpServer,
     schedule_runtime: Option<khive_runtime::KhiveRuntime>,
 ) -> usize {
-    let regs = component_registrations(schedule_runtime);
+    let regs = component_registrations(schedule_runtime, server.blob_upload_manager());
     start_component_registrations(
         regs,
         server,
@@ -347,6 +384,7 @@ pub(crate) fn start_daemon_components_with_schedule(
 
 fn component_registrations(
     schedule_runtime: Option<khive_runtime::KhiveRuntime>,
+    upload_manager: Option<Arc<khive_pack_blob::uploads::UploadManager>>,
 ) -> Vec<ComponentRegistration> {
     let linked: Vec<&'static DaemonComponentRegistration> =
         inventory::iter::<DaemonComponentRegistration>().collect();
@@ -362,6 +400,9 @@ fn component_registrations(
             runtime,
             crate::pending_events::tick_interval_from_env(),
         ));
+    }
+    if let Some(manager) = upload_manager {
+        regs.push(blob_upload_component_registration(manager));
     }
     regs
 }
@@ -669,6 +710,203 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct UploadSweepProbe {
+        calls: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::BlobStore for UploadSweepProbe {
+        async fn put(
+            &self,
+            _bytes: Vec<u8>,
+        ) -> khive_storage::StorageResult<khive_storage::ContentRef> {
+            panic!("sweeper must not publish objects")
+        }
+
+        async fn get_bounded_verified(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+            _max_bytes: u64,
+        ) -> khive_storage::StorageResult<Vec<u8>> {
+            panic!("sweeper must not read committed objects")
+        }
+
+        async fn exists(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            panic!("sweeper must not inspect committed objects")
+        }
+
+        async fn size(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<Option<u64>> {
+            panic!("sweeper must not inspect committed objects")
+        }
+
+        async fn delete(
+            &self,
+            _content_ref: &khive_storage::ContentRef,
+        ) -> khive_storage::StorageResult<bool> {
+            panic!("sweeper must not delete committed objects")
+        }
+
+        async fn sweep_uploads(&self, _idle_for: Duration) -> khive_storage::StorageResult<u64> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= 6 {
+                Err(khive_storage::StorageError::Internal(
+                    "transient upload sweep failure".to_string(),
+                ))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    fn blob_server(runtime: KhiveRuntime) -> KhiveMcpServer {
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_blob::BlobPack::new(runtime));
+        KhiveMcpServer::from_registry(builder.build().expect("blob registry"))
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn blob_upload_roster_uses_the_registered_manager_and_requires_an_available_store() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let unavailable = blob_server(runtime);
+        assert!(unavailable.blob_upload_manager().is_none());
+
+        let empty_registry = khive_runtime::VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let absent = KhiveMcpServer::from_registry(empty_registry);
+        assert!(absent.blob_upload_manager().is_none());
+
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        runtime
+            .install_blob_store(Arc::new(UploadSweepProbe::default()))
+            .expect("install blob store");
+        let server = blob_server(runtime);
+        let manager = server.blob_upload_manager().expect("upload manager");
+        assert!(Arc::ptr_eq(
+            &manager,
+            &server
+                .clone()
+                .blob_upload_manager()
+                .expect("cloned manager")
+        ));
+        let roster = component_registrations(None, Some(manager));
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|reg| reg.name == BLOB_UPLOAD_COMPONENT_NAME)
+                .count(),
+            1
+        );
+        assert!(
+            component_registrations(None, unavailable.blob_upload_manager())
+                .iter()
+                .all(|reg| reg.name != BLOB_UPLOAD_COMPONENT_NAME)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn blob_upload_roster_obeys_its_own_runtime_mode_in_mixed_deployments() {
+        let (_dir, db) = tmp_db();
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(db)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["blob".to_string()],
+            ..Default::default()
+        };
+        KhiveRuntime::new(config.clone()).expect("initialize database");
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+        let read_only = KhiveRuntime::new_readonly(config).expect("read-only runtime");
+        read_only
+            .install_blob_store(Arc::new(UploadSweepProbe::default()))
+            .expect("install read-only blob store");
+        let before = read_only.backend().pool().writer_acquisition_snapshot();
+        let writable = KhiveRuntime::memory().expect("writable runtime");
+        writable
+            .install_blob_store(Arc::new(UploadSweepProbe::default()))
+            .expect("install writable blob store");
+
+        let read_only_blob = blob_server(read_only.clone()).with_runtime(writable.clone());
+        assert!(read_only_blob.blob_upload_manager().is_none());
+        let writable_blob = blob_server(writable).with_runtime(read_only.clone());
+        assert!(writable_blob.blob_upload_manager().is_some());
+        assert_eq!(
+            read_only.backend().pool().writer_acquisition_snapshot(),
+            before,
+            "upload admission must not probe a read-only backend through a writer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blob_upload_sweeper_delays_retries_skips_missed_ticks_and_joins_on_cancel() {
+        let store = Arc::new(UploadSweepProbe::default());
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        runtime
+            .install_blob_store(store.clone())
+            .expect("install blob store");
+        let server = blob_server(runtime);
+        let manager = server.blob_upload_manager().expect("upload manager");
+        let interval = manager.sweep_interval();
+        let health = HealthReporter::default();
+        let parent = CancellationToken::new();
+        let supervisor = tokio::spawn(supervise(
+            blob_upload_component_registration(manager),
+            server,
+            parent.child_token(),
+            health.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+
+        for expected in 2..=7 {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+            assert_eq!(store.calls.load(Ordering::SeqCst), expected);
+        }
+        let status = health.status(BLOB_UPLOAD_COMPONENT_NAME).expect("status");
+        assert_eq!(status.state, ComponentState::Running);
+        assert_eq!(
+            status.restart_count, 0,
+            "backend errors must not spend restart budget"
+        );
+        assert!(status.last_heartbeat.is_some());
+
+        tokio::time::advance(interval * 4).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            8,
+            "missed ticks must not burst"
+        );
+        parent.cancel();
+        supervisor.await.expect("supervisor joins");
+        let status = health.status(BLOB_UPLOAD_COMPONENT_NAME).expect("status");
+        assert_eq!(status.state, ComponentState::Stopped);
+        tokio::time::advance(interval * 3).await;
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            8,
+            "no sweep may outlive shutdown"
+        );
+    }
+
     #[test]
     fn shutdown_wait_is_clamped_strictly_inside_the_drain_window() {
         let drain_ms = 10_000;
@@ -752,11 +990,11 @@ mod tests {
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime");
 
-        let absent = component_registrations(None)
+        let absent = component_registrations(None, None)
             .into_iter()
             .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
             .count();
-        let present: Vec<_> = component_registrations(Some(rt))
+        let present: Vec<_> = component_registrations(Some(rt), None)
             .into_iter()
             .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
             .collect();
@@ -793,7 +1031,7 @@ mod tests {
         let read_only = KhiveRuntime::new_readonly(cfg).expect("open schedule snapshot read-only");
         let before = read_only.backend().pool().writer_acquisition_snapshot();
 
-        let schedule_count = component_registrations(Some(read_only.clone()))
+        let schedule_count = component_registrations(Some(read_only.clone()), None)
             .into_iter()
             .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
             .count();

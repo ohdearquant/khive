@@ -503,6 +503,94 @@ impl Fixture {
 
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
+async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
+    let f = Fixture::new(true, true).await;
+    let manifest = f.tree(&[("a.txt", b"caller program control\n", 644)]).await;
+    let refs = f.git_bytes(&["show-ref"]);
+    let index = std::fs::read(f.repo.join(".git/index")).expect("index before refused calls");
+    let handlers: Vec<_> = f
+        .registry
+        .pack_verbs("git")
+        .expect("registered Git handlers")
+        .iter()
+        .filter(|handler| handler.params.iter().any(|param| param.name == "repo"))
+        .collect();
+    assert!(!handlers.is_empty());
+    for handler in handlers {
+        let verb = handler.name;
+        let cases = match verb {
+            "git.init" => vec![json!({"repo":f.blank,"branch":"main"})],
+            "git.checkout" => vec![json!({"repo":f.repo,"ref":f.base})],
+            "git.diff" => {
+                vec![json!({"repo":f.repo,"input_kind":"commits","base":f.base,"head":f.base})]
+            }
+            "git.branch" => {
+                vec![
+                    json!({"repo":f.repo,"name":"program-control","from":f.base,"expected":f.base}),
+                ]
+            }
+            "git.commit" => vec![
+                f.commit_params(&manifest),
+                json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy program control"}),
+            ],
+            "git.push" => {
+                vec![
+                    json!({"repo":f.repo,"branch":"work","expected_local":f.base,"expected_remote":null}),
+                ]
+            }
+            "git.pr_open" => {
+                vec![
+                    json!({"repo":f.repo,"head":"work","base":"main","title":"Program control","body":"","expected_head":f.base}),
+                ]
+            }
+            "git.pr_review" => {
+                vec![
+                    json!({"repo":f.repo,"number":1,"verdict":"comment","body":"Program control","expected_head":f.base}),
+                ]
+            }
+            "git.pr_merge" => {
+                vec![
+                    json!({"repo":f.repo,"number":1,"method":"squash","subject":"Program control","body":"","expected_head":f.base}),
+                ]
+            }
+            "git.receipts" | "git.gates" | "git.status" | "git.log" => {
+                vec![json!({"repo":f.repo})]
+            }
+            _ => panic!("repository-taking Git verb needs an arm 5 payload: {verb}"),
+        };
+        f.policy(verb, "allow").await;
+        let help = f.registry.describe_verb(verb).expect("Git verb schema");
+        let schema = &help["input_schema"];
+        assert_eq!(schema["additionalProperties"], false, "{verb}");
+        let properties = schema["properties"].as_object().expect("schema properties");
+        assert!(!properties.contains_key("program"), "{verb}");
+        for mut params in cases {
+            for key in params.as_object().expect("object payload").keys() {
+                assert!(
+                    properties.contains_key(key),
+                    "{verb}: undeclared fixture field {key}"
+                );
+            }
+            for required in schema["required"].as_array().expect("required fields") {
+                let required = required.as_str().expect("required field name");
+                assert!(
+                    params.get(required).is_some(),
+                    "{verb}: missing fixture field {required}"
+                );
+            }
+            params["program"] = json!(f.git);
+            let error = f.err(verb, params.clone()).await;
+            assert!(error.contains("invalid_params"), "{verb} {params}: {error}");
+        }
+    }
+    assert_eq!(f.git_bytes(&["show-ref"]), refs);
+    assert_eq!(std::fs::read(f.repo.join(".git/index")).unwrap(), index);
+    assert!(!f.blank.join(".git").exists());
+    assert_eq!(f.resolver_count(), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
 async fn arm13_existing_branch_refuses_without_repository_changes() {
     let f = Fixture::new(true, false).await;
     f.policy("git.branch", "allow").await;
@@ -1466,7 +1554,7 @@ async fn arm30_tool_pack_absence_refuses_tree_commit_but_preserves_legacy_paths(
     let legacy = f
         .call(
             "git.commit",
-            json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy paths commit"}),
+            json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy paths commit","branch":"work","expected_head":f.base}),
         )
         .await;
     let sha = legacy["sha"].as_str().expect("legacy commit SHA");

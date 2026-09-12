@@ -20,10 +20,12 @@ pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
+mod error_projection;
 mod event_store_guard;
 pub mod events_split;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod input_schema;
 pub mod keyed_memory;
 #[cfg(test)]
 mod keyed_memory_tests;
@@ -51,9 +53,10 @@ pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
 mod streams;
+pub mod telemetry_config;
 pub use streams::{
-    refusal_value, StreamAppendSpec, StreamBatchMember, StreamBatchRefusal, StreamObservation,
-    StreamWriteSpec,
+    refusal_value, StreamAppendDisposition, StreamAppendFailure, StreamAppendSpec,
+    StreamBatchMember, StreamBatchRefusal, StreamObservation, StreamWriteSpec,
 };
 pub mod time_anchor;
 pub use khive_storage::usage;
@@ -106,6 +109,7 @@ pub use error::{
     WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
     WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
+pub use error_projection::runtime_error_value;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -139,10 +143,11 @@ pub use operations::{
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
     IdResolutionMode, IngestAuditStore, InterceptedDispatchResult, KindHook, NoteKindSpec,
-    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration,
-    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
-    SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
-    VerifiedActor, Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
+    PackMetadataRegistry, PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError,
+    PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy,
+    VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
+    AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
@@ -163,6 +168,10 @@ pub use runtime::{
     NoteMutationHookFn, NoteWriteValidatorFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+pub use telemetry_config::{
+    TelemetryCarrier, TelemetryChannelConfig, TelemetryConfig, TelemetryFailurePosture,
+    TelemetryPolicy,
+};
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

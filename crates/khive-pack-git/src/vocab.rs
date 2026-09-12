@@ -11,6 +11,8 @@ use khive_types::{
     IdResolutionMode, ParamDef, VerbCategory, Visibility,
 };
 
+use crate::sql::sql;
+
 /// Shared open/closed lifecycle for `issue` and `pull_request`. See
 /// crates/khive-pack-git/docs/api/vocab.md#git_lifecycle.
 const GIT_LIFECYCLE: NoteLifecycleSpec = NoteLifecycleSpec {
@@ -43,15 +45,8 @@ pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 5] = [
     crate::receipts::RECEIPTS_TABLE_SQL,
     crate::receipts::RECEIPTS_ACTOR_INDEX_SQL,
     crate::receipts::RECEIPTS_SESSION_INDEX_SQL,
-    "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
-        project_id   TEXT NOT NULL,\
-        kind         TEXT NOT NULL,\
-        cursor_value TEXT,\
-        updated_at   INTEGER NOT NULL,\
-        PRIMARY KEY (project_id, kind)\
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_git_mirror_cursor_updated \
-        ON git_mirror_cursor(updated_at DESC)",
+    sql!("git_mirror_cursor_table_create"),
+    sql!("git_mirror_cursor_updated_index_create"),
 ];
 
 /// ADR-088 Amendment 1: parent→child commit lineage as `precedes` edges

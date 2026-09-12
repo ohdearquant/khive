@@ -92,6 +92,9 @@ pub enum ConfigError {
     #[error("[exec] {key}: {reason}")]
     InvalidExecConfig { key: String, reason: String },
 
+    #[error("{entry}: {reason}")]
+    InvalidTelemetryConfig { entry: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -450,6 +453,9 @@ pub struct GitWriteEntryConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteSectionConfig {
+    /// Absolute git executable override; absent preserves PATH resolution.
+    #[serde(default)]
+    pub program: Option<PathBuf>,
     #[serde(default)]
     pub allowed: Vec<GitWriteEntryConfig>,
     #[serde(default)]
@@ -515,6 +521,7 @@ fn default_git_credential_resolver() -> Vec<String> {
 impl Default for GitWriteSectionConfig {
     fn default() -> Self {
         Self {
+            program: None,
             allowed: Vec::new(),
             actors: BTreeMap::new(),
             repositories: BTreeMap::new(),
@@ -526,11 +533,44 @@ impl Default for GitWriteSectionConfig {
 }
 
 impl GitWriteSectionConfig {
+    pub fn git_program(&self) -> &Path {
+        self.program.as_deref().unwrap_or_else(|| Path::new("git"))
+    }
+
     pub fn validate_dev_loop(&self) -> Result<(), ConfigError> {
         let invalid = |key: &str, reason: &str| ConfigError::InvalidGitWriteConfig {
             key: key.to_string(),
             reason: reason.to_string(),
         };
+        if let Some(program) = &self.program {
+            if !program.is_absolute() {
+                return Err(invalid("git_write.program", "must be absolute"));
+            }
+            let metadata = std::fs::metadata(program).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    invalid("git_write.program", "does not exist")
+                } else {
+                    invalid("git_write.program", &format!("is not executable: {error}"))
+                }
+            })?;
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(windows)]
+            let executable = program
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+                });
+            #[cfg(not(any(unix, windows)))]
+            let executable = false;
+            if !metadata.is_file() || !executable {
+                return Err(invalid("git_write.program", "is not executable"));
+            }
+        }
         if self.contract_faults && !cfg!(feature = "contract-faults") {
             tracing::error!(
                 target: "khive.boot",
@@ -730,12 +770,13 @@ pub struct ExecSectionConfig {
 /// - `[gate]`: built-in caller enrollment
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
+/// - `[telemetry]`: stream and channel carrier policy
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The security-sensitive `[gate]` and `[brain]` tables are closed with
+/// compatibility. The `[gate]`, `[brain]`, and `[telemetry]` tables are closed with
 /// `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
@@ -808,6 +849,10 @@ pub struct KhiveConfig {
     /// refuses every `exec.run` until `[exec] read_roots` names a toolchain.
     #[serde(default)]
     pub exec: ExecSectionConfig,
+
+    /// Stream and channel carrier policy. Unclassified kinds default to ephemeral.
+    #[serde(default)]
+    pub telemetry: crate::telemetry_config::TelemetryConfig,
 
     /// Rendering timezone configuration (ADR-169). Absent `timezone` resolves
     /// to the host's local zone at [`RuntimeConfig`](crate::RuntimeConfig)
@@ -1097,6 +1142,7 @@ impl KhiveConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
+        self.telemetry.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
@@ -2875,6 +2921,220 @@ grant_unattributed = false
         assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
+    #[test]
+    fn telemetry_missing_default_stays_absent_with_or_without_engines() {
+        use crate::{TelemetryCarrier, TelemetryConfig};
+
+        assert_eq!(KhiveConfig::default().telemetry, TelemetryConfig::default());
+        assert_eq!(
+            in_memory_runtime_config().telemetry,
+            TelemetryConfig::default()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            for telemetry in ["", "[telemetry]\n"] {
+                let path = write_toml(&dir, &format!("{engines}\n{telemetry}"));
+                let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+                let mut base = in_memory_runtime_config();
+                base.telemetry.stream = "previous".to_string();
+                base.telemetry.default_carrier = Some(TelemetryCarrier::Durable);
+                let resolved = crate::runtime_config_from_khive_config(&config, base);
+                assert_eq!(resolved.telemetry, TelemetryConfig::default());
+                assert_eq!(resolved.telemetry.stream, "telemetry");
+                assert_eq!(resolved.telemetry.default_carrier, None);
+                let error = resolved
+                    .telemetry
+                    .validate_activation()
+                    .expect_err("activating telemetry requires the declared default");
+                assert!(error.to_string().contains("telemetry.default_carrier"));
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_table_loads_and_resolves_with_or_without_engines() {
+        use crate::{TelemetryCarrier, TelemetryFailurePosture};
+
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "[[engines]]\nname = \"primary\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"{engines}
+[telemetry]
+stream = "operations"
+default_carrier = "durable"
+[[telemetry.channels]]
+kinds = ["run.started", "run.completed"]
+carrier = "durable"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["turn.delta", "*.heartbeat"]
+carrier = "ephemeral"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+            assert_eq!(config.telemetry.channels.len(), 2);
+            let resolved =
+                crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+            assert_eq!(resolved.telemetry, config.telemetry);
+            assert_eq!(resolved.telemetry.stream, "operations");
+            for kind in ["run.started", "run.completed"] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Durable);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Gap);
+            }
+            for kind in ["turn.delta", "run.heartbeat", "turn.child.heartbeat"] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Ephemeral);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
+            }
+            for kind in [
+                "unclassified",
+                "heartbeat",
+                "run.notheartbeat",
+                "run.heartbeat.extra",
+            ] {
+                let policy = resolved.telemetry.policy_for_kind(kind).unwrap();
+                assert_eq!(policy.carrier, TelemetryCarrier::Durable);
+                assert_eq!(policy.failure_posture, TelemetryFailurePosture::Stop);
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_invalid_policy_values_name_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        for (carrier, posture, field, value) in [
+            ("disk", "stop", "carrier", "disk"),
+            ("Durable", "stop", "carrier", "Durable"),
+            ("durable", "ignore", "failure_posture", "ignore"),
+            ("durable", "Stop", "failure_posture", "Stop"),
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["first"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["second"]
+carrier = "{carrier}"
+failure_posture = "{posture}"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("invalid policy must refuse");
+            let message = error.to_string();
+            for expected in ["telemetry.channels[1]", field, value] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+        let path = write_toml(&dir, "[telemetry]\ndefault_carrier = \"disk\"\n");
+        let error = KhiveConfig::load(Some(&path)).expect_err("unknown fallback must refuse");
+        assert!(
+            error.to_string().contains("telemetry.default_carrier"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn telemetry_overlapping_channels_name_both_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for (first, second) in [
+            ("run.started", "run.started"),
+            ("run.heartbeat", "*.heartbeat"),
+            ("*.heartbeat", "run.heartbeat"),
+            ("*.heartbeat", "*.heartbeat"),
+            ("*.heartbeat", "*.child.heartbeat"),
+            ("*.child.heartbeat", "*.heartbeat"),
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["{first}"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = ["{second}"]
+carrier = "durable"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("overlap must refuse");
+            let message = error.to_string();
+            for expected in [
+                "telemetry.channels[1]",
+                "telemetry.channels[0]",
+                first,
+                second,
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_empty_and_invalid_kind_patterns_name_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        for kinds in [
+            "[]",
+            "[\"\"]",
+            "[\" \"]",
+            "[\"two names\"]",
+            "[\"*\"]",
+            "[\"run.*\"]",
+            "[\"*.\"]",
+            "[\"**.heartbeat\"]",
+            "[\"*.heart*beat\"]",
+        ] {
+            let path = write_toml(
+                &dir,
+                &format!(
+                    r#"[[telemetry.channels]]
+kinds = ["first"]
+carrier = "ephemeral"
+failure_posture = "gap"
+[[telemetry.channels]]
+kinds = {kinds}
+carrier = "durable"
+failure_posture = "stop"
+"#
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("invalid kinds must refuse");
+            assert!(
+                error.to_string().contains("telemetry.channels[1]"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_tables_reject_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            "[telemetry]\ndefault_carrrier = \"durable\"\n",
+            "[telemetry.ring]\ncapacity = 4096\n",
+            "[[telemetry.channels]]\nkinds = [\"run\"]\ncarrier = \"durable\"\nfailure_posture = \"stop\"\ncarrrier = \"ephemeral\"\n",
+        ] {
+            let path = write_toml(&dir, content);
+            let error = KhiveConfig::load(Some(&path)).expect_err("unknown key must refuse");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
     // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────
 
     // No [git_write] section at all -> empty allowlist, valid config.
@@ -2886,6 +3146,106 @@ grant_unattributed = false
             .expect("no error")
             .expect("file found");
         assert!(cfg.git_write.allowed.is_empty());
+    }
+
+    fn write_git_program_config(dir: &tempfile::TempDir, program: &Path) -> PathBuf {
+        let program = toml::Value::String(program.to_str().unwrap().to_string());
+        write_toml(dir, &format!("[git_write]\nprogram = {program}\n"))
+    }
+
+    #[test]
+    fn git_program_absent_preserves_path_default() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in ["# no git_write section\n", "[git_write]\n"] {
+            let path = write_toml(&dir, content);
+            let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+            assert!(cfg.git_write.program.is_none());
+            assert_eq!(cfg.git_write.git_program(), Path::new("git"));
+        }
+        assert!(GitWriteSectionConfig::default().program.is_none());
+        assert_eq!(
+            GitWriteSectionConfig::default().git_program(),
+            Path::new("git")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn git_program_absolute_executable_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = std::env::current_exe().unwrap();
+        let path = write_git_program_config(&dir, &program);
+        let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        assert_eq!(cfg.git_write.program.as_deref(), Some(program.as_path()));
+        assert_eq!(cfg.git_write.git_program(), program);
+    }
+
+    #[test]
+    fn git_program_relative_path_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for program in ["git", "relative/git"] {
+            let path = write_git_program_config(&dir, Path::new(program));
+            let error = KhiveConfig::load(Some(&path)).expect_err("relative program must fail");
+            assert!(
+                matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                    if key == "git_write.program" && reason == "must be absolute"),
+                "unexpected error: {error}"
+            );
+            assert!(error.to_string().contains("git_write.program"));
+        }
+    }
+
+    #[test]
+    fn git_program_missing_file_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_git_program_config(&dir, &dir.path().join("missing-git"));
+        let error = KhiveConfig::load(Some(&path)).expect_err("missing program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
+    }
+
+    #[test]
+    fn git_program_nonexecutable_file_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("git.txt");
+        std::fs::write(&program, "not executable\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = write_git_program_config(&dir, &program);
+        let error = KhiveConfig::load(Some(&path)).expect_err("nonexecutable program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "is not executable"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
+    }
+
+    #[test]
+    fn git_program_directory_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("git.exe");
+        std::fs::create_dir(&program).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = write_git_program_config(&dir, &program);
+        let error = KhiveConfig::load(Some(&path)).expect_err("directory program must fail");
+        assert!(
+            matches!(config_error_root(&error), ConfigError::InvalidGitWriteConfig { key, reason }
+                if key == "git_write.program" && reason == "is not executable"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("git_write.program"));
     }
 
     // A well-formed [[git_write.allowed]] entry parses correctly.

@@ -43,7 +43,7 @@ use khive_runtime::{
 };
 use khive_types::RefusalReason;
 
-use khive_storage::{EdgeRelation, StorageCapability};
+use khive_storage::EdgeRelation;
 
 use crate::coordinator::{BackendSearchFailureKind, CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
@@ -619,6 +619,7 @@ impl DispatchFailure {
         let reason = match &error {
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
             RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
+            error if error.is_stream_policy_refusal() => Some(RefusalReason::PolicyRefusal),
             _ => None,
         };
         Self {
@@ -875,6 +876,14 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     );
     let brain = format!("{:x}", brain_hasher.finalize());
 
+    let mut telemetry_hasher = Sha256::new();
+    telemetry_hasher.update(b"khive.telemetry-policy.v1");
+    telemetry_hasher.update(
+        serde_json::to_vec(&config.telemetry)
+            .expect("telemetry configuration is JSON serializable"),
+    );
+    let telemetry = format!("{:x}", telemetry_hasher.finalize());
+
     let backend = if storage_read_only {
         format!("{:?}:read_only", config.backend_id)
     } else {
@@ -909,7 +918,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};telemetry={};display_tz={}",
         packs.join(","),
         db,
         primary,
@@ -921,6 +930,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         gate,
         git_write,
         brain,
+        telemetry,
         config.display_timezone.name(),
     );
 
@@ -1760,6 +1770,12 @@ impl KhiveMcpServer {
         self
     }
 
+    pub(crate) fn blob_upload_manager(
+        &self,
+    ) -> Option<Arc<khive_pack_blob::uploads::UploadManager>> {
+        self.registry.pack_host_state("blob")
+    }
+
     /// Clone the verb registry for use by background tasks (e.g. channel polling loops).
     ///
     /// `VerbRegistry` is internally `Arc`-wrapped so this clone is cheap. The returned
@@ -2568,6 +2584,10 @@ async fn dispatch_via_coordinator_inner(
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             let metadata = args_value.get("metadata").cloned();
+            let resurrect = args_value
+                .get("resurrect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
 
             let result = registry
                 .dispatch_intercepted_with_metadata_and_disposition(
@@ -2576,7 +2596,10 @@ async fn dispatch_via_coordinator_inner(
                     identity,
                     |namespace| async move {
                         let coord_result = coord
-                            .link(&namespace, source_id, target_id, relation, weight, metadata)
+                            .link(
+                                &namespace, source_id, target_id, relation, weight, metadata,
+                                resurrect,
+                            )
                             .await
                             .map_err(RuntimeError::from)?;
                         let mut raw = serde_json::to_value(&coord_result.edge)
@@ -2586,6 +2609,9 @@ async fn dispatch_via_coordinator_inner(
                                 obj.insert("source_id".to_string(), json!(source_id.to_string()));
                                 obj.insert("target_id".to_string(), json!(target_id.to_string()));
                             }
+                        }
+                        if let Some(obj) = raw.as_object_mut() {
+                            obj.insert("mutation".to_string(), json!(coord_result.mutation.name()));
                         }
                         Ok(InterceptedDispatchResult::new(raw, ()))
                     },
@@ -2772,144 +2798,15 @@ fn coordinator_search_visibility(
 /// Every runtime variant is explicitly covered. Dispatch provenance, not the
 /// variant, determines whether the domain handler ran successfully, except for
 /// the named write outcomes, which carry their own domain proof.
+/// Apply MCP transport limits after the shared typed projection. The boundary's
+/// original disposition decides whether an obligation result may be retained;
+/// named error overrides remain exactly as emitted by the shared projection.
 fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
-    // These named outcomes carry their own domain proof. Do not infer general
-    // write disposition from a conflict or unavailable variant.
-    let named_disposition = match &error {
-        RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
-            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
-            // ADR-174 A1.1: a stream member refusal carries
-            // `domain_disposition: not_committed` wherever it surfaces. In
-            // per-member mode it is the member's own value and the runtime
-            // writes the field itself; in atomic mode the refusal is raised
-            // as the call's error, where without these rows the boundary's
-            // `unknown` would stand and the caller could not tell a batch
-            // that wrote nothing from one whose outcome is unestablished.
-            (khive_types::ErrorKind::Conflict, Some("seq_conflict")) => Some("not_committed"),
-            (khive_types::ErrorKind::Conflict, Some("unknown_op")) => Some("not_committed"),
-            (khive_types::ErrorKind::Conflict, Some("version_conflict" | "identity_conflict")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::Conflict, Some("expired" | "live_until_unreadable")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
-                Some("not_committed")
-            }
-            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
-                Some("not_committed")
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    // The refusal text is the same Display string every consumer already
-    // matches on; the receipt fields ride beside it.
-    let denial_message =
-        matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
-    let payload = match error {
-        RuntimeError::PermissionDenied {
-            verb,
-            reason,
-            receipt,
-        } => json!({
-            "kind": "runtime_error",
-            "code": "permission_denied",
-            "message": denial_message.unwrap_or_default(),
-            "verb": verb,
-            "reason": reason,
-            "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
-            "audit_outcome": receipt.audit_outcome.wire_code(),
-        }),
-        RuntimeError::AuditObligation {
-            failure,
-            domain_result,
-        } => {
-            let mut error = serde_json::Map::from_iter([
-                ("kind".into(), json!("obligation")),
-                ("code".into(), json!(failure.wire_code())),
-                ("message".into(), json!(failure.to_string())),
-            ]);
-            error.insert("domain_result".into(), domain_result);
-            Value::Object(error)
-        }
-        RuntimeError::Khive(k) => serde_json::to_value(&k)
-            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
-        RuntimeError::RemoteFetchError { remote, message } => json!({
-            "kind": "remote_fetch_error",
-            "remote": remote,
-            "message": message,
-        }),
-        other @ (RuntimeError::Storage(_)
-        | RuntimeError::Sqlite(_)
-        | RuntimeError::Query(_)
-        | RuntimeError::NotFound(_)
-        | RuntimeError::InvalidInput(_)
-        | RuntimeError::UnknownVerb(_)
-        | RuntimeError::Unconfigured(_)
-        | RuntimeError::UnknownModel(_)
-        | RuntimeError::Embedding(_)
-        | RuntimeError::Ambiguous(_)
-        | RuntimeError::Fusion(_)
-        | RuntimeError::UnknownFusionStrategy(_)
-        | RuntimeError::Internal(_)
-        | RuntimeError::IncompatibleEventStore(_)
-        | RuntimeError::GuardedWriteFailed(_)
-        | RuntimeError::MissingPackDependency(_)
-        | RuntimeError::MissingPackDependencies(_)
-        | RuntimeError::CircularPackDependency(_)
-        | RuntimeError::PackRedeclared { .. }
-        | RuntimeError::VerbCollision { .. }
-        | RuntimeError::ReservedEnvelopeParam { .. }
-        | RuntimeError::GateUnavailable { .. }
-        | RuntimeError::NamespaceMismatch { .. }
-        | RuntimeError::AmbiguousPrefix { .. }
-        | RuntimeError::CrossBackendMergeUnsupported { .. }
-        | RuntimeError::UnknownRemote { .. }
-        | RuntimeError::RemoteCacheMissing { .. }
-        | RuntimeError::AmbiguousId { .. }
-        | RuntimeError::CrossNamespaceWrite { .. }
-        | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::SecretDetected(_)
-        | RuntimeError::DeadlineExceeded { .. }) => {
-            if let Some(context) = other.writer_task_failure_context() {
-                json!({"kind":"storage", "code":context.stage, "stage":context.stage,
-                    "message":other.to_string(), "retryable":context.retryable,
-                    "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
-            } else if let Some(context) = other.retryable_failure_context() {
-                let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
-                json!({"kind":"unavailable", "code":context.stage, "stage":context.stage,
-                    "message":other.to_string(), "retryable":true, "timeout_ms":timeout_ms,
-                    "capability":context.capability.map(storage_capability_wire_name),
-                    "operation":context.operation, "scope":context.scope, "retry_after_ms":context.retry_after_ms})
-            } else {
-                json!({"kind":"runtime_error", "message":other.to_string()})
-            }
-        }
-    };
-    let mut value = error_with_disposition(payload, disposition);
-    if let Some(named) = named_disposition {
-        value["domain_disposition"] = json!(named);
-    }
+    let projected = khive_runtime::runtime_error_value(error, disposition);
+    let projected_disposition = error_disposition(&projected);
+    let mut value = error_with_disposition(projected, disposition);
+    value["domain_disposition"] = json!(projected_disposition.as_str());
     value
-}
-
-fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
-    match capability {
-        StorageCapability::Sql => "sql",
-        StorageCapability::Notes => "notes",
-        StorageCapability::Entities => "entities",
-        StorageCapability::Graph => "graph",
-        StorageCapability::Events => "events",
-        StorageCapability::Vectors => "vectors",
-        StorageCapability::Sparse => "sparse",
-        StorageCapability::Text => "text",
-        StorageCapability::Blob => "blob",
-        StorageCapability::Attachments => "attachments",
-    }
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
@@ -5009,10 +4906,42 @@ impl ServerHandler for KhiveMcpServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::coordinator::BackendSearchFailure;
+    use super::{
+        attach_audit_persistence_advisories, backend_errors_value, bounded_backend_error_key,
+        bounded_backend_error_message, build_instructions, build_verb_catalog,
+        canonical_fingerprint_path, chain_aggregation_depth_reject,
+        chain_ok_envelope_or_depth_error, compute_config_id, compute_config_id_with_ann_fresh_tail,
+        compute_config_id_with_runtime_policies, compute_config_id_with_storage_mode,
+        coordinator_search_visibility, dsl_err_to_mcp, empty_rendered_daemon_frame_len,
+        encode_backend_topology, ensure_bridge_request_id, entry_escaped_len, envelope_escaped_len,
+        envelope_metadata, envelope_metadata_escaped_len, execute_bounded_batch,
+        fit_rendered_batch_envelope, format_served_kinds_suffix, frame_budget_omission,
+        ok_envelope, parallel_batch_envelope, present_ok_envelope_or_depth_error, render_result,
+        rendered_response_daemon_frame_len, rendered_response_fits_daemon_frame,
+        request_read_timeout, result_exceeds_depth_limit, runtime_error_value,
+        scope_mcp_request_read_cancellation, search_diagnostic_value, search_diagnostic_wire_len,
+        search_retry_after_ms, serialize_response_value, serialized_response_len,
+        BackendErrorDiagnostic, BatchTask, DispatchOrigin, KhiveMcpServer, OpSuccess,
+        RunParsedContext, SearchArmEvidence, SearchArmParticipation, SearchArmStatus,
+        SearchDegradation, SearchStatus, BATCH_RESPONSE_BUDGET_BYTES, MAX_BACKEND_ERROR_ENTRIES,
+        MAX_BACKEND_ERROR_KEY_CHARS, MAX_BACKEND_ERROR_MESSAGE_CHARS, MAX_BATCH_CONCURRENCY,
+        MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP, MISSING_BACKEND_ERROR_MESSAGE,
+    };
+    #[cfg(unix)]
+    use super::{stdio_serve_mode_for, ForwardFuture, StdioServeMode};
+    use crate::coordinator::{
+        BackendSearchFailure, BackendSearchFailureKind, CoordSearchResult, CoordinatorService,
+    };
+    use crate::tools::request::RequestParams;
+    use khive_request::{parse_request, ExecutionMode, TypedJsonOp};
+    use khive_runtime::{
+        render_format, DomainDisposition, KhiveRuntime, Namespace, OutputFormat, PresentationMode,
+        RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    };
+    use rmcp::{handler::server::wrapper::Parameters, ErrorData as McpError};
+    use serde_json::{json, Value};
+    use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
-    use khive_runtime::Namespace;
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
@@ -5297,7 +5226,18 @@ mod tests {
 
     #[cfg(unix)]
     mod read_replay_tests {
-        use super::*;
+        use super::super::{ForwardFuture, KhiveMcpServer};
+        use super::{clear_daemon_env, stats_without_request_local_usage};
+        use crate::tools::request::RequestParams;
+        use khive_runtime::{
+            KhiveRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+        };
+        use rmcp::handler::server::wrapper::Parameters;
+        use serde_json::Value;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         thread_local! {
             static CAPTURED_FORWARD: std::cell::RefCell<Option<(String, bool)>> =
@@ -6440,6 +6380,52 @@ mod tests {
         assert_ne!(configured_id, fingerprint(&revoked));
         revoked.brain.fleet_readers.clear();
         assert_eq!(fingerprint(&revoked), fingerprint(&base));
+    }
+
+    #[test]
+    fn config_id_separates_telemetry_policy_without_exposing_values() {
+        use khive_runtime::{TelemetryCarrier, TelemetryChannelConfig, TelemetryFailurePosture};
+
+        let mut base = RuntimeConfig::no_embeddings();
+        base.telemetry.stream = "example-telemetry-stream".into();
+        base.telemetry.channels.push(TelemetryChannelConfig {
+            kinds: vec!["run.completed".into()],
+            carrier: TelemetryCarrier::Durable,
+            failure_posture: TelemetryFailurePosture::Stop,
+        });
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let original = fingerprint(&base);
+        assert!(!original.contains("example-telemetry-stream"));
+        assert!(!original.contains("run.completed"));
+        assert_eq!(original, fingerprint(&base.clone()));
+        for field in [
+            "stream",
+            "default_carrier",
+            "kinds",
+            "carrier",
+            "failure_posture",
+            "channels",
+        ] {
+            let mut changed = base.clone();
+            match field {
+                "stream" => changed.telemetry.stream.push('2'),
+                "default_carrier" => {
+                    changed.telemetry.default_carrier = Some(TelemetryCarrier::Durable)
+                }
+                "kinds" => changed.telemetry.channels[0]
+                    .kinds
+                    .push("run.failed".into()),
+                "carrier" => changed.telemetry.channels[0].carrier = TelemetryCarrier::Ephemeral,
+                "failure_posture" => {
+                    changed.telemetry.channels[0].failure_posture = TelemetryFailurePosture::Gap
+                }
+                "channels" => changed.telemetry.channels.clear(),
+                _ => unreachable!(),
+            }
+            assert_ne!(original, fingerprint(&changed), "changed {field}");
+        }
     }
 
     #[test]
@@ -8832,6 +8818,50 @@ mod tests {
         assert_eq!(names, vec!["assign", "list", "search"]);
     }
 
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn telemetry_inventory_dispatch_preserves_configured_carriers() {
+        use khive_runtime::{TelemetryCarrier, TelemetryChannelConfig, TelemetryFailurePosture};
+
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".into(), "telemetry".into()];
+        config.telemetry.stream = "configured-events".into();
+        config.telemetry.default_carrier = Some(TelemetryCarrier::Ephemeral);
+        config.telemetry.channels.push(TelemetryChannelConfig {
+            kinds: vec!["run.completed".into()],
+            carrier: TelemetryCarrier::Durable,
+            failure_posture: TelemetryFailurePosture::Stop,
+        });
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("linked telemetry factory");
+        let durable = server
+            .registry
+            .dispatch(
+                "telemetry.emit",
+                json!({"kind":"run.completed","payload":{"count":1}}),
+            )
+            .await
+            .expect("configured durable emit");
+        assert_eq!(durable["carrier"], "durable");
+        let ephemeral = server
+            .registry
+            .dispatch("telemetry.emit", json!({"kind":"new.event","payload":null}))
+            .await
+            .expect("default ephemeral emit");
+        assert_eq!(ephemeral["carrier"], "ephemeral");
+        assert_eq!(ephemeral["outcome"], "dropped");
+        assert_eq!(ephemeral["classified"], false);
+        assert!(ephemeral["receipt_id"].is_null());
+        let page = server
+            .registry
+            .dispatch("stream.read", json!({"stream":"configured-events"}))
+            .await
+            .expect("existing stream read");
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["record"]["kind"], "run.completed");
+    }
+
     // ── #658 regression: brain dispatch hook wired into production builder ──
 
     /// The hook (registered via `PackInstall::dispatch_hook`) and the pack
@@ -10932,9 +10962,15 @@ mod tests {
 }
 #[cfg(test)]
 mod request_read_cancellation_tests {
-    use std::time::Duration;
-
-    use super::*;
+    use super::{
+        scope_mcp_request_read_cancellation, stdio_bridge_response_deadline_from_env,
+        KhiveMcpServer,
+    };
+    use crate::tools::request::RequestParams;
+    use khive_runtime::{KhiveRuntime, RuntimeConfig};
+    use rmcp::{handler::server::wrapper::Parameters, ErrorData as McpError};
+    use serde_json::Value;
+    use std::{future::Future, sync::Arc, time::Duration};
 
     #[derive(Clone)]
     struct EofProbeServer {

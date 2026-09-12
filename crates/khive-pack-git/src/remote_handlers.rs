@@ -12,6 +12,7 @@ use crate::local_handlers::{
 };
 use crate::receipts::{self, Disposition, Receipt};
 use crate::remote_transport::{ApiRequest, PushRequest, RemoteError};
+use crate::sql::sql;
 use crate::write_argv::{validate_ref_name, validate_repo_path};
 use crate::{credentials, local_git, GitPack};
 
@@ -426,13 +427,24 @@ impl GitPack {
             }
         }
         if verb == "git.push" {
-            let (version, supported) = local_git::push_marker_support(&repo).await?;
+            let (version, supported) = local_git::push_marker_support(
+                self.runtime().config().git_write.git_program(),
+                &repo,
+            )
+            .await?;
             if !supported {
-                receipt.result = json!({"toolchain":{"git_version":version,"missing_capability":"reflog write"}});
+                receipt.result = json!({"toolchain":{"git_version":version,"git_program":self.runtime().config().git_write.git_program(),"missing_capability":"reflog write"}});
                 return Err(Failure::refused("unsupported_toolchain"));
             }
             let expected = required(params, "expected_local")?.to_ascii_lowercase();
-            if local_git::branch_head(&repo, required(params, "branch")?).await? != expected {
+            if local_git::branch_head(
+                self.runtime().config().git_write.git_program(),
+                &repo,
+                required(params, "branch")?,
+            )
+            .await?
+                != expected
+            {
                 return Err(Failure::refused("expected_local_mismatch"));
             }
         }
@@ -658,7 +670,14 @@ impl GitPack {
             return Err(Failure::refused("expected_remote_mismatch"));
         }
         if let Some(old) = &old {
-            if !local_git::is_ancestor(Path::new(&receipt.repo), old, &expected).await? {
+            if !local_git::is_ancestor(
+                self.runtime().config().git_write.git_program(),
+                Path::new(&receipt.repo),
+                old,
+                &expected,
+            )
+            .await?
+            {
                 return Err(Failure::refused("non_fast_forward"));
             }
         }
@@ -686,9 +705,15 @@ impl GitPack {
             return Err(Failure::unknown("remote_readback_mismatch"));
         }
         // A marker records an acknowledged effect, never an intention to push.
-        local_git::record_push_marker(Path::new(&receipt.repo), branch, &expected, &receipt.id)
-            .await
-            .map_err(|_| Failure::unknown("marker_unavailable"))?;
+        local_git::record_push_marker(
+            self.runtime().config().git_write.git_program(),
+            Path::new(&receipt.repo),
+            branch,
+            &expected,
+            &receipt.id,
+        )
+        .await
+        .map_err(|_| Failure::unknown("marker_unavailable"))?;
         Ok(result)
     }
 
@@ -742,11 +767,20 @@ impl GitPack {
             .reader()
             .await
             .map_err(RuntimeError::from)?;
-        let rows = reader.query_all(SqlStatement {
-            sql:"SELECT actor, credential FROM git_receipts WHERE namespace=?1 AND repo=?2 AND verb='git.pr_open' AND disposition != 'not_committed' AND json_extract(result,'$.number')=?3 LIMIT 1001".into(),
-            params:vec![SqlValue::Text(receipt.namespace.clone()),SqlValue::Text(receipt.repo.clone()),SqlValue::Integer(i64::try_from(number).map_err(|_| Failure::invalid("number too large"))?)],
-            label:Some("git_pr_opener".into()),
-        }).await.map_err(RuntimeError::from)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql!("pr_open_receipts_by_number_select").into(),
+                params: vec![
+                    SqlValue::Text(receipt.namespace.clone()),
+                    SqlValue::Text(receipt.repo.clone()),
+                    SqlValue::Integer(
+                        i64::try_from(number).map_err(|_| Failure::invalid("number too large"))?,
+                    ),
+                ],
+                label: Some("git_pr_opener".into()),
+            })
+            .await
+            .map_err(RuntimeError::from)?;
         if rows.len() > 1000 {
             return Err(Failure::refused("opener_evidence_limit"));
         }
@@ -784,17 +818,20 @@ impl GitPack {
             .reader()
             .await
             .map_err(RuntimeError::from)?;
-        let rows = reader.query_all(SqlStatement {
-            sql: "SELECT id, repo, disposition, credential FROM git_receipts \
-                  WHERE namespace=?1 AND verb='git.push' AND disposition IN ('committed','unknown') \
-                  AND lower(json_extract(result,'$.sha'))=?2 AND json_extract(result,'$.ref')=?3 \
-                  AND lower(json_extract(result,'$.remote')) IN (?4,?5) \
-                  ORDER BY rowid DESC LIMIT 1001".into(),
-            params: vec![SqlValue::Text(receipt.namespace.clone()),SqlValue::Text(expected.into()),
-                SqlValue::Text(format!("refs/heads/{branch}")),SqlValue::Text(remote.clone()),
-                SqlValue::Text(format!("{remote}.git"))],
-            label: Some("git_last_pusher".into()),
-        }).await.map_err(RuntimeError::from)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql!("push_receipts_by_head_select").into(),
+                params: vec![
+                    SqlValue::Text(receipt.namespace.clone()),
+                    SqlValue::Text(expected.into()),
+                    SqlValue::Text(format!("refs/heads/{branch}")),
+                    SqlValue::Text(remote.clone()),
+                    SqlValue::Text(format!("{remote}.git")),
+                ],
+                label: Some("git_last_pusher".into()),
+            })
+            .await
+            .map_err(RuntimeError::from)?;
         // No SQL reader is held across local Git process execution.
         drop(reader);
         for row in rows.iter().take(1000) {
@@ -804,9 +841,15 @@ impl GitPack {
             };
             let id = column("id")?;
             if column("disposition")? != "committed"
-                && !local_git::operation_recorded(Path::new(column("repo")?), branch, expected, id)
-                    .await
-                    .unwrap_or(false)
+                && !local_git::operation_recorded(
+                    self.runtime().config().git_write.git_program(),
+                    Path::new(column("repo")?),
+                    branch,
+                    expected,
+                    id,
+                )
+                .await
+                .unwrap_or(false)
             {
                 // A durable intent or a lost transport ACK is not push evidence.
                 continue;
@@ -926,9 +969,15 @@ impl GitPack {
                 if prior.result.get("remote").and_then(Value::as_str) != Some(&target.remote) {
                     return Ok(());
                 }
-                local_git::operation_recorded(repo, branch, &sha, &prior.id)
-                    .await
-                    .unwrap_or(false)
+                local_git::operation_recorded(
+                    self.runtime().config().git_write.git_program(),
+                    repo,
+                    branch,
+                    &sha,
+                    &prior.id,
+                )
+                .await
+                .unwrap_or(false)
                     && self
                         .remote_transport()
                         .remote_ref(

@@ -27,6 +27,14 @@ fn fixture_with_keep(keep: bool) -> Fixture {
 }
 
 fn fixture_with_limits(keep: bool, limits: ExecLimitsConfig) -> Fixture {
+    fixture_with_limits_and_output_cap(keep, limits, 128)
+}
+
+fn fixture_with_limits_and_output_cap(
+    keep: bool,
+    limits: ExecLimitsConfig,
+    max_output_bytes: u64,
+) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
@@ -37,7 +45,7 @@ fn fixture_with_limits(keep: bool, limits: ExecLimitsConfig) -> Fixture {
             read_roots: vec!["/bin".into(), "/usr/bin".into()],
             env: vec!["E1_ALLOWED".into()],
             never: vec!["/usr/bin/true".into()],
-            max_output_bytes: Some(128),
+            max_output_bytes: Some(max_output_bytes),
             timeout_default_s: Some(5.0),
             timeout_max_s: Some(10.0),
             keep,
@@ -694,6 +702,7 @@ async fn refusals_write_receipts_and_touch_no_disk() {
         .to_string();
     let receipt = f.call("exec.receipt", json!({ "id": id })).await;
     assert_eq!(receipt["denied"], true);
+    assert_eq!(receipt["effective_max_output_bytes"], 128);
     assert!(receipt["exit_code"].is_null());
     assert!(receipt["tree_out"].is_null());
     assert!(root_is_empty(&f));
@@ -713,6 +722,7 @@ async fn refusals_write_receipts_and_touch_no_disk() {
         .to_string();
     let receipt = f.call("exec.receipt", json!({ "id": id })).await;
     assert_eq!(receipt["decision"]["decision"], "deny");
+    assert_eq!(receipt["effective_max_output_bytes"], 128);
     assert_eq!(receipt["decision"]["source"], "policy");
     assert!(receipt["decision"]["id"].is_string());
     // Never binary refused even with allow.
@@ -1097,6 +1107,7 @@ async fn run_materialize_symlink_failure_persists_receipt_and_cleans_up() {
         assert!(receipt["profile_ref"].is_null());
         assert!(receipt["sandbox"].is_null());
         assert_eq!(receipt["changed"], json!([]));
+        assert_eq!(receipt["effective_max_output_bytes"], 128);
         assert_eq!(out["changed"], json!([]));
         let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
         assert_eq!(&stored, receipt, "the materialization failure is durable");
@@ -1156,6 +1167,7 @@ async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
         assert!(receipt["finished_at"].is_string());
         let stored = f.call("exec.receipt", json!({"id":receipt["id"]})).await;
         assert_eq!(&stored, receipt, "the failed receipt is durable");
+        assert_eq!(receipt["effective_max_output_bytes"], 128);
         let events = f.call("exec.events", json!({"run_id":receipt["id"]})).await;
         let kinds: Vec<&str> = events["events"]
             .as_array()
@@ -1625,6 +1637,7 @@ async fn run_timeout_kills_the_group_and_output_tail_is_kept() {
     assert_eq!(receipt["timed_out"], true, "{receipt}");
     assert!(receipt["exit_code"].is_null());
     assert_eq!(receipt["success"], false);
+    assert_eq!(receipt["effective_max_output_bytes"], 128);
     let big = f
         .call(
             "exec.run",
@@ -1950,4 +1963,108 @@ async fn limiting_resource_refusal_is_present_null() {
     let stored = f.call("exec.receipt", json!({"id": listed["id"]})).await;
     assert_eq!(stored.get("limiting_resource"), Some(&Value::Null));
     assert!(root_is_empty(&f));
+}
+
+async fn check_effective_output_cap(f: &Fixture, receipt: &Value, cap: u64) {
+    assert_eq!(receipt.get("effective_max_output_bytes"), Some(&json!(cap)));
+    let stored = f.call("exec.receipt", json!({"id": receipt["id"]})).await;
+    assert_eq!(&stored, receipt, "the stored cap belongs to this run");
+    let runs = f.call("exec.runs", json!({"actor": "local"})).await;
+    let listed = runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == receipt["id"])
+        .expect("receipt listed");
+    assert_eq!(listed, receipt);
+}
+
+#[tokio::test]
+async fn effective_output_cap_is_preserved_on_refusal_receipts() {
+    for cap in [0, 17, 4096] {
+        let f = fixture_with_limits_and_output_cap(false, ExecLimitsConfig::default(), cap);
+        let tree = f.tree(&[]).await;
+        let error = f
+            .call_err(
+                "exec.run",
+                json!({"tree": tree, "tool": "unregistered-output-tool", "actor": "local"}),
+            )
+            .await;
+        let id = error
+            .split("receipt_id=")
+            .nth(1)
+            .expect("refusal names its durable receipt")
+            .trim_end_matches(')');
+        let receipt = f.call("exec.receipt", json!({"id": id})).await;
+        assert_eq!(receipt["denied"], true);
+        assert!(receipt["started_at"].is_null());
+        assert!(receipt["sandbox"].is_null());
+        check_effective_output_cap(&f, &receipt, cap).await;
+        assert!(root_is_empty(&f));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn effective_output_cap_is_preserved_on_complete_receipts() {
+    for cap in [17, 41] {
+        let f = fixture_with_limits_and_output_cap(false, ExecLimitsConfig::default(), cap);
+        f.register_sh("sh", "allow").await;
+        let tree = f.tree(&[]).await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree": tree, "tool": "sh", "actor": "local",
+                    "args": ["-c", "printf out; printf err >&2"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["success"], true, "{receipt}");
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(receipt[format!("{stream}_produced_bytes")], 3);
+            assert_eq!(receipt[format!("{stream}_retained_bytes")], 3);
+            assert_eq!(receipt[format!("{stream}_capture")], "complete");
+        }
+        check_effective_output_cap(&f, receipt, cap).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn effective_output_cap_explains_truncated_receipts() {
+    for cap in [0, 17] {
+        let f = fixture_with_limits_and_output_cap(false, ExecLimitsConfig::default(), cap);
+        f.register_sh("sh", "allow").await;
+        let tree = f.tree(&[]).await;
+        let out = f
+            .call(
+                "exec.run",
+                json!({"tree": tree, "tool": "sh", "actor": "local",
+                    "args": ["-c", "printf 0123456789abcdefghijklmnop; printf ABCDEFGHIJKLMNOPQRSTUVWXYZ >&2"]}),
+            )
+            .await;
+        let receipt = &out["receipt"];
+        assert_eq!(receipt["success"], true, "{receipt}");
+        for (stream, produced) in [
+            ("stdout", "0123456789abcdefghijklmnop"),
+            ("stderr", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        ] {
+            assert_eq!(receipt[format!("{stream}_produced_bytes")], 26);
+            assert_eq!(receipt[format!("{stream}_retained_bytes")], cap);
+            assert!(
+                receipt[format!("{stream}_retained_bytes")]
+                    .as_u64()
+                    .unwrap()
+                    < receipt[format!("{stream}_produced_bytes")]
+                        .as_u64()
+                        .unwrap()
+            );
+            assert_eq!(receipt[format!("{stream}_capture")], "incomplete");
+            assert_eq!(
+                f.blob_text(&receipt[format!("{stream}_ref")]).await,
+                &produced[produced.len() - cap as usize..]
+            );
+        }
+        check_effective_output_cap(&f, receipt, cap).await;
+    }
 }

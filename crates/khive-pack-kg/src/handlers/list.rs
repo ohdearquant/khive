@@ -16,6 +16,7 @@ use super::common::{
     resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json, validate_entity_type, KindSpec,
     ListParams,
 };
+use crate::sql::sql;
 use crate::KgPack;
 
 const ENTITY_LIST_CAP: u32 = 500;
@@ -86,20 +87,9 @@ async fn resolve_message_thread_filter(
     } else {
         token.visible_namespace_strs()
     };
-    let placeholders = (1..=visible.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
-                   FROM notes WHERE namespace IN ({placeholders}) AND deleted_at IS NULL \
-                   AND json_type(properties, '$.thread_id') = 'text' \
-                   AND kind = 'message'"
-    );
-    let params = visible
-        .into_iter()
-        .map(|namespace| SqlValue::Text(namespace.to_string()))
-        .collect();
+    let visible_json = serde_json::to_string(&visible).map_err(|error| {
+        RuntimeError::Internal(format!("serialize visible namespaces: {error}"))
+    })?;
     let mut reader = runtime
         .sql()
         .reader()
@@ -107,8 +97,8 @@ async fn resolve_message_thread_filter(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql,
-            params,
+            sql: sql!("message_threads_list").to_string(),
+            params: vec![SqlValue::Text(visible_json)],
             label: Some("list.resolve_message_thread_filter".to_string()),
         })
         .await
@@ -779,6 +769,7 @@ impl KgPack {
 mod tests {
     use super::parse_after_cursor;
     use crate::handlers::common::{event_filter_from_params, ListParams};
+    use crate::sql::sql;
 
     #[test]
     fn after_cursor_rejects_prefix_with_keyset_consequence() {
@@ -807,6 +798,53 @@ mod tests {
             assert!(message.contains(field), "{message}");
             assert!(message.contains("can miss or be ambiguous"), "{message}");
             assert!(message.contains("exact stable record"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_limit() {
+        use khive_runtime::{KhiveRuntime, Namespace};
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let namespace = Namespace::parse("scope-one").expect("valid namespace");
+        let token = runtime.authorize(namespace).expect("authorized namespace");
+        runtime
+            .create_note(
+                &token,
+                "message",
+                None,
+                "threaded message",
+                None,
+                Some(serde_json::json!({
+                    "thread_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                })),
+                vec![],
+            )
+            .await
+            .expect("create message note");
+
+        let past_bind_limit = (0..33_000)
+            .map(|index| format!("scope-{index}"))
+            .chain(std::iter::once("scope-one".to_string()))
+            .collect::<Vec<_>>();
+        for (case, namespaces, expected_rows) in [
+            ("empty", Vec::<String>::new(), 0),
+            ("single", vec!["scope-one".to_string()], 1),
+            ("past SQLite bind limit", past_bind_limit, 1),
+        ] {
+            let namespaces_json =
+                serde_json::to_string(&namespaces).expect("serialize namespace scope");
+            let mut reader = runtime.sql().reader().await.expect("SQL reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: sql!("message_threads_list").to_string(),
+                    params: vec![SqlValue::Text(namespaces_json)],
+                    label: Some("test.message_threads_list".into()),
+                })
+                .await
+                .expect("message thread scope query");
+            assert_eq!(rows.len(), expected_rows, "{case} namespace scope");
         }
     }
 }

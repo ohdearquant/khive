@@ -33,7 +33,7 @@ pub(super) enum LexicalPhase {
     PhaseBHydration,
     EligibilityFallback,
     NamespaceMembership,
-    RecentFallback,
+    NamespaceExistence,
 }
 
 impl LexicalPhase {
@@ -45,7 +45,7 @@ impl LexicalPhase {
             Self::PhaseBHydration => "phase_b_hydration",
             Self::EligibilityFallback => "eligibility_fallback",
             Self::NamespaceMembership => "namespace_membership",
-            Self::RecentFallback => "recent_fallback",
+            Self::NamespaceExistence => "namespace_existence",
         }
     }
 

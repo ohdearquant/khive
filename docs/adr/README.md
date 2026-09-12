@@ -199,6 +199,8 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-180](ADR-180-tool-pack.md)                                         | Tool Pack: Capability Registry, Ontological Discovery and Use Policy                                       |
 | [ADR-181](ADR-181-exec-verb-sandboxed-run.md)                           | Exec Verb: One Declared Command in a Sandbox over a Materialized Tree                                      |
 | [ADR-182](ADR-182-git-dev-loop-verbs.md)                                | Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests            |
+| [ADR-183](ADR-183-batched-write-disposition.md)                         | Batched Write Disposition: Commit What Passes, Name What Refuses                                           |
+| [ADR-184](ADR-184-telemetry-pack.md)                                    | Telemetry Pack — Channel Table, Emit Outcome, and Read-Time Rollup                                         |
 
 <!-- END GENERATED ADR CATALOG -->
 

@@ -13,7 +13,7 @@ use khive_db::stores::blob_s3::{S3BlobStore, S3BlobStoreConfig};
 use khive_db::{SqliteError, StorageBackend};
 use khive_storage::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, SqlAccess,
-    StorageCapability, StorageError, StorageResult,
+    StorageCapability, StorageError, StorageResult, UploadId,
 };
 
 use crate::engine_config::BlobConfig;
@@ -427,6 +427,26 @@ impl BlobStore for ReadOnlyBlobStore {
         Err(Self::mutation_error("put"))
     }
 
+    async fn begin_upload(&self, _declared_size: u64) -> StorageResult<UploadId> {
+        Err(Self::mutation_error("begin_upload"))
+    }
+
+    async fn append_part(&self, _id: &UploadId, _bytes: Vec<u8>) -> StorageResult<u64> {
+        Err(Self::mutation_error("append_part"))
+    }
+
+    async fn commit_upload(&self, _id: &UploadId, _content_ref: &ContentRef) -> StorageResult<()> {
+        Err(Self::mutation_error("commit_upload"))
+    }
+
+    async fn abort_upload(&self, _id: &UploadId) -> StorageResult<()> {
+        Err(Self::mutation_error("abort_upload"))
+    }
+
+    async fn sweep_uploads(&self, _idle_for: std::time::Duration) -> StorageResult<u64> {
+        Err(Self::mutation_error("sweep_uploads"))
+    }
+
     async fn get_bounded_verified(
         &self,
         content_ref: &ContentRef,
@@ -470,6 +490,53 @@ mod tests {
     use super::*;
     use crate::engine_config::StorageSectionConfig;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn read_only_upload_methods_refuse_without_mutating_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0).unwrap(),
+        );
+        let id = inner.begin_upload(1).await.unwrap();
+        let reference = ContentRef::from_hex("a".repeat(64)).unwrap();
+        let guarded = ReadOnlyBlobStore {
+            inner: inner.clone(),
+        };
+        let failures = [
+            guarded.begin_upload(1).await.map(|_| ()),
+            guarded.append_part(&id, vec![1]).await.map(|_| ()),
+            guarded.commit_upload(&id, &reference).await,
+            guarded.abort_upload(&id).await,
+            guarded
+                .sweep_uploads(std::time::Duration::ZERO)
+                .await
+                .map(|_| ()),
+        ];
+        for (result, expected) in failures.into_iter().zip([
+            "begin_upload",
+            "append_part",
+            "commit_upload",
+            "abort_upload",
+            "sweep_uploads",
+        ]) {
+            let StorageError::Unsupported {
+                operation, message, ..
+            } = result.unwrap_err()
+            else {
+                panic!("expected read-only refusal")
+            };
+            assert_eq!(operation, expected);
+            assert!(message.contains("read-only"));
+        }
+        let uploads = inner.root().join(".uploads");
+        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::metadata(uploads.join(id.as_str())).unwrap().len(),
+            0
+        );
+        assert!(!inner.exists(&reference).await.unwrap());
+        inner.abort_upload(&id).await.unwrap();
+    }
 
     #[derive(Debug, Default)]
     struct RecordingReadStore {

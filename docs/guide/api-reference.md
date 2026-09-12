@@ -30,7 +30,7 @@ An always-machine-readable copy of this page is at
 | `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
-| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
@@ -69,12 +69,15 @@ or annotation-edge ID is skipped even when its row is soft-deleted, so neither
 real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
 it.
 
-`blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
-`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
+`blob` registers no note or entity kinds; its seven verbs (`blob.put` / `blob.get` /
+`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort`) expose
+content-addressed storage and sequential uploads (ADR-111, ADR-173). A
 normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
 even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
 unconfigured (erroring until a backend is installed) when the server boots against an
-in-memory backend, which has no directory to default a root beside.
+in-memory backend, which has no directory to default a root beside. Staged uploads currently
+use the filesystem backend; the S3 backend retains `blob.put` / `blob.get` / `blob.stat`
+and refuses creation of new staging with `Unsupported`.
 
 `tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
 `tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
@@ -392,25 +395,30 @@ request(ops="stats()")
 
 Patch entity, note, or edge fields. Field set depends on substrate: entities accept
 `name`/`description`/`properties`/`tags`; notes accept
-`name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
+`name`/`content`/`salience`/`decay_factor`/`properties`/`tags`; edges accept
 `relation`/`weight`/`properties`.
 
 Entity/note text updates use the same full-source storage and bounded embedding contract as
 singleton `create`; a successful response includes `warnings` when embedding actually truncated.
 
-| Param          | Type            | Required | Notes                                                                     |
-| -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
-| `id`           | uuid            | yes      | Record to patch.                                                          |
-| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID. |
-| `name`         | string          | no       | Entities and notes.                                                       |
-| `description`  | string          | no       | Entities only.                                                            |
-| `content`      | string          | no       | Notes only (body text).                                                   |
-| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                      |
-| `decay_factor` | number          | no       | Notes only, >= 0.                                                         |
-| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                            |
-| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                      |
-| `properties`   | object          | no       | Shallow-merged in.                                                        |
-| `tags`         | array\<string\> | no       | Replaces the tag list.                                                    |
+| Param          | Type            | Required | Notes                                                                             |
+| -------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
+| `id`           | uuid            | yes      | Record to patch.                                                                  |
+| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
+| `name`         | string          | no       | Entities and notes.                                                               |
+| `description`  | string          | no       | Entities only.                                                                    |
+| `content`      | string          | no       | Notes only (body text).                                                           |
+| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
+| `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
+| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                                    |
+| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
+| `properties`   | object          | no       | Shallow-merged in.                                                                |
+| `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+
+Note tags remain stored and returned in `properties.tags`. Updating that property directly
+also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
+`tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
+as usual.
 
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")
@@ -598,7 +606,11 @@ identify the hit. It diverges from both `neighbors` and `list`'s row shapes abov
 
 ### `link` — Commissive
 
-Create a typed directed edge.
+Create or replace a typed directed edge. The natural key is
+`(namespace, source_id, target_id, relation)` after symmetric endpoint
+canonicalization. A live match retains its row ID and creation time while
+replacing weight and metadata. A soft-deleted match is refused unless the
+caller explicitly opts into restoration.
 
 | Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                     |
 | ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -606,10 +618,20 @@ Create a typed directed edge.
 | `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                              |
 | `relation`  | string | yes      | One of the 17 canonical relations: `contains`\|`part_of`\|`instance_of`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
 | `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                         |
+| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                     |
+| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                               |
 
 ```
 request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"extends\")")
 ```
+
+The singleton response contains the persisted edge plus `mutation`, one of
+`created`, `updated`, or `resurrected`. Bulk summaries report those three
+counts separately; verbose bulk rows carry the same per-edge field. Every
+successful mutation emits `LinkCreated` (create) or `EdgeUpdated`
+(replacement/restoration), with the previous edge snapshot for non-create
+mutations. `list(kind="event", observed=["<edge-uuid>"])` therefore retrieves
+the edge's mutation history.
 
 ### `neighbors` — Assertive
 
@@ -1997,9 +2019,9 @@ request(ops="[{\"tool\":\"knowledge.fold\",\"args\":{\"candidates\":[{\"id\":\"a
 ### `knowledge.search` — Assertive
 
 TF-IDF ranked search over the knowledge corpus with embedding rerank (default when an
-embedder is configured). Draft and deprecated atoms are excluded by default. Score
-bands: `score>=0.46` reliably on-target, `0.42<=score<0.46` mixed quality, `score<0.42`
-mostly off-target.
+embedder is configured). Draft and deprecated atoms are excluded by default. Scores are
+request-relative ranking values, not calibrated relevance probabilities. Interpret rank
+together with the candidate and score provenance described below.
 
 | Param                 | Type    | Required | Notes                                                                                   |
 | --------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
@@ -2017,6 +2039,40 @@ mostly off-target.
 | `intersection_bonus`  | number  | no       | Default 0.25; score multiplier for multi-sub-query hits.                                |
 | `rerank`              | bool    | no       | Default true; embedding rerank; no-op with no embedder configured.                      |
 | `rerank_alpha`        | number  | no       | Default 0.7 (TF-IDF-dominant blend).                                                    |
+
+The response is `{results, total, candidate_provenance, ...}`. A genuine FTS miss does
+not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` reports:
+
+- `matched`: eligible lexical candidates were found.
+- `no_match`: no lexical match was found in the caller's namespace.
+- `filtered`: lexical matches were removed by eligibility, such as kind or status filters.
+- `partial_timeout`: a timed-out fetch retains eligible candidates, or decomposed passes
+  mix completed and timed-out outcomes.
+- `timed_out`: a fetch times out with no retained candidates, or every decomposed pass
+  does so. Completing empty terms before a timeout does not make a fetch partial.
+
+These states supplement `degraded.lexical_timeout` and any public timeout details. A lexical
+stage timeout does not by itself mean the request's broader read deadline has expired.
+
+`candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
+no returned result has lexical evidence; otherwise it is `none`, including for an empty
+result. Each `knowledge.search` result includes `score_provenance`:
+
+```json
+{
+  "sources": ["lexical", "ann"],
+  "embedding_rerank": true,
+  "normalization": "s_over_s_plus_1",
+  "calibrated": false
+}
+```
+
+`sources` is a stable-order subset of `lexical` and `ann`; a hit found by both retains
+both labels after RRF fusion. `embedding_rerank` records whether a successful embedding
+rerank transformed that result's score. Search monotonically squashes the score with
+`s / (s + 1)` before applying its status multiplier and final `min_score` filter. Scores
+remain useful for ordering and thresholding within a call, but no fixed numeric band
+establishes relevance across queries.
 
 ```
 request(ops="knowledge.search(query=\"FastAPI JWT middleware\", rerank=true, limit=10)")
@@ -2513,14 +2569,19 @@ reporting surface over a code-map database.
 
 ---
 
-## `blob` pack — 3 verbs
+## `blob` pack — 7 verbs
 
-Content-addressed binary object storage (ADR-111). Optional; load with
+Content-addressed binary object storage and sequential uploads (ADR-111, ADR-173). Optional; load with
 `KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
 installs a default `FsBlobStore` rooted beside the database file even with no
 `[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
 unconfigured (erroring until a backend is installed) only when the server boots against
 an in-memory backend, which has no directory to default a root beside.
+
+Staged uploads currently use `FsBlobStore`; S3 supports the existing whole-object
+operations but returns `Unsupported` when new staging is required. The known-reference
+shortcut in `blob.begin` can return an existing object without staging. `blob.put` and
+all four upload verbs refuse on a read-only runtime.
 
 ### `blob.put` — Commissive
 
@@ -2543,7 +2604,7 @@ before slicing.
 
 | Param         | Type   | Required | Notes                                                                                                                             |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`.                                                            |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`.                                           |
 | `range`       | object | no       | `{offset, length}`, both non-negative integers when present. Applied to the fetched object as a slice, not a streamed range read. |
 
 ### `blob.stat` — Assertive
@@ -2551,13 +2612,100 @@ before slicing.
 Report whether an object exists and its size, answered by a single metadata read with
 no bytes hydrated.
 
-| Param         | Type   | Required | Notes                                                                  |
-| ------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`. |
+| Param         | Type   | Required | Notes                                                                                   |
+| ------------- | ------ | -------- | --------------------------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`. |
+
+### `blob.begin` — Declaration
+
+Begin an upload with a declared total size. A new upload returns
+`{upload_id, part_limit, next_index}`: `upload_id` is a 32-character lowercase-hex
+string, `part_limit` is the integer maximum decoded bytes per part, and `next_index`
+starts at integer `0`. If the supplied reference already exists, return
+`{content_ref, size}` with its stored integer byte length and no `upload_id` or staging object.
+
+| Param         | Type    | Required | Notes                                                                                                           |
+| ------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `size`        | integer | yes      | Non-negative declared byte length, at most 64 MiB (67,108,864 bytes). Zero is allowed.                          |
+| `content_ref` | string  | no       | Optional 64-character lowercase-hex BLAKE3 reference. Checked for existence now and against the hash at commit. |
+
+Use the returned `part_limit`; it currently equals 780,288 bytes, derived from the
+smaller of the request-parser and daemon-frame caps with an 8192-byte reserve for
+request fields. Upload IDs are capabilities held in process memory, with no actor
+ownership restriction or restart recovery. After a daemon restart, begin again.
+
+Each loaded upload manager allows 128 staged uploads in total and 16 per originating
+actor by default. `KHIVE_BLOB_UPLOAD_MAX_ACTIVE` and
+`KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR` accept positive integer overrides; invalid values
+warn and use their defaults. Reaching either ceiling refuses `blob.begin` with
+`InvalidInput` naming that ceiling. Pending creation and uploads awaiting successful
+cleanup occupy slots; successful commit or cleanup releases them. Cancelling the
+begin request does not cancel admitted creation: its upload remains tracked until
+expiry. The existing-reference shortcut uses no slot and remains available when
+the ceiling is full. These limits apply per process, not as a shared disk quota.
+
+On Windows and other non-Unix systems, filesystem staging requires trusted local
+write access to the blob root, its contents and its ancestor directories. The
+path checks do not prevent a local writer from swapping a junction or reparse
+point between validation and use. See the
+[filesystem platform limits](../../crates/khive-pack-blob/docs/design.md#filesystem-platform-limits).
+
+### `blob.put_part` — Declaration
+
+Append one part and return `{next_index, received_bytes}`, both non-negative integers.
+Parts start at index `0` and proceed sequentially.
+
+| Param       | Type    | Required | Notes                                                                                   |
+| ----------- | ------- | -------- | --------------------------------------------------------------------------------------- |
+| `upload_id` | string  | yes      | 32-character lowercase-hex capability returned by `blob.begin`.                         |
+| `index`     | integer | yes      | Non-negative next part index, or the last accepted index for an identical tail retry.   |
+| `bytes`     | string  | yes      | Base64-encoded part with decoded length at most `part_limit`. An empty part is allowed. |
+
+An identical resend of the last accepted part returns the same counters without
+appending or refreshing the idle clock. A tail resend with different decoded length
+or bytes is refused and aborts the upload. Other out-of-order indices are refused
+with `InvalidInput` without advancing the upload. A next part crossing the declared
+total aborts it; a part exceeding only `part_limit` is refused while preserving the
+upload. Invalid base64 is refused before appending.
+
+Unknown or consumed IDs return `unknown upload`. With no new part for 3600 seconds
+after begin or the last accepted new part, `blob.put_part` and `blob.commit` discard
+the expired upload and return `unknown upload`. The daemon also sweeps idle staging
+every 600 seconds. `KHIVE_BLOB_UPLOAD_IDLE_SECS` and
+`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS` accept positive integer seconds; invalid
+values warn and use their defaults. Tail retries do not extend the idle bound.
+
+### `blob.commit` — Declaration
+
+Publish a complete upload and return `{content_ref, size}`: a 64-character lowercase-hex
+BLAKE3 string and the integer byte length. Success consumes the upload ID, including
+when the content already exists; the result has no deduplication flag.
+
+| Param       | Type   | Required | Notes                                                           |
+| ----------- | ------ | -------- | --------------------------------------------------------------- |
+| `upload_id` | string | yes      | 32-character lowercase-hex capability returned by `blob.begin`. |
+
+The received length must equal the declared `size`. An incomplete commit is refused
+with `InvalidInput` and leaves the upload available for further parts. A mismatch
+with the optional expected `content_ref` aborts the upload. Unknown, consumed, or
+expired IDs return `unknown upload`.
+
+### `blob.abort` — Declaration
+
+Discard staged bytes and invalidate the upload ID. Success returns `{aborted: true}`.
+Unknown or already consumed IDs return `unknown upload`; abort does not delete a
+committed object.
+
+| Param       | Type   | Required | Notes                                                           |
+| ----------- | ------ | -------- | --------------------------------------------------------------- |
+| `upload_id` | string | yes      | 32-character lowercase-hex capability returned by `blob.begin`. |
 
 ```
 request(ops="blob.put(bytes=\"aGVsbG8=\")")
 request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
+request(ops="blob.begin(size=5)")
+request(ops="blob.put_part(upload_id=\"<32-char-hex>\", index=0, bytes=\"aGVsbG8=\")")
+request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 ```
 
 ---

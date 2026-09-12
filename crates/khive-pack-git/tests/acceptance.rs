@@ -1585,7 +1585,7 @@ async fn ingest_masks_secret_shaped_changed_paths() {
 }
 
 /// Issue #763 exact acceptance repro: a PR body containing a bare 64-char hex
-/// hash near the standalone word "token" must ingest with only the flagged
+/// hash in the same sentence as the standalone word "token" must ingest with only the flagged
 /// span masked — the containing PR note (and its surrounding prose) must be
 /// retained, not dropped.
 #[tokio::test]
@@ -1625,7 +1625,7 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
         "baseRefName": "main",
         "headRefName": "docs/rotation",
         "mergeCommit": null,
-        "body": format!("Rotated the deploy token. Old hash was {hex64} before rotation.")
+        "body": format!("Rotated the deploy token, old hash was {hex64} before rotation.")
     }])
     .to_string();
 
@@ -1662,7 +1662,7 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
         !content.contains(&hex64),
         "raw 64-hex hash must not survive into stored content: {content:?}"
     );
-    let expected = "Rotated the deploy token. Old hash was ***MASKED*** before rotation.";
+    let expected = "Rotated the deploy token, old hash was ***MASKED*** before rotation.";
     assert_eq!(
         content, expected,
         "only the flagged hash span is replaced, surrounding prose is retained exactly: {content:?}"
@@ -7574,6 +7574,7 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
 
     let _guard = ENV_MUTEX.lock().await;
     let rt = KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

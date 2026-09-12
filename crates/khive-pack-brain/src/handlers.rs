@@ -71,19 +71,22 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
+    // MAINTENANCE, deliberately kept out of the description: the event plane is
+    // ADR-103 Stage 1 (#724 Ask A) and the cost_unit stamp is ADR-103 Amendment 1,
+    // landed in PR #927.
     HandlerDef {
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
-            plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
+            plane; feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
             with signal (by_profile_and_signal, for per-seat negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
-            payload.resource.cost_unit (ADR-103 Amendment 1; stamped on every successful verb \
-            dispatch since PR #927) sum into total_cost_unit and cost_unit_by_verb; events with \
-            no resource.cost_unit (pre-Amendment-1 events, or errored/denied dispatches) simply \
+            payload.resource.cost_unit (stamped on every successful verb dispatch) sum into \
+            total_cost_unit and cost_unit_by_verb; events with no resource.cost_unit (events \
+            older than that stamp, or errored/denied dispatches) simply \
             do not contribute. total_cost_unit is omitted, not zero-filled, when no event in the \
             window carries cost_unit. When truncated=true, every scalar total (total, \
             total_cost_unit) is over the fetched page only, same as the other counts_by_* \
@@ -107,7 +110,11 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             bound `until` in the past for a closed population. Exhaustive windows matching more than \
             2,000,000 events are rejected rather than returned as partial aggregates; narrow \
             since/until or add actor/kind filters. Scope defaults to the caller; named foreign \
-            actors must be visible, and all_actors=true requires the serving brain.fleet_readers allowlist.",
+            actors must be visible, and all_actors=true requires the serving brain.fleet_readers \
+            allowlist. The window covers exactly one namespace: the caller's own, or the one named \
+            by an explicit `namespace=` argument. The result's `scope` states which namespace the \
+            answer covered and which others this caller may ask for the same way; rows written to \
+            any other namespace are absent from these counts rather than counted as zero.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -287,7 +294,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
                               or entity the feedback applies to. Prefix resolution is \
-                              namespace-unfiltered under ADR-007.",
+                              searches every namespace you can see.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {
@@ -322,14 +329,16 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Scorer pass identifier, half of the (scorer_run_id, serve_ledger_id) dedup key. Must be supplied together with serve_ledger_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Id of the brain_serve_ledger row being graded. Must be supplied together with scorer_run_id; backfills the row's grade and gates dedup.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -338,8 +347,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         name: "brain.auto_feedback",
         description: "Emit caller-attributed feedback for one recall result. Omitting signal \
             records no judgment and emits no feedback event; when signal is present, target_id must \
-            identify exactly one object in results. Keeps memory and brain packs decoupled \
-            (#517).",
+            identify exactly one object in results. Keeps memory and brain packs \
+            decoupled.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
@@ -389,21 +398,25 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "scorer_run_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Forwarded verbatim to brain.feedback. Must be supplied together with serve_ledger_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "serve_ledger_id",
                 param_type: "string",
                 required: false,
-                description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-081.
+                description: "Forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Exact feedback namespace override (ADR-007 Rev 6 escape hatch). The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
+                // MAINTENANCE, deliberately kept out of the description: this is the
+                // ADR-007 Rev 6 escape hatch.
+                description: "Exact feedback namespace override. The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -453,6 +466,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             },
         ],
     },
+    // MAINTENANCE, deliberately kept out of the description: this reuses the existing
+    // ADR-103 Stage 1 PhaseStarted/work_class vocabulary rather than adding an EventKind
+    // variant, which is why the work_class is a payload value and not a kind.
     HandlerDef {
         name: "brain.mark_turn",
         description: "Emit a PhaseStarted event (work_class=\"actor_turn\") carrying the \
@@ -460,9 +476,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             callers invoke this once per bounded unit of work (a wake, a turn) so \
             brain.event_counts's counts_by_work_class[\"actor_turn\"], grouped by actor, \
             gives a discipline-ratio denominator (e.g. feedback_explicit / actor_turn) that \
-            is not biased toward whichever actor issues the most raw verb calls. Reuses the \
-            existing ADR-103 Stage 1 PhaseStarted/work_class vocabulary rather than a new \
-            EventKind variant. Best-effort — never fails the caller's turn.",
+            is not biased toward whichever actor issues the most raw verb calls. \
+            Best-effort — never fails the caller's turn.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -1025,6 +1040,22 @@ impl BrainPack {
             None => vec![caller.clone()],
         };
 
+        // The event plane is read through a store scoped to exactly one
+        // namespace (`Runtime::events` opens `token.namespace()` and the SQL
+        // pins `namespace = ?`), so a visibility set does not widen this
+        // window the way it widens a note read. Name the namespace the answer
+        // covers, and name the others this caller may ask for by passing
+        // `namespace=`, so an undercount is legible from the result itself.
+        let scope_namespace = token.namespace().as_str().to_string();
+        let mut scope_other: Vec<String> = token
+            .visible_namespace_strs()
+            .iter()
+            .map(|n| n.to_string())
+            .filter(|n| n != &scope_namespace)
+            .collect();
+        scope_other.sort();
+        scope_other.dedup();
+
         let store = self.runtime.events(token)?;
         let base_filter = EventFilter {
             actors: actor_filters,
@@ -1144,6 +1175,16 @@ impl BrainPack {
             "truncated": truncated,
             "window_event_total": window_event_total,
             "exhaustive": exhaustive,
+            // The scope the answer was computed under, stated rather than
+            // implied. `namespace` is the single namespace this window covers;
+            // `other_namespaces` are the ones this caller may read by asking
+            // for them explicitly, and whose rows are absent here. A caller can
+            // therefore tell a real zero from an out-of-scope population, and
+            // knows what to pass to reach the rest.
+            "scope": {
+                "namespace": scope_namespace,
+                "other_namespaces": scope_other,
+            },
         });
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
         if !by_profile.is_empty() {
@@ -2353,7 +2394,7 @@ impl BrainPack {
         let p: MarkTurnParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         if let Some(label) = p.label.as_deref() {
-            khive_runtime::secret_gate::check(label)?;
+            khive_runtime::secret_gate::check_at(label, "turn", "label")?;
         }
         let phase = p.label.unwrap_or_else(|| "actor_turn".to_string());
         let actor = format!("{}:{}", token.actor().kind, token.actor().id);
@@ -2429,13 +2470,13 @@ impl BrainPack {
         // Secret gate: scan arbitrary text fields before writing.
         // Wildcard sentinel `*` is safe; real values are scanned.
         if actor != "*" {
-            khive_runtime::secret_gate::check(&actor)?;
+            khive_runtime::secret_gate::check_at(&actor, "binding", "actor")?;
         }
         if namespace != "*" {
-            khive_runtime::secret_gate::check(&namespace)?;
+            khive_runtime::secret_gate::check_at(&namespace, "binding", "namespace")?;
         }
         if consumer_kind != "*" {
-            khive_runtime::secret_gate::check(&consumer_kind)?;
+            khive_runtime::secret_gate::check_at(&consumer_kind, "binding", "consumer_kind")?;
         }
 
         if consumer_kind != "*" {
@@ -2700,10 +2741,10 @@ impl BrainPack {
 
         // Secret gate: scan caller-supplied text before any write.
         // `p_name` is already constrained to [a-zA-Z0-9-]+ and cannot carry a secret.
-        khive_runtime::secret_gate::check(&description)?;
-        khive_runtime::secret_gate::check(&consumer_kind)?;
+        khive_runtime::secret_gate::check_at(&description, "profile", "description")?;
+        khive_runtime::secret_gate::check_at(&consumer_kind, "profile", "consumer_kind")?;
         if let Some(ref seed) = p.seed_priors {
-            khive_runtime::secret_gate::check_json(seed)?;
+            khive_runtime::secret_gate::check_json_at(seed, "profile", "seed_priors")?;
         }
         let seed_priors = p.seed_priors;
 

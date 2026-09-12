@@ -1,9 +1,20 @@
-use super::*;
+use super::{
+    run_prepared_stream_batch, statement, StreamAppendSpec, StreamBatchMember, StreamObservation,
+    StreamWriteSpec,
+};
+use crate::note_write::{NoteFence, NoteFences};
+use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult, VerbRegistry};
 use async_trait::async_trait;
-use khive_storage::{SqlReader, StorageError, StorageResult, WriterTaskRequestState};
-use khive_types::{HandlerDef, Namespace, Pack};
+use khive_storage::{
+    AtomicUnitOp, Note, SqlAccess, SqlReader, SqlRow, SqlStatement, SqlValue, SqlWriter,
+    StorageError, StorageResult, WriterTaskRequestState,
+};
+use khive_types::{HandlerDef, KhiveError, Namespace, Pack};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::{any::Any, collections::HashSet};
+use uuid::Uuid;
 
 use crate::embedder_registry::EmbedderProvider;
 use crate::pack::{KindHook, PackRuntime, VerbRegistryBuilder};
@@ -790,7 +801,7 @@ async fn stream_batch_fence_rechecks_after_writer_admission() {
         Some(NoteFence {
             key: "fence".into(),
             kind: "head".into(),
-            expected_version: 1,
+            expected_version: Some(1),
         }),
         vec![],
     )
@@ -869,12 +880,12 @@ async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission
                         NoteFence {
                             key: "stable".into(),
                             kind: "head".into(),
-                            expected_version: 1,
+                            expected_version: Some(1),
                         },
                         NoteFence {
                             key: "renewed".into(),
                             kind: "head".into(),
-                            expected_version: 1,
+                            expected_version: Some(1),
                         },
                     ],
                 ),
@@ -1210,12 +1221,12 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
                             NoteFence {
                                 key: "first".into(),
                                 kind: "head".into(),
-                                expected_version: 1,
+                                expected_version: Some(1),
                             },
                             NoteFence {
                                 key: "second".into(),
                                 kind: "head".into(),
-                                expected_version: if stale { 2 } else { 1 },
+                                expected_version: Some(if stale { 2 } else { 1 }),
                             },
                         ],
                     ),

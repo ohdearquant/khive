@@ -390,6 +390,8 @@ pub struct RuntimeConfig {
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
+    /// Resolved carrier and failure policy for telemetry emission.
+    pub telemetry: crate::telemetry_config::TelemetryConfig,
     /// Resolved rendering timezone (ADR-169), consumed today by date-only
     /// `parse_due` anchoring. Populated from `[display] timezone` in
     /// `khive.toml` by [`runtime_config_from_khive_config`]; when absent,
@@ -489,6 +491,7 @@ impl Default for RuntimeConfig {
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
+            telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
@@ -840,6 +843,7 @@ pub fn runtime_config_from_khive_config(
     let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();
     let exec = khive_cfg.exec.clone();
+    let telemetry = khive_cfg.telemetry.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -867,6 +871,7 @@ pub fn runtime_config_from_khive_config(
             brain,
             git_write,
             exec,
+            telemetry,
             mounts,
             blob_hydration_bytes,
             display_timezone,
@@ -908,6 +913,7 @@ pub fn runtime_config_from_khive_config(
         brain,
         git_write,
         exec,
+        telemetry,
         mounts,
         blob_hydration_bytes,
         display_timezone,

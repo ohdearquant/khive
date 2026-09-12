@@ -746,6 +746,19 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Whether the immutable stream record policy refused this write.
+    ///
+    /// Only the structured runtime marker establishes this class. Ordinary
+    /// conflicts, caller sequence preconditions, and raw storage failures do
+    /// not acquire a refusal classification from their rendered messages.
+    /// These membership guards refuse before applying the requested domain write.
+    pub fn is_stream_policy_refusal(&self) -> bool {
+        matches!(self, Self::Khive(error)
+            if error.kind() == khive_types::ErrorKind::Conflict
+                && error.details().and_then(|details| details.get("reason"))
+                    == Some("stream_member"))
+    }
+
     /// A gate refusal from a path that writes no audit row.
     pub fn permission_denied(verb: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::PermissionDenied {
@@ -1021,6 +1034,62 @@ impl From<khive_types::KhiveError> for RuntimeError {
 }
 
 #[cfg(test)]
+mod stream_policy_refusal_tests {
+    use super::RuntimeError;
+    use khive_types::{Details, KhiveError};
+
+    #[test]
+    fn stream_policy_refusal_uses_structured_kind_and_marker() {
+        let policy = RuntimeError::Khive(
+            KhiveError::conflict("changed diagnostic wording")
+                .with_details(Details::new([("reason", "stream_member")])),
+        );
+        assert!(policy.is_stream_policy_refusal());
+
+        let wrong_kind = RuntimeError::Khive(
+            KhiveError::invalid_input("stream entries are immutable")
+                .with_details(Details::new([("reason", "stream_member")])),
+        );
+        assert!(!wrong_kind.is_stream_policy_refusal());
+    }
+
+    #[test]
+    fn stream_policy_refusal_excludes_other_conflicts_and_message_lookalikes() {
+        for marker in [
+            None,
+            Some("seq_conflict"),
+            Some("key_conflict"),
+            Some("version_conflict"),
+            Some("fence_conflict"),
+            Some("identity_conflict"),
+            Some("expired"),
+            Some("live_until_unreadable"),
+            Some("key_ambiguous"),
+            Some("unknown_op"),
+            Some("stream_member_extra"),
+        ] {
+            let mut error = KhiveError::conflict("stream entries are immutable");
+            if let Some(marker) = marker {
+                error = error.with_details(Details::new([("reason", marker)]));
+            }
+            assert!(
+                !RuntimeError::Khive(error).is_stream_policy_refusal(),
+                "unrelated conflict marker {marker:?}"
+            );
+        }
+
+        let internal = RuntimeError::Internal("conflict: stream entries are immutable".into());
+        assert!(!internal.is_stream_policy_refusal());
+        let driver = RuntimeError::Storage(khive_storage::StorageError::driver(
+            khive_storage::StorageCapability::Sql,
+            "inline.execute",
+            std::io::Error::other("stream_member"),
+        ));
+        assert!(!driver.is_stream_policy_refusal());
+    }
+}
+
+#[cfg(test)]
 mod channel_ingest_failure_class_tests {
     use super::{ChannelIngestFailureClass, RuntimeError};
     use crate::secret_gate::SecretMatch;
@@ -1032,11 +1101,13 @@ mod channel_ingest_failure_class_tests {
             detector: "fixture",
             trigger: None,
             masked: "first-rendering".to_string(),
+            location: None,
         });
         let second = RuntimeError::SecretDetected(SecretMatch {
             detector: "fixture",
             trigger: Some("token"),
             masked: "completely-different-rendering".to_string(),
+            location: None,
         });
 
         assert_ne!(first.to_string(), second.to_string());

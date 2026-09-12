@@ -20,6 +20,7 @@ fn actor_registry(
     let runtime = KhiveRuntime::from_backend(
         backend,
         RuntimeConfig {
+            telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
             git_write: Default::default(),

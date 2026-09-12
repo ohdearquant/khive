@@ -19,6 +19,7 @@ use khive_types::Namespace;
 
 fn build_runtime() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

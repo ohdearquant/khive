@@ -190,6 +190,11 @@ struct AssignParams {
     status: Option<String>,
     #[serde(default)]
     due: Option<String>,
+    /// IANA zone the date-only `due` anchors in; absent means the configured
+    /// display timezone. Both task entry points read it, or the two would
+    /// disagree about which zone a deadline means.
+    #[serde(default)]
+    timezone: Option<String>,
     #[serde(default)]
     start: Option<String>,
     #[serde(default)]
@@ -470,6 +475,11 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
         .to_string();
     let assignee = props.get("assignee").cloned().unwrap_or(Value::Null);
     let due = props.get("due").cloned().unwrap_or(Value::Null);
+    // The zone the deadline was anchored in travels with the deadline. Storing it
+    // and not projecting it would leave a reader with the same unreadable instant
+    // the argument exists to fix, so the write path and this projection have to
+    // agree or neither is worth having.
+    let due_timezone = props.get("due_timezone").cloned().unwrap_or(Value::Null);
     let context_entity_id = props
         .get("context_entity_id")
         .cloned()
@@ -484,6 +494,7 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
         "priority": priority,
         "assignee": assignee,
         "due": due,
+        "due_timezone": due_timezone,
         "context_entity_id": context_entity_id,
         "namespace": note.namespace,
         "created_at": ts_to_rfc(note.created_at),
@@ -1071,7 +1082,7 @@ pub async fn prepare_transition(
         )));
     }
     if let Some(n) = note_arg {
-        khive_runtime::secret_gate::check(n)?;
+        khive_runtime::secret_gate::check_at(n, "task", "note")?;
     }
 
     let (note, current) = load_task(runtime, token, raw_id).await?;
@@ -1183,7 +1194,7 @@ pub async fn prepare_complete(
     let target = complete_target_status(status_arg)?;
 
     if let Some(result) = result_arg {
-        khive_runtime::secret_gate::check(result)?;
+        khive_runtime::secret_gate::check_at(result, "task", "result")?;
     }
 
     let (note, current) = load_task(runtime, token, raw_id).await?;
@@ -1255,6 +1266,7 @@ impl GtdPack {
             priority: p.priority,
             status: p.status,
             due: p.due,
+            timezone: p.timezone,
             start: p.start,
             end: p.end,
             depends_on: p.depends_on,
@@ -1776,6 +1788,7 @@ impl GtdPack {
             "priority": task["priority"],
             "assignee": task["assignee"],
             "due": task["due"],
+            "due_timezone": task["due_timezone"],
             "audit_persisted": audit_persisted,
         }))
     }

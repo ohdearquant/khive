@@ -2457,6 +2457,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     // Default impl resolves embedding_model to a real on-disk model, which is
     // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        telemetry: Default::default(),
         mounts: Vec::new(),
         git_write: Default::default(),
         brain: Default::default(),
@@ -7971,6 +7972,112 @@ mod event_counts_tests {
             "window must include the `since` boundary and exclude the `until` boundary: {result}"
         );
         assert_eq!(result["counts_by_kind"]["search_executed"], json!(2));
+    }
+
+    /// A count covering one namespace must say which one, and say what else
+    /// the caller could ask for.
+    ///
+    /// Memory and brain verbs stamp the acting identity's namespace whenever a
+    /// call carries one, so a caller reading the default scope can be missing a
+    /// whole population of its own activity. The event window is opened on a
+    /// single namespace, so a visibility set does NOT widen it the way it
+    /// widens a note read: arm three below is the falsifier for that belief,
+    /// and it is the reason the disclosure has to name the reachable
+    /// namespaces rather than let the caller infer them from what came back.
+    #[tokio::test]
+    async fn counts_disclose_the_namespace_they_covered_and_the_way_to_ask() {
+        let (pack, rt) = make_pack_with_actor("lambda:a");
+        let registry = empty_registry();
+        let here = rt.authorize(Namespace::local()).unwrap();
+        let elsewhere = rt
+            .authorize(Namespace::parse("other").expect("namespace"))
+            .expect("authorize other");
+
+        for at in [1_000_000_i64, 1_100_000] {
+            seed_event(
+                &rt,
+                &here,
+                "search",
+                EventKind::SearchExecuted,
+                "lambda:a",
+                at,
+                json!({}),
+            )
+            .await;
+        }
+        seed_event(
+            &rt,
+            &elsewhere,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_200_000,
+            json!({}),
+        )
+        .await;
+
+        let window = json!({
+            "since": micros_to_iso(900_000),
+            "until": micros_to_iso(2_000_000),
+        });
+
+        // Arm 1: the default read. It covers `local` and names it.
+        let narrow = pack
+            .dispatch("brain.event_counts", window.clone(), &registry, &here)
+            .await
+            .expect("narrow read must succeed");
+        assert_eq!(
+            narrow["scope"]["namespace"],
+            json!("local"),
+            "the scope must state the namespace the answer was computed under: {narrow}"
+        );
+        assert_eq!(
+            narrow["total"],
+            json!(2),
+            "the narrow read counts only what it could see: {narrow}"
+        );
+
+        // Arm 2: the way to ask. A token scoped to the other namespace returns
+        // that namespace's row and nothing from `local`, so the population the
+        // narrow read omitted is reachable rather than lost.
+        let asked = pack
+            .dispatch("brain.event_counts", window.clone(), &registry, &elsewhere)
+            .await
+            .expect("explicit-namespace read must succeed");
+        assert_eq!(
+            asked["scope"]["namespace"],
+            json!("other"),
+            "asking for a namespace must move the scope to it: {asked}"
+        );
+        assert_eq!(
+            asked["total"],
+            json!(1),
+            "the asked-for namespace returns its own row, not the caller's: {asked}"
+        );
+
+        // Arm 3: visibility does not widen this window. The token below may
+        // read `other`, and the count is still the `local` two — which is
+        // exactly why `other_namespaces` has to be stated instead of inferred.
+        let wide_token = rt
+            .authorize_with_visibility(
+                Namespace::local(),
+                vec![Namespace::parse("other").expect("namespace")],
+            )
+            .expect("authorize with visibility");
+        let wide = pack
+            .dispatch("brain.event_counts", window, &registry, &wide_token)
+            .await
+            .expect("wide read must succeed");
+        assert_eq!(
+            wide["total"],
+            json!(2),
+            "a visibility set must not widen a single-namespace event window: {wide}"
+        );
+        assert_eq!(
+            wide["scope"]["other_namespaces"],
+            json!(["other"]),
+            "the scope must name the namespaces this caller can ask for: {wide}"
+        );
     }
 
     #[tokio::test]
