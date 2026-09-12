@@ -3138,3 +3138,154 @@ async fn every_kg_write_emits_its_domain_event() {
         );
     }
 }
+
+// `context` walks edges, and an edge endpoint is any record kind, but it used to
+// hydrate record metadata from the entity store alone and silently skip whatever
+// it could not find there. The visible symptom was the worst shape available: an
+// empty neighbour list beside `dropped.neighbors == 0`, because the notes were
+// dropped in assembly before the budget stage ever counted them, so both halves
+// of the response were true and the caller had no way to tell.
+//
+// The fixture mixes substrates on purpose. An implementation that hydrates only
+// entities returns one of three and fails the count; one that returns the notes
+// without saying which store they came from fails the substrate assertion; one
+// that returns them without their own kind fails the kind assertion, and kind is
+// what tells a task from an observation.
+// `handle_context` reaches the config-ledger seam, so the workspace census in
+// khive-runtime requires this group. It is the first test in this crate to take it.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn context_returns_note_neighbours_and_names_their_substrate() {
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+
+    let anchor = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "context-substrate-anchor",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create anchor");
+    let sibling = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "context-substrate-sibling",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create sibling entity neighbour");
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation about the anchor",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation");
+    let question = rt
+        .create_note(
+            &token,
+            "question",
+            Some("a named question"),
+            "why does the anchor exist",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create question");
+
+    for (source, relation) in [
+        (sibling.id, "extends"),
+        (observation.id, "annotates"),
+        (question.id, "annotates"),
+    ] {
+        pack.handle_link(
+            &token,
+            json!({
+                "source_id": source,
+                "target_id": anchor.id,
+                "relation": relation,
+            }),
+            &registry,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("link {relation}: {e}"));
+    }
+
+    // The control: the neighbour walk itself sees all three. Any shortfall in
+    // `context` below is therefore hydration and not the edges.
+    let neighbours = pack
+        .handle_neighbors(&token, json!({"node_id": anchor.id, "direction": "both"}))
+        .await
+        .expect("neighbors");
+    assert_eq!(
+        neighbours
+            .as_array()
+            .expect("neighbors returns an array")
+            .len(),
+        3,
+        "control: the neighbour walk must see all three endpoints: {neighbours}"
+    );
+
+    let ctx = pack
+        .handle_context(
+            &token,
+            json!({"entity_ids": [anchor.id.to_string()], "hops": 1}),
+        )
+        .await
+        .expect("context");
+
+    let anchors = ctx["anchors"].as_array().expect("anchors array");
+    assert_eq!(anchors.len(), 1, "one anchor was asked for: {ctx}");
+    let returned = anchors[0]["neighbors"].as_array().expect("neighbors array");
+    assert_eq!(
+        returned.len(),
+        3,
+        "context must return every neighbour the walk found; dropped={:?} truncated={:?} got={returned:?}",
+        ctx["dropped"],
+        ctx["truncated"]
+    );
+
+    let mut by_id: std::collections::BTreeMap<String, &serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for n in returned {
+        by_id.insert(n["id"].as_str().expect("neighbour id").to_string(), n);
+    }
+
+    let entity_neighbour = by_id
+        .get(&sibling.id.to_string())
+        .expect("the entity neighbour must still be there");
+    assert_eq!(entity_neighbour["substrate"], json!("entity"));
+    assert_eq!(entity_neighbour["kind"], json!("concept"));
+
+    let note_neighbour = by_id
+        .get(&observation.id.to_string())
+        .expect("the observation must be there");
+    assert_eq!(note_neighbour["substrate"], json!("note"));
+    assert_eq!(note_neighbour["kind"], json!("observation"));
+    assert_eq!(
+        note_neighbour["description"],
+        json!("an observation about the anchor"),
+        "a note's body stands in for a description"
+    );
+
+    let named_note = by_id
+        .get(&question.id.to_string())
+        .expect("the question must be there");
+    assert_eq!(named_note["substrate"], json!("note"));
+    assert_eq!(named_note["kind"], json!("question"));
+    assert_eq!(named_note["name"], json!("a named question"));
+}

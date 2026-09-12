@@ -9,6 +9,12 @@
 //!      direction of `Both` uses `neighbors_with_query_directed`, which fetches
 //!      both directions in a single storage query (`UNION ALL` with a
 //!      direction literal per arm) and returns each hit tagged `Out`/`In`.
+//!   3. An edge endpoint is any record kind, so the neighbour walk returns
+//!      notes as readily as entities, while record metadata lives in two
+//!      stores. The handler hydrates entities and then the remainder from the
+//!      note store rather than reading one store and dropping what it cannot
+//!      find, which is what made a note neighbour disappear with nothing in
+//!      the response saying it had.
 //!   2. Symmetric relations (`competes_with`, `composed_with`) force
 //!      `Direction::Both` inside `neighbors_with_query` regardless of the
 //!      direction requested (existing op behavior) — the handler mirrors
@@ -31,6 +37,33 @@ use super::common::{deser, parse_direction, parse_relation, resolve_uuid_async, 
 use crate::KgPack;
 
 static CONTEXT_CALL_ID: AtomicU64 = AtomicU64::new(0);
+
+/// What a neighbour block needs about the record it points at, independent of
+/// which store holds that record.
+struct NeighborMeta {
+    substrate: &'static str,
+    kind: String,
+    name: Option<String>,
+    description: Option<String>,
+}
+
+/// A note's body stands in for an entity's description, bounded so that one
+/// long note cannot crowd every other neighbour out of the response budget.
+const NOTE_SNIPPET_CHARS: usize = 200;
+
+/// Truncation is by character and never by byte: a byte cut can land inside a
+/// UTF-8 sequence, and the result is a panic on a note nobody thought was
+/// unusual.
+fn note_snippet(content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut out: String = content.chars().take(NOTE_SNIPPET_CHARS).collect();
+    if content.chars().nth(NOTE_SNIPPET_CHARS).is_some() {
+        out.push('\u{2026}');
+    }
+    Some(out)
+}
 
 fn context_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -443,13 +476,65 @@ impl KgPack {
                 .map_err(RuntimeError::Storage)?;
             page.items.into_iter().map(|e| (e.id, e)).collect()
         };
+
+        // The neighbour walk returns edge endpoints of every record kind, and
+        // the query above answers for entities alone. Without this second
+        // fetch a note neighbour missed the stage 4 lookup and was skipped
+        // before `assemble_within_budget` ever saw it, so the response could
+        // report an empty neighbour list beside `dropped.neighbors == 0` and
+        // both halves were true. `get_notes_batch` takes ids only, so the
+        // visible-namespace restriction the entity filter applied is applied
+        // here by hand rather than left off.
+        let visible: HashSet<String> = token
+            .visible_namespace_strs()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let unresolved: Vec<Uuid> = all_ids
+            .iter()
+            .copied()
+            .filter(|id| !entity_meta.contains_key(id))
+            .collect();
+        let note_meta: HashMap<Uuid, khive_storage::note::Note> = if unresolved.is_empty() {
+            HashMap::new()
+        } else {
+            self.runtime
+                .notes(token)?
+                .get_notes_batch(&unresolved)
+                .await
+                .map_err(RuntimeError::Storage)?
+                .into_iter()
+                .filter(|n| visible.contains(&n.namespace))
+                .map(|n| (n.id, n))
+                .collect()
+        };
+        let meta_for = |id: &Uuid| -> Option<NeighborMeta> {
+            if let Some(e) = entity_meta.get(id) {
+                return Some(NeighborMeta {
+                    substrate: "entity",
+                    kind: e.kind.clone(),
+                    name: Some(e.name.clone()),
+                    description: e.description.clone(),
+                });
+            }
+            note_meta.get(id).map(|n| NeighborMeta {
+                substrate: "note",
+                kind: n.kind.clone(),
+                name: n.name.clone(),
+                description: note_snippet(&n.content),
+            })
+        };
         if let Some(t) = t3 {
-            plog(call_id, "entity_fetch", t.elapsed().as_micros());
+            plog(call_id, "record_fetch", t.elapsed().as_micros());
         }
 
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
-        // Guards only the residual delete race; see docs/api/context-verb.md.
+        // An anchor that resolves to nothing here is the residual delete race
+        // (see docs/api/context-verb.md). Anchors stay entity-only by the
+        // verb's own contract, which refuses a note id up front with a named
+        // error; it is the NEIGHBOURS that are substrate-free, and this
+        // `continue` used to drop every one of them that was not an entity.
         let mut blocks: Vec<AnchorBlock> = Vec::with_capacity(anchor_ids.len());
         for (i, anchor) in anchor_ids.iter().enumerate() {
             let Some(e) = entity_meta.get(anchor) else {
@@ -466,12 +551,14 @@ impl KgPack {
 
             let mut neighbor_jsons = Vec::with_capacity(per_anchor_neighbors[i].len());
             for rec in &per_anchor_neighbors[i] {
-                let Some(ne) = entity_meta.get(&rec.id) else {
+                let Some(ne) = meta_for(&rec.id) else {
                     continue;
                 };
                 let nj = json!({
                     "id": rec.id.to_string(),
                     "name": ne.name,
+                    "kind": ne.kind,
+                    "substrate": ne.substrate,
                     "relation": rec.relation.as_str(),
                     "direction": rec.direction,
                     "weight": rec.weight,
