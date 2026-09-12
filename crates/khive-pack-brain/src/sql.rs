@@ -7,9 +7,18 @@
 //! does not exist fails before a test ever runs.
 
 /// The statement text of `sql/<name>.sql`, checked in at compile time.
+///
+/// The trailing newline every text file carries is trimmed, in a `const` block so
+/// it costs nothing at run time and the result stays a `&'static str`. A statement
+/// that used to be a Rust literal ended at its last word, and callers and tests
+/// anchored on that: leaving the newline on would change the string a reader of
+/// this file has no reason to think changed.
 macro_rules! sql {
     ($name:literal) => {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sql/", $name, ".sql"))
+        const {
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sql/", $name, ".sql"))
+                .trim_ascii_end()
+        }
     };
 }
 pub(crate) use sql;

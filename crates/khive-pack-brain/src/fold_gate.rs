@@ -334,8 +334,7 @@ async fn claim_dedup_within_tx(
 ) -> Result<bool, RuntimeError> {
     let rows_affected = writer
         .execute(SqlStatement {
-            sql: sql!("brain_scorer_dedup_claim")
-                .into(),
+            sql: sql!("brain_scorer_dedup_claim").into(),
             params: vec![
                 SqlValue::Text(scorer_run_id.to_string()),
                 SqlValue::Text(serve_ledger_id.to_string()),
@@ -361,8 +360,7 @@ async fn fold_within_tx(
 ) -> Result<FoldGateOutcome, RuntimeError> {
     let row = writer
         .query_row(SqlStatement {
-            sql: sql!("brain_implicit_mass_read")
-                .into(),
+            sql: sql!("brain_implicit_mass_read").into(),
             params: vec![
                 SqlValue::Text(profile_id.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -406,8 +404,7 @@ async fn fold_within_tx(
 
     writer
         .execute(SqlStatement {
-            sql: sql!("brain_implicit_mass_upsert")
-                .into(),
+            sql: sql!("brain_implicit_mass_upsert").into(),
             params: vec![
                 SqlValue::Text(profile_id.to_string()),
                 SqlValue::Text(namespace.to_string()),

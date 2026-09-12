@@ -8007,19 +8007,96 @@ pub(crate) mod tests {
             out
         }
 
+        /// The body of the Rust string literal whose opening quote is at `open`, or
+        /// `None` if it does not terminate. Escapes are skipped rather than decoded:
+        /// this only has to find the end and hand back text to match against.
+        fn literal_body(text: &str, open: usize) -> Option<&str> {
+            let bytes = text.as_bytes();
+            let mut i = open + 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => return text.get(open + 1..i),
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+
+        /// One line, single-spaced. A statement in Rust wears its line breaks three
+        /// ways — a real newline in a raw string, a `\n` escape, or a backslash line
+        /// continuation — and this scan reads source text, so all three have to read as
+        /// one space before any keyword after the first can be matched. `\n` is two
+        /// characters here, and dropping only the backslash would leave `nFROM`, which
+        /// is exactly how this check first failed its own must-fail control.
+        fn flatten(body: &str) -> String {
+            let mut out = String::with_capacity(body.len());
+            let mut chars = body.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.clone().next() {
+                    // An escape that stands for whitespace: consume both characters.
+                    Some('n' | 't' | 'r') => {
+                        chars.next();
+                        out.push(' ');
+                    }
+                    // A line continuation, or any other escape: the backslash goes,
+                    // what follows is kept and judged on its own.
+                    _ => out.push(' '),
+                }
+            }
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
         fn sql_literals(text: &str) -> Vec<String> {
-            const VERBS: [&str; 9] = [
-                "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER ",
-                "PRAGMA ", "REPLACE ",
+            // A leading verb alone is a heuristic, and it is wrong often enough to
+            // matter: "insert serve batch" is an error label and "Create a new brain
+            // profile with given name" is a verb description, and both start with a
+            // SQL verb. So a literal has to carry a second structural keyword too, and
+            // both are matched CASE-SENSITIVELY, because every statement in this tree
+            // writes its keywords in upper case and English prose does not.
+            const SHAPES: [(&str, &[&str]); 9] = [
+                ("SELECT ", &[" FROM "]),
+                ("INSERT ", &["INSERT INTO ", "INSERT OR "]),
+                ("UPDATE ", &[" SET "]),
+                ("DELETE ", &["DELETE FROM "]),
+                (
+                    "CREATE ",
+                    &[
+                        "CREATE TABLE",
+                        "CREATE INDEX",
+                        "CREATE UNIQUE",
+                        "CREATE VIEW",
+                        "CREATE VIRTUAL",
+                        "CREATE TRIGGER",
+                    ],
+                ),
+                (
+                    "DROP ",
+                    &["DROP TABLE", "DROP INDEX", "DROP VIEW", "DROP TRIGGER"],
+                ),
+                ("ALTER ", &["ALTER TABLE"]),
+                ("PRAGMA ", &["PRAGMA "]),
+                ("REPLACE ", &["REPLACE INTO "]),
             ];
             let mut found = Vec::new();
             for (index, _) in text.match_indices('"') {
-                let rest = &text[index + 1..];
-                let upper: String = rest.chars().take(8).collect::<String>().to_uppercase();
-                if let Some(verb) = VERBS.iter().find(|v| upper.starts_with(**v)) {
-                    let snippet: String = rest.chars().take(60).collect();
-                    found.push(format!("{verb}… {snippet}"));
+                let Some(body) = literal_body(text, index) else {
+                    continue;
+                };
+                let flat = flatten(body);
+                let Some((verb, seconds)) = SHAPES.iter().find(|(v, _)| flat.starts_with(*v))
+                else {
+                    continue;
+                };
+                if !seconds.iter().any(|second| flat.contains(second)) {
+                    continue;
                 }
+                let snippet: String = flat.chars().take(70).collect();
+                found.push(format!("{verb}… {snippet}"));
             }
             found
         }

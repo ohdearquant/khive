@@ -834,8 +834,7 @@ async fn load_snapshot_version_on_reader<R: SqlReader + ?Sized>(
 ) -> Result<Option<i64>, RuntimeError> {
     let row = reader
         .query_scalar(SqlStatement {
-            sql: sql!("brain_profile_snapshot_version")
-                .into(),
+            sql: sql!("brain_profile_snapshot_version").into(),
             params: vec![
                 SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -1043,8 +1042,7 @@ async fn load_events_since_with_window(
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: sql!("brain_event_log_since")
-                .into(),
+            sql: sql!("brain_event_log_since").into(),
             params: vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(since_us),

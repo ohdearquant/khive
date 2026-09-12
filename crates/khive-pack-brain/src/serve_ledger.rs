@@ -110,8 +110,7 @@ fn serve_ledger_insert_statement(
     serve_attribution: Option<&str>,
 ) -> SqlStatement {
     SqlStatement {
-        sql: sql!("brain_serve_ledger_insert")
-            .into(),
+        sql: sql!("brain_serve_ledger_insert").into(),
         params: vec![
             SqlValue::Text(row.id.clone()),
             SqlValue::Text(namespace.to_string()),
@@ -238,8 +237,7 @@ pub async fn get_serve_row(
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let row = reader
         .query_row(SqlStatement {
-            sql: sql!("brain_serve_ledger_row")
-                .into(),
+            sql: sql!("brain_serve_ledger_row").into(),
             params: vec![SqlValue::Text(id.to_string())],
             label: Some("brain_serve_ledger_get".into()),
         })
@@ -286,8 +284,7 @@ pub async fn backfill_grade(
     let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
     writer
         .execute(SqlStatement {
-            sql: sql!("brain_serve_ledger_backfill_grade")
-                .into(),
+            sql: sql!("brain_serve_ledger_backfill_grade").into(),
             params: vec![
                 SqlValue::Text(grade.to_string()),
                 SqlValue::Integer(graded_at_us),
@@ -522,9 +519,13 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let statements = &batches[0];
         assert_eq!(statements.len(), rows.len());
+        // The statement now comes from `sql/brain_serve_ledger_insert.sql`, which wraps
+        // its clauses across lines. SQL does not care and neither does this assertion:
+        // what it is here to pin is that the batch upserts and swallows the duplicate
+        // rather than failing the whole batch, so it reads the clause, not the layout.
+        let one_line = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
         for (statement, row) in statements.iter().zip(rows.iter()) {
-            assert!(statement
-                .sql
+            assert!(one_line(&statement.sql)
                 .ends_with("ON CONFLICT(namespace, target_id, query_class, served_at) DO NOTHING"));
             assert_eq!(
                 statement.label.as_deref(),
