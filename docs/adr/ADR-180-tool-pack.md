@@ -367,6 +367,28 @@ was not asked for one, and getting it wrong silently widens or silently narrows 
 is named here so that nobody reads this amendment as having made scoped rules effective everywhere.
 The column is a prerequisite for that work, not a substitute for it.
 
+### A second thing this amendment does not answer (added 2026-09-11)
+
+Item 5 accepts that a row with `actor *` and an exact scope outranks a row with an exact actor and
+no scope, because the ordering is a sum of comparable weights and a sum has no dimension
+precedence. That acceptance settles what happens; it is not a claim that the sum is the right
+ordering once scoped rows are common.
+
+The consequence an operator will actually meet is worth writing down plainly. Adding a broad-actor
+scoped `allow` can outrank a narrow-actor unscoped `deny` that was already in the table, and the
+operator who wrote the allow was thinking about the scope they named, not about the actor column
+they left as `*`. Nothing in the call tells them the older row stopped deciding. Acceptance arm 34
+pins the crossing so the behaviour is asserted rather than assumed, and that is all an acceptance
+arm can do: it makes the answer stable, not obviously right.
+
+The alternative ordering, lexicographic over actor then tool then scope, is deliberately out of
+scope here. It would also change how `lambda:*` with an exact tool ranks against an exact actor
+with `tool.*`, which is a change to behaviour that predates this column entirely and should not
+ride in on it. That is a separate decision carrying its own migration question.
+
+So the crossing case is decided and tested, and the ordering that produces it is not settled. Both
+are recorded here as distinct so that neither is read as having answered the other.
+
 ## Acceptance for Amendment 4
 
 26. A table containing only unscoped rows answers every `tool.check` exactly as it did before the
