@@ -8058,7 +8058,13 @@ pub(crate) mod tests {
             // SQL verb. So a literal has to carry a second structural keyword too, and
             // both are matched CASE-SENSITIVELY, because every statement in this tree
             // writes its keywords in upper case and English prose does not.
-            const SHAPES: [(&str, &[&str]); 9] = [
+            const SHAPES: [(&str, &[&str]); 10] = [
+                // A statement need not start with a verb at all. A common table
+                // expression starts with WITH, and there are a dozen of them in this
+                // workspace, so a census that only knows verbs reads a crate clean while
+                // its largest queries sit in Rust. The second keyword here is the CTE's
+                // own binding, which prose does not write.
+                ("WITH ", &[" AS ("]),
                 ("SELECT ", &[" FROM "]),
                 ("INSERT ", &["INSERT INTO ", "INSERT OR "]),
                 ("UPDATE ", &[" SET "]),
@@ -8135,6 +8141,66 @@ pub(crate) mod tests {
                 offenders.push(format!("{crate_name} {}: {literal}", path.display()));
             }
         }
+
+        // Must-fail control: take every statement this program has already extracted,
+        // write it back into a Rust literal in each of the three shapes a statement can
+        // take in Rust source, and require the predicate to catch each one. The
+        // must-match control below proves the predicate fires SOMEWHERE; this proves it
+        // fires on exactly the regression the census exists to stop, which is a
+        // converted statement coming home. The escaped-newline shape is not decoration:
+        // an earlier version of `flatten` dropped the backslash and left `nFROM`, and
+        // six of eleven statements would have come back unseen.
+        let mut round_tripped = 0usize;
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("khive-runtime's Cargo.toml lives directly under crates/")
+            .to_path_buf();
+        for crate_name in CONVERTED {
+            let sql_dir = crates_root.join(crate_name).join("sql");
+            let entries = std::fs::read_dir(&sql_dir).unwrap_or_else(|e| {
+                panic!("{crate_name} is on the converted list but {sql_dir:?} is unreadable: {e}")
+            });
+            for entry in entries.filter_map(Result::ok) {
+                let file = entry.path();
+                if file.extension().and_then(|e| e.to_str()) != Some("sql") {
+                    continue;
+                }
+                let statement =
+                    std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+                // A quoted identifier would otherwise close the synthetic literal early
+                // and fail this control for a reason that has nothing to do with it.
+                let statement = statement.trim().replace('"', "\\\"");
+                let shapes = [
+                    (
+                        "one line",
+                        statement.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ),
+                    ("escaped newlines", statement.replace('\n', "\\n")),
+                    (
+                        "line continuations",
+                        statement.replace('\n', " \\\n            "),
+                    ),
+                ];
+                for (shape, rendered) in shapes {
+                    let snippet = format!("let statement = \"{rendered}\";");
+                    let seen = sql_literals(&snippet);
+                    assert_eq!(
+                        seen.len(),
+                        1,
+                        "must-fail control: {file:?} written back into Rust as {shape} was \
+                         seen {} time(s), so the census would not notice this statement \
+                         moving home",
+                        seen.len()
+                    );
+                    round_tripped += 1;
+                }
+            }
+        }
+        assert!(
+            round_tripped > 0,
+            "must-fail control ran on nothing: {CONVERTED:?} contributed no .sql files, so \
+             its passing says only that the loop body never executed"
+        );
 
         assert!(
             control_hits > 0,
