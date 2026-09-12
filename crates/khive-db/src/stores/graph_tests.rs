@@ -193,6 +193,20 @@ pub(super) mod traverse_progress_seam {
 /// holding the graph DDL alone can no longer answer them. That shape is test-only:
 /// production applies one schema to one connection (`Backend::open`), and the guarded
 /// edge insert already reads those two tables.
+/// The graph DDL plus the minimal `entities`/`notes` tables the edge counts probe for
+/// endpoint tombstones, applied together because a database holding one without the other
+/// cannot answer those counts. That split is test-only: production applies one schema to
+/// one connection, and the guarded edge insert already reads both tables.
+fn apply_test_schema(conn: &rusqlite::Connection) {
+    conn.execute_batch(GRAPH_DDL).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+         CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+         CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY);",
+    )
+    .unwrap();
+}
+
 fn setup_memory_store() -> SqlGraphStore {
     setup_memory_store_with_substrates().1
 }
@@ -213,7 +227,7 @@ fn setup_file_store_with_origin_view() -> (
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     let identity = match pool.origin() {
         khive_storage::tx_registry::TxOrigin::Database(identity) => identity,
@@ -237,15 +251,7 @@ fn setup_memory_store_with_substrates() -> (Arc<ConnectionPool>, SqlGraphStore) 
 
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
-        writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-            )
-            .unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
@@ -343,7 +349,7 @@ async fn edge_pages_run_when_sqlite_count_is_denied() {
     );
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     // Pooled-reader mode lets the authorizer below observe the exact
     // connection used by both the control count and the page queries.
@@ -765,15 +771,7 @@ async fn observed_batch_upsert_later_refusal_preserves_earlier_replacement() {
             );
             {
                 let writer = pool.writer().unwrap();
-                writer.conn().execute_batch(GRAPH_DDL).unwrap();
-                writer
-                    .conn()
-                    .execute_batch(
-                        "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-                    )
-                    .unwrap();
+                apply_test_schema(writer.conn());
             }
             let store = SqlGraphStore::new_scoped(Arc::clone(&pool), is_file_backed, "default");
             assert_eq!(
@@ -1077,11 +1075,7 @@ async fn batched_namespace_edge_counts_exceed_sqlite_variable_limit() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
     let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-b");
 
@@ -1158,11 +1152,7 @@ async fn query_edges_in_namespaces_offset_paging_exceeds_sqlite_variable_limit()
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-a");
     let store_b = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "list-b");
 
@@ -1232,11 +1222,7 @@ async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
-    pool.writer()
-        .unwrap()
-        .conn()
-        .execute_batch(GRAPH_DDL)
-        .unwrap();
+    apply_test_schema(pool.writer().unwrap().conn());
     let store_a = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "stats-a");
 
     let mut edge_a1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
@@ -2111,7 +2097,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
     let secondary_identity = match pool.origin() {
         khive_storage::tx_registry::TxOrigin::Database(id) => id,
@@ -4400,7 +4386,7 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
@@ -4458,7 +4444,7 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
     }
 
     let store = Arc::new(SqlGraphStore::new_scoped(
@@ -4965,15 +4951,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
-        writer
-            .conn()
-            .execute_batch(
-                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
-                 CREATE TABLE events (id TEXT PRIMARY KEY);",
-            )
-            .unwrap();
+        apply_test_schema(writer.conn());
     }
     assert!(
         pool.writer_task_handle().unwrap().is_none(),
@@ -5113,7 +5091,7 @@ fn setup_store_with_a_corrupt_relation_row(node: Uuid, good: usize) -> SqlGraphS
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     {
         let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        apply_test_schema(writer.conn());
         let now = Utc::now().timestamp_micros();
         for i in 0..good {
             writer
