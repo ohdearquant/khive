@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::keyed_memory::{create_keyed_memory, validate_memory_key, KeyedMemorySpec};
-use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 
