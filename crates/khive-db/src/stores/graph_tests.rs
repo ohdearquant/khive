@@ -17,9 +17,8 @@ fn deny_count_function(ctx: AuthContext<'_>) -> Authorization {
     }
 }
 
-/// Deterministic barrier at the exact insert-to-probe seam
-/// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
-/// guarded `INSERT` is refused, before the missing-endpoint probe runs.
+/// Deterministic barrier immediately before the in-transaction endpoint
+/// probe used by an observed guarded edge write.
 ///
 /// A pure wall-clock race at this seam is not observable: a refused,
 /// zero-row `INSERT` autocommits (and so releases SQLite's write lock)
@@ -511,6 +510,126 @@ async fn test_upsert_and_get_edge() {
 }
 
 #[tokio::test]
+async fn observed_upsert_distinguishes_replace_refusal_and_resurrection() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.4);
+    original.metadata = Some(serde_json::json!({"revision": 1}));
+    let original_id = original.id;
+
+    let created = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: original.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(created) = created else {
+        panic!("first natural-key write must succeed");
+    };
+    assert_eq!(created.disposition, EdgeUpsertDisposition::Created);
+    assert!(created.previous.is_none());
+
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.9);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let updated = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(updated) = updated else {
+        panic!("live natural-key replacement must succeed");
+    };
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, original_id);
+    assert_eq!(updated.edge.metadata, replacement.metadata);
+    assert_eq!(updated.previous.unwrap().metadata, original.metadata);
+
+    store
+        .delete_edge(original_id, DeleteMode::Soft)
+        .await
+        .unwrap();
+    let refused = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::ResurrectionRequired {
+        edge: tombstone,
+    }) = refused
+    else {
+        panic!("implicit resurrection must be refused");
+    };
+    assert_eq!(tombstone.id, original_id);
+    assert!(tombstone.deleted_at.is_some());
+
+    replacement.weight = 0.7;
+    replacement.metadata = Some(serde_json::json!({"revision": 3}));
+    let resurrected = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: replacement.clone(),
+            resurrect: true,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(resurrected) = resurrected else {
+        panic!("explicit resurrection must succeed");
+    };
+    assert_eq!(resurrected.disposition, EdgeUpsertDisposition::Resurrected);
+    assert_eq!(resurrected.edge.id, original_id);
+    assert!(resurrected.edge.deleted_at.is_none());
+    assert_eq!(resurrected.edge.metadata, replacement.metadata);
+    assert!(resurrected.previous.unwrap().deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn observed_upsert_uses_canonical_symmetric_natural_key() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let left = Uuid::new_v4();
+    let right = Uuid::new_v4();
+    insert_live_entity(&pool, left);
+    insert_live_entity(&pool, right);
+    let first = make_edge(left, right, EdgeRelation::CompetesWith, 0.4);
+    let first_id = first.id;
+    let created = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: first,
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        created,
+        GuardedEdgeUpsertOutcome::Written(EdgeUpsertResult {
+            disposition: EdgeUpsertDisposition::Created,
+            ..
+        })
+    ));
+
+    let reverse = make_edge(right, left, EdgeRelation::CompetesWith, 0.8);
+    let updated = store
+        .upsert_edge_guarded_observed(EdgeUpsertRequest {
+            edge: reverse,
+            resurrect: false,
+        })
+        .await
+        .unwrap();
+    let GuardedEdgeUpsertOutcome::Written(updated) = updated else {
+        panic!("reverse symmetric edge must target the canonical row");
+    };
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, first_id);
+    assert_eq!(updated.edge.weight, 0.8);
+}
+
+#[tokio::test]
 async fn insert_edge_if_absent_preserves_the_natural_key_winner() {
     let store = setup_memory_store();
     let source = Uuid::new_v4();
@@ -528,6 +647,217 @@ async fn insert_edge_if_absent_preserves_the_natural_key_winner() {
     assert!((persisted.weight - 1.0).abs() < f64::EPSILON);
     assert_eq!(persisted.metadata, None);
     assert!(store.get_edge(loser_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observed_batch_upsert_reports_updated_preimage_and_created_rows() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let other_target = Uuid::new_v4();
+    for id in [source, target, other_target] {
+        insert_live_entity(&pool, id);
+    }
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+    original.metadata = Some(serde_json::json!({"revision": 1, "old_only": true}));
+    original.target_backend = Some("old-backend".into());
+    let original_id = original.id;
+    store.upsert_edge(original).await.unwrap();
+    let original = store.get_edge(original_id).await.unwrap().unwrap();
+
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let replacement_id = replacement.id;
+    let created = make_edge(source, other_target, EdgeRelation::Extends, 0.5);
+    let created_id = created.id;
+    let outcome = store
+        .upsert_edges_guarded_observed(vec![
+            EdgeUpsertRequest {
+                edge: replacement.clone(),
+                resurrect: false,
+            },
+            EdgeUpsertRequest {
+                edge: created,
+                resurrect: false,
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(outcome.refusal.is_none());
+    assert_eq!(outcome.rows.len(), 2);
+    let updated = &outcome.rows[0];
+    assert_eq!(updated.disposition, EdgeUpsertDisposition::Updated);
+    assert_eq!(updated.edge.id, original_id);
+    assert_eq!(updated.edge.created_at, original.created_at);
+    assert_eq!(updated.edge.weight, replacement.weight);
+    assert_eq!(updated.edge.metadata, replacement.metadata);
+    assert_eq!(updated.edge.target_backend, None);
+    assert_eq!(
+        serde_json::to_value(updated.previous.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(outcome.rows[1].disposition, EdgeUpsertDisposition::Created);
+    assert_eq!(outcome.rows[1].edge.id, created_id);
+    assert!(outcome.rows[1].previous.is_none());
+    for row in &outcome.rows {
+        let persisted = store.get_edge(row.edge.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::to_value(&row.edge).unwrap()
+        );
+    }
+    assert!(store.get_edge(replacement_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observed_batch_upsert_later_refusal_preserves_earlier_replacement() {
+    for (route, is_file_backed, use_writer_task) in [
+        ("memory_fallback", false, false),
+        ("file_fallback", true, false),
+        ("writer_task", true, true),
+    ] {
+        for resurrection_refusal in [false, true] {
+            let directory = is_file_backed.then(|| tempfile::tempdir().unwrap());
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: directory
+                        .as_ref()
+                        .map(|dir| dir.path().join("batch-refusal.db")),
+                    write_queue_enabled: Some(use_writer_task),
+                    write_routing_strict: use_writer_task,
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            {
+                let writer = pool.writer().unwrap();
+                writer.conn().execute_batch(GRAPH_DDL).unwrap();
+                writer
+                    .conn()
+                    .execute_batch(
+                        "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+                    )
+                    .unwrap();
+            }
+            let store = SqlGraphStore::new_scoped(Arc::clone(&pool), is_file_backed, "default");
+            assert_eq!(
+                pool.writer_task_handle().unwrap().is_some(),
+                use_writer_task,
+                "{route}"
+            );
+            let source = Uuid::new_v4();
+            let target = Uuid::new_v4();
+            let refused_target = Uuid::new_v4();
+            let other_target = Uuid::new_v4();
+            for id in [source, target, refused_target, other_target] {
+                insert_live_entity(&pool, id);
+            }
+            let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+            original.metadata = Some(serde_json::json!({"revision": 1}));
+            original.target_backend = Some("original-backend".into());
+            let original_id = original.id;
+            store.upsert_edge(original).await.unwrap();
+            let original = store.get_edge(original_id).await.unwrap().unwrap();
+
+            let tombstone = if resurrection_refusal {
+                let mut edge = make_edge(target, refused_target, EdgeRelation::Extends, 0.5);
+                edge.metadata = Some(serde_json::json!({"tombstone": true}));
+                let id = edge.id;
+                store.upsert_edge(edge).await.unwrap();
+                store.delete_edge(id, DeleteMode::Soft).await.unwrap();
+                store.get_edge_including_deleted(id).await.unwrap()
+            } else {
+                hard_delete_entity(&pool, refused_target);
+                None
+            };
+            let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+            replacement.metadata = Some(serde_json::json!({"revision": 2}));
+            let refused = make_edge(target, refused_target, EdgeRelation::Extends, 0.9);
+            let created = make_edge(source, other_target, EdgeRelation::Extends, 1.0);
+            let incoming_ids = [replacement.id, refused.id, created.id];
+
+            let acquisitions_before = pool.writer_acquisition_snapshot();
+            let outcome = store
+                .upsert_edges_guarded_observed(
+                    [replacement, refused, created]
+                        .into_iter()
+                        .map(|edge| EdgeUpsertRequest {
+                            edge,
+                            resurrect: false,
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let acquisitions_after = pool.writer_acquisition_snapshot();
+            assert_eq!(
+                (
+                    acquisitions_after.pooled_acquisitions
+                        - acquisitions_before.pooled_acquisitions,
+                    acquisitions_after.standalone_acquisitions
+                        - acquisitions_before.standalone_acquisitions,
+                    acquisitions_after.writer_task_acquisitions
+                        - acquisitions_before.writer_task_acquisitions,
+                ),
+                match route {
+                    "memory_fallback" => (1, 0, 0),
+                    "file_fallback" => (0, 1, 0),
+                    "writer_task" => (0, 0, 1),
+                    _ => unreachable!(),
+                },
+                "{route}: the refused batch must execute on the selected writer route"
+            );
+
+            assert!(outcome.rows.is_empty());
+            let refusal = outcome.refusal.expect("later entry must refuse the batch");
+            assert_eq!(refusal.entry_index, 1);
+            match (refusal.reason, tombstone) {
+                (EdgeUpsertRefusal::ResurrectionRequired { edge }, Some(tombstone)) => {
+                    assert_eq!(
+                        serde_json::to_value(&edge).unwrap(),
+                        serde_json::to_value(&tombstone).unwrap()
+                    );
+                    let persisted = store
+                        .get_edge_including_deleted(tombstone.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&persisted).unwrap(),
+                        serde_json::to_value(&tombstone).unwrap()
+                    );
+                }
+                (EdgeUpsertRefusal::MissingEndpoints(missing), None) => {
+                    assert!(!missing.source);
+                    assert!(missing.target);
+                }
+                other => panic!("unexpected later refusal: {other:?}"),
+            }
+            let persisted = store.get_edge(original_id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&persisted).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "{route}: preflight must refuse before replacing an earlier live edge"
+            );
+            for id in incoming_ids {
+                assert!(store
+                    .get_edge_including_deleted(id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            let writer_join = pool.take_writer_task_join();
+            drop(store);
+            drop(pool);
+            if let Some(writer_join) = writer_join {
+                writer_join.await.unwrap();
+            }
+            drop(directory);
+        }
+    }
 }
 
 /// The base `PRIMARY KEY (namespace, id)` alone would let two namespaces
@@ -4271,6 +4601,99 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
 }
 
 #[tokio::test]
+async fn legacy_guarded_batch_later_refusal_classifies_culprit_and_aborted_siblings() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let other_target = Uuid::new_v4();
+    let missing_target = Uuid::new_v4();
+    for id in [source, target, other_target] {
+        insert_live_entity(&pool, id);
+    }
+    let mut original = make_edge(source, target, EdgeRelation::Extends, 0.25);
+    original.metadata = Some(serde_json::json!({"revision": 1}));
+    let original_id = original.id;
+    store.upsert_edge(original).await.unwrap();
+    let original = store.get_edge(original_id).await.unwrap().unwrap();
+    let mut replacement = make_edge(source, target, EdgeRelation::Extends, 0.75);
+    replacement.metadata = Some(serde_json::json!({"revision": 2}));
+    let edges = vec![
+        replacement,
+        make_edge(target, missing_target, EdgeRelation::Extends, 0.5),
+        make_edge(source, other_target, EdgeRelation::Extends, 1.0),
+    ];
+
+    let outcome = store.upsert_edges_guarded(edges.clone()).await.unwrap();
+    let refusal = outcome.refused.as_ref().unwrap();
+    assert_eq!(refusal.entry_index, 1);
+    assert!(!refusal.missing.source);
+    assert!(refusal.missing.target);
+    let summary = &outcome.summary;
+    assert_eq!(summary.attempted, 3);
+    assert_eq!(summary.affected, 0);
+    assert_eq!(summary.failed, 3);
+    assert_eq!(summary.errors.len(), 3);
+    assert_eq!(summary.errors_omitted, 0);
+    assert!(!summary.errors_truncated);
+    assert_eq!(
+        summary.first_error,
+        format!(
+            "batch entry 1: edge endpoint no longer exists at write time: source {target} or target {missing_target}"
+        )
+    );
+    for (index, error) in summary.errors.iter().enumerate() {
+        assert_eq!(error.index, index as u64);
+        assert_eq!(error.item_id, Some(edges[index].id.to_string()));
+        if index == 1 {
+            assert_eq!(error.class, BatchWriteErrorClass::InvalidInput);
+            assert_eq!(error.retryability, BatchWriteRetryability::Permanent);
+            assert_eq!(error.message, summary.first_error);
+        } else {
+            assert_eq!(error.class, BatchWriteErrorClass::BatchAborted);
+            assert_eq!(error.retryability, BatchWriteRetryability::Unknown);
+            assert_eq!(
+                error.message,
+                format!(
+                    "batch entry {index} was not written because guarded batch entry 1 was refused"
+                )
+            );
+        }
+    }
+    assert_eq!(summary.error_counts.len(), 2);
+    for count in &summary.error_counts {
+        match count.class {
+            BatchWriteErrorClass::InvalidInput => assert_eq!(count.count, 1),
+            BatchWriteErrorClass::BatchAborted => assert_eq!(count.count, 2),
+            other => panic!("unexpected refusal error class: {other:?}"),
+        }
+    }
+    let page = outcome
+        .refusal_page(
+            &edges,
+            None,
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.total, Some(3));
+    assert_eq!(page.items, summary.errors);
+    let persisted = store.get_edge(original_id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&persisted).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    for edge in edges {
+        assert!(store
+            .get_edge_including_deleted(edge.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn upsert_edges_guarded_preserves_refusal_beyond_summary_cap() {
     let (pool, store) = setup_memory_store_with_substrates();
     let source = Uuid::new_v4();
@@ -4383,9 +4806,9 @@ async fn upsert_edges_guarded_preserves_refusal_beyond_summary_cap() {
 /// every time.
 ///
 /// So this version does not race at all. [`insert_probe_seam`] has
-/// production code itself (`edge_insert_guarded`, `#[cfg(test)]`-only)
-/// park the guarded call at the exact seam between its `INSERT` and its
-/// probe, keyed on this test's own `(source, target)` pair so unrelated
+/// production code itself (`observed_edge_upsert`, `#[cfg(test)]`-only)
+/// park the guarded call immediately before its endpoint probe, keyed on
+/// this test's own `(source, target)` pair so unrelated
 /// concurrent tests are unaffected. The racer's write is then forced to
 /// attempt landing at that exact seam:
 ///   - unwrapped (pre-fix) code holds no lock at the seam, so the racer's
@@ -4439,7 +4862,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let edge_id = edge.id;
 
     // Install the seam barrier before spawning the guarded call, keyed on
-    // the exact (source, target) pair `edge_insert_guarded` canonicalizes
+    // the exact (source, target) pair `observed_edge_upsert` canonicalizes
     // to and passes into `insert_probe_seam::hook` (Extends is not a
     // symmetric relation, so canonicalization is a no-op here).
     let (reached_rx, proceed_tx) = insert_probe_seam::install((source, target));
@@ -4450,7 +4873,7 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     };
 
     // Deterministic rendezvous: blocks until the guarded call has actually
-    // executed its refused INSERT and is parked at the seam. No sleep, no
+    // entered the write transaction and is parked before the probe. No sleep, no
     // guess — a real signal sent from production code at that exact point.
     tokio::task::spawn_blocking(move || reached_rx.recv())
         .await

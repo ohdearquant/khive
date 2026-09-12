@@ -178,6 +178,7 @@ async fn prepare(
                     relation: input.relation,
                     weight: 1.0,
                     metadata: None,
+                    resurrect: false,
                 },
             )
             .await?;
@@ -582,6 +583,7 @@ mod tests {
                             relation: EdgeRelation::Contains,
                             weight: 0.75,
                             metadata: Some(serde_json::json!({"winner": "competing"})),
+                            resurrect: false,
                         },
                     )
                     .await

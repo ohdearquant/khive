@@ -69,7 +69,7 @@ impl AtomicOpPlan {
             AtomicOpPlan::AddNote(p) => p.statements.clone(),
             AtomicOpPlan::Update(p) => p.statements.clone(),
             AtomicOpPlan::Delete(p) => p.statements.clone(),
-            AtomicOpPlan::Link(p) => vec![p.statement.clone()],
+            AtomicOpPlan::Link(p) => p.statements.clone(),
             AtomicOpPlan::Merge(p) => {
                 let mut statements: Vec<PlanStatement> = p
                     .rewires
@@ -778,7 +778,7 @@ mod tests {
         AtomicOpPlan::Link(LinkPlan {
             source_id: source,
             target_id: target,
-            statement: PlanStatement {
+            statements: vec![PlanStatement {
                 statement: SqlStatement {
                     sql: "INSERT INTO graph_edges \
                           (namespace, id, source_id, target_id, relation, created_at, updated_at) \
@@ -794,7 +794,8 @@ mod tests {
                     label: Some("insert-edge-where-exists".to_string()),
                 },
                 guard: Some(AffectedRowGuard::exactly(1)),
-            },
+            }],
+            disposition: khive_storage::EdgeUpsertDisposition::Created,
         })
     }
 

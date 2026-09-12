@@ -2012,8 +2012,27 @@ impl VerbRegistry {
                         "params": params_arr,
                         "identifier_resolution": identifier_resolution_help(),
                     });
+                    // A pack that authored its own schema keeps it; every other
+                    // verb gets one derived from the declarations the runtime
+                    // already holds, so a bridged model has a schema to read
+                    // instead of parsing the prose `params[].type`.
                     if let Some(schema) = pack.input_schema(verb) {
                         envelope["input_schema"] = schema;
+                    } else {
+                        let described: Vec<(String, String)> = params_arr
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p["name"].as_str().unwrap_or_default().to_string(),
+                                    p["description"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect();
+                        if let Some(schema) =
+                            crate::input_schema::derive_input_schema(handler.params, &described)
+                        {
+                            envelope["input_schema"] = schema;
+                        }
                     }
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));

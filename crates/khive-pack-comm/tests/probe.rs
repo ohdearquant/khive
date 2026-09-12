@@ -2,12 +2,13 @@
 //! the daemon hardening slice (ADR-D5).
 //!
 //! INLINE TEST JUSTIFICATION: separate from `tests/integration.rs` because
-//! every test here needs `idx_comm_message_to_actor` actually created via
+//! every test here needs the comm probe indexes actually created via
 //! `VerbRegistry::apply_schema_plans` (the probe SQL uses `INDEXED BY`, which
 //! errors loudly if the index is absent) — `integration.rs`'s shared
 //! `build_registry()` fixture intentionally does not apply schema plans, and
 //! changing it would be a behavior change for unrelated tests in that file.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
@@ -16,12 +17,12 @@ use khive_runtime::{
     VerbRegistryBuilder,
 };
 use khive_storage::note::Note;
-use khive_storage::types::DeleteMode;
-use serde_json::json;
+use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// Build a registry with the comm pack's auxiliary schema plan actually
-/// applied, so `idx_comm_message_to_actor` exists for `INDEXED BY` to find.
+/// applied, so the probe's history and partial unread indexes exist.
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
@@ -151,6 +152,23 @@ async fn probe_empty_inbox_returns_zeroed_response() {
     assert_eq!(result["cursor_us"], json!(0));
     assert_eq!(result["new_messages"], json!([]));
     assert_eq!(result["stale_unread_count"], json!(0));
+}
+
+#[tokio::test]
+async fn probe_empty_page_preserves_a_negative_caller_cursor() {
+    let (registry, _rt) = build_registry();
+    for cursor in [-1_i64, -100] {
+        let result = registry
+            .dispatch(
+                "comm.probe",
+                json!({"actor": "lambda:nobody", "since_us": cursor}),
+            )
+            .await
+            .expect("negative cursor is accepted");
+        assert_eq!(result["new_messages"], json!([]));
+        assert_eq!(result["cursor_us"], json!(cursor));
+        assert_eq!(result["stale_unread_count"], json!(0));
+    }
 }
 
 #[tokio::test]
@@ -285,12 +303,12 @@ async fn probe_new_messages_ordered_newest_last() {
 }
 
 #[tokio::test]
-async fn probe_caps_new_messages_at_100_newest() {
+async fn probe_caps_new_messages_at_100_earliest_unseen_sequences() {
     let (registry, rt) = build_registry();
     let actor = "lambda:leo";
 
-    // Plant 105 rows; the oldest 5 must be dropped by the LIMIT 100, and the
-    // 100 kept must still come back ascending (oldest-of-the-kept first).
+    // The first page selects the earliest unseen sequences, leaving the final
+    // five for the next page instead of skipping them behind its cursor.
     let base = 1_000_000_i64;
     for i in 0..105 {
         plant_inbound_message(&rt, actor, "a", base + i * 1_000, None, false).await;
@@ -308,14 +326,135 @@ async fn probe_caps_new_messages_at_100_newest() {
         .iter()
         .map(|m| m["created_at_us"].as_i64().unwrap())
         .collect();
-    let expected_first = base + 5 * 1_000; // the 5 oldest rows were dropped
-    let expected_last = base + 104 * 1_000;
+    let expected_first = base;
+    let expected_last = base + 99 * 1_000;
     assert_eq!(timestamps.first().copied(), Some(expected_first));
     assert_eq!(timestamps.last().copied(), Some(expected_last));
     assert!(
         timestamps.windows(2).all(|w| w[0] < w[1]),
         "kept messages must be strictly ascending: {timestamps:?}"
     );
+}
+
+async fn stored_note_sequences(rt: &KhiveRuntime) -> HashMap<String, i64> {
+    let access = rt.sql();
+    let mut reader = access.reader().await.expect("reader");
+    reader
+        .query_all(SqlStatement {
+            sql: "SELECT note_id, seq FROM notes_seq".into(),
+            params: Vec::new(),
+            label: None,
+        })
+        .await
+        .expect("read durable note sequences")
+        .into_iter()
+        .map(|row| match (row.get("note_id"), row.get("seq")) {
+            (Some(SqlValue::Text(id)), Some(SqlValue::Integer(seq))) => (id.clone(), *seq),
+            other => panic!("invalid note sequence row: {other:?}"),
+        })
+        .collect()
+}
+
+fn probe_message_ids(response: &Value) -> HashSet<String> {
+    response["new_messages"]
+        .as_array()
+        .expect("message array")
+        .iter()
+        .map(|message| message["id"].as_str().expect("message id").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn probe_burst_150_drains_as_100_then_50_without_cursor_skips() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:burst";
+    let mut planted = Vec::new();
+    for index in 0..150 {
+        // Reverse timestamps make sequence selection observably different
+        // from presentation order and from selecting the oldest timestamps.
+        planted.push(
+            plant_inbound_message(
+                &rt,
+                actor,
+                "sender",
+                1_000_000 + (150 - index) * 1_000,
+                None,
+                false,
+            )
+            .await
+            .to_string(),
+        );
+    }
+    let sequences = stored_note_sequences(&rt).await;
+    let population_max = planted.iter().map(|id| sequences[id]).max().unwrap();
+    let first = registry
+        .dispatch("comm.probe", json!({"actor": actor}))
+        .await
+        .expect("first burst page");
+    let first_cursor = first["cursor_us"].as_i64().expect("first cursor");
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({"actor": actor, "since_us": first_cursor}),
+        )
+        .await
+        .expect("second burst page");
+    let second_cursor = second["cursor_us"].as_i64().expect("second cursor");
+    // Capture both pages before checking the cursor. The population-MAX
+    // regression must report its decisive 100/0 witness, not stop earlier.
+    let page_counts = (
+        first["new_messages"].as_array().unwrap().len(),
+        second["new_messages"].as_array().unwrap().len(),
+    );
+    assert_eq!(
+        page_counts, (100, 50),
+        "burst page counts were {page_counts:?}; first_cursor={first_cursor}, population_max={population_max}"
+    );
+    let first_ids = probe_message_ids(&first);
+    let second_ids = probe_message_ids(&second);
+    assert_eq!(
+        first_ids,
+        planted[..100].iter().cloned().collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        second_ids,
+        planted[100..].iter().cloned().collect::<HashSet<_>>()
+    );
+    assert!(first_ids.is_disjoint(&second_ids));
+    assert_eq!(
+        first_ids
+            .union(&second_ids)
+            .cloned()
+            .collect::<HashSet<_>>(),
+        planted.iter().cloned().collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        first_cursor,
+        first_ids.iter().map(|id| sequences[id]).max().unwrap()
+    );
+    assert!(
+        first_cursor < population_max,
+        "the first cursor must not consume unreturned rows"
+    );
+    assert_eq!(second_cursor, population_max);
+    for page in [&first, &second] {
+        let times: Vec<_> = page["new_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["created_at_us"].as_i64().unwrap())
+            .collect();
+        assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    let third = registry
+        .dispatch(
+            "comm.probe",
+            json!({"actor": actor, "since_us": second_cursor}),
+        )
+        .await
+        .expect("empty third burst page");
+    assert_eq!(third["new_messages"], json!([]));
+    assert_eq!(third["cursor_us"], json!(second_cursor));
 }
 
 #[tokio::test]
@@ -341,6 +480,201 @@ async fn probe_stale_unread_count_uses_default_20_minutes() {
         result["stale_unread_count"],
         json!(1),
         "only the old+unread message counts as stale: {result}"
+    );
+}
+
+fn probe_note(namespace: &str, created_at: i64, properties: Value) -> Note {
+    Note {
+        version: 1,
+        key: None,
+        id: Uuid::new_v4(),
+        namespace: namespace.into(),
+        kind: "message".into(),
+        status: "active".into(),
+        name: None,
+        content: "bounded probe fixture".into(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(properties),
+        created_at,
+        updated_at: created_at,
+        deleted_at: None,
+    }
+}
+
+#[tokio::test]
+async fn probe_stale_count_saturates_at_1000_even_after_the_page_cursor() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:capped-stale";
+    let stale_time = chrono::Utc::now().timestamp_micros() - 60 * 60_000_000;
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let store = rt.notes(&token).expect("notes store");
+    let summary = store
+        .upsert_notes((0..1001).map(|_| probe_note("local", stale_time, json!({
+            "to_actor": actor, "from_actor": "sender", "direction": "inbound", "read": false,
+        }))).collect())
+        .await
+        .expect("seed more than the stale count cap");
+    assert_eq!(summary.affected, 1001, "{summary:?}");
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    let population_max = stored_note_sequences(&rt)
+        .await
+        .into_values()
+        .max()
+        .unwrap();
+    let first = registry
+        .dispatch("comm.probe", json!({"actor": actor}))
+        .await
+        .expect("first capped stale page");
+    let exhausted = registry
+        .dispatch(
+            "comm.probe",
+            json!({"actor": actor, "since_us": population_max}),
+        )
+        .await
+        .expect("cursor beyond all stale rows");
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 100);
+    assert_eq!(exhausted["new_messages"], json!([]));
+    for response in [&first, &exhausted] {
+        assert_eq!(response["stale_unread_count"], json!(1000), "{response}");
+    }
+    assert_eq!(exhausted["cursor_us"], json!(population_max));
+}
+
+#[tokio::test]
+async fn probe_stale_count_is_independent_of_page_and_preserves_unread_eligibility() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:stale-controls";
+    let now = chrono::Utc::now().timestamp_micros();
+    let fresh_time = now + 60 * 60_000_000;
+    let stale_time = now - 60 * 60_000_000;
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let store = rt.notes(&token).expect("notes store");
+    let summary = store
+        .upsert_notes((0..120).map(|_| probe_note("local", fresh_time, json!({
+            "to_actor": actor, "from_actor": "sender", "direction": "inbound", "read": false,
+        }))).collect())
+        .await
+        .expect("seed fresh first page");
+    assert_eq!(summary.affected, 120, "{summary:?}");
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    for read in [
+        None,
+        Some(Value::Null),
+        Some(json!(1)),
+        Some(json!("true")),
+        Some(json!(false)),
+    ] {
+        let mut properties =
+            json!({"to_actor": actor, "from_actor": "sender", "direction": "inbound"});
+        if let Some(read) = read {
+            properties["read"] = read;
+        }
+        store
+            .upsert_note(probe_note("local", stale_time, properties))
+            .await
+            .expect("seed non-true unread flag");
+    }
+    plant_inbound_message(&rt, actor, "sender", stale_time, None, true).await;
+    plant_inbound_message(
+        &rt,
+        "lambda:someone-else",
+        "sender",
+        stale_time,
+        None,
+        false,
+    )
+    .await;
+    plant_inbound_message_in_namespace(&rt, "tenant-b", actor, "sender", stale_time, None, false)
+        .await;
+    store
+        .upsert_note(probe_note(
+            "local",
+            stale_time,
+            json!({
+                "to_actor": actor, "from_actor": "sender", "direction": "outbound", "read": false,
+            }),
+        ))
+        .await
+        .expect("seed outbound control");
+    let deleted = plant_inbound_message(&rt, actor, "sender", stale_time, None, false).await;
+    assert!(store
+        .delete_note(deleted, DeleteMode::Soft)
+        .await
+        .expect("soft-delete control"));
+
+    let sequences = stored_note_sequences(&rt).await;
+    let first = registry
+        .dispatch("comm.probe", json!({"actor": actor}))
+        .await
+        .expect("fresh page");
+    // Cursor correctness has its own burst regression; use stored page
+    // boundaries here so a bad response cursor cannot hide count assertions.
+    let first_boundary = probe_message_ids(&first)
+        .iter()
+        .map(|id| sequences[id])
+        .max()
+        .expect("fresh page has rows");
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({"actor": actor, "since_us": first_boundary}),
+        )
+        .await
+        .expect("stale page");
+    let second_boundary = probe_message_ids(&second)
+        .iter()
+        .map(|id| sequences[id])
+        .max()
+        .expect("stale page has rows");
+    let third = registry
+        .dispatch(
+            "comm.probe",
+            json!({"actor": actor, "since_us": second_boundary}),
+        )
+        .await
+        .expect("empty page");
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 100);
+    assert!(first["new_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["created_at_us"] == json!(fresh_time)));
+    assert_eq!(second["new_messages"].as_array().unwrap().len(), 26);
+    assert_eq!(third["new_messages"], json!([]));
+    for response in [&first, &second, &third] {
+        assert_eq!(response["stale_unread_count"], json!(5), "count must ignore page/cursor and reject fresh, read, outbound, foreign and deleted controls: {response}");
+    }
+}
+
+#[tokio::test]
+async fn probe_production_sql_stale_cutoff_is_strict() {
+    let (_registry, rt) = build_registry();
+    let actor = "lambda:cutoff";
+    for created_at in [999, 1000, 1001] {
+        plant_inbound_message(&rt, actor, "sender", created_at, None, false).await;
+    }
+    let access = rt.sql();
+    let mut reader = access.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: khive_pack_comm::handlers::PROBE_SQL.into(),
+            params: vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text(actor.into()),
+                SqlValue::Null,
+                SqlValue::Integer(1000),
+            ],
+            label: None,
+        })
+        .await
+        .expect("production SQL with exact cutoff");
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row.get("stale_unread_count"), Some(SqlValue::Integer(1)))),
+        "only the row strictly before the cutoff is stale: {rows:?}"
     );
 }
 
@@ -598,39 +932,76 @@ async fn probe_rejects_unknown_fields() {
 }
 
 #[tokio::test]
-async fn probe_query_plan_uses_the_to_actor_index() {
+async fn probe_production_sql_stale_count_plan_uses_partial_index_and_cutoff() {
     let (_registry, rt) = build_registry();
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("reader");
     let plan = reader
-        .explain(khive_storage::types::SqlStatement {
-            sql: "SELECT id FROM notes INDEXED BY idx_comm_message_to_actor \
-                  WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
-                  AND json_extract(properties, '$.to_actor') = ?2 \
-                  AND json_extract(properties, '$.direction') = 'inbound'"
-                .to_string(),
+        .explain(SqlStatement {
+            sql: khive_pack_comm::handlers::PROBE_SQL.into(),
             params: vec![
-                khive_storage::types::SqlValue::Text("local".into()),
-                khive_storage::types::SqlValue::Text("lambda:leo".into()),
+                SqlValue::Text("local".into()),
+                SqlValue::Text("lambda:leo".into()),
+                SqlValue::Null,
+                SqlValue::Integer(1_000_000),
             ],
             label: Some("comm_probe_plan_check".into()),
         })
         .await
         .expect("EXPLAIN QUERY PLAN succeeds when the index exists");
 
-    let plan_text: String = plan
+    let nodes: Vec<_> = plan
         .iter()
-        .flat_map(|row| row.columns.iter())
-        .filter_map(|c| match &c.value {
-            khive_storage::types::SqlValue::Text(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(
+            |row| match (row.get("id"), row.get("parent"), row.get("detail")) {
+                (
+                    Some(SqlValue::Integer(id)),
+                    Some(SqlValue::Integer(parent)),
+                    Some(SqlValue::Text(detail)),
+                ) => (*id, *parent, detail.as_str()),
+                other => panic!("invalid EXPLAIN QUERY PLAN row: {other:?}"),
+            },
+        )
+        .collect();
+    let stats_id = nodes
+        .iter()
+        .find(|(_, _, detail)| matches!(*detail, "CO-ROUTINE stats" | "MATERIALIZE stats"))
+        .map(|(id, _, _)| *id)
+        .unwrap_or_else(|| panic!("production stale-count subtree is missing: {nodes:?}"));
+
+    // The page legitimately joins notes_seq; only the independent count subtree
+    // must avoid the full message-history index and sequence join.
+    let mut stats_ids = HashSet::from([stats_id]);
+    loop {
+        let previous_len = stats_ids.len();
+        for (id, parent, _) in &nodes {
+            if stats_ids.contains(parent) {
+                stats_ids.insert(*id);
+            }
+        }
+        if stats_ids.len() == previous_len {
+            break;
+        }
+    }
+    let stats_details: Vec<_> = nodes
+        .iter()
+        .filter(|(id, _, _)| stats_ids.contains(id))
+        .map(|(_, _, detail)| *detail)
+        .collect();
     assert!(
-        plan_text.contains("idx_comm_message_to_actor"),
-        "query plan must use idx_comm_message_to_actor: {plan_text}"
+        stats_details.iter().any(|detail| {
+            detail.starts_with("SEARCH ")
+                && detail.contains("idx_notes_unread_probe_recipient_direction")
+                && detail.contains("created_at<?")
+        }),
+        "stale count must seek the partial index with its strict cutoff: {nodes:?}"
+    );
+    assert!(
+        stats_details.iter().all(|detail| {
+            !detail.contains("idx_comm_message_to_actor") && !detail.contains("notes_seq")
+        }),
+        "stale count must not join sequence rows or scan full message history: {nodes:?}"
     );
 }
 

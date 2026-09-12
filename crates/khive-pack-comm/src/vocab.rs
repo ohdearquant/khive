@@ -604,6 +604,15 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
     HandlerDef {
         name: "comm.probe",
         description: "Read-only poll for new inbound message metadata and stale unread count. \
+                      Selects the earliest 100 unseen messages by commit sequence, then displays \
+                      that page by created_at ascending. cursor_us advances only through rows \
+                      actually returned and never below the honored caller cursor; an empty page \
+                      does not advance it. Round-trip the cursor to drain larger bursts. The page \
+                      and count share one SQL statement's snapshot, scoped to live inbound messages \
+                      with the exact actor and namespace. stale_unread_count is capped at 1000: \
+                      smaller values are exact, and 1000 means at least 1000. It counts unread rows \
+                      strictly older than the cutoff independently of the arrival cursor. Only \
+                      JSON boolean true in properties.read marks a message read. \
                       Unlike comm.inbox, the actor is not inferred from the caller — pass it \
                       explicitly via the required `actor` param (khive #93). A `since_us` the \
                       store cannot have issued is discarded and the page comes from the \

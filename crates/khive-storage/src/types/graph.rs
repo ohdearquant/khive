@@ -651,6 +651,75 @@ impl MissingEndpoints {
     }
 }
 
+/// What an edge upsert did to the natural-key row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeUpsertDisposition {
+    /// No row with this natural key existed, so a new edge was inserted.
+    Created,
+    /// A live row existed and was replaced according to the upsert contract.
+    Updated,
+    /// A tombstoned row existed and was restored by an explicit opt-in.
+    Resurrected,
+}
+
+impl EdgeUpsertDisposition {
+    /// Canonical wire spelling used in link responses and event payloads.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Resurrected => "resurrected",
+        }
+    }
+}
+
+/// One edge upsert together with the preimage needed for an audit record.
+#[derive(Clone, Debug)]
+pub struct EdgeUpsertResult {
+    pub edge: Edge,
+    pub disposition: EdgeUpsertDisposition,
+    /// Present for replacement and resurrection; absent for a new insert.
+    pub previous: Option<Edge>,
+}
+
+/// One requested edge plus its tombstone-restoration policy.
+#[derive(Clone, Debug)]
+pub struct EdgeUpsertRequest {
+    pub edge: Edge,
+    /// When false, a natural-key conflict with a tombstone is refused without
+    /// changing either its payload or deletion marker.
+    pub resurrect: bool,
+}
+
+/// Why an observed guarded upsert was refused inside its write transaction.
+#[derive(Clone, Debug)]
+pub enum EdgeUpsertRefusal {
+    MissingEndpoints(MissingEndpoints),
+    ResurrectionRequired { edge: Edge },
+}
+
+/// Observed singleton upsert outcome, including refusal provenance.
+#[derive(Clone, Debug)]
+pub enum GuardedEdgeUpsertOutcome {
+    Written(EdgeUpsertResult),
+    Refused(EdgeUpsertRefusal),
+}
+
+/// Batch refusal attributed to the caller's entry order.
+#[derive(Clone, Debug)]
+pub struct GuardedEdgeBatchRefusal {
+    pub entry_index: usize,
+    pub reason: EdgeUpsertRefusal,
+}
+
+/// All-or-nothing observed batch upsert outcome.
+#[derive(Clone, Debug)]
+pub struct GuardedEdgeBatchUpsertOutcome {
+    pub rows: Vec<EdgeUpsertResult>,
+    pub refusal: Option<GuardedEdgeBatchRefusal>,
+}
+
 /// Outcome of [`crate::GraphStore::upsert_edge_guarded`], determined entirely
 /// inside the guard's own storage transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]

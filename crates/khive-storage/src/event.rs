@@ -112,12 +112,16 @@ impl Event {
     }
 }
 
-/// Which substrate (entity or note) the referent record lives in.
+/// Which durable record family an event observation refers to. Edge remains
+/// relational storage rather than a fourth [`SubstrateKind`]; this narrower
+/// discriminant exists so edge lifecycle events can still be queried through
+/// `observed=[edge_id]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferentKind {
     Entity,
     Note,
+    Edge,
 }
 
 impl ReferentKind {
@@ -126,6 +130,7 @@ impl ReferentKind {
         match self {
             Self::Entity => "entity",
             Self::Note => "note",
+            Self::Edge => "edge",
         }
     }
 }
