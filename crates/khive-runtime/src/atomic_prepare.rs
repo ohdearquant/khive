@@ -401,8 +401,8 @@ async fn push_index_purge_statements(
 /// lifecycle event after their row mutation: `update_entity` ->
 /// `EntityUpdated`, `delete_entity` -> `EntityDeleted`, `delete_note` ->
 /// `NoteDeleted`, `update_edge` -> `EdgeUpdated`, `delete_edge` ->
-/// `EdgeDeleted`, and `link` -> `LinkCreated`/`EdgeUpdated`. `update_note`
-/// appends no event and must never call this. See
+/// `EdgeDeleted`, `link` -> `LinkCreated`/`EdgeUpdated`, and
+/// `update_note` -> `NoteUpdated`. See
 /// `docs/api/atomic_prepare.md#event_append_statements` for why
 /// this is a `PlanStatement` rather than a `PostCommitEffect`.
 ///
@@ -413,7 +413,7 @@ async fn push_index_purge_statements(
 /// describes strengthens canonical's guarantee: the non-atomic handlers write
 /// the event in a separate transaction, ordered but not atomic with the row
 /// mutation.
-fn event_append_statements(
+pub(crate) fn event_append_statements(
     token: &NamespaceToken,
     namespace: &str,
     verb: &str,
@@ -4756,11 +4756,16 @@ mod tests {
         }
     }
 
-    /// Parity boundary: atomic `update` of a note must append no event:
-    /// canonical `update_note` never calls `append_event` (unlike
-    /// `update_entity`, which always does).
+    /// Parity boundary: an atomic `update` of a note appends exactly one
+    /// `NoteUpdated` event, because this path and canonical `update_note` build
+    /// their plan through the same `prepare_versioned_note_update`, which is
+    /// where the event statements are added.
+    ///
+    /// This test used to assert the opposite. That was a faithful record of a
+    /// gap rather than a contract: notes were the substrate that recorded no
+    /// update at all, so the parity it certified was parity with nothing.
     #[tokio::test]
-    async fn atomic_update_note_appends_no_event() {
+    async fn atomic_update_note_appends_its_domain_event() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -4799,14 +4804,21 @@ mod tests {
             )
             .await
             .expect("query_events");
-        assert!(
-            page.items.iter().all(|e| e.target_id != Some(note_id)),
-            "update_note must append no event; found: {:?}",
-            page.items
-                .iter()
-                .filter(|e| e.target_id == Some(note_id))
-                .collect::<Vec<_>>()
+        let for_note: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.target_id == Some(note_id))
+            .collect();
+        assert_eq!(
+            for_note.len(),
+            1,
+            "an atomic note update must append exactly one event; found: {for_note:?}"
         );
+        assert_eq!(for_note[0].kind, EventKind::NoteUpdated);
+        assert_eq!(for_note[0].substrate, SubstrateKind::Note);
+        assert_eq!(for_note[0].verb, "update");
+        assert_eq!(for_note[0].payload["id"], json!(note_id));
+        assert_eq!(for_note[0].payload["text_changed"], json!(true));
     }
 
     /// Atomic `link` commits its mutation and event-plane observation in the

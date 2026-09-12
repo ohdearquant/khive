@@ -570,6 +570,23 @@ impl KhiveRuntime {
                 });
             }
         }
+        // The note update event, in the same atomic unit as the row it
+        // describes, exactly as the entity update plan does. This is the third
+        // of the three domain kinds that had no emitter anywhere in the tree.
+        statements.extend(crate::atomic_prepare::event_append_statements(
+            token,
+            &note.namespace,
+            "update",
+            khive_types::EventKind::NoteUpdated,
+            khive_types::SubstrateKind::Note,
+            note.id,
+            serde_json::json!({
+                "id": note.id,
+                "namespace": note.namespace,
+                "version": note.version,
+                "text_changed": text_changed,
+            }),
+        )?);
         // This is a potential reindex. Inherited membership is resolved by the
         // writer because vector publication can occur without a note revision.
         let post_commit =
