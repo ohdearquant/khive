@@ -1,5 +1,7 @@
 //! pack-kg — Knowledge Graph verb pack for khive. 24 verbs: entities, notes, edges, queries, proposals, context, resolve, whoami, db_diagnostics.
 
+mod sql;
+
 pub mod apply_worker;
 mod dispatch;
 pub mod entity_type_registry;
