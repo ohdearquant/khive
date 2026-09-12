@@ -70,7 +70,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
-        description: "Create an entity or note (singleton) or a batch of entities (bulk via `items`).",
+        description: "Create an entity or note (singleton) or a batch of entities (bulk via \
+                      `items`). When a new entity's name resembles one that already exists, the \
+                      response carries `similar_existing`. Read it before creating another: in \
+                      most cases the right next step is to link to what is already there rather \
+                      than add a near-duplicate. The field is absent when nothing similar was \
+                      found, and suppressed entirely by `skip_dedup_check`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
