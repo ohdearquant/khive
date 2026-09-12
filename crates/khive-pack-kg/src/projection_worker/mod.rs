@@ -2,6 +2,7 @@
 
 mod helpers;
 
+use crate::sql::sql;
 use helpers::build_conditional_event_insert;
 
 use khive_runtime::{EventAttribution, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -38,11 +39,7 @@ impl ProposalsProjectionWorker {
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
         writer
             .execute(SqlStatement {
-                sql: "INSERT INTO proposals_open \
-                        (proposal_id, namespace, proposer, title, status, \
-                         created_at, updated_at, expiry) \
-                      VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6)"
-                    .to_string(),
+                sql: sql!("proposals_insert").to_string(),
                 params: vec![
                     SqlValue::Text(proposal_id.to_string()),
                     SqlValue::Text(ns),
@@ -87,14 +84,7 @@ impl ProposalsProjectionWorker {
         let rows = if let Some(new_status) = new_status_opt {
             writer
                 .execute(SqlStatement {
-                    sql: "UPDATE proposals_open \
-                          SET status = ?1, updated_at = ?2, last_decision = ?3, \
-                              review_count = review_count + 1, \
-                              approve_count = approve_count + ?4, \
-                              reject_count = reject_count + ?5 \
-                          WHERE proposal_id = ?6 AND namespace = ?7 \
-                            AND status NOT IN ('applied', 'withdrawn', 'rejected', 'approved')"
-                        .to_string(),
+                    sql: sql!("proposals_update_review_status").to_string(),
                     params: vec![
                         SqlValue::Text(new_status.to_string()),
                         SqlValue::Integer(now),
@@ -111,11 +101,7 @@ impl ProposalsProjectionWorker {
         } else {
             writer
                 .execute(SqlStatement {
-                    sql: "UPDATE proposals_open \
-                          SET updated_at = ?1, last_decision = ?2, \
-                              review_count = review_count + 1 \
-                          WHERE proposal_id = ?3 AND namespace = ?4"
-                        .to_string(),
+                    sql: sql!("proposals_update_review_comment").to_string(),
                     params: vec![
                         SqlValue::Integer(now),
                         SqlValue::Text(last_decision_str.to_string()),
@@ -142,11 +128,7 @@ impl ProposalsProjectionWorker {
         let ns = token.namespace().as_str().to_owned();
         let event = EventAttribution::from_token(token).stamp(event);
         let projection_stmt = SqlStatement {
-            sql: "UPDATE proposals_open \
-                  SET status = 'applied', updated_at = ?1 \
-                  WHERE proposal_id = ?2 AND namespace = ?3 \
-                    AND status = 'applying'"
-                .to_string(),
+            sql: sql!("proposals_mark_applied").to_string(),
             params: vec![
                 SqlValue::Integer(now),
                 SqlValue::Text(proposal_id.to_string()),
@@ -154,7 +136,7 @@ impl ProposalsProjectionWorker {
             ],
             label: Some("projection_worker.applied_and_emit.cas".into()),
         };
-        let event_stmt = build_conditional_event_insert(&event, "changes() = 1", vec![]);
+        let event_stmt = build_conditional_event_insert(&event);
 
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
@@ -183,11 +165,7 @@ impl ProposalsProjectionWorker {
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
         let rows = writer
             .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = 'applying', updated_at = ?1 \
-                      WHERE proposal_id = ?2 AND namespace = ?3 \
-                        AND status = 'approved'"
-                    .to_string(),
+                sql: sql!("proposals_mark_applying").to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(proposal_id.to_string()),
@@ -212,11 +190,7 @@ impl ProposalsProjectionWorker {
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
         let rows = writer
             .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = 'withdrawn', updated_at = ?1 \
-                      WHERE proposal_id = ?2 AND namespace = ?3 \
-                        AND status NOT IN ('applied', 'applying', 'withdrawn', 'rejected')"
-                    .to_string(),
+                sql: sql!("proposals_mark_withdrawn").to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(proposal_id.to_string()),
@@ -241,11 +215,7 @@ impl ProposalsProjectionWorker {
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
         writer
             .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = 'approved', updated_at = ?1 \
-                      WHERE proposal_id = ?2 AND namespace = ?3 \
-                        AND status = 'applying'"
-                    .to_string(),
+                sql: sql!("proposals_revert_to_approved").to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(proposal_id.to_string()),
@@ -280,37 +250,23 @@ impl ProposalsProjectionWorker {
             };
         let last_decision_str = payload.decision.as_str();
 
-        let (projection_stmt, guard_sql, guard_params) = if let Some(new_status) = new_status_opt {
-            let stmt = SqlStatement {
-                    sql: "UPDATE proposals_open \
-                          SET status = ?1, updated_at = ?2, last_decision = ?3, \
-                              review_count = review_count + 1, \
-                              approve_count = approve_count + ?4, \
-                              reject_count = reject_count + ?5 \
-                          WHERE proposal_id = ?6 AND namespace = ?7 \
-                            AND status NOT IN ('applied', 'applying', 'withdrawn', 'rejected', 'approved')"
-                        .to_string(),
-                    params: vec![
-                        SqlValue::Text(new_status.to_string()),
-                        SqlValue::Integer(now),
-                        SqlValue::Text(last_decision_str.to_string()),
-                        SqlValue::Integer(approve_delta),
-                        SqlValue::Integer(reject_delta),
-                        SqlValue::Text(proposal_id.to_string()),
-                        SqlValue::Text(ns.clone()),
-                    ],
-                    label: Some("projection_worker.reviewed_and_emit.cas".into()),
-                };
-            let guard = "changes() = 1";
-            let gp: Vec<SqlValue> = vec![];
-            (stmt, guard, gp)
+        let projection_stmt = if let Some(new_status) = new_status_opt {
+            SqlStatement {
+                sql: sql!("proposals_update_pending_review_status").to_string(),
+                params: vec![
+                    SqlValue::Text(new_status.to_string()),
+                    SqlValue::Integer(now),
+                    SqlValue::Text(last_decision_str.to_string()),
+                    SqlValue::Integer(approve_delta),
+                    SqlValue::Integer(reject_delta),
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("projection_worker.reviewed_and_emit.cas".into()),
+            }
         } else {
-            let stmt = SqlStatement {
-                sql: "UPDATE proposals_open \
-                          SET updated_at = ?1, last_decision = ?2, \
-                              review_count = review_count + 1 \
-                          WHERE proposal_id = ?3 AND namespace = ?4"
-                    .to_string(),
+            SqlStatement {
+                sql: sql!("proposals_update_review_comment").to_string(),
                 params: vec![
                     SqlValue::Integer(now),
                     SqlValue::Text(last_decision_str.to_string()),
@@ -318,14 +274,11 @@ impl ProposalsProjectionWorker {
                     SqlValue::Text(ns.clone()),
                 ],
                 label: Some("projection_worker.reviewed_and_emit.comment".into()),
-            };
-            let guard = "changes() = 1";
-            let gp: Vec<SqlValue> = vec![];
-            (stmt, guard, gp)
+            }
         };
 
         let event_id = event.id;
-        let event_stmt = build_conditional_event_insert(&event, guard_sql, guard_params);
+        let event_stmt = build_conditional_event_insert(&event);
 
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
@@ -355,11 +308,7 @@ impl ProposalsProjectionWorker {
         let event = EventAttribution::from_token(token).stamp(event);
 
         let projection_stmt = SqlStatement {
-            sql: "UPDATE proposals_open \
-                  SET status = 'withdrawn', updated_at = ?1 \
-                  WHERE proposal_id = ?2 AND namespace = ?3 \
-                    AND status NOT IN ('applied', 'applying', 'withdrawn', 'rejected')"
-                .to_string(),
+            sql: sql!("proposals_mark_withdrawn").to_string(),
             params: vec![
                 SqlValue::Integer(now),
                 SqlValue::Text(proposal_id.to_string()),
@@ -368,11 +317,8 @@ impl ProposalsProjectionWorker {
             label: Some("projection_worker.withdrawn_and_emit.cas".into()),
         };
 
-        let guard_sql = "changes() = 1";
-        let guard_params: Vec<SqlValue> = vec![];
-
         let event_id = event.id;
-        let event_stmt = build_conditional_event_insert(&event, guard_sql, guard_params);
+        let event_stmt = build_conditional_event_insert(&event);
 
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
@@ -396,10 +342,7 @@ impl ProposalsProjectionWorker {
         let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
         let row = reader
             .query_row(SqlStatement {
-                sql: "SELECT proposal_id, proposer, status, approve_count, reject_count \
-                      FROM proposals_open \
-                      WHERE proposal_id = ?1 AND namespace = ?2"
-                    .to_string(),
+                sql: sql!("proposals_read_projection").to_string(),
                 params: vec![SqlValue::Text(proposal_id.to_string()), SqlValue::Text(ns)],
                 label: Some("projection_worker.proposals_open.get".into()),
             })

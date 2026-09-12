@@ -8784,6 +8784,91 @@ async fn list_proposals_status_filter() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_proposals_actor_filter_and_explicit_proposer_precedence() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+
+    let fixture_for = |actor: &str| {
+        let mut builder = VerbRegistryBuilder::new();
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("configure trusted runtime audit store");
+        builder.with_actor_id(Some(actor.to_string()));
+        builder.register(KgPack::new(rt.clone()));
+        Fixture {
+            registry: builder.build().expect("registry build must succeed"),
+        }
+    };
+
+    let alice = fixture_for("alice");
+    let bob = fixture_for("bob");
+    let alice_id = alice
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Alice proposal",
+                "description": "Owned by Alice",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Alice proposal must succeed")["id"]
+        .as_str()
+        .expect("Alice proposal id")
+        .to_string();
+    let bob_id = bob
+        .dispatch(
+            "propose",
+            json!({
+                "title": "Bob proposal",
+                "description": "Owned by Bob",
+                "changeset": changeset_add_entity()
+            }),
+        )
+        .await
+        .expect("Bob proposal must succeed")["id"]
+        .as_str()
+        .expect("Bob proposal id")
+        .to_string();
+
+    let default_items = alice
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("default proposal list must succeed");
+    let default_items = list_items(&default_items);
+    assert!(default_items.iter().any(|item| item["id"] == alice_id));
+    assert!(!default_items.iter().any(|item| item["id"] == bob_id));
+
+    let all_items = alice
+        .dispatch("list", json!({"kind": "proposal", "actor": "*"}))
+        .await
+        .expect("unscoped proposal list must succeed");
+    let all_items = list_items(&all_items);
+    assert!(all_items.iter().any(|item| item["id"] == alice_id));
+    assert!(all_items.iter().any(|item| item["id"] == bob_id));
+
+    let explicit_items = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "alice", "proposer": "bob"}),
+        )
+        .await
+        .expect("explicit proposer list must succeed");
+    let explicit_items = list_items(&explicit_items);
+    assert!(!explicit_items.iter().any(|item| item["id"] == alice_id));
+    assert!(explicit_items.iter().any(|item| item["id"] == bob_id));
+
+    let empty_status = alice
+        .dispatch(
+            "list",
+            json!({"kind": "proposal", "actor": "*", "status": ""}),
+        )
+        .await
+        .expect("empty status filter must remain a real filter");
+    assert!(list_items(&empty_status).is_empty());
+}
+
 /// Negative path: withdraw on an applied proposal must fail.
 /// propose → approve (auto-applies) → withdraw → expect error mentioning "applied".
 #[tokio::test]
