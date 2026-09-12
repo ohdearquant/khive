@@ -392,9 +392,10 @@ pub(crate) async fn prepare_atomic_note_requests(
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
     let mut notes: Vec<Note> = Vec::with_capacity(requests.len());
-    for request in &requests {
+    for (index, request) in requests.iter().enumerate() {
         let spec = &request.spec;
         let options = &request.options;
+        let record = format!("note[{index}]");
         runtime.validate_note_kind(spec.kind)?;
         // Same owned-identity derivation every other note-write site runs
         // (`operations.rs`'s create funnel, `atomic_prepare::prepare_add_note`):
@@ -404,12 +405,12 @@ pub(crate) async fn prepare_atomic_note_requests(
         let properties =
             runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-        crate::secret_gate::check(spec.content)?;
+        crate::secret_gate::check_at(spec.content, &record, "content")?;
         if let Some(n) = spec.name {
-            crate::secret_gate::check(n)?;
+            crate::secret_gate::check_at(n, &record, "name")?;
         }
         if let Some(ref p) = properties {
-            crate::secret_gate::check_json(p)?;
+            crate::secret_gate::check_json_at(p, &record, "properties")?;
         }
 
         let ns = spec.token.namespace().as_str();

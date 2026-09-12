@@ -524,14 +524,14 @@ pub async fn prepare_add_entity(
     let properties = optional_properties(args, "properties")?;
     let tags = optional_tags(args)?.unwrap_or_default();
 
-    crate::secret_gate::check(name)?;
+    crate::secret_gate::check_at(name, "entity", "name")?;
     if let Some(ref d) = description {
-        crate::secret_gate::check(d)?;
+        crate::secret_gate::check_at(d, "entity", "description")?;
     }
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "entity", "properties")?;
     }
-    crate::secret_gate::check_tags(&tags)?;
+    crate::secret_gate::check_tags_at(&tags, "entity", "tags")?;
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
     let ns = token.namespace().as_str();
@@ -592,12 +592,12 @@ pub async fn prepare_add_note(
     // (threaded in by the apply worker), not the proposer's.
     let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
-    crate::secret_gate::check(content)?;
+    crate::secret_gate::check_at(content, "note", "content")?;
     if let Some(ref n) = name {
-        crate::secret_gate::check(n)?;
+        crate::secret_gate::check_at(n, "note", "name")?;
     }
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "note", "properties")?;
     }
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 
@@ -1038,7 +1038,7 @@ async fn prepare_update_edge(
     let properties = optional_properties(args, "properties")?;
 
     if let Some(ref p) = properties {
-        crate::secret_gate::check_json(p)?;
+        crate::secret_gate::check_json_at(p, "edge", "properties")?;
     }
     crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
 

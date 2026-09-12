@@ -1071,7 +1071,7 @@ pub async fn prepare_transition(
         )));
     }
     if let Some(n) = note_arg {
-        khive_runtime::secret_gate::check(n)?;
+        khive_runtime::secret_gate::check_at(n, "task", "note")?;
     }
 
     let (note, current) = load_task(runtime, token, raw_id).await?;
@@ -1183,7 +1183,7 @@ pub async fn prepare_complete(
     let target = complete_target_status(status_arg)?;
 
     if let Some(result) = result_arg {
-        khive_runtime::secret_gate::check(result)?;
+        khive_runtime::secret_gate::check_at(result, "task", "result")?;
     }
 
     let (note, current) = load_task(runtime, token, raw_id).await?;
