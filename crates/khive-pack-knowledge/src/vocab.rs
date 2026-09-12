@@ -33,7 +33,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
         params: &[
             ParamDef {
                 name: "atoms",
-                param_type: "array<object>",
+                param_type: "array of object",
                 required: true,
                 description: "List of atoms: {slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}. On update, omitted source/finalized fields are preserved; null clears a source or resets finalized to false without demoting lifecycle status.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -54,7 +54,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
         category: VerbCategory::Commissive,
         params: &[ParamDef {
             name: "domains",
-            param_type: "array<object>",
+            param_type: "array of object",
             required: true,
             description: "List of domains: {slug, name, description?, tags?, members?}",
             resolution_mode: IdResolutionMode::NotApplicable,
@@ -129,7 +129,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
             ParamDef {
                 name: "fields",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Non-empty exact response projection. Atom fields: id, namespace, slug, \
                               name, content, tags, properties, status, source_uri, source_type, finalized, \
@@ -163,7 +163,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
         params: &[
             ParamDef {
                 name: "ids",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: true,
                 description: "Atom slugs or UUIDs to delete",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -205,7 +205,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
         params: &[
             ParamDef {
                 name: "ids",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Atom slugs/IDs to index. Omit to index all.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -241,7 +241,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
         params: &[
             ParamDef {
                 name: "candidates",
-                param_type: "array<object>",
+                param_type: "array of object",
                 required: true,
                 description: "Scored items: {id, score, size, name?, members?, content?, category?, information_gain?}. `members` is an optional live member count; candidates with members=0 are not selected. `knowledge.suggest`'s `results` feed this directly.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -435,14 +435,14 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
             ParamDef {
                 name: "domain_ids",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Domain UUIDs or slugs whose member atoms should be included",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "atom_ids",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Atom UUIDs or slugs to include directly",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -500,7 +500,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
             ParamDef {
                 name: "sections",
-                param_type: "array<object>",
+                param_type: "array of object",
                 required: true,
                 description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]. \
                     section_type is a closed enum — valid values: overview | core_model | boundary_conditions | formalism | operational_guidance | examples | failure_modes | expert_lens | references | other. \
@@ -641,7 +641,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
             ParamDef {
                 name: "tags",
-                param_type: "array<string>",
+                param_type: "array of string",
                 required: false,
                 description: "Optional tag list",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -674,7 +674,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
             },
             ParamDef {
                 name: "weight",
-                param_type: "float",
+                param_type: "number",
                 required: false,
                 description: "Edge weight; defaults to 1.0, clamped 0.0-1.0",
                 resolution_mode: IdResolutionMode::NotApplicable,

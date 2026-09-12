@@ -1,12 +1,17 @@
 //! Derive a JSON Schema for a verb's parameters from its own [`ParamDef`] list.
 //!
 //! `help` publishes `params[].type` as a documentation string. Every machine
-//! bridge parses it as a JSON Schema type, and most of the spellings in use are
-//! not schema types: `bool` and `boolean` appear in the same verb, `array of
-//! string` and `array<string>` are one type spelled two ways, and `uuid` and
-//! `object or array of object` are not types at all. A driver that cannot read
-//! a verb's parameter types cannot call it, and only the git pack publishes a
+//! bridge parses it as a JSON Schema type, and several of the spellings in use
+//! are not schema types: `uuid` names a format, `array` names no element type,
+//! and `object or array of object` is a union. A driver that cannot read a
+//! verb's parameter types cannot call it, and only the git pack publishes a
 //! hand-authored `input_schema` to read instead.
+//!
+//! The duplicate spellings this module used to absorb are gone: one type is
+//! written one way, and the registry-wide test in `kkernel` asserts the exact
+//! set. The map below therefore has one arm per spelling, and adding an
+//! alternation to an arm is the shape to refuse, because it lets a second
+//! spelling of an existing type back in without anything failing.
 //!
 //! This module closes that by deriving a schema from the declarations the
 //! runtime already holds. A pack-supplied `input_schema` still wins, so the
@@ -50,15 +55,15 @@ pub fn json_schema_type(param_type: &str) -> Option<Value> {
     let schema = match param_type {
         "string" => json!({"type": "string"}),
         "integer" => json!({"type": "integer"}),
-        "number" | "float" => json!({"type": "number"}),
-        "boolean" | "bool" => json!({"type": "boolean"}),
+        "number" => json!({"type": "number"}),
+        "boolean" => json!({"type": "boolean"}),
         "object" => json!({"type": "object"}),
         "array" => json!({"type": "array"}),
         "uuid" => json!({"type": "string", "format": "uuid"}),
-        "array of string" | "array<string>" => {
+        "array of string" => {
             json!({"type": "array", "items": {"type": "string"}})
         }
-        "array of object" | "array<object>" => {
+        "array of object" => {
             json!({"type": "array", "items": {"type": "object"}})
         }
         "array of uuid" => {
