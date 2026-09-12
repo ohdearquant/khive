@@ -9,14 +9,18 @@
 //!
 //! Nothing about that is caught by review, because the text reads correct to the
 //! person writing it: the second audience arrived after the words did. This test is
-//! the forced consumer. It scans the MCP-visible surface of every loaded pack and
-//! fails on an internal reference that is not in the recorded baseline below.
+//! the forced consumer. It scans the published surface of every pack the server
+//! links by default and fails on an internal reference that is not in the recorded
+//! baseline below.
+//!
+//! The population is the pack list in `khive-mcp`'s `pack` module minus the two
+//! feature-gated packs. A pack added there and not here is a hole in this test, so
+//! the scan asserts it walked a real surface before believing any absence.
 //!
 //! The baseline may only SHRINK. An entry that no longer matches fails the test too,
 //! so the list cannot quietly rot into a permission slip.
 
-use khive_runtime::Pack;
-use khive_types::pack::{HandlerDef, Visibility};
+use khive_types::pack::{HandlerDef, Pack, Visibility};
 
 /// Patterns that mean "written for someone with the repository open".
 fn internal_reference(text: &str) -> Option<&'static str> {
@@ -100,6 +104,11 @@ fn offenders() -> Vec<(Site, String)> {
     collect(
         "session",
         khive_pack_session::SessionPack::HANDLERS,
+        &mut out,
+    );
+    collect(
+        "telemetry",
+        khive_pack_telemetry::TelemetryPack::HANDLERS,
         &mut out,
     );
     collect("tool", khive_pack_tool::ToolPack::HANDLERS, &mut out);
