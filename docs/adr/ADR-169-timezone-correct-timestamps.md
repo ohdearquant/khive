@@ -373,6 +373,33 @@ Sequencing: step 3 is the minimum that resolves the observed defect and can land
 rest. Steps 1 and 2 are its prerequisites. Step 4 closes D1's stated scope and should not lag
 step 3 by long, since until it lands D1 is true of one parser and not the other.
 
+## Amendment 1 (2026-09-12): the caller may name the zone, and the answer says which one was used
+
+D1 anchors a date-only `due` to the earliest instant of that local date in the configured
+display timezone. That resolution is unchanged. What this amendment adds is WHICH zone, because
+`display_timezone` is one `RuntimeConfig` field resolved once at construction and a single
+process serves callers in many zones. One value cannot be right for a caller in New York and a
+caller in Berlin at the same time, so configuring the host replaces UTC-for-everyone with one
+wrong zone for everyone. The zone a deadline is anchored in is a property of whose deadline it
+is, and the runtime does not know whose. The caller does.
+
+Task creation therefore takes an optional `timezone` argument, an IANA zone name, defaulting to
+the configured display timezone when absent. Nothing about D1's resolution within a zone
+changes, including the gap and ambiguous cases.
+
+The answer echoes the zone that was actually used, as `due_timezone`, and it is present whenever
+`due` is present rather than only when the caller named one. That is the load-bearing half of the
+amendment and the reason it is written down rather than left to the implementation: without the
+echo, a deadline anchored in a zone the caller chose and one anchored in whatever the host
+happened to be configured with are byte-identical in the stored record. The ambiguity the
+argument removes from the parse would reappear, unannounced, at every later reader. A field that
+appeared only on the caller-supplied path would leave the defaulted case an absence, which is the
+same defect wearing the opposite sign.
+
+An unresolvable zone name is refused with the value named. It is never silently defaulted: a
+caller that meant a zone and mistyped it would otherwise receive a correct-looking deadline
+anchored somewhere else.
+
 ## References
 
 - ADR-078: output format and shape-aware rendering.

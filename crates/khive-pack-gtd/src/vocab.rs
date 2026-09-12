@@ -141,7 +141,17 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "due",
                 param_type: "string",
                 required: false,
-                description: "Due date (ISO-8601).",
+                description: "Due date (ISO-8601). A date-only value is anchored to the earliest \
+                              instant of that local date in `timezone`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "timezone",
+                param_type: "string",
+                required: false,
+                description: "IANA zone name (e.g. \"America/New_York\") the date-only `due` is \
+                              anchored in. Defaults to the server's configured display timezone. \
+                              The zone actually used is echoed back as `due_timezone`.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
