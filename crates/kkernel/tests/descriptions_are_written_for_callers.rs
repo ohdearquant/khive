@@ -60,8 +60,8 @@ const BASELINE: &[Site] = &[];
 
 fn collect(pack: &'static str, handlers: &'static [HandlerDef], out: &mut Vec<(Site, String)>) {
     for h in handlers {
-        // Internal handlers are not part of the published surface.
-        if h.visibility != Visibility::Mcp {
+        // `Subhandler` is operator-only; `Verb` is what the MCP surface publishes.
+        if h.visibility != Visibility::Verb {
             continue;
         }
         if let Some(kind) = internal_reference(h.description) {
@@ -97,7 +97,11 @@ fn offenders() -> Vec<(Site, String)> {
         khive_pack_schedule::SchedulePack::HANDLERS,
         &mut out,
     );
-    collect("session", khive_pack_session::SessionPack::HANDLERS, &mut out);
+    collect(
+        "session",
+        khive_pack_session::SessionPack::HANDLERS,
+        &mut out,
+    );
     collect("tool", khive_pack_tool::ToolPack::HANDLERS, &mut out);
     collect("web", khive_pack_web::WebPack::HANDLERS, &mut out);
     collect(
@@ -117,7 +121,10 @@ fn no_shipped_description_carries_an_internal_reference() {
         khive_pack_kg::KgPack::HANDLERS,
         khive_pack_gtd::GtdPack::HANDLERS,
     ] {
-        scanned += handlers.iter().filter(|h| h.visibility == Visibility::Mcp).count();
+        scanned += handlers
+            .iter()
+            .filter(|h| h.visibility == Visibility::Verb)
+            .count();
     }
     assert!(
         scanned > 5,

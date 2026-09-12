@@ -753,7 +753,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 required: false,
                 description: "Required in singleton mode. Source node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
-                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              and prefix lookup search every namespace you can see; \
                               entity-name fallback uses the primary namespace. Ignored when \
                               links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
@@ -764,7 +764,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 required: false,
                 description: "Required in singleton mode. Target node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
-                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              and prefix lookup search every namespace you can see; \
                               entity-name fallback uses the primary namespace. Ignored when \
                               links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
@@ -773,9 +773,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "relation",
                 param_type: "string",
                 required: false,
+                // MAINTENANCE, deliberately kept out of the description: the
+                // entity->entity table below is a hand-maintained mirror of
+                // `base_entity_endpoint_rules()` in khive-runtime, guarded by a
+                // regression test on key rows. Enforcement reads the shared rule data
+                // through `base_entity_rule_allows()`, never this text, so the two can
+                // drift and only that test will say so. Pack extensions come from
+                // `KG_EDGE_RULES` in this crate's `pack.rs`. A crate path and an issue
+                // number cannot be acted on by the caller this text is published to.
                 description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
-                    Base ADR-002 entity->entity allowlist (issue #964 — this table is a hand-maintained mirror of `base_entity_endpoint_rules()` (khive-runtime) and is guarded by a regression test on key rows; enforcement consults the shared rule data via `base_entity_rule_allows()`, not this text — `base_entity_endpoint_rules()` is just an exposed view of the same constant): \
+                    Base entity->entity allowlist: \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
@@ -791,8 +799,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
                     supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim), note->note (same-substrate only). \
                     annotates: note -> {entity, note, edge, event} — the only relation permitting a note source paired with ANY target substrate (supersedes/supports/refutes also permit a note source, but only same-substrate: a note source there requires a note target too). \
-                    The `kg` pack additionally allows (pack-extensible, additive-only per ADR-017): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
-                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here. Full pack-rule source: `KG_EDGE_RULES` in `khive-pack-kg/src/pack.rs` (ADR-017).",
+                    The `kg` pack additionally allows (pack rules are additive only): part_of/instance_of person->org, part_of/instance_of person->project, depends_on/enables/contains/part_of/precedes org->org, precedes decision-note->decision-note. \
+                    Other loaded packs may add further pairs (e.g. `gtd` allows depends_on task-note->task-note; `formal` allows typed depends_on between theorem/definition/axiom/structure/instance/goal entity_types) — pack rules only ever add allowed pairs, never remove one listed here.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1001,9 +1009,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "entity_ids",
                 param_type: "array of string",
                 required: false,
-                description: "Explicit anchor UUIDs, short prefixes, or slugs (ADR-046 \
-                              resolution). Honored in full — never clamped by `limit`. At \
-                              least one of query/entity_ids is required.",
+                description: "Explicit anchor UUIDs, short prefixes, or slugs. Honored in \
+                              full — never clamped by `limit`. At least one of \
+                              query/entity_ids is required.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1035,8 +1043,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "string",
                 required: false,
                 description: "Edge direction during expansion: \"outgoing\" | \"incoming\" | \
-                              \"both\" (default \"both\" — diverges from `neighbors`' \
-                              \"outgoing\" default; see ADR-089).",
+                              \"both\" (default \"both\", which differs from `neighbors`, \
+                              whose default is \"outgoing\").",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1307,7 +1315,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                       classified as ledger_behind_pre_v14_duplicate_edge_state. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
                       row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
-                      ADR-091 checkpoint counters, a PASSIVE \
+                      WAL checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
