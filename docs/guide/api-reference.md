@@ -2629,6 +2629,22 @@ smaller of the request-parser and daemon-frame caps with an 8192-byte reserve fo
 request fields. Upload IDs are capabilities held in process memory, with no actor
 ownership restriction or restart recovery. After a daemon restart, begin again.
 
+Each loaded upload manager allows 128 staged uploads in total and 16 per originating
+actor by default. `KHIVE_BLOB_UPLOAD_MAX_ACTIVE` and
+`KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR` accept positive integer overrides; invalid values
+warn and use their defaults. Reaching either ceiling refuses `blob.begin` with
+`InvalidInput` naming that ceiling. Pending creation and uploads awaiting successful
+cleanup occupy slots; successful commit or cleanup releases them. Cancelling the
+begin request does not cancel admitted creation: its upload remains tracked until
+expiry. The existing-reference shortcut uses no slot and remains available when
+the ceiling is full. These limits apply per process, not as a shared disk quota.
+
+On Windows and other non-Unix systems, filesystem staging requires trusted local
+write access to the blob root, its contents and its ancestor directories. The
+path checks do not prevent a local writer from swapping a junction or reparse
+point between validation and use. See the
+[filesystem platform limits](../../crates/khive-pack-blob/docs/design.md#filesystem-platform-limits).
+
 ### `blob.put_part` — Declaration
 
 Append one part and return `{next_index, received_bytes}`, both non-negative integers.

@@ -84,8 +84,21 @@ staging and returns `{aborted: true}`; unknown or consumed ids report unknown up
 The four upload verbs are Declaration verbs; existing `blob.put` remains Commissive,
 and `blob.get` / `blob.stat` remain Assertive.
 All mutations refuse on a read-only runtime. Upload ids are capabilities: the
-originating actor is retained for attribution, not an ownership restriction.
+originating actor is retained for attribution and admission limits, not an ownership restriction.
 There is no upload journal and a restarted daemon answers unknown upload.
+
+Each loaded upload manager admits at most 128 staged uploads in total and 16 per
+originating actor. `KHIVE_BLOB_UPLOAD_MAX_ACTIVE` and
+`KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR` override those ceilings with positive integers;
+invalid values warn and use the defaults. A full ceiling refuses `blob.begin` with
+`InvalidInput` naming the total or per-actor ceiling. The known-reference shortcut
+needs no slot. Reservations count pending backend creation and remain occupied
+until successful commit or cleanup, including when cleanup must be retried. Once
+creation is admitted, it finishes registering its record even if the request is
+cancelled, so the reservation and stage remain tracked for expiry. Admission and
+reservation happen under one short lock; backend I/O holds no admission lock.
+These are process-local concurrency bounds, not disk quotas or request rate limits.
+Staging orphaned by a process restart is still reclaimed by backend sweeping.
 
 Only the daemon starts the upload sweep component. Each tick expires pack records
 and calls backend `sweep_uploads` for orphan staging, using the same idle policy as
@@ -99,6 +112,30 @@ by the interval. The filesystem stages below `.uploads/`, which object GC ignore
 The current staged-upload backend is `FsBlobStore`. `S3BlobStore` retains whole-object
 put/get/stat support but inherits Unsupported for staging methods; its known-reference
 begin shortcut can still return an existing object without staging.
+
+## Filesystem platform limits
+
+On Windows and other non-Unix systems, staged filesystem operations validate paths
+and then resolve them again for creation, append, publication and removal. These
+checks do not prevent a local writer from swapping a directory, junction or reparse
+point between validation and use, redirecting an operation outside the blob root.
+Deploy with the blob root, its contents and its ancestor directories writable only
+by trusted processes. An untrusted process running as the same service account is
+also outside this containment boundary. Upload IDs constrain input names but do
+not close the filesystem race.
+
+The Unix implementation uses anchored directory handles and no-follow operations.
+A Windows handle-based replacement remains follow-up work: it needs native
+Windows coverage of concurrent swaps during begin, append, commit, abort and sweep,
+including both the publication source and destination. A compile-only check does
+not establish those runtime guarantees.
+
+Filesystem writes currently share a per-root mutex across staged operations,
+ordinary publication and object GC. The guard stays held through blocking writes
+and synchronization, including after cancellation of the async caller. Concurrent
+uploads can be admitted, but their filesystem writes to the same root are serialized.
+Changing that lock requires preserving cancellation ownership, capacity checks,
+publication and GC exclusion; it is separate follow-up work.
 
 ## Expiry and ownership controls
 
@@ -122,8 +159,11 @@ Removing only backend `sweep_uploads` leaves live-record expiry effective throug
 `scripts/test-blob-upload-mutations.py` builds baseline, mutated and restored executables in
 an isolated clean checkout with an explicit `CARGO_TARGET_DIR`. Supply `--root`, `--head`,
 `--binary` and a fresh `--out` evidence directory outside the checkout. Its default
-`--case all` runs five controls: the four ADR-173 mutation operators (tail digest, verb
-expiry, backend sweep, copied publisher) and daemon ownership. `--case owner` selects
+`--case all` runs six controls: the four ADR-173 mutation operators (tail digest, verb
+expiry, backend sweep, copied publisher), daemon ownership and the total upload ceiling.
+`--case cap` removes only the total ceiling while the per-actor limit remains above
+the test's total limit; accepting another `blob.begin` must fail the assertion.
+`--case owner` selects
 only the ownership control, suppressing the entire daemon sweep call while preserving its
 timer and heartbeat. It requires one baseline pass, exactly one failure reporting retained
 staging, exact source restoration and one restored pass. Compile errors and unrelated

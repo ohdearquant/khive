@@ -42,14 +42,14 @@ struct Fixture {
 
 fn manager_with_store(runtime: KhiveRuntime, store: Arc<dyn BlobStore>) -> UploadManager {
     runtime.install_blob_store(store).unwrap();
-    UploadManager {
-        runtime,
-        policy: UploadPolicy {
-            idle_for: IDLE,
-            sweep_interval: Duration::from_secs(600),
-        },
-        records: Mutex::new(HashMap::new()),
-    }
+    let mut manager = UploadManager::new(runtime);
+    manager.policy = UploadPolicy {
+        idle_for: IDLE,
+        sweep_interval: Duration::from_secs(600),
+        max_active: 128,
+        max_per_actor: 16,
+    };
+    manager
 }
 
 fn fixture() -> Fixture {
@@ -103,6 +103,352 @@ fn age_file(path: &Path) {
         .unwrap()
         .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
         .unwrap();
+}
+
+fn assert_upload_ceiling(error: RuntimeError, ceiling: &str, limit: usize) {
+    match error {
+        RuntimeError::InvalidInput(message) => assert_eq!(
+            message,
+            format!("blob.begin: {ceiling} active-upload ceiling of {limit} reached")
+        ),
+        other => panic!("expected named InvalidInput upload ceiling, got {other}"),
+    }
+}
+
+#[test]
+fn upload_ceiling_parser_accepts_positive_usize_and_rejects_invalid_values() {
+    assert_eq!(UploadPolicy::positive_limit("1"), Some(1));
+    assert_eq!(UploadPolicy::positive_limit("128"), Some(128));
+    assert_eq!(
+        UploadPolicy::positive_limit(&usize::MAX.to_string()),
+        Some(usize::MAX)
+    );
+    for invalid in ["", "0", "-1", "1.5", " 16", "sixteen"] {
+        assert_eq!(UploadPolicy::positive_limit(invalid), None, "{invalid:?}");
+    }
+    assert_eq!(
+        UploadPolicy::positive_limit(&format!("{}0", usize::MAX)),
+        None
+    );
+}
+
+#[tokio::test]
+async fn total_active_upload_ceiling_refuses_before_staging_and_abort_restores_slot() {
+    let mut f = fixture();
+    f.manager.policy.max_active = 2;
+    f.manager.policy.max_per_actor = 3;
+    let first = begin(&f.manager, 0).await;
+    let second = begin(&f.manager, 0).await;
+    assert_upload_ceiling(
+        f.manager
+            .begin(0, None, "uploader:b".into())
+            .await
+            .unwrap_err(),
+        "total",
+        2,
+    );
+    assert_eq!(
+        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
+        2
+    );
+    let retained_record = f.manager.record(&first).unwrap();
+    f.manager.abort(&first).await.unwrap();
+    assert!(!staged(&f.root, &first).exists());
+    let replacement = upload_id(&f.manager.begin(0, None, "uploader:b".into()).await.unwrap());
+    assert!(retained_record.lock().await.slot.is_none());
+    assert_ne!(replacement, first);
+    assert!(staged(&f.root, &second).exists());
+    f.manager.abort(&second).await.unwrap();
+    f.manager.abort(&replacement).await.unwrap();
+}
+
+#[tokio::test]
+async fn per_actor_upload_ceiling_isolated_and_abort_releases_originating_actor_slot() {
+    let mut f = fixture();
+    f.manager.policy.max_active = 4;
+    f.manager.policy.max_per_actor = 1;
+    let first = begin(&f.manager, 0).await;
+    assert_upload_ceiling(
+        f.manager
+            .begin(0, None, "uploader:a".into())
+            .await
+            .unwrap_err(),
+        "per-actor",
+        1,
+    );
+    let other = upload_id(&f.manager.begin(0, None, "uploader:b".into()).await.unwrap());
+    crate::handlers::handle_abort(&f.manager, json!({"upload_id": first.to_string()}))
+        .await
+        .unwrap();
+    let replacement = begin(&f.manager, 0).await;
+    assert_upload_ceiling(
+        f.manager
+            .begin(0, None, "uploader:b".into())
+            .await
+            .unwrap_err(),
+        "per-actor",
+        1,
+    );
+    assert!(staged(&f.root, &other).exists());
+    f.manager.abort(&other).await.unwrap();
+    f.manager.abort(&replacement).await.unwrap();
+}
+
+#[tokio::test]
+async fn committed_upload_releases_total_and_actor_slots() {
+    let mut f = fixture();
+    f.manager.policy.max_active = 1;
+    f.manager.policy.max_per_actor = 1;
+    let id = begin(&f.manager, 1).await;
+    f.manager.put_part(&id, 0, b"a".to_vec()).await.unwrap();
+    let retained_record = f.manager.record(&id).unwrap();
+    f.manager.commit(&id).await.unwrap();
+    assert!(!staged(&f.root, &id).exists());
+    assert!(f.store.exists(&content_ref(b"a")).await.unwrap());
+    let replacement = begin(&f.manager, 0).await;
+    assert!(retained_record.lock().await.slot.is_none());
+    f.manager.abort(&replacement).await.unwrap();
+}
+
+#[tokio::test]
+async fn known_reference_bypasses_full_upload_ceilings_without_reserving_slot() {
+    let mut f = fixture();
+    f.manager.policy.max_active = 1;
+    f.manager.policy.max_per_actor = 1;
+    let id = begin(&f.manager, 0).await;
+    let reference = f.store.put(b"known".to_vec()).await.unwrap();
+    for actor in ["uploader:a", "uploader:b"] {
+        let result = f
+            .manager
+            .begin(0, Some(reference.clone()), actor.into())
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"content_ref": reference.to_string(), "size": 5})
+        );
+        assert!(result.get("upload_id").is_none());
+    }
+    assert_eq!(f.manager.records.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
+        1
+    );
+    assert_upload_ceiling(
+        f.manager
+            .begin(0, None, "uploader:b".into())
+            .await
+            .unwrap_err(),
+        "total",
+        1,
+    );
+    f.manager.abort(&id).await.unwrap();
+    let replacement = begin(&f.manager, 0).await;
+    f.manager.abort(&replacement).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_begins_reserve_total_and_actor_slots_before_backend_returns() {
+    let f = fixture();
+    let store = Arc::new(ControlledStore::new(f.store.clone()));
+    store.pause_after_begin.store(true, Ordering::SeqCst);
+    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    manager.policy.max_active = 2;
+    manager.policy.max_per_actor = 1;
+    let manager = Arc::new(manager);
+    let first = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.begin(0, None, "uploader:a".into()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), store.begun.notified())
+        .await
+        .unwrap();
+    assert!(manager.records.lock().unwrap().is_empty());
+    assert_upload_ceiling(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.begin(0, None, "uploader:a".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err(),
+        "per-actor",
+        1,
+    );
+    let second = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.begin(0, None, "uploader:b".into()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), store.begun.notified())
+        .await
+        .unwrap();
+    assert!(manager.records.lock().unwrap().is_empty());
+    assert_eq!(store.begin_calls.load(Ordering::SeqCst), 2);
+    assert_upload_ceiling(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.begin(0, None, "uploader:c".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err(),
+        "total",
+        2,
+    );
+    assert_eq!(store.begin_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
+        2
+    );
+    store.pause_after_begin.store(false, Ordering::SeqCst);
+    store.release_begin.notify_waiters();
+    let first_id = upload_id(
+        &tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    let second_id = upload_id(
+        &tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    assert_ne!(first_id, second_id);
+    assert_eq!(manager.records.lock().unwrap().len(), 2);
+    manager.abort(&first_id).await.unwrap();
+    manager.abort(&second_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_backend_begin_releases_total_and_actor_reservation() {
+    let f = fixture();
+    let store = Arc::new(ControlledStore::new(f.store.clone()));
+    store.begin_failures.store(1, Ordering::SeqCst);
+    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    manager.policy.max_active = 1;
+    manager.policy.max_per_actor = 1;
+    let error = manager
+        .begin(0, None, "uploader:a".into())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected begin failure"));
+    assert!(manager.records.lock().unwrap().is_empty());
+    assert!(!f.root.join(".uploads").exists());
+    let id = begin(&manager, 0).await;
+    assert_eq!(store.begin_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store.begun_ids.lock().unwrap().as_slice(),
+        std::slice::from_ref(&id)
+    );
+    manager.abort(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_cleanup_retains_upload_slots_until_sweep_succeeds() {
+    let f = fixture();
+    let store = Arc::new(ControlledStore::new(f.store.clone()));
+    store.abort_failures.store(2, Ordering::SeqCst);
+    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    manager.policy.max_active = 2;
+    manager.policy.max_per_actor = 1;
+    let id = begin(&manager, 0).await;
+    assert!(manager.abort(&id).await.is_err());
+    assert_upload_ceiling(
+        manager
+            .begin(0, None, "uploader:a".into())
+            .await
+            .unwrap_err(),
+        "per-actor",
+        1,
+    );
+    let other = upload_id(&manager.begin(0, None, "uploader:b".into()).await.unwrap());
+    assert_upload_ceiling(
+        manager
+            .begin(0, None, "uploader:c".into())
+            .await
+            .unwrap_err(),
+        "total",
+        2,
+    );
+    assert!(manager.sweep().await.is_err());
+    assert!(staged(&f.root, &id).exists());
+    assert_upload_ceiling(
+        manager
+            .begin(0, None, "uploader:a".into())
+            .await
+            .unwrap_err(),
+        "total",
+        2,
+    );
+    assert_eq!(manager.sweep().await.unwrap(), 1);
+    assert_eq!(store.abort_calls.load(Ordering::SeqCst), 3);
+    assert!(!staged(&f.root, &id).exists());
+    assert!(staged(&f.root, &other).exists());
+    let replacement = begin(&manager, 0).await;
+    manager.abort(&other).await.unwrap();
+    manager.abort(&replacement).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_begin_keeps_reservation_and_staging_until_expiry_cleanup() {
+    let f = fixture();
+    let store = Arc::new(ControlledStore::new(f.store.clone()));
+    store.pause_after_begin.store(true, Ordering::SeqCst);
+    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    manager.policy.max_active = 1;
+    manager.policy.max_per_actor = 1;
+    let manager = Arc::new(manager);
+    let request = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.begin(0, None, "uploader:a".into()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), store.begun.notified())
+        .await
+        .unwrap();
+    let id = store.begun_ids.lock().unwrap()[0].clone();
+    assert!(staged(&f.root, &id).exists());
+    assert!(manager.records.lock().unwrap().is_empty());
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_upload_ceiling(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.begin(0, None, "uploader:b".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err(),
+        "total",
+        1,
+    );
+    store.pause_after_begin.store(false, Ordering::SeqCst);
+    store.release_begin.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if manager.records.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_upload_ceiling(
+        manager
+            .begin(0, None, "uploader:a".into())
+            .await
+            .unwrap_err(),
+        "total",
+        1,
+    );
+    expire_record(&manager, &id).await;
+    assert_eq!(manager.sweep().await.unwrap(), 1);
+    assert!(!staged(&f.root, &id).exists());
+    let replacement = begin(&manager, 0).await;
+    manager.abort(&replacement).await.unwrap();
 }
 
 #[tokio::test]
@@ -651,13 +997,12 @@ async fn restart_orphan_sweep_removes_staging_without_a_live_record() {
     f.manager.put_part(&id, 0, b"a".to_vec()).await.unwrap();
     let runtime = f.manager.runtime.clone();
     drop(f.manager);
-    let restarted = UploadManager {
-        runtime,
-        policy: UploadPolicy {
-            idle_for: IDLE,
-            sweep_interval: Duration::from_secs(600),
-        },
-        records: Mutex::new(HashMap::new()),
+    let mut restarted = UploadManager::new(runtime);
+    restarted.policy = UploadPolicy {
+        idle_for: IDLE,
+        sweep_interval: Duration::from_secs(600),
+        max_active: 128,
+        max_per_actor: 16,
     };
     assert_unknown(restarted.commit(&id).await.unwrap_err());
     assert!(staged(&f.root, &id).exists());
@@ -738,10 +1083,10 @@ async fn read_only_runtime_refuses_every_upload_operation_without_mutation() {
     settled.close().unwrap();
     let runtime = KhiveRuntime::new_readonly(config).unwrap();
     assert!(runtime.is_read_only());
-    let mut readonly = manager_with_store(runtime, f.store.clone());
+    let readonly = manager_with_store(runtime, f.store.clone());
     readonly
         .records
-        .get_mut()
+        .lock()
         .unwrap()
         .insert(id.clone(), f.manager.record(&id).unwrap());
     for result in [
@@ -763,6 +1108,12 @@ async fn read_only_runtime_refuses_every_upload_operation_without_mutation() {
 #[derive(Debug)]
 struct ControlledStore {
     inner: Arc<FsBlobStore>,
+    begin_calls: AtomicUsize,
+    begin_failures: AtomicUsize,
+    pause_after_begin: AtomicBool,
+    begun_ids: Mutex<Vec<UploadId>>,
+    begun: tokio::sync::Notify,
+    release_begin: tokio::sync::Notify,
     abort_failures: AtomicUsize,
     abort_calls: AtomicUsize,
     pause_after_append: AtomicBool,
@@ -775,6 +1126,12 @@ impl ControlledStore {
     fn new(inner: Arc<FsBlobStore>) -> Self {
         Self {
             inner,
+            begin_calls: AtomicUsize::new(0),
+            begin_failures: AtomicUsize::new(0),
+            pause_after_begin: AtomicBool::new(false),
+            begun_ids: Mutex::new(Vec::new()),
+            begun: tokio::sync::Notify::new(),
+            release_begin: tokio::sync::Notify::new(),
             abort_failures: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
             pause_after_append: AtomicBool::new(false),
@@ -792,7 +1149,21 @@ impl BlobStore for ControlledStore {
     }
 
     async fn begin_upload(&self, size: u64) -> StorageResult<UploadId> {
-        self.inner.begin_upload(size).await
+        self.begin_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .begin_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StorageError::Internal("injected begin failure".into()));
+        }
+        let id = self.inner.begin_upload(size).await?;
+        self.begun_ids.lock().unwrap().push(id.clone());
+        if self.pause_after_begin.load(Ordering::SeqCst) {
+            self.begun.notify_one();
+            self.release_begin.notified().await;
+        }
+        Ok(id)
     }
 
     async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {

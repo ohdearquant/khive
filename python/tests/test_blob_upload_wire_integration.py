@@ -212,10 +212,14 @@ def upload_daemon_factory():
     assert binary.is_file() and os.access(binary, os.X_OK), binary
     daemons = []
 
-    def create(*, idle=3600, sweep=NO_SWEEP_SECS):
+    def create(*, idle=3600, sweep=NO_SWEEP_SECS, max_active=None, max_per_actor=None):
         # /tmp keeps both the main and derived events AF_UNIX paths below macOS's cap.
         root = Path(tempfile.mkdtemp(prefix="blob-wire-", dir="/tmp"))
         daemon = _Daemon(str(binary), root, idle, sweep)
+        if max_active is not None:
+            daemon.env["KHIVE_BLOB_UPLOAD_MAX_ACTIVE"] = str(max_active)
+        if max_per_actor is not None:
+            daemon.env["KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR"] = str(max_per_actor)
         daemons.append(daemon)
         return daemon.start()
 
@@ -338,6 +342,29 @@ def test_blob_upload_wire_begin_above_object_ceiling_creates_no_stage(upload_dae
     daemon = upload_daemon_factory()
     assert _rust_constant("crates/khive-pack-blob/src/handlers.rs", "MAX_OBJECT_BYTES") == OBJECT_BYTES
     _refused(daemon.client(), "blob.begin", size=OBJECT_BYTES + 1, contains="invalid input")
+    assert not daemon.staging() and not daemon.objects()
+
+
+def test_blob_upload_wire_total_active_cap_refuses_and_abort_releases_slot(upload_daemon_factory):
+    # Keep the per-actor ceiling above the attempted third upload so it cannot
+    # mask removal of the total-cap guard in the mutation control.
+    daemon = upload_daemon_factory(max_active=2, max_per_actor=3)
+    client = daemon.client()
+    active = [_begin(client, 0) for _ in range(2)]
+    stages = {daemon.stage(begin) for begin in active}
+    assert len(stages) == 2 and daemon.staging() == stages
+    assert all(stage.stat().st_size == 0 for stage in stages)
+    _refused(client, "blob.begin", size=0, contains="total active-upload ceiling of 2 reached")
+    assert daemon.staging() == stages and not daemon.objects()
+
+    _one(client, "blob.abort", upload_id=active[0]["upload_id"])
+    remaining = daemon.stage(active[1])
+    assert daemon.staging() == {remaining}
+    replacement = _begin(client, 0)
+    assert replacement["upload_id"] not in {begin["upload_id"] for begin in active}
+    assert daemon.staging() == {remaining, daemon.stage(replacement)}
+    for begin in (active[1], replacement):
+        _one(client, "blob.abort", upload_id=begin["upload_id"])
     assert not daemon.staging() and not daemon.objects()
 
 

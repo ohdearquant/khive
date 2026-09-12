@@ -14,10 +14,25 @@ use crate::handlers::{blob_store, max_request_part_raw_bytes, MAX_OBJECT_BYTES};
 struct UploadPolicy {
     idle_for: Duration,
     sweep_interval: Duration,
+    max_active: usize,
+    max_per_actor: usize,
 }
 
 impl UploadPolicy {
+    fn positive_limit(raw: &str) -> Option<usize> {
+        raw.parse::<usize>().ok().filter(|value| *value > 0)
+    }
+
     fn from_env() -> Self {
+        fn limit(name: &str, default: usize) -> usize {
+            match std::env::var(name) {
+                Ok(raw) => UploadPolicy::positive_limit(&raw).unwrap_or_else(|| {
+                    tracing::warn!(name, "invalid upload ceiling; using default");
+                    default
+                }),
+                Err(_) => default,
+            }
+        }
         fn duration(name: &str, default: u64) -> Duration {
             match std::env::var(name) {
                 Ok(raw) => match raw.parse::<u64>() {
@@ -40,6 +55,64 @@ impl UploadPolicy {
         Self {
             idle_for: duration("KHIVE_BLOB_UPLOAD_IDLE_SECS", 3600),
             sweep_interval: duration("KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS", 600),
+            max_active: limit("KHIVE_BLOB_UPLOAD_MAX_ACTIVE", 128),
+            max_per_actor: limit("KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR", 16),
+        }
+    }
+}
+
+/// Reservations include backend creation and records awaiting successful cleanup.
+/// Actor counts live outside the async record locks so admission never holds the
+/// registry mutex across I/O or inverts the record -> registry cleanup lock order.
+#[derive(Default)]
+struct UploadSlots {
+    by_actor: Mutex<HashMap<String, usize>>,
+}
+
+impl UploadSlots {
+    fn reserve(
+        self: &Arc<Self>,
+        actor: &str,
+        policy: UploadPolicy,
+    ) -> Result<UploadSlot, RuntimeError> {
+        let mut counts = self.by_actor.lock().expect("upload slots mutex poisoned");
+        let total: usize = counts.values().sum();
+        if total >= policy.max_active {
+            return Err(RuntimeError::InvalidInput(format!(
+                "blob.begin: total active-upload ceiling of {} reached",
+                policy.max_active
+            )));
+        }
+        if counts.get(actor).copied().unwrap_or(0) >= policy.max_per_actor {
+            return Err(RuntimeError::InvalidInput(format!(
+                "blob.begin: per-actor active-upload ceiling of {} reached",
+                policy.max_per_actor
+            )));
+        }
+        *counts.entry(actor.to_owned()).or_default() += 1;
+        Ok(UploadSlot {
+            slots: Arc::clone(self),
+            actor: actor.to_owned(),
+        })
+    }
+}
+
+struct UploadSlot {
+    slots: Arc<UploadSlots>,
+    actor: String,
+}
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .slots
+            .by_actor
+            .lock()
+            .expect("upload slots mutex poisoned");
+        let count = counts.get_mut(&self.actor).expect("reserved upload actor");
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.actor);
         }
     }
 }
@@ -63,13 +136,15 @@ struct UploadRecord {
     actor: String,
     last_part: Instant,
     phase: UploadPhase,
+    slot: Option<UploadSlot>,
 }
 
 /// Shared state owned by one loaded blob pack; upload ids do not survive restart.
 pub struct UploadManager {
     runtime: KhiveRuntime,
     policy: UploadPolicy,
-    records: Mutex<HashMap<UploadId, Arc<tokio::sync::Mutex<UploadRecord>>>>,
+    records: Arc<Mutex<HashMap<UploadId, Arc<tokio::sync::Mutex<UploadRecord>>>>>,
+    slots: Arc<UploadSlots>,
 }
 
 impl UploadManager {
@@ -77,7 +152,8 @@ impl UploadManager {
         Self {
             runtime,
             policy: UploadPolicy::from_env(),
-            records: Mutex::new(HashMap::new()),
+            records: Arc::new(Mutex::new(HashMap::new())),
+            slots: Arc::new(UploadSlots::default()),
         }
     }
 
@@ -121,6 +197,7 @@ impl UploadManager {
         record.phase = UploadPhase::Aborted;
         record.store.abort_upload(id).await?;
         record.phase = UploadPhase::Finished;
+        drop(record.slot.take());
         self.forget(id);
         Ok(())
     }
@@ -166,24 +243,37 @@ impl UploadManager {
                 return Ok(json!({"content_ref": reference.to_string(), "size": stored_size}));
             }
         }
-        let last_part = Instant::now();
-        let id = store.begin_upload(size).await?;
-        let record = UploadRecord {
-            store,
-            size,
-            expected_ref,
-            hasher: blake3::Hasher::new(),
-            received_bytes: 0,
-            next_index: 0,
-            tail: None,
-            actor,
-            last_part,
-            phase: UploadPhase::Active,
-        };
-        self.records
-            .lock()
-            .expect("upload map mutex poisoned")
-            .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(record)));
+        let slot = self.slots.reserve(&actor, self.policy)?;
+        let records = Arc::clone(&self.records);
+        // Once admitted, finish registration even if the calling request is
+        // cancelled. Otherwise a backend creation could outlive its reservation
+        // and leave staging that no longer counts toward either ceiling.
+        let id = tokio::spawn(async move {
+            let last_part = Instant::now();
+            let id = store.begin_upload(size).await?;
+            let record = UploadRecord {
+                store,
+                size,
+                expected_ref,
+                hasher: blake3::Hasher::new(),
+                received_bytes: 0,
+                next_index: 0,
+                tail: None,
+                actor,
+                last_part,
+                phase: UploadPhase::Active,
+                slot: Some(slot),
+            };
+            records
+                .lock()
+                .expect("upload map mutex poisoned")
+                .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(record)));
+            Ok::<_, RuntimeError>(id)
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::Internal(format!("blob.begin: creation task failed: {error}"))
+        })??;
         Ok(
             json!({"upload_id": id.to_string(), "part_limit": max_request_part_raw_bytes(), "next_index": 0}),
         )
@@ -326,6 +416,7 @@ impl UploadManager {
             return Err(error.into());
         }
         record.phase = UploadPhase::Finished;
+        drop(record.slot.take());
         self.forget(id);
         Ok(json!({"content_ref": reference.to_string(), "size": record.size}))
     }

@@ -3,7 +3,9 @@
 
 Requires an isolated clean checkout, an explicit native CARGO_TARGET_DIR and
 Python pytest/pydantic/blake3 dependencies. Use a fresh --out outside the checkout.
---case all runs all five controls, including daemon cleanup ownership.
+--case all runs all six controls, including daemon cleanup ownership and the
+total active-upload ceiling. --case cap suppresses only the total-cap guard;
+its wire witness keeps the per-actor ceiling above the rejected begin.
 --case owner runs that control alone, leaving the timer and heartbeat alive
 while suppressing its sweep call. Rustup selects the pinned toolchain explicitly.
 Every case retains raw logs and rebuilds the restored source before succeeding.
@@ -25,7 +27,7 @@ import subprocess
 import sys
 
 
-CASES = ("tail", "expiry", "sweep", "publisher", "owner")
+CASES = ("tail", "expiry", "sweep", "publisher", "owner", "cap")
 
 
 def sha(data):
@@ -101,6 +103,7 @@ def main():
         "sweep": "test_blob_upload_wire_restart_orphan_sweep_and_begin_again",
         "live": "test_blob_upload_wire_daemon_expiry_without_verbs_keeps_committed_object",
         "owner": "test_blob_upload_wire_daemon_owns_expiry_after_mcp_client_exit",
+        "cap": "test_blob_upload_wire_total_active_cap_refuses_and_abort_releases_slot",
     }
 
     def witness(label, name, red=False):
@@ -113,6 +116,10 @@ def main():
             r"^E\s+AssertionError: unexpectedly accepted blob\.put_part:", text, re.MULTILINE
         ):
             raise RuntimeError(f"{label}: failure was not acceptance of the refused write")
+        if red and name == "cap" and not re.search(
+            r"^E\s+AssertionError: unexpectedly accepted blob\.begin:", text, re.MULTILINE
+        ):
+            raise RuntimeError(f"{label}: failure was not acceptance above the total upload ceiling")
         if red and name in ("sweep", "owner") and not re.search(
             r"^E\s+AssertionError: daemon did not expire ", text, re.MULTILINE
         ):
@@ -139,6 +146,8 @@ def main():
             return replace_one(changed, "let (tail_len, tail_hash)", "let (tail_len, _tail_hash)").encode()
         if case == "expiry":
             return replace_one(text, "if record.last_part.elapsed() >= self.policy.idle_for {", "if false {").encode()
+        if case == "cap":
+            return replace_one(text, "if total >= policy.max_active {", "if false {").encode()
         start = text.index("        match store.sweep_uploads(self.policy.idle_for).await {")
         end = text.index("        match failure {", start)
         return (text[:start] + "        let _ = store; // backend staging sweep deliberately removed\n" + text[end:]).encode()
