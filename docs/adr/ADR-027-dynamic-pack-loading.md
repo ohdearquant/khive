@@ -1,6 +1,8 @@
 # ADR-027: Dynamic Pack Loading via Self-Registration
 
-**Status**: accepted\
+**Status**: accepted, and partly superseded by Amendment 4 (2026-09-12), which keeps this
+record's answer for packs linked into the binary and supersedes it for independently
+installed pack distributions. Native dynamic loading stays rejected.\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
 
@@ -495,3 +497,84 @@ this amendment to reflect the deviation.
 - [ADR-028](ADR-028-pack-scoped-backends.md) — extends pack configuration with per-pack
   backend assignment
 - `inventory` crate — compile-time plugin registration via linker sections
+
+## Amendment 4 (2026-09-12): installable pack distributions, and what stays rejected
+
+**Status**: proposed
+
+This ADR gave one answer to "how does a pack get into the process": it is linked at build
+time and discovered through `inventory`. That answer stays exactly as written for **built-in
+packs**, which remain the only packs the binary links. It is **superseded for a second
+class**: a versioned pack **distribution** that a running deployment installs and binds to
+one graph, without rebuilding the binary.
+
+The need this ADR called hypothetical has arrived. A curation application whose record
+kinds, closed schemas and validation rules are entirely data, authored outside this
+repository and installed into one tenant's store, cannot be served by "build kkernel with
+that pack as a dependency": the deployment would rebuild per application, and every
+installation would be a release.
+
+### What stays rejected
+
+- **Native dynamic loading.** `dlopen` remains rejected for the reasons in "Why not dlopen /
+  WASM dynamic loading" and Alternative B: ABI stability across version skew, symbol and
+  lifetime management, and arbitrary native code inside the store host. Nothing below
+  reopens it.
+- **A second discovery mechanism for linked packs.** `inventory` stays the only way a linked
+  pack is found. `REQUIRES` topological ordering, boot-time verb collisions and
+  `KHIVE_PACKS` selection are unchanged.
+
+### The two installable profiles
+
+1. **Data-only.** No executable payload. The distribution carries an identity, its record
+   kinds with closed schemas, bounded declarative rules (regex, enum, size, required-set),
+   verb parameter schemas and descriptions, its capability requests, a promotion adapter, and
+   its skills and resources. The native host interprets all of it. There is no ABI, because
+   there is no code.
+2. **Programmable.** A component compiled to WebAssembly against a pinned interface world,
+   hosted by the native kernel. This profile exists for a distribution that supplies an
+   algorithm the host does not have. The kernel itself is not ported; see the amendment on
+   ADR-026, which separates that question from this one.
+
+The first profile lands first and on its own. The second is a separate, later phase and
+nothing in it is authorized by this amendment.
+
+### The installation is the deployment's, not the distribution's
+
+Four identities stay distinct, and conflating any two of them is the failure this design is
+shaped against:
+
+| identity          | what it holds                                                                                  | who owns it               |
+| ----------------- | ---------------------------------------------------------------------------------------------- | ------------------------- |
+| distribution      | kinds, schemas, rules, verb contracts, capability requests, promotion format; immutable digest | the publisher             |
+| installation      | the accepted version, the granted capabilities, the graph binding, the generation              | the installing deployment |
+| graph instance    | the namespace the installation is bound to, with its history                                   | the installing deployment |
+| execution sandbox | a separate, revocable resource, never the store host                                           | the installing deployment |
+
+A distribution requests capabilities. It never holds them. An upgrade pins package, host
+interface, schema and resource revisions separately; added capabilities require fresh
+approval; a failed migration leaves the prior generation active; uninstall revokes grants
+first and keeps data and history by default.
+
+### Refusal is the default, and it is enumerated
+
+An install is refused, with no partial state, on any of: digest mismatch, unknown field,
+unsupported predicate, missing resource, verb-name collision against the live catalogue,
+dependency cycle, denied capability grant, an empty required set, a version downgrade, or a
+permission increase relative to the accepted installation. An **unknown predicate refuses the
+install**; it is never ignored and never treated as vacuously true, because a rule the host
+does not understand is a rule it cannot enforce.
+
+A description is documentation for a caller. It carries instructions and never authority: no
+text supplied by a distribution grants a capability, selects a namespace, or changes who may
+approve anything.
+
+### Ordering, stated as a constraint rather than a plan
+
+No git, exec or code verb is exposed to an installed distribution before an execution sandbox
+exists whose revocation is verified by reading state back: a durable disabled flag, an
+incremented epoch, zero active sandboxes, terminal outcomes for what was running, and a
+refused effect at the old epoch. A control that only hides tools from a listing does not
+satisfy it.
+
+Nothing in this amendment authorizes implementation.

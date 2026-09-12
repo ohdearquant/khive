@@ -689,3 +689,56 @@ defaults an omitted result limit to 100, and returns no partial paths when the
 shared work or deadline budget is exceeded. These are verb semantics, so they
 belong in the generated handler help and public API reference as well as the
 storage contract; they do not add a new verb or change its speech act.
+
+## Amendment: an independently installed distribution is a pack (2026-09-12)
+
+**Status**: proposed
+
+§10 "Pack installation" says end users do not install packs at runtime, that there is no
+dynamic loading, and that using a third-party pack means building kkernel with it. It also
+says a future ADR may revisit that once a clear use case emerges. This amendment is that
+revisit, and it is narrow.
+
+**A pack may now arrive as an independently installed distribution**, either data-only or as
+a hosted component, beside the packs linked into the binary. Such a distribution is a pack in
+every sense this ADR defines, and the rules below are kept rather than relaxed:
+
+- **Two-tier visibility (§2)** is unchanged. An installed distribution declares handlers with
+  `Verb` or `Subhandler` visibility and only the former reach the wire.
+- **Verb naming (§4)** is unchanged. Installed verbs are pack-prefixed. The bare namespace
+  stays reserved to `kg`, and an installed distribution may not claim a bare verb.
+- **Composition (§7)** is unchanged, and this is the part worth being explicit about: no verb
+  override, no middleware, no verb inheritance, no horizontal sharing of a verb name. The two
+  extension routes stay the only two — new pack-private verbs, or a `KindHook` on an existing
+  substrate verb.
+- **Field naming (§5)** and **kind-polymorphic substrate verbs (§6)** apply as written.
+- **Discovery (§9)** is unchanged for linked packs: `inventory` at link time, `REQUIRES`
+  topological sort, `BootError::VerbCollision` at boot.
+
+### The one addition
+
+Collision checking acquires a second moment. For linked packs it happens at boot, against the
+set the binary carries. For an installed distribution it must also happen **at install time,
+against the deployment's live accepted set**, and a colliding install is refused then. Waiting
+for the next boot would accept a distribution that cannot be served and would turn a rejected
+install into a failed restart. The collision domain is the deployment's accepted set, which is
+the linked packs plus every installation bound to that store.
+
+### What an installed distribution may not do
+
+- Supply an open-ended expression language. Rules are bounded declarations the host
+  interprets: identity, kinds with closed schemas, regex, enum, size and required-set
+  constraints, verb parameter schemas, capability requests, a pure pre-write validation, a
+  post-write enrichment subscription, a promotion adapter, skills and resources. Nothing
+  evaluates arbitrary expressions.
+- Take authority from prose. A description tells a caller what a verb does and never grants a
+  capability, selects a namespace, or decides who may approve anything.
+- Be admitted with a predicate the host does not know. An unrecognized rule refuses the
+  install rather than being skipped.
+
+§10's stated reason for the v1 choice was that type safety and ABI stability outweighed
+zero-rebuild ergonomics. That trade holds where there is an ABI. The data-only profile has no
+ABI because it has no code, and the component profile pins an interface world rather than a
+native ABI, so neither reopens the cost §10 was avoiding.
+
+Nothing in this amendment authorizes implementation.
