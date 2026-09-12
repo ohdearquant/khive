@@ -83,7 +83,7 @@ impl std::fmt::Display for UploadId {
 }
 
 impl<'de> Deserialize<'de> for UploadId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Self::from_hex(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
