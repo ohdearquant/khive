@@ -3138,3 +3138,116 @@ async fn every_kg_write_emits_its_domain_event() {
         );
     }
 }
+
+/// `delete` names what it removed. The response `kind` used to be the caller's own
+/// request parameter handed back, so a delete by a bare id or a hex prefix answered
+/// `null` and a delete that named a kind answered that same string whatever the row
+/// turned out to be. Neither value carried anything the server resolved, which is the
+/// one thing a caller cannot work out for itself after the row is gone.
+#[tokio::test]
+async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    // Entity, deleted by a bare id: the caller named no kind at all.
+    let entity = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "resolved kind subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let out = registry
+        .dispatch("delete", json!({"id": entity.id.to_string()}))
+        .await
+        .expect("delete by bare id must succeed");
+    assert_eq!(out["deleted"], json!(true));
+    assert_eq!(
+        out["kind"],
+        json!("concept"),
+        "a bare-id delete must report the kind the row carried, not null: {out}"
+    );
+
+    // Note, deleted by a bare id: the other substrate, same question.
+    let note = rt
+        .create_note(
+            &token,
+            "insight",
+            None,
+            "resolved kind note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    let out = registry
+        .dispatch("delete", json!({"id": note.id.to_string()}))
+        .await
+        .expect("delete note by bare id must succeed");
+    assert_eq!(out["kind"], json!("insight"), "note kind: {out}");
+
+    // Deleted with the generic spelling: the specific kind still comes back. This is
+    // the arm the old code passed by accident, because it echoed "entity" verbatim.
+    let generic = rt
+        .create_entity(
+            &token,
+            "project",
+            None,
+            "generic spelling subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let out = registry
+        .dispatch(
+            "delete",
+            json!({"id": generic.id.to_string(), "kind": "entity"}),
+        )
+        .await
+        .expect("delete with the generic kind must succeed");
+    assert_eq!(
+        out["kind"],
+        json!("project"),
+        "a generic `entity` request must resolve to the specific kind: {out}"
+    );
+
+    // The mismatch guard is unchanged: naming the wrong kind still refuses, and this
+    // arm is what stops the fix from being read as "kind is now ignored".
+    let guarded = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "mismatch subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let err = registry
+        .dispatch(
+            "delete",
+            json!({"id": guarded.id.to_string(), "kind": "project"}),
+        )
+        .await
+        .expect_err("a kind that does not match the row must refuse");
+    assert!(
+        format!("{err}").contains("kind mismatch"),
+        "expected a kind mismatch refusal, got: {err}"
+    );
+}
