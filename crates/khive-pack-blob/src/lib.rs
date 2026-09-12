@@ -1,6 +1,6 @@
 //! Blob verb pack — thin MCP verbs over the existing `BlobStore` CAS.
 //!
-//! Three verbs — `blob.put`, `blob.get`, and `blob.stat` — expose the installed
+//! Direct put, staged upload, get and stat verbs expose the installed
 //! content-addressed service. `put` and `stat` use the raw store's mutation and
 //! metadata capabilities; `get` enters the paired runtime `BlobHydrator` for
 //! backend-verified, shared-admission whole-buffer reads. This pack adds no
@@ -10,7 +10,12 @@
 
 pub mod handlers;
 mod pack;
+pub mod uploads;
 pub mod vocab;
+
+pub use uploads::UploadManager;
+
+use std::sync::Arc;
 
 use khive_runtime::KhiveRuntime;
 use khive_types::{HandlerDef, Pack};
@@ -23,6 +28,7 @@ pub(crate) const PACK_NAME: &str = "blob";
 /// Blob pack: thin verb surface over the runtime's installed `BlobStore`.
 pub struct BlobPack {
     runtime: KhiveRuntime,
+    uploads: Arc<UploadManager>,
 }
 
 impl Pack for BlobPack {
@@ -35,7 +41,8 @@ impl Pack for BlobPack {
 
 impl BlobPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        let uploads = Arc::new(UploadManager::new(runtime.clone()));
+        Self { runtime, uploads }
     }
 
     pub(crate) fn runtime(&self) -> &KhiveRuntime {

@@ -1,13 +1,12 @@
 //! `git.digest` verb handler (ADR-088 Amendment 1).
 //!
 //! Resolves the `source` argument (local path or `https://` URL, cloning/
-//! fetching remote sources into the scratch cache), resolves or auto-creates
-//! the repo-anchor `project` entity, then drives the shared
+//! fetching a remote only when commits need a repository), resolves or
+//! auto-creates the repo-anchor `project` entity, then drives the shared
 //! `ingest::run_ingest` core with a bounded, cursor-resumable pass.
 
 use std::path::Path;
 
-use anyhow::anyhow;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -16,29 +15,38 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::cache::{self, CacheError};
 use crate::ingest::{
-    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
-    GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
+    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, run_remote_api_ingest,
+    CacheRepairStrategy, GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
     canonical_remote_identity, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
     repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
+use crate::sql::sql;
 use crate::GitPack;
 
 /// Recover the typed error when a digest ingest/resolution failure chain
-/// carries a storage-class failure (for example a reader admission timeout
-/// under concurrent load), so resource exhaustion is not reported as the
-/// caller's invalid input. Every other failure keeps the established
-/// invalid-input shape.
+/// carries a storage or remote-cache failure, rather than blaming the
+/// caller's input for an infrastructure failure.
 fn digest_failure_to_runtime(e: anyhow::Error) -> RuntimeError {
     let e = match e.downcast::<RuntimeError>() {
-        Ok(rte @ RuntimeError::Storage(_)) => return rte,
+        Ok(rte @ (RuntimeError::Storage(_) | RuntimeError::RemoteFetchError { .. })) => return rte,
         Ok(other) => return RuntimeError::InvalidInput(other.to_string()),
         Err(e) => e,
     };
     match e.downcast::<khive_storage::StorageError>() {
         Ok(se) => RuntimeError::Storage(se),
         Err(e) => RuntimeError::InvalidInput(e.to_string()),
+    }
+}
+
+fn remote_cache_error(remote: &str, stage: &str, error: CacheError) -> RuntimeError {
+    RuntimeError::RemoteFetchError {
+        remote: redact_repo_url(remote),
+        message: format!(
+            "{stage}: {}",
+            cache::sanitize_diagnostic(&error.to_string())
+        ),
     }
 }
 
@@ -87,18 +95,26 @@ impl RemoteCommitRecovery {
                 // ownership-guard failure is terminal: it is not a signal
                 // that a fresh clone would fare any differently, and is
                 // never worth risking a second destructive operation for.
-                Err(CacheError::Git(_)) => {
+                Err(error @ CacheError::Git(_)) => {
                     self.stage = RemoteRecoveryStage::Refetched;
-                    self.reclone()
+                    self.reclone(Some(error))
                 }
-                Err(e) => Err(anyhow!("cache repair (refetch) failed: {e}")),
+                Err(error) => Err(remote_cache_error(
+                    &self.canonical_url,
+                    "cache repair (refetch) failed",
+                    error,
+                )
+                .into()),
             },
-            RemoteRecoveryStage::Refetched => self.reclone(),
+            RemoteRecoveryStage::Refetched => self.reclone(None),
             RemoteRecoveryStage::Recloned => Ok(None),
         }
     }
 
-    fn reclone(&mut self) -> anyhow::Result<Option<RecoveredRepo>> {
+    fn reclone(
+        &mut self,
+        refetch_error: Option<CacheError>,
+    ) -> anyhow::Result<Option<RecoveredRepo>> {
         match cache::reclone(&self.canonical_url) {
             Ok(repo) => {
                 self.stage = RemoteRecoveryStage::Recloned;
@@ -107,7 +123,16 @@ impl RemoteCommitRecovery {
                     strategy: CacheRepairStrategy::Reclone,
                 }))
             }
-            Err(e) => Err(anyhow!("cache repair (reclone) failed: {e}")),
+            Err(error) => {
+                let stage = match refetch_error {
+                    Some(refetch) => format!(
+                        "cache repair (reclone) failed after refetch failed ({})",
+                        cache::sanitize_diagnostic(&refetch.to_string())
+                    ),
+                    None => "cache repair (reclone) failed".into(),
+                };
+                Err(remote_cache_error(&self.canonical_url, &stage, error).into())
+            }
         }
     }
 }
@@ -151,18 +176,41 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
-        // Resolve a local repo path -- remote sources clone/fetch into the
-        // scratch cache first (ADR-088 Amendment 1 §Remote-URL mode).
+        // Commits need a repository to walk. Issues and pull requests are
+        // source-bound `gh` API reads, so a remote API-only request uses a
+        // neutral working directory and never clones unused git history.
         let (repo_path, expected_github_repo) = match &source {
             DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
-                let cloned =
-                    cache::ensure_clone(canonical).map_err(|e| RuntimeError::RemoteFetchError {
-                        remote: redact_repo_url(canonical),
-                        message: e.to_string(),
-                    })?;
+                let repo = if include.commits {
+                    // `ensure_clone` shells out to `git clone`/`git fetch` and
+                    // blocks the calling thread on the clone-size monitor
+                    // loop (`cache::clone`) for as long as the transfer runs
+                    // -- on a Tokio worker thread that starves every other
+                    // task scheduled there, so the blocking span moves to a
+                    // dedicated thread (same pattern as
+                    // `source::local_origin_remote_url`).
+                    let redacted = redact_repo_url(canonical);
+                    let canonical = canonical.clone();
+                    tokio::task::spawn_blocking(move || cache::ensure_clone(&canonical))
+                        .await
+                        .map_err(|_| RuntimeError::RemoteFetchError {
+                            remote: redacted.clone(),
+                            message: "initial cache setup: clone task panicked or was cancelled"
+                                .into(),
+                        })?
+                        .map_err(|e| {
+                            remote_cache_error(&redacted, "initial cache setup failed", e)
+                        })?
+                } else {
+                    std::env::current_dir().map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "resolving a working directory for remote GitHub ingest: {e}"
+                        ))
+                    })?
+                };
                 (
-                    cloned,
+                    repo,
                     gh_slug
                         .as_ref()
                         .map(|(owner, repo)| format!("{owner}/{repo}")),
@@ -211,12 +259,15 @@ impl GitPack {
         // is never a candidate for self-heal (issue #765).
         let mut report = match &source {
             DigestSource::Local(_) => run_ingest(self.runtime(), token, registry, opts).await,
-            DigestSource::Remote { canonical, .. } => {
+            DigestSource::Remote { canonical, .. } if include.commits => {
                 let mut recovery = RemoteCommitRecovery::new(canonical.clone());
                 run_ingest_with_commit_recovery(self.runtime(), token, registry, opts, {
                     move |repo, err| recovery.repair(repo, err)
                 })
                 .await
+            }
+            DigestSource::Remote { .. } => {
+                run_remote_api_ingest(self.runtime(), token, registry, opts).await
             }
         }
         .map_err(digest_failure_to_runtime)?;
@@ -481,11 +532,7 @@ async fn find_projects_by_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_slug')=?2 \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_by_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -522,12 +569,7 @@ async fn find_projects_by_legacy_repo_url(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_slug') IS NULL \
-                  AND json_extract(properties,'$.repo_url')=?2 \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_by_legacy_repo_url_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(repo_url.to_string()),
@@ -560,14 +602,7 @@ async fn find_projects_without_canonical_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, json_extract(properties,'$.repo_url') AS repo_url \
-                  FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug') IS NULL \
-                       OR json_extract(properties,'$.repo_slug')<>?2) \
-                  ORDER BY created_at ASC, id ASC"
-                .into(),
+            sql: sql!("projects_without_canonical_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -607,13 +642,7 @@ async fn find_soft_deleted_projects_without_canonical_slug(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, deleted_at, json_extract(properties,'$.repo_url') AS repo_url \
-                  FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NOT NULL \
-                  AND json_extract(properties,'$.repo_url') IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug') IS NULL \
-                       OR json_extract(properties,'$.repo_slug')<>?2)"
-                .into(),
+            sql: sql!("soft_deleted_projects_without_canonical_slug_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -724,11 +753,7 @@ async fn find_orphaned_anchor(
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let rows = r
         .query_all(SqlStatement {
-            sql: "SELECT id, deleted_at FROM entities WHERE kind='project' AND namespace=?1 \
-                  AND deleted_at IS NOT NULL \
-                  AND (json_extract(properties,'$.repo_slug')=?2 \
-                       OR json_extract(properties,'$.repo_url')=?3)"
-                .into(),
+            sql: sql!("orphaned_projects_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(identity.to_string()),
@@ -784,12 +809,7 @@ async fn find_orphaned_anchor(
     for dead_project_id in dead_project_ids {
         let count = r
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM notes n \
-                      JOIN graph_edges e ON e.source_id = n.id AND e.namespace = n.namespace \
-                      WHERE n.namespace = ?1 AND n.deleted_at IS NULL \
-                      AND n.kind IN ('commit', 'issue', 'pull_request') \
-                      AND e.relation = 'annotates' AND e.target_id = ?2 AND e.deleted_at IS NULL"
-                    .into(),
+                sql: sql!("orphaned_project_notes_count").into(),
                 params: vec![
                     SqlValue::Text(token.namespace().as_str().to_string()),
                     SqlValue::Text(dead_project_id.to_string()),
@@ -2170,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_failure_preserves_storage_class_and_flattens_the_rest() {
+    fn digest_failure_preserves_storage_and_remote_types() {
         // A storage-class failure inside the ingest chain (here: a
         // writer-handle admission timeout under load) must surface typed,
         // not as the caller's invalid input.
@@ -2201,7 +2221,21 @@ mod tests {
             RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
         ));
 
-        // Non-storage runtime failures keep the established invalid-input
+        let remote = anyhow::Error::new(remote_cache_error(
+            "https://user:tok3n@example.com/repo?token=SECRET",
+            "cache repair (refetch) failed",
+            CacheError::Io(std::io::Error::other("cache directory unavailable")),
+        ))
+        .context("preparing commit snapshot");
+        assert!(matches!(
+            digest_failure_to_runtime(remote),
+            RuntimeError::RemoteFetchError { remote, message }
+                if remote == "https://example.com/repo"
+                    && message.contains("cache repair (refetch) failed")
+                    && message.contains("scratch-cache I/O error")
+        ));
+
+        // Other runtime failures keep the established invalid-input
         // shape, message intact.
         let not_found = anyhow::Error::new(RuntimeError::NotFound("proj-x".to_string()));
         match digest_failure_to_runtime(not_found) {
@@ -2210,7 +2244,7 @@ mod tests {
         }
 
         // Plain anyhow context errors keep the established shape as well.
-        match digest_failure_to_runtime(anyhow!("gh probe failed")) {
+        match digest_failure_to_runtime(anyhow::anyhow!("gh probe failed")) {
             RuntimeError::InvalidInput(msg) => assert_eq!(msg, "gh probe failed"),
             other => panic!("untyped failure must flatten to InvalidInput, got {other:?}"),
         }

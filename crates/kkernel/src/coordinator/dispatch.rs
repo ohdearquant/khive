@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_runtime::{
-    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit, SearchSource,
+    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, RuntimeError, SearchHit,
+    SearchSource,
 };
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
@@ -24,17 +25,24 @@ use super::registry::BackendRegistry;
 /// on [`BackendSearchResult`] for internal routing; the MCP boundary applies
 /// the same canonical secret masker before exposing it on the wire.
 fn bounded_backend_id_for_log(backend_id: &str) -> String {
-    const MAX_INPUT_CHARS: usize = 4_096;
     const MAX_OUTPUT_CHARS: usize = 256;
 
     let backend_id_chars = backend_id.chars().count();
-    let bounded_input: String = backend_id.chars().take(MAX_INPUT_CHARS).collect();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    let was_masked = masked.as_ref() != bounded_input || masked.trim().is_empty();
-    let sanitized = if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded id. The window doubles as the
+    // output cap here — this function applies its own further prefix +
+    // fingerprint bounding below.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        backend_id,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+    );
+    let was_masked = result.redacted || result.truncated || result.text.trim().is_empty();
+    let sanitized = if result.text.trim().is_empty() {
         "masked-backend"
     } else {
-        masked.as_ref()
+        result.text.as_str()
     };
     if !was_masked && backend_id_chars <= MAX_OUTPUT_CHARS {
         return sanitized.to_string();
@@ -54,36 +62,81 @@ fn bounded_backend_id_for_log(backend_id: &str) -> String {
 /// mirrors the MCP wire boundary so the earlier coordinator diagnostic cannot
 /// leak a credential that the response would later redact.
 pub(super) fn bounded_backend_cause_for_log(message: &str) -> String {
-    const MAX_INPUT_CHARS: usize = 4_096;
     const MAX_OUTPUT_CHARS: usize = 1_024;
     const MISSING_CAUSE: &str = "backend search failed without diagnostic detail";
 
-    let mut input_chars = message.chars();
-    let bounded_input: String = input_chars.by_ref().take(MAX_INPUT_CHARS).collect();
-    let input_truncated = input_chars.next().is_some();
-    let masked = khive_runtime::secret_gate::mask_secrets(&bounded_input);
-    if masked.trim().is_empty() {
+    // Bound the masker's own input window (see `secret_gate::mask_bounded`)
+    // rather than masking the full, unbounded message: cost stays
+    // proportional to the shared window regardless of message length, and a
+    // token straddling the window is dropped whole rather than echoed
+    // unmasked.
+    let result = khive_runtime::secret_gate::mask_bounded(
+        khive_runtime::secret_gate::RedactionSurface::McpDiagnostic,
+        message,
+        khive_runtime::secret_gate::MASK_WINDOW_CHARS,
+        MAX_OUTPUT_CHARS,
+    );
+    if result.text.trim().is_empty() {
         return MISSING_CAUSE.to_string();
     }
+    result.text
+}
 
-    let mut masked_chars = masked.chars();
-    let mut bounded: String = masked_chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
-    if masked_chars.next().is_some() || input_truncated {
-        bounded.push('…');
+/// Stable classification for a failed fan-out backend leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSearchFailureKind {
+    BackendError,
+    Timeout,
+}
+
+/// Typed failure for one fan-out backend leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSearchFailure {
+    pub kind: BackendSearchFailureKind,
+    pub message: String,
+}
+
+impl BackendSearchFailure {
+    fn timeout(timeout_ms: u64) -> Self {
+        Self {
+            kind: BackendSearchFailureKind::Timeout,
+            message: format!("backend search timed out after {timeout_ms}ms"),
+        }
     }
-    bounded
+
+    pub(super) fn from_runtime_error(error: RuntimeError) -> Self {
+        let kind = if matches!(
+            &error,
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { .. })
+                | RuntimeError::DeadlineExceeded { .. }
+        ) {
+            BackendSearchFailureKind::Timeout
+        } else {
+            BackendSearchFailureKind::BackendError
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Result of a single backend's entity-search contribution to a fan-out.
 ///
 /// `hits` may be empty when the backend returned no results.
-/// `error` carries the backend-specific failure message on error.
+/// `error` carries the backend-specific typed failure for a whole-backend
+/// failure (text arm, or a fatal error before either arm ran); a backend that
+/// reported one is treated as having contributed no hits at all.
+/// `vector_error` instead carries a vector-arm-only failure: the text arm
+/// still ran and `hits` still carries its results, so this backend is NOT
+/// `error`-failed.
 #[derive(Debug)]
 pub struct BackendSearchResult {
     pub backend_id: BackendId,
     pub hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
-    pub error: Option<String>,
+    pub error: Option<BackendSearchFailure>,
+    pub vector_error: Option<String>,
 }
 
 /// A located edge endpoint: which backend owns it, and its substrate kind.
@@ -430,6 +483,25 @@ impl SubstrateCoordinator {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> Result<khive_storage::Edge, String> {
+        self.link_cross_backend_observed(
+            namespace, source_id, target_id, relation, weight, metadata, false,
+        )
+        .await
+        .map(|row| row.edge)
+    }
+
+    /// Observable, policy-aware form of [`Self::link_cross_backend`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_cross_backend_observed(
+        &self,
+        namespace: &Namespace,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<serde_json::Value>,
+        resurrect: bool,
+    ) -> Result<khive_storage::EdgeUpsertResult, String> {
         let src_located = self
             .locate_endpoint(source_id, namespace)
             .await
@@ -512,7 +584,7 @@ impl SubstrateCoordinator {
         };
 
         let edge = src_runtime
-            .link_with_target_backend(
+            .link_with_target_backend_observed(
                 &token,
                 source_id,
                 target_id,
@@ -520,6 +592,7 @@ impl SubstrateCoordinator {
                 weight,
                 metadata,
                 target_backend_stamp,
+                resurrect,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -613,7 +686,8 @@ impl SubstrateCoordinator {
                         backend_id: backend_id.clone(),
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(e.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(e)),
+                        vector_error: None,
                     };
                     return (vec![], vec![], vec![backend_result]);
                 }
@@ -638,10 +712,9 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .search_notes(
+                        .search_notes_outcome(
                             &token,
                             request.query(),
-                            None,
                             search_limit,
                             request.kind_filter(),
                             include_superseded,
@@ -654,8 +727,9 @@ impl SubstrateCoordinator {
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(note_hits)) => {
-                        let filtered_note_hits: Vec<NoteSearchHit> = note_hits
+                    Ok(Ok(outcome)) => {
+                        let filtered_note_hits: Vec<NoteSearchHit> = outcome
+                            .hits
                             .iter()
                             .filter(|hit| {
                                 request
@@ -668,8 +742,9 @@ impl SubstrateCoordinator {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
-                            note_hits,
+                            note_hits: outcome.hits,
                             error: None,
+                            vector_error: outcome.vector_error,
                         };
                         return (vec![], filtered_note_hits, vec![backend_result]);
                     }
@@ -678,7 +753,8 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(e.to_string()),
+                            error: Some(BackendSearchFailure::from_runtime_error(e)),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -697,7 +773,8 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -709,10 +786,9 @@ impl SubstrateCoordinator {
                         unreachable!("a pending future never resolves");
                     }
                     runtime
-                        .hybrid_search(
+                        .hybrid_search_outcome(
                             &token,
                             request.query(),
-                            None,
                             search_limit,
                             request.kind_filter(),
                             request.entity_type(),
@@ -725,8 +801,9 @@ impl SubstrateCoordinator {
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(hits)) => {
-                        let filtered_hits: Vec<SearchHit> = hits
+                    Ok(Ok(outcome)) => {
+                        let filtered_hits: Vec<SearchHit> = outcome
+                            .hits
                             .iter()
                             .filter(|hit| {
                                 request
@@ -738,9 +815,10 @@ impl SubstrateCoordinator {
                             .collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
-                            hits,
+                            hits: outcome.hits,
                             note_hits: vec![],
                             error: None,
+                            vector_error: outcome.vector_error,
                         };
                         return (filtered_hits, vec![], vec![backend_result]);
                     }
@@ -749,7 +827,8 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(e.to_string()),
+                            error: Some(BackendSearchFailure::from_runtime_error(e)),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -768,7 +847,8 @@ impl SubstrateCoordinator {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
-                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -855,14 +935,15 @@ impl SubstrateCoordinator {
                             "injected failure".to_string(),
                         )),
                         None::<Vec<NoteSearchHit>>,
+                        None,
                     );
                 }
                 if search_notes {
                     if let Some(hits) = note_override {
-                        return (backend_id, Ok(vec![]), Some(hits));
+                        return (backend_id, Ok(vec![]), Some(hits), None);
                     }
                 } else if let Some(hits) = entity_override {
-                    return (backend_id, Ok(hits), None);
+                    return (backend_id, Ok(hits), None, None);
                 }
                 let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
                     Ok(t) => t,
@@ -871,15 +952,14 @@ impl SubstrateCoordinator {
                             error = %bounded_backend_cause_for_log(&e.to_string()),
                             "fan_out_search: authorization denied for namespace"
                         );
-                        return (backend_id, Err(e), None);
+                        return (backend_id, Err(e), None, None);
                     }
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(
+                        .search_notes_outcome(
                             &token,
                             &q,
-                            None,
                             sl,
                             kf.as_deref(),
                             include_superseded,
@@ -893,15 +973,19 @@ impl SubstrateCoordinator {
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
                         // `rrf_merge_note_hits` applies `limit` once, after merge.
-                        Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
-                        Err(e) => (backend_id, Err(e), None),
+                        Ok(outcome) => (
+                            backend_id,
+                            Ok(vec![]),
+                            Some(outcome.hits),
+                            outcome.vector_error,
+                        ),
+                        Err(e) => (backend_id, Err(e), None, None),
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(
+                        .hybrid_search_outcome(
                             &token,
                             &q,
-                            None,
                             sl,
                             kf.as_deref(),
                             et.as_deref(),
@@ -912,8 +996,8 @@ impl SubstrateCoordinator {
                     match result {
                         // See the note-substrate arm above: no per-backend
                         // truncation before RRF merge (MAJ-4).
-                        Ok(hits) => (backend_id, Ok(hits), None),
-                        Err(e) => (backend_id, Err(e), None),
+                        Ok(outcome) => (backend_id, Ok(outcome.hits), None, outcome.vector_error),
+                        Err(e) => (backend_id, Err(e), None, None),
                     }
                 }
             };
@@ -954,7 +1038,7 @@ impl SubstrateCoordinator {
                 }
             };
             match joined {
-                Ok(Ok(((backend_id, Ok(hits), note_hits_opt), completed_at)))
+                Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     let note_hits = note_hits_opt.unwrap_or_default();
@@ -969,16 +1053,18 @@ impl SubstrateCoordinator {
                         hits,
                         note_hits,
                         error: None,
+                        vector_error,
                     });
                 }
-                Ok(Ok(((backend_id, Err(e), _), completed_at)))
+                Ok(Ok(((backend_id, Err(e), _, _), completed_at)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(e.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(e)),
+                        vector_error: None,
                     });
                 }
                 Ok(Err(join_err)) => {
@@ -994,7 +1080,8 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(error.to_string()),
+                        error: Some(BackendSearchFailure::from_runtime_error(error)),
+                        vector_error: None,
                     });
                 }
                 Ok(Ok((_late_result, _completed_at))) => {
@@ -1007,7 +1094,8 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                        vector_error: None,
                     });
                 }
                 Err(_elapsed) => {
@@ -1020,7 +1108,8 @@ impl SubstrateCoordinator {
                         backend_id: joined_backend_id,
                         hits: vec![],
                         note_hits: vec![],
-                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                        vector_error: None,
                     });
                 }
             }
@@ -1223,5 +1312,59 @@ mod futures_util {
             }
             results
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors khive-mcp's
+    // backend_error_message_drops_a_url_credential_whose_terminator_crosses_the_window:
+    // the credential's terminating `@` lands past the shared masking window,
+    // so a masker restricted to the window can never recognize the span. The
+    // whole straddling token — having no internal whitespace — is dropped
+    // rather than partially echoed, so no fragment of it survives even
+    // though it is never marked as masked.
+
+    #[test]
+    fn backend_cause_for_log_drops_a_url_credential_whose_terminator_crosses_the_window() {
+        let marker = "CoordinatorCauseMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let url = format!("postgres://svc:{password}@internal-host.example.com/db");
+        let message = format!("backend probe failed: {url}");
+
+        let at_offset = message.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+
+        let bounded = bounded_backend_cause_for_log(&message);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive: {bounded}"
+        );
+        assert!(
+            !bounded.contains("postgres://"),
+            "the straddling token must be dropped whole, not partially echoed: {bounded}"
+        );
+        assert!(bounded.starts_with("backend probe failed:"));
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn backend_id_for_log_drops_a_url_credential_whose_terminator_crosses_the_window() {
+        let marker = "CoordinatorIdMarkerXYZ789";
+        let padding = "z".repeat(khive_runtime::secret_gate::MASK_WINDOW_CHARS + 200);
+        let password = format!("{marker}{padding}");
+        let backend_id = format!("postgres://svc:{password}@internal-host.example.com/db");
+
+        let at_offset = backend_id.find('@').expect("test fixture must contain '@'");
+        assert!(at_offset > khive_runtime::secret_gate::MASK_WINDOW_CHARS);
+
+        let bounded = bounded_backend_id_for_log(&backend_id);
+        assert!(
+            !bounded.contains(marker),
+            "no fragment of the credential may survive: {bounded}"
+        );
     }
 }

@@ -1,14 +1,4 @@
-//! Handler table and runtime dispatch for the agent pack.
-//!
-//! Unlike the other packs in this workspace, `AgentPack` is not registered
-//! through `inventory::submit!`/`PackFactory`: that self-registration path
-//! constructs a pack from a bare `KhiveRuntime` alone, and `KhiveRuntime`
-//! has no accessor for an `AgentStore` (no such accessor is part of the
-//! shared contract this crate was built against, and adding one is outside
-//! this crate's file scope). Callers construct `AgentPack::new(runtime,
-//! store)` directly and register the instance with
-//! `RegistryBuilder::register`, the same manual path already supported for
-//! any `Pack + PackRuntime` value.
+//! Handler table and runtime dispatch for the opt-in agent pack.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,8 +12,8 @@ use crate::{handlers, AgentPack, PACK_NAME};
 pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "agent.spawn",
-        description: "Create a new agent process record and return its id and initial state \
-                       (ADR-142 §1).",
+        description:
+            "Request an agent process; refuses provider_unavailable until an adapter exists.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
@@ -45,8 +35,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
                 name: "idempotency_key",
                 param_type: "string",
                 required: false,
-                description: "Caller-supplied replay key, scoped to the calling actor; a \
-                               repeat with identical arguments returns the original record.",
+                description: "Reserved replay key; spawn currently refuses provider_unavailable.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -66,10 +55,12 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
             },
         ],
     },
+    // MAINTENANCE, deliberately kept out of the four descriptions below: the agent
+    // process lifecycle and its transition boundaries are specified in ADR-142 §1.
     HandlerDef {
         name: "agent.observe",
-        description: "Report an agent process record's current fields without changing state \
-                       (ADR-142 §1).",
+        description: "Report an agent process record's current fields without changing \
+                       state.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[ParamDef {
@@ -83,7 +74,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "agent.suspend",
         description: "Transition a running agent process to suspended at a message-yield \
-                       boundary (ADR-142 §1).",
+                       boundary.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
@@ -96,7 +87,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     },
     HandlerDef {
         name: "agent.resume",
-        description: "Transition a suspended agent process back to running (ADR-142 §1).",
+        description: "Transition a suspended agent process back to running.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
@@ -110,7 +101,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "agent.kill",
         description: "Transition an agent process to terminal/killed; a no-op returning the \
-                       current state when already terminal (ADR-142 §1).",
+                       current state when already terminal.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
@@ -150,17 +141,31 @@ impl PackRuntime for AgentPack {
         verb: &str,
         params: Value,
         _registry: &VerbRegistry,
-        token: &NamespaceToken,
+        _token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "agent.spawn" => handlers::handle_spawn(self.store(), token, params).await,
-            "agent.observe" => handlers::handle_observe(self.store(), params).await,
-            "agent.suspend" => handlers::handle_suspend(self.store(), params).await,
-            "agent.resume" => handlers::handle_resume(self.store(), params).await,
-            "agent.kill" => handlers::handle_kill(self.store(), params).await,
+            "agent.spawn" => handlers::handle_spawn(params),
+            "agent.observe" => handlers::handle_observe(self.store().await?, params).await,
+            "agent.suspend" => handlers::handle_suspend(self.store().await?, params).await,
+            "agent.resume" => handlers::handle_resume(self.store().await?, params).await,
+            "agent.kill" => handlers::handle_kill(self.store().await?, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "{PACK_NAME} pack does not handle verb {verb:?}"
             ))),
         }
     }
 }
+
+struct AgentPackFactory;
+impl khive_runtime::PackFactory for AgentPackFactory {
+    fn name(&self) -> &'static str {
+        PACK_NAME
+    }
+    fn requires(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn create(&self, runtime: khive_runtime::KhiveRuntime) -> Box<dyn PackRuntime> {
+        Box::new(AgentPack::from_runtime(runtime))
+    }
+}
+inventory::submit! { khive_runtime::PackRegistration(&AgentPackFactory) }

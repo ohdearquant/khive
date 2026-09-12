@@ -1143,6 +1143,9 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -1158,6 +1161,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("file-backed runtime");
         apply_session_schema(&rt).await;
@@ -2797,6 +2801,80 @@ mod tests {
             stored_raw.contains("***MASKED***"),
             "stored raw must carry the secret_gate redaction marker"
         );
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_export_secret_bearing_title_is_masked_in_stored_slug() {
+        let (rt, _dir) = setup().await;
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let conv = json!({
+            "id": "conv-secret-title",
+            "title": format!("prod creds {secret}"),
+            "current_node": "msg-secret-title-user",
+            "mapping": {
+                "root-secret-title": {
+                    "id": "root-secret-title",
+                    "message": null,
+                    "parent": null,
+                    "children": ["msg-secret-title-user"]
+                },
+                "msg-secret-title-user": {
+                    "id": "msg-secret-title-user",
+                    "parent": "root-secret-title",
+                    "children": [],
+                    "message": {
+                        "id": "msg-secret-title-user",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Hello"]}
+                    }
+                }
+            }
+        });
+        let content = serde_json::to_string(&json!([conv])).unwrap();
+        let (_file, path) = write_export_file(&content);
+
+        mirror_chatgpt_export_file(&rt, &path, 0)
+            .await
+            .expect("secret-title chatgpt conversation ingest");
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let session = reader
+            .query_row(SqlStatement {
+                sql: "SELECT slug FROM sessions WHERE id='conv-secret-title'".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query secret-title session")
+            .expect("secret-title session row");
+        let Some(SqlValue::Text(slug)) = session.get("slug") else {
+            panic!("stored slug must be text");
+        };
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
+
+        // The pre-mask title must not be recoverable from any other stored
+        // column either — the message-bearing node this conversation carries
+        // has no title field of its own, so text/raw must not echo it back.
+        let message_row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT text, raw FROM session_messages WHERE session_id='conv-secret-title'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query secret-title message")
+            .expect("secret-title message row");
+        let (Some(SqlValue::Text(stored_text)), Some(SqlValue::Text(stored_raw))) =
+            (message_row.get("text"), message_row.get("raw"))
+        else {
+            panic!("stored text/raw must be text");
+        };
+        assert!(!stored_text.contains(&secret));
+        assert!(!stored_raw.contains(&secret));
     }
 
     fn claude_ai_happy_export_json() -> String {

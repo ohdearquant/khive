@@ -2,8 +2,8 @@
 //!
 //! Every caller-supplied value that can reach `std::process::Command::args`
 //! for `git.commit` / `git.branch` / `git.push` passes through this module
-//! first. Nothing here ever touches a shell: `Command::new("git")` spawns the
-//! binary directly and `.args([...])` passes each element as one literal,
+//! first. Nothing here ever touches a shell: `Command::new(program)` spawns the
+//! operator-selected binary directly and `.args([...])` passes each element as one literal,
 //! unparsed argv entry — there is no string interpolation anywhere in this
 //! crate's write path for a caller-supplied value to escape.
 //!

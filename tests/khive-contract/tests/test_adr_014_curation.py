@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, KhiveOperationError
+from khive_contract.client import KhiveMcpSession, KhiveOperationError, error_text
 
 VERBS_UNDER_TEST = {"create", "link", "update", "delete", "merge", "get", "list"}
 
@@ -147,7 +147,7 @@ def test_delete_entity_soft_and_hard(
                                                                        "namespace": temp_namespace}}])
     first = envelope["results"][0]
     assert not first.get("ok", False), "Hard-deleted entity must not be gettable"
-    assert "not found" in first.get("error", "").lower(), (
+    assert "not found" in error_text(first).lower(), (
         f"Expected not-found error after hard delete: {first.get('error')!r}"
     )
 
@@ -214,7 +214,7 @@ def test_merge_entity_rewires_edges_unions_tags_drops_self_loops(
                                                                             "namespace": temp_namespace}}])
     first_gone = envelope_gone["results"][0]
     assert not first_gone.get("ok", False), "Merged-away entity must not be gettable"
-    assert "not found" in first_gone.get("error", "").lower(), (
+    assert "not found" in error_text(first_gone).lower(), (
         f"Expected not-found for merged-away entity: {first_gone.get('error')!r}"
     )
 
@@ -244,7 +244,7 @@ def test_merge_entity_rewires_edges_unions_tags_drops_self_loops(
     ])
     first_loop = envelope_loop["results"][0]
     assert not first_loop.get("ok", False), "Self-loop edge must be deleted after merge"
-    assert "not found" in first_loop.get("error", "").lower(), (
+    assert "not found" in error_text(first_loop).lower(), (
         f"Self-loop edge should be not-found: {first_loop.get('error')!r}"
     )
 

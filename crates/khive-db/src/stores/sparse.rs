@@ -10,7 +10,8 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector,
+    BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, SparseRecord, SparseSearchHit,
+    SparseSearchRequest, SparseVector,
 };
 use khive_storage::{SparseStore, StorageCapability};
 use khive_types::SubstrateKind;
@@ -107,31 +108,39 @@ fn batch_insert_sparse_dml(
          updated_at = excluded.updated_at"
     );
 
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
+        let item_id = Some(record.subject_id.to_string());
         // Validate inline — skip invalid records rather than aborting the batch.
         if record.vector.indices.len() != record.vector.values.len()
             || record.vector.indices.is_empty()
             || record.vector.values.iter().any(|v| !v.is_finite())
             || record.vector.indices.windows(2).any(|w| w[0] >= w[1])
         {
-            if first_error.is_empty() {
-                first_error = format!("invalid sparse vector for subject {}", record.subject_id);
-            }
-            failed += 1;
+            summary.record_failure(
+                index,
+                item_id,
+                BatchWriteErrorClass::InvalidInput,
+                BatchWriteRetryability::Permanent,
+                format!("invalid sparse vector for subject {}", record.subject_id),
+            );
             continue;
         }
 
         let indices_json = match serde_json::to_string(&record.vector.indices) {
             Ok(j) => j,
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                summary.record_failure(
+                    index,
+                    item_id,
+                    BatchWriteErrorClass::Serialization,
+                    BatchWriteRetryability::Permanent,
+                    e.to_string(),
+                );
                 continue;
             }
         };
@@ -152,22 +161,15 @@ fn batch_insert_sparse_dml(
                 now
             ],
         ) {
-            Ok(_) => affected += 1,
+            Ok(_) => summary.affected = summary.affected.saturating_add(1),
             Err(e) => {
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, item_id, class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 /// Create the sparse table and its index for the given model_key.

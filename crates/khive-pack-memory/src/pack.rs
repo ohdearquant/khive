@@ -14,7 +14,7 @@ use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Vi
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
+use crate::ann::{new_shared_for_role, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -43,11 +43,22 @@ impl MemoryPack {
     ///
     /// See `crates/khive-pack-memory/docs/api/pack-integration.md`.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the memory
+    /// index from the full corpus. The serving factory passes the daemon role:
+    /// a corpus build is minutes of CPU and a segment rewrite every other reader
+    /// on the index root must absorb, so a short-lived client serves what is
+    /// persisted and leaves the build to the daemon. Direct constructions —
+    /// admin reindex, benches, tests — build, because building is what they are
+    /// for.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
-            ann: new_shared(),
+            ann: new_shared_for_role(builds_corpus_indexes),
             query_cache: QueryEmbeddingCache::with_default_capacity(),
             recall_state: Mutex::new(BalancedRecallState::new(10_000)),
             brain_profile,
@@ -91,6 +102,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "string",
                 required: true,
                 description: "Memory content to store.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "key",
+                param_type: "string",
+                required: false,
+                description: "Immutable operation key, at most 512 UTF-8 bytes and no NUL (empty is allowed). Unique among live memories in the write namespace. Replay returns key_conflict with existing_id; pin the original namespace when reconciling across actors.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -170,7 +188,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -185,28 +203,28 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10).",
+                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100). Takes priority over limit.",
+                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by ADR-104 posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15%-under-ADR-104 range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
+                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -269,7 +287,8 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Serving-profile override (ADR-104 §4): short-circuits binding resolution so the named profile's state serves this request; stamped and ledgered like a resolved profile. Unknown ids error.",
+                // MAINTENANCE, deliberately kept out of the description: ADR-104 §4.
+                description: "Serving-profile override: short-circuits binding resolution so the named profile's state serves this request; stamped and ledgered like a resolved profile. Unknown ids error.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -294,10 +313,26 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "exclude_tags",
+                param_type: "array",
+                required: false,
+                description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "include_source_id",
+                param_type: "boolean",
+                required: false,
+                description: "When true every hit carries source_id: the UUID the memory annotates (its source_id at remember time), or null when it has none. Default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Exact-match read-namespace override (ADR-007 Rev 6 escape hatch). When absent, reads the caller's default visible namespace set (unchanged default behavior). When present, scopes the candidate fetch to exactly this namespace; invalid values are rejected.",
+                // MAINTENANCE, deliberately kept out of the description: this is the
+                // ADR-007 Rev 6 escape hatch.
+                description: "Exact-match read-namespace override. When absent, reads the caller's default visible namespace set (unchanged default behavior). When present, scopes the candidate fetch to exactly this namespace; invalid values are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -347,7 +382,9 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Commissive: curation prune of low-salience or expired memories
     HandlerDef {
         name: "memory.prune",
-        description: "Soft-delete memories below a salience threshold and/or past expires_at. Curation-layer operation per ADR-014.",
+        // MAINTENANCE, deliberately kept out of the description: ADR-014 defines the
+        // curation layer this verb belongs to.
+        description: "Soft-delete memories below a salience threshold and/or past expires_at. A curation-layer operation.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -405,7 +442,10 @@ impl khive_runtime::PackFactory for MemoryPackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(MemoryPack::new(runtime))
+        Box::new(MemoryPack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 }
 
@@ -1084,10 +1124,11 @@ mod note_mutation_hook_tests {
             .await
             .expect("warm recall");
 
+        ann::wait_until_warm_idle(ann, &mutation_hook_ann_key()).await;
         assert!(
             ann::is_current(ann, &mutation_hook_ann_key()).await,
-            "sanity: warm-up recall must leave the ANN cache current before \
-             the mutation under test"
+            "precondition: completed ANN warm-up must leave the cache current \
+             before testing mutation invalidation"
         );
         id
     }

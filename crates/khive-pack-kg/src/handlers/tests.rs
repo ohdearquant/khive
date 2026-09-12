@@ -179,16 +179,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 20 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
+// KG pack must expose exactly 24 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
 #[test]
-fn kg_pack_exposes_20_handlers() {
+fn kg_pack_exposes_24_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        20,
-        "kg pack must expose 20 handlers (was 19, +1 for db_diagnostics)"
+        24,
+        "kg pack must expose 24 handlers including ordered streams and stream.batch"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -1742,70 +1742,312 @@ async fn update_edge_symmetric_conflict_returns_tombstoned_survivor_with_deleted
     );
 }
 
-// HIGH regression: update(note_id, tags=[...]) must return an explicit error.
-// Notes have no top-level tags column; tags live in properties["tags"].
-// Before the fix, tags was silently dropped on the note path (the error string
-// even advertised it as valid — making the bug worse for callers following docs).
 #[tokio::test]
-async fn update_note_with_entity_field_tags_returns_error() {
-    use crate::KgPack;
-    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
-
-    let note = rt
-        .create_note(
+async fn update_note_tags_replaces_created_tags_and_preserves_unrelated_properties() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
             &token,
-            "observation",
-            None,
-            "note content unchanged",
-            None,
-            None,
-            vec![],
+            json!({
+                "kind": "observation",
+                "content": "note content unchanged",
+                "tags": ["queued", "old"],
+                "properties": {"keep": {"value": 7}},
+            }),
+            &registry,
         )
         .await
         .expect("create note");
+    assert_eq!(note["properties"]["tags"], json!(["queued", "old"]));
 
-    let pack = KgPack::new(rt.clone());
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    let registry = builder.build().expect("registry build");
-
-    let result = pack
+    let updated = pack
         .handle_update(
             &token,
-            json!({ "id": note.id.to_string(), "tags": ["rust", "ml"] }),
+            json!({"id": note["id"], "tags": ["active", "rust"]}),
             &registry,
         )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "update note with entity-only field 'tags' must return an error, got ok"
-    );
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("tags"),
-        "error must name the invalid field 'tags'; got: {err_msg}"
-    );
-    assert!(
-        err_msg.contains("content"),
-        "error must list 'content' as a valid note field; got: {err_msg}"
-    );
-
-    // Confirm note content is unchanged.
-    let unchanged = rt
-        .notes(&token)
-        .unwrap()
-        .get_note(note.id)
         .await
-        .unwrap()
-        .expect("note must still exist");
+        .expect("replace note tags");
+    assert_eq!(updated["properties"]["tags"], json!(["active", "rust"]));
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .expect("read updated note");
     assert_eq!(
-        unchanged.content, "note content unchanged",
-        "note content must be unchanged after rejected update"
+        fetched["properties"],
+        json!({"tags": ["active", "rust"], "keep": {"value": 7}})
     );
+    assert_eq!(fetched["content"], "note content unchanged");
+    assert_eq!(fetched["tags"], json!(["active", "rust"]));
+}
+
+#[tokio::test]
+async fn update_note_omitted_tags_preserves_tags_while_patching_other_fields() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "observation", "content": "before", "tags": ["queued"],
+                "properties": {"keep": 7},
+            }),
+            &registry,
+        )
+        .await
+        .unwrap();
+    pack.handle_update(
+        &token,
+        json!({"id": note["id"], "content": "after", "properties": {"added": true}}),
+        &registry,
+    )
+    .await
+    .expect("update other fields without tags");
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .unwrap();
+    assert_eq!(fetched["content"], "after");
+    assert_eq!(
+        fetched["properties"],
+        json!({"tags": ["queued"], "keep": 7, "added": true})
+    );
+}
+
+#[tokio::test]
+async fn update_note_empty_tags_clears_created_tags() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({"kind": "observation", "content": "clear tags", "tags": ["queued"], "properties": {"keep": 7}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+    pack.handle_update(&token, json!({"id": note["id"], "tags": []}), &registry)
+        .await
+        .expect("clear note tags");
+    let fetched = pack
+        .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+        .await
+        .unwrap();
+    assert_eq!(fetched["properties"], json!({"tags": [], "keep": 7}));
+    assert_eq!(fetched["tags"], json!([]));
+}
+
+#[tokio::test]
+async fn update_entity_tags_still_replace_preserve_and_clear() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept", "name": "tagged entity", "tags": ["queued", "old"],
+                "properties": {"keep": 7}, "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .unwrap();
+    for (patch, expected) in [
+        (
+            json!({"id": entity["id"], "tags": ["active"]}),
+            json!(["active"]),
+        ),
+        (
+            json!({"id": entity["id"], "name": "renamed entity"}),
+            json!(["active"]),
+        ),
+        (json!({"id": entity["id"], "tags": []}), json!([])),
+    ] {
+        pack.handle_update(&token, patch, &registry).await.unwrap();
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": entity["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(fetched["tags"], expected);
+        assert_eq!(fetched["properties"], json!({"keep": 7}));
+    }
+}
+
+#[tokio::test]
+async fn update_note_properties_tags_route_still_replaces_and_clears() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    let note = pack
+        .handle_create(
+            &token,
+            json!({"kind": "observation", "content": "nested tags", "tags": ["queued"], "properties": {"keep": 7}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+    for tags in [json!(["nested"]), json!([])] {
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "properties": {"tags": tags, "added": true}}),
+            &registry,
+        )
+        .await
+        .expect("patch existing properties.tags route");
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": tags, "keep": 7, "added": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_note_top_level_tags_override_properties_tags_including_empty() {
+    let (_, token, pack, registry) = configured_kg_pack().await;
+    for tags in [json!(["top-level"]), json!([])] {
+        let note = pack
+            .handle_create(
+                &token,
+                json!({"kind": "observation", "content": "conflicting tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                &registry,
+            )
+            .await
+            .unwrap();
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "tags": tags, "properties": {"tags": ["nested"], "added": true}}),
+            &registry,
+        )
+        .await
+        .expect("top-level tags win over nested tags");
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": tags, "keep": 7, "added": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preserved() {
+    use khive_runtime::{
+        KhiveRuntime, KindHook, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry,
+        VerbRegistryBuilder,
+    };
+    use khive_types::{HandlerDef, Pack};
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct TagHook(Mutex<Vec<Value>>);
+
+    #[async_trait::async_trait]
+    impl KindHook for TagHook {
+        async fn prepare_create(
+            &self,
+            _: &KhiveRuntime,
+            _: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn after_create(
+            &self,
+            _: &KhiveRuntime,
+            _: uuid::Uuid,
+            _: &Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn prepare_note_update(
+            &self,
+            _: &KhiveRuntime,
+            _: &NamespaceToken,
+            _: &khive_storage::Note,
+            args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            self.0.lock().unwrap().push(args.clone());
+            args["properties"]["tags"] = json!(["hook-approved"]);
+            args["properties"]["hook_seen"] = json!(true);
+            Ok(())
+        }
+    }
+
+    struct TagHookPack(Arc<TagHook>);
+
+    impl Pack for TagHookPack {
+        const NAME: &'static str = "tag-update-test";
+        const NOTE_KINDS: &'static [&'static str] = &["tag-hook-note"];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait::async_trait]
+    impl PackRuntime for TagHookPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+            (kind == "tag-hook-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+        }
+        async fn dispatch(
+            &self,
+            _: &str,
+            _: Value,
+            _: &VerbRegistry,
+            _: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            unreachable!()
+        }
+    }
+
+    let (rt, token, pack, _) = configured_kg_pack().await;
+    let hook = Arc::new(TagHook::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt));
+    builder.register(TagHookPack(hook.clone()));
+    let registry = builder.build().unwrap();
+    for tags in [json!(["top-level"]), json!([])] {
+        let note = pack
+            .handle_create(
+                &token,
+                json!({"kind": "tag-hook-note", "content": "hook tags", "tags": ["queued"], "properties": {"keep": 7}}),
+                &registry,
+            )
+            .await
+            .unwrap();
+        pack.handle_update(
+            &token,
+            json!({"id": note["id"], "tags": tags, "properties": {"tags": ["nested"], "added": true}}),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let seen = hook.0.lock().unwrap().last().unwrap().clone();
+        assert!(seen.get("tags").is_none());
+        assert_eq!(seen["properties"], json!({"tags": tags, "added": true}));
+        let fetched = pack
+            .handle_get(&token, &token, json!({"id": note["id"]}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched["properties"],
+            json!({"tags": ["hook-approved"], "keep": 7, "added": true, "hook_seen": true})
+        );
+    }
+    assert_eq!(hook.0.lock().unwrap().len(), 2);
 }
 
 // MEDIUM regression: update(entity_id, salience=...) must return an explicit
@@ -2215,6 +2457,177 @@ async fn configured_kg_pack() -> (
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let pack = KgPack::new(rt.clone());
     (rt, token, pack, registry)
+}
+
+// khive#2087: `link` is an observable upsert. A live natural-key conflict is
+// an explicit replacement, while a tombstone requires caller opt-in before it
+// can be resurrected. Typed lifecycle events must project the affected edge id
+// so the event surface can answer `observed=[edge_id]`.
+#[tokio::test]
+async fn link_reports_replace_and_explicit_resurrection_with_edge_observations() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+    use uuid::Uuid;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let source = rt
+        .create_entity(&token, "concept", None, "source", None, None, vec![])
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(&token, "concept", None, "target", None, None, vec![])
+        .await
+        .expect("create target");
+
+    let created = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.4,
+                "metadata": {"phase": "created"},
+            }),
+            &registry,
+        )
+        .await
+        .expect("initial link");
+    assert_eq!(created["mutation"], "created");
+    let edge_id = Uuid::parse_str(created["id"].as_str().expect("edge id")).expect("UUID");
+
+    let created_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::LinkCreated],
+                observed: vec![edge_id],
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query LinkCreated by edge observation");
+    let all_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query all events");
+    assert_eq!(
+        created_events.items.len(),
+        1,
+        "LinkCreated must be visible through its edge observation; all events: {:?}",
+        all_events.items
+    );
+    assert_eq!(created_events.items[0].target_id, Some(edge_id));
+
+    let updated = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.7,
+                "metadata": {"phase": "updated"},
+            }),
+            &registry,
+        )
+        .await
+        .expect("live natural-key replacement");
+    assert_eq!(updated["mutation"], "updated");
+    assert_eq!(updated["id"], created["id"]);
+    assert_eq!(updated["metadata"], json!({"phase": "updated"}));
+
+    assert!(rt
+        .delete_edge(&token, edge_id, false)
+        .await
+        .expect("soft-delete edge"));
+    let tombstone = rt
+        .get_edge_including_deleted(&token, edge_id)
+        .await
+        .expect("read tombstone")
+        .expect("tombstone exists");
+    assert!(tombstone.deleted_at.is_some());
+
+    let refusal = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.9,
+                "metadata": {"phase": "must-not-apply"},
+            }),
+            &registry,
+        )
+        .await
+        .expect_err("implicit resurrection must be refused");
+    assert!(
+        refusal.to_string().contains("resurrect=true"),
+        "refusal must explain the explicit opt-in: {refusal}"
+    );
+    let preserved = rt
+        .get_edge_including_deleted(&token, edge_id)
+        .await
+        .expect("read refused tombstone")
+        .expect("tombstone remains");
+    assert_eq!(preserved.deleted_at, tombstone.deleted_at);
+    assert_eq!(preserved.metadata, tombstone.metadata);
+
+    let resurrected = pack
+        .handle_link(
+            &token,
+            json!({
+                "source_id": source.id,
+                "target_id": target.id,
+                "relation": "extends",
+                "weight": 0.9,
+                "metadata": {"phase": "resurrected"},
+                "resurrect": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("explicit resurrection");
+    assert_eq!(resurrected["mutation"], "resurrected");
+    assert_eq!(resurrected["id"], created["id"]);
+    assert!(resurrected["deleted_at"].is_null());
+
+    let mutation_events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::EdgeUpdated],
+                observed: vec![edge_id],
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query EdgeUpdated by edge observation");
+    assert_eq!(mutation_events.items.len(), 2);
+    assert!(mutation_events
+        .items
+        .iter()
+        .any(|event| event.payload["mutation"] == "resurrected"
+            && !event.payload["previous"]["deleted_at"].is_null()));
 }
 
 // ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
@@ -2850,5 +3263,384 @@ async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
     assert_eq!(
         status, "not_found",
         "resolve has no message slot for a merge hint in this interim change; got {result:?}"
+    );
+}
+
+// The reason this change exists: before it, a create through the kg verbs left an
+// audit row at the exec layer and no domain event at all, so the event plane could
+// say what left the graph and not what entered it. This walks create, update and
+// delete for both substrates and requires all six domain kinds, each exactly once
+// and each carrying its own record as the target. Audit rows are emitted a layer
+// above the pack registry, so they are outside this test's reach by construction;
+// what is in reach is the half that was missing.
+#[tokio::test]
+async fn every_kg_write_emits_its_domain_event() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+
+    let entity = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "entity",
+                "entity_kind": "concept",
+                "name": "domain-event-arm",
+            }),
+            &registry,
+        )
+        .await
+        .expect("create entity");
+    let entity_id =
+        Uuid::parse_str(entity["id"].as_str().expect("entity id")).expect("entity uuid");
+
+    let note = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "domain event arm",
+            }),
+            &registry,
+        )
+        .await
+        .expect("create note");
+    let note_id = Uuid::parse_str(note["id"].as_str().expect("note id")).expect("note uuid");
+
+    pack.handle_update(
+        &token,
+        json!({"id": entity_id, "description": "updated by the domain event arm"}),
+        &registry,
+    )
+    .await
+    .expect("update entity");
+    pack.handle_update(
+        &token,
+        json!({"id": note_id, "content": "domain event arm, updated"}),
+        &registry,
+    )
+    .await
+    .expect("update note");
+
+    pack.handle_delete(&token, json!({"id": entity_id}), &registry)
+        .await
+        .expect("delete entity");
+    pack.handle_delete(&token, json!({"id": note_id}), &registry)
+        .await
+        .expect("delete note");
+
+    let page = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 500,
+            },
+        )
+        .await
+        .expect("query every event in the namespace");
+
+    let mut by_kind: BTreeMap<String, Vec<Option<Uuid>>> = BTreeMap::new();
+    for event in &page.items {
+        by_kind
+            .entry(format!("{:?}", event.kind))
+            .or_default()
+            .push(event.target_id);
+    }
+    let census: Vec<(String, usize)> = by_kind
+        .iter()
+        .map(|(kind, targets)| (kind.clone(), targets.len()))
+        .collect();
+
+    for (kind, expected_target) in [
+        (EventKind::EntityCreated, entity_id),
+        (EventKind::EntityUpdated, entity_id),
+        (EventKind::EntityDeleted, entity_id),
+        (EventKind::NoteCreated, note_id),
+        (EventKind::NoteUpdated, note_id),
+        (EventKind::NoteDeleted, note_id),
+    ] {
+        let key = format!("{kind:?}");
+        let targets = by_kind.get(&key).cloned().unwrap_or_default();
+        assert_eq!(
+            targets.len(),
+            1,
+            "expected exactly one {key} event; kind census was {census:?}"
+        );
+        assert_eq!(
+            targets[0],
+            Some(expected_target),
+            "{key} must target the record it describes; kind census was {census:?}"
+        );
+    }
+}
+
+// `context` walks edges, and an edge endpoint is any record kind, but it used to
+// hydrate record metadata from the entity store alone and silently skip whatever
+// it could not find there. The visible symptom was the worst shape available: an
+// empty neighbour list beside `dropped.neighbors == 0`, because the notes were
+// dropped in assembly before the budget stage ever counted them, so both halves
+// of the response were true and the caller had no way to tell.
+//
+// The fixture mixes substrates on purpose. An implementation that hydrates only
+// entities returns one of three and fails the count; one that returns the notes
+// without saying which store they came from fails the substrate assertion; one
+// that returns them without their own kind fails the kind assertion, and kind is
+// what tells a task from an observation.
+// `handle_context` reaches the config-ledger seam, so the workspace census in
+// khive-runtime requires this group. It is the first test in this crate to take it.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn context_returns_note_neighbours_and_names_their_substrate() {
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+
+    let anchor = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "context-substrate-anchor",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create anchor");
+    let sibling = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "context-substrate-sibling",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create sibling entity neighbour");
+    let observation = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "an observation about the anchor",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation");
+    let question = rt
+        .create_note(
+            &token,
+            "question",
+            Some("a named question"),
+            "why does the anchor exist",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create question");
+
+    for (source, relation) in [
+        (sibling.id, "extends"),
+        (observation.id, "annotates"),
+        (question.id, "annotates"),
+    ] {
+        pack.handle_link(
+            &token,
+            json!({
+                "source_id": source,
+                "target_id": anchor.id,
+                "relation": relation,
+            }),
+            &registry,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("link {relation}: {e}"));
+    }
+
+    // The control: the neighbour walk itself sees all three. Any shortfall in
+    // `context` below is therefore hydration and not the edges.
+    let neighbours = pack
+        .handle_neighbors(&token, json!({"node_id": anchor.id, "direction": "both"}))
+        .await
+        .expect("neighbors");
+    assert_eq!(
+        neighbours
+            .as_array()
+            .expect("neighbors returns an array")
+            .len(),
+        3,
+        "control: the neighbour walk must see all three endpoints: {neighbours}"
+    );
+
+    let ctx = pack
+        .handle_context(
+            &token,
+            json!({"entity_ids": [anchor.id.to_string()], "hops": 1}),
+        )
+        .await
+        .expect("context");
+
+    let anchors = ctx["anchors"].as_array().expect("anchors array");
+    assert_eq!(anchors.len(), 1, "one anchor was asked for: {ctx}");
+    let returned = anchors[0]["neighbors"].as_array().expect("neighbors array");
+    assert_eq!(
+        returned.len(),
+        3,
+        "context must return every neighbour the walk found; dropped={:?} truncated={:?} got={returned:?}",
+        ctx["dropped"],
+        ctx["truncated"]
+    );
+
+    let mut by_id: std::collections::BTreeMap<String, &serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for n in returned {
+        by_id.insert(n["id"].as_str().expect("neighbour id").to_string(), n);
+    }
+
+    let entity_neighbour = by_id
+        .get(&sibling.id.to_string())
+        .expect("the entity neighbour must still be there");
+    assert_eq!(entity_neighbour["substrate"], json!("entity"));
+    assert_eq!(entity_neighbour["kind"], json!("concept"));
+
+    let note_neighbour = by_id
+        .get(&observation.id.to_string())
+        .expect("the observation must be there");
+    assert_eq!(note_neighbour["substrate"], json!("note"));
+    assert_eq!(note_neighbour["kind"], json!("observation"));
+    assert_eq!(
+        note_neighbour["description"],
+        json!("an observation about the anchor"),
+        "a note's body stands in for a description"
+    );
+
+    let named_note = by_id
+        .get(&question.id.to_string())
+        .expect("the question must be there");
+    assert_eq!(named_note["substrate"], json!("note"));
+    assert_eq!(named_note["kind"], json!("question"));
+    assert_eq!(named_note["name"], json!("a named question"));
+}
+
+/// `delete` names what it removed. The response `kind` used to be the caller's own
+/// request parameter handed back, so a delete by a bare id or a hex prefix answered
+/// `null` and a delete that named a kind answered that same string whatever the row
+/// turned out to be. Neither value carried anything the server resolved, which is the
+/// one thing a caller cannot work out for itself after the row is gone.
+#[tokio::test]
+async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    // Entity, deleted by a bare id: the caller named no kind at all.
+    let entity = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "resolved kind subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let out = registry
+        .dispatch("delete", json!({"id": entity.id.to_string()}))
+        .await
+        .expect("delete by bare id must succeed");
+    assert_eq!(out["deleted"], json!(true));
+    assert_eq!(
+        out["kind"],
+        json!("concept"),
+        "a bare-id delete must report the kind the row carried, not null: {out}"
+    );
+
+    // Note, deleted by a bare id: the other substrate, same question.
+    let note = rt
+        .create_note(
+            &token,
+            "insight",
+            None,
+            "resolved kind note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    let out = registry
+        .dispatch("delete", json!({"id": note.id.to_string()}))
+        .await
+        .expect("delete note by bare id must succeed");
+    assert_eq!(out["kind"], json!("insight"), "note kind: {out}");
+
+    // Deleted with the generic spelling: the specific kind still comes back. This is
+    // the arm the old code passed by accident, because it echoed "entity" verbatim.
+    let generic = rt
+        .create_entity(
+            &token,
+            "project",
+            None,
+            "generic spelling subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let out = registry
+        .dispatch(
+            "delete",
+            json!({"id": generic.id.to_string(), "kind": "entity"}),
+        )
+        .await
+        .expect("delete with the generic kind must succeed");
+    assert_eq!(
+        out["kind"],
+        json!("project"),
+        "a generic `entity` request must resolve to the specific kind: {out}"
+    );
+
+    // The mismatch guard is unchanged: naming the wrong kind still refuses, and this
+    // arm is what stops the fix from being read as "kind is now ignored".
+    let guarded = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "mismatch subject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let err = registry
+        .dispatch(
+            "delete",
+            json!({"id": guarded.id.to_string(), "kind": "project"}),
+        )
+        .await
+        .expect_err("a kind that does not match the row must refuse");
+    assert!(
+        format!("{err}").contains("kind mismatch"),
+        "expected a kind mismatch refusal, got: {err}"
     );
 }

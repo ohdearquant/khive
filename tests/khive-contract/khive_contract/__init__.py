@@ -5,6 +5,8 @@ from khive_contract.client import (
     KhiveMcpSession,
     KhiveOperationError,
     KhiveRpcError,
+    error_detail,
+    error_text,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "KhiveMcpError",
     "KhiveRpcError",
     "KhiveOperationError",
+    "error_text",
+    "error_detail",
 ]

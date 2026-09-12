@@ -259,7 +259,8 @@ impl KhiveRuntime {
                 )));
             }
         }
-        for edge in &archive.edges {
+        for (index, edge) in archive.edges.iter().enumerate() {
+            let record = format!("edge[{index}]");
             crate::operations::validate_edge_weight(edge.weight)?;
             // Edge properties are caller-controlled input: the runtime-owned
             // `khive:secret_gate` key is reservation-only on import, and edge
@@ -267,7 +268,7 @@ impl KhiveRuntime {
             // class, so credential-shaped values are rejected here as well.
             crate::secret_gate::reject_reserved_secret_gate_property(edge.properties.as_ref())?;
             if let Some(p) = edge.properties.as_ref() {
-                crate::secret_gate::check_json(p)?;
+                crate::secret_gate::check_json_at(p, &record, "properties")?;
             }
         }
 

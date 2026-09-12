@@ -26,6 +26,16 @@ pub struct Note {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// Immutable caller-chosen identity, unique among live notes of the same namespace and kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Persisted revision, assigned by storage and advanced on every matched update.
+    #[serde(default = "initial_note_version")]
+    pub version: i64,
+}
+
+const fn initial_note_version() -> i64 {
+    1
 }
 
 impl Note {
@@ -50,6 +60,8 @@ impl Note {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            key: None,
+            version: 1,
         }
     }
 
@@ -120,6 +132,21 @@ mod tests {
 
     fn base_note() -> Note {
         Note::new("ns:test", "memory", "hello world")
+    }
+
+    #[test]
+    fn note_key_is_optional_and_unkeyed_wire_shape_is_unchanged() {
+        let note = base_note();
+        assert_eq!(note.key, None);
+        let legacy = serde_json::to_value(&note).unwrap();
+        assert!(legacy.get("key").is_none());
+        assert_eq!(serde_json::from_value::<Note>(legacy).unwrap(), note);
+
+        let mut keyed = note;
+        keyed.key = Some("operation-1".to_string());
+        let encoded = serde_json::to_value(&keyed).unwrap();
+        assert_eq!(encoded["key"], "operation-1");
+        assert_eq!(serde_json::from_value::<Note>(encoded).unwrap(), keyed);
     }
 
     // -- with_salience --
@@ -481,6 +508,10 @@ pub enum FilterOp {
     /// value END = value`, mirroring callers whose read model assigns one
     /// textual default to absent, JSON-null, and malformed legacy values.
     TextEqOrNonText,
+    /// Matches a JSON text field against the supplied set, or any missing or
+    /// non-text value. The non-text branch still matches when the set is empty.
+    /// `PropertyFilter.value` is unused; the set lives in this variant.
+    TextInOrNonText(Vec<SqlValue>),
     Ne,
     Lt,
     Lte,
@@ -498,15 +529,13 @@ pub enum FilterOp {
     JsonTypeNeMissing,
     /// Matches rows where `json_extract(properties, path)` equals any value in
     /// the set. A row with a missing/NULL property does not match — use
-    /// `NotInOrMissing` with the complementary set when "absent" should count
-    /// as included. `PropertyFilter.value` is unused for this op; the set
+    /// `TextInOrNonText` when a textual read model includes missing/non-text
+    /// legacy values. `PropertyFilter.value` is unused for this op; the set
     /// lives in the variant itself.
     In(Vec<SqlValue>),
     /// Matches rows where the property is missing/NULL OR its value is not in
-    /// the set. Used for "exclude a small closed set of terminal values, but
-    /// treat a still-unset property as included" (e.g. GTD default task
-    /// listing excludes `done`/`cancelled` while a task with no `status` yet
-    /// still counts as `inbox`, i.e. included). `PropertyFilter.value` is
+    /// the set. Used to exclude a closed set while treating an unset property
+    /// as included (e.g. comm inbox excludes `outbound`). `PropertyFilter.value` is
     /// unused for this op; the set lives in the variant itself.
     NotInOrMissing(Vec<SqlValue>),
 }
@@ -520,6 +549,44 @@ pub struct PropertyFilter {
     pub json_path: String,
     pub op: FilterOp,
     pub value: SqlValue,
+}
+
+/// Keyset pagination boundary over the notes store's default total order
+/// (`created_at DESC, id ASC` — see `note_filter_page_order_clause`).
+///
+/// Only meaningful when [`NoteFilter::order_by`] is `None`: the boundary is
+/// expressed in terms of that default order, and combining it with a custom
+/// sort field has no defined meaning, so callers must not set both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteSeekAfter {
+    pub created_at: i64,
+    pub id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteTagMode {
+    #[default]
+    Any,
+    All,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NoteKeyCursor {
+    pub updated_at: i64,
+    pub key: String,
+    pub id: Uuid,
+}
+
+impl From<&Note> for NoteKeyCursor {
+    fn from(note: &Note) -> Self {
+        Self {
+            updated_at: note.updated_at,
+            key: note.key.clone().expect("keyed row"),
+            id: note.id,
+        }
+    }
 }
 
 /// Filter + sort options for [`NoteStore::query_notes_filtered`].
@@ -542,12 +609,59 @@ pub struct NoteFilter {
     /// Restrict to notes where `created_at >= min_created_at` (microseconds epoch).
     /// `None` applies no lower-bound constraint.
     pub min_created_at: Option<i64>,
+    #[serde(default)]
+    pub min_updated_at: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tag_mode: NoteTagMode,
+    /// Restrict results to rows strictly after this boundary in the default
+    /// `created_at DESC, id ASC` order, for keyset (seek) pagination that
+    /// avoids re-walking earlier pages the way `PageRequest.offset` does.
+    /// Requires `order_by` to be `None`.
+    ///
+    /// Honoured only by [`NoteStore::query_notes_filtered_count_free`], which
+    /// seeks directly to the boundary and returns `total: None`.
+    /// [`NoteStore::query_notes_filtered`] rejects a non-`None` value with
+    /// `StorageError::InvalidInput`: it computes an exact `COUNT(*)` total
+    /// over the whole matching set, which has no defined meaning paired with
+    /// a seek boundary.
+    #[serde(default)]
+    pub after: Option<NoteSeekAfter>,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
-    /// Insert or update a single note.
+    async fn get_live_notes_by_key(
+        &self,
+        _namespace: &str,
+        _key: &str,
+        _kind: Option<&str>,
+    ) -> StorageResult<Vec<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "get_live_notes_by_key".into(),
+            message: "backend has no keyed note lookup".into(),
+        })
+    }
+
+    async fn query_keyed_notes(
+        &self,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _prefix: &str,
+        _after: Option<&NoteKeyCursor>,
+        _page: PageRequest,
+    ) -> StorageResult<(Vec<Note>, Option<NoteKeyCursor>)> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_keyed_notes".into(),
+            message: "backend has no keyed note pagination".into(),
+        })
+    }
+
+    /// Insert or update a single note. Updates preserve the stored immutable key.
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
     /// Replace a note only when the persisted row still matches the caller's
     /// read snapshot.
@@ -599,7 +713,7 @@ pub trait NoteStore: Send + Sync + 'static {
             message: "this backend does not implement guarded note insertion".into(),
         })
     }
-    /// Insert or update a batch of notes.
+    /// Insert or update a batch of notes. Updates preserve each stored immutable key.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;

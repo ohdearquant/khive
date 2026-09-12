@@ -9,9 +9,9 @@ use uuid::Uuid;
 use khive_score::{cmp_desc_then_id, try_score_from_distance, DeterministicScore, ScoreError};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, SqlStatement,
-    SqlValue, VectorIndexKind, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo,
+    BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, IndexRebuildScope,
+    OrphanSweepConfig, OrphanSweepResult, SqlStatement, SqlValue, VectorIndexKind, VectorRecord,
+    VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
 };
 use khive_storage::StorageCapability;
 use khive_storage::StorageResult;
@@ -679,34 +679,45 @@ fn batch_insert_vectors_dml(
     attempted: u64,
     failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
+        let item_id = Some(record.subject_id.to_string());
         if record.vectors.len() != 1 {
-            if first_error.is_empty() {
-                first_error = format!("expected 1 vector per record, got {}", record.vectors.len());
-            }
-            failed += 1;
+            summary.record_failure(
+                index,
+                item_id,
+                BatchWriteErrorClass::InvalidInput,
+                BatchWriteRetryability::Permanent,
+                format!("expected 1 vector per record, got {}", record.vectors.len()),
+            );
             continue;
         }
         let embedding = &record.vectors[0];
         if embedding.len() != dims {
-            if first_error.is_empty() {
-                first_error = format!(
+            summary.record_failure(
+                index,
+                item_id,
+                BatchWriteErrorClass::InvalidInput,
+                BatchWriteRetryability::Permanent,
+                format!(
                     "wrong vector dimension: expected {dims}, got {}",
                     embedding.len()
-                );
-            }
-            failed += 1;
+                ),
+            );
             continue;
         }
         if non_finite_index(embedding).is_some() {
-            if first_error.is_empty() {
-                first_error = "embedding contains non-finite values (NaN or Inf)".to_string();
-            }
-            failed += 1;
+            summary.record_failure(
+                index,
+                item_id,
+                BatchWriteErrorClass::InvalidInput,
+                BatchWriteRetryability::Permanent,
+                "embedding contains non-finite values (NaN or Inf)",
+            );
             continue;
         }
         let kind_str = record.kind.to_string();
@@ -733,25 +744,18 @@ fn batch_insert_vectors_dml(
         match result {
             Ok(()) => {
                 conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
-                affected += 1;
+                summary.affected = summary.affected.saturating_add(1);
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
                 let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, item_id, class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 /// Shared DELETE-then-INSERT DML for single-record `insert`/`update`, run
@@ -2348,10 +2352,12 @@ mod first_error_tests {
 
         // Both records have wrong dimensions, so they fail the pre-SAVEPOINT
         // validation and never touch the vec0 virtual table.
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
         let summary = store
             .insert_batch(vec![
                 VectorRecord {
-                    subject_id: Uuid::new_v4(),
+                    subject_id: first_id,
                     kind: SubstrateKind::Entity,
                     namespace: "ns:test".to_string(),
                     field: "body".to_string(),
@@ -2360,7 +2366,7 @@ mod first_error_tests {
                     updated_at: chrono::Utc::now(),
                 },
                 VectorRecord {
-                    subject_id: Uuid::new_v4(),
+                    subject_id: second_id,
                     kind: SubstrateKind::Entity,
                     namespace: "ns:test".to_string(),
                     field: "body".to_string(),
@@ -2383,6 +2389,19 @@ mod first_error_tests {
             "first_error must be populated when failed > 0; \
              got empty string; the validation error is silently swallowed"
         );
+        assert_eq!(summary.errors.len(), 2);
+        assert_eq!(summary.errors[0].index, 0);
+        assert_eq!(summary.errors[1].index, 1);
+        assert_eq!(summary.errors[0].item_id, Some(first_id.to_string()));
+        assert_eq!(summary.errors[1].item_id, Some(second_id.to_string()));
+        assert!(summary.errors.iter().all(|error| {
+            error.class == khive_storage::BatchWriteErrorClass::InvalidInput
+                && error.retryability == khive_storage::BatchWriteRetryability::Permanent
+        }));
+        assert!(!summary.errors_truncated);
+        assert_eq!(summary.errors_omitted, 0);
+        assert_eq!(summary.error_counts.len(), 1);
+        assert_eq!(summary.error_counts[0].count, 2);
     }
 }
 

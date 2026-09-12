@@ -1,5 +1,7 @@
 //! kkernel — khive admin/management library.
 
+mod sql;
+
 mod atomic_apply;
 pub mod cli;
 pub mod code_audit;
@@ -7,9 +9,11 @@ pub mod code_ingest;
 pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
+pub mod entity_type_backfill;
 pub mod exec;
 pub mod git_ingest;
 pub mod kg;
+pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
 pub mod repo;
@@ -35,10 +39,12 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
+    use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
     use khive_pack_git::GitPack as _;
@@ -50,5 +56,8 @@ mod _pack_links {
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    use khive_pack_telemetry::TelemetryPack as _;
+    use khive_pack_tool::ToolPack as _;
+    use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;
 }

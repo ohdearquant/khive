@@ -8,7 +8,7 @@ use uuid::Uuid;
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace as RuntimeNamespace;
 use khive_runtime::{
-    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, SearchHit, SearchSource,
+    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, RuntimeError, SearchHit, SearchSource,
     VerbRegistryBuilder,
 };
 use khive_score::DeterministicScore;
@@ -17,7 +17,10 @@ use khive_storage::EdgeRelation;
 use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::dispatch::bounded_backend_cause_for_log;
-use super::{BackendRegistry, LocatorCache, SubstrateCoordinator, SubstrateCoordinatorService};
+use super::{
+    BackendRegistry, BackendSearchFailure, BackendSearchFailureKind, LocatorCache,
+    SubstrateCoordinator, SubstrateCoordinatorService,
+};
 
 fn memory_runtime() -> Arc<KhiveRuntime> {
     Arc::new(KhiveRuntime::memory().expect("memory runtime"))
@@ -81,6 +84,133 @@ fn memory_runtime_denied_with(cause: String) -> Arc<KhiveRuntime> {
         })
         .expect("memory runtime with denying gate"),
     )
+}
+
+/// An `EmbeddingService` that always succeeds with a fixed vector — used to
+/// stand up a runtime whose vector arm can later be broken independently of
+/// entity creation (which also embeds).
+struct ConstantEmbeddingService {
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for ConstantEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "coordinator-test-constant-embedding"
+    }
+}
+
+struct ConstantEmbedderProvider {
+    name: String,
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for ConstantEmbedderProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(ConstantEmbeddingService {
+            dimensions: self.dimensions,
+        }))
+    }
+}
+
+/// An `EmbeddingService` that always fails — drives a real vector-arm
+/// failure (not an `Unconfigured` short-circuit) through the coordinator's
+/// fan-out.
+struct FailingEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for FailingEmbeddingService {
+    async fn embed(
+        &self,
+        _texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Err(lattice_embed::EmbedError::ModelInitialization(
+            "injected vector-arm failure".to_string(),
+        ))
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "coordinator-test-failing-embedding"
+    }
+}
+
+struct FailingEmbedderProvider {
+    name: String,
+    dimensions: usize,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for FailingEmbedderProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(FailingEmbeddingService))
+    }
+}
+
+/// A runtime configured with a healthy (constant) embedder — entity creation
+/// and search both work until [`break_vector_arm`] swaps the provider out.
+fn memory_runtime_with_constant_embeddings() -> Arc<KhiveRuntime> {
+    let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(model),
+        packs: vec!["kg".to_string()],
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
+    runtime.register_embedder(ConstantEmbedderProvider {
+        name: model.to_string(),
+        dimensions: model.dimensions(),
+    });
+    Arc::new(runtime)
+}
+
+/// Swap the runtime's registered embedder for the always-failing one, keyed
+/// under the same model name so the vector leg picks it up on the next
+/// embed call — `EmbedderRegistry::register` overwrites by name.
+fn break_vector_arm(runtime: &KhiveRuntime) {
+    let model = lattice_embed::EmbeddingModel::AllMiniLmL6V2;
+    runtime.register_embedder(FailingEmbedderProvider {
+        name: model.to_string(),
+        dimensions: model.dimensions(),
+    });
 }
 
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
@@ -432,6 +562,245 @@ async fn fan_out_search_single_backend_returns_hits() {
     assert!(per_backend[0].error.is_none(), "no error");
 }
 
+/// A vector-arm failure after a successful text leg must not discard the
+/// text hit or mark the backend as whole-backend-failed: `hits` still
+/// carries the text match, `error` stays `None`, and `vector_error` alone
+/// reports the vector-arm cause. Single-backend early-return path.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
+    let ns = Namespace::local();
+
+    let token = runtime.authorize(ns.clone()).unwrap();
+    runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    break_vector_arm(&runtime);
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "FlashAttention",
+        "limit": 10,
+    }));
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(
+        !hits.is_empty(),
+        "text arm's hit must survive a vector-arm failure"
+    );
+    assert_eq!(per_backend.len(), 1, "single backend report");
+    assert!(
+        per_backend[0].error.is_none(),
+        "vector-arm-only failure must not read as a whole-backend error: {:?}",
+        per_backend[0].error
+    );
+    let vector_error = per_backend[0]
+        .vector_error
+        .as_deref()
+        .expect("vector arm failure must be reported");
+    assert!(
+        vector_error.contains("injected vector-arm failure"),
+        "vector_error must carry the underlying cause, got {vector_error:?}"
+    );
+}
+
+/// Positive control: proves the note vector leg genuinely runs and fails when
+/// exercised through the fail-loud `search_notes` entry point, establishing
+/// that `break_vector_arm` is a real behavioral trigger for the note
+/// substrate too — the note-substrate twin of
+/// `hybrid_search_still_fails_loud_on_vector_arm_error` for entities.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn search_notes_still_fails_loud_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let ns = Namespace::local();
+    let token = runtime.authorize(ns).unwrap();
+    runtime
+        .create_note(
+            &token,
+            "observation",
+            Some("FlashAttentionNote"),
+            "IO-aware exact attention observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    break_vector_arm(&runtime);
+
+    let result = runtime
+        .search_notes(
+            &token,
+            "FlashAttentionNote",
+            None,
+            10,
+            None,
+            false,
+            &[],
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "the fail-loud search_notes entry point must still propagate a vector-arm failure, got {result:?}"
+    );
+}
+
+/// Note-substrate twin of
+/// `fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error`: a
+/// vector-arm failure after a successful note text leg must not discard the
+/// note's text hit or mark the backend as whole-backend-failed.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_error() {
+    let runtime = memory_runtime_with_constant_embeddings();
+    let coord = SubstrateCoordinator::single(Arc::clone(&runtime));
+    let ns = Namespace::local();
+
+    let token = runtime.authorize(ns.clone()).unwrap();
+    runtime
+        .create_note(
+            &token,
+            "observation",
+            Some("FlashAttentionNote"),
+            "IO-aware exact attention observation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    break_vector_arm(&runtime);
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "FlashAttentionNote",
+        "limit": 10,
+    }));
+    let (_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(
+        !note_hits.is_empty(),
+        "text arm's note hit must survive a vector-arm failure"
+    );
+    assert_eq!(per_backend.len(), 1, "single backend report");
+    assert!(
+        per_backend[0].error.is_none(),
+        "vector-arm-only failure must not read as a whole-backend error: {:?}",
+        per_backend[0].error
+    );
+    let vector_error = per_backend[0]
+        .vector_error
+        .as_deref()
+        .expect("vector arm failure must be reported");
+    assert!(
+        vector_error.contains("injected vector-arm failure"),
+        "vector_error must carry the underlying cause, got {vector_error:?}"
+    );
+}
+
+/// Same guarantee as the single-backend test above, but for the spawned
+/// multi-backend fan-out path: a healthy sibling backend must not be
+/// affected by another backend's vector-arm-only failure.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend() {
+    let mut registry = BackendRegistry::new();
+    let rt_broken = memory_runtime_with_constant_embeddings();
+    let rt_healthy = memory_runtime();
+    registry.register(backend_id("broken"), Arc::clone(&rt_broken));
+    registry.register(backend_id("healthy"), Arc::clone(&rt_healthy));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    let tok_broken = rt_broken.authorize(ns.clone()).unwrap();
+    rt_broken
+        .create_entity(
+            &tok_broken,
+            "concept",
+            None,
+            "LoRA",
+            Some("Low-rank adaptation"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create on broken backend");
+    break_vector_arm(&rt_broken);
+
+    let tok_healthy = rt_healthy.authorize(ns.clone()).unwrap();
+    rt_healthy
+        .create_entity(
+            &tok_healthy,
+            "concept",
+            None,
+            "QLoRA",
+            Some("Quantised LoRA"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create on healthy backend");
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "LoRA",
+        "limit": 10,
+    }));
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert_eq!(per_backend.len(), 2, "both backends in report");
+    assert!(
+        !merged_hits.is_empty(),
+        "merged results must still include the broken backend's text hit"
+    );
+
+    let broken_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "broken")
+        .expect("broken backend reported");
+    assert!(
+        broken_report.error.is_none(),
+        "broken backend's text arm succeeded — must not be a whole-backend error: {:?}",
+        broken_report.error
+    );
+    assert!(
+        !broken_report.hits.is_empty(),
+        "broken backend's text hit must survive"
+    );
+    assert!(
+        broken_report
+            .vector_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("injected vector-arm failure"),
+        "broken backend must report its vector_error, got {:?}",
+        broken_report.vector_error
+    );
+
+    let healthy_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "healthy")
+        .expect("healthy backend reported");
+    assert!(
+        healthy_report.error.is_none() && healthy_report.vector_error.is_none(),
+        "healthy sibling must be unaffected: {healthy_report:?}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
@@ -657,6 +1026,27 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
 
 // ---- MAJ-2: per-backend fan-out search timeout ----
 
+#[test]
+fn backend_search_failure_classifies_typed_runtime_timeouts_without_message_matching() {
+    let storage_timeout = BackendSearchFailure::from_runtime_error(RuntimeError::Storage(
+        khive_storage::StorageError::Timeout {
+            operation: "fts_search".into(),
+        },
+    ));
+    let deadline = BackendSearchFailure::from_runtime_error(RuntimeError::DeadlineExceeded {
+        operation: "search".to_string(),
+        budget_ms: 5_000,
+        elapsed_ms: 5_001,
+    });
+    let internal = BackendSearchFailure::from_runtime_error(RuntimeError::Internal(
+        "backend search timed out after 5000ms".to_string(),
+    ));
+
+    assert_eq!(storage_timeout.kind, BackendSearchFailureKind::Timeout);
+    assert_eq!(deadline.kind, BackendSearchFailureKind::Timeout);
+    assert_eq!(internal.kind, BackendSearchFailureKind::BackendError);
+}
+
 /// A hung backend's search task must not block the fan-out from returning a
 /// healthy sibling's results, and must surface a timeout-specific error for
 /// itself in its `BackendSearchResult`.
@@ -708,10 +1098,11 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
         .expect("hung backend must have a report entry");
     let err = hung_report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "hung backend error must be timeout-specific, got: {err:?}"
     );
 
@@ -758,8 +1149,9 @@ async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
     assert_eq!(per_backend.len(), 3);
     assert!(per_backend.iter().all(|entry| entry
         .error
-        .as_deref()
-        .is_some_and(|error| error.contains("timed out"))));
+        .as_ref()
+        .is_some_and(|error| error.kind == BackendSearchFailureKind::Timeout
+            && error.message.contains("timed out"))));
     let elapsed = started.elapsed();
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
@@ -799,8 +1191,9 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
         assert!(
             report
                 .error
-                .as_deref()
-                .is_some_and(|error| error.contains("timed out")),
+                .as_ref()
+                .is_some_and(|error| error.kind == BackendSearchFailureKind::Timeout
+                    && error.message.contains("timed out")),
             "{backend} completed outside the absolute deadline but was accepted: {:?}",
             report.error
         );
@@ -850,10 +1243,11 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
     assert_eq!(report.backend_id.as_str(), "hung");
     let err = report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung single backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
 }
@@ -906,10 +1300,24 @@ fn coordinator_warning_cause_masker_is_bounded_and_fail_closed() {
     assert!(masked.contains("***MASKED***"));
     assert!(!masked.contains("sk_live_"));
 
+    // 5,000 non-whitespace characters: a single token longer than the
+    // shared masking window (MASK_WINDOW_CHARS = 4,096). There is no
+    // whitespace anywhere in the window to fall back to, so the whole
+    // window is dropped and replaced by the bare truncation marker rather
+    // than partially echoed content — see secret_gate::mask_bounded.
     let oversized = "x".repeat(5_000);
     let bounded = bounded_backend_cause_for_log(&oversized);
+    assert_eq!(bounded, "…");
+
+    // Comfortably under the 4,096-char window (so no token gets dropped),
+    // but over the 1,024-char output cap: behaves exactly as before,
+    // truncated to the output limit plus one trailing truncation marker.
+    let long_benign_prose = "word ".repeat(300);
+    assert!(long_benign_prose.chars().count() < 4_096);
+    let bounded = bounded_backend_cause_for_log(&long_benign_prose);
     assert_eq!(bounded.chars().count(), 1_025);
     assert!(bounded.ends_with('…'));
+
     assert_eq!(
         bounded_backend_cause_for_log(" \t\n"),
         "backend search failed without diagnostic detail"
@@ -948,8 +1356,8 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
     assert!(
         per_backend[0]
             .error
-            .as_deref()
-            .is_some_and(|error| error.contains("sk_live_")),
+            .as_ref()
+            .is_some_and(|error| error.message.contains("sk_live_")),
         "internal result should retain the raw cause until the MCP sanitizer"
     );
     assert!(
@@ -994,10 +1402,11 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     assert_eq!(report.backend_id.as_str(), "hung");
     let err = report
         .error
-        .as_deref()
+        .as_ref()
         .expect("hung single backend must carry an error");
+    assert_eq!(err.kind, BackendSearchFailureKind::Timeout);
     assert!(
-        err.contains("timed out"),
+        err.message.contains("timed out"),
         "single-backend timeout error must be timeout-specific, got: {err:?}"
     );
 }
@@ -1624,10 +2033,11 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         .expect("panicked backend remains identified");
     let error = panicked
         .error
-        .as_deref()
+        .as_ref()
         .expect("panicked backend carries an explicit error");
+    assert_eq!(error.kind, BackendSearchFailureKind::BackendError);
     assert!(
-        error.contains("join failed") && error.contains("panic"),
+        error.message.contains("join failed") && error.message.contains("panic"),
         "join error should identify the task panic, got {error:?}"
     );
     assert!(logs.contains("backend search task failed"));
@@ -2063,6 +2473,7 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     );
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -2084,18 +2495,19 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
         Some(false),
         "T2c: link op must fail closed on the wire: {response}"
     );
-    let wire_err = op["error"]
+    let wire_error_object = op["error"].to_string();
+    let wire_err = op["error"]["message"]
         .as_str()
-        .unwrap_or_else(|| panic!("T2c: MCP-visible error must be a string: {response}"))
+        .unwrap_or_else(|| panic!("T2c: MCP-visible error.message must be a string: {response}"))
         .to_string();
 
     assert!(
-        !wire_err.contains(CANARY),
-        "T2c: MCP-visible link error must not embed backend error text: {wire_err:?}"
+        !wire_error_object.contains(CANARY),
+        "T2c: MCP-visible link error must not embed backend error text: {wire_error_object:?}"
     );
     assert!(
-        !wire_err.contains("svc") && !wire_err.contains("internal-host"),
-        "T2c: MCP-visible link error must not embed backend error fragments: {wire_err:?}"
+        !wire_error_object.contains("svc") && !wire_error_object.contains("internal-host"),
+        "T2c: MCP-visible link error must not embed backend error fragments: {wire_error_object:?}"
     );
     assert!(
         wire_err.contains("gate backend unavailable"),
@@ -2180,6 +2592,7 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
     let ops = format!(r#"list(kind="entity", canary="{CANARY}")"#);
     let raw = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops,
             presentation: None,
             presentation_per_op: None,
@@ -2201,14 +2614,15 @@ async fn t2d_rego_gate_evaluator_failure_omits_canary_from_wire_and_logs() {
         Some(false),
         "T2d: list op must fail closed on the wire: {response}"
     );
-    let wire_err = op["error"]
+    let wire_error_object = op["error"].to_string();
+    let wire_err = op["error"]["message"]
         .as_str()
-        .unwrap_or_else(|| panic!("T2d: MCP-visible error must be a string: {response}"))
+        .unwrap_or_else(|| panic!("T2d: MCP-visible error.message must be a string: {response}"))
         .to_string();
 
     assert!(
-        !wire_err.contains(CANARY),
-        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_err:?}"
+        !wire_error_object.contains(CANARY),
+        "T2d: MCP-visible error must not embed the evaluator's raw error text: {wire_error_object:?}"
     );
     assert!(
         wire_err.contains("policy evaluation failed"),
@@ -2937,6 +3351,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7aConcept")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -2996,6 +3411,7 @@ async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
     ) -> BTreeSet<String> {
         let raw = server
             .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+                plan: None,
                 ops: ops.to_string(),
                 presentation: None,
                 presentation_per_op: None,
@@ -3111,6 +3527,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7bTarget")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3138,6 +3555,81 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
             "T7b: only concept hits expected, got entity_kind={kind:?} in: {hit}"
         );
     }
+}
+
+/// `SubstrateCoordinatorService::fan_out_search`'s per-backend mapping
+/// (`service.rs`'s `vector_error: r.vector_error` join line) must carry a
+/// real vector-arm failure all the way to the rendered JSON envelope:
+/// `arm_participation.vector.status == "error"`,
+/// `arm_participation.text.status == "ran"`, and the text arm's
+/// `candidate_count` equal to the number of text-sourced hits. Two backends
+/// are required so the coordinator path is actually taken instead of falling
+/// through to the single-backend registry dispatch (`is_single_backend()`
+/// short-circuit in `khive-mcp/src/server.rs`).
+#[tokio::test]
+async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() {
+    let rt_broken = memory_runtime_with_constant_embeddings();
+    let rt_healthy = memory_runtime();
+    let ns = Namespace::local();
+
+    let token = rt_broken.authorize(ns).unwrap();
+    rt_broken
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "FlashAttention",
+            Some("IO-aware exact attention"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    break_vector_arm(&rt_broken);
+
+    let server = two_backend_server(Arc::clone(&rt_broken), Arc::clone(&rt_healthy));
+
+    let result_str = server
+        .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
+            ops: r#"search(kind="concept", query="FlashAttention")"#.to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+            request_id: None,
+        })
+        .await
+        .expect("dispatch");
+
+    let response: serde_json::Value =
+        serde_json::from_str(&result_str).expect("parse response JSON");
+    let op = &response["results"][0];
+    assert_eq!(
+        op["ok"].as_bool(),
+        Some(true),
+        "search op must succeed: {op}"
+    );
+
+    let hits = op["result"].as_array().expect("result must be array");
+    let text_hit_count = hits.iter().filter(|hit| hit["source"] == "text").count();
+
+    assert_eq!(
+        op["arm_participation"]["vector"]["status"],
+        serde_json::json!("error"),
+        "vector arm must report error, got: {op}"
+    );
+    assert_eq!(
+        op["arm_participation"]["text"]["status"],
+        serde_json::json!("ran"),
+        "text arm must report ran, got: {op}"
+    );
+    assert_eq!(
+        op["arm_participation"]["text"]["candidate_count"].as_u64(),
+        Some(text_hit_count as u64),
+        "text candidate_count must equal the number of text-sourced hits, got: {op}"
+    );
 }
 
 /// T7c: `min_score` floor filters out low-scoring hits.
@@ -3174,6 +3666,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
     // min_score=1.0 is always above any real RRF score → result must be empty.
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="concept", query="T7cMinScoreProbe", min_score=1.0)"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3232,6 +3725,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 
     let result_str = server
         .dispatch_request_local(khive_mcp::tools::request::RequestParams {
+            plan: None,
             ops: r#"search(kind="session", query="standup")"#.to_string(),
             presentation: None,
             presentation_per_op: None,
@@ -3269,6 +3763,35 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
 }
 
 // ---- MIN-1: SubstrateCoordinatorService hydration seam ----
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial(config_ledger)]
+async fn coordinator_service_preserves_timeout_failure_kind() {
+    use khive_mcp::coordinator::{
+        BackendSearchFailureKind as CoordFailureKind, CoordinatorService,
+    };
+
+    let mut backend_reg = BackendRegistry::new();
+    backend_reg.register(backend_id("hung"), memory_runtime());
+    let service = SubstrateCoordinatorService::new(
+        SubstrateCoordinator::new(backend_reg).with_hanging_backend("hung"),
+    );
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "typed timeout seam",
+        "limit": 10,
+    }));
+
+    let result = service
+        .fan_out_search(&request, &Namespace::local(), &[])
+        .await;
+
+    let failure = result.per_backend[0]
+        .error
+        .as_ref()
+        .expect("hung backend must carry a typed failure");
+    assert_eq!(failure.kind, CoordFailureKind::Timeout);
+}
 
 /// The `khive-mcp` row-shape parity test drives `MockCoordinator` with
 /// pre-populated `entity_kinds`/`note_kinds`/etc. maps, so it never runs
@@ -3325,7 +3848,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
     let entity_errors: Vec<&str> = entity_result
         .per_backend
         .iter()
-        .filter_map(|r| r.error.as_deref())
+        .filter_map(|r| r.error.as_ref().map(|error| error.message.as_str()))
         .collect();
     assert!(
         entity_errors.is_empty(),
@@ -3363,7 +3886,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
     let note_errors: Vec<&str> = note_result
         .per_backend
         .iter()
-        .filter_map(|r| r.error.as_deref())
+        .filter_map(|r| r.error.as_ref().map(|error| error.message.as_str()))
         .collect();
     assert!(
         note_errors.is_empty(),

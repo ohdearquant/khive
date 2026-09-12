@@ -7,10 +7,13 @@ rerank, and composed into markdown briefings under a token budget.
 ## Features
 
 - **TF-IDF corpus search** (`knowledge.search`) over atom name/tags/content, with
-  request-relative scores, explicit lexical/ANN score provenance, query
+  request-relative scores, per-result lexical/ANN score provenance, query
   decomposition, and RRF fusion against an ANN pass when an embedder is configured.
-  Scores are not calibrated probabilities or absolute presence signals; interpret
-  rank together with the reported candidate and score provenance
+  Scores are not calibrated probabilities; interpret rank together with
+  `score_provenance` and the response's `candidate_provenance`
+- **Bounded lexical fan-out** — one 32-term allowance covers the full query and
+  decomposed passes, including rarity and eligibility probes. Search reports
+  `candidate_provenance.terms_truncated` when it omits terms.
 - **Section-level records** (`knowledge.edit`) — a closed 10-value `section_type`
   enum (`overview`, `core_model`, `formalism`, `failure_modes`, ... `other`) per
   atom, each independently disputable and adjudicable (ADR-051)
@@ -35,6 +38,14 @@ through the MCP `request` DSL (or `kkernel exec`). A caller issues:
 ```text
 request(ops="knowledge.search(query=\"block-max wand posting list pruning\", limit=10)")
 ```
+
+Each `knowledge.search` result includes `score_provenance`: the contributing
+`sources` (`lexical`, `ann`, or both), whether `embedding_rerank` ran successfully,
+`normalization: "s_over_s_plus_1"`, and `calibrated: false`. The response's
+`candidate_provenance.lexical` distinguishes `matched`, `no_match`, `filtered`,
+`partial_timeout`, and `timed_out`. Its `fallback` is `ann` only when returned
+results have ANN evidence and none has lexical evidence; otherwise it is `none`.
+A genuine lexical miss contributes no candidates from unrelated recent rows.
 
 The same DSL runs from the shell without an MCP client via `kkernel exec`:
 
@@ -66,20 +77,30 @@ let report = reindex_knowledge(&runtime, &token, opts, None, None).await?;
 
 ## Verbs
 
-| Verb                                                                              | What it does                                                |
-| --------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                       |
-| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                            |
-| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only) |
-| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly         |
-| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget    |
-| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest          |
-| `knowledge.import`                                                                | Validate/import atlas markdown with stable path identity    |
-| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                     |
-| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                     |
-| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights              |
+| Verb                                                                              | What it does                                                     |
+| --------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `knowledge.upsert_atoms` / `knowledge.upsert_domains`                             | Bulk insert or update atoms / domains                            |
+| `knowledge.get` / `knowledge.list` / `knowledge.delete_atoms` / `knowledge.stats` | Corpus CRUD and aggregate counts                                 |
+| `knowledge.index`                                                                 | Backfill embeddings (FTS rebuild is `kkernel reindex`-only)      |
+| `knowledge.search` / `knowledge.suggest` / `knowledge.compose`                    | TF-IDF search, domain suggestion, briefing assembly              |
+| `knowledge.fold`                                                                  | Knapsack selection of scored candidates against a budget         |
+| `knowledge.edit`                                                                  | Upsert one atom's sections without wiping the rest               |
+| `knowledge.import`                                                                | Validate/import atlas markdown with frontmatter or path identity |
+| `knowledge.challenge` / `knowledge.adjudicate`                                    | Dispute and resolve a section's content                          |
+| `knowledge.learn` / `knowledge.cite` / `knowledge.topic`                          | Register/link/browse `concept` entities                          |
+| `knowledge.feedback`                                                              | Apply per-section signals to posterior weights                   |
 
 All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
+
+For a cheap, stable inventory walk, call
+`knowledge.list(fields=["id","slug"], after="", limit=500)` and round-trip each
+non-null `next_after`. The projection is pushed into SQL, so atom `content` is
+not hydrated. Cursor pages use `created_at ASC, id ASC`; legacy offset pages
+retain `created_at DESC, id DESC`. The cursor is a live traversal: inserts
+behind an issued boundary wait for a fresh walk, while inserts ahead may extend
+the current walk without shifting or duplicating pre-existing rows. Stop when
+`next_after` is null; cursor pages carry no `total`, because counting the
+namespace is a full scan per page.
 
 ## Where this sits
 
@@ -89,7 +110,7 @@ All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
 [`khive-pack-kg`](https://crates.io/crates/khive-pack-kg) (a hard `REQUIRES`
 dependency for the underlying `concept`/`document` entity substrate) and
 [`khive-pack-brain`](https://crates.io/crates/khive-pack-brain) (feedback
-target). It is one of the twelve packs loaded by default in `khive-mcp`. Governing
+target). It is one of the fourteen packs loaded by default in `khive-mcp`. Governing
 ADRs:
 [ADR-017 (Pack Standard)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md),
 [ADR-048 (Knowledge Section Profiles)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-048-knowledge-section-profiles.md),

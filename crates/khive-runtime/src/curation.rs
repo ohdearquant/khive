@@ -490,6 +490,37 @@ pub struct NotePatch {
     pub decay_factor: Option<Option<f64>>,
     pub properties: Option<Value>,
     pub(crate) kind_status: Option<String>,
+    pub write_options: crate::note_write::NoteWriteOptions,
+}
+
+/// Normalize the public note tag replacement into its stored property before
+/// kind hooks inspect the patch. An explicit list, including an empty one,
+/// wins over properties.tags; omission and null preserve the property patch.
+pub(crate) fn normalize_note_update_tags(args: &mut Value) -> RuntimeResult<()> {
+    let args = args
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("update arguments must be an object".into()))?;
+    let Some(tags) = args.get("tags").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let tags: Vec<String> = serde_json::from_value(tags.clone()).map_err(|error| {
+        RuntimeError::InvalidInput(format!("tags must be an array of strings: {error}"))
+    })?;
+    let mut properties = match args.get("properties") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(properties)) => properties.clone(),
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "properties must be an object".into(),
+            ));
+        }
+    };
+    properties.insert("tags".into(), serde_json::json!(tags));
+    args.insert("properties".into(), Value::Object(properties));
+    // A hook may normalize this property further. Remove the alias so later
+    // preparation cannot overwrite the hook's result by applying it again.
+    args.remove("tags");
+    Ok(())
 }
 
 impl NotePatch {
@@ -509,7 +540,13 @@ impl NotePatch {
             decay_factor,
             properties,
             kind_status: None,
+            write_options: Default::default(),
         }
+    }
+
+    pub fn with_write_options(mut self, options: crate::note_write::NoteWriteOptions) -> Self {
+        self.write_options = options;
+        self
     }
 }
 
@@ -872,24 +909,57 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
+        self.prepare_guarded_entity_update(token, id, patch, None, &[])
+            .await
+    }
+
+    async fn prepare_guarded_entity_update(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        expected: Option<&Entity>,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
+        if !remove_properties.is_empty() {
+            let removals = Value::Object(
+                remove_properties
+                    .iter()
+                    .map(|key| ((*key).to_string(), Value::Null))
+                    .collect(),
+            );
+            crate::secret_gate::reject_reserved_secret_gate_property(Some(&removals))?;
+        }
         if let Some(ref name) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "entity", "name")?;
         }
         if let Some(Some(ref desc)) = patch.description {
-            crate::secret_gate::check(desc)?;
+            crate::secret_gate::check_at(desc, "entity", "description")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "entity", "properties")?;
         }
         if let Some(ref tags) = patch.tags {
-            crate::secret_gate::check_tags(tags)?;
+            crate::secret_gate::check_tags_at(tags, "entity", "tags")?;
         }
         let store = self.entities(token)?;
-        let mut entity = store
-            .get_entity(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+        let mut entity = store.get_entity(id).await?.ok_or_else(|| {
+            if expected.is_some() {
+                stale_entity_snapshot_error(id)
+            } else {
+                RuntimeError::NotFound(format!("entity {id}"))
+            }
+        })?;
+        if let Some(expected) = expected {
+            let actual = serde_json::to_value(&entity)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            let expected = serde_json::to_value(expected)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            if actual != expected {
+                return Err(stale_entity_snapshot_error(id));
+            }
+        }
         let expected_updated_at = entity.updated_at;
         let expected_deleted_at = entity.deleted_at;
         #[cfg(test)]
@@ -929,6 +999,15 @@ impl KhiveRuntime {
             entity.properties = merged;
             changed_fields.push("properties");
         }
+        if let Some(Value::Object(properties)) = entity.properties.as_mut() {
+            let mut removed = false;
+            for key in remove_properties {
+                removed |= properties.remove(*key).is_some();
+            }
+            if removed && !changed_fields.contains(&"properties") {
+                changed_fields.push("properties");
+            }
+        }
         if let Some(tags) = patch.tags {
             entity.tags = tags;
             changed_fields.push("tags");
@@ -937,6 +1016,16 @@ impl KhiveRuntime {
             reindex_required |= entity.entity_type != entity_type;
             entity.entity_type = entity_type;
             changed_fields.push("entity_type");
+        }
+
+        if expected.is_some() && changed_fields.is_empty() {
+            return Ok((
+                entity,
+                reindex_required,
+                changed_fields,
+                expected_updated_at,
+                expected_deleted_at,
+            ));
         }
 
         // `updated_at` is also the optimistic-concurrency revision for
@@ -982,6 +1071,63 @@ impl KhiveRuntime {
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_update_entity(token, id, patch).await?;
 
+        self.persist_prepared_entity_update(
+            token,
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        )
+        .await
+    }
+
+    /// Apply an admin patch only if the entity still matches the full read snapshot.
+    /// Property removals apply after the normal merge and preserve all other keys.
+    /// Missing keys alone are a no-op; reserved runtime-owned keys cannot be removed.
+    /// A changed, deleted, or missing entity returns a conflict without writing.
+    pub async fn update_entity_if_unchanged(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<Entity> {
+        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
+            self.prepare_guarded_entity_update(
+                token,
+                expected.id,
+                patch,
+                Some(expected),
+                remove_properties,
+            )
+            .await?;
+        if changed_fields.is_empty() {
+            return Ok(entity);
+        }
+        Ok(self
+            .persist_prepared_entity_update(
+                token,
+                entity,
+                reindex_required,
+                changed_fields,
+                expected_updated_at,
+                expected_deleted_at,
+            )
+            .await?
+            .0)
+    }
+
+    async fn persist_prepared_entity_update(
+        &self,
+        token: &NamespaceToken,
+        entity: Entity,
+        reindex_required: bool,
+        changed_fields: Vec<&'static str>,
+        expected_updated_at: i64,
+        expected_deleted_at: Option<i64>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        let id = entity.id;
         let store = self.entities(token)?;
         let persisted = store
             .replace_entity_if_unchanged(entity.clone(), expected_updated_at, expected_deleted_at)
@@ -1132,7 +1278,7 @@ impl KhiveRuntime {
         validation: EntityMergeValidation,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -1419,11 +1565,20 @@ impl KhiveRuntime {
         note: &khive_storage::note::Note,
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
-        self.text_for_notes(token)?
-            .upsert_document(note_fts_document(note))
-            .await?;
-
-        let ns = note.namespace.clone();
+        let statements = khive_db::stores::text::delete_document_statements(
+            "fts_notes",
+            &note.namespace,
+            note.id,
+        )
+        .into_iter()
+        .chain(khive_db::stores::text::insert_document_statements(
+            "fts_notes",
+            &note_fts_document(note),
+        ))
+        .collect();
+        if !self.apply_note_index_revision(note, statements).await? {
+            return Ok(crate::retrieval::EmbeddingTruncationReport::default());
+        }
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
             match self
@@ -1437,17 +1592,25 @@ impl KhiveRuntime {
                 Ok(outcome) => {
                     report.observe(&outcome);
                     match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => {
-                            if let Err(e) = vs
-                                .insert(
-                                    note.id,
-                                    SubstrateKind::Note,
-                                    &ns,
-                                    "note.content",
-                                    vec![outcome.vector],
-                                )
-                                .await
-                            {
+                        Ok(_) => {
+                            if outcome.vector.iter().any(|value| !value.is_finite()) {
+                                tracing::warn!(model = model_name, id = %note.id, "reindex_note: non-finite vector, skipping model");
+                                continue;
+                            }
+                            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
+                            let statements = crate::atomic_message::vector_insert_statements(
+                                &table,
+                                &note.namespace,
+                                note.id,
+                                "note.content",
+                                model_name,
+                                &outcome.vector,
+                                "note-reindex",
+                            )
+                            .into_iter()
+                            .map(|planned| planned.statement)
+                            .collect();
+                            if let Err(e) = self.apply_note_index_revision(note, statements).await {
                                 tracing::warn!(
                                     model = model_name,
                                     id = %note.id,
@@ -1486,15 +1649,20 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+        if patch.content.is_some() || patch.properties.is_some() {
+            if let Some(error) = self.stream_member_error(&note).await? {
+                return Err(error);
+            }
+        }
         crate::secret_gate::reject_reserved_secret_gate_property(patch.properties.as_ref())?;
         if let Some(ref content) = patch.content {
-            crate::secret_gate::check(content)?;
+            crate::secret_gate::check_at(content, "note", "content")?;
         }
         if let Some(Some(ref name)) = patch.name {
-            crate::secret_gate::check(name)?;
+            crate::secret_gate::check_at(name, "note", "name")?;
         }
         if let Some(ref props) = patch.properties {
-            crate::secret_gate::check_json(props)?;
+            crate::secret_gate::check_json_at(props, "note", "properties")?;
         }
 
         reject_pack_managed_schedule_mutation(&note, "update")?;
@@ -1671,40 +1839,41 @@ impl KhiveRuntime {
         khive_storage::note::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
-        let expected_updated_at = snapshot.updated_at;
-        let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
-        let store = self.notes(token)?;
-        let current = store
-            .get_note(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
-        if current != snapshot {
-            return Err(stale_note_snapshot_error(id));
-        }
-        let (note, text_changed) = self
-            .prepare_update_note_from_snapshot(token, snapshot, patch)
+        let (note, plan) = self
+            .prepare_versioned_note_update(token, snapshot, patch)
             .await?;
-
-        let persisted = store
-            .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
-            .await?;
-        if !persisted {
-            return Err(stale_note_snapshot_error(id));
-        }
-
-        let embedding_report = if text_changed {
-            let report = self.reindex_note(token, &note).await?;
-            // Notify any pack-owned vector cache (e.g. a warm ANN index) that this
-            // note's embedding changed, via a generic hook so khive-runtime/pack-kg
-            // never take a dependency on the consuming pack. No-op if unregistered.
-            self.fire_note_mutation_hook(&note.kind, note.id).await;
-            report
-        } else {
-            crate::retrieval::EmbeddingTruncationReport::default()
+        use crate::atomic_runner::{
+            run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome,
         };
-
-        Ok((note, embedding_report))
+        match run_atomic_unit(self.sql().as_ref(), vec![AtomicOpPlan::Update(plan)]).await {
+            Ok(AtomicRunOutcome::Committed { post_commit }) => {
+                let outcomes = crate::atomic_prepare::apply_post_commit_effects_with_report(
+                    self,
+                    token,
+                    post_commit,
+                )
+                .await?;
+                let report = outcomes
+                    .into_iter()
+                    .next()
+                    .map(|outcome| outcome.truncation)
+                    .unwrap_or_default();
+                Ok((note, report))
+            }
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::NoteConflict(conflict),
+                ..
+            }) => Err(conflict.into_error().into()),
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::GuardFailed { .. },
+                ..
+            }) => Err(stale_note_snapshot_error(id)),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                format!("note update rolled back: {failure:?}"),
+            )),
+            Err(error) => Err(RuntimeError::Storage(error.0)),
+        }
     }
 
     /// Claim `external_id` on an outbound `message` note through the
@@ -1968,9 +2137,13 @@ impl KhiveRuntime {
             ));
         }
 
-        crate::secret_gate::check_json(&serde_json::json!({
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "last_error": &last_error,
+            }),
+            "message",
+            "last_error",
+        )?;
 
         let snapshot = self.outbound_message(token, id).await?;
         let props = snapshot.properties.as_ref().and_then(Value::as_object);
@@ -2035,10 +2208,14 @@ impl KhiveRuntime {
         delivered_at: String,
         transport_message_id: Option<String>,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "delivered_at": &delivered_at,
-            "transport_message_id": &transport_message_id,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "delivered_at": &delivered_at,
+                "transport_message_id": &transport_message_id,
+            }),
+            "message",
+            "delivered",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2080,10 +2257,14 @@ impl KhiveRuntime {
         failed_at: String,
         last_error: String,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        crate::secret_gate::check_json(&serde_json::json!({
-            "failed_at": &failed_at,
-            "last_error": &last_error,
-        }))?;
+        crate::secret_gate::check_json_at(
+            &serde_json::json!({
+                "failed_at": &failed_at,
+                "last_error": &last_error,
+            }),
+            "message",
+            "failed",
+        )?;
         let snapshot = self.outbound_message(token, id).await?;
         if Self::outbound_delivery_is_terminal(
             snapshot.properties.as_ref().and_then(Value::as_object),
@@ -2151,7 +2332,7 @@ impl KhiveRuntime {
         reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
-            crate::secret_gate::check(reason)?;
+            crate::secret_gate::check_at(reason, "merge", "reason")?;
         }
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -2179,6 +2360,13 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
         Self::ensure_namespace(&from_note.namespace, &ns)?;
 
+        if !dry_run {
+            for note in [&into_note, &from_note] {
+                if let Some(error) = self.stream_member_error(note).await? {
+                    return Err(error);
+                }
+            }
+        }
         reject_pack_managed_schedule_mutation(&into_note, "merge")?;
         reject_pack_managed_schedule_mutation(&from_note, "merge")?;
 
@@ -3124,7 +3312,7 @@ fn read_merge_note(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
-         expires_at, properties, created_at, updated_at, deleted_at \
+         expires_at, properties, created_at, updated_at, deleted_at, key, version \
          FROM notes WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -3145,6 +3333,8 @@ fn read_merge_note(
     let created_at: i64 = row.get(10)?;
     let updated_at: i64 = row.get(11)?;
     let deleted_at: Option<i64> = row.get(12)?;
+    let key: Option<String> = row.get(13)?;
+    let version: i64 = row.get(14)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -3171,6 +3361,8 @@ fn read_merge_note(
         created_at,
         updated_at,
         deleted_at,
+        key,
+        version,
     })
 }
 
@@ -3599,6 +3791,7 @@ fn merge_note_sql(
                 into_note.created_at,
                 now,
                 into_note.deleted_at,
+                &into_note.key,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -3695,6 +3888,12 @@ fn merge_note_sql(
         created_at: into_note.created_at,
         updated_at: now,
         deleted_at: into_note.deleted_at,
+        key: into_note.key.clone(),
+        version: conn.query_row(
+            "SELECT version FROM notes WHERE id = ?1",
+            [&into_str],
+            |row| row.get(0),
+        )?,
     };
 
     Ok((
@@ -4087,6 +4286,28 @@ mod tests {
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    async fn entity_update_events(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+    ) -> Vec<khive_storage::event::Event> {
+        runtime
+            .events(token)
+            .unwrap()
+            .query_events(
+                khive_storage::event::EventFilter {
+                    kinds: vec![EventKind::EntityUpdated],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap()
+            .items
     }
 
     fn outbound_message_note() -> Note {
@@ -4913,6 +5134,315 @@ mod tests {
         assert_eq!(updated.name, "OriginalName");
         assert_eq!(updated.description.as_deref(), Some("new desc"));
         assert_eq!(updated.properties, Some(serde_json::json!({"k":"v"})));
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_removes_properties_after_merge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "LegacyEcho",
+                Some("keep description"),
+                Some(serde_json::json!({
+                    "type": " Concept ",
+                    "nested": {"items": [1, {"value": null}], "keep": true},
+                    "label": "verbatim"
+                })),
+                vec!["keep-tag".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"type": "also remove", "added": 7})),
+                    ..Default::default()
+                },
+                &["type", "absent", "type"],
+            )
+            .await
+            .expect("remove only the requested key after merging");
+
+        let mut expected = entity.clone();
+        expected.properties = Some(serde_json::json!({
+            "nested": {"items": [1, {"value": null}], "keep": true},
+            "label": "verbatim",
+            "added": 7
+        }));
+        assert!(updated.updated_at > entity.updated_at);
+        expected.updated_at = updated.updated_at;
+        assert_eq!(serde_json::json!(updated), serde_json::json!(expected));
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(expected)
+        );
+        let events = entity_update_events(&rt, &tok).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            serde_json::json!(["properties"])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_missing_removals_are_no_op() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        for properties in [
+            None,
+            Some(serde_json::json!({"keep": [true, null]})),
+            Some(serde_json::json!(["not an object"])),
+        ] {
+            let entity = rt
+                .create_entity(&tok, "concept", None, "NoRemoval", None, properties, vec![])
+                .await
+                .unwrap();
+            let unchanged = rt
+                .update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["absent"])
+                .await
+                .unwrap();
+            assert_eq!(serde_json::json!(unchanged), serde_json::json!(entity));
+            assert_eq!(
+                serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+                serde_json::json!(entity)
+            );
+        }
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_stale_full_snapshot() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "StaleBackfill",
+                None,
+                Some(serde_json::json!({"type": "concept", "keep": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        for field in ["properties", "entity_type", "deleted_at", "updated_at"] {
+            let mut stale = entity.clone();
+            match field {
+                "properties" => stale.properties = Some(serde_json::json!({"type": "algorithm"})),
+                "entity_type" => stale.entity_type = Some("algorithm".to_string()),
+                "deleted_at" => stale.deleted_at = Some(entity.updated_at),
+                "updated_at" => stale.updated_at -= 1,
+                _ => unreachable!(),
+            }
+            let error = rt
+                .update_entity_if_unchanged(
+                    &tok,
+                    &stale,
+                    EntityPatch {
+                        entity_type: Some(Some("algorithm".to_string())),
+                        ..Default::default()
+                    },
+                    &["type"],
+                )
+                .await
+                .expect_err("every stale snapshot field must refuse before edits");
+            assert!(
+                matches!(error, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+                "{field}: {error}"
+            );
+            assert_eq!(
+                serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+                serde_json::json!(entity),
+                "{field}"
+            );
+        }
+
+        let store = rt.entities(&tok).unwrap();
+        store
+            .delete_entity(entity.id, khive_storage::types::DeleteMode::Soft)
+            .await
+            .unwrap();
+        let tombstone = store
+            .get_entity_including_deleted(entity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = rt
+            .update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["type"])
+            .await
+            .expect_err("a deleted candidate must not be resurrected");
+        assert!(
+            matches!(error, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+            "{error}"
+        );
+        assert_eq!(
+            serde_json::json!(store
+                .get_entity_including_deleted(entity.id)
+                .await
+                .unwrap()
+                .unwrap()),
+            serde_json::json!(tombstone)
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_concurrent_writer_after_snapshot_check() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "RacingBackfill",
+                None,
+                Some(serde_json::json!({"type": "concept", "keep": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (guarded, normal) = tokio::join!(
+            race_seam::AFTER_READ_BARRIER.scope(
+                Arc::clone(&barrier),
+                rt.update_entity_if_unchanged(&tok, &entity, EntityPatch::default(), &["type"]),
+            ),
+            race_seam::AFTER_READ_BARRIER.scope(
+                barrier,
+                rt.update_entity(
+                    &tok,
+                    entity.id,
+                    EntityPatch {
+                        properties: Some(serde_json::json!({"normal_writer": true})),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        );
+        assert_eq!(
+            usize::from(guarded.is_ok()) + usize::from(normal.is_ok()),
+            1
+        );
+        let (winner, refused) = match (guarded, normal) {
+            (Ok(winner), Err(refused)) | (Err(refused), Ok(winner)) => (winner, refused),
+            results => panic!("exactly one writer must win: {results:?}"),
+        };
+        assert!(
+            matches!(refused, RuntimeError::Khive(ref error) if error.kind() == khive_types::ErrorKind::Conflict),
+            "{refused}"
+        );
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(winner)
+        );
+        assert_eq!(entity_update_events(&rt, &tok).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_normalizes_type_with_installed_validator() {
+        let rt = rt();
+        let composed = khive_types::EntityTypeRegistry::with_extra([khive_types::EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "backfill_test_report",
+            aliases: &["field_report"],
+        }]);
+        rt.install_entity_type_validator(Arc::new(move |kind, raw| {
+            let kind = kind
+                .parse::<khive_types::EntityKind>()
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+            composed
+                .resolve(kind, raw)
+                .map(|resolved| resolved.entity_type)
+                .map_err(RuntimeError::from)
+        }));
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "LegacySubtype",
+                None,
+                Some(serde_json::json!({"type": " Field-Report ", "keep": [1, 2]})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let updated = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch {
+                    entity_type: Some(Some(" Field-Report ".to_string())),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+            .expect("normal write validation resolves pack-supplied aliases");
+        assert_eq!(updated.entity_type.as_deref(), Some("backfill_test_report"));
+        assert_eq!(updated.properties, entity.properties);
+        assert_eq!(
+            rt.get_entity(&tok, entity.id).await.unwrap().entity_type,
+            updated.entity_type
+        );
+        let error = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &updated,
+                EntityPatch {
+                    entity_type: Some(Some("not_registered".to_string())),
+                    ..Default::default()
+                },
+                &["type"],
+            )
+            .await
+            .expect_err("invalid subtype refuses the entire patch and removal");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(updated)
+        );
+        let events = entity_update_events(&rt, &tok).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            serde_json::json!(["entity_type"])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entity_if_unchanged_refuses_reserved_property_removal() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "ReservedRemoval", None, None, vec![])
+            .await
+            .unwrap();
+        let error = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &entity,
+                EntityPatch::default(),
+                &[crate::secret_gate::RESERVED_SECRET_GATE_KEY],
+            )
+            .await
+            .expect_err("removal must share the reserved-property write validator");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+        assert_eq!(
+            serde_json::json!(rt.get_entity(&tok, entity.id).await.unwrap()),
+            serde_json::json!(entity)
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
     }
 
     #[tokio::test]
@@ -7986,6 +8516,63 @@ mod tests {
             from_store.get_note(from_id).await.unwrap().is_none(),
             "merged-from note should be soft-deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn merge_note_preserves_the_kept_memory_key() {
+        use crate::keyed_memory::{create_keyed_memory, KeyedMemorySpec};
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let (into, _) = create_keyed_memory(
+            &rt,
+            &tok,
+            KeyedMemorySpec {
+                content: "Into keyed memory",
+                key: "kept-memory-key",
+                salience: 0.7,
+                decay_factor: 0.0,
+                properties: serde_json::json!({}),
+                source_id: None,
+                embedding_model: None,
+            },
+        )
+        .await
+        .unwrap();
+        let from = rt
+            .create_note(&tok, "memory", None, "From memory", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .expect("merge binds every stored note field");
+        assert_eq!(summary.kept_id, into.id);
+        let stored = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(into.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.key.as_deref(), Some("kept-memory-key"));
+        assert!(stored.content.contains("Into keyed memory"));
+        assert!(stored.content.contains("From memory"));
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(from.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // Note merge must absorb a conflicting edge natural key exactly like entity

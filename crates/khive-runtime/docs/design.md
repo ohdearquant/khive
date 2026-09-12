@@ -169,6 +169,8 @@
 
 - Pack factories are discovered via `inventory` at link time; missing dependencies are a boot error
 - Missing dependencies are not silently auto-added; the requested set must be explicit
+- A factory whose pack has no public verbs is a boot error unless it explicitly returns `true`
+  from `PackFactory::intentionally_verbless`
 - `PackRegistry` performs topological sort of packs using Kahn's algorithm
 - Startup selection precedence is `--pack` → `KHIVE_PACKS` → `[runtime].packs` → the built-in
   production set; `[packs.<name>]` assigns backends and does not select packs for loading

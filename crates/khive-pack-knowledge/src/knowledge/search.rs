@@ -4,6 +4,7 @@
 //! FTS/ANN pipeline, reranking, hydration, and handler dispatch.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -15,6 +16,7 @@ use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
+use super::lexical_timeout::{LexicalPass, LexicalPhase, LexicalStage, LexicalTimeout};
 use super::matching;
 use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
 use super::scoring::{
@@ -76,7 +78,7 @@ impl ScoreProvenance {
         self.embedding_rerank |= other.embedding_rerank;
     }
 
-    fn sources(self) -> Vec<&'static str> {
+    fn to_json(self) -> Value {
         let mut sources = Vec::with_capacity(2);
         if self.lexical {
             sources.push("lexical");
@@ -84,12 +86,8 @@ impl ScoreProvenance {
         if self.ann {
             sources.push("ann");
         }
-        sources
-    }
-
-    fn to_json(self) -> Value {
         json!({
-            "sources": self.sources(),
+            "sources": sources,
             "embedding_rerank": self.embedding_rerank,
             "normalization": "s_over_s_plus_1",
             "calibrated": false,
@@ -97,13 +95,8 @@ impl ScoreProvenance {
     }
 }
 
-/// `ann` only when the returned set carries ANN evidence and no returned hit
-/// carries lexical evidence — i.e. the response is entirely ANN-sourced, not
-/// merely ANN-assisted.
 fn candidate_fallback(hits: &[ScoredHit]) -> &'static str {
-    let has_lexical = hits.iter().any(|hit| hit.provenance.lexical);
-    let has_ann = hits.iter().any(|hit| hit.provenance.ann);
-    if has_ann && !has_lexical {
+    if hits.iter().any(|hit| hit.provenance.ann) && !hits.iter().any(|hit| hit.provenance.lexical) {
         "ann"
     } else {
         "none"
@@ -253,14 +246,10 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[ScoredHit], min_scor
         .map(|hit| (hit.id.clone(), DeterministicScore::from_f32(hit.score)))
         .collect();
     for hit in ann_hits {
-        match by_id.entry(hit.id.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.get_mut().provenance.merge_sources(hit.provenance);
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(hit.clone());
-            }
-        }
+        by_id
+            .entry(hit.id.clone())
+            .and_modify(|existing| existing.provenance.merge_sources(hit.provenance))
+            .or_insert_with(|| hit.clone());
     }
 
     let source_count = usize::from(!fts_source.is_empty()) + usize::from(!ann_source.is_empty());
@@ -327,7 +316,7 @@ fn deprecated_allowed_by_status_policy(statuses: &[String], exclude_statuses: &[
 
 /// Remove hits that do not match `type_filter` after hydration.
 ///
-/// Mirrors the FTS/SQL path in `fetch_fts_candidates`:
+/// Mirrors eligibility in the FTS/SQL path in `fetch_fts_candidates`:
 ///
 /// - `Some("domain")` keeps only domain hits (`hit.is_domain == true`).
 /// - `Some(other)` where other is non-empty keeps only non-domain hits.
@@ -391,8 +380,7 @@ fn quote_fts5_phrase(raw_query: &str) -> String {
 
 /// Build the per-term FTS5 match clauses the candidate fetch runs bounded
 /// subqueries over — one quoted phrase per de-duplicated, non-stop, expanded
-/// term. Queries with no scoreable term fall back to the exact raw phrase
-/// (same fallback `fts5_candidate_expression` uses).
+/// term. Queries with no scoreable term fall back to the exact raw phrase.
 ///
 /// FTS is only the candidate generator; TF-IDF remains the ranker. Requiring
 /// the whole raw query as one phrase drops candidates whose matching terms are
@@ -417,21 +405,10 @@ fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
     }
 }
 
-/// The OR-joined form of [`fts5_candidate_terms`] over the full, untruncated
-/// term set. `fetch_fts_candidates`'s own raw-existence probe joins its
-/// (possibly budget-truncated) `terms` directly instead of calling this, so
-/// truncation and eligibility stay distinguishable outcomes; this remains as
-/// a test-only building block for exercising `fts5_candidate_terms`'s
-/// OR-joined shape in isolation.
-#[cfg(test)]
-fn fts5_candidate_expression(raw_query: &str) -> String {
-    fts5_candidate_terms(raw_query).join(" OR ")
-}
-
 /// SQL eligibility predicate for the public atom/domain kind filter.
 ///
 /// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
-/// this predicate in the bounded FTS query is load-bearing: filtering after
+/// this predicate in FTS hydration and recovery is load-bearing: filtering after
 /// `LIMIT` lets the wrong kind consume every candidate slot.
 fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
     match type_filter {
@@ -445,45 +422,154 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 
 // ─── FTS5 candidate pool fetch ────────────────────────────────────────────────
 
-/// Per-term bounded candidate cap (issue #1930). A single-term `MATCH` orders
-/// a much smaller row set than the OR-joined expression over every expanded
-/// term, so bounding each term independently — instead of bounding only the
-/// combined result — keeps the read cost proportional to the number of terms,
-/// never to the size of the full match set.
+/// Per-term candidate cap. FTS enumerates in rowid order and stops at the
+/// limit; application TF-IDF scoring ranks only the admitted candidates.
 const FTS_TERM_LIMIT: usize = 500;
 
-/// Bound on the number of distinct scoreable terms that issue their own
-/// `MATCH` query, shared across every lexical fetch a single `knowledge.search`
-/// (or `suggest`) call makes. Without this cap a caller-controlled query with
-/// many distinct terms turns one request into an unbounded number of index
-/// probes plus proportional retained-row memory (each bounded only by
-/// `FTS_TERM_LIMIT`), with the request read deadline as the only backstop.
-/// `search_decomposed` calls the lexical fetch up to three times (full query
-/// plus two sub-queries) for one request; the budget is a request-scoped
-/// [`std::sync::atomic::AtomicUsize`] threaded through [`SearchCtx`] so those calls draw
-/// from one shared allowance instead of each getting their own `32`. Terms
-/// beyond the remaining budget are dropped after dedup/expansion, in the same
-/// deterministic order `fts5_candidate_terms` produces, so a query at or
-/// under the cap sees byte-for-byte identical candidate generation and
-/// ranking to the uncapped behavior.
+/// Shared by the full query and both decomposed passes. Admission happens
+/// before rarity probes; every later stage reuses that admitted term set.
 const FTS_TERM_COUNT_LIMIT: usize = 32;
 
-/// Outcome of the bounded lexical candidate fetch.
-///
-/// `state` distinguishes a real lexical miss from a match removed by public
-/// eligibility and from the fail-open timeout outcome. Any non-timeout
-/// storage error (including a genuine FTS5 syntax/parser error) still
-/// surfaces as an `Err`. `terms_truncated` reports whether the query supplied
-/// more distinct scoreable terms than the remaining `FTS_TERM_COUNT_LIMIT`
-/// budget, so a caller can tell a bounded candidate generation stage from a
-/// full one. The raw-existence eligibility probe below scopes itself to the
-/// same truncated term set, so a truncation-caused miss is never reported as
-/// `Filtered` — `Filtered` means eligibility removed a match among the terms
-/// actually searched, not that an untested term might have matched.
-struct FtsFetchOutcome {
-    atoms: Vec<Atom>,
-    state: LexicalCandidateState,
-    terms_truncated: bool,
+struct FtsTermBudget {
+    remaining: AtomicUsize,
+    truncated: AtomicBool,
+}
+
+impl FtsTermBudget {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(FTS_TERM_COUNT_LIMIT),
+            truncated: AtomicBool::new(false),
+        }
+    }
+
+    fn admit(&self, mut terms: Vec<String>) -> Vec<String> {
+        let remaining = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(terms.len()))
+            })
+            .expect("term reservation always succeeds");
+        if terms.len() > remaining {
+            self.truncated.store(true, Ordering::Relaxed);
+            terms.truncate(remaining);
+        }
+        terms
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
+    }
+}
+
+fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
+    SqlStatement {
+        sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
+              ORDER BY rowid LIMIT ?2"
+            .into(),
+        params: vec![SqlValue::Text(term.into()), SqlValue::Integer(limit as i64)],
+        label: Some("knowledge.fts_rowids".into()),
+    }
+}
+
+async fn rarest_fts_terms_first(
+    reader: &mut dyn khive_storage::SqlReader,
+    terms: Vec<String>,
+    stage: &mut LexicalStage,
+) -> Result<Vec<String>, khive_storage::StorageError> {
+    let mut frequencies = Vec::with_capacity(terms.len());
+    for term in terms {
+        // Count only a bounded index prefix. Rare counts are exact; terms
+        // above the cap tie by spelling, without scanning their whole lists.
+        let rows = stage
+            .read(
+                LexicalPhase::TermFrequency,
+                reader.query_all(phase_a_rowids_statement(&term, FTS_TERM_LIMIT + 1)),
+            )
+            .await?;
+        if !rows.is_empty() {
+            frequencies.push((term, rows.len()));
+        }
+    }
+    frequencies
+        .sort_unstable_by(|(a, a_count), (b, b_count)| a_count.cmp(b_count).then_with(|| a.cmp(b)));
+    Ok(frequencies.into_iter().map(|(term, _)| term).collect())
+}
+
+/// Overfetch factor applied to a term's phase-A rowid window when phase B has
+/// an eligibility predicate (status or type) that can reject rows phase A had
+/// no way to see (issue #1930 Amendment 2 — see [`fetch_fts_candidates`]).
+/// Phase A carries no eligibility predicate at all, so without headroom an
+/// ineligible-heavy match set could starve phase B down to nothing even
+/// though eligible rows exist further down the rowid sequence.
+const PHASE_A_OVERFETCH_FACTOR: usize = 4;
+
+/// Ceiling a single term's phase-A probe window is allowed to widen to
+/// (issue #1930 Amendment 2). Bounds the worst case — every phase-A row
+/// ineligible, and the corpus large enough to keep returning full pages — to
+/// a fixed per-term cost instead of an unbounded retry loop.
+const PHASE_A_WIDEN_CEILING: usize = 8000;
+
+/// Independent read-deadline budget for the lexical/FTS candidate fetch
+/// (issue #1930 Amendment 2). `khive_storage::scope_request_read_deadline`
+/// keeps whichever deadline is earlier, so nesting this around just the
+/// fetch only ever *tightens* its effective deadline; popping back out of
+/// the scope once the fetch returns restores the wider request deadline for
+/// every stage that runs after it (rerank, body-line counts, member
+/// sizing). A lexical-stage timeout therefore no longer means the request
+/// itself is out of time — only that this one stage's own budget is.
+pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
+
+// ── Test-only seam: override the lexical-stage budget and the phase-A widen
+// ceiling ──────────────────────────────────────────────────────────────────
+//
+// Both overrides ride the same request-scoped `tokio::task_local!` mechanism
+// `khive_storage::scope_request_read_deadline` already uses for the read
+// deadline (issue #2396 fix 4). A task-local override is visible only to the
+// task it is scoped around, so two tests running concurrently under Cargo's
+// parallel runner can never observe each other's override the way the prior
+// process-global `AtomicU64` could — there is nothing shared left to reset
+// on drop or serialize with a mutex.
+tokio::task_local! {
+    static LEXICAL_STAGE_BUDGET_OVERRIDE_MS: u64;
+    static PHASE_A_WIDEN_CEILING_OVERRIDE: usize;
+}
+
+fn lexical_stage_budget() -> std::time::Duration {
+    let ms = LEXICAL_STAGE_BUDGET_OVERRIDE_MS
+        .try_with(|ms| *ms)
+        .unwrap_or(LEXICAL_STAGE_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn phase_a_widen_ceiling() -> usize {
+    PHASE_A_WIDEN_CEILING_OVERRIDE
+        .try_with(|ceiling| *ceiling)
+        .unwrap_or(PHASE_A_WIDEN_CEILING)
+}
+
+/// Scope `future` to a lexical-stage budget override, so a test can force a
+/// controlled deadline instead of depending on a real multi-second wall-clock
+/// wait against the production default (mirrors `vamana::warm_wait_timeout_ms`'s
+/// override seam). `pub(crate)` (not scoped to `mod tests` below) so the
+/// handler-level degrade tests in `ann_degrade_tests.rs` can reuse it.
+#[cfg(test)]
+pub(crate) async fn with_lexical_stage_budget_override_ms<F>(ms: u64, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    LEXICAL_STAGE_BUDGET_OVERRIDE_MS.scope(ms, future).await
+}
+
+/// Scope `future` to a phase-A widen-ceiling override, so a test can shrink
+/// the ceiling far below `PHASE_A_WIDEN_CEILING` and reach the ceiling-
+/// exhaustion fallback (fix 2) with a small fixture.
+#[cfg(test)]
+pub(crate) async fn with_phase_a_widen_ceiling_override<F>(ceiling: usize, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PHASE_A_WIDEN_CEILING_OVERRIDE.scope(ceiling, future).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,7 +582,7 @@ enum LexicalCandidateState {
 }
 
 impl LexicalCandidateState {
-    const fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Matched => "matched",
             Self::NoMatch => "no_match",
@@ -506,33 +592,34 @@ impl LexicalCandidateState {
         }
     }
 
-    const fn timed_out(self) -> bool {
-        matches!(self, Self::PartialTimeout | Self::TimedOut)
-    }
-
     fn merge(states: &[Self]) -> Self {
-        if states.contains(&Self::PartialTimeout) {
-            return Self::PartialTimeout;
-        }
-
-        let timeout_count = states
+        let timed_out = states
             .iter()
-            .filter(|state| **state == Self::TimedOut)
+            .filter(|&&state| state == Self::TimedOut)
             .count();
-        if timeout_count == states.len() {
-            return Self::TimedOut;
+        if !states.is_empty() && timed_out == states.len() {
+            Self::TimedOut
+        } else if timed_out > 0 || states.contains(&Self::PartialTimeout) {
+            Self::PartialTimeout
+        } else if states.contains(&Self::Matched) {
+            Self::Matched
+        } else if states.contains(&Self::Filtered) {
+            Self::Filtered
+        } else {
+            Self::NoMatch
         }
-        if timeout_count > 0 {
-            return Self::PartialTimeout;
-        }
-        if states.contains(&Self::Matched) {
-            return Self::Matched;
-        }
-        if states.contains(&Self::Filtered) {
-            return Self::Filtered;
-        }
-        Self::NoMatch
     }
+}
+
+/// Outcome of the bounded lexical candidate fetch.
+///
+/// `timeout` is set only for [`khive_storage::StorageError::Timeout`]. Any other storage error
+/// (including a genuine FTS5 syntax/parser error) still surfaces as an `Err`;
+/// fail-open applies to a timeout only.
+struct FtsFetchOutcome {
+    atoms: Vec<Atom>,
+    timeout: Option<LexicalTimeout>,
+    state: LexicalCandidateState,
 }
 
 #[cfg(test)]
@@ -560,19 +647,24 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
     }
 }
 
-// Counts per-term `MATCH` statements actually issued by the loop below, so a
-// test can prove the fan-out is bounded by the shared term budget rather
-// than trusting the cap's arithmetic alone.
 #[cfg(test)]
-tokio::task_local! {
-    static FTS_TEST_TERM_QUERY_COUNT: std::sync::Arc<std::sync::atomic::AtomicUsize>;
-}
-
-#[cfg(test)]
-fn count_fts_test_term_query() {
-    let _ = FTS_TEST_TERM_QUERY_COUNT.try_with(|counter| {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
+pub(crate) async fn with_fts_deadline_advance_after_term<F>(
+    after_completed_terms: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FTS_TEST_DEADLINE_ADVANCE
+        .scope(
+            FtsTestDeadlineAdvance {
+                after_completed_terms,
+                by,
+            },
+            future,
+        )
+        .await
 }
 
 fn is_timeout(e: &khive_storage::StorageError) -> bool {
@@ -590,6 +682,28 @@ fn is_read_timeout(e: &RuntimeError) -> bool {
 
 /// Fetch a bounded lexical candidate pool.
 ///
+/// Two-phase per term (issue #1930 Amendment 2). The original shape ordered
+/// a full atom row — `content` included — per FTS5 match *before* its own
+/// per-term `LIMIT`, so every match paid a scattered read against the whole
+/// (potentially multi-gigabyte) atom table even though only the top few
+/// hundred survived. Phase A instead enumerates bare rowids straight off
+/// the `fts_knowledge` index, stopping before scoring the full match set;
+/// phase B hydrates just the surviving
+/// rowids from `knowledge_atoms` in chunks, applying namespace, soft-delete,
+/// status, and type eligibility there.
+///
+/// Phase A carries no namespace predicate. `fts_knowledge.namespace` is
+/// UNINDEXED on this external-content FTS5 table, so filtering on it (as the
+/// original single query did) forces FTS5 to fetch the backing content row
+/// per candidate — exactly the cost phase A exists to avoid. The namespace
+/// check moves entirely to phase B, where the atom row is already being
+/// read for its other eligibility columns. Overfetch and the scoped ceiling
+/// fallback recover eligible rows beyond an ineligible prefix.
+///
+/// Phase A also drops the `a.slug` tie-break the old query used: `rowid` is
+/// already stable and needs no join. `ORDER BY rowid` is consumed by FTS5,
+/// so LIMIT can stop enumeration without a temporary full-match sort.
+///
 /// Replaces a single `ORDER BY bm25(...)` over one OR-joined match expression
 /// (whose cost scales with the size of the entire match set — the #1930 read
 /// timeout at ~94K atoms) with one bounded, independently-capped subquery per
@@ -605,109 +719,224 @@ async fn fetch_fts_candidates(
     statuses: &[String],
     exclude_statuses: &[&str],
     fetch_limit: usize,
-    term_budget: &std::sync::atomic::AtomicUsize,
+    term_budget: &FtsTermBudget,
+    mut stage: LexicalStage,
 ) -> Result<FtsFetchOutcome, RuntimeError> {
-    // Consume from the request-scoped term budget before doing any I/O: a
-    // budget already exhausted by an earlier call in this request (e.g. the
-    // full query in `search_decomposed`) means this call contributes no
-    // lexical candidates at all, and there is no reason to open a reader.
-    let mut terms = fts5_candidate_terms(raw_query);
-    let full_term_count = terms.len();
-    let remaining_budget = term_budget.load(std::sync::atomic::Ordering::Relaxed);
-    let terms_truncated = full_term_count > remaining_budget;
-    terms.truncate(remaining_budget);
-    term_budget.store(
-        remaining_budget - terms.len(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
+    let mut terms = term_budget.admit(fts5_candidate_terms(raw_query));
     if terms.is_empty() {
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
+            timeout: None,
             state: LexicalCandidateState::NoMatch,
-            terms_truncated: true,
         });
     }
-
     let sql = runtime.sql();
-    let mut reader = match sql.reader().await {
+    let reader = match stage.read(LexicalPhase::ReaderOpen, sql.reader()).await {
         Ok(reader) => reader,
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
                 atoms: Vec::new(),
+                timeout: stage.timeout,
                 state: LexicalCandidateState::TimedOut,
-                terms_truncated,
             });
         }
         Err(e) => return Err(sql_err("search fts reader", e)),
     };
 
+    #[cfg(test)]
+    let reader = tests::record_term_probes(reader);
+    let mut reader = reader;
     let type_clause = type_eligibility_sql(type_filter, "a");
-    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
     let per_term_limit = if terms.len() == 1 {
         fetch_limit
     } else {
         fetch_limit.clamp(1, FTS_TERM_LIMIT)
     };
+    // `status_sql_clause`'s no-filter case still excludes `deprecated`, so
+    // this is currently always true; kept explicit (not assumed) so a future
+    // change that *can* return an empty clause degrades to no-overfetch
+    // instead of silently keeping an overfetch with nothing to absorb.
+    let has_eligibility_clause = !status_sql_clause(statuses, exclude_statuses, 1)
+        .0
+        .is_empty()
+        || !type_clause.is_empty();
+    let widen_ceiling = phase_a_widen_ceiling();
+    let base_probe_limit = if has_eligibility_clause {
+        per_term_limit
+            .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
+            .min(widen_ceiling)
+    } else {
+        per_term_limit
+    };
 
-    let mut seen_ids: HashSet<Uuid> = HashSet::new();
-    let mut combined: Vec<Atom> = Vec::new();
+    if terms.len() > 1 {
+        terms = match rarest_fts_terms_first(reader.as_mut(), terms, &mut stage).await {
+            Ok(terms) => terms,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timeout: stage.timeout,
+                    state: LexicalCandidateState::TimedOut,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts term frequency probe", e)),
+        };
+    }
 
-    // Join the canonical atom row before LIMIT so deleted, status-ineligible,
-    // and wrong-kind FTS rows cannot consume the bounded candidate window.
-    // bm25 orders each term's eligible matches before its own cap; slug is
-    // the stable tie break for equal lexical rank.
-    let per_term_sql = format!(
-        "SELECT a.* FROM fts_knowledge \
-         JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-         WHERE fts_knowledge MATCH ?1 \
-           AND fts_knowledge.namespace = ?2 \
-           AND a.namespace = ?2 \
-           AND a.deleted_at IS NULL{status_clause}{type_clause} \
-         ORDER BY bm25(fts_knowledge), a.slug \
-         LIMIT ?3"
-    );
-
-    // Query every term rather than stopping once `combined` reaches
+    // Query every matching term rather than stopping once `combined` reaches
     // `fetch_limit` — an early break made pool membership depend on query
     // word order (a fast-filling early term could starve every later term
     // of a query at all). Each term's rows are collected independently and
     // merged round-robin below, so no single term can crowd out the rest.
+    // Rarest-first scheduling preserves useful narrow matches if a later
+    // common term exhausts the independent stage deadline.
     let mut per_term_rows: Vec<Vec<Atom>> = Vec::with_capacity(terms.len());
+    // Retain phase-A rowids to distinguish filtered local matches from a miss
+    // without another FTS query or an unscoped existence probe.
+    let mut term_probe_rowids: Vec<Vec<i64>> = Vec::with_capacity(terms.len());
+    let mut unexhausted_terms = Vec::new();
     let mut term_query_timed_out = false;
 
-    for term in &terms {
-        let mut params = vec![
-            SqlValue::Text(term.clone()),
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Integer(per_term_limit as i64),
-        ];
-        params.extend(status_params.iter().cloned());
+    'terms: for term in &terms {
+        let mut probe_limit = base_probe_limit;
 
-        let rows = match reader
-            .query_all(SqlStatement {
-                sql: per_term_sql.clone(),
-                params,
-                label: None,
-            })
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) if is_timeout(&e) => {
-                term_query_timed_out = true;
-                break;
+        let (mut eligible, probed_rowids, exhausted): (Vec<Atom>, Vec<i64>, bool) = loop {
+            let phase_a_rows = match stage
+                .read(
+                    LexicalPhase::PhaseARowids,
+                    reader.query_all(phase_a_rowids_statement(term, probe_limit)),
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) if is_timeout(&e) => {
+                    term_query_timed_out = true;
+                    break 'terms;
+                }
+                Err(e) => return Err(sql_err("search fts phase-a query", e)),
+            };
+            let rowids: Vec<i64> = phase_a_rows
+                .iter()
+                .filter_map(|r| row_i64(r, "rowid"))
+                .collect();
+            let phase_a_full = rowids.len() >= probe_limit;
+            if rowids.is_empty() {
+                break (Vec::new(), rowids, true);
             }
-            Err(e) => return Err(sql_err("search fts query", e)),
+
+            let mut atoms_by_rowid: HashMap<i64, Atom> = HashMap::with_capacity(rowids.len());
+            for chunk in rowids.chunks(HYDRATION_ID_CHUNK) {
+                let statement = phase_b_hydration_statement(
+                    ns,
+                    chunk,
+                    statuses,
+                    exclude_statuses,
+                    type_clause.as_str(),
+                );
+                let rows = match stage
+                    .read(LexicalPhase::PhaseBHydration, reader.query_all(statement))
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) if is_timeout(&e) => {
+                        term_query_timed_out = true;
+                        break 'terms;
+                    }
+                    Err(e) => return Err(sql_err("search fts phase-b hydration", e)),
+                };
+                for row in &rows {
+                    if let (Some(atom), Some(rowid)) = (atom_from_row(row), row_i64(row, "rowid")) {
+                        atoms_by_rowid.insert(rowid, atom);
+                    }
+                }
+            }
+
+            // Reassemble in phase A's rowid order; ineligible rows or intervening deletes drop out.
+            // The reads share no snapshot: an intervening edit hydrates current text,
+            // which the lexical scorer uses even if it no longer matches the term.
+            let eligible_now: Vec<Atom> = rowids
+                .iter()
+                .filter_map(|rowid| atoms_by_rowid.get(rowid).cloned())
+                .collect();
+
+            // Widen only when phase A itself was the bottleneck (it returned
+            // a full page, meaning more matches may exist beyond this
+            // probe) and only up to the ceiling; a term that is genuinely
+            // exhausted (phase A returned less than it asked for) has
+            // nothing more to gain from a wider probe.
+            if has_eligibility_clause && eligible_now.len() < per_term_limit && phase_a_full {
+                if probe_limit < widen_ceiling {
+                    probe_limit = probe_limit
+                        .saturating_mul(PHASE_A_OVERFETCH_FACTOR)
+                        .min(widen_ceiling);
+                    continue;
+                }
+
+                // Ceiling exhausted and still short: more than `widen_ceiling`
+                // ineligible top-ranked rows could still be hiding an
+                // eligible one further down the rowid sequence than phase A
+                // ever probed. Pay once for the pre-#2396-shape eligibility-
+                // scoped join, bounded to this term's own `per_term_limit`,
+                // so the ceiling bounds cost without letting an ineligible-
+                // heavy match set hide a real candidate (issue #2396 fix 2).
+                let (scoped_status_clause, scoped_status_params) =
+                    status_sql_clause(statuses, exclude_statuses, 4);
+                let scoped_sql = format!(
+                    "SELECT a.* FROM fts_knowledge \
+                     CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                     WHERE fts_knowledge MATCH ?1 \
+                       AND +a.namespace = ?2 \
+                       AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} \
+                     ORDER BY fts_knowledge.rowid \
+                     LIMIT ?3"
+                );
+                let mut scoped_params = vec![
+                    SqlValue::Text(term.clone()),
+                    SqlValue::Text(ns.to_owned()),
+                    SqlValue::Integer(per_term_limit as i64),
+                ];
+                scoped_params.extend(scoped_status_params);
+                let scoped_rows = match stage
+                    .read(
+                        LexicalPhase::EligibilityFallback,
+                        reader.query_all(SqlStatement {
+                            sql: scoped_sql,
+                            params: scoped_params,
+                            label: None,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) if is_timeout(&e) => {
+                        term_query_timed_out = true;
+                        break 'terms;
+                    }
+                    Err(e) => {
+                        return Err(sql_err("search fts eligibility-scoped ceiling fallback", e));
+                    }
+                };
+                break (
+                    scoped_rows.iter().filter_map(atom_from_row).collect(),
+                    rowids,
+                    false,
+                );
+            }
+            break (eligible_now, rowids, !phase_a_full);
         };
 
-        per_term_rows.push(rows.iter().filter_map(atom_from_row).collect());
-        #[cfg(test)]
-        {
-            count_fts_test_term_query();
-            advance_fts_test_deadline_after_term(per_term_rows.len()).await;
+        eligible.truncate(per_term_limit);
+        per_term_rows.push(eligible);
+        term_probe_rowids.push(probed_rowids);
+        if !exhausted {
+            unexhausted_terms.push(term.clone());
         }
+        #[cfg(test)]
+        advance_fts_test_deadline_after_term(per_term_rows.len()).await;
     }
 
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut combined: Vec<Atom> = Vec::new();
     let max_term_rows = per_term_rows.iter().map(Vec::len).max().unwrap_or(0);
     'merge: for i in 0..max_term_rows {
         for term_rows in &per_term_rows {
@@ -723,73 +952,119 @@ async fn fetch_fts_candidates(
     }
 
     if term_query_timed_out {
-        let state = if combined.is_empty() {
-            LexicalCandidateState::TimedOut
-        } else {
-            LexicalCandidateState::PartialTimeout
-        };
         return Ok(FtsFetchOutcome {
+            state: if combined.is_empty() {
+                LexicalCandidateState::TimedOut
+            } else {
+                LexicalCandidateState::PartialTimeout
+            },
             atoms: combined,
-            state,
-            terms_truncated,
+            timeout: stage.timeout,
         });
     }
 
     if !combined.is_empty() {
         return Ok(FtsFetchOutcome {
             atoms: combined,
+            timeout: None,
             state: LexicalCandidateState::Matched,
-            terms_truncated,
         });
     }
 
-    // No term produced an eligible row. Distinguish a true lexical miss from
-    // a lexical match whose rows were all ineligible. In either case an empty
-    // lexical result is correct; the distinction is response provenance. This
-    // probe scopes itself to the same (possibly truncated) `terms` the loop
-    // above actually searched — never to the full untruncated query — so a
-    // truncation-caused miss is reported as `NoMatch` (paired with
-    // `terms_truncated: true`), never as `Filtered`: `Filtered` means
-    // eligibility removed a match among the terms actually searched, and an
-    // untested term's eligibility is simply unknown. This probe has no
-    // ORDER BY and LIMIT 1, so it stays cheap even over the OR-joined
-    // expression.
-    let match_expr = terms.join(" OR ");
-    let raw_fts_match = match reader
-        .query_row(SqlStatement {
-            sql: "SELECT 1 AS present FROM fts_knowledge \
-                  WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT 1"
-                .to_string(),
-            params: vec![SqlValue::Text(match_expr), SqlValue::Text(ns.to_owned())],
-            label: None,
-        })
-        .await
-    {
-        Ok(row) => row,
-        Err(e) if is_timeout(&e) => {
-            return Ok(FtsFetchOutcome {
-                atoms: Vec::new(),
-                state: LexicalCandidateState::TimedOut,
-                terms_truncated,
-            });
+    // Classify empty candidates using only namespace-scoped evidence. A match
+    // in another tenant must remain indistinguishable from a true local miss.
+    // Reuse the bounded phase-A windows; never browse unrelated recent rows.
+    let mut probe_rowids: Vec<i64> = term_probe_rowids.into_iter().flatten().collect();
+    probe_rowids.sort_unstable();
+    probe_rowids.dedup();
+
+    let mut namespace_has_match = false;
+    for chunk in probe_rowids.chunks(HYDRATION_ID_CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![SqlValue::Text(ns.to_owned())];
+        params.extend(chunk.iter().map(|rowid| SqlValue::Integer(*rowid)));
+        let membership_sql = format!(
+            "SELECT 1 AS present FROM knowledge_atoms \
+             WHERE rowid IN ({placeholders}) AND namespace = ?1 LIMIT 1"
+        );
+        let row = match stage
+            .read(
+                LexicalPhase::NamespaceMembership,
+                reader.query_row(SqlStatement {
+                    sql: membership_sql,
+                    params,
+                    label: None,
+                }),
+            )
+            .await
+        {
+            Ok(row) => row,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timeout: stage.timeout,
+                    state: LexicalCandidateState::TimedOut,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts namespace membership probe", e)),
+        };
+        if row.is_some() {
+            namespace_has_match = true;
+            break;
         }
-        Err(e) => return Err(sql_err("search fts eligibility probe", e)),
-    };
-    if raw_fts_match.is_some() {
+    }
+    // A capped global window cannot prove local absence: a foreign prefix may
+    // hide local ineligible rows. Recover namespace-only existence for those
+    // terms before exposing no_match, within the same lexical deadline.
+    if !namespace_has_match {
+        for term in unexhausted_terms {
+            let row = match stage
+                .read(
+                    LexicalPhase::NamespaceExistence,
+                    reader.query_row(SqlStatement {
+                        sql: "SELECT 1 AS present FROM fts_knowledge \
+                              CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                              WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 LIMIT 1"
+                            .into(),
+                        params: vec![SqlValue::Text(term), SqlValue::Text(ns.to_owned())],
+                        label: None,
+                    }),
+                )
+                .await
+            {
+                Ok(row) => row,
+                Err(e) if is_timeout(&e) => {
+                    return Ok(FtsFetchOutcome {
+                        atoms: Vec::new(),
+                        timeout: stage.timeout,
+                        state: LexicalCandidateState::TimedOut,
+                    });
+                }
+                Err(e) => return Err(sql_err("search fts scoped namespace existence", e)),
+            };
+            if row.is_some() {
+                namespace_has_match = true;
+                break;
+            }
+        }
+    }
+    if namespace_has_match {
         return Ok(FtsFetchOutcome {
             atoms: Vec::new(),
+            timeout: None,
             state: LexicalCandidateState::Filtered,
-            terms_truncated,
         });
     }
 
-    // A genuine FTS miss is an empty lexical candidate set. Corpus recency is
-    // not query evidence; feeding newest rows into rank fusion creates an
-    // artificial lexical source and can make off-topic results look topical.
     Ok(FtsFetchOutcome {
         atoms: Vec::new(),
+        timeout: None,
         state: LexicalCandidateState::NoMatch,
-        terms_truncated,
     })
 }
 
@@ -805,31 +1080,25 @@ struct SearchCtx<'a> {
     fetch_limit: usize,
     statuses: &'a [String],
     exclude_statuses: &'a [&'a str],
-    /// Request-scoped remaining allowance for [`FTS_TERM_COUNT_LIMIT`],
-    /// shared by every lexical fetch this request makes. `search_decomposed`
-    /// calls `search_core` up to three times for one `knowledge.search`
-    /// request; sharing one counter across them bounds the whole request's
-    /// distinct-term fan-out instead of granting each call its own budget.
-    /// Atomic rather than `Cell` only because the handler future must stay
-    /// `Send` across its `.await` points; every access is sequential — this
-    /// pack never touches the counter from more than one task at a time.
-    term_budget: &'a std::sync::atomic::AtomicUsize,
+    term_budget: &'a FtsTermBudget,
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
 
-/// `search_core`'s result plus the lexical/FTS candidate-stage outcome. A
-/// caller sees `hits` possibly empty/partial and an explicit timeout state
-/// instead of an `Err` for a genuine request read-deadline expiry.
-/// `terms_truncated` reports whether any lexical fetch in this call ran out
-/// of the shared per-request term budget.
+/// `search_core`'s result plus any lexical/FTS read timeout diagnostics.
+/// A caller sees `hits` possibly empty/partial and timeout details instead of an
+/// `Err` — never a verb-level error for a genuine timeout.
 struct SearchCoreOutcome {
     hits: Vec<ScoredHit>,
+    lexical_timeouts: Vec<LexicalTimeout>,
     lexical_state: LexicalCandidateState,
-    terms_truncated: bool,
 }
 
-async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutcome, RuntimeError> {
+async fn search_core(
+    ctx: &SearchCtx<'_>,
+    query: &str,
+    pass: LexicalPass,
+) -> Result<SearchCoreOutcome, RuntimeError> {
     let runtime = ctx.runtime;
     let ns = ctx.ns;
     let role = ctx.role;
@@ -841,8 +1110,8 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if raw_query.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
+            lexical_timeouts: Vec::new(),
             lexical_state: LexicalCandidateState::NoMatch,
-            terms_truncated: false,
         });
     }
 
@@ -873,26 +1142,41 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
+    // The lexical stage owns an independent, narrower read-deadline budget
+    // (issue #1930 Amendment 2): `scope_request_read_deadline` keeps
+    // whichever deadline is earlier, so this only ever tightens the fetch's
+    // effective deadline; once the fetch returns, the wider request
+    // deadline governs everything that runs after it (rerank, body-line
+    // counts, member sizing) — a lexical-stage timeout no longer spends the
+    // whole request.
+    let configured_budget = lexical_stage_budget();
+    let stage_started = tokio::time::Instant::now();
     let FtsFetchOutcome {
         atoms,
-        state,
-        terms_truncated,
-    } = fetch_fts_candidates(
-        runtime,
-        ns,
-        &raw_query,
-        type_filter,
-        ctx.statuses,
-        ctx.exclude_statuses,
-        CANDIDATE_POOL,
-        ctx.term_budget,
-    )
+        timeout,
+        state: lexical_state,
+    } = khive_storage::scope_request_read_deadline(configured_budget, async {
+        let stage = LexicalStage::new(pass, stage_started, configured_budget);
+        fetch_fts_candidates(
+            runtime,
+            ns,
+            &raw_query,
+            type_filter,
+            ctx.statuses,
+            ctx.exclude_statuses,
+            CANDIDATE_POOL,
+            ctx.term_budget,
+            stage,
+        )
+        .await
+    })
     .await?;
+    let lexical_timeouts: Vec<_> = timeout.into_iter().collect();
     if atoms.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_state: state,
-            terms_truncated,
+            lexical_timeouts,
+            lexical_state,
         });
     }
 
@@ -900,8 +1184,12 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
     if candidates.is_empty() {
         return Ok(SearchCoreOutcome {
             hits: Vec::new(),
-            lexical_state: state,
-            terms_truncated,
+            lexical_timeouts,
+            lexical_state: if lexical_state == LexicalCandidateState::PartialTimeout {
+                lexical_state
+            } else {
+                LexicalCandidateState::Filtered
+            },
         });
     }
 
@@ -953,8 +1241,8 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<SearchCoreOutco
                 provenance: ScoreProvenance::lexical(),
             })
             .collect(),
-        lexical_state: state,
-        terms_truncated,
+        lexical_timeouts,
+        lexical_state,
     })
 }
 
@@ -977,12 +1265,9 @@ async fn search_decomposed(
 
     let SearchCoreOutcome {
         hits: full,
+        mut lexical_timeouts,
         lexical_state: full_state,
-        terms_truncated: full_truncated,
-    } = search_core(ctx, query).await?;
-    // Same `term_budget` `Cell` as `ctx`: the three lexical fetches below draw
-    // from one shared per-request allowance rather than each getting their
-    // own `FTS_TERM_COUNT_LIMIT`.
+    } = search_core(ctx, query, LexicalPass::Full).await?;
     let sub_ctx1 = SearchCtx {
         runtime: ctx.runtime,
         ns: ctx.ns,
@@ -997,29 +1282,48 @@ async fn search_decomposed(
     };
     let SearchCoreOutcome {
         hits: s1,
+        lexical_timeouts: s1_timeouts,
         lexical_state: s1_state,
-        terms_truncated: s1_truncated,
-    } = search_core(&sub_ctx1, &sub_q1).await?;
+    } = search_core(&sub_ctx1, &sub_q1, LexicalPass::Subquery1).await?;
     let SearchCoreOutcome {
         hits: s2,
+        lexical_timeouts: s2_timeouts,
         lexical_state: s2_state,
-        terms_truncated: s2_truncated,
-    } = search_core(&sub_ctx1, &sub_q2).await?;
-    let lexical_state = LexicalCandidateState::merge(&[full_state, s1_state, s2_state]);
-    let terms_truncated = full_truncated || s1_truncated || s2_truncated;
+    } = search_core(&sub_ctx1, &sub_q2, LexicalPass::Subquery2).await?;
+    lexical_timeouts.extend(s1_timeouts);
+    lexical_timeouts.extend(s2_timeouts);
 
+    Ok(SearchCoreOutcome {
+        hits: merge_decomposed_hits(full, [s1, s2], intersection_bonus, ctx.fetch_limit),
+        lexical_timeouts,
+        lexical_state: LexicalCandidateState::merge(&[full_state, s1_state, s2_state]),
+    })
+}
+
+fn merge_decomposed_hits(
+    full: Vec<ScoredHit>,
+    subqueries: [Vec<ScoredHit>; 2],
+    intersection_bonus: f32,
+    fetch_limit: usize,
+) -> Vec<ScoredHit> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut data: HashMap<String, ScoredHit> = HashMap::new();
 
-    for hit in full {
+    for mut hit in full {
         scores.insert(hit.id.clone(), hit.score);
+        if let Some(existing) = data.get(&hit.id) {
+            hit.provenance.merge_sources(existing.provenance);
+        }
         data.insert(hit.id.clone(), hit);
     }
 
     let mut sub_counts: HashMap<String, u32> = HashMap::new();
-    for hits in [s1, s2] {
+    for hits in subqueries {
         let mut seen: HashSet<String> = HashSet::new();
         for hit in hits {
+            if let Some(existing) = data.get_mut(&hit.id) {
+                existing.provenance.merge_sources(hit.provenance);
+            }
             if !seen.insert(hit.id.clone()) {
                 continue;
             }
@@ -1054,42 +1358,130 @@ async fn search_decomposed(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.slug.cmp(&b.slug))
     });
-    ranked.truncate(ctx.fetch_limit);
-    Ok(SearchCoreOutcome {
-        hits: ranked,
-        lexical_state,
-        terms_truncated,
-    })
+    ranked.truncate(fetch_limit);
+    ranked
 }
 
 // ─── embedding rerank ────────────────────────────────────────────────────────
 
+/// Request-local cache for the query's embedding vector(s), threaded through
+/// search/suggest/compose so a query is embedded at most once per role it is
+/// actually needed in.
+///
+/// `EmbeddingService::embed_query` and `::embed` are different provider
+/// methods: instruction-tuned models (E5, Qwen) prepend a query prompt for
+/// the former, so the two calls land in different sides of the retrieval
+/// space for the identical text. `role_specific` holds the outcome of the
+/// request's one attempt at `runtime.embed_query` (the ANN and KG-blend
+/// dense-search path); `generic` holds the first slot of a combined
+/// `runtime.embed_batch` rerank call. A `generic` vector is a valid stand-in
+/// for `role_specific` in rerank cosine math (both are just "the query's
+/// embedding" for a same-space comparison against candidates embedded the
+/// same generic way), but it must never satisfy a caller that specifically
+/// requires `role_specific` — passing it to the KG blend's `hybrid_search`
+/// masks a real `embed_query` failure behind a same-shaped, wrong-space
+/// vector (#2307).
+#[derive(Debug, Default, Clone)]
+struct QueryEmbeddingCache {
+    role_specific: RoleSpecificEmbedding,
+    generic: Option<Vec<f32>>,
+}
+
+/// Outcome of the request's (at most one) attempt to obtain the query's
+/// role-specific (`embed_query`) vector.
+///
+/// A plain `Option<Vec<f32>>` cannot tell "never tried" from "tried and the
+/// provider failed" — both read as `None`. That collapse is exactly what let
+/// a failed attempt in one stage (e.g. `suggest`) get retried by a later
+/// stage in the same request (e.g. `compose`'s KG-blend gate): the later
+/// stage saw `None` and had no way to know an attempt, and a failure, had
+/// already happened (#2307). `Failed` records that the attempt happened so
+/// nothing downstream pays for a second failing provider call; only
+/// `NotAttempted` authorizes a stage to try.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum RoleSpecificEmbedding {
+    #[default]
+    NotAttempted,
+    Failed,
+    Vector(Vec<f32>),
+}
+
+impl RoleSpecificEmbedding {
+    fn as_deref(&self) -> Option<&[f32]> {
+        match self {
+            Self::Vector(v) => Some(v.as_slice()),
+            Self::NotAttempted | Self::Failed => None,
+        }
+    }
+
+    fn is_not_attempted(&self) -> bool {
+        matches!(self, Self::NotAttempted)
+    }
+}
+
+impl QueryEmbeddingCache {
+    fn any(&self) -> Option<&[f32]> {
+        self.role_specific.as_deref().or(self.generic.as_deref())
+    }
+}
+
 async fn embed_cosine_scores(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut QueryEmbeddingCache,
     candidate_texts: &[String],
 ) -> Result<Option<Vec<f32>>, RuntimeError> {
     if runtime.default_embedder_name().is_empty() || candidate_texts.is_empty() {
         return Ok(None);
     }
-    let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
-    texts.push(query.to_string());
-    texts.extend_from_slice(candidate_texts);
+
+    // When nothing is cached yet, include the query in this one batch and
+    // retain its vector as `generic` for downstream cosine math. Otherwise
+    // embed only candidates; the query vector is request-local immutable data.
+    let query_was_cached = query_embedding.any().is_some();
+    let texts = if query_was_cached {
+        candidate_texts.to_vec()
+    } else {
+        let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
+        texts.push(query.to_string());
+        texts.extend_from_slice(candidate_texts);
+        texts
+    };
+    // A request read-deadline timeout here degrades to "rerank did not run"
+    // (`Ok(None)`) rather than propagating, same contract as every other
+    // read in this module (issue #1930 Amendment 2): before the lexical
+    // stage owned its own budget, this call was only ever reached when the
+    // shared request deadline had *not* already expired, so a mid-flight
+    // expiry racing this specific await was unreachable in practice. With
+    // the stages decoupled, a lexical-only degradation with real time left
+    // to spare now reaches this call normally, and the ordinary
+    // async-scheduling race — the deadline elapsing while this embed_batch
+    // is in flight — is reachable and must degrade, not hard-error.
     let embeddings = match khive_storage::await_request_read_phase(
         "knowledge.embedding_rerank",
         runtime.embed_batch(&texts),
     )
-    .await?
+    .await
     {
-        Ok(embeddings) => embeddings,
-        Err(_) => return Ok(None),
+        Ok(Ok(embeddings)) => embeddings,
+        Ok(Err(_)) => return Ok(None),
+        Err(e) if is_timeout(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
     if embeddings.len() != texts.len() {
         return Ok(None);
     }
-    let query_emb = &embeddings[0];
+    let candidate_embeddings = if query_was_cached {
+        embeddings.as_slice()
+    } else {
+        query_embedding.generic = Some(embeddings[0].clone());
+        &embeddings[1..]
+    };
+    let query_emb = query_embedding
+        .any()
+        .expect("query embedding was cached or populated from non-empty batch");
     Ok(Some(
-        embeddings[1..]
+        candidate_embeddings
             .iter()
             .map(|emb| cosine_similarity(query_emb, emb))
             .collect(),
@@ -1099,6 +1491,7 @@ async fn embed_cosine_scores(
 async fn rerank_with_embeddings(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut QueryEmbeddingCache,
     hits: &mut [ScoredHit],
     alpha: f32,
 ) -> Result<bool, RuntimeError> {
@@ -1109,7 +1502,7 @@ async fn rerank_with_embeddings(
         .iter()
         .map(|h| format!("{} {}", h.name, h.content.as_deref().unwrap_or("")))
         .collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         let max_tfidf = hits
             .iter()
             .map(|h| h.score)
@@ -1206,6 +1599,51 @@ fn hydrate_domains_statement(ns: &str, ids: &[String]) -> SqlStatement {
         sql: format!(
             "SELECT id, slug, name, description, tags, status FROM knowledge_domains \
              WHERE id IN ({placeholders}) AND +namespace = ?1 AND deleted_at IS NULL"
+        ),
+        params,
+        label: None,
+    }
+}
+
+/// Build the phase-B hydration statement for one chunk of phase-A rowids
+/// (issue #2396 fix 5).
+///
+/// `+a.namespace = ?1` (not a bare equality) is deliberate — same reason and
+/// shape as [`hydrate_atoms_statement`]/[`hydrate_domains_statement`]:
+/// without table statistics (this codebase never runs `ANALYZE` on
+/// `knowledge_atoms`), SQLite's planner prefers `idx_knowledge_atoms_ns` over
+/// the integer primary key for a large `rowid IN (...)` list, turning an
+/// O(chunk) rowid seek into an O(matching-namespace-rows) index scan per
+/// chunk. Verified with `EXPLAIN QUERY PLAN` against a freshly loaded,
+/// unanalyzed `knowledge_atoms` table at a 900-row chunk (this statement's
+/// own `HYDRATION_ID_CHUNK`): without the unary plus the planner chose
+/// `SEARCH a USING INDEX idx_knowledge_atoms_ns (namespace=? AND rowid=?)`;
+/// with it, `SEARCH a USING INTEGER PRIMARY KEY (rowid=?)`. The unary plus
+/// defeats the index without changing the predicate's meaning.
+fn phase_b_hydration_statement(
+    ns: &str,
+    rowids: &[i64],
+    statuses: &[String],
+    exclude_statuses: &[&str],
+    type_clause: &str,
+) -> SqlStatement {
+    let rowid_placeholders = rowids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (status_clause, status_params) =
+        status_sql_clause(statuses, exclude_statuses, 2 + rowids.len());
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(rowids.iter().map(|rowid| SqlValue::Integer(*rowid)));
+    params.extend(status_params);
+    SqlStatement {
+        sql: format!(
+            "SELECT a.*, a.rowid AS rowid FROM knowledge_atoms AS a \
+             WHERE a.rowid IN ({rowid_placeholders}) \
+               AND +a.namespace = ?1 \
+               AND a.deleted_at IS NULL{status_clause}{type_clause}"
         ),
         params,
         label: None,
@@ -1358,7 +1796,10 @@ fn attach_hydration_degradation(out: &mut Value, hydration_failures: usize) {
 /// (issue #1930). Set alongside whatever ANN-backed results (if any) still
 /// made it into the response — a timed-out lexical stage degrades the
 /// response, it never fails the verb outright.
-fn attach_lexical_timeout_degradation(out: &mut Value) {
+fn attach_lexical_timeout_degradation(out: &mut Value, timeouts: &[LexicalTimeout]) {
+    if timeouts.is_empty() {
+        return;
+    }
     if !out
         .get("degraded")
         .is_some_and(serde_json::Value::is_object)
@@ -1366,6 +1807,15 @@ fn attach_lexical_timeout_degradation(out: &mut Value) {
         out["degraded"] = json!({});
     }
     out["degraded"]["lexical_timeout"] = json!(true);
+    out["degraded"]["lexical_timeout_instrumented"] = json!(true);
+    let details: Vec<_> = timeouts
+        .iter()
+        .filter(|detail| detail.phase.public())
+        .take(3)
+        .collect();
+    if !details.is_empty() {
+        out["degraded"]["lexical_timeout_details"] = json!(details);
+    }
 }
 
 /// Flag that the best-effort body-line aggregate hit the request read
@@ -1380,6 +1830,37 @@ fn attach_body_lines_timeout_degradation(out: &mut Value) {
         out["degraded"] = json!({});
     }
     out["degraded"]["body_lines_timeout"] = json!(true);
+}
+
+/// Report unmeasured domains under the stable `member_sizing_timeout` key,
+/// whether sizing timed out or the canonical domain row could not be measured.
+/// Every affected domain is withheld from `results` — never left in with a
+/// `size` the caller cannot price — and listed here instead, as
+/// `{id, name, rank, score}`, so the caller sees exactly which ranked hits
+/// were excluded and why. `suggest`'s documented contract (issue #105) is
+/// that `results` feeds `knowledge.fold`'s `candidates` unmodified;
+/// withholding the unpriced domain keeps that passthrough valid instead of
+/// turning one unmeasured domain into a hard parse error for the whole fold
+/// request.
+fn attach_member_sizing_timeout_degradation(out: &mut Value, excluded: &[Value]) {
+    if excluded.is_empty() {
+        return;
+    }
+
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["member_sizing_timeout"] = json!({
+        "excluded": excluded,
+        "note": "no measurement was produced (timeout or missing canonical domain), so these domains \
+                 were withheld from `results` — their cost is unknown and a \
+                 budgeted knowledge.fold selection cannot safely admit an unpriced \
+                 item. Each entry keeps its id/name/rank/score for reference; \
+                 measure size separately before folding one of these in.",
+    });
 }
 
 struct EligibleAnnSearchState {
@@ -1614,14 +2095,25 @@ fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
     })
 }
 
+#[derive(Debug, Default)]
+struct DomainMemberSizing {
+    tokens: usize,
+    live_members: usize,
+}
+
+/// Member-token sizing is best-effort: a request read-deadline timeout on
+/// reader checkout or the query returns an empty map and `true`, not `Err`.
+/// One `query_all` has no partial-completion state, so the flag covers the batch.
+/// Every live canonical domain enters the map, with zero size and members
+/// when no live member joins. Only absent domains stay unmeasured.
 async fn load_domain_member_token_sizes(
     runtime: &KhiveRuntime,
     ns: &str,
     domain_ids: &[String],
-) -> Result<HashMap<String, usize>, RuntimeError> {
-    let mut sizes: HashMap<String, usize> = domain_ids.iter().map(|id| (id.clone(), 0)).collect();
+) -> Result<(HashMap<String, DomainMemberSizing>, bool), RuntimeError> {
+    let mut sizes: HashMap<String, DomainMemberSizing> = HashMap::new();
     if domain_ids.is_empty() {
-        return Ok(sizes);
+        return Ok((sizes, false));
     }
 
     let placeholders = domain_ids
@@ -1634,17 +2126,18 @@ async fn load_domain_member_token_sizes(
     params.extend(domain_ids.iter().cloned().map(SqlValue::Text));
 
     let sql = runtime.sql();
-    let mut reader = sql
-        .reader()
-        .await
-        .map_err(|e| sql_err("suggest member size reader", e))?;
-    let rows = reader
+    let mut reader = match sql.reader().await {
+        Ok(reader) => reader,
+        Err(e) if is_timeout(&e) => return Ok((sizes, true)),
+        Err(e) => return Err(sql_err("suggest member size reader", e)),
+    };
+    let rows = match reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT d.id AS domain_id, a.name, a.content \
+                "SELECT DISTINCT d.id AS domain_id, a.id AS atom_id, a.name, a.content \
                  FROM knowledge_domains AS d \
-                 JOIN json_each(d.members) AS member ON 1 = 1 \
-                 JOIN knowledge_atoms AS a \
+                 LEFT JOIN json_each(d.members) AS member ON 1 = 1 \
+                 LEFT JOIN knowledge_atoms AS a \
                    ON a.namespace = d.namespace \
                   AND a.slug = member.value \
                   AND a.deleted_at IS NULL \
@@ -1656,21 +2149,28 @@ async fn load_domain_member_token_sizes(
             label: None,
         })
         .await
-        .map_err(|e| sql_err("suggest member size query", e))?;
+    {
+        Ok(rows) => rows,
+        Err(e) if is_timeout(&e) => return Ok((sizes, true)),
+        Err(e) => return Err(sql_err("suggest member size query", e)),
+    };
 
     for row in rows {
         let Some(domain_id) = row_str(&row, "domain_id") else {
             continue;
         };
+        let sizing = sizes.entry(domain_id).or_default();
         let Some(content) = row_str(&row, "content") else {
             continue;
         };
         let name = row_str(&row, "name").unwrap_or_default();
-        let size = sizes.entry(domain_id).or_default();
-        *size = size.saturating_add(estimate_compose_item_tokens(&name, &content));
+        sizing.tokens = sizing
+            .tokens
+            .saturating_add(estimate_compose_item_tokens(&name, &content));
+        sizing.live_members = sizing.live_members.saturating_add(1);
     }
 
-    Ok(sizes)
+    Ok((sizes, false))
 }
 
 /// Body-line metadata is best-effort: a request read-deadline timeout on
@@ -1748,13 +2248,14 @@ async fn load_atom_body_line_counts(
 async fn rerank_text_items(
     runtime: &KhiveRuntime,
     query: &str,
+    query_embedding: &mut QueryEmbeddingCache,
     items: &mut [ScoredTextItem],
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
         return Ok(());
     }
     let texts: Vec<String> = items.iter().map(|item| item.text.clone()).collect();
-    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await? {
+    if let Some(cosines) = embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         for (item, cos) in items.iter_mut().zip(cosines.iter()) {
             item.score = cos.max(0.0);
         }
@@ -1812,15 +2313,38 @@ async fn search_kg_entities(
     token: &NamespaceToken,
     ns: &str,
     query: &str,
+    query_embedding: &mut QueryEmbeddingCache,
     cap: usize,
     min_score: f32,
 ) -> Result<Vec<KgEntityHit>, RuntimeError> {
+    // KG discovery has two kind-specific hybrid searches. Both are gated on
+    // `role_specific` specifically, never `generic`: a vector produced by
+    // the rerank's combined batch (`embed_batch`) lands in a different
+    // embedding space than `embed_query` for asymmetric-prompt models, so it
+    // must never stand in for a role-specific vector here — doing so would
+    // mask a real `embed_query` failure behind a same-shaped wrong-space
+    // vector instead of degrading to the atom-only briefing (#2307). No
+    // role-specific vector (never attempted, or attempted and failed) means
+    // the dense blend is unavailable and the caller safely keeps its
+    // already-complete atom-only briefing.
+    let Some(query_vector) = query_embedding.role_specific.as_deref() else {
+        return Ok(Vec::new());
+    };
     let candidate_k = ((cap * 4) as u32).max(20);
     let mut candidate_ids: Vec<Uuid> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
     for kind in KG_BLEND_ENTITY_KINDS {
         let hits = runtime
-            .hybrid_search(token, query, None, candidate_k, Some(kind), None, &[], None)
+            .hybrid_search(
+                token,
+                query,
+                Some(query_vector.to_vec()),
+                candidate_k,
+                Some(kind),
+                None,
+                &[],
+                None,
+            )
             .await?;
         for hit in hits {
             if seen.insert(hit.entity_id) {
@@ -1866,7 +2390,7 @@ async fn search_kg_entities(
         .iter()
         .map(|e| format!("{} {}", e.name, e.description.as_deref().unwrap_or("")))
         .collect();
-    let cosines = match embed_cosine_scores(runtime, query, &texts).await? {
+    let cosines = match embed_cosine_scores(runtime, query, query_embedding, &texts).await? {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
@@ -2130,10 +2654,7 @@ impl KnowledgeHandlers {
         let allow_deprecated =
             deprecated_allowed_by_status_policy(&requested_statuses, &effective_exclude_statuses);
 
-        // One term budget for the whole request: `search_decomposed` below
-        // may call the lexical fetch up to three times, and they must share
-        // this allowance rather than each getting their own.
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let term_budget = FtsTermBudget::new();
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2160,6 +2681,10 @@ impl KnowledgeHandlers {
         let mut ann_hits: Vec<ScoredHit> = Vec::new();
         let mut ann_availability: Option<AnnAvailability> = None;
         let mut hydration_failures = 0usize;
+        // One query vector is shared by ANN retrieval and the optional
+        // embedding rerank. Candidate embeddings remain stage-specific, but
+        // the request never pays to embed the same query twice (#2232).
+        let mut query_embedding = QueryEmbeddingCache::default();
         let ann_k = fetch_limit.max(20);
         match khive_storage::await_request_read_phase(
             "knowledge.search",
@@ -2168,10 +2693,20 @@ impl KnowledgeHandlers {
         .await
         {
             Ok(Ok(query_emb)) => {
+                query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb);
                 let model = runtime.default_embedder_name();
                 let key = vamana::AnnKey::new(&ns, model);
                 match search_eligible_ann_with_refill(
-                    &ctx, token, ann, &key, &query_emb, ann_k, ann_k,
+                    &ctx,
+                    token,
+                    ann,
+                    &key,
+                    query_embedding
+                        .role_specific
+                        .as_deref()
+                        .expect("query embedding was just populated"),
+                    ann_k,
+                    ann_k,
                 )
                 .await
                 {
@@ -2195,14 +2730,13 @@ impl KnowledgeHandlers {
 
         let SearchCoreOutcome {
             mut hits,
+            lexical_timeouts,
             lexical_state,
-            terms_truncated,
         } = if do_decompose && non_stop_count >= decompose_threshold {
             search_decomposed(&ctx, &raw_query, intersection_bonus).await?
         } else {
-            search_core(&ctx, &raw_query).await?
+            search_core(&ctx, &raw_query, LexicalPass::Full).await?
         };
-        let lexical_timed_out = lexical_state.timed_out();
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2224,18 +2758,25 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
-        // See `suggest`'s matching guard: a lexical-stage timeout means the
-        // request read deadline is already spent, so skip the further
-        // embedding read rather than let it convert a degraded-but-ok
-        // response into a verb-level error.
-        if do_rerank && !hits.is_empty() && !lexical_timed_out {
-            rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
+        // The lexical stage now owns its own budget (issue #1930 Amendment
+        // 2), so `lexical_timeout` no longer implies the request read
+        // deadline is spent — only that stage's narrower budget is. Gate on
+        // the live ambient deadline instead: a lexical-only degradation
+        // with request time left to spare still gets its embedding rerank.
+        if do_rerank && !hits.is_empty() && !khive_storage::request_read_is_cancelled() {
+            rerank_with_embeddings(
+                runtime,
+                &raw_query,
+                &mut query_embedding,
+                &mut hits,
+                rerank_alpha,
+            )
+            .await?;
         }
 
         apply_status_multipliers(&mut hits, allow_deprecated);
         enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
-        let fallback = candidate_fallback(&hits);
 
         let atom_ids: Vec<String> = hits
             .iter()
@@ -2243,7 +2784,7 @@ impl KnowledgeHandlers {
             .map(|hit| hit.id.clone())
             .collect();
         let mut body_lines_timed_out = false;
-        let body_line_counts = if lexical_timed_out {
+        let body_line_counts = if khive_storage::request_read_is_cancelled() {
             None
         } else {
             match load_atom_body_line_counts(runtime, &ns, &atom_ids).await? {
@@ -2287,35 +2828,60 @@ impl KnowledgeHandlers {
             "total": count,
             "candidate_provenance": {
                 "lexical": lexical_state.as_str(),
-                "fallback": fallback,
-                "terms_truncated": terms_truncated,
+                "fallback": candidate_fallback(&hits),
+                "terms_truncated": term_budget.truncated(),
             },
         });
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
-        if lexical_timed_out {
-            attach_lexical_timeout_degradation(&mut out);
-        }
+        attach_lexical_timeout_degradation(&mut out, &lexical_timeouts);
         if body_lines_timed_out {
             attach_body_lines_timeout_degradation(&mut out);
         }
         attach_hydration_degradation(&mut out, hydration_failures);
-        // A lexical-stage or body-line-stage timeout already committed this
-        // call to a degraded response (never a verb-level error, issue #1930)
-        // — re-checking the same expired deadline here would discard it.
-        if !lexical_timed_out && !body_lines_timed_out {
+        // The lexical stage's own budget no longer implies the request
+        // deadline is spent (issue #1930 Amendment 2), so this last check
+        // re-reads the live ambient deadline rather than the stage-local
+        // flags: skip only when the request has actually stopped, never a
+        // verb-level error for a degradation already reported above.
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.search")?;
         }
         Ok(out)
     }
 
+    /// Suggest domains with measured compose-member costs and live member counts.
+    /// Present domains without live members have size zero and members zero.
+    /// Every unmeasured domain is withheld under the stable
+    /// `degraded.member_sizing_timeout.excluded` key, whether sizing timed out or not.
     pub(crate) async fn suggest(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
         ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
+        let (out, _) = Self::suggest_with_query_embedding(
+            runtime,
+            token,
+            params,
+            ann,
+            QueryEmbeddingCache::default(),
+        )
+        .await?;
+        Ok(out)
+    }
+
+    /// Internal suggest path that accepts and returns the request's cached
+    /// query vector. Auto-compose calls this directly so its suggest, atom,
+    /// section, and KG stages all share one successful query embedding.
+    async fn suggest_with_query_embedding(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        ann: &vamana::SharedAnn,
+        mut query_embedding: QueryEmbeddingCache,
+    ) -> Result<(Value, QueryEmbeddingCache), RuntimeError> {
         khive_storage::ensure_request_read_active("knowledge.suggest")?;
         let p: SuggestParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -2337,7 +2903,7 @@ impl KnowledgeHandlers {
         // should not drive auto-compose or agent orientation.
         const SUGGEST_EXCLUDE: &[&str] = &["draft", "deprecated"];
 
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
+        let term_budget = FtsTermBudget::new();
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2364,50 +2930,56 @@ impl KnowledgeHandlers {
         // 50× over-fetch (floor 200) gives domains a fair chance to appear in the
         // top ANN neighbors before the type gate discards atom hits.
         let ann_k = (limit * 50).max(200);
-        match khive_storage::await_request_read_phase(
-            "knowledge.suggest",
-            runtime.embed_query(&raw_query),
-        )
-        .await
-        {
-            Ok(Ok(query_emb)) => {
-                let model = runtime.default_embedder_name();
-                let key = vamana::AnnKey::new(&ns, model);
-                match search_eligible_ann_with_refill(
-                    &ctx,
-                    token,
-                    ann,
-                    &key,
-                    &query_emb,
-                    ctx.fetch_limit,
-                    ann_k,
-                )
-                .await
-                {
-                    Ok(EligibleAnnSearchState {
-                        hits,
-                        availability,
-                        hydration_failures: ann_hydration_failures,
-                    }) => {
-                        hydration_failures += ann_hydration_failures;
-                        ann_hits = hits;
-                        ann_availability = Some(availability);
-                    }
-                    Err(e) if is_read_timeout(&e) => {}
-                    Err(e) => return Err(e),
+        if query_embedding.role_specific.is_not_attempted() {
+            match khive_storage::await_request_read_phase(
+                "knowledge.suggest",
+                runtime.embed_query(&raw_query),
+            )
+            .await
+            {
+                Ok(Ok(query_emb)) => {
+                    query_embedding.role_specific = RoleSpecificEmbedding::Vector(query_emb)
                 }
+                Ok(Err(_)) => query_embedding.role_specific = RoleSpecificEmbedding::Failed,
+                Err(e) if is_timeout(&e) => {
+                    query_embedding.role_specific = RoleSpecificEmbedding::Failed
+                }
+                Err(e) => return Err(e.into()),
             }
-            Ok(Err(_)) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e.into()),
+        }
+        if let Some(query_emb) = query_embedding.role_specific.as_deref() {
+            let model = runtime.default_embedder_name();
+            let key = vamana::AnnKey::new(&ns, model);
+            match search_eligible_ann_with_refill(
+                &ctx,
+                token,
+                ann,
+                &key,
+                query_emb,
+                ctx.fetch_limit,
+                ann_k,
+            )
+            .await
+            {
+                Ok(EligibleAnnSearchState {
+                    hits,
+                    availability,
+                    hydration_failures: ann_hydration_failures,
+                }) => {
+                    hydration_failures += ann_hydration_failures;
+                    ann_hits = hits;
+                    ann_availability = Some(availability);
+                }
+                Err(e) if is_read_timeout(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         let SearchCoreOutcome {
             mut hits,
-            lexical_state,
-            terms_truncated: _,
-        } = search_core(&ctx, &raw_query).await?;
-        let lexical_timed_out = lexical_state.timed_out();
+            lexical_timeouts,
+            ..
+        } = search_core(&ctx, &raw_query, LexicalPass::Full).await?;
 
         let mut ann_unavailable = false;
         if !ann_hits.is_empty() {
@@ -2422,14 +2994,22 @@ impl KnowledgeHandlers {
         filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
         filter_hits_by_type(&mut hits, Some("domain"));
 
-        // A lexical-stage timeout already committed this call to a degraded,
-        // ANN-backed response — the request read deadline is spent, so
-        // skip further reads/embedding calls rather than let them convert
-        // this into a verb-level error.
-        let fresh_rerank_applied = if lexical_timed_out {
+        // The lexical stage now owns its own budget (issue #1930 Amendment
+        // 2), so `lexical_timeout` no longer implies the request read
+        // deadline is spent — only that stage's narrower budget is. Gate on
+        // the live ambient deadline instead: a lexical-only degradation
+        // with request time left to spare still gets its embedding rerank.
+        let fresh_rerank_applied = if khive_storage::request_read_is_cancelled() {
             false
         } else {
-            rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?
+            rerank_with_embeddings(
+                runtime,
+                &raw_query,
+                &mut query_embedding,
+                &mut hits,
+                D_SUGGEST_RERANK_ALPHA,
+            )
+            .await?
         };
 
         // Safety net: retain only domain hits in case any non-domain survived above.
@@ -2437,31 +3017,68 @@ impl KnowledgeHandlers {
         hits.truncate(limit);
 
         let domain_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
-        let member_token_sizes = if lexical_timed_out {
-            HashMap::new()
-        } else {
-            load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
-        };
-        if !lexical_timed_out {
+        // A cancelled ambient deadline skips the call the same way an
+        // internal timeout inside it does — both leave every domain in this
+        // batch unmeasured, never a measured member cost
+        // (issue #2396 fix 3).
+        let (member_token_sizes, member_sizing_timed_out) =
+            if khive_storage::request_read_is_cancelled() {
+                (HashMap::new(), !domain_ids.is_empty())
+            } else {
+                load_domain_member_token_sizes(runtime, &ns, &domain_ids).await?
+            };
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
+        // A domain the sizing pass returned no row for is unmeasured as well:
+        // a missing entry never defaults to a fabricated zero.
+        let unmeasured_domain_ids: HashSet<&str> = domain_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| member_sizing_timed_out || !member_token_sizes.contains_key(*id))
+            .collect();
 
         // Price the member atom bodies that compose expands, not the much smaller
         // domain mirror description used for retrieval. The batched join keeps the
         // suggest -> fold budget in compose's estimated-token unit without an N+1
-        // hydration pass.
+        // hydration pass. A domain whose members were not measured is withheld
+        // from `results` entirely and reported under
+        // `degraded.member_sizing_timeout.excluded` instead — `suggest`'s
+        // documented contract (issue #105) is that `results` feeds
+        // `knowledge.fold`'s `candidates` unmodified, and `FoldCandidate::size`
+        // is a non-optional `usize`, so leaving an unpriced item in `results`
+        // (as `size: null`, issue #2396 fix 3) turned one unmeasured domain into
+        // a hard parse error for the whole fold request. Exclusion keeps the
+        // passthrough valid while still refusing to let an unpriced domain enter
+        // a budgeted fold selection for free.
         let results: Vec<Value> = hits
             .iter()
-            .map(|h| {
-                json!({
+            .filter(|h| !unmeasured_domain_ids.contains(h.id.as_str()))
+            .filter_map(|h| {
+                let sizing = member_token_sizes.get(&h.id)?;
+                Some(json!({
                     "id": h.id,
                     "name": h.name,
                     "score": h.score,
-                    "size": member_token_sizes.get(&h.id).copied().unwrap_or_default(),
-                })
+                    "size": sizing.tokens,
+                    "members": sizing.live_members,
+                }))
             })
             .collect();
         let count = results.len();
+        let excluded: Vec<Value> = hits
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| unmeasured_domain_ids.contains(h.id.as_str()))
+            .map(|(i, h)| {
+                json!({
+                    "id": h.id,
+                    "name": h.name,
+                    "rank": i + 1,
+                    "score": h.score,
+                })
+            })
+            .collect();
 
         let mut out = json!({ "results": results, "total": count });
         if ann_unavailable {
@@ -2502,14 +3119,18 @@ impl KnowledgeHandlers {
                 "note": note,
             });
         }
-        if lexical_timed_out {
-            attach_lexical_timeout_degradation(&mut out);
-        }
+        attach_lexical_timeout_degradation(&mut out, &lexical_timeouts);
         attach_hydration_degradation(&mut out, hydration_failures);
-        if !lexical_timed_out {
+        attach_member_sizing_timeout_degradation(&mut out, &excluded);
+        // The lexical stage's own budget no longer implies the request
+        // deadline is spent (issue #1930 Amendment 2), so this last check
+        // re-reads the live ambient deadline rather than the stage-local
+        // flag: skip only when the request has actually stopped, never a
+        // verb-level error for a degradation already reported above.
+        if !khive_storage::request_read_is_cancelled() {
             khive_storage::ensure_request_read_active("knowledge.suggest")?;
         }
-        Ok(out)
+        Ok((out, query_embedding))
     }
 
     pub(crate) async fn compose(
@@ -2571,6 +3192,7 @@ impl KnowledgeHandlers {
         let blend_kg = p.blend_kg.unwrap_or(true) && !atom_ids_only;
         let mut suggest_ann_unavailable = false;
         let mut suggest_hydration_failures = 0usize;
+        let mut query_embedding = QueryEmbeddingCache::default();
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
             if word_count < 10 {
@@ -2606,18 +3228,20 @@ impl KnowledgeHandlers {
 
         if is_auto {
             let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
-            let suggest_attempt = Self::suggest(
+            let suggest_attempt = Self::suggest_with_query_embedding(
                 runtime,
                 token,
                 json!({ "query": &raw_query, "limit": auto_limit }),
                 ann,
+                std::mem::take(&mut query_embedding),
             )
             .await;
             try_or_finish!(khive_storage::ensure_request_read_active(
                 "knowledge.compose"
             ));
             let suggest_result = match suggest_attempt {
-                Ok(v) => {
+                Ok((v, reused_query_embedding)) => {
+                    query_embedding = reused_query_embedding;
                     suggest_ann_unavailable = v
                         .get("ann_unavailable")
                         .and_then(|f| f.as_bool())
@@ -2653,7 +3277,7 @@ impl KnowledgeHandlers {
                 }
             };
             if let Some(results) = suggest_result.get("results").and_then(|v| v.as_array()) {
-                for r in results {
+                for r in results.iter().filter(|r| r["members"] != 0) {
                     if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
                         domain_ids.push(id.to_string());
                     }
@@ -2764,7 +3388,33 @@ impl KnowledgeHandlers {
             .collect();
 
         try_or_finish!(timing.begin(Phase::Rerank));
-        try_or_finish!(rerank_text_items(runtime, &raw_query, &mut items).await);
+        // The KG blend below requires a role-specific vector (search_kg_entities
+        // gates on it, never a generic one — #2307). When this compose call can
+        // reach the blend, attempt embed_query directly so a real failure keeps
+        // the blend on its degradation path; rerank_text_items's own
+        // combined-batch fallback still covers the failure case below. When the
+        // blend cannot run anyway (blend_kg is off, or atom_ids_only), skip the
+        // solo call and let rerank_text_items embed query + candidates in one
+        // combined batch, matching the pre-cache single-job cost.
+        if blend_kg
+            && query_embedding.role_specific.is_not_attempted()
+            && !runtime.default_embedder_name().is_empty()
+        {
+            let embedded = try_or_finish!(
+                khive_storage::await_request_read_phase(
+                    "knowledge.compose",
+                    runtime.embed_query(&raw_query),
+                )
+                .await
+            );
+            query_embedding.role_specific = match embedded {
+                Ok(v) => RoleSpecificEmbedding::Vector(v),
+                Err(_) => RoleSpecificEmbedding::Failed,
+            };
+        }
+        try_or_finish!(
+            rerank_text_items(runtime, &raw_query, &mut query_embedding, &mut items,).await
+        );
 
         let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
         let atom_cosine_scores: HashMap<String, f32> = items
@@ -2803,22 +3453,14 @@ impl KnowledgeHandlers {
                 })
                 .collect();
 
-            let q_emb = try_or_finish!(
-                khive_storage::await_request_read_phase(
-                    "knowledge.compose",
-                    runtime.embed_query(&raw_query),
-                )
-                .await
-            );
             try_or_finish!(khive_storage::ensure_request_read_active(
                 "knowledge.compose"
             ));
-            let q_emb = q_emb.ok();
 
-            if let Some(qe) = q_emb {
+            if let Some(qe) = query_embedding.any() {
                 try_or_finish!(super::compose::score_sections(
                     &raw_query,
-                    &qe,
+                    qe,
                     &atom_cosine_scores,
                     &section_map,
                     &domain_scores,
@@ -2944,6 +3586,7 @@ impl KnowledgeHandlers {
                     token,
                     &ns,
                     &raw_query,
+                    &mut query_embedding,
                     KG_BLEND_CAP,
                     floor,
                 )
@@ -3086,8 +3729,390 @@ pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, voca
 }
 
 #[cfg(test)]
+#[path = "lexical_timeout_tests.rs"]
+mod lexical_timeout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use khive_storage::types::{SqlRow, StorageResult};
+    use std::sync::{Arc, Mutex};
+
+    tokio::task_local! {
+        static TERM_PROBES: Arc<Mutex<Vec<SqlStatement>>>;
+    }
+
+    struct TermRecordingReader {
+        inner: Box<dyn khive_storage::SqlReader>,
+        probes: Arc<Mutex<Vec<SqlStatement>>>,
+    }
+
+    impl TermRecordingReader {
+        fn record(&self, statement: &SqlStatement) {
+            if statement.sql.contains("fts_knowledge MATCH") {
+                self.probes
+                    .lock()
+                    .expect("term probes")
+                    .push(statement.clone());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for TermRecordingReader {
+        async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            self.record(&statement);
+            self.inner.query_row(statement).await
+        }
+
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.record(&statement);
+            self.inner.query_all(statement).await
+        }
+
+        async fn query_scalar(
+            &mut self,
+            statement: SqlStatement,
+        ) -> StorageResult<Option<SqlValue>> {
+            self.record(&statement);
+            self.inner.query_scalar(statement).await
+        }
+
+        async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.inner.explain(statement).await
+        }
+    }
+
+    pub(super) fn record_term_probes(
+        inner: Box<dyn khive_storage::SqlReader>,
+    ) -> Box<dyn khive_storage::SqlReader> {
+        match TERM_PROBES.try_with(Arc::clone) {
+            Ok(probes) => Box::new(TermRecordingReader { inner, probes }),
+            Err(_) => inner,
+        }
+    }
+
+    fn distinct_term_query(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("distinctterm{index}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn probed_term(statement: &SqlStatement) -> &str {
+        match &statement.params[0] {
+            SqlValue::Text(term) => term,
+            other => panic!("expected bound FTS term, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_term_fan_out_is_bounded_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        for query in [
+            distinct_term_query(FTS_TERM_COUNT_LIMIT * 2),
+            "alpha beta gamma".into(),
+        ] {
+            let terms = fts5_candidate_terms(&query);
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let response = TERM_PROBES
+                .scope(
+                    probes.clone(),
+                    KnowledgeHandlers::search(
+                        &runtime,
+                        &token,
+                        json!({"query": query, "rerank": false}),
+                        &vamana::new_shared(),
+                    ),
+                )
+                .await
+                .expect("bounded search");
+            let probes = probes.lock().expect("term probes");
+            assert_eq!(probes.len(), terms.len().min(FTS_TERM_COUNT_LIMIT));
+            assert_eq!(
+                probes.iter().map(probed_term).collect::<Vec<_>>(),
+                terms
+                    .iter()
+                    .take(FTS_TERM_COUNT_LIMIT)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "admission must precede even the rarity-frequency probes"
+            );
+            assert_eq!(
+                response["candidate_provenance"]["terms_truncated"],
+                terms.len() > FTS_TERM_COUNT_LIMIT
+            );
+            assert_eq!(response["candidate_provenance"]["lexical"], "no_match");
+        }
+    }
+
+    #[tokio::test]
+    async fn term_budget_is_shared_across_decomposed_sub_queries() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        // Ten raw terms expand to twenty: the full query fits, but the
+        // combined work of all three passes must still consume one budget.
+        for count in [10, FTS_TERM_COUNT_LIMIT + 18] {
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let response = TERM_PROBES.scope(probes.clone(), KnowledgeHandlers::search(
+                &runtime, &token,
+                json!({"query": distinct_term_query(count), "decompose": true, "rerank": false}),
+                &vamana::new_shared(),
+            )).await.expect("decomposed bounded search");
+            assert_eq!(
+                probes.lock().expect("term probes").len(),
+                FTS_TERM_COUNT_LIMIT
+            );
+            assert_eq!(response["candidate_provenance"]["terms_truncated"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn term_bound_covers_staged_fallback_and_namespace_probes() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let query = distinct_term_query(FTS_TERM_COUNT_LIMIT * 2);
+        let terms = fts5_candidate_terms(&query);
+        let content = terms
+            .iter()
+            .map(|term| term.trim_matches('"'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for index in 0..4 {
+            let (namespace, content) = if index < 3 {
+                ("foreign", content.as_str())
+            } else {
+                ("local", terms.last().unwrap().trim_matches('"'))
+            };
+            writer.execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?3, ?4, '[]', 1, 'reviewed', 0, 0)".into(),
+                params: vec![
+                    SqlValue::Text(Uuid::new_v4().to_string()),
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(format!("term-bound-{index}")),
+                    SqlValue::Text(content.into()),
+                ],
+                label: None,
+            }).await.expect("seed bounded-stage fixture");
+        }
+        drop(writer);
+        let budget = FtsTermBudget::new();
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let outcome = TERM_PROBES
+            .scope(
+                probes.clone(),
+                with_phase_a_widen_ceiling_override(
+                    2,
+                    super::fetch_fts_candidates(
+                        &runtime,
+                        "local",
+                        &query,
+                        None,
+                        &[],
+                        &[],
+                        5,
+                        &budget,
+                        LexicalStage::new(
+                            LexicalPass::Full,
+                            tokio::time::Instant::now(),
+                            lexical_stage_budget(),
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .expect("bounded staged fetch");
+        assert_eq!(outcome.state, LexicalCandidateState::NoMatch);
+        assert!(outcome.atoms.is_empty() && outcome.timeout.is_none());
+        assert!(budget.truncated());
+        let probes = probes.lock().expect("term probes");
+        let allowed: HashSet<_> = terms
+            .iter()
+            .take(FTS_TERM_COUNT_LIMIT)
+            .map(String::as_str)
+            .collect();
+        assert!(probes
+            .iter()
+            .all(|statement| allowed.contains(probed_term(statement))));
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT rowid"))
+                .count(),
+            2 * FTS_TERM_COUNT_LIMIT
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT a.*"))
+                .count(),
+            FTS_TERM_COUNT_LIMIT
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement
+                    .sql
+                    .starts_with("SELECT 1 AS present FROM fts_knowledge"))
+                .count(),
+            FTS_TERM_COUNT_LIMIT
+        );
+    }
+
+    #[test]
+    fn lexical_candidate_state_merge_preserves_completed_and_timed_out_passes() {
+        use LexicalCandidateState::*;
+        for (states, expected) in [
+            (vec![], NoMatch),
+            (vec![NoMatch, NoMatch], NoMatch),
+            (vec![NoMatch, Filtered], Filtered),
+            (vec![Filtered, Matched], Matched),
+            (vec![TimedOut, TimedOut], TimedOut),
+            (vec![TimedOut, NoMatch], PartialTimeout),
+            (vec![Matched, TimedOut], PartialTimeout),
+            (vec![PartialTimeout, Matched], PartialTimeout),
+        ] {
+            assert_eq!(
+                LexicalCandidateState::merge(&states),
+                expected,
+                "{states:?}"
+            );
+            let reversed: Vec<_> = states.into_iter().rev().collect();
+            assert_eq!(LexicalCandidateState::merge(&reversed), expected);
+        }
+    }
+
+    async fn seed_candidate_state_fixture(runtime: &KhiveRuntime) {
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer.execute(SqlStatement {
+            sql: "INSERT INTO knowledge_atoms \
+                  (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) \
+                  VALUES \
+                  ('92700000-0000-0000-0000-000000000001', 'local', 'newest-unrelated', \
+                   'Newest Unrelated', 'ordinary background content', '[]', 1, 'reviewed', 20, 20), \
+                  ('92700000-0000-0000-0000-000000000002', 'local', 'filtered-match', \
+                   'Filtered Match', 'zzfilteredzz', '[]', 0, 'draft', 10, 10)".into(),
+            params: Vec::new(),
+            label: None,
+        }).await.expect("seed candidate state rows");
+    }
+
+    #[tokio::test]
+    async fn true_lexical_miss_does_not_return_newest_rows() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_candidate_state_fixture(&runtime).await;
+        let query = "zzgenuinelyabsentzz";
+        let outcome = fetch_fts_candidates(&runtime, "local", query, None, &[], &[], 5)
+            .await
+            .expect("true lexical miss");
+        assert!(
+            outcome.atoms.is_empty(),
+            "a true FTS miss must not return recent rows"
+        );
+        assert_eq!(outcome.state, LexicalCandidateState::NoMatch);
+        assert!(outcome.timeout.is_none());
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let response = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": query, "rerank": false}),
+            &vamana::new_shared(),
+        )
+        .await
+        .expect("public search");
+        assert_eq!(
+            response,
+            json!({
+                "results": [], "total": 0,
+                "candidate_provenance": {"lexical": "no_match", "fallback": "none", "terms_truncated": false},
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_candidate_state_distinguishes_filtered_match() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_candidate_state_fixture(&runtime).await;
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        for (include_drafts, state, total) in [(false, "filtered", 0), (true, "matched", 1)] {
+            let response = KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": "zzfilteredzz", "rerank": false, "include_drafts": include_drafts}),
+                &ann,
+            )
+            .await
+            .expect("filtered search");
+            assert_eq!(
+                response["candidate_provenance"],
+                json!({"lexical": state, "fallback": "none", "terms_truncated": false})
+            );
+            assert_eq!(response["total"], total);
+            if include_drafts {
+                assert_eq!(response["results"][0]["slug"], "filtered-match");
+            }
+        }
+    }
+
+    async fn fetch_fts_candidates(
+        runtime: &KhiveRuntime,
+        ns: &str,
+        raw_query: &str,
+        type_filter: Option<&str>,
+        statuses: &[String],
+        exclude_statuses: &[&str],
+        fetch_limit: usize,
+    ) -> Result<FtsFetchOutcome, RuntimeError> {
+        super::fetch_fts_candidates(
+            runtime,
+            ns,
+            raw_query,
+            type_filter,
+            statuses,
+            exclude_statuses,
+            fetch_limit,
+            &FtsTermBudget::new(),
+            LexicalStage::new(
+                LexicalPass::Full,
+                tokio::time::Instant::now(),
+                lexical_stage_budget(),
+            ),
+        )
+        .await
+    }
+
+    struct ProbeRecordingReader {
+        inner: Box<dyn khive_storage::SqlReader>,
+        probes: Vec<(SqlStatement, usize)>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for ProbeRecordingReader {
+        async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            self.inner.query_row(statement).await
+        }
+
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            let rows = self.inner.query_all(statement.clone()).await?;
+            self.probes.push((statement, rows.len()));
+            Ok(rows)
+        }
+
+        async fn query_scalar(
+            &mut self,
+            statement: SqlStatement,
+        ) -> StorageResult<Option<SqlValue>> {
+            self.inner.query_scalar(statement).await
+        }
+
+        async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.inner.explain(statement).await
+        }
+    }
 
     #[tokio::test]
     async fn compose_direct_handler_rejects_namespace_token_mismatch() {
@@ -3115,17 +4140,214 @@ mod tests {
     }
 
     #[test]
-    fn fts_candidate_expression_recalls_non_contiguous_terms() {
+    fn fts_candidate_terms_recalls_non_contiguous_terms() {
         assert_eq!(
-            fts5_candidate_expression("alpha beta alpha and"),
+            fts5_candidate_terms("alpha beta alpha and").join(" OR "),
             "\"alpha\" OR \"alphas\" OR \"beta\" OR \"betas\""
         );
-        assert_eq!(fts5_candidate_expression("RAG"), "\"rag\" OR \"rags\"");
         assert_eq!(
-            fts5_candidate_expression("the and"),
+            fts5_candidate_terms("RAG").join(" OR "),
+            "\"rag\" OR \"rags\""
+        );
+        assert_eq!(
+            fts5_candidate_terms("the and").join(" OR "),
             "\"the and\"",
             "stop-only queries retain the exact-phrase fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn rarity_probes_are_capped_and_sort_rare_terms_before_common_terms() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_100, 20).await;
+        let mut reader = ProbeRecordingReader {
+            inner: runtime.sql().reader().await.expect("reader"),
+            probes: Vec::new(),
+        };
+        let terms = ["\"term1\"", "\"term18\"", "\"missing\"", "\"term11\""];
+        let ordered = rarest_fts_terms_first(
+            &mut reader,
+            terms.iter().map(|term| (*term).to_string()).collect(),
+            &mut LexicalStage::new(
+                LexicalPass::Full,
+                tokio::time::Instant::now(),
+                lexical_stage_budget(),
+            ),
+        )
+        .await
+        .expect("frequency probes");
+        assert_eq!(ordered, ["\"term11\"", "\"term18\"", "\"term1\""]);
+        assert_eq!(reader.probes.len(), terms.len());
+        assert_eq!(
+            reader
+                .probes
+                .iter()
+                .map(|(_, count)| *count)
+                .collect::<Vec<_>>(),
+            [501, 55, 0, 55]
+        );
+        for (statement, count) in &reader.probes {
+            assert!(matches!(statement.params[1], SqlValue::Integer(501)));
+            assert!(*count <= FTS_TERM_LIMIT + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fts_candidates_pin_the_rowid_prefix_boundary() {
+        for (regular_count, best_is_admitted) in [
+            (FTS_TERM_LIMIT * PHASE_A_OVERFETCH_FACTOR, false),
+            (FTS_TERM_LIMIT - 1, true),
+        ] {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE entries(n) AS ( \
+                              VALUES(1) UNION ALL SELECT n + 1 FROM entries WHERE n < ?1 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              rowid, id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) \
+                          SELECT n, printf('92700000-0000-0000-0000-%012d', n), \
+                              'local', printf('prefix-%06d', n), 'Prefix Document', \
+                              'zzprefixzz padding padding padding padding padding padding padding', \
+                              '[]', 1, 'reviewed', 0, 0 FROM entries"
+                        .into(),
+                    params: vec![SqlValue::Integer(regular_count as i64)],
+                    label: None,
+                })
+                .await
+                .expect("seed early matches");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              rowid, id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) VALUES ( \
+                              ?1, '92700000-0000-0000-0001-000000000000', 'local', \
+                              'zzprefix-best', 'Prefix Document', ?2, '[]', 1, 'reviewed', 0, 0)"
+                        .into(),
+                    params: vec![
+                        SqlValue::Integer((regular_count + 1) as i64),
+                        SqlValue::Text("zzprefixzz ".repeat(8)),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("seed late repeated match");
+            drop(writer);
+
+            let mut reader = access.reader().await.expect("reader");
+            let best = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT a.rowid, a.slug FROM fts_knowledge \
+                          JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                          WHERE fts_knowledge MATCH ?1 AND a.namespace = 'local' \
+                            AND a.deleted_at IS NULL \
+                          ORDER BY bm25(fts_knowledge), a.slug LIMIT 1"
+                        .into(),
+                    params: vec![SqlValue::Text("\"zzprefixzz\"".into())],
+                    label: None,
+                })
+                .await
+                .expect("BM25 control query")
+                .expect("BM25 match");
+            assert_eq!(row_str(&best, "slug").as_deref(), Some("zzprefix-best"));
+            assert_eq!(row_i64(&best, "rowid"), Some((regular_count + 1) as i64));
+            drop(reader);
+
+            let outcome = fetch_fts_candidates(
+                &runtime,
+                "local",
+                "zzprefixzz",
+                None,
+                &[],
+                &[],
+                FTS_TERM_LIMIT,
+            )
+            .await
+            .expect("bounded candidate fetch");
+            assert!(outcome.timeout.is_none());
+            assert_eq!(outcome.atoms.len(), FTS_TERM_LIMIT);
+            assert_eq!(
+                outcome.atoms.iter().any(|atom| atom.slug == "zzprefix-best"),
+                best_is_admitted,
+                "BM25-best row admission must follow the rowid window; regular_count={regular_count}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_a_limit_uses_index_order_without_sorting_matches() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+        let access = runtime.sql();
+        let mut reader = access.reader().await.expect("reader");
+        let statement = phase_a_rowids_statement("\"term1\"", 3);
+        for (query, should_sort) in [
+            (statement.sql.clone(), false),
+            (
+                statement
+                    .sql
+                    .replace("ORDER BY rowid", "ORDER BY bm25(fts_knowledge), rowid"),
+                true,
+            ),
+        ] {
+            let plan = reader
+                .query_all(SqlStatement {
+                    sql: format!("EXPLAIN QUERY PLAN {query}"),
+                    params: statement.params.clone(),
+                    label: None,
+                })
+                .await
+                .expect("query plan");
+            assert!(!plan.is_empty());
+            let sorts = plan.iter().any(|row| {
+                row_str(row, "detail").is_some_and(|detail| detail.contains("TEMP B-TREE"))
+            });
+            assert_eq!(sorts, should_sort, "plan: {plan:?}");
+        }
+        let rows = reader.query_all(statement).await.expect("bounded rowids");
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| row_i64(row, "rowid").unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rare_term_survives_stage_expiry_independent_of_query_order() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+        let deadline = std::time::Duration::from_secs(1);
+        for query in ["term1 term18", "term18 term1"] {
+            let outcome = khive_storage::scope_request_read_deadline(
+                deadline,
+                FTS_TEST_DEADLINE_ADVANCE.scope(
+                    FtsTestDeadlineAdvance {
+                        after_completed_terms: 1,
+                        by: deadline,
+                    },
+                    fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL),
+                ),
+            )
+            .await
+            .expect("partial fetch");
+            assert!(outcome.timeout.is_some());
+            assert_eq!(outcome.state, LexicalCandidateState::PartialTimeout);
+            assert_eq!(
+                outcome.atoms.len(),
+                50,
+                "the rarer term must complete first"
+            );
+            assert!(outcome
+                .atoms
+                .iter()
+                .all(|atom| atom.content.contains("term18")));
+        }
     }
 
     /// Issue #1930: the old OR-joined query returned an all-or-nothing error
@@ -3153,7 +4375,6 @@ mod tests {
 
         let query = "term0 term1";
         let deadline = std::time::Duration::from_millis(650);
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
 
         let new_result = khive_storage::scope_request_read_deadline(
             deadline,
@@ -3162,22 +4383,17 @@ mod tests {
                     after_completed_terms: 1,
                     by: deadline,
                 },
-                fetch_fts_candidates(
-                    &runtime,
-                    "local",
-                    query,
-                    None,
-                    &[],
-                    &[],
-                    CANDIDATE_POOL,
-                    &term_budget,
-                ),
+                fetch_fts_candidates(&runtime, "local", query, None, &[], &[], CANDIDATE_POOL),
             ),
         )
         .await;
         let outcome = new_result.expect(
             "the per-term fetch must return partial degradation when the controlled deadline \
              expires between term queries",
+        );
+        assert!(
+            outcome.timeout.is_some(),
+            "the controlled deadline must be observed"
         );
         assert_eq!(outcome.state, LexicalCandidateState::PartialTimeout);
         assert!(
@@ -3298,20 +4514,11 @@ mod tests {
         }
 
         let fetch_limit = 5;
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let outcome = fetch_fts_candidates(
-            &runtime,
-            "local",
-            "alpha beta",
-            None,
-            &[],
-            &[],
-            fetch_limit,
-            &term_budget,
-        )
-        .await
-        .expect("fetch must not error");
-        assert_eq!(outcome.state, LexicalCandidateState::Matched);
+        let outcome =
+            fetch_fts_candidates(&runtime, "local", "alpha beta", None, &[], &[], fetch_limit)
+                .await
+                .expect("fetch must not error");
+        assert!(outcome.timeout.is_none());
         assert_eq!(outcome.atoms.len(), fetch_limit);
 
         let beta_present = outcome
@@ -3331,277 +4538,755 @@ mod tests {
         );
     }
 
-    /// Issue #1982: a genuine FTS miss is not a request to browse the newest
-    /// corpus rows. The former bounded full-scan fallback returned this atom
-    /// despite there being no lexical overlap, and rank fusion could then
-    /// turn that arbitrary recency order into a topical-looking score.
-    #[tokio::test]
-    async fn true_lexical_miss_does_not_return_newest_rows() {
+    /// Issue #1930 Amendment 2: the lexical stage's own budget must not
+    /// cancel the rest of the request when it expires. Paused Tokio time
+    /// plus the existing per-term deadline control place the expiry
+    /// deterministically between two term queries, inside a nested
+    /// `scope_request_read_deadline` call mirroring exactly what
+    /// `search_core` does around `fetch_fts_candidates` (a narrow stage
+    /// scope nested inside a much longer outer one).
+    ///
+    /// Before this change, `search_core` called `fetch_fts_candidates`
+    /// directly under whatever deadline the caller installed, so this same
+    /// expiry — with no separate inner scope to pop back out of — left the
+    /// *outer* deadline expired too, and `ensure_request_read_active`
+    /// called afterward, still nested in that one shared scope, returned
+    /// `Err`. Confirmed by running this test against the fetch called
+    /// directly (no stage-budget wrap) before adding the wrap: `still_active`
+    /// came back `Err(Timeout { .. })` — this assertion is the red-before
+    /// case for that call shape; the wrap makes it green.
+    #[tokio::test(start_paused = true)]
+    async fn lexical_stage_budget_expiry_does_not_cancel_the_request() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        {
-            let access = runtime.sql();
-            let mut writer = access.writer().await.expect("writer");
-            writer
-                .execute(SqlStatement {
-                    sql: "INSERT INTO knowledge_atoms ( \
-                              id, namespace, slug, name, content, tags, properties, finalized, \
-                              status, source_uri, source_type, created_at, updated_at, deleted_at \
-                          ) VALUES ( \
-                              '92000000-0000-0000-0000-000000000001', 'local', \
-                              'newest-unrelated', 'Newest Unrelated', \
-                              'content about retrieval systems and vector indexes', '[]', NULL, \
-                              1, 'reviewed', NULL, NULL, 999, 999, NULL \
-                          )"
-                    .to_string(),
-                    params: Vec::new(),
-                    label: None,
-                })
+        const N: u32 = 1_000;
+        const VOCAB: u32 = 20;
+        seed_low_overlap_corpus(&runtime, N, VOCAB).await;
+
+        let query = "term0 term1";
+        // This test wraps `fetch_fts_candidates` in its own explicit
+        // `scope_request_read_deadline`, exactly mirroring what `search_core`
+        // does around it in production — it never goes through
+        // `lexical_stage_budget()`'s override seam, so a literal duration is
+        // enough here.
+        let budget = std::time::Duration::from_millis(50);
+        let outer_deadline = std::time::Duration::from_secs(60);
+
+        let (fetch, still_active) =
+            khive_storage::scope_request_read_deadline(outer_deadline, async {
+                let fetch = khive_storage::scope_request_read_deadline(
+                    budget,
+                    FTS_TEST_DEADLINE_ADVANCE.scope(
+                        FtsTestDeadlineAdvance {
+                            after_completed_terms: 1,
+                            by: budget,
+                        },
+                        fetch_fts_candidates(
+                            &runtime,
+                            "local",
+                            query,
+                            None,
+                            &[],
+                            &[],
+                            CANDIDATE_POOL,
+                        ),
+                    ),
+                )
                 .await
-                .expect("seed unrelated atom");
-        }
+                .expect("the fetch must not hard-error on its own stage budget");
 
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let outcome = fetch_fts_candidates(
-            &runtime,
-            "local",
-            "zzzxqvnonexistent",
-            None,
-            &[],
-            &[],
-            CANDIDATE_POOL,
-            &term_budget,
-        )
-        .await
-        .expect("lexical miss must not error");
+                let still_active =
+                    khive_storage::ensure_request_read_active("test.lexical_stage_budget");
+                (fetch, still_active)
+            })
+            .await;
 
-        assert_eq!(outcome.state, LexicalCandidateState::NoMatch);
         assert!(
-            outcome.atoms.is_empty(),
-            "a true lexical miss must stay empty, not return newest rows: {:?}",
+            fetch.timeout.is_some(),
+            "the lexical stage's own narrower budget must be observed"
+        );
+        assert!(
+            !fetch.atoms.is_empty(),
+            "candidates from the completed term must survive the stage degradation"
+        );
+        assert!(
+            still_active.is_ok(),
+            "the outer request deadline must still be active once the lexical \
+             stage's own budget expires and its scope returns; got {still_active:?}"
+        );
+    }
+
+    /// Companion pair for issue #1930 Amendment 2's phase-A overfetch/widen
+    /// behavior. A term whose top bm25/rowid page is entirely status-
+    /// ineligible must still surface its eligible rows once widening looks
+    /// past that page — 30 `deprecated` rows are inserted first (lower
+    /// rowids, so they sort first at equal bm25) and 3 `reviewed` rows
+    /// inserted after (higher rowids). `fetch_limit=5` with a single real
+    /// term gives `per_term_limit=5` and a first-round probe of `5*4=20`,
+    /// which the 30 deprecated rows alone fill — round one must see zero
+    /// eligible rows, forcing the widen arm to reach the 3 reviewed rows in
+    /// round two (probe 80, corpus only has 33 total so phase A returns
+    /// fewer than it asked for, correctly stopping further widening).
+    #[tokio::test]
+    async fn phase_b_widening_recovers_eligible_rows_behind_an_ineligible_top_page() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 29 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92000000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzwidenzz-dep-%02d', x.n), printf('Widen Dep %02d', x.n), \
+                          'synthetic content about zzwidenzz only', '[]', NULL, 1, \
+                          'deprecated', NULL, NULL, x.n, x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed deprecated widen rows");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 2 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92100000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzwidenzz-ok-%02d', x.n), printf('Widen Ok %02d', x.n), \
+                          'synthetic content about zzwidenzz only', '[]', NULL, 1, \
+                          'reviewed', NULL, NULL, 100 + x.n, 100 + x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed reviewed widen rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzwidenzz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(outcome.timeout.is_none());
+        assert_eq!(
+            outcome.atoms.len(),
+            3,
+            "only the 3 reviewed rows are eligible; widening must have looked \
+             past the all-deprecated first page to find them: {:?}",
             outcome
                 .atoms
                 .iter()
-                .map(|atom| atom.slug.as_str())
+                .map(|a| a.slug.as_str())
                 .collect::<Vec<_>>()
         );
-
-        let token = runtime.authorize(Namespace::local()).expect("local token");
-        let ann = vamana::new_shared();
-        let off_topic = KnowledgeHandlers::search(
-            &runtime,
-            &token,
-            json!({"query": "zzzxqvnonexistent", "rerank": false}),
-            &ann,
-        )
-        .await
-        .expect("off-topic search must not error");
-        assert_eq!(off_topic["total"], 0);
-        assert_eq!(off_topic["candidate_provenance"]["lexical"], "no_match");
-        assert_eq!(off_topic["candidate_provenance"]["fallback"], "none");
-
-        let lexical = KnowledgeHandlers::search(
-            &runtime,
-            &token,
-            json!({"query": "retrieval", "rerank": false}),
-            &ann,
-        )
-        .await
-        .expect("lexical search must not error");
-        assert_eq!(lexical["candidate_provenance"]["lexical"], "matched");
-        assert_eq!(lexical["candidate_provenance"]["fallback"], "none");
-        let first = &lexical["results"][0];
-        assert_eq!(first["slug"], "newest-unrelated");
-        assert_eq!(first["score_provenance"]["sources"], json!(["lexical"]));
-        assert_eq!(first["score_provenance"]["embedding_rerank"], false);
-        assert_eq!(
-            first["score_provenance"]["normalization"],
-            "s_over_s_plus_1"
+        assert!(
+            outcome
+                .atoms
+                .iter()
+                .all(|a| a.slug.starts_with("zzwidenzz-ok-")),
+            "no deprecated row may survive into the eligible set: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
         );
-        assert_eq!(first["score_provenance"]["calibrated"], false);
     }
 
+    /// Control for the widening test above: a term with genuinely fewer
+    /// matches than `per_term_limit` (2 reviewed rows, cap 5) must return
+    /// exactly those 2 without fabricating more. Phase A's first probe
+    /// (`5*4=20`) already exceeds the corpus size for this term, so it
+    /// returns short on round one and widening never triggers at all — this
+    /// is what proves `phase_a_full` correctly detects exhaustion instead
+    /// of retrying up to the ceiling.
     #[tokio::test]
-    async fn lexical_candidate_state_distinguishes_filtered_match() {
+    async fn phase_b_accepts_a_genuine_shortfall_without_widening() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        {
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92200000-0000-0000-0000-000000000000', 'local', 'zzsparsezz-00', \
+                       'Sparse 00', 'synthetic content about zzsparsezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92200000-0000-0000-0000-000000000001', 'local', 'zzsparsezz-01', \
+                       'Sparse 01', 'synthetic content about zzsparsezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed sparse rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzsparsezz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(outcome.timeout.is_none());
+        assert_eq!(
+            outcome.atoms.len(),
+            2,
+            "a term with only 2 genuinely eligible matches must return exactly \
+             those, not fabricate more via widening: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase A carries no namespace predicate (it is index-only); the
+    /// namespace check moves entirely to phase B's hydration query. Seed a
+    /// matching row in another namespace and confirm it is hydrated out —
+    /// never returned — even though phase A's rowid list spans both
+    /// namespaces.
+    #[tokio::test]
+    async fn phase_a_cross_namespace_matches_are_hydrated_out() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92300000-0000-0000-0000-000000000000', 'local', 'zzcrossns-local', \
+                       'Cross NS Local', 'synthetic content about zzcrossns only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92300000-0000-0000-0000-000000000001', 'other', 'zzcrossns-other', \
+                       'Cross NS Other', 'synthetic content about zzcrossns only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed cross-namespace rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzcrossns", None, &[], &[], 10)
+            .await
+            .expect("fetch must not error");
+
+        assert!(outcome.timeout.is_none());
+        assert_eq!(
+            outcome.atoms.len(),
+            1,
+            "only the local-namespace row is eligible: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| (a.slug.as_str(), a.namespace.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.atoms[0].namespace, "local");
+        assert_eq!(outcome.atoms[0].slug, "zzcrossns-local");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual 200000-row lexical namespace measurement"]
+    async fn measure_cross_namespace_lexical_work() {
+        async fn seed_namespace(
+            runtime: &KhiveRuntime,
+            ns: &str,
+            id_prefix: &str,
+            rows: i64,
+            matching_rows: i64,
+        ) {
             let access = runtime.sql();
             let mut writer = access.writer().await.expect("writer");
             writer
                 .execute(SqlStatement {
-                    sql: "INSERT INTO knowledge_atoms ( \
-                              id, namespace, slug, name, content, tags, properties, finalized, \
-                              status, source_uri, source_type, created_at, updated_at, deleted_at \
-                          ) VALUES ( \
-                              '92000000-0000-0000-0000-000000000002', 'local', \
-                              'filtered-draft', 'Filtered Draft', \
-                              'uniquefilteredtoken content', '[]', NULL, 0, 'draft', \
-                              NULL, NULL, 1, 1, NULL \
-                          )"
+                    sql: "WITH RECURSIVE seq(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?3 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) \
+                          SELECT printf('%s-%012d', ?2, n), ?1, \
+                                 printf('measurement-%06d', n), 'Measurement Row', \
+                                 CASE WHEN n < ?4 THEN \
+                                     'namespacechannel content with ordinary padding text' \
+                                 ELSE 'unrelated content with ordinary padding text' END, \
+                                 '[]', 1, 'reviewed', n, n FROM seq"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(ns.into()),
+                        SqlValue::Text(id_prefix.into()),
+                        SqlValue::Integer(rows),
+                        SqlValue::Integer(matching_rows),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("seed namespace corpus");
+        }
+
+        for local_matches in [0, 3] {
+            for foreign_present in [true, false] {
+                let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+                if foreign_present {
+                    seed_namespace(
+                        &runtime,
+                        "tenant-a",
+                        "92500000-0000-0000-0000",
+                        200_000,
+                        200_000,
+                    )
+                    .await;
+                }
+                seed_namespace(
+                    &runtime,
+                    "tenant-b",
+                    "92600000-0000-0000-0000",
+                    10,
+                    local_matches,
+                )
+                .await;
+
+                for (mode, query) in [
+                    ("single", "namespacechannel"),
+                    ("multi", "namespacechannel absentchannel"),
+                ] {
+                    let start = std::time::Instant::now();
+                    let outcome = khive_storage::scope_request_read_deadline(
+                        lexical_stage_budget(),
+                        fetch_fts_candidates(
+                            &runtime,
+                            "tenant-b",
+                            query,
+                            None,
+                            &[],
+                            &[],
+                            CANDIDATE_POOL,
+                        ),
+                    )
+                    .await
+                    .expect("bounded lexical fetch");
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    assert!(outcome
+                        .atoms
+                        .iter()
+                        .all(|atom| atom.namespace == "tenant-b"));
+                    println!(
+                        "LEXICAL_NAMESPACE mode={mode} foreign_present={foreign_present} local_matches={local_matches} rows={} lexical_elapsed_ms={elapsed_ms:.3} lexical_timeout={}",
+                        outcome.atoms.len(),
+                        outcome.timeout.is_some(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Foreign FTS matches must not change the public candidate state or
+    /// admit unrelated local rows. This retains the #2396 namespace boundary
+    /// after removing the recent-row fallback.
+    #[tokio::test]
+    async fn empty_result_fallback_never_leaks_a_foreign_namespace_match() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92400000-0000-0000-0000-000000000000', 'local', 'unrelated-local-atom', \
+                       'Unrelated Local Atom', 'generic filler text with no special term', \
+                       '[]', NULL, 1, 'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92400000-0000-0000-0000-000000000001', 'tenant-b', 'foreign-term-atom', \
+                       'Foreign Term Atom', 'synthetic content about zzoraclezz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
                     .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed oracle rows");
+        drop(writer);
+
+        let foreign_match =
+            fetch_fts_candidates(&runtime, "local", "zzoraclezz", None, &[], &[], 5)
+                .await
+                .expect("fetch must not error");
+        let no_match =
+            fetch_fts_candidates(&runtime, "local", "zzoracleabsentzz", None, &[], &[], 5)
+                .await
+                .expect("fetch must not error");
+
+        assert!(foreign_match.timeout.is_none());
+        assert!(no_match.timeout.is_none());
+        assert_eq!(foreign_match.state, LexicalCandidateState::NoMatch);
+        assert_eq!(foreign_match.state, no_match.state);
+        let foreign_slugs: Vec<&str> = foreign_match
+            .atoms
+            .iter()
+            .map(|a| a.slug.as_str())
+            .collect();
+        let absent_slugs: Vec<&str> = no_match.atoms.iter().map(|a| a.slug.as_str()).collect();
+        assert_eq!(
+            foreign_slugs, absent_slugs,
+            "a term matching only in another namespace must produce the exact \
+             same response as a term matching nowhere at all — any \
+             difference is a cross-namespace existence oracle"
+        );
+        assert!(
+            foreign_slugs.is_empty(),
+            "unrelated recent rows are not candidates"
+        );
+    }
+
+    /// A real indexed match survives, without unrelated recent rows.
+    #[tokio::test]
+    async fn empty_result_fallback_control_index_match_skips_fallback() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES \
+                      ('92400000-0000-0000-0000-000000000002', 'local', 'indexed-term-atom', \
+                       'Indexed Term Atom', 'synthetic content about zzindexedzz only', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 0, 0, NULL), \
+                      ('92400000-0000-0000-0000-000000000003', 'local', 'unrelated-recent-atom', \
+                       'Unrelated Recent Atom', 'generic filler text with no special term', '[]', NULL, 1, \
+                       'reviewed', NULL, NULL, 1, 1, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed control rows");
+        drop(writer);
+
+        let outcome = fetch_fts_candidates(&runtime, "local", "zzindexedzz", None, &[], &[], 5)
+            .await
+            .expect("fetch must not error");
+
+        assert!(outcome.timeout.is_none());
+        assert_eq!(
+            outcome.atoms.len(),
+            1,
+            "only the indexed match may be returned, never the unrelated \
+             fallback-only row: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.atoms[0].slug, "indexed-term-atom");
+        assert_eq!(outcome.state, LexicalCandidateState::Matched);
+    }
+
+    #[tokio::test]
+    async fn filtered_candidate_state_is_stable_behind_a_foreign_ceiling_prefix() {
+        let mut public_responses = Vec::new();
+        for foreign_prefix in [false, true] {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            if foreign_prefix {
+                writer
+                    .execute(SqlStatement {
+                        sql: "WITH RECURSIVE x(n) AS ( \
+                                  VALUES(1) UNION ALL SELECT n + 1 FROM x WHERE n < 20 \
+                              ) \
+                              INSERT INTO knowledge_atoms ( \
+                                  rowid, id, namespace, slug, name, content, tags, finalized, \
+                                  status, created_at, updated_at \
+                              ) \
+                              SELECT x.n, printf('92710000-0000-0000-0000-%012d', x.n), \
+                                  'foreign', printf('foreign-prefix-%02d', x.n), 'Foreign Match', \
+                                  'zzfilteredceilingzz', '[]', 1, 'reviewed', 0, 0 \
+                              FROM x"
+                            .into(),
+                        params: Vec::new(),
+                        label: None,
+                    })
+                    .await
+                    .expect("seed foreign ceiling prefix");
+            }
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              rowid, id, namespace, slug, name, content, tags, finalized, \
+                              status, created_at, updated_at \
+                          ) VALUES ( \
+                              21, '92710000-0000-0000-0000-000000000021', 'local', \
+                              'local-filtered-match', 'Local Filtered Match', \
+                              'zzfilteredceilingzz', '[]', 0, 'draft', 0, 0 \
+                          )"
+                    .into(),
                     params: Vec::new(),
                     label: None,
                 })
                 .await
-                .expect("seed filtered atom");
-        }
+                .expect("seed identical local filtered match");
+            drop(writer);
 
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let outcome = fetch_fts_candidates(
-            &runtime,
-            "local",
-            "uniquefilteredtoken",
-            None,
-            &[],
-            &["draft", "deprecated"],
-            CANDIDATE_POOL,
-            &term_budget,
+            let mut reader = access.reader().await.expect("reader");
+            let rows = reader
+                .query_all(phase_a_rowids_statement("\"zzfilteredceilingzz\"", 20))
+                .await
+                .expect("inspect ceiling window");
+            let rowids: Vec<_> = rows
+                .iter()
+                .filter_map(|row| row_i64(row, "rowid"))
+                .collect();
+            if foreign_prefix {
+                assert_eq!(rowids, (1..=20).collect::<Vec<i64>>());
+            } else {
+                assert_eq!(rowids, [21]);
+            }
+            drop(reader);
+
+            let token = runtime.authorize(Namespace::local()).expect("local token");
+            let ann = vamana::new_shared();
+            let response = with_phase_a_widen_ceiling_override(20, async {
+                KnowledgeHandlers::search(
+                    &runtime,
+                    &token,
+                    json!({"query": "zzfilteredceilingzz", "rerank": false}),
+                    &ann,
+                )
+                .await
+            })
+            .await
+            .expect("public filtered search");
+            assert_eq!(
+                response,
+                json!({
+                    "results": [], "total": 0,
+                    "candidate_provenance": {"lexical": "filtered", "fallback": "none", "terms_truncated": false},
+                }),
+                "foreign matches must not change the same local filtered result: {foreign_prefix}"
+            );
+            public_responses
+                .push(serde_json::to_vec(&response).expect("serialize public response"));
+        }
+        assert_eq!(public_responses[0], public_responses[1]);
+    }
+
+    /// Issue #2396 fix 2: when phase A's widening reaches the ceiling and the
+    /// eligible set is still short, more than `ceiling` ineligible top-ranked
+    /// rows must not be allowed to hide an eligible row further down the
+    /// bm25 ranking than phase A ever probed. The ceiling is overridden down
+    /// to 20 so the fixture can stay small: 20 `deprecated` rows (lower
+    /// rowids, so they sort first at equal bm25) exactly fill the first — and
+    /// at this override, only — probe window, so `eligible_now` is empty
+    /// right at the ceiling. The eligibility-scoped fallback query must then
+    /// recover the 2 `reviewed` rows seeded after them (higher rowids, never
+    /// inside the ceiling-bounded window). The ordinary (non-ceiling)
+    /// widening path and its shortfall control are covered by
+    /// `phase_b_widening_recovers_eligible_rows_behind_an_ineligible_top_page`
+    /// and `phase_b_accepts_a_genuine_shortfall_without_widening` above.
+    #[tokio::test]
+    async fn phase_b_ceiling_exhaustion_recovers_eligible_row_via_scoped_fallback() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 19 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92500000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzceilingzz-dep-%02d', x.n), printf('Ceiling Dep %02d', x.n), \
+                          'synthetic content about zzceilingzz only', '[]', NULL, 1, \
+                          'deprecated', NULL, NULL, x.n, x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed deprecated ceiling rows");
+        writer
+            .execute(SqlStatement {
+                sql: "WITH RECURSIVE x(n) AS ( \
+                          VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 1 \
+                      ) \
+                      INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) \
+                      SELECT \
+                          printf('92510000-0000-0000-0000-%012d', x.n), \
+                          'local', printf('zzceilingzz-ok-%02d', x.n), printf('Ceiling Ok %02d', x.n), \
+                          'synthetic content about zzceilingzz only', '[]', NULL, 1, \
+                          'reviewed', NULL, NULL, 100 + x.n, 100 + x.n, NULL \
+                      FROM x"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed reviewed ceiling rows");
+        drop(writer);
+
+        let outcome = with_phase_a_widen_ceiling_override(20, async {
+            fetch_fts_candidates(&runtime, "local", "zzceilingzz", None, &[], &[], 5).await
+        })
+        .await
+        .expect("fetch must not error");
+
+        assert!(outcome.timeout.is_none());
+        assert_eq!(
+            outcome.atoms.len(),
+            2,
+            "the 2 reviewed rows sit beyond the ceiling-bounded phase-A \
+             window; only the eligibility-scoped fallback query can recover \
+             them: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .atoms
+                .iter()
+                .all(|a| a.slug.starts_with("zzceilingzz-ok-")),
+            "no deprecated row may survive into the eligible set: {:?}",
+            outcome
+                .atoms
+                .iter()
+                .map(|a| a.slug.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A member-token-sizing timeout returns no measurements, never a
+    /// placeholder zero that could be admitted as a free fold candidate.
+    #[tokio::test]
+    async fn member_token_sizes_report_timeout_instead_of_a_measured_zero() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let access = runtime.sql();
+        let mut writer = access.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms ( \
+                          id, namespace, slug, name, content, tags, properties, finalized, \
+                          status, source_uri, source_type, created_at, updated_at, deleted_at \
+                      ) VALUES ( \
+                          '92600000-0000-0000-0000-000000000000', 'local', 'sizing-member-atom', \
+                          'Sizing Member Atom', \
+                          'enough body content to price a non-zero token size for the owning domain once member sizing actually runs to completion', \
+                          '[]', NULL, 1, 'reviewed', NULL, NULL, 0, 0, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed member atom");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_domains ( \
+                          id, namespace, slug, name, description, tags, members, status, \
+                          created_at, updated_at, deleted_at \
+                      ) VALUES ( \
+                          '92600000-0000-0000-0000-000000000001', 'local', 'sizing-domain', \
+                          'Sizing Domain', NULL, '[]', '[\"sizing-member-atom\"]', 'reviewed', \
+                          0, 0, NULL)"
+                    .to_string(),
+                params: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed domain");
+        drop(writer);
+
+        let domain_ids = vec!["92600000-0000-0000-0000-000000000001".to_string()];
+
+        let (degraded_sizes, timed_out) = khive_storage::scope_request_read_deadline(
+            std::time::Duration::ZERO,
+            load_domain_member_token_sizes(&runtime, "local", &domain_ids),
         )
         .await
-        .expect("filtered lexical match must not error");
+        .expect("an expired read deadline must degrade, not error");
+        assert!(
+            timed_out,
+            "an expired read deadline must be reported as unmeasured"
+        );
+        assert!(
+            degraded_sizes.is_empty(),
+            "a timed-out batch must not contain fabricated measurements"
+        );
 
-        assert!(outcome.atoms.is_empty());
-        assert_eq!(outcome.state, LexicalCandidateState::Filtered);
+        let (healthy_sizes, healthy_timed_out) =
+            load_domain_member_token_sizes(&runtime, "local", &domain_ids)
+                .await
+                .expect("undeadlined lookup must succeed");
+        assert!(!healthy_timed_out);
+        assert!(
+            healthy_sizes
+                .get(&domain_ids[0])
+                .is_some_and(|sizing| sizing.tokens > 0 && sizing.live_members == 1),
+            "control: without a deadline the lookup measures the real member \
+             body cost; got {healthy_sizes:?}"
+        );
     }
 
-    /// Issue: a caller can supply a query with an unbounded number of
-    /// distinct scoreable terms, turning one request into one `MATCH`
-    /// statement per term with no bound but the request read deadline. The
-    /// per-term loop must stop once the shared budget is exhausted
-    /// regardless of how many distinct terms the query carries, and report
-    /// the truncation.
+    /// Issue #2396 fix 4: the lexical-stage-budget override rides a
+    /// `tokio::task_local!`, so it is scoped to the task it wraps only.
+    /// Two concurrent tasks — one scoped to an override, one with none —
+    /// must observe different budgets; the prior process-global `AtomicU64`
+    /// override could not guarantee this; a task with no override of its own
+    /// could observe whatever value another concurrently running test last
+    /// stored.
     #[tokio::test]
-    async fn distinct_term_fan_out_is_bounded_and_reports_truncation() {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    async fn lexical_stage_budget_override_does_not_leak_across_concurrent_tasks() {
+        let with_override = tokio::spawn(with_lexical_stage_budget_override_ms(50, async {
+            tokio::task::yield_now().await;
+            lexical_stage_budget()
+        }));
+        let without_override = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            lexical_stage_budget()
+        });
 
-        let over_cap_query: String = (0..(FTS_TERM_COUNT_LIMIT * 2))
-            .map(|i| format!("distinctterm{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let full_terms = fts5_candidate_terms(&over_cap_query);
-        assert!(
-            full_terms.len() > FTS_TERM_COUNT_LIMIT,
-            "test setup must exceed the cap: got {} terms",
-            full_terms.len()
-        );
+        let overridden = with_override.await.expect("task must not panic");
+        let baseline = without_override.await.expect("task must not panic");
 
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let outcome = FTS_TEST_TERM_QUERY_COUNT
-            .scope(
-                counter.clone(),
-                fetch_fts_candidates(
-                    &runtime,
-                    "local",
-                    &over_cap_query,
-                    None,
-                    &[],
-                    &[],
-                    CANDIDATE_POOL,
-                    &term_budget,
-                ),
-            )
-            .await
-            .expect("bounded fan-out fetch must not error");
-
+        assert_eq!(overridden, std::time::Duration::from_millis(50));
         assert_eq!(
-            counter.load(std::sync::atomic::Ordering::Relaxed),
-            FTS_TERM_COUNT_LIMIT,
-            "a query with more distinct terms than the cap must issue exactly \
-             FTS_TERM_COUNT_LIMIT MATCH statements, never one per term"
-        );
-        assert!(
-            outcome.terms_truncated,
-            "the outcome must report that the term set was truncated"
-        );
-
-        // Control: a query at or under the cap sees byte-for-byte identical
-        // candidate generation — no truncation, one statement per term.
-        let under_cap_query = "alpha beta gamma";
-        let under_cap_terms = fts5_candidate_terms(under_cap_query);
-        assert!(under_cap_terms.len() <= FTS_TERM_COUNT_LIMIT);
-
-        let control_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let control_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let control_outcome = FTS_TEST_TERM_QUERY_COUNT
-            .scope(
-                control_counter.clone(),
-                fetch_fts_candidates(
-                    &runtime,
-                    "local",
-                    under_cap_query,
-                    None,
-                    &[],
-                    &[],
-                    CANDIDATE_POOL,
-                    &control_budget,
-                ),
-            )
-            .await
-            .expect("under-cap fetch must not error");
-        assert_eq!(
-            control_counter.load(std::sync::atomic::Ordering::Relaxed),
-            under_cap_terms.len()
-        );
-        assert!(!control_outcome.terms_truncated);
-    }
-
-    /// The fan-out bound above is per-request, not per-call: `search_decomposed`
-    /// runs the lexical fetch up to three times (full query plus two
-    /// sub-queries) for one `knowledge.search` request. Each of the three
-    /// getting its own `FTS_TERM_COUNT_LIMIT` would let one decomposed
-    /// request issue up to 3x the intended number of `MATCH` statements —
-    /// exactly the fan-out this bound exists to prevent. All three calls here
-    /// share one `SearchCtx::term_budget`, so the full query (already over
-    /// the cap on its own) exhausts the budget and leaves nothing for either
-    /// sub-query.
-    #[tokio::test]
-    async fn term_budget_is_shared_across_decomposed_sub_queries() {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-
-        let over_cap_query: String = (0..(FTS_TERM_COUNT_LIMIT + 18))
-            .map(|i| format!("distinctterm{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let statuses: Vec<String> = Vec::new();
-        let weights = Weights::default();
-        let term_budget = std::sync::atomic::AtomicUsize::new(FTS_TERM_COUNT_LIMIT);
-        let ctx = SearchCtx {
-            runtime: &runtime,
-            ns: "local",
-            role: None,
-            type_filter: None,
-            min_score: 0.0,
-            w: &weights,
-            fetch_limit: CANDIDATE_POOL,
-            statuses: &statuses,
-            exclude_statuses: &[],
-            term_budget: &term_budget,
-        };
-
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let outcome = FTS_TEST_TERM_QUERY_COUNT
-            .scope(
-                counter.clone(),
-                search_decomposed(&ctx, &over_cap_query, 0.25),
-            )
-            .await
-            .expect(
-                "a decomposed search must not error even when every leg's \
-                 term budget is exhausted",
-            );
-
-        assert_eq!(
-            counter.load(std::sync::atomic::Ordering::Relaxed),
-            FTS_TERM_COUNT_LIMIT,
-            "the full query and both sub-queries must draw from ONE shared \
-             per-request term budget: the full query alone exceeds the cap, \
-             so it must exhaust the budget and leave zero MATCH statements \
-             for either sub-query — never 3 independent budgets' worth"
-        );
-        assert!(
-            outcome.terms_truncated,
-            "the outcome must report the request-wide truncation"
+            baseline,
+            std::time::Duration::from_millis(LEXICAL_STAGE_BUDGET_MS),
+            "a concurrently running task with no override of its own must \
+             never observe another task's override; got {baseline:?}"
         );
     }
 
@@ -3784,6 +5469,42 @@ mod tests {
         );
     }
 
+    /// Issue #2396 fix 5, same plan-pin shape as the two tests above applied
+    /// to the lexical phase-B hydration statement: at `HYDRATION_ID_CHUNK`
+    /// (900) rowids, the no-statistics planner must seek the integer primary
+    /// key, never fall back to `idx_knowledge_atoms_ns`.
+    #[tokio::test]
+    async fn phase_b_hydration_statement_plan_uses_primary_key_not_namespace_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let rowids: Vec<i64> = (1..=HYDRATION_ID_CHUNK as i64).collect();
+
+        let mut reader = runtime.sql().reader().await.expect("plan reader");
+        let rows = reader
+            .explain(phase_b_hydration_statement("local", &rowids, &[], &[], ""))
+            .await
+            .expect("explain phase-b hydration statement");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("USING INTEGER PRIMARY KEY")),
+            "phase-b hydration must seek the rowid primary key: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("idx_knowledge_atoms_ns")),
+            "phase-b hydration must not fall back to a namespace index: {details:?}"
+        );
+    }
+
     /// Functional companion to the plan-pin tests above: the primary-key-first
     /// rewrite must not weaken namespace scoping. Seed atoms in two
     /// namespaces, hydrate ids drawn from both against a single namespace,
@@ -3853,10 +5574,12 @@ mod tests {
     }
 
     // ── embed-intent regression ───────────────────────────────────────────────
-    // Guard that the ANN query paths in `search` and `suggest` use the
-    // query-intent embedding call, not the generic `runtime.embed(...)`.
-    // Uses include_str! so the assertion runs on the actual source bytes,
-    // but splits the needle to avoid matching the needle itself in test source.
+    // Guard that the query-embedding call sites in `search`, `suggest`, and
+    // `compose` (ANN retrieval for the first two; the KG-blend gate for the
+    // third) use the query-intent embedding call, not the generic
+    // `runtime.embed(...)`. Uses include_str! so the assertion runs on the
+    // actual source bytes, but splits the needle to avoid matching the
+    // needle itself in test source.
     #[test]
     fn knowledge_ann_query_paths_use_query_intent_embed() {
         let src = include_str!("search.rs");
@@ -3873,20 +5596,547 @@ mod tests {
             "ANN query paths must not call generic {generic_needle}; \
              found {generic_count} occurrence(s) — use embed_query instead"
         );
-        // Confirm the query-intent call is present for both search and suggest.
+
+        // Positive check (#2307): the assertion above only proves the generic
+        // path is *absent* — a mutation that replaced every production
+        // `embed_query` call with a different method entirely (e.g.
+        // `embed_document`) would still pass it, since that mutation never
+        // introduces the generic-embed needle either. Count the query-intent
+        // call sites directly so a silent removal (or mutation-away) of one
+        // is caught: `search`'s ANN fetch, `suggest`'s ANN fetch, and
+        // `compose`'s KG-blend gate (immediately before its
+        // `rerank_text_items` call) are the only three production call sites.
         let query_intent_needle: String = [".embed_query(", "&raw_query)"].concat();
         let query_intent_count = src
             .lines()
-            .filter(|l| !l.contains("concat"))
+            .filter(|l| !l.contains("concat") && !l.contains("needle"))
             .filter(|l| l.contains(&query_intent_needle))
             .count();
-        // 3 sites: knowledge.search ANN path, knowledge.suggest ANN path,
-        // and the section-scoring query embed (search.rs:~1291).
         assert_eq!(
             query_intent_count, 3,
-            "expected exactly 3 {query_intent_needle} calls \
-             (search ANN + suggest ANN + section query), found {query_intent_count}"
+            "expected exactly 3 {query_intent_needle} call sites \
+             (search ANN + suggest ANN + compose KG-blend gate), found {query_intent_count}"
         );
+    }
+
+    /// #2232: once a rerank stage has successfully embedded the query, later
+    /// stages embed candidates only. The recording provider sees the literal
+    /// query exactly once across two independent candidate pools.
+    #[tokio::test]
+    async fn query_embedding_cache_reuses_query_vector_across_reranks() {
+        use std::sync::{Arc, Mutex};
+
+        use async_trait::async_trait;
+        use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+        const MODEL_KEY: &str = "all-minilm-l6-v2";
+        const DIM: usize = 384;
+
+        struct RecordingService {
+            texts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl EmbeddingService for RecordingService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                self.texts
+                    .lock()
+                    .expect("recording lock")
+                    .extend(texts.iter().cloned());
+                Ok(texts.iter().map(|_| vec![0.5; DIM]).collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "query-reuse-recording-service"
+            }
+        }
+
+        struct RecordingProvider {
+            texts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                MODEL_KEY
+            }
+
+            fn dimensions(&self) -> usize {
+                DIM
+            }
+
+            async fn build(
+                &self,
+            ) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+                Ok(Arc::new(RecordingService {
+                    texts: Arc::clone(&self.texts),
+                }))
+            }
+        }
+
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: Vec::new(),
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["knowledge".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: Vec::new(),
+            allowed_outbound_namespaces: Vec::new(),
+            actor_id: None,
+            exec: Default::default(),
+        })
+        .expect("runtime");
+        runtime.register_embedder(RecordingProvider {
+            texts: Arc::clone(&texts),
+        });
+
+        let query = "one request-local query vector";
+        let mut query_embedding = QueryEmbeddingCache::default();
+        let first = vec![
+            "first candidate".to_string(),
+            "second candidate".to_string(),
+        ];
+        let second = vec!["third candidate".to_string()];
+        assert_eq!(
+            embed_cosine_scores(&runtime, query, &mut query_embedding, &first)
+                .await
+                .expect("first rerank")
+                .expect("first scores")
+                .len(),
+            2
+        );
+        assert!(
+            query_embedding.any().is_some(),
+            "first rerank must fill cache"
+        );
+        assert!(
+            query_embedding.role_specific.is_not_attempted(),
+            "embed_cosine_scores must cache the batch vector as generic, \
+             never role_specific — it came from embed_batch, not embed_query"
+        );
+        assert_eq!(
+            embed_cosine_scores(&runtime, query, &mut query_embedding, &second)
+                .await
+                .expect("second rerank")
+                .expect("second scores")
+                .len(),
+            1
+        );
+
+        let recorded = texts.lock().expect("recording lock");
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|text| text.as_str() == query)
+                .count(),
+            1,
+            "the shared query must be embedded exactly once: {recorded:?}"
+        );
+        assert_eq!(recorded.len(), 4, "one query plus three candidates");
+    }
+
+    // ── #2307: failed query embeddings must not be retried within a request ──
+    //
+    // Extends the #2232 `RecordingService` pattern above with a separate,
+    // overridable `embed_query` (distinct from the generic `embed`) so these
+    // tests can fail the query embedding on demand and prove which method a
+    // given text actually reached.
+
+    const ROLE_RECORDING_MODEL_KEY: &str = "all-minilm-l6-v2";
+    const ROLE_RECORDING_DIM: usize = 384;
+    const ROLE_RECORDING_QUERY: &str = "graph traversal caching strategies distributed \
+         knowledge retrieval systems degraded embedding providers";
+    // Atom content must clear the 20-word minimum; repeats the query terms
+    // (for lexical relevance) plus filler.
+    const ROLE_RECORDING_ATOM_CONTENT: &str = "graph traversal caching strategies distributed \
+         knowledge retrieval systems degraded embedding providers require resilient fallback \
+         behavior across production knowledge retrieval pipelines and search infrastructure";
+
+    #[derive(Debug, Default)]
+    struct RoleAwareRecordingCalls {
+        query: Vec<String>,
+        generic: Vec<String>,
+    }
+
+    struct RoleAwareRecordingService {
+        calls: std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        fail_query: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RoleAwareRecordingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .generic
+                .extend(texts.iter().cloned());
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.5; ROLE_RECORDING_DIM])
+                .collect())
+        }
+
+        async fn embed_query(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .query
+                .extend(texts.iter().cloned());
+            if self.fail_query.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(lattice_embed::EmbedError::InferenceFailed(
+                    "forced query-embedding failure".into(),
+                ));
+            }
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.25; ROLE_RECORDING_DIM])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "role-aware-recording-service"
+        }
+    }
+
+    struct RoleAwareRecordingProvider {
+        calls: std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        fail_query: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RoleAwareRecordingProvider {
+        fn name(&self) -> &str {
+            ROLE_RECORDING_MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            ROLE_RECORDING_DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(RoleAwareRecordingService {
+                calls: std::sync::Arc::clone(&self.calls),
+                fail_query: std::sync::Arc::clone(&self.fail_query),
+            }))
+        }
+    }
+
+    fn rt_with_role_aware_recording_embedder() -> (
+        KhiveRuntime,
+        std::sync::Arc<std::sync::Mutex<RoleAwareRecordingCalls>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(RoleAwareRecordingCalls::default()));
+        let fail_query = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
+            git_write: Default::default(),
+            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
+            events_split: None,
+            db_path: None,
+            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: Vec::new(),
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: Vec::new(),
+            allowed_outbound_namespaces: Vec::new(),
+            actor_id: None,
+            exec: Default::default(),
+        })
+        .expect("in-memory runtime");
+        runtime.register_embedder(RoleAwareRecordingProvider {
+            calls: std::sync::Arc::clone(&calls),
+            fail_query: std::sync::Arc::clone(&fail_query),
+        });
+        (runtime, calls, fail_query)
+    }
+
+    fn build_role_recording_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+        builder.register(crate::KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("registry builds");
+        rt.install_edge_rules(registry.all_edge_rules());
+        registry
+    }
+
+    /// Seeds one atom as a domain member so `compose`'s auto flow reaches the
+    /// Rerank phase; auto-compose skips domains with no live members before
+    /// the KG-blend gate these tests exercise.
+    async fn seed_role_recording_corpus(registry: &khive_runtime::VerbRegistry) {
+        registry
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({
+                    "atoms": [{
+                        "slug": "role-recording-atom",
+                        "name": "Role Recording Atom",
+                        "finalized": true,
+                        "content": ROLE_RECORDING_ATOM_CONTENT
+                    }]
+                }),
+            )
+            .await
+            .expect("upsert atom");
+        registry
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({
+                    "domains": [{
+                        "slug": "role-recording-domain",
+                        "name": "Role Recording Domain",
+                        "description": ROLE_RECORDING_ATOM_CONTENT,
+                        "members": ["role-recording-atom"]
+                    }]
+                }),
+            )
+            .await
+            .expect("upsert domain");
+        registry
+            .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+            .await
+            .expect("index");
+    }
+
+    /// (a) A failed `embed_query` inside `suggest` must not be retried by
+    /// `compose`'s KG-blend gate immediately afterward in the same
+    /// auto-compose request. Before the fix, `compose` saw
+    /// `role_specific: None` — indistinguishable from "never tried" — and
+    /// spent a second failing provider call; the query text was attempted
+    /// twice. Red before the fix: 2 attempts.
+    #[tokio::test]
+    async fn compose_auto_does_not_retry_role_specific_embed_after_suggest_failure() {
+        let (rt, calls, fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({ "query": ROLE_RECORDING_QUERY }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err when the query embedding is degraded");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a failed embed_query must not be retried later in the same request; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "the atom must still reach the briefing through the degraded blend path; \
+             result: {result}"
+        );
+    }
+
+    /// (b) Control: without a prior failure, `suggest`'s successful
+    /// role-specific embed is the *only* attempt across the whole
+    /// auto-compose request — `compose`'s KG-blend gate reuses it rather than
+    /// embedding again. The narrower claim (a rerank stage specifically
+    /// reuses a cached vector across candidate batches) is covered by
+    /// `query_embedding_cache_reuses_query_vector_across_reranks` (#2232)
+    /// above; this test covers the handler-level chain instead.
+    #[tokio::test]
+    async fn compose_auto_reuses_successful_suggest_embed_without_retry() {
+        let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({ "query": ROLE_RECORDING_QUERY }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a successful embed_query must be reused, not repeated; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "result: {result}"
+        );
+    }
+
+    /// (c) Control: a `compose` call that never goes through `suggest` (explicit
+    /// `domain_ids`, so auto-mode never runs) still embeds the query exactly
+    /// once for its own KG-blend gate — `NotAttempted` always authorizes the
+    /// one attempt a stage that never tried is entitled to.
+    #[tokio::test]
+    async fn compose_direct_call_without_suggest_still_embeds_query_once() {
+        let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&rt);
+        seed_role_recording_corpus(&registry).await;
+
+        let ann = vamana::new_shared();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let result = KnowledgeHandlers::compose(
+            &rt,
+            &token,
+            json!({
+                "query": ROLE_RECORDING_QUERY,
+                "domain_ids": ["role-recording-domain"],
+            }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect("compose must not Err");
+
+        let attempts = calls
+            .lock()
+            .expect("recording lock")
+            .query
+            .iter()
+            .filter(|text| text.as_str() == ROLE_RECORDING_QUERY)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "a stage that never tried must still embed once; result: {result}"
+        );
+        assert_eq!(
+            result["data"]["count"].as_u64(),
+            Some(1),
+            "result: {result}"
+        );
+    }
+
+    /// (d) #2307 item 2: `search`, `suggest`, and `compose` must each dispatch
+    /// the query text through `EmbeddingService::embed_query` specifically —
+    /// never through the generic `embed`. The source-scan guard below this
+    /// test only ever checked the generic path's *absence*; a mutation
+    /// swapping every production `embed_query` call for `embed_document`
+    /// still passed it (documented in the crate's fix report for #2307).
+    /// This behavioral check closes that gap by observing which method the
+    /// query text actually reaches at runtime.
+    #[tokio::test]
+    async fn search_suggest_compose_dispatch_query_through_embed_query_not_generic() {
+        for verb in ["search", "suggest", "compose"] {
+            let (rt, calls, _fail_query) = rt_with_role_aware_recording_embedder();
+            let registry = build_role_recording_registry(&rt);
+            seed_role_recording_corpus(&registry).await;
+            let ann = vamana::new_shared();
+            let token = rt.authorize(Namespace::local()).expect("authorize");
+
+            match verb {
+                "search" => {
+                    KnowledgeHandlers::search(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                    )
+                    .await
+                    .expect("search must not Err");
+                }
+                "suggest" => {
+                    KnowledgeHandlers::suggest(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                    )
+                    .await
+                    .expect("suggest must not Err");
+                }
+                "compose" => {
+                    KnowledgeHandlers::compose(
+                        &rt,
+                        &token,
+                        json!({ "query": ROLE_RECORDING_QUERY }),
+                        &ann,
+                        HashMap::new(),
+                    )
+                    .await
+                    .expect("compose must not Err");
+                }
+                _ => unreachable!(),
+            }
+
+            let recorded = calls.lock().expect("recording lock");
+            assert!(
+                recorded
+                    .query
+                    .iter()
+                    .any(|text| text == ROLE_RECORDING_QUERY),
+                "{verb}: query text must reach embed_query at least once; recorded={recorded:?}"
+            );
+            assert!(
+                !recorded
+                    .generic
+                    .iter()
+                    .any(|text| text == ROLE_RECORDING_QUERY),
+                "{verb}: query text must never reach the generic embed path; recorded={recorded:?}"
+            );
+        }
     }
 
     // ── filter_by_excluded_statuses ───────────────────────────────────────────
@@ -3913,36 +6163,154 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fusion_preserves_per_hit_score_sources_and_ann_fallback() {
-        let mut hybrid = vec![make_hit("shared", Some("reviewed"), 0.8)];
-        let ann = vec![make_ann_hit("shared", Some("reviewed"), 0.9)];
-        fuse_ann_hits(&mut hybrid, &ann, 0.0);
-        assert_eq!(hybrid.len(), 1);
-        assert_eq!(hybrid[0].provenance.sources(), ["lexical", "ann"]);
-        assert_eq!(candidate_fallback(&hybrid), "none");
+    fn rrf_overlap_retains_both_candidate_sources() {
+        let mut hits = vec![
+            make_hit("shared", Some("reviewed"), 8.0),
+            make_hit("lexical-only", Some("reviewed"), 4.0),
+        ];
+        let ann = vec![
+            make_ann_hit("shared", Some("reviewed"), 0.9),
+            make_ann_hit("ann-only", Some("reviewed"), 0.8),
+        ];
+        fuse_ann_hits(&mut hits, &ann, 0.0);
 
-        let mut ann_only = Vec::new();
-        fuse_ann_hits(
-            &mut ann_only,
-            &[make_ann_hit("semantic", Some("reviewed"), 0.9)],
-            0.0,
-        );
-        assert_eq!(ann_only.len(), 1);
-        assert_eq!(ann_only[0].provenance.sources(), ["ann"]);
-        assert_eq!(candidate_fallback(&ann_only), "ann");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, "shared");
+        assert_eq!(hits[0].score, 1.0);
         assert_eq!(
-            ann_only[0].provenance.to_json(),
+            hits[0].provenance.to_json(),
             json!({
-                "sources": ["ann"],
+                "sources": ["lexical", "ann"],
                 "embedding_rerank": false,
                 "normalization": "s_over_s_plus_1",
                 "calibrated": false,
             })
         );
+        let lexical = hits.iter().find(|hit| hit.id == "lexical-only").unwrap();
+        let ann = hits.iter().find(|hit| hit.id == "ann-only").unwrap();
+        assert_eq!(lexical.provenance, ScoreProvenance::lexical());
+        assert_eq!(ann.provenance, ScoreProvenance::ann());
+        assert_eq!(lexical.score, ann.score);
+    }
 
-        let lexical_only = vec![make_hit("lexical", Some("reviewed"), 0.7)];
-        assert_eq!(lexical_only[0].provenance.sources(), ["lexical"]);
-        assert_eq!(candidate_fallback(&lexical_only), "none");
+    #[test]
+    fn decomposed_overlap_merges_provenance_without_counting_duplicates_twice() {
+        let full = vec![
+            make_hit("shared", Some("reviewed"), 8.0),
+            make_hit("full-only", Some("reviewed"), 6.0),
+        ];
+        let subqueries = [
+            vec![
+                make_ann_hit("shared", Some("reviewed"), 100.0),
+                make_hit("sub-shared", Some("reviewed"), 10.0),
+                make_ann_hit("sub-shared", Some("reviewed"), 50.0),
+            ],
+            vec![
+                make_ann_hit("shared", Some("reviewed"), 100.0),
+                make_ann_hit("sub-shared", Some("reviewed"), 50.0),
+                make_ann_hit("ann-only", Some("reviewed"), 2.0),
+            ],
+        ];
+        let hits = merge_decomposed_hits(full, subqueries, 0.5, 10);
+
+        let ids: Vec<_> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(ids, ["shared", "full-only", "sub-shared", "ann-only"]);
+        assert_eq!(hits[0].score, 12.0);
+        assert_eq!(hits[1].score, 6.0);
+        assert_eq!(hits[2].score, 4.5);
+        assert!((hits[3].score - 0.6).abs() < 1e-6);
+        for hit in [&hits[0], &hits[2]] {
+            assert!(hit.provenance.lexical && hit.provenance.ann);
+            assert!(!hit.provenance.embedding_rerank);
+        }
+        assert_eq!(hits[1].provenance, ScoreProvenance::lexical());
+        assert_eq!(hits[3].provenance, ScoreProvenance::ann());
+    }
+
+    #[test]
+    fn candidate_fallback_requires_ann_without_any_lexical_source() {
+        let lexical = make_hit("lexical", None, 1.0);
+        let ann = make_ann_hit("ann", None, 1.0);
+        let mut overlap = lexical.clone();
+        overlap.provenance.merge_sources(ann.provenance);
+        assert_eq!(candidate_fallback(&[]), "none");
+        assert_eq!(candidate_fallback(std::slice::from_ref(&ann)), "ann");
+        assert_eq!(candidate_fallback(std::slice::from_ref(&lexical)), "none");
+        assert_eq!(candidate_fallback(&[lexical, ann]), "none");
+        assert_eq!(candidate_fallback(&[overlap]), "none");
+    }
+
+    #[tokio::test]
+    async fn skipped_embedding_rerank_preserves_scores_and_provenance() {
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("in-memory runtime without embeddings");
+        assert!(runtime.config().db_path.is_none());
+        let mut hits = vec![
+            make_hit("lexical", None, 3.0),
+            make_ann_hit("ann", None, 0.8),
+        ];
+        let applied = rerank_with_embeddings(
+            &runtime,
+            "provenance query",
+            &mut QueryEmbeddingCache::default(),
+            &mut hits,
+            0.7,
+        )
+        .await
+        .expect("optional rerank");
+        assert!(!applied);
+        assert_eq!(hits[0].score, 3.0);
+        assert_eq!(hits[1].score, 0.8);
+        assert_eq!(hits[0].provenance, ScoreProvenance::lexical());
+        assert_eq!(hits[1].provenance, ScoreProvenance::ann());
+    }
+
+    #[tokio::test]
+    async fn search_reports_lexical_provenance_and_successful_embedding_rerank() {
+        let (runtime, calls, fail_query) = rt_with_role_aware_recording_embedder();
+        let registry = build_role_recording_registry(&runtime);
+        seed_role_recording_corpus(&registry).await;
+        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+
+        for rerank in [false, true] {
+            calls.lock().expect("recording lock").generic.clear();
+            let response = KnowledgeHandlers::search(
+                &runtime,
+                &token,
+                json!({"query": ROLE_RECORDING_QUERY, "kind": "atom", "rerank": rerank}),
+                &ann,
+            )
+            .await
+            .expect("search");
+            assert_eq!(response["total"], 1, "{response}");
+            assert_eq!(response["results"][0]["slug"], "role-recording-atom");
+            assert_eq!(
+                response["results"][0]["score_provenance"],
+                json!({
+                    "sources": ["lexical"],
+                    "embedding_rerank": rerank,
+                    "normalization": "s_over_s_plus_1",
+                    "calibrated": false,
+                })
+            );
+            let recorded = calls.lock().expect("recording lock");
+            if rerank {
+                assert_eq!(
+                    recorded.generic,
+                    [
+                        ROLE_RECORDING_QUERY.to_string(),
+                        format!("Role Recording Atom {ROLE_RECORDING_ATOM_CONTENT}")
+                    ]
+                );
+            } else {
+                assert!(recorded.generic.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -4178,133 +6546,6 @@ mod tests {
             healthy.and_then(|counts| counts.get(&atom_ids[0]).copied()),
             Some(0),
             "control: without a deadline the lookup returns real counts"
-        );
-    }
-
-    // ── deterministic embedder for the rerank-provenance test ────────────
-
-    const RERANK_TEST_MODEL_KEY: &str = "all-minilm-l6-v2";
-    const RERANK_TEST_DIM: usize = 384;
-
-    struct RerankTestEmbedService;
-
-    #[async_trait::async_trait]
-    impl lattice_embed::EmbeddingService for RerankTestEmbedService {
-        async fn embed(
-            &self,
-            texts: &[String],
-            _model: lattice_embed::EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-            // Distinct, non-degenerate unit vectors per text position so
-            // cosine similarity is well-defined and never uniform, the same
-            // shape `ann_degrade_tests::FakeDimService` uses.
-            Ok(texts
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let v = (i + 1) as f32;
-                    let norm = (RERANK_TEST_DIM as f32 * v * v).sqrt();
-                    vec![v / norm; RERANK_TEST_DIM]
-                })
-                .collect())
-        }
-
-        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "rerank-test-embed"
-        }
-    }
-
-    struct RerankTestEmbedProvider;
-
-    #[async_trait::async_trait]
-    impl khive_runtime::EmbedderProvider for RerankTestEmbedProvider {
-        fn name(&self) -> &str {
-            RERANK_TEST_MODEL_KEY
-        }
-
-        fn dimensions(&self) -> usize {
-            RERANK_TEST_DIM
-        }
-
-        async fn build(
-            &self,
-        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
-            Ok(std::sync::Arc::new(RerankTestEmbedService))
-        }
-    }
-
-    fn runtime_with_deterministic_embedder() -> KhiveRuntime {
-        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
-            git_write: Default::default(),
-            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
-            events_split: None,
-            db_path: None,
-            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
-            default_namespace: Namespace::local(),
-            embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
-            additional_embedding_models: vec![],
-            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
-            packs: vec!["kg".to_string(), "knowledge".to_string()],
-            backend_id: khive_runtime::BackendId::main(),
-            brain_profile: None,
-            visible_namespaces: vec![],
-            allowed_outbound_namespaces: vec![],
-            actor_id: None,
-        })
-        .expect("in-memory runtime with embedder config");
-        rt.register_embedder(RerankTestEmbedProvider);
-        rt
-    }
-
-    /// Existing coverage only asserts `score_provenance.embedding_rerank ==
-    /// false` (no embedder configured); the mutation at
-    /// `rerank_with_embeddings` that sets it `true` on a successful rerank
-    /// had no test that would fail if it were deleted. This pins the `true`
-    /// case under a deterministic embedder.
-    #[tokio::test]
-    async fn embedding_rerank_provenance_is_true_when_rerank_runs() {
-        let runtime = runtime_with_deterministic_embedder();
-        {
-            let access = runtime.sql();
-            let mut writer = access.writer().await.expect("writer");
-            writer
-                .execute(SqlStatement {
-                    sql: "INSERT INTO knowledge_atoms ( \
-                              id, namespace, slug, name, content, tags, properties, finalized, \
-                              status, source_uri, source_type, created_at, updated_at, deleted_at \
-                          ) VALUES ( \
-                              '94000000-0000-0000-0000-000000000001', 'local', \
-                              'rerank-target', 'Rerank Target', \
-                              'content that the lexical stage must match for the rerank pass', \
-                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
-                          )"
-                    .to_string(),
-                    params: Vec::new(),
-                    label: None,
-                })
-                .await
-                .expect("seed rerank target atom");
-        }
-
-        let token = runtime.authorize(Namespace::local()).expect("local token");
-        let ann = vamana::new_shared();
-        let out = KnowledgeHandlers::search(
-            &runtime,
-            &token,
-            json!({"query": "rerank target content", "rerank": true}),
-            &ann,
-        )
-        .await
-        .expect("rerank-enabled search must not error");
-
-        assert_eq!(out["total"], 1);
-        assert_eq!(
-            out["results"][0]["score_provenance"]["embedding_rerank"], true,
-            "a successful embedding rerank must record embedding_rerank: true; got {out:?}"
         );
     }
 }

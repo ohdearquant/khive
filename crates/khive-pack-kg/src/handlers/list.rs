@@ -16,6 +16,7 @@ use super::common::{
     resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json, validate_entity_type, KindSpec,
     ListParams,
 };
+use crate::sql::sql;
 use crate::KgPack;
 
 const ENTITY_LIST_CAP: u32 = 500;
@@ -26,7 +27,7 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
 
-fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
+pub(super) fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
     serde_json::json!({
         "items": items,
         "requested_limit": requested,
@@ -35,7 +36,7 @@ fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
     })
 }
 
-fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
+pub(super) fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
     response["requested_limit"] = serde_json::json!(requested);
     response["effective_limit"] = serde_json::json!(effective);
     response["limit_clamped"] = serde_json::json!(requested > effective);
@@ -58,6 +59,7 @@ async fn resolve_message_thread_filter(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     raw: &str,
+    primary_only: bool,
 ) -> Result<String, RuntimeError> {
     // Message-scope invariant: this resolver ONLY serves the message thread
     // filter, so the DISTINCT scan binds kind='message' unconditionally. The
@@ -80,21 +82,14 @@ async fn resolve_message_thread_filter(
     // reads (`['local'] ∪ visible_namespaces`): resolving against only the
     // primary namespace rejects prefixes of threads the list itself would
     // return, and silently hides a cross-namespace prefix collision.
-    let visible = token.visible_namespace_strs();
-    let placeholders = (1..=visible.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
-                   FROM notes WHERE namespace IN ({placeholders}) AND deleted_at IS NULL \
-                   AND json_type(properties, '$.thread_id') = 'text' \
-                   AND kind = 'message'"
-    );
-    let params = visible
-        .into_iter()
-        .map(|namespace| SqlValue::Text(namespace.to_string()))
-        .collect();
+    let visible = if primary_only {
+        vec![token.namespace().as_str()]
+    } else {
+        token.visible_namespace_strs()
+    };
+    let visible_json = serde_json::to_string(&visible).map_err(|error| {
+        RuntimeError::Internal(format!("serialize visible namespaces: {error}"))
+    })?;
     let mut reader = runtime
         .sql()
         .reader()
@@ -102,8 +97,8 @@ async fn resolve_message_thread_filter(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql,
-            params,
+            sql: sql!("message_threads_list").to_string(),
+            params: vec![SqlValue::Text(visible_json)],
             label: Some("list.resolve_message_thread_filter".to_string()),
         })
         .await
@@ -171,7 +166,7 @@ async fn resolve_message_thread_filter(
     )))
 }
 
-fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
+pub(super) fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
     let properties = note.properties.as_ref();
     if let Some(wanted) = params.tags.as_deref().filter(|tags| !tags.is_empty()) {
         let stored = properties
@@ -184,7 +179,15 @@ fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !tags_match_any(&stored, wanted) {
+        let matches = match params.tag_mode.unwrap_or_default() {
+            khive_storage::note::NoteTagMode::Any => tags_match_any(&stored, wanted),
+            khive_storage::note::NoteTagMode::All => wanted.iter().all(|wanted| {
+                stored
+                    .iter()
+                    .any(|stored| stored.eq_ignore_ascii_case(wanted))
+            }),
+        };
+        if !matches {
             return false;
         }
     }
@@ -282,6 +285,22 @@ impl KgPack {
             ));
         }
         let spec = resolve_kind_spec(&p.kind, registry)?;
+        if !matches!(&spec, KindSpec::Note { .. })
+            && (p.key_prefix.is_some()
+                || p.after_key.is_some()
+                || p.created_after.is_some()
+                || p.updated_after.is_some()
+                || p.tag_mode.is_some())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "key, timestamp and tag_mode filters require notes".into(),
+            ));
+        }
+        if p.after_key.is_some() && p.key_prefix.is_none() {
+            return Err(RuntimeError::InvalidInput(
+                "after_key requires key_prefix".into(),
+            ));
+        }
         match spec {
             KindSpec::Entity { specific } => {
                 if p.note_kind.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -350,6 +369,7 @@ impl KgPack {
                                 .as_deref()
                                 .map(|t| vec![t.to_string()])
                                 .unwrap_or_default(),
+                            legacy_entity_type_fallback: true,
                             tags_any: tag_list.clone(),
                             namespaces: token
                                 .visible_namespace_strs()
@@ -452,11 +472,29 @@ impl KgPack {
                 )?;
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
-                        resolve_message_thread_filter(&self.runtime, token, &raw_thread_id).await?,
+                        resolve_message_thread_filter(
+                            &self.runtime,
+                            token,
+                            &raw_thread_id,
+                            p.key_prefix.is_some(),
+                        )
+                        .await?,
                     );
                 }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
+                let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                if p.key_prefix.is_some() {
+                    return super::note_list::list_keyed_notes(
+                        &self.runtime,
+                        token,
+                        &p,
+                        &filter,
+                        requested,
+                        limit,
+                    )
+                    .await;
+                }
                 let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
                     || p.thread_id.is_some()
                     || p.direction.is_some()
@@ -483,9 +521,9 @@ impl KgPack {
                             let scan_limit = MAX_SCAN_TOTAL.saturating_sub(scanned).min(PAGE_SIZE);
                             let (page, next_raw_after) = self
                                 .runtime
-                                .list_notes_after(
+                                .list_notes_filtered_after(
                                     token,
-                                    kind_filter.as_deref(),
+                                    filter.clone(),
                                     raw_after,
                                     scan_limit,
                                 )
@@ -534,7 +572,7 @@ impl KgPack {
                     } else {
                         let (notes, next_after) = self
                             .runtime
-                            .list_notes_after(token, kind_filter.as_deref(), after, limit)
+                            .list_notes_filtered_after(token, filter.clone(), after, limit)
                             .await?;
                         (notes, next_after, false)
                     };
@@ -574,7 +612,7 @@ impl KgPack {
                         }
                         let page = self
                             .runtime
-                            .list_notes(token, kind_filter.as_deref(), remaining_scan, db_offset)
+                            .list_notes_filtered(token, filter.clone(), remaining_scan, db_offset)
                             .await?;
                         let fetched = page.len() as u32;
                         for note in page {
@@ -596,7 +634,7 @@ impl KgPack {
                     collected
                 } else {
                     self.runtime
-                        .list_notes(token, kind_filter.as_deref(), limit, offset)
+                        .list_notes_filtered(token, filter.clone(), limit, offset)
                         .await?
                 };
 
@@ -731,6 +769,7 @@ impl KgPack {
 mod tests {
     use super::parse_after_cursor;
     use crate::handlers::common::{event_filter_from_params, ListParams};
+    use crate::sql::sql;
 
     #[test]
     fn after_cursor_rejects_prefix_with_keyset_consequence() {
@@ -759,6 +798,53 @@ mod tests {
             assert!(message.contains(field), "{message}");
             assert!(message.contains("can miss or be ambiguous"), "{message}");
             assert!(message.contains("exact stable record"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_limit() {
+        use khive_runtime::{KhiveRuntime, Namespace};
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let namespace = Namespace::parse("scope-one").expect("valid namespace");
+        let token = runtime.authorize(namespace).expect("authorized namespace");
+        runtime
+            .create_note(
+                &token,
+                "message",
+                None,
+                "threaded message",
+                None,
+                Some(serde_json::json!({
+                    "thread_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                })),
+                vec![],
+            )
+            .await
+            .expect("create message note");
+
+        let past_bind_limit = (0..33_000)
+            .map(|index| format!("scope-{index}"))
+            .chain(std::iter::once("scope-one".to_string()))
+            .collect::<Vec<_>>();
+        for (case, namespaces, expected_rows) in [
+            ("empty", Vec::<String>::new(), 0),
+            ("single", vec!["scope-one".to_string()], 1),
+            ("past SQLite bind limit", past_bind_limit, 1),
+        ] {
+            let namespaces_json =
+                serde_json::to_string(&namespaces).expect("serialize namespace scope");
+            let mut reader = runtime.sql().reader().await.expect("SQL reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: sql!("message_threads_list").to_string(),
+                    params: vec![SqlValue::Text(namespaces_json)],
+                    label: Some("test.message_threads_list".into()),
+                })
+                .await
+                .expect("message thread scope query");
+            assert_eq!(rows.len(), expected_rows, "{case} namespace scope");
         }
     }
 }

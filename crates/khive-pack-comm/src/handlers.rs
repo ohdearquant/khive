@@ -14,10 +14,12 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
+use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
-    validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
+    dual_write_message_with_identity, note_to_message_json, project_message_json, resolve_id,
+    short_id, validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
@@ -187,6 +189,19 @@ fn inbox_note_matches(
     content_needle: Option<&str>,
 ) -> bool {
     let props = note.properties.as_ref();
+    if params.kind.as_deref().is_some_and(|kind| note.kind != kind) {
+        return false;
+    }
+    if params.tags.as_ref().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            !props
+                .and_then(|properties| properties.get("tags"))
+                .and_then(Value::as_array)
+                .is_some_and(|stored| stored.iter().any(|value| value.as_str() == Some(tag)))
+        })
+    }) {
+        return false;
+    }
     let sender = props
         .and_then(|properties| properties.get("from_actor"))
         .and_then(Value::as_str);
@@ -278,15 +293,8 @@ fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
 ///
-/// Known gap (external desk review, 2026-07-21): there is no idempotency
-/// guard here, so a retrying caller that repeats an identical `send` (same
-/// `to`/`content`) produces a fresh duplicate outbound+inbound pair every
-/// call. `comm.ingest`'s `external_id` dedup key is a different mechanism
-/// (transport-level dedup for channel-delivered inbound mail) and does not
-/// apply to caller-composed sends. Fixing this needs a caller-supplied
-/// idempotency key param on `SendParams` (additive) — a content-hash dedup
-/// invented here would risk collapsing legitimate repeated messages, so this
-/// is left as a design decision rather than implemented speculatively.
+/// Caller-keyed sends reconcile through the atomic outbound claim and its
+/// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
@@ -349,7 +357,18 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (outbound_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "send", "to": to_actor, "content": p.content,
+            "subject": p.subject, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+        })
+    })?;
+    let MessageWrite {
+        outbound: outbound_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -364,9 +383,12 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // `thread_id` is a strict full-UUID input on a later send. Surface the
     // canonical value persisted by `dual_write_message` so this response can
@@ -385,6 +407,9 @@ pub(crate) async fn handle_send(
         "subject": p.subject,
         "sent_at": sent_at,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &outbound_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -466,6 +491,11 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
+    let thread_id = p
+        .thread_id
+        .as_deref()
+        .map(|raw| canonicalize_thread_id("inbox", raw))
+        .transpose()?;
     validate_message_projection_fields("inbox", p.fields.as_deref())?;
     let wait_ms = p.wait_ms.unwrap_or(0);
     if wait_ms > MAX_INBOX_WAIT_MS {
@@ -648,6 +678,14 @@ pub(crate) async fn handle_inbox(
         }
     }
 
+    if let Some(thread_id) = thread_id {
+        property_filters.push(PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(thread_id),
+        });
+    }
+
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
@@ -749,7 +787,9 @@ async fn query_inbox_response(
     offset: u64,
     limit: usize,
 ) -> Result<Value, RuntimeError> {
-    let has_post_filter = params.from_prefix.is_some()
+    let has_post_filter = params.kind.is_some()
+        || params.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+        || params.from_prefix.is_some()
         || params.exclude_from_actor.is_some()
         || before_micros.is_some()
         || subject_needle.is_some()
@@ -758,23 +798,40 @@ async fn query_inbox_response(
     // Offset is defined over the fully-filtered sequence. When a filter cannot
     // be represented by `NoteFilter`, scan the indexed base query and count only
     // matching rows before collecting one lookahead item for `has_more`.
+    //
+    // Each page is fetched from a keyset boundary (`NoteFilter.after`), not a
+    // growing `PageRequest.offset`: an offset re-walks every earlier row on
+    // every page, so this loop's total work was quadratic in the number of
+    // pages scanned before a post-filter match was found. Seeking from the
+    // last row's `(created_at, id)` makes each page's fetch cost independent
+    // of how many pages came before it. `filter.order_by` is always `None`
+    // here (see its construction above), which `after` requires.
     let mut messages: Vec<Value> = if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
         let mut matched: u64 = 0;
-        let mut db_offset: u64 = 0;
+        let mut cursor: Option<khive_storage::note::NoteSeekAfter> = None;
         loop {
+            let mut page_filter = filter.clone();
+            page_filter.after = cursor;
             let page = store
                 .query_notes_filtered_count_free(
                     namespace,
-                    filter,
+                    &page_filter,
                     PageRequest {
                         limit: PAGE_SIZE,
-                        offset: db_offset,
+                        offset: 0,
                     },
                 )
                 .await?;
             let fetched = page.items.len() as u32;
+            cursor = page
+                .items
+                .last()
+                .map(|n| khive_storage::note::NoteSeekAfter {
+                    created_at: n.created_at,
+                    id: n.id,
+                });
             for n in &page.items {
                 if !inbox_note_matches(n, params, before_micros, subject_needle, content_needle) {
                     continue;
@@ -791,9 +848,6 @@ async fn query_inbox_response(
             if collected.len() > limit || fetched < PAGE_SIZE {
                 break;
             }
-            db_offset = db_offset.checked_add(u64::from(PAGE_SIZE)).ok_or_else(|| {
-                RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
-            })?;
         }
         collected
     } else {
@@ -1201,8 +1255,11 @@ async fn validate_read_target(
         .and_then(Value::as_str)
     {
         if to_actor != caller_actor {
+            // The resolved uuid stays out of this message: a caller who asked by
+            // 8-char prefix would otherwise learn both that a message exists and
+            // its full id from a refusal (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "read: message {id} is not addressed to caller actor {caller_actor:?}"
+                "read: that message is not addressed to caller actor {caller_actor:?}"
             )));
         }
     } else {
@@ -1484,8 +1541,11 @@ pub(crate) async fn handle_reply(
         let is_participant = original_from_actor.as_deref() == Some(caller_actor)
             || original_to_actor.as_deref() == Some(caller_actor);
         if !is_participant {
+            // Same non-disclosure rule as `read` above: the refusal names the
+            // caller's own actor and nothing the caller did not already supply
+            // (issue #2564).
             return Err(RuntimeError::InvalidInput(format!(
-                "reply: message {id} is not addressed to or from caller actor {caller_actor:?}"
+                "reply: that message is not addressed to or from caller actor {caller_actor:?}"
             )));
         }
     } else {
@@ -1545,7 +1605,18 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let (reply_note, embedding_truncation) = dual_write_message(
+    let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
+        json!({
+            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+            "subject": reply_subject_opt, "thread_id": thread_id,
+            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+        })
+    })?;
+    let MessageWrite {
+        outbound: reply_note,
+        embedding_truncation,
+        replayed,
+    } = dual_write_message_with_identity(
         runtime,
         token,
         &caller_ns,
@@ -1560,9 +1631,12 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        identity.as_ref(),
     )
     .await?;
-    inbox_signal.publish();
+    if !replayed {
+        inbox_signal.publish();
+    }
 
     // Replying is the strongest possible read signal, and callers universally
     // chained `reply | read` to say so — fold it in. Skips only an explicitly
@@ -1586,7 +1660,7 @@ pub(crate) async fn handle_reply(
     let caller_is_addressee = original_to_actor
         .as_deref()
         .is_none_or(|addressee| addressee == from_actor_label);
-    let marked_read = if original_direction == "outbound" || !caller_is_addressee {
+    let marked_read = if replayed || original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
         let updated_at = Utc::now().timestamp_micros();
@@ -1612,6 +1686,9 @@ pub(crate) async fn handle_reply(
         "sent_at": sent_at,
         "marked_read": marked_read,
     });
+    if let Some(identity) = identity {
+        identity.annotate_response(&mut response, &reply_note, replayed);
+    }
     add_embedding_truncation_warning(&mut response, &embedding_truncation);
     Ok(response)
 }
@@ -2483,10 +2560,10 @@ pub(crate) async fn handle_heartbeat(
         _ => unreachable!("outcome already validated above"),
     }
 
-    khive_runtime::secret_gate::check_json(&props)?;
+    khive_runtime::secret_gate::check_json_at(&props, "channel", "properties")?;
 
     let content = format!("channel heartbeat: {}:{}", p.channel_kind, p.channel_slug);
-    khive_runtime::secret_gate::check(&content)?;
+    khive_runtime::secret_gate::check_at(&content, "channel", "content")?;
 
     let created_at = existing
         .as_ref()
@@ -2514,6 +2591,8 @@ pub(crate) async fn handle_heartbeat(
     };
 
     let note = Note {
+        version: 1,
+        key: None,
         id,
         namespace: ns.to_string(),
         kind: "channel_health".to_string(),
@@ -2875,6 +2954,12 @@ pub(crate) struct ProbeResponse {
     pub cursor_us: i64,
     pub new_messages: Vec<ProbeMessage>,
     pub stale_unread_count: i64,
+    /// Present and `true` only when the caller's `since_us` was discarded and
+    /// the page was taken from the baseline instead (#2400). A poller that
+    /// cannot see this reads a full baseline page as arrivals, which is
+    /// indistinguishable from real mail and repeats on every pass.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_reset: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2887,35 +2972,36 @@ pub(crate) struct ProbeMessage {
     pub subject: Option<String>,
 }
 
-/// The single indexed read powering `comm.probe` (ADR-D5). `INDEXED BY
-/// idx_comm_message_to_actor` is a regression fence against silent table scans.
+/// The page and bounded stale count share one SQL snapshot (ADR-D5). The
+/// stale-count index excludes read history and seeks directly below the cutoff.
+/// The shared bounded NoteStore counter cannot express that strict upper bound
+/// or join this statement's snapshot, so this count stays inside the probe.
 /// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, NOT `created_at` or
 /// SQLite `rowid` — both can regress/collide across concurrent writers, VACUUM,
 /// or hard-delete. Do not revert to either. See
 /// crates/khive-pack-comm/docs/api/probe-cursor.md#handlersrsprobe_sql for the full
 /// #780/#827 incident history.
-const PROBE_SQL: &str = "WITH \
+#[doc(hidden)]
+pub const PROBE_SQL: &str = "WITH \
 stats AS ( \
-    SELECT \
-        COALESCE(MAX(notes_seq.seq), 0) AS cursor_us, \
-        COALESCE(SUM( \
-            CASE \
-                WHEN (json_type(notes.properties, '$.read') IS NULL \
-                      OR json_type(notes.properties, '$.read') != 'true') \
-                     AND notes.created_at < ?4 \
-                THEN 1 ELSE 0 \
-            END \
-        ), 0) AS stale_unread_count \
-    FROM notes INDEXED BY idx_comm_message_to_actor \
-    JOIN notes_seq ON notes_seq.note_id = notes.id \
-    WHERE notes.namespace = ?1 \
-      AND notes.kind = 'message' \
-      AND notes.deleted_at IS NULL \
-      AND json_extract(notes.properties, '$.to_actor') = ?2 \
-      AND json_extract(notes.properties, '$.direction') = 'inbound' \
+    SELECT COUNT(*) AS stale_unread_count \
+    FROM ( \
+        SELECT 1 \
+        FROM notes INDEXED BY idx_notes_unread_probe_recipient_direction \
+        WHERE notes.namespace = ?1 \
+          AND notes.kind = 'message' \
+          AND notes.deleted_at IS NULL \
+          AND ifnull(json_extract(notes.properties, '$.to_actor'), '') = ?2 \
+          AND json_extract(notes.properties, '$.direction') = 'inbound' \
+          AND (json_type(notes.properties, '$.read') IS NULL \
+               OR json_type(notes.properties, '$.read') != 'true') \
+          AND notes.created_at < ?4 \
+        LIMIT 1000 \
+    ) AS stale_unread_rows \
 ), \
 new_rows AS ( \
     SELECT \
+        notes_seq.seq AS cursor_us, \
         notes.id, \
         notes.created_at AS created_at_us, \
         COALESCE(json_extract(notes.properties, '$.from_actor'), notes.namespace) AS from_actor, \
@@ -2928,26 +3014,23 @@ new_rows AS ( \
       AND json_extract(notes.properties, '$.to_actor') = ?2 \
       AND json_extract(notes.properties, '$.direction') = 'inbound' \
       AND (?3 IS NULL OR notes_seq.seq > ?3) \
-    ORDER BY notes.created_at DESC \
+    ORDER BY notes_seq.seq ASC \
     LIMIT 100 \
 ) \
 SELECT \
-    stats.cursor_us, \
+    new_rows.cursor_us, \
     stats.stale_unread_count, \
     new_rows.id, \
     new_rows.created_at_us, \
     new_rows.from_actor, \
     new_rows.subject \
 FROM stats \
-LEFT JOIN ( \
-    SELECT * FROM new_rows ORDER BY created_at_us ASC \
-) AS new_rows ON TRUE \
-ORDER BY new_rows.created_at_us ASC";
+LEFT JOIN new_rows ON TRUE \
+ORDER BY new_rows.created_at_us ASC, new_rows.cursor_us ASC";
 
 /// `probe` — strictly read-only poll for new inbound message metadata and a
-/// stale-unread count (ADR-D5). No read-flag mutation, no writes: this is
-/// polled every ~30s by many monitors and must stay a single cheap indexed
-/// query.
+/// stale-unread count capped at 1000 (ADR-D5). No read-flag mutation, no writes:
+/// the earliest unseen sequence page and stale count share one indexed statement.
 pub(crate) async fn handle_probe(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -3013,6 +3096,10 @@ async fn query_probe(
 
     let effective_since = match since_us {
         Some(v) if v > high_water_mark => {
+            // #2400: this reset also travels back to the caller as
+            // `cursor_reset`. A log line the poller cannot read leaves it
+            // deduplicating a baseline page against its own inbox, which is the
+            // cost this warning was silently imposing.
             tracing::warn!(
                 actor,
                 since_us = v,
@@ -3046,18 +3133,19 @@ async fn query_probe(
         .await
         .map_err(RuntimeError::Storage)?;
 
-    let mut cursor_us = 0i64;
+    let mut cursor_us = effective_since.unwrap_or(0);
     let mut stale_unread_count = 0i64;
     let mut new_messages = Vec::new();
 
     for row in &rows {
-        if let Some(SqlValue::Integer(v)) = row.get("cursor_us") {
-            cursor_us = *v;
-        }
         if let Some(SqlValue::Integer(v)) = row.get("stale_unread_count") {
             stale_unread_count = *v;
         }
 
+        let message_cursor = match row.get("cursor_us") {
+            Some(SqlValue::Integer(v)) => *v,
+            _ => continue,
+        };
         let id = match row.get("id") {
             Some(SqlValue::Text(s)) => s.clone(),
             _ => continue,
@@ -3081,10 +3169,13 @@ async fn query_probe(
             from_actor,
             subject,
         });
+        // The displayed page is timestamp-ordered, not sequence-ordered. Only
+        // emitted rows advance the cursor; unseen later pages must remain visible.
+        cursor_us = cursor_us.max(message_cursor);
     }
 
     // #827: never let the returned cursor regress below what the caller already
-    // holds (a hard-deleted high-seq row can lower MAX(seq) below a prior cursor).
+    // holds, including an empty page after a high-sequence row was hard-deleted.
     if let Some(floor) = effective_since {
         if cursor_us < floor {
             cursor_us = floor;
@@ -3095,6 +3186,7 @@ async fn query_probe(
         cursor_us,
         new_messages,
         stale_unread_count,
+        cursor_reset: since_us.is_some() && effective_since.is_none(),
     })
 }
 
@@ -3528,6 +3620,9 @@ mod tests {
 
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -3543,6 +3638,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4628,6 +4724,9 @@ mod tests {
 
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            telemetry: Default::default(),
+            mounts: Vec::new(),
+            brain: Default::default(),
             git_write: Default::default(),
             display_timezone: khive_runtime::config::resolve_default_display_timezone(),
             events_split: None,
@@ -4643,6 +4742,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            exec: Default::default(),
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4654,6 +4754,8 @@ mod tests {
         let created_at = chrono::Utc::now().timestamp_micros();
         store
             .upsert_note(Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),
@@ -4746,6 +4848,9 @@ mod tests {
         ] {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                telemetry: Default::default(),
+                mounts: Vec::new(),
+                brain: Default::default(),
                 git_write: Default::default(),
                 display_timezone: khive_runtime::config::resolve_default_display_timezone(),
                 events_split: None,
@@ -4761,6 +4866,7 @@ mod tests {
                 visible_namespaces: vec![],
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
+                exec: Default::default(),
             })
             .expect("in-memory runtime");
             let token = runtime
@@ -4771,6 +4877,8 @@ mod tests {
             let id = Uuid::new_v4();
             let created_at = chrono::Utc::now().timestamp_micros();
             let note = Note {
+                version: 1,
+                key: None,
                 id,
                 namespace: ns.clone(),
                 kind: "message".to_string(),

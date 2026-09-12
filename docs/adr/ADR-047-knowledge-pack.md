@@ -1,57 +1,33 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30, 2026-08-30b)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
 
-## Amendment (2026-08-30): honest lexical fallback and score provenance
-
-A genuine FTS miss yields an empty lexical candidate set. It no longer falls back to a
-bounded scan ordered by atom creation time: corpus recency is not query evidence, and treating
-those newest rows as a lexical rank source lets reciprocal-rank fusion manufacture relevance
-for zero-overlap queries. The cheap raw-FTS existence probe remains so a miss can be distinguished
-from a lexical match removed by kind/status eligibility. ANN-only retrieval remains available when
-an embedder and index can supply it.
-
-`knowledge.search` adds backward-compatible provenance fields:
-
-- Top-level `candidate_provenance.lexical` is `matched`, `no_match`, `filtered`, `partial_timeout`,
-  or `timed_out`.
-- Top-level `candidate_provenance.fallback` is `ann` only when the returned set has ANN
-  evidence and no returned result has lexical evidence; otherwise it is `none`.
-- Each result adds `score_provenance` with a stable-order `sources` subset of `lexical` and
-  `ann`, `embedding_rerank` (whether a successful dense rerank transformed the score),
-  `normalization: "s_over_s_plus_1"`, and `calibrated: false`.
-
-Search scores are request-relative ranking values. After lexical/ANN fusion and optional
-embedding rerank, the score is monotonically squashed with `s / (s + 1)` and receives the
-existing status multiplier. It is not a probability, a cross-query comparable measure, or an
-absolute presence signal. The former `0.46`/`0.42` bands predated the squash and are retired;
-callers use response-local rank together with candidate and per-hit provenance. `min_score`
-continues to apply to the final returned score.
-
 ## Amendment (2026-08-30b): request-wide bound on distinct FTS terms
 
-The lexical stage bounds the number of distinct scoreable terms that each issue their own FTS
-`MATCH` statement, independent of the per-term row cap the 2026-06 candidate-refill work
-introduced. Without this bound, a query with many distinct terms turns one request into a
-proportionally unbounded number of index probes and retained-row memory, checked only by the
-request read deadline. The bound is shared across every lexical fetch one `knowledge.search` or
-`knowledge.suggest` request makes — `search`'s query-decomposition path issues the lexical fetch
-up to three times (the full query plus two sub-queries) for a single request, and all three draw
-from one allowance rather than each getting their own, so a decomposed request cannot triple the
-effective cap.
+The lexical candidate stage admits at most 32 distinct expanded terms across one
+`knowledge.search` or `knowledge.suggest` request. Terms are deduplicated and expanded,
+then admitted in deterministic spelling order before any database read, including the
+rarest-first frequency probes. The full query and both optional decomposed passes share
+one allowance; repeating a term in a later pass consumes another admission because that
+pass repeats the retrieval work. A pass with no allowance left opens no reader.
 
-`candidate_provenance.terms_truncated` is `true` when the query supplied more distinct scoreable
-terms than the remaining request-wide budget; the lexical candidate set only reflects terms up to
-that bound. A query at or under the bound sees identical candidate generation and ranking to the
-unbounded behavior. The raw-existence eligibility probe that distinguishes `no_match` from
-`filtered` scopes itself to the same (possibly truncated) term set the candidate fetch actually
-searched, never to the full query: an untested term's eligibility is unknown, so a truncation-
-caused miss is reported as `no_match` (paired with `terms_truncated: true`), never as `filtered`.
+Within a pass, rarity ordering, phase-A rowid probes and widening, eligibility fallback,
+and namespace-only existence recovery all use the same admitted terms or their subsets.
+The bound limits combined distinct-term work, not the number of SQL statements: one term
+can require multiple bounded probes. Existing per-term row caps, widening ceilings, and
+lexical deadlines remain in force. Queries with no scoreable terms retain the raw-phrase
+fallback, which consumes one admission.
+
+`candidate_provenance.terms_truncated` is true when any lexical pass drops terms because
+the shared allowance is exhausted. It is independent of timeout reporting. `no_match`
+and `filtered` describe only admitted terms in the caller's namespace: a local match
+reachable only through an untested term must not turn a truncation-caused miss into
+`filtered`. ANN retrieval and scoring remain unchanged.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -280,10 +256,38 @@ namespace-agnostic. Returns 404 if not found.
 #### `knowledge.list` — paginated listing
 
 ```
-list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {results: [...], total: N, limit, offset}
+list(
+  type?: "atom"|"domain",
+  limit?: 20,
+  offset?: 0,
+  after?: <full-uuid|"">,
+  fields?: [<field>, ...]
+) → {results: [...], limit, order, total?, offset?, next_after?}
 ```
 
-Default type is `atom`. Limit capped at 500.
+Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
+declared total order of `created_at DESC, id DESC`.
+
+Completeness-sensitive consumers use keyset mode: pass `after=""` on the first
+request, then round-trip each non-null `next_after` full UUID. Cursor pages seek
+by `created_at ASC, id ASC`; `after` and `offset` are mutually exclusive. This is
+a live traversal rather than an MVCC snapshot. Inserts whose key is behind an
+already-issued boundary belong to a fresh walk, while inserts ahead of the
+boundary may extend the current walk. Existing rows are not shifted, skipped,
+or duplicated by those inserts. A cursor remains usable if its row is
+soft-deleted, but a missing, wrong-type, or out-of-namespace cursor fails.
+Callers must retain the same type and status filters for the whole walk.
+The walk is complete when `next_after` is null. Cursor pages carry no `total`:
+counting the namespace is a full scan per page and cannot signal completion.
+Offset pages keep `total`.
+
+`fields` is a strict, non-empty response projection. Atom fields are `id`,
+`namespace`, `slug`, `name`, `content`, `tags`, `properties`, `status`,
+`source_uri`, `source_type`, `finalized`, `kind`, `created_at`, and `updated_at`.
+Domain fields are `id`, `namespace`, `slug`, `name`, `description`, `tags`,
+`members`, `kind`, `created_at`, and `updated_at`. Projection is applied at the
+SQL boundary: `fields=["id","slug"]` selects no atom content, apart from hidden
+`id`/`created_at` pagination keys that are not rendered unless requested.
 
 #### `knowledge.delete_atoms` — soft delete
 
@@ -333,7 +337,7 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {lexical, fallback, terms_truncated}}
+search(query, type?, status?, exclude_status?, include_drafts?: false, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {results: [...], total: N, candidate_provenance: {...}}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, tags, and content
@@ -372,12 +376,36 @@ retrieval path goes through the same status gate.
 same default exclusion. There is no `include_drafts` override on `suggest` — domain atoms in
 draft state should not drive agent composition.
 
-**Score interpretation (amended 2026-08-30)**: scores are request-relative hybrid ranking
-values, not calibrated relevance probabilities or absolute presence signals. Use result rank
-together with `candidate_provenance` and each result's `score_provenance`; do not apply fixed
-numeric bands across queries. A true lexical miss returns no lexical candidates instead of
-ranking the newest corpus rows, though a healthy ANN leg may still return explicitly labeled
-ANN-only results.
+**Search score interpretation**: scores are request-relative ranking values, not calibrated
+relevance probabilities or absolute presence signals. Use result rank together with
+`candidate_provenance` and each result's `score_provenance`; no fixed numeric band establishes
+relevance across queries.
+
+Every `knowledge.search` result carries `score_provenance` with these fields:
+
+- `sources`: a stable-order subset of `["lexical", "ann"]`. A hit present in both candidate
+  sources retains both labels after RRF fusion.
+- `embedding_rerank`: whether a successful embedding rerank transformed this hit's score.
+- `normalization`: `"s_over_s_plus_1"`. Search applies the monotonic `s / (s + 1)` squash to
+  the score before the status multiplier and final `min_score` filter.
+- `calibrated`: `false`.
+
+The response's `candidate_provenance.lexical` records the lexical candidate-stage outcome:
+`matched` for eligible candidates, `no_match` for no lexical match in the caller's namespace,
+`filtered` for matches removed by eligibility, `partial_timeout` when a timed-out fetch retains
+eligible candidates or decomposed passes mix completion and timeout, and `timed_out` when a
+fetch times out with no retained candidates (or every decomposed pass does so).
+Completed empty terms alone do not make a fetch partial. These states supplement the
+lexical timeout diagnostics.
+
+`candidate_provenance.terms_truncated` reports whether any pass exceeded the shared
+32-term allowance described above; the lexical state applies only to admitted terms.
+
+`candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and no
+returned hit has lexical evidence; otherwise it is `none`, including for an empty result.
+A genuine lexical miss returns no lexical candidates instead of ranking unrelated recent
+corpus rows. A healthy ANN leg can still supply explicitly labeled ANN-only results. Bounded
+eligibility recovery for actual FTS matches remains part of lexical candidate retrieval.
 
 #### `knowledge.compose` — namespace-consistent briefing composition
 

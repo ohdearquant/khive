@@ -9,8 +9,9 @@ use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedWriteOutcome, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
+    EdgeSortField, EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedBatchOutcome,
+    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, LinkId,
+    NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
     TraversalRequest,
 };
 
@@ -19,8 +20,35 @@ use crate::types::{
 pub trait GraphStore: Send + Sync + 'static {
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
+    /// Insert an edge only when neither its id nor natural key already
+    /// exists. Returns `true` when this call inserted the row and `false`
+    /// when an existing row won the race. The existing row is never updated.
+    ///
+    /// The default returns `Unsupported` rather than falling back to
+    /// [`GraphStore::upsert_edge`], because an upsert would overwrite the
+    /// winning row and violate this method's conditional-insert contract.
+    async fn insert_edge_if_absent(&self, _edge: Edge) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "insert_edge_if_absent".into(),
+            message: "this backend does not implement conditional edge insert".into(),
+        })
+    }
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
+    /// Insert or replace one edge and return the transaction-observed
+    /// disposition plus preimage. Tombstone restoration is controlled by the
+    /// request rather than being an implicit side effect of every upsert.
+    async fn upsert_edge_observed(
+        &self,
+        _request: EdgeUpsertRequest,
+    ) -> StorageResult<EdgeUpsertResult> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edge_observed".into(),
+            message: "this backend does not implement observed edge upserts".into(),
+        })
+    }
     /// Replace an edge only when the persisted row still matches the
     /// caller's read snapshot.
     ///
@@ -71,12 +99,27 @@ pub trait GraphStore: Send + Sync + 'static {
             message: "this backend does not implement guarded edge writes".into(),
         })
     }
+    /// Observed form of [`GraphStore::upsert_edge_guarded`]. In addition to
+    /// the endpoint guard, it distinguishes create, live replacement, and
+    /// explicit resurrection without a caller-side read/write race.
+    async fn upsert_edge_guarded_observed(
+        &self,
+        _request: EdgeUpsertRequest,
+    ) -> StorageResult<GuardedEdgeUpsertOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edge_guarded_observed".into(),
+            message: "this backend does not implement observed guarded edge upserts".into(),
+        })
+    }
     /// Batch form of [`GraphStore::upsert_edge_guarded`]. All-or-nothing:
     /// if any edge's endpoints are missing at write time, no edge from the
     /// batch is persisted, `BatchWriteSummary::affected` is `0`, and
     /// `GuardedBatchOutcome::refused` names the first failing batch entry and
     /// its missing endpoint(s) — determined by the same in-transaction
     /// pre-check that aborted the batch, not a post-hoc re-read.
+    /// Retain the original ordered input to enumerate every aborted write via
+    /// [`GuardedBatchOutcome::refusal_page`] beyond the default bounded sample.
     ///
     /// Default returns `StorageError::Unsupported`, for the same reason as
     /// [`GraphStore::upsert_edge_guarded`]'s default.
@@ -85,6 +128,19 @@ pub trait GraphStore: Send + Sync + 'static {
             capability: StorageCapability::Graph,
             operation: "upsert_edges_guarded".into(),
             message: "this backend does not implement guarded edge writes".into(),
+        })
+    }
+    /// All-or-nothing observed batch form. Implementations must perform
+    /// endpoint and tombstone-policy preflight in the same write transaction
+    /// before applying any row.
+    async fn upsert_edges_guarded_observed(
+        &self,
+        _requests: Vec<EdgeUpsertRequest>,
+    ) -> StorageResult<GuardedEdgeBatchUpsertOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edges_guarded_observed".into(),
+            message: "this backend does not implement observed guarded edge batches".into(),
         })
     }
     /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.

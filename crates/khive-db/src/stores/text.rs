@@ -1090,11 +1090,12 @@ fn batch_upsert_documents_dml(
          VALUES (?1, ?2, last_insert_rowid())"
     );
 
-    let mut affected = 0u64;
-    let mut failed = 0u64;
-    let mut first_error = String::new();
+    let mut summary = BatchWriteSummary {
+        attempted,
+        ..BatchWriteSummary::default()
+    };
 
-    for doc in documents {
+    for (index, doc) in documents.iter().enumerate() {
         conn.execute_batch("SAVEPOINT fts_upsert_doc")?;
         let id_str = doc.subject_id.to_string();
         let namespace = &doc.namespace;
@@ -1125,25 +1126,18 @@ fn batch_upsert_documents_dml(
         match result {
             Ok(()) => {
                 conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc")?;
-                affected += 1;
+                summary.affected = summary.affected.saturating_add(1);
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc");
                 let _ = conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc");
-                if first_error.is_empty() {
-                    first_error = e.to_string();
-                }
-                failed += 1;
+                let (class, retryability) = super::classify_batch_sqlite_error(&e);
+                summary.record_failure(index, Some(id_str), class, retryability, e.to_string());
             }
         }
     }
 
-    Ok(BatchWriteSummary {
-        attempted,
-        affected,
-        failed,
-        first_error,
-    })
+    Ok(summary)
 }
 
 #[async_trait]

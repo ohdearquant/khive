@@ -18,11 +18,12 @@ Write semantics, stated once because every experiment depends on them:
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
 from .errors import BatchError, OperationError
-from .models import Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
+from .models import Attachment, Edge, EdgeRelation, Entity, Incidence, Note, OpResult, Page
 from .ops import encode, op
 from .transport import Session, SocketTransport, Transport
 
@@ -68,14 +69,20 @@ def _note_from_wire(row: dict[str, Any]) -> Note:
     return Note.model_validate(row)
 
 
-def _page(raw: Any, parse: Any) -> Page:
+def _page(raw: Any, parse: Any, *, cursor_key: str) -> Page:
     if isinstance(raw, dict):
-        items = raw.get("items", raw.get("results", []))
-        total = raw.get("total")
-        next_offset = raw.get("next_offset")
-    else:
-        items, total, next_offset = raw or [], None, None
-    return Page(items=[parse(x) for x in items], total=total, next_offset=next_offset)
+        items = raw.get("items", raw.get(cursor_key, raw.get("results", [])))
+        return Page(
+            items=[parse(x) for x in items],
+            total=raw.get("total"),
+            next_offset=raw.get("next_offset"),
+            next_after=raw.get("next_after"),
+            scan_incomplete=raw.get("scan_incomplete"),
+            requested_limit=raw.get("requested_limit"),
+            effective_limit=raw.get("effective_limit"),
+            limit_clamped=raw.get("limit_clamped"),
+        )
+    return Page(items=[parse(x) for x in raw or []])
 
 
 class Khive:
@@ -96,12 +103,11 @@ class Khive:
     ) -> None:
         if transport is None:
             transport = SocketTransport(socket_path)
-        self.session = Session(
-            transport, namespace=namespace, actor_id=actor_id, timeout=timeout
-        )
+        self.session = Session(transport, namespace=namespace, actor_id=actor_id, timeout=timeout)
         self.entities = _Entities(self)
         self.notes = _Notes(self)
         self.graph = _Graph(self)
+        self.blobs = _Blobs(self)
 
     # -- raw planes --------------------------------------------------------
 
@@ -112,14 +118,11 @@ class Khive:
     def batch(self, ops: list[dict[str, Any]]) -> list[OpResult]:
         """Like `raw`, but raises `BatchError` if any op failed."""
         results = self.session.request(encode(ops))
-        failures = [
-            (i, r.get("tool", "?"), str(r.get("error")))
-            for i, r in enumerate(results)
-            if not r.get("ok")
-        ]
+        parsed = [OpResult.model_validate(r) for r in results]
+        failures = [(i, r.tool, r.error) for i, r in enumerate(parsed) if not r.ok]
         if failures:
             raise BatchError(results, failures)
-        return [OpResult.model_validate(r) for r in results]
+        return parsed
 
     # -- database-wide reads ----------------------------------------------
 
@@ -152,7 +155,9 @@ class Khive:
         kind: str = "entity",
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        raw = _one(self.session.request(encode([op("search", kind=kind, query=query, limit=limit)])))
+        raw = _one(
+            self.session.request(encode([op("search", kind=kind, query=query, limit=limit)]))
+        )
         if isinstance(raw, dict):
             return raw.get("items", raw.get("results", []))
         return raw or []
@@ -198,7 +203,7 @@ class _Entities:
                 encode([op("list", kind=kind, limit=limit, offset=offset, **filters)])
             )
         )
-        return _page(raw, Entity.model_validate)
+        return _page(raw, Entity.model_validate, cursor_key="entities")
 
     def update(self, id: str, **patch: Any) -> Entity:
         raw = _one(self._db.session.request(encode([op("update", id=id, **patch)])))
@@ -217,7 +222,15 @@ class _Notes:
     def __init__(self, db: Khive) -> None:
         self._db = db
 
-    def create(self, note: Note | None = None, /, **fields: Any) -> Note:
+    def create(
+        self,
+        note: Note | None = None,
+        /,
+        *,
+        fence: dict[str, Any] | list[dict[str, Any]] | None = None,
+        embed: bool | None = None,
+        **fields: Any,
+    ) -> Note:
         n = note or Note(**fields)
         # subject rides in properties until the daemon grows the column.
         props = {**n.properties, "subject": n.subject} if n.subject else (n.properties or None)
@@ -229,6 +242,9 @@ class _Notes:
                             "create",
                             kind=n.kind,
                             content=n.content,
+                            key=n.key,
+                            fence=fence,
+                            embed=embed,
                             properties=props or None,
                             tags=n.tags or None,
                         )
@@ -242,8 +258,10 @@ class _Notes:
         return _note_from_wire(_one(self._db.session.request(encode([op("get", id=id)]))))
 
     def list(self, *, kind: str = "note", limit: int | None = None, **filters: Any) -> Page:
-        raw = _one(self._db.session.request(encode([op("list", kind=kind, limit=limit, **filters)])))
-        return _page(raw, _note_from_wire)
+        raw = _one(
+            self._db.session.request(encode([op("list", kind=kind, limit=limit, **filters)]))
+        )
+        return _page(raw, _note_from_wire, cursor_key="notes")
 
 
 class _Graph:
@@ -315,9 +333,7 @@ class _Graph:
     ) -> Any:
         return _one(
             self._db.session.request(
-                encode(
-                    [op("neighbors", node_id=node_id, direction=direction, relations=relations)]
-                )
+                encode([op("neighbors", node_id=node_id, direction=direction, relations=relations)])
             )
         )
 
@@ -351,7 +367,7 @@ class _Graph:
         raw = _one(
             self._db.session.request(encode([op("list", kind="edge", limit=limit, **filters)]))
         )
-        return _page(raw, _edge_from_wire)
+        return _page(raw, _edge_from_wire, cursor_key="edges")
 
     # -- incidence-aware reads (client-side PROTOTYPE) ---------------------
     # The target engine computes these as an incidence join server-side:
@@ -372,6 +388,63 @@ class _Graph:
         """(edge, other-member) pairs — the hypergraph neighbor view,
         each neighbor carrying ITS OWN weight in the shared edge."""
         return [(e, m) for e in self.incident(node_id) for m in e.others(node_id)]
+
+
+class _Blobs:
+    """Content-addressed blob store: bytes in, BLAKE3 ContentRef out.
+
+    Storage backend (local file tree vs S3) is the daemon's config, not the
+    client's concern — same put/get/stat either way. Idempotent: identical
+    bytes return the identical ref without a re-write."""
+
+    def __init__(self, db: Khive) -> None:
+        self._db = db
+
+    def put(self, data: bytes) -> str:
+        raw = _one(
+            self._db.session.request(
+                encode([op("blob.put", bytes=base64.b64encode(data).decode())])
+            )
+        )
+        return raw["content_ref"]
+
+    def get(self, content_ref: str) -> bytes:
+        raw = _one(self._db.session.request(encode([op("blob.get", content_ref=content_ref)])))
+        return base64.b64decode(raw["bytes"])
+
+    def stat(self, content_ref: str) -> dict[str, Any]:
+        return _one(self._db.session.request(encode([op("blob.stat", content_ref=content_ref)])))
+
+    # -- attachments (PROTOTYPE carrier) -----------------------------------
+    # The db has a first-class attachments table keyed (record, role), but
+    # no public verb writes it yet. Until that verb lands, the attachment
+    # descriptor rides in the record's properties["attachments"][role] and
+    # the bytes live in the blob store — same information, migratable.
+
+    def attach(
+        self,
+        record_id: str,
+        data: bytes,
+        *,
+        role: str = "attachment",
+        media_type: str | None = None,
+    ) -> Attachment:
+        ref = self.put(data)
+        att = Attachment(content_ref=ref, role=role, media_type=media_type, size=len(data))
+        rec = _one(self._db.session.request(encode([op("get", id=record_id)])))
+        atts = dict((rec.get("properties") or {}).get("attachments") or {})
+        atts[role] = att.model_dump(exclude_none=True)
+        props = dict(rec.get("properties") or {})
+        props["attachments"] = atts
+        _one(self._db.session.request(encode([op("update", id=record_id, properties=props)])))
+        return att
+
+    def attachment(self, record_id: str, role: str = "attachment") -> bytes:
+        rec = _one(self._db.session.request(encode([op("get", id=record_id)])))
+        atts = (rec.get("properties") or {}).get("attachments") or {}
+        if role not in atts:
+            raise KeyError(f"record {record_id} has no attachment role {role!r}")
+        return self.get(atts[role]["content_ref"])
 
 
 def _json_pretty(value: Any) -> str:

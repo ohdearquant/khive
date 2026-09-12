@@ -455,6 +455,23 @@ instrumentation cannot see the population this record shrinks.
   the records it holds. That is a separate property and the two must not be conflated: a record
   handled correctly by the write path, on a store configured to lose recent commits, is still
   exposed. Both halves have to hold, and satisfying one says nothing about the other.
+
+  **Named exceptions.** Two bounded exceptions to INV-1 are recorded in this document, and there
+  are no others. Amendment 1 scopes an admission-pressure undercount to allowlisted read verbs.
+  Amendment 6 adds a wedged-store path that applies to every producer class: when a generation's
+  append does not return within `driver_append_deadline` (3x `resolution_deadline`), the driver
+  abandons the generation. If the detached append later commits, its rows are durable but no
+  waiter observes them; if it fails permanently, they are lost. Either way the loss path is never
+  silent: the generation snapshot carries `terminal_reason = DriverAppendAbandoned` with
+  `committed_rows = 0`, `flush_failures` increments, and pure producers record degradation. An
+  operator reads that snapshot as a store that stopped answering for longer than the bound, not as
+  a write-path defect, and treats the snapshot's row count as the upper bound on what was lost. The
+  same amendment's cap on outstanding abandoned appends (`max_abandoned_appends`) adds a second,
+  same-family sub-path rather than a third exception: once that many appends are already
+  outstanding, a further generation is shed without an append ever being attempted, so its rows are
+  lost with certainty rather than merely possibly, upon the same non-silent surfacing —
+  `terminal_reason = StoreWedged`, `flush_failures` increments, and pure producers record
+  degradation exactly as they do for `DriverAppendAbandoned`.
 - **INV-2 (D5).** An unclassified input resolves to the stricter handling — commit failure fails
   the dispatch — enforced by exhaustive matching without a wildcard.
 - **INV-3.** Batch accumulation is bounded and never blocks dispatch indefinitely; a full batch
@@ -619,7 +636,8 @@ it would change what usage gets accounted.
 
 ## Amendment 1 (2026-08-26): A Named, Bounded Exception to D4/INV-1 for Admission-Pressure Reads
 
-**Status**: Accepted, implemented alongside PR #2228 (khive#2147/khive#2217/khive#2208).
+**Status**: Accepted, implemented alongside PR #2228 and extended across the reviewed
+cross-pack Assertive surface for khive#2217 (khive#2147/khive#2208).
 
 D2 states: _"A dispatch must not report success when the record that accounts for, authorizes, or
 audits it did not commit"_ (`ADR-133:297-298`), and D4/INV-1 states the same as a system-wide
@@ -628,12 +646,15 @@ once: never dropped, never volatile at return, never falsely acknowledged, never
 (`ADR-133:436-438`), with failure mode 3 named explicitly as _"**Falsely acknowledged** — the
 operation reports success when the record did not commit"_ (`ADR-133:375`).
 
-This amendment qualifies both sentences for one narrow, named case: the eleven read verbs on
+This amendment qualifies both sentences for one narrow, named case: the 39 reviewed read verbs on
 `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` (`crates/khive-runtime/src/pack.rs`; the full list and
 rationale are in ADR-103 Amendment 3), and only when the row's own commit did not resolve before
 the dispatch returned because the audit lane's admission was transiently exhausted or the caller's
 bounded wait for it elapsed — `AuditTerminalReason::QueueAdmissionExhausted` or
-`AdmissionDeadlineExpired`, never a persistent commit failure. For that verb set and those two
+`AdmissionDeadlineExpired`, never a persistent commit failure. Membership in that verb set is
+itself bound to the exact pack that registered the handler, not the verb name alone (ADR-103
+Amendment 3) — a handler under a different pack never qualifies for this exception, no matter what
+it is named. For that verb set and those two
 terminal reasons, the dispatch reports its already-computed successful read result without waiting
 on its own audit/accounting row. The two reasons are not the same fact, though, and this amendment
 does not treat them as one:
@@ -671,7 +692,7 @@ loss from an unresolved one — see ADR-103 Amendment 3.
 **What does not change:** D4/INV-1 continues to hold without qualification for every write, every
 non-allowlisted Assertive handler, gate-denial rows, unknown-verb rows, and `git.digest` receipts.
 D2's "must not report success" sentence is unqualified for a persistent commit failure on any row,
-including the eleven allowlisted verbs — the exception is admission pressure specifically, not
+including the 39 allowlisted verbs — the exception is admission pressure specifically, not
 store failure generally.
 
 This amendment does not revisit "Split the audit row so accounting lives in its own record" from
@@ -708,3 +729,259 @@ The exception's enumerated verb set is authoritative in ADR-103 Amendment 4, whi
 the extended census test to assert list-to-enumeration equality and per-entry handler resolution —
 so a branch widening the constant without a signed amendment fails the census rather than widening
 this exception silently.
+
+## Amendment 3 (2026-09-08): The obligation error carries the domain disposition, and a post-dispatch obligation error is never retry permission
+
+**Status**: Proposed.
+
+### The gap
+
+D2 fails a would-be-success dispatch when its obligation row does not commit. The fold that applies
+D2 (`fold_audit_obligation`, `crates/khive-runtime/src/pack.rs`) has the domain result in hand in
+that arm and discards it:
+
+```rust
+(Ok(value), Ok(())) => Ok(value),
+(Ok(_), Err(audit_err)) => Err(audit_err),
+(Err(err), _) => Err(err),
+```
+
+The domain verb is dispatched before the audit append, so in the middle arm the domain effect has
+usually already committed. The error the caller receives says nothing about that effect. Two
+observations of this one class are on file: an `AdmissionDeadlineExpired` after a comm write had
+committed (#2399) and a `StoreFailure` after a domain write had committed (#2256). The class is
+defined by where the error is raised, after the dispatch, not by the reason it names.
+
+The consequence lands on the caller. A client that retries after such an error creates a duplicate
+it cannot see; a client that refuses to retry has to re-read an outcome it holds no key for. D4's
+fourth forbidden mode, duplicated accounting, is pushed one layer out onto the domain records, where
+nothing checks it. The policy is right: a dispatch must not report success over an uncommitted
+obligation row. What was never stated is what the error must say, and what a caller may do with it.
+This amendment states both. Tracked as #2424.
+
+### A3.1 The error carries a machine-readable domain disposition
+
+Every per-op error object on the `request` envelope, and the error field of a daemon-frame response,
+carries `domain_disposition` with exactly one of three values:
+
+- `committed`: the domain dispatch returned a success value and the error was raised afterwards by
+  the obligation path (D2), or by the transport after the dispatch returned. The error object also
+  carries `domain_result`, the value the fold was holding, so the caller learns the same identifiers
+  a success would have returned. When that value cannot be carried (the response depth guard or the
+  batch byte budget refused it), `domain_result` is omitted and `code` names the limit; the caller
+  resolves that case as it resolves `unknown`. The op still reports `ok: false`; D2, D3 and D4 are
+  unchanged.
+- `not_committed`: the error was raised by the envelope layer before the op was handed to a pack:
+  an unknown verb, a request that failed parameter validation or `$prev` resolution, a conflict
+  refusal, the permission refusal of an internal subhandler, and every aborted chain entry (an op
+  never dispatched because an earlier op in its chain failed). No domain effect exists. The value
+  is assigned by raise site, never by error variant: `InvalidInput` is raised by pack handlers as
+  well as by parameter validation, and the secret gate is the standing example: it is invoked inside
+  handlers (`crates/khive-runtime/src/operations.rs`, the code and git ingest
+  handlers) at points where a handler may already have written, so a `SecretDetected` raised there
+  is `unknown`. One pack-raised class joins `not_committed`: a refusal the handler asserts wrote
+  nothing and that names the existing record, such as a keyed create-if-absent that found the
+  holder (`key_conflict`, the first member); the handler asserts it and arm 5 covers it. A handler
+  whose gate provably runs before every write on a path may claim `not_committed` for that path by
+  name, in a later amendment.
+- `unknown`: everything else. A domain handler's own error, an error the transport could not
+  deliver, a daemon `version_mismatch`. The caller cannot learn the disposition from the error and
+  must resolve it another way.
+
+Three values, not two, because a caller reads an absent or two-valued field as `not_committed`
+exactly when the runtime could not tell, which reinstates the defect with more confidence attached.
+The field is present on every error object; absence is a defect, not a fourth state. An aborted
+chain entry carries no error object today (`ok: false`, `aborted: true`, `message`); it carries
+`domain_disposition: "not_committed"` at the entry level.
+
+`runtime_error_value` renders obligation errors as a structured object with `kind: "obligation"`,
+`code` set to the terminal reason (`admission_deadline_expired`, `store_failure`, and the other
+`AuditTerminalReason` values in snake case), `message`, `domain_disposition: "committed"` and
+`domain_result`. An obligation path that fails before it has a terminal reason (the git digest
+receipt path's setup branches: no event store, no deferred audit, a malformed receipt payload)
+renders the same object with `code` set to that path's own failure code in snake case
+(`git_digest_receipt_failure`) and the branch named in `message`; it is `committed` because the
+digest report exists, and `domain_result` carries it. Any handler-owned receipt path that bypasses
+the fold is in scope of this amendment and renders through the same serializer. Errors that today serialize as a bare string keep their message and gain the field
+by becoming an object of the shape `{"kind": "...", "message": "...", "domain_disposition": "..."}`.
+
+Wire rule. Today `error` is a string at some sites (dispatch failures, the conflict and `$prev`
+refusals, the internal-subhandler permission refusal, the batch byte budget) and an object at others
+(the storage and unavailable contexts, the depth guard). String to object is a shape change for
+every consumer that reads `error` as text; the message stays at `error.message`. Presentation is
+applied to the `result` field only and never touches an error entry, so the two fields survive every
+presentation mode and per-op override on the canonical machine result. A client that reshapes
+entries on its own side is outside this guarantee; the canonical request/outcome carrier for the
+Python client is separate work and cites this record.
+
+On the daemon frame the top-level `error` stays text, because unchanged peers deserialize it as a
+string; the frame gains an additive optional `error_detail` object of the same shape as the per-op
+error object (`kind`, `code`, `message`, `domain_disposition`, and `domain_result` when present),
+which the MCP side maps into its error data and the Python client exposes. No protocol version
+change for this amendment; a peer that ignores `error_detail` sees what it saw before.
+
+### A3.2 A post-dispatch obligation error is UNKNOWN to the caller and never retry permission
+
+The consumer rule, stated once here so every client inherits it rather than rediscovering it: an
+error whose `domain_disposition` is not `not_committed` is not permission to resend the request.
+`committed` is resolved from the error itself, using `domain_result`. `unknown` is resolved only by
+an outcome re-read keyed on an identity the caller chose before the call; ranked recall and inbox
+listings are not absence oracles. No reason string, code or message text promotes an error into a
+retry decision. The Python client exposes the field on the per-op error object and raises nothing
+new for it.
+
+This amendment does not supply the caller-chosen identity; that is a separate record. Response loss
+before the fold and every `unknown` disposition stay genuinely unknown until it lands.
+
+### Acceptance
+
+1. **Committed arm.** A dispatch that writes a domain row and whose obligation row is forced to fail
+   returns `ok: false`, `domain_disposition: "committed"`, and a `domain_result` carrying the id of
+   the row; the row exists in the store. On the pre-amendment code the same test fails because the
+   field is absent (run the mutation, quote both results).
+2. **Not-committed arm.** An unknown verb, an invalid-parameter request and the permission refusal
+   of an internal subhandler each return `domain_disposition: "not_committed"` and leave `stats()`
+   unchanged.
+3. **Unknown arm.** A handler that returns its own error yields `domain_disposition: "unknown"`
+   and no `domain_result`; a secret-gate refusal raised inside a handler yields the same.
+4. **Degrade path unchanged.** An admission-degrade-safe read under the two transient reasons of
+   Amendment 1 still returns `ok: true` with its result; no disposition field appears on a success.
+5. **Every error carries the field.** A test walks every error constructor reachable from the
+   envelope, the exhaustive match in `runtime_error_value` and the envelope-layer sites that build an
+   error entry without it (the depth guard, the batch byte budget, the conflict, `$prev` and
+   permission refusals, the aborted-entry constructor), and asserts the field is present; adding an
+   error variant or an envelope-layer site without a disposition fails to compile or fails this test.
+6. **Three surfaces, one shape.** The MCP `request` tool, the daemon frame and the Python client
+   return the same error object for the same forced failure; the Python client preserves the two
+   new keys without validation errors.
+7. **The caller that retried anyway.** After a committed-arm response, replaying the identical
+   request produces a second domain record, and the test asserts that second record exists. This
+   arm documents today's behaviour honestly; it flips to a refusal when the caller-chosen identity
+   record lands, and stays in the suite until then.
+8. **Aborted entries.** A chain whose first op fails returns every later entry with `aborted: true`
+   and `domain_disposition: "not_committed"`; the summary counts them as aborted, not failed.
+9. **Consumers of the error field.** Before the object form replaces a string at any site, the
+   implementation enumerates the consumers of `error` outside this repository (the lionagi v1
+   client, autopipe, khive-cloud, the inbox monitor probe) and shows each parses the object form,
+   quoting the read site. A consumer that reads the text keeps the string at `error` and the object
+   lands at `error_detail` instead; the implementation PR states which of the two it shipped.
+
+### Implementation notes
+
+- `fold_audit_obligation` keeps the value in the obligation arm and returns an error that owns it:
+  a `RuntimeError` variant wrapping the audit reason and the domain value (name is implementation
+  freedom; the wire fields are not).
+- `runtime_error_value` in `crates/khive-mcp/src/server.rs` sets `domain_disposition` for every
+  variant through an exhaustive match; `not_committed` is assigned at the envelope-layer raise
+  sites and in the aborted-entry constructor, never by matching a variant (`SecretDetected` maps to
+  `unknown`); the daemon response path uses the same serializer.
+- `python/khive/envelope.py`: `_validate_op_errors` admits the two keys and exposes them; no
+  behaviour change for callers that ignore them.
+
+<!-- Amendment numbers are allocated in merge order, not by date: Amendment 3 was
+accepted on main while Amendments 4 to 6 were in flight, and it keeps its number so
+existing citations stay valid. Read them in numeric order. -->
+
+## Amendment 4 (2026-08-30): Resolve Enqueued Audit Outcomes for Committed Successes
+
+**Status**: Accepted, implemented for khive#2256.
+
+Amendment 1 deliberately lets an admission-degrade-safe read return when its already-enqueued
+audit row crosses `admission_deadline`. That same return rule is not sound for a successful
+non-degrade-safe operation: its domain effect may already be committed, so converting the audit
+wait timeout into a generic dispatch failure reports the opposite of what happened and invites an
+unsafe retry of a non-idempotent verb.
+
+Successful `DispatchSucceeded` operations outside the read-degrade allowlist, plus the dedicated
+`GitDigestReceipt` producer, therefore use the batch seam's resolved-wait mode. They enqueue and
+share generations exactly as before. If `admission_deadline` elapses after enqueue, the runtime
+records a warning and keeps awaiting that same receiver until the generation reports its real
+commit or terminal failure; it never re-enqueues the row and never reruns the handler.
+
+The distinction at the two admission boundaries remains exact:
+
+- `QueueAdmissionExhausted` happens before enqueue and is still returned immediately. No audit row
+  exists to await.
+- `AdmissionDeadlineExpired` remains a caller-visible result of ordinary bounded `submit()` and
+  continues to drive Amendment 1's read-degradation accounting. It is not returned by the
+  resolved-wait mode once a committed success row has been enqueued.
+- `IdentityConflict`, `StoreFailure`, unsupported idempotency, and driver terminal failures still
+  fail the successful dispatch once they are known. The change removes only a false failure caused
+  by an unresolved wait threshold; it does not weaken durable audit obligations.
+
+Gate-denial, unknown-verb, failed-dispatch, and pure-observability rows retain bounded submission:
+their caller-visible operation outcome is already fixed, or their contract is explicitly
+best-effort. The eleven admission-degrade-safe reads remain governed by Amendment 1 unchanged.
+
+## Amendment 5 (2026-09-03): Bound the Resolved Wait Itself
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 4's resolved-wait mode kept the enqueued audit receiver alive with no upper bound once
+`admission_deadline` elapsed: a stalled `EventStore::append_events_idempotent()` call (a wedged
+writer task, an unreachable events daemon that never times out at that layer, and so on) retained
+the completed write's caller, its request slot, and its audit-lane waiter indefinitely. The stalled
+generation also stops the driver from draining any row queued behind it, so both request and audit
+capacity exhaust together rather than the caller ever observing a terminal outcome.
+
+`AuditBatchConfig` gains a second, larger bound, `resolution_deadline`, which caps how much longer
+`AuditBatch::submit_until_resolved` may wait once `admission_deadline` has already elapsed on the
+row. It defaults to 6x `admission_deadline` and is validated (debug-only, at `AuditBatch`
+construction) to be no shorter than `admission_deadline`.
+
+If `resolution_deadline` also elapses, the caller receives a new terminal reason,
+`AuditTerminalReason::ResolutionDeadlineExpired`, distinct from `AdmissionDeadlineExpired`: the
+domain effect has already committed, so it is not retried and the row is not re-enqueued, but the
+audit outcome itself is now unknown to the caller rather than merely slow. The row is left exactly
+where the driver holds it — in `state.pending`, or already mid-generation — for the driver to
+resolve independently, the same non-removal contract Amendment 1 established for
+`AdmissionDeadlineExpired`. Amendment 6 gives such a row a second possible ending: once the
+driver's own bound on the generation holding it elapses, that generation is abandoned and the row
+resolves as `DriverAppendAbandoned` rather than to a commit the driver observes. Every other
+boundary in Amendment 4 is unchanged: `QueueAdmissionExhausted`
+still returns immediately with no audit row to await, and a genuine `IdentityConflict`,
+`StoreFailure`, unsupported-idempotency, or driver terminal failure that resolves before
+`resolution_deadline` still fails the successful dispatch exactly as before.
+
+## Amendment 6 (2026-09-04): Bound the Driver's Own Append, Not Just the Caller's Wait
+
+**Status**: Accepted, implemented for khive#2331.
+
+Amendment 5 left exactly the gap its own text names: bounding how long a _caller_ waits does not
+bound how long the _driver_ holds a stalled generation. `supervisor_loop` drains rows into one
+generation, spawns a child task that calls `EventStore::append_events_idempotent()`, and then
+awaits that child with no timeout of its own. When the call never returns, the loop never returns
+to the top to drain `state.pending` again — every submission arriving after the stall piles up in
+`pending` regardless of whether its own caller is using bounded `submit()` or resolved-wait
+`submit_until_resolved()`, and regardless of whether that caller has already given up. Once
+`pending` reaches `max_pending_rows`, every later submission gets `QueueAdmissionExhausted`, not
+just the row that started the stall — a caller giving up on its own deadline frees nothing, because
+the row it gave up on is never removed from wherever the driver holds it.
+
+`supervisor_loop` now wraps its `child.await` in `tokio::time::timeout`, bounded by a
+`driver_append_deadline` derived from `resolution_deadline` (3x it, not a new config field — see
+the rationale on `driver_append_deadline` in `audit_batch.rs`, which exists to guarantee the driver
+can never race ahead of a `submit_until_resolved` caller's own, more specific
+`ResolutionDeadlineExpired` reason for the same row). If that bound elapses, the generation is
+recorded with the new `AuditTerminalReason::DriverAppendAbandoned`, every waiter on it is resolved
+with that reason, and the loop continues immediately to drain whatever has queued in `pending`
+since — restoring admission capacity for later callers regardless of how the stalled generation
+eventually resolves. The underlying `append_events_idempotent()` call is not cancelled — it may be
+a blocking storage call that cannot be safely aborted mid-write — so it is handed to a detached
+task that drives it to completion and discards whatever it eventually returns; no waiter is still
+listening for that result. As with `ResolutionDeadlineExpired`, the caller's already-committed
+domain effect is never retried and the row is never re-enqueued. Under a store that never returns,
+this mints one detached task per `driver_append_deadline` (90 s at the defaults: a 5 s
+`admission_deadline`, 6x for `resolution_deadline`, 3x again for the driver) — but only up to
+`AuditBatchConfig::max_abandoned_appends` (default 4) may be outstanding at once. Before spawning a
+generation's child, `supervisor_loop` reads the current count of still-running
+`DriverAppendAbandoned` appends; at or above the cap, the store is treated as wedged and this
+generation is shed instead of attempted: no child task is spawned and no store call is made, every
+waiter resolves immediately with the new `AuditTerminalReason::StoreWedged`, `flush_failures`
+increments, and the loop continues straight to the next `pending` drain. A shed generation costs no
+store work at all. Recovery needs no timer of its own: as soon as one outstanding append returns —
+commit or failure, each recorded on a dedicated counter so an operator can see that a store recorded
+as wedged later drained — the count drops back below the cap and the next generation attempts a
+real append again. This bounds the retained-buffer growth a wedged store can cause to
+`max_abandoned_appends * max_rows_per_generation` rows, in place of the fully unbounded growth this
+amendment originally left.

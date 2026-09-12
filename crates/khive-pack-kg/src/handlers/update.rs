@@ -7,6 +7,9 @@ use khive_runtime::{
     EdgePatch, EntityPatch, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
 };
 
+use khive_storage::Entity;
+use khive_types::pack::PACK_REGISTRY_TAGS;
+
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
     optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_unfiltered,
@@ -15,10 +18,40 @@ use super::common::{
 };
 use crate::KgPack;
 
+/// Refuse a write to a row a pack owns through its own registry.
+///
+/// The row's fields are policy inputs, not metadata: the tool registry's
+/// `source` names the binary a granted name resolves to, and `side_effect` is
+/// read at run time and handed to the policy decision. The check reads the
+/// row's CURRENT tags, so a patch that would strip the tag first is refused by
+/// the same rule rather than becoming the way around it.
+fn refuse_pack_registry_row(entity: &Entity, verb: &str) -> Result<(), RuntimeError> {
+    let Some(tag) = entity
+        .tags
+        .iter()
+        .find(|tag| PACK_REGISTRY_TAGS.contains(&tag.as_str()))
+    else {
+        return Ok(());
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb} refuses {}: it is a registry row tagged {tag:?}, whose fields are policy inputs; \
+         the owning pack's own verbs are its only writer, and changing what a registered name \
+         means requires registering a new name",
+        entity.id
+    )))
+}
+
 // Field applicability guard, authoritative field sets per substrate — see
 // docs/api/note-crud-fields.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
 // whenever UpdateParams or a patch struct changes.
 fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
+    if !matches!(spec, KindSpec::Note { .. })
+        && (p.expected_version.is_some() || p.fence.is_some() || p.embed.is_some())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "expected_version, fence and embed apply only to notes".into(),
+        ));
+    }
     let (bad_field, valid): (Option<&str>, &str) = match spec {
         KindSpec::Entity { .. } => {
             let bad = if p.content.is_some() {
@@ -39,8 +72,6 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
         KindSpec::Note { .. } => {
             let bad = if p.description.is_some() {
                 Some("description")
-            } else if p.tags.is_some() {
-                Some("tags")
             } else if p.relation.is_some() {
                 Some("relation")
             } else if p.weight.is_some() {
@@ -50,7 +81,10 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             } else {
                 None
             };
-            (bad, "name, content, salience, decay_factor, properties")
+            (
+                bad,
+                "name, content, salience, decay_factor, properties, tags",
+            )
         }
         KindSpec::Edge => {
             let bad = if p.name.is_some() {
@@ -149,6 +183,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params.clone())?;
+        super::common::require_object_param(p.properties.as_ref(), "properties")?;
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
@@ -189,6 +224,7 @@ impl KgPack {
         match spec {
             KindSpec::Entity { specific } => {
                 let entity = self.runtime.get_entity(token, id).await?;
+                refuse_pack_registry_row(&entity, "update")?;
                 if let Some(k) = specific.as_ref() {
                     if entity.kind != *k {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -266,13 +302,20 @@ impl KgPack {
                     .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
                     .await?;
                 let p: UpdateParams = deser(params)?;
+                super::common::require_object_param(p.properties.as_ref(), "properties")?;
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,
                     p.salience,
                     p.decay_factor,
                     p.properties,
-                );
+                )
+                .with_write_options(khive_runtime::note_write::NoteWriteOptions {
+                    expected_version: p.expected_version,
+                    fence: p.fence,
+                    embed: p.embed,
+                    key: None,
+                });
                 let (note, report) = self
                     .runtime
                     .update_note_from_snapshot_with_embedding_report(token, note, patch)
@@ -346,17 +389,19 @@ impl KgPack {
 
         match spec {
             KindSpec::Entity { specific } => {
+                // Read the row before deciding: a registry row is refused here
+                // whether or not the caller named a kind, so the guard cannot
+                // be stepped around by omitting one.
+                let entity = if hard {
+                    self.runtime
+                        .get_entity_including_deleted(token, id)
+                        .await?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("entity {}", p.id)))?
+                } else {
+                    self.runtime.get_entity(token, id).await?
+                };
+                refuse_pack_registry_row(&entity, "delete")?;
                 if let Some(ref expected) = specific {
-                    let entity = if hard {
-                        self.runtime
-                            .get_entity_including_deleted(token, id)
-                            .await?
-                            .ok_or_else(|| {
-                                RuntimeError::NotFound(format!("{} {}", expected, p.id))
-                            })?
-                    } else {
-                        self.runtime.get_entity(token, id).await?
-                    };
                     if entity.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
                             "kind mismatch: {} exists with kind '{}', not '{}'",
@@ -364,31 +409,38 @@ impl KgPack {
                         )));
                     }
                 }
+                // Report the kind the row carries, not the one the caller typed. The row
+                // was read a few lines up to enforce the mismatch guard, so this costs
+                // nothing, and a caller who deleted by a bare id or a hex prefix learns
+                // what it actually removed.
+                let resolved_kind = entity.kind.clone();
                 let deleted = self.runtime.delete_entity(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                )
             }
             KindSpec::Note { specific } => {
+                // Read the row whether or not the caller named a kind. It used to be read
+                // only to enforce the mismatch guard, which meant the response could
+                // report a kind only when the caller had already supplied one.
+                let label = specific.as_deref().unwrap_or("note");
+                let note = if hard {
+                    self.runtime
+                        .get_note_including_deleted(token, id)
+                        .await?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("{} {}", label, p.id)))?
+                } else {
+                    self.runtime
+                        .notes(token)?
+                        .get_note(id)
+                        .await
+                        .map_err(RuntimeError::Storage)?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("{} {}", label, p.id)))?
+                };
                 if let Some(ref expected) = specific {
-                    let note = if hard {
-                        self.runtime
-                            .get_note_including_deleted(token, id)
-                            .await?
-                            .ok_or_else(|| {
-                                RuntimeError::NotFound(format!("{} {}", expected, p.id))
-                            })?
-                    } else {
-                        self.runtime
-                            .notes(token)?
-                            .get_note(id)
-                            .await
-                            .map_err(RuntimeError::Storage)?
-                            .ok_or_else(|| {
-                                RuntimeError::NotFound(format!("{} {}", expected, p.id))
-                            })?
-                    };
                     if note.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
                             "kind mismatch: {} exists with kind '{}', not '{}'",
@@ -396,11 +448,14 @@ impl KgPack {
                         )));
                     }
                 }
+                let resolved_kind = note.kind.clone();
                 let deleted = self.runtime.delete_note(token, id, hard).await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                )
             }
             KindSpec::Edge => {
                 let deleted = self.runtime.delete_edge(token, id, hard).await?;

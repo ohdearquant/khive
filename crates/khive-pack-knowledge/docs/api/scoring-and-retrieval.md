@@ -50,7 +50,7 @@ indexed until a knowledge read path can select or fuse them.
 
 ### Vamana ANN Signal
 
-In parallel with TF-IDF, if a Vamana ANN index is warm (populated via `knowledge.index
+Alongside the TF-IDF signal, if a Vamana ANN index is warm (populated via `knowledge.index
 rebuild_ann=true`), the query embedding is also used for ANN search. ANN hits are fused with
 TF-IDF hits via RRF (Reciprocal Rank Fusion) with $k = 60$:
 
@@ -60,13 +60,21 @@ $$
 
 ### Candidate Admission and Degradation
 
-The FTS leg is a recall stage, not the final ranker. It ORs the de-duplicated non-stop query
-terms, including the scorer's singular/plural expansions, so candidates with matching terms
-separated in their text remain eligible for in-memory TF-IDF scoring. FTS candidates are ordered
-by BM25, with slug as a deterministic tie-break. Deletion, status, and atom/domain kind
-eligibility are applied in SQL before the bounded candidate-window `LIMIT`; ineligible rows
-therefore cannot consume the window and hide eligible rows beyond it. The bounded full-scan
-fallback applies the same pre-limit eligibility rules. Status precedence is resolved once for
+The FTS leg is a recall stage, not the final ranker. It queries each de-duplicated non-stop
+term separately, including the scorer's singular/plural expansions, so matches separated in
+the text remain eligible for TF-IDF scoring. Phase A enumerates bounded rowid windows from the
+index; phase B hydrates them with namespace, deletion, status, and kind eligibility. Widening
+and eligibility-scoped FTS recovery keep an ineligible prefix from hiding real matches, within
+the lexical deadline. A genuine FTS miss contributes no unrelated recent rows.
+
+`knowledge.search` returns per-hit `score_provenance` (lexical/ANN sources, successful
+embedding rerank, `s_over_s_plus_1` normalization, and `calibrated: false`) plus response
+`candidate_provenance`. The latter distinguishes healthy matches, filtered matches, misses,
+and partial or complete lexical timeouts; its `fallback` is `ann` only when returned hits
+have ANN evidence without any lexical evidence. These fields replace fixed numeric score
+bands as retrieval-path evidence, not as a relevance guarantee.
+
+Status precedence is resolved once for
 candidate admission and final scoring: an explicit `exclude_status` excludes exactly that status,
 so `deprecated` remains eligible unless the resolved policy excludes it; default and
 `include_drafts=true` searches continue to exclude deprecated rows.
@@ -100,6 +108,13 @@ from the same category.
 Atlas markdown format:
 
 ```
+---
+id: retrieval.rope
+name: Rotary Position Embeddings
+tags: [retrieval, transformers]
+properties:
+  owner: research
+---
 # Title
 
 Optional pre-section body text.
@@ -114,24 +129,30 @@ the first `##` heading as the atom body, and maps each `##` heading to a `Sectio
 `SectionType::from_str_loose` (which accepts common heading aliases). Headings that don't match
 any canonical type are classified as `Other`.
 
-An optional `atlas_id:` front-matter line in the first 32 lines is extracted and stored in
-`properties.atlas_id` and as `source_uri = atlas:<id>`. Every import also stores the original
-root-relative markdown path in `properties.source_path`; without an Atlas ID, `source_uri` is
-`file:<source_path>`.
+Optional delimiter-bounded YAML frontmatter is removed before markdown parsing and content
+storage. `id`, `atlas_id`, and `atlas-id` are agreeing aliases for canonical identity; when
+present, the normalized ID supplies the slug and the original value is stored in
+`properties.atlas_id` and `source_uri = atlas:<id>`. `name` (then `title`), `tags`, and nested
+`properties` map to their atom fields, while other top-level metadata is retained in properties.
+Every import stores the original root-relative markdown path in `properties.source_path`.
+Without a canonical ID, identity falls back to the path and `source_uri` is
+`file:<source_path>` (a legacy loose `atlas_id:` hint may still supply Atlas provenance without
+changing the path-derived slug).
 
 The chunk strategy `"section"` (default) creates one atom + N sections per file.
-The `"atom"` strategy creates one atom with the byte-exact UTF-8 file content as `content` and no
-sections.
+The `"atom"` strategy creates one atom with the byte-exact UTF-8 post-frontmatter body as
+`content` and no sections. Without frontmatter, that body is the complete file.
 
-Directory slugs are stable root-relative identities: normalized path components join with `--`
-(`guides/rope.md` becomes `guides--rope`). A direct file keeps its normalized stem. Any
-normalization collision fails before writes and names both paths. Discovery is deterministic,
-does not follow symlinks, and fails closed at 32 directory levels, 100,000 entries, or 10,000
-markdown files. A root directory symlink is rejected even with a trailing separator. Limit errors
-name the exact failing path and report the current/configured depth, entry, and markdown-file
-counts. The response retains `imported_atoms`, `imported_sections`, and `files_processed`, and
-adds `entries_visited`, `files_discovered`, `files_skipped`, `traversal_errors`,
-`sections_discovered`, and `sections_skipped`.
+When frontmatter has no canonical ID, directory slugs are stable root-relative identities:
+normalized path components join with `--` (`guides/rope.md` becomes `guides--rope`). A direct
+file keeps its normalized stem. Any final-slug collision fails before writes and names both paths.
+A canonical re-import updates the same slug/UUID; an identity already claimed by another live slug
+is refused rather than duplicated. Discovery is deterministic, does not follow symlinks, and fails
+closed at 32 directory levels, 100,000 entries, or 10,000 markdown files. A root directory symlink
+is rejected even with a trailing separator. Limit errors name the exact failing path and report the
+current/configured depth, entry, and markdown-file counts. The response retains `imported_atoms`,
+`imported_sections`, and `files_processed`, and adds `entries_visited`, `files_discovered`,
+`files_skipped`, `traversal_errors`, `sections_discovered`, and `sections_skipped`.
 
 ## Numeric Validation
 

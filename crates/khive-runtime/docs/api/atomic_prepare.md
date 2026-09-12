@@ -88,6 +88,14 @@ computed entirely from data already on hand at prepare time, unlike the
 `ReindexEntity`/`ReindexNote` post-commit effects this module defers because those need an
 embedding call.
 
+Atomic `link` includes its event statements in the same unit. Prepare reads the
+natural-key row including tombstones and chooses a guarded create, live replace,
+or explicit resurrection statement. The guard revalidates endpoint existence
+and the natural-key snapshot at commit, so the response/event disposition cannot
+become stale. A create emits `LinkCreated`; replacement and resurrection emit
+`EdgeUpdated` with the prior row in `payload.previous`. Default tombstone
+conflicts fail during prepare with guidance to pass `resurrect=true`.
+
 `apply_post_commit_effects_with_report` returns one `PostCommitEmbeddingOutcome` for every reindex
 effect it successfully executes. Each outcome retains the originating effect identity plus its
 typed truncation report, allowing CLI or pack response builders to attach warnings to the exact

@@ -42,7 +42,7 @@ This is the production entrypoint. The deno/npm distribution invokes it:
 # stdio MCP server (default transport) — what MCP clients spawn
 kkernel mcp --db ~/.khive/khive.db
 
-# pick packs explicitly (default loads all 12 production packs)
+# pick packs explicitly (default loads all 14 production packs)
 kkernel mcp --pack kg --pack gtd --pack knowledge
 
 # warm Unix-socket daemon (owns ANN indexes; stdio clients auto-spawn + forward to it)
@@ -99,6 +99,32 @@ A request in which every op failed or aborted always exits nonzero after printin
 response. Without `--strict`, a _partially_ failed request (`status: "partial"` with at least
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
+
+### Check grammar without execution
+
+Use `kkernel exec --plan '<ops>'` to parse an operations string and inspect its stages without
+executing any verb:
+
+```bash
+kkernel exec --plan 'create(kind="note", content="example") | get(id=$prev.id)'
+```
+
+This requires an already-running daemon using the same configuration. Start it with
+`kkernel mcp --daemon` first, using matching `--db` and `--config` selections when needed.
+Planning connects to that daemon directly; it does not start a daemon or construct a local
+runtime. An unavailable daemon or a protocol/configuration mismatch is a terminal error.
+`KHIVE_NO_DAEMON` does not select local execution for a plan.
+
+The command prints the decoded plan object as JSON. Both `parsed=true` and `parsed=false`
+exit successfully: a grammar error appears in the result's `error` field. A plan lists
+normalized arguments, literal `$prev` references, stage count and whether each verb is in
+the daemon's loaded catalog. It does not establish permission or resolve references.
+
+`--plan` requires positional operations and rejects explicit presentation, output, save,
+bulk-file, execution-mode and identity options, including `--presentation verbose` and
+`--strict`. The ordinary command's default verbose presentation does not affect plans.
+`--db` and `--config` select the matching daemon configuration; no actor or request identity
+is sent. Invalid options and transport failures exit nonzero.
 
 ### Bulk JSONL execution
 
@@ -163,10 +189,11 @@ added, but an existing token's spelling and meaning never change.
 | `strict-op-failure`     | `--strict` observed at least one otherwise-unclassified failed or aborted operation. |
 | `parse-error`           | The operation expression or JSONL operation failed to parse.                         |
 | `verb-refused`          | The requested verb is unknown or is not loaded.                                      |
+| `policy-refusal`        | A write was refused by the immutable stream record policy.                           |
 
 For a multi-failure batch, stderr contains one line per classified failed or
-aborted operation. A specific dispatch reason (`gate-refusal` or
-`verb-refused`) takes precedence over the aggregate `strict-op-failure` reason
+aborted operation. A specific dispatch reason (`gate-refusal`, `verb-refused`, or
+`policy-refusal`) takes precedence over the aggregate `strict-op-failure` reason
 for that entry. An invocation-level actor refusal emits one line and returns
 the same normal `results`/`summary` JSON shape over every parsed operation
 without dispatching. Those failed rows and the `summary.failed` count describe
@@ -220,7 +247,13 @@ non-zero without an aborted one.
 Atomic ops-file preflight and prepare failures use the real per-operation
 `results` shape: an unknown or unloaded verb receives `verb-refused`, while a
 known verb that is merely ineligible for `--atomic` remains unclassified.
-Secret-gate failures during atomic prepare receive `gate-refusal`. An atomic
+Secret-gate failures during atomic prepare receive `gate-refusal`. Immutable
+stream record refusals receive `policy-refusal` during ordinary dispatch and
+atomic prepare. These guards refuse before the domain write and report
+`domain_disposition: "not_committed"`: inside the structured `error` for ordinary
+dispatch, or beside the string `error` on the atomic result entry. This
+classification does not cover ordinary sequence precondition conflicts or raw
+SQL trigger failures. An atomic
 rollback passed with `--strict` receives `strict-op-failure` on each
 not-committed result without changing the atomic path's existing process-exit
 semantics. Ordinary validation, transport, storage, and authorization-gate
@@ -278,20 +311,20 @@ kkernel reindex --db ~/.khive/khive.db --namespace khive
 kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only section embeddings
 ```
 
-| Flag               | Effect                                                                          |
-| ------------------ | ------------------------------------------------------------------------------- |
-| `--db <path>`      | database (env `KHIVE_DB`; `:memory:` for ephemeral) — parity with `mcp`/`exec`  |
-| `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`    |
-| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                 |
-| `--no-knowledge`   | only entities/notes (skip knowledge)                                            |
-| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)    |
-| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                   |
-| `--model <name>`   | entities/notes use this single engine instead of fanning out                    |
-| `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them    |
-| `--batch-size <n>` | records per embedding batch (default 128, max 500)                              |
-| `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
-| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)  |
-| `--human`          | readable report instead of JSON                                                 |
+| Flag               | Effect                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------- |
+| `--db <path>`      | database (env `KHIVE_DB`); with `[[backends]]`, must match one declared SQLite path |
+| `--config <path>`  | khive TOML config (env `KHIVE_CONFIG`) — resolves engines like `kkernel mcp`        |
+| `--knowledge-only` | only the knowledge corpus (skip entities/notes)                                     |
+| `--no-knowledge`   | only entities/notes (skip knowledge)                                                |
+| `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)        |
+| `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                       |
+| `--model <name>`   | entities/notes use this single engine instead of fanning out                        |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them        |
+| `--batch-size <n>` | records per embedding batch (default 128, max 500)                                  |
+| `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed)     |
+| `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)      |
+| `--human`          | readable report instead of JSON                                                     |
 
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
 vector work to missing records, but the selected graph pass still backfills FTS.
@@ -303,6 +336,15 @@ win over the `KHIVE_EMBEDDING_MODEL` env vars and over `RuntimeConfig` defaults.
 This guarantees reindex writes vectors for the SAME engine set the MCP server
 serves recall from. `--namespace` is the explicit per-namespace target and
 always wins over any config `[actor] id`.
+
+When the selected config declares `[[backends]]`, reindex remains a
+one-database command: `--db` / `KHIVE_DB` is required and must match one of the
+declared SQLite backend paths (including a secondary backend). An omitted,
+`:memory:`, or undeclared path is refused before any database is opened. The
+canonical path and filesystem identity (device + inode) observed at
+validation time are what reindex actually opens, re-checked immediately
+before open: a symlink retargeted, or the declared file replaced in place,
+after validation is refused rather than silently followed.
 
 **Fail-closed.** By default reindex returns a **non-zero exit** if any requested
 engine failed, the knowledge pass errored, any knowledge atom vector insert
@@ -461,3 +503,10 @@ make ci             # full gate (fmt, clippy -D warnings, tests, contract + smok
 ```
 
 After `make local`, run `/mcp` in Claude Code to reconnect to the rebuilt server.
+
+### Tool-source catalog management
+
+`kkernel mount repin <name> [--config <path>] [--db <path>]` refreshes an
+operator-configured stdio source and atomically replaces its pinned catalog with one
+audit record. Calls use ordinary `kkernel exec '<mount>.<tool>(...)'` dispatch.
+See [mounted tool sources](../../../docs/packs/mounts.md) for configuration and lifecycle.

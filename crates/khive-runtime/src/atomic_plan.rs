@@ -1,7 +1,7 @@
 //! ADR-099 (cross-op atomicity for bulk apply) — prepared write-plan types.
 //!
 //! Async prepare materializes a synchronous write plan outside any
-//! transaction; commit later applies its statements as DML under a per-op
+//! transaction; commit later applies DML or a typed GTD no-op read assertion under a per-op
 //! SAVEPOINT. This module defines the plan *shapes* only, one family per
 //! admissible verb group (`update`, `delete`, `link`, `merge`,
 //! `gtd.transition`, `gtd.complete`, the governance verbs) — not yet wired
@@ -26,13 +26,14 @@ use khive_storage::SqlStatement;
 /// One statement in a plan, paired with the guard (if any) that validates
 /// it. **Runner contract:** a present `guard` is checked against the
 /// affected-row count of applying `statement` alone (`SqlWriter::execute`'s
-/// return value for this statement), not a batch total and not another
-/// statement's count. `guard: None` means prepare made no row-existence
+/// return value), or the result-row count for a GTD no-op read assertion,
+/// not a batch total and not another statement's count.
+/// `guard: None` means prepare made no row-existence
 /// assumption about this particular statement (e.g. a cascade delete that
 /// may legitimately touch zero rows).
 #[derive(Debug, Clone)]
 pub struct PlanStatement {
-    /// The DML to apply inside the atomic unit.
+    /// The DML, or GTD no-op SELECT assertion, to apply inside the atomic unit.
     pub statement: SqlStatement,
     /// The expected-effect guard for `statement`, if prepare's validation
     /// assumed a target row exists for it.
@@ -113,7 +114,9 @@ pub enum PostCommitEffect {
     ReindexEntity { entity_id: Uuid },
     /// Re-embed and re-warm the given note's vector row from its committed
     /// content (ADR-099 D3 `update` caveat: note name/content change).
-    ReindexNote { note_id: Uuid },
+    ReindexNote { note_id: Uuid, version: i64 },
+    /// Invalidate consumers without recreating explicitly removed vectors.
+    NoteChanged { note_id: Uuid, kind: String },
     /// Append one `gtd_lifecycle_audit` row for a committed `gtd.transition`
     /// or `gtd.complete` (ADR-099 B3, GAP-5): canonical `handle_transition`/
     /// `handle_complete` call `ensure_audit_schema` +
@@ -239,6 +242,9 @@ pub struct UpdatePlan {
     /// (entity, note, non-symmetric edge), where `target_id` alone is
     /// already an exact, non-advisory identifier.
     pub(crate) edge_natural_key: Option<EdgeNaturalKey>,
+    pub(crate) note_guard: Option<crate::note_write::NoteWriteGuard>,
+    pub(crate) note_vector_purge: Option<crate::note_write::NoteVectors>,
+    pub(crate) note_embedding_inheritance: Option<crate::note_write::NoteEmbeddingInheritance>,
 }
 
 impl UpdatePlan {
@@ -252,7 +258,8 @@ impl UpdatePlan {
         self.edge_natural_key.as_ref()
     }
 
-    /// The deferred post-commit effect assigned by the prepare pass.
+    /// The potential deferred effect. The writer resolves inherited embedding
+    /// membership before issuing the committed-effects token.
     pub fn post_commit(&self) -> &PostCommitEffect {
         &self.post_commit
     }
@@ -288,6 +295,7 @@ impl AddEntityPlan {
 pub struct AddNotePlan {
     /// The freshly generated id of the note being created.
     pub(crate) note_id: Uuid,
+    pub(crate) note_guard: Option<crate::note_write::NoteWriteGuard>,
     /// Row + FTS insert statements to apply inside the atomic unit, in
     /// order, mirroring [`AddEntityPlan::statements`].
     pub(crate) statements: Vec<PlanStatement>,
@@ -358,9 +366,13 @@ impl DeletePlan {
 pub struct LinkPlan {
     pub(crate) source_id: Uuid,
     pub(crate) target_id: Uuid,
-    /// The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` statement:
-    /// its affected-row count is the endpoint-existence probe.
-    pub(crate) statement: PlanStatement,
+    /// Guarded edge mutation followed by its event-plane append statements.
+    /// The first statement's affected-row count is also the endpoint and
+    /// compare-and-swap probe; event statements are reached only after it
+    /// succeeds.
+    pub(crate) statements: Vec<PlanStatement>,
+    /// Prepare-time disposition, protected by the first statement's guard.
+    pub(crate) disposition: khive_storage::EdgeUpsertDisposition,
 }
 
 impl LinkPlan {
@@ -372,6 +384,12 @@ impl LinkPlan {
     /// The canonical target endpoint used by the prepared statement.
     pub fn target_id(&self) -> Uuid {
         self.target_id
+    }
+
+    /// Whether this atomic link created, replaced, or explicitly resurrected
+    /// its natural-key row.
+    pub fn disposition(&self) -> khive_storage::EdgeUpsertDisposition {
+        self.disposition
     }
 }
 
@@ -420,12 +438,13 @@ pub struct GtdTransitionPlan {
     /// revision, deletion marker, and semantic status (prepare validated the
     /// current status and requested transition were legal). For an idempotent
     /// no-op (`current == target` after `normalize_status`) this contains one
-    /// guarded, mutation-free assertion that revalidates the prepare snapshot
+    /// guarded SELECT assertion that revalidates the prepare snapshot
     /// under the commit transaction. Atomic v1 still persists no caller note;
     /// canonical dispatch has a separately documented note-event path.
     pub(crate) statements: Vec<PlanStatement>,
-    /// Explicit result-shape discriminator. A no-op can no longer be inferred
-    /// from an empty statement list because it carries a guarded assertion.
+    /// Explicit result-shape and execution discriminator: true executes the
+    /// snapshot assertion through the writer's read API and guards its result
+    /// count; false executes DML and guards affected rows.
     pub(crate) idempotent_noop: bool,
     /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
     /// `PostCommitEffect::None` for the idempotent no-op case. This matches a
@@ -603,6 +622,9 @@ mod tests {
     fn update_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
         let id = Uuid::new_v4();
         let plan = UpdatePlan {
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
             target_id: id,
             statements: vec![
                 guarded("update-row", AffectedRowGuard::exactly(1)),
@@ -643,14 +665,18 @@ mod tests {
         let plan = LinkPlan {
             source_id: source,
             target_id: target,
-            statement: guarded("insert-edge-where-exists", AffectedRowGuard::exactly(1)),
+            statements: vec![guarded(
+                "insert-edge-where-exists",
+                AffectedRowGuard::exactly(1),
+            )],
+            disposition: khive_storage::EdgeUpsertDisposition::Created,
         };
         assert_eq!(plan.source_id, source);
         assert_eq!(plan.target_id, target);
         // Dangling-edge acceptance criterion: once an endpoint row is gone,
         // the guarded INSERT...WHERE EXISTS affects 0 rows and the guard
         // on *that exact statement* must fail, not silently pass.
-        let guard = plan.statement.guard.expect("link insert is guarded");
+        let guard = plan.statements[0].guard.expect("link insert is guarded");
         assert!(!guard.holds_for(0));
     }
 
@@ -806,19 +832,26 @@ mod tests {
     fn add_note_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
         let id = Uuid::new_v4();
         let plan = AddNotePlan {
+            note_guard: None,
             note_id: id,
             statements: vec![
                 guarded("note-insert", AffectedRowGuard::exactly(1)),
                 unguarded("note-fts-insert"),
             ],
-            post_commit: PostCommitEffect::ReindexNote { note_id: id },
+            post_commit: PostCommitEffect::ReindexNote {
+                note_id: id,
+                version: 1,
+            },
         };
         assert_eq!(plan.note_id, id);
         assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
         assert_eq!(plan.statements[1].guard, None);
         assert_eq!(
             plan.post_commit,
-            PostCommitEffect::ReindexNote { note_id: id }
+            PostCommitEffect::ReindexNote {
+                note_id: id,
+                version: 1
+            }
         );
     }
 

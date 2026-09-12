@@ -57,10 +57,18 @@ impl Pack for KnowledgePack {
 impl KnowledgePack {
     /// Create a new pack bound to the given runtime, initializing a shared ANN index.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        Self::new_with_index_role(runtime, true)
+    }
+
+    /// As [`Self::new`], but states whether this process may build the atom
+    /// index from the full corpus. See `MemoryPack::new_with_index_role` for the
+    /// reasoning; the two packs share one index root per model family and the
+    /// same cost.
+    pub fn new_with_index_role(runtime: KhiveRuntime, builds_corpus_indexes: bool) -> Self {
         let brain_profile = runtime.config().brain_profile.clone();
         Self {
             runtime,
-            ann: vamana::new_shared(),
+            ann: vamana::new_shared_for_role(builds_corpus_indexes),
             section_posteriors: Mutex::new(HashMap::new()),
             brain_profile,
         }
@@ -79,7 +87,10 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
-        Box::new(KnowledgePack::new(runtime))
+        Box::new(KnowledgePack::new_with_index_role(
+            runtime,
+            khive_runtime::daemon::is_warm_index_host(),
+        ))
     }
 
     fn create_resolver(
@@ -732,12 +743,18 @@ mod tests {
             "dropping the pack must drop its last strong ANN reference"
         );
 
+        // The watcher builds its interval on its first poll, which can land
+        // after this advance; under paused time `sleep` auto-advances the
+        // clock once every task is idle, so the tick is reached by virtual
+        // time rather than by a fixed yield budget.
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        for _ in 0..100 {
-            if khive_runtime::background_task_count() == before {
-                break;
-            }
-            tokio::task::yield_now().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while khive_runtime::background_task_count() != before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watcher must exit once its ANN state is dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(
             khive_runtime::background_task_count(),
