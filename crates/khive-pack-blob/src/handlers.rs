@@ -116,7 +116,11 @@ pub(crate) async fn handle_begin(
         Some(_) => Some(parse_content_ref(&params, "blob.begin")?),
     };
     uploads
-        .begin(size, reference, token.actor().to_string())
+        .begin(
+            size,
+            reference,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
         .await
 }
 
