@@ -59,6 +59,7 @@ impl ValidatedSearchRequest {
     /// Parse and validate the canonical KG search wire contract.
     pub fn from_value(params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
         let p: SearchParams = deser(params)?;
+        super::common::require_object_param(p.properties.as_ref(), "properties")?;
         let kind_raw = p
             .kind
             .as_deref()
@@ -74,7 +75,20 @@ impl ValidatedSearchRequest {
         };
         let tags = p.tags.unwrap_or_default();
         let limit = p.limit.unwrap_or(10).min(100);
-        let min_score = p.min_score.unwrap_or(0.0).max(0.0);
+        // The declared range is 0.0 to 1.0 and neither end was enforced. A floor
+        // above 1.0 was honoured and returned an empty result, which a caller cannot
+        // tell from no such record; a negative floor was silently clamped to 0.0, so
+        // the value the caller passed was not the value that ran. Refuse both and
+        // name the range, the way the other input refusals on this surface do.
+        let min_score = match p.min_score {
+            None => 0.0,
+            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+            Some(value) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "min_score must be between 0.0 and 1.0; got {value}"
+                )))
+            }
+        };
         let source = match p.source.as_deref() {
             None => None,
             Some("text") => Some(SearchSource::Text),

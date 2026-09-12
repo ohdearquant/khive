@@ -182,6 +182,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params.clone())?;
+        super::common::require_object_param(p.properties.as_ref(), "properties")?;
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
@@ -300,6 +301,7 @@ impl KgPack {
                     .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
                     .await?;
                 let p: UpdateParams = deser(params)?;
+                super::common::require_object_param(p.properties.as_ref(), "properties")?;
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,

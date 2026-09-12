@@ -155,6 +155,10 @@ impl KgPack {
                 let mut specs: Vec<EntityCreateSpec> = Vec::with_capacity(attempted);
                 let mut entity_type_normalized: Vec<Value> = Vec::new();
                 for (idx, entry) in entries.into_iter().enumerate() {
+                    super::common::require_object_param(
+                        entry.properties.as_ref(),
+                        &format!("items[{idx}].properties"),
+                    )?;
                     // Resolve the item's own kind.
                     let item_kind_spec = resolve_kind_spec(&entry.kind, registry).map_err(|e| {
                         RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}"))
@@ -378,6 +382,7 @@ impl KgPack {
         }
 
         let p: CreateParams = deser(params.clone())?;
+        super::common::require_object_param(p.properties.as_ref(), "properties")?;
         if p.kind != "note" && (p.key.is_some() || p.embed.is_some() || p.fence.is_some()) {
             return Err(RuntimeError::InvalidInput(
                 "key, embed and fence apply only to notes".into(),
