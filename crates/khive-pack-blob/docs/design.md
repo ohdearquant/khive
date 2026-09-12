@@ -28,6 +28,13 @@ verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob
   shared admission controller, then optionally slices it and returns base64 bytes.
 - `blob.stat(content_ref)` reports existence and size through metadata only; it neither hydrates
   bytes nor implies a lease or reservation.
+- `blob.begin(size, content_ref?)` opens staging and returns `{upload_id, part_limit, next_index}`,
+  or returns `{content_ref, size}` for an existing reference without staging.
+- `blob.put_part(upload_id, index, bytes)` appends sequential base64 parts and returns
+  `{next_index, received_bytes}`; an identical last-part retry returns the same counters.
+- `blob.commit(upload_id)` checks the complete length and optional expected reference, publishes
+  the object, and returns `{content_ref, size}` while consuming the upload id.
+- `blob.abort(upload_id)` discards staging, consumes the upload id, and returns `{aborted: true}`.
 
 ## Invariants
 
@@ -40,8 +47,8 @@ verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob
   happens after full verified hydration.
 - `blob.get` uses digest-verified hydration; `blob.stat` deliberately does not claim digest
   verification because it never reads the content.
-- `blob.put` is unavailable on a read-only runtime. Reads remain available when a store is
-  installed.
+- `blob.put` and the four upload verbs are unavailable on a read-only runtime. Reads remain
+  available when a store is installed.
 - Deleting committed objects and sweeping unreferenced committed objects remain administrator-only
   operations. Upload abort and expiry remove only staging.
 
@@ -49,35 +56,49 @@ verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob
 
 `blob.begin(size, content_ref?)` returns `{upload_id, part_limit, next_index}`. If the
 optional reference already exists, it returns `{content_ref, size}` without creating
-staging. `blob.put_part(upload_id, index, bytes)` accepts base64 parts in order and
-returns `{next_index, received_bytes}`. The returned `part_limit` derives from the
-live request-parser and frame caps, minus an 8192-byte request reserve, scaled by 3/4.
+staging; that response uses the stored object's size. `size` is a required non-negative
+integer at most 64 MiB, including zero. Content references are 64-character lowercase-hex
+strings and upload ids are 32-character lowercase-hex strings, not UUID spellings or paths.
+`blob.put_part(upload_id, index, bytes)` requires a non-negative integer index and a
+base64 string, accepts parts in order starting at zero, and returns integer
+`{next_index, received_bytes}` counters. Empty parts are valid. The returned integer
+`part_limit` derives from the live request-parser and frame caps, minus an 8192-byte
+request reserve, scaled by 3/4; it currently equals 780,288 decoded bytes.
 
 An identical resend of the last part is acknowledged without changing bytes, hash,
-index or activity time. An altered tail retry aborts the upload. Crossing declared
-size also aborts. A successful append records activity from before backend I/O,
-so a slow sync cannot make the pack clock newer than an already expiring stage.
+index or activity time. An altered tail retry aborts the upload. Other out-of-order
+indices are refused with `InvalidInput` without advancing it. A next part crossing
+declared size also aborts; exceeding only `part_limit` refuses the part while retaining
+the upload. Invalid base64 is refused before appending. A successful append records
+activity from before backend I/O, so a slow sync cannot make the pack clock newer than
+an already expiring stage.
 Cancelled or failed backend writes invalidate the record; cleanup failures retain
 an unusable record for the next sweep to retry.
 
 `blob.commit(upload_id)` requires exactly the declared length, verifies an optional
 expected reference, and calls the backend's shared publication routine. It returns
-`{content_ref, size}` and consumes the id. `blob.abort(upload_id)` removes staging
-and returns `{aborted: true}`; unknown or consumed ids report unknown upload.
+`{content_ref, size}` and consumes the id. An incomplete commit is refused without
+discarding the upload; a reference mismatch aborts it. `blob.abort(upload_id)` removes
+staging and returns `{aborted: true}`; unknown or consumed ids report unknown upload.
 
-The four upload verbs are Declaration verbs; existing `blob.put` remains Commissive.
+The four upload verbs are Declaration verbs; existing `blob.put` remains Commissive,
+and `blob.get` / `blob.stat` remain Assertive.
 All mutations refuse on a read-only runtime. Upload ids are capabilities: the
 originating actor is retained for attribution, not an ownership restriction.
 There is no upload journal and a restarted daemon answers unknown upload.
 
 Only the daemon starts the upload sweep component. Each tick expires pack records
 and calls backend `sweep_uploads` for orphan staging, using the same idle policy as
-the verbs. Failures warn and retry on the next tick. The component joins the existing
+the verbs. `put_part` and `commit` also enforce expiry directly: once begin or the last
+accepted new part is at least the idle bound old, they discard the upload and report
+unknown upload. Failures warn and retry on the next tick. The component joins the existing
 daemon cancellation and drain path. `KHIVE_BLOB_UPLOAD_IDLE_SECS` defaults to 3600;
 `KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS` defaults to 600. Both accept positive integer
 seconds; invalid values use the default with a warning. The first tick is delayed
 by the interval. The filesystem stages below `.uploads/`, which object GC ignores.
-Backends without staged-upload support return Unsupported from the storage contract.
+The current staged-upload backend is `FsBlobStore`. `S3BlobStore` retains whole-object
+put/get/stat support but inherits Unsupported for staging methods; its known-reference
+begin shortcut can still return an existing object without staging.
 
 ## Expiry and ownership controls
 
@@ -100,9 +121,10 @@ Removing only backend `sweep_uploads` leaves live-record expiry effective throug
 
 `scripts/test-blob-upload-mutations.py` builds baseline, mutated and restored executables in
 an isolated clean checkout with an explicit `CARGO_TARGET_DIR`. Supply `--root`, `--head`,
-`--binary` and a fresh `--out` evidence directory outside the checkout. Its default `--case all` runs the four
-ADR-173 mutation operators (tail digest, verb expiry, backend sweep, copied publisher).
-The additional `--case owner` suppresses the entire daemon sweep call while preserving its
+`--binary` and a fresh `--out` evidence directory outside the checkout. Its default
+`--case all` runs five controls: the four ADR-173 mutation operators (tail digest, verb
+expiry, backend sweep, copied publisher) and daemon ownership. `--case owner` selects
+only the ownership control, suppressing the entire daemon sweep call while preserving its
 timer and heartbeat. It requires one baseline pass, exactly one failure reporting retained
 staging, exact source restoration and one restored pass. Compile errors and unrelated
 test failures do not satisfy a mutation control. All commands, counts and logs are retained.

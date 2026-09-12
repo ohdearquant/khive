@@ -30,7 +30,7 @@ An always-machine-readable copy of this page is at
 | `git`       | 16    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
-| `blob`      | 3     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 13    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
@@ -69,12 +69,15 @@ or annotation-edge ID is skipped even when its row is soft-deleted, so neither
 real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
 it.
 
-`blob` registers no note or entity kinds; its three verbs (`blob.put` / `blob.get` /
-`blob.stat`) dispatch over the `BlobStore` content-addressed storage trait (ADR-111). A
+`blob` registers no note or entity kinds; its seven verbs (`blob.put` / `blob.get` /
+`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort`) expose
+content-addressed storage and sequential uploads (ADR-111, ADR-173). A
 normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
 even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
 unconfigured (erroring until a backend is installed) when the server boots against an
-in-memory backend, which has no directory to default a root beside.
+in-memory backend, which has no directory to default a root beside. Staged uploads currently
+use the filesystem backend; the S3 backend retains `blob.put` / `blob.get` / `blob.stat`
+and refuses creation of new staging with `Unsupported`.
 
 `tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
 `tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
@@ -2561,14 +2564,19 @@ reporting surface over a code-map database.
 
 ---
 
-## `blob` pack — 3 verbs
+## `blob` pack — 7 verbs
 
-Content-addressed binary object storage (ADR-111). Optional; load with
+Content-addressed binary object storage and sequential uploads (ADR-111, ADR-173). Optional; load with
 `KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
 installs a default `FsBlobStore` rooted beside the database file even with no
 `[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
 unconfigured (erroring until a backend is installed) only when the server boots against
 an in-memory backend, which has no directory to default a root beside.
+
+Staged uploads currently use `FsBlobStore`; S3 supports the existing whole-object
+operations but returns `Unsupported` when new staging is required. The known-reference
+shortcut in `blob.begin` can return an existing object without staging. `blob.put` and
+all four upload verbs refuse on a read-only runtime.
 
 ### `blob.put` — Commissive
 
@@ -2591,7 +2599,7 @@ before slicing.
 
 | Param         | Type   | Required | Notes                                                                                                                             |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`.                                                            |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`.                                           |
 | `range`       | object | no       | `{offset, length}`, both non-negative integers when present. Applied to the fetched object as a slice, not a streamed range read. |
 
 ### `blob.stat` — Assertive
@@ -2599,13 +2607,84 @@ before slicing.
 Report whether an object exists and its size, answered by a single metadata read with
 no bytes hydrated.
 
-| Param         | Type   | Required | Notes                                                                  |
-| ------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put`. |
+| Param         | Type   | Required | Notes                                                                                   |
+| ------------- | ------ | -------- | --------------------------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`. |
+
+### `blob.begin` — Declaration
+
+Begin an upload with a declared total size. A new upload returns
+`{upload_id, part_limit, next_index}`: `upload_id` is a 32-character lowercase-hex
+string, `part_limit` is the integer maximum decoded bytes per part, and `next_index`
+starts at integer `0`. If the supplied reference already exists, return
+`{content_ref, size}` with its stored integer byte length and no `upload_id` or staging object.
+
+| Param         | Type    | Required | Notes                                                                                                           |
+| ------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `size`        | integer | yes      | Non-negative declared byte length, at most 64 MiB (67,108,864 bytes). Zero is allowed.                          |
+| `content_ref` | string  | no       | Optional 64-character lowercase-hex BLAKE3 reference. Checked for existence now and against the hash at commit. |
+
+Use the returned `part_limit`; it currently equals 780,288 bytes, derived from the
+smaller of the request-parser and daemon-frame caps with an 8192-byte reserve for
+request fields. Upload IDs are capabilities held in process memory, with no actor
+ownership restriction or restart recovery. After a daemon restart, begin again.
+
+### `blob.put_part` — Declaration
+
+Append one part and return `{next_index, received_bytes}`, both non-negative integers.
+Parts start at index `0` and proceed sequentially.
+
+| Param       | Type    | Required | Notes                                                                                   |
+| ----------- | ------- | -------- | --------------------------------------------------------------------------------------- |
+| `upload_id` | string  | yes      | 32-character lowercase-hex capability returned by `blob.begin`.                         |
+| `index`     | integer | yes      | Non-negative next part index, or the last accepted index for an identical tail retry.   |
+| `bytes`     | string  | yes      | Base64-encoded part with decoded length at most `part_limit`. An empty part is allowed. |
+
+An identical resend of the last accepted part returns the same counters without
+appending or refreshing the idle clock. A tail resend with different decoded length
+or bytes is refused and aborts the upload. Other out-of-order indices are refused
+with `InvalidInput` without advancing the upload. A next part crossing the declared
+total aborts it; a part exceeding only `part_limit` is refused while preserving the
+upload. Invalid base64 is refused before appending.
+
+Unknown or consumed IDs return `unknown upload`. With no new part for 3600 seconds
+after begin or the last accepted new part, `blob.put_part` and `blob.commit` discard
+the expired upload and return `unknown upload`. The daemon also sweeps idle staging
+every 600 seconds. `KHIVE_BLOB_UPLOAD_IDLE_SECS` and
+`KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS` accept positive integer seconds; invalid
+values warn and use their defaults. Tail retries do not extend the idle bound.
+
+### `blob.commit` — Declaration
+
+Publish a complete upload and return `{content_ref, size}`: a 64-character lowercase-hex
+BLAKE3 string and the integer byte length. Success consumes the upload ID, including
+when the content already exists; the result has no deduplication flag.
+
+| Param       | Type   | Required | Notes                                                           |
+| ----------- | ------ | -------- | --------------------------------------------------------------- |
+| `upload_id` | string | yes      | 32-character lowercase-hex capability returned by `blob.begin`. |
+
+The received length must equal the declared `size`. An incomplete commit is refused
+with `InvalidInput` and leaves the upload available for further parts. A mismatch
+with the optional expected `content_ref` aborts the upload. Unknown, consumed, or
+expired IDs return `unknown upload`.
+
+### `blob.abort` — Declaration
+
+Discard staged bytes and invalidate the upload ID. Success returns `{aborted: true}`.
+Unknown or already consumed IDs return `unknown upload`; abort does not delete a
+committed object.
+
+| Param       | Type   | Required | Notes                                                           |
+| ----------- | ------ | -------- | --------------------------------------------------------------- |
+| `upload_id` | string | yes      | 32-character lowercase-hex capability returned by `blob.begin`. |
 
 ```
 request(ops="blob.put(bytes=\"aGVsbG8=\")")
 request(ops="blob.stat(content_ref=\"<64-char-hex>\")")
+request(ops="blob.begin(size=5)")
+request(ops="blob.put_part(upload_id=\"<32-char-hex>\", index=0, bytes=\"aGVsbG8=\")")
+request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 ```
 
 ---
