@@ -73,7 +73,7 @@ def _one(client: Session, verb: str, **args) -> dict:
 
 def _refused(client: Session, verb: str, *, contains: str, **args) -> dict:
     entry = _entry(client, verb, **args)
-    assert not entry["ok"], entry
+    assert not entry["ok"], f"unexpectedly accepted {verb}: {entry}"
     assert contains in entry["error"]["message"].lower(), entry
     return entry["error"]
 
@@ -555,6 +555,9 @@ def test_blob_upload_wire_daemon_owns_expiry_after_mcp_client_exit(upload_daemon
         child.stdin.close()
         assert child.wait(timeout=15) == 0, stderr_path.read_text(errors="replace")
         assert child.pid != daemon.process.pid and stage.read_bytes() == b"a"
+        # No RPC or upload verb may run from here to the removal assertion:
+        # verb-side expiry would otherwise hide an inert daemon sweeper.
+        # Fixture deletion runs only after this test returns (or fails).
         daemon.wait_removed(stage)
         assert child.poll() == 0 and not daemon.staging()
     finally:

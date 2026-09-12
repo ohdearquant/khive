@@ -78,3 +78,31 @@ daemon cancellation and drain path. `KHIVE_BLOB_UPLOAD_IDLE_SECS` defaults to 36
 seconds; invalid values use the default with a warning. The first tick is delayed
 by the interval. The filesystem stages below `.uploads/`, which object GC ignores.
 Backends without staged-upload support return Unsupported from the storage contract.
+
+## Expiry and ownership controls
+
+`python/tests/test_blob_upload_wire_integration.py` contains real daemon controls for
+[ADR-173](../../../docs/adr/ADR-173-blob-chunked-upload.md) acceptance items 5 and 6.
+The tests require an explicit `KKERNEL` executable and the Python client test dependencies.
+
+| Acceptance          | Wire arm                                             | Discriminating failure                                                                            |
+| ------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 5: verb expiry      | `verb_expiry_without_sweeper[put_part]`              | Removing the verb idle guard acknowledges the stale part instead of refusing it.                  |
+| 5: daemon expiry    | `daemon_expiry_without_verbs_keeps_committed_object` | Removing the whole daemon sweep leaves staging present; the committed object must survive.        |
+| 6: restart          | `restart_orphan_sweep_and_begin_again`               | Removing backend sweeping leaves the old process's staging present despite its unknown upload id. |
+| 6: daemon ownership | `daemon_owns_expiry_after_mcp_client_exit`           | Removing the whole daemon sweep leaves staging present after the client has exited.               |
+
+The owner arm proves the file exists after the client exits, then polls only filesystem
+state and daemon liveness until removal. It sends no further verb, and fixture cleanup runs
+after the assertion. This prevents verb-side expiry or teardown from satisfying the control.
+Removing only backend `sweep_uploads` leaves live-record expiry effective through
+`abort_upload`, so the live-record control correctly remains green under that mutation.
+
+`scripts/test-blob-upload-mutations.py` builds baseline, mutated and restored executables in
+an isolated clean checkout with an explicit `CARGO_TARGET_DIR`. Supply `--root`, `--head`,
+`--binary` and a fresh `--out` evidence directory outside the checkout. Its default `--case all` runs the four
+ADR-173 mutation operators (tail digest, verb expiry, backend sweep, copied publisher).
+The additional `--case owner` suppresses the entire daemon sweep call while preserving its
+timer and heartbeat. It requires one baseline pass, exactly one failure reporting retained
+staging, exact source restoration and one restored pass. Compile errors and unrelated
+test failures do not satisfy a mutation control. All commands, counts and logs are retained.
