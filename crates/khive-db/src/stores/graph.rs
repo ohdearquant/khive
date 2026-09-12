@@ -1145,6 +1145,33 @@ fn edge_order_clause(sort: &[SortOrder<EdgeSortField>]) -> String {
     format!(" ORDER BY {}", parts.join(", "))
 }
 
+/// Restricts an edge count to edges whose endpoints are still live.
+///
+/// A soft delete leaves incident edges in place on purpose (`KhiveRuntime::delete_entity`
+/// documents it; only a hard delete purges them). Every reader that walks the graph
+/// hydrates the endpoint records, so it cannot reach an edge whose endpoint is
+/// tombstoned. A count that includes those edges therefore reports a density no reader
+/// can walk, under a `count_scope` that says `live_only`.
+///
+/// The predicate excludes an endpoint only when it is PRESENT AND tombstoned. An id
+/// found in neither table belongs to a substrate this database does not hold, and
+/// treating its absence as a tombstone would silently under-count; erring toward
+/// counting keeps the failure in the direction the old behaviour already had.
+const LIVE_ENDPOINTS_CONDITION: &str = "NOT EXISTS (SELECT 1 FROM entities le \
+     WHERE le.id = graph_edges.source_id AND le.deleted_at IS NOT NULL) \
+     AND NOT EXISTS (SELECT 1 FROM entities le \
+     WHERE le.id = graph_edges.target_id AND le.deleted_at IS NOT NULL) \
+     AND NOT EXISTS (SELECT 1 FROM notes ln \
+     WHERE ln.id = graph_edges.source_id AND ln.deleted_at IS NOT NULL) \
+     AND NOT EXISTS (SELECT 1 FROM notes ln \
+     WHERE ln.id = graph_edges.target_id AND ln.deleted_at IS NOT NULL)";
+
+/// Append [`LIVE_ENDPOINTS_CONDITION`] to a `WHERE` clause produced by the edge filter
+/// builders, which always emit a non-empty ` WHERE ...`.
+fn with_live_endpoints(where_clause: &str) -> String {
+    format!("{where_clause} AND {LIVE_ENDPOINTS_CONDITION}")
+}
+
 fn build_edge_filter_sql(
     namespace: &str,
     filter: &EdgeFilter,
@@ -2354,7 +2381,10 @@ impl GraphStore for SqlGraphStore {
         let namespace = self.namespace.clone();
         self.with_reader("count_edges", move |conn| {
             let (where_clause, params) = build_edge_filter_sql(&namespace, &filter);
-            let sql = format!("SELECT COUNT(*) FROM graph_edges{}", where_clause);
+            let sql = format!(
+                "SELECT COUNT(*) FROM graph_edges{}",
+                with_live_endpoints(&where_clause)
+            );
             let mut stmt = conn.prepare(&sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|p| p.as_ref()).collect();
@@ -2379,7 +2409,10 @@ impl GraphStore for SqlGraphStore {
             let mut total = 0;
             for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
                 let (where_clause, params) = build_edge_filter_sql_for_namespaces(chunk, &filter);
-                let sql = format!("SELECT COUNT(*) FROM graph_edges{where_clause}");
+                let sql = format!(
+                    "SELECT COUNT(*) FROM graph_edges{}",
+                    with_live_endpoints(&where_clause)
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -2467,10 +2500,12 @@ impl GraphStore for SqlGraphStore {
     async fn count_edges_by_relation(&self) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
         let namespace = self.namespace.clone();
         self.with_reader("count_edges_by_relation", move |conn| {
-            let sql = "SELECT relation, COUNT(*) FROM graph_edges \
-                       WHERE namespace = ?1 AND deleted_at IS NULL \
-                       GROUP BY relation";
-            let mut stmt = conn.prepare(sql)?;
+            let sql = format!(
+                "SELECT relation, COUNT(*) FROM graph_edges \
+                 WHERE namespace = ?1 AND deleted_at IS NULL AND {LIVE_ENDPOINTS_CONDITION} \
+                 GROUP BY relation"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([&namespace], |row| {
                 let relation_str: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
@@ -2509,7 +2544,8 @@ impl GraphStore for SqlGraphStore {
                 let (where_clause, params) =
                     build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
                 let sql = format!(
-                    "SELECT relation, COUNT(*) FROM graph_edges{where_clause} GROUP BY relation"
+                    "SELECT relation, COUNT(*) FROM graph_edges{} GROUP BY relation",
+                    with_live_endpoints(&where_clause)
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
