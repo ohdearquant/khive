@@ -4162,7 +4162,7 @@ mod tests {
         .expect("matching lexical control");
         assert_eq!(
             lexical["candidate_provenance"],
-            json!({"lexical": "matched", "fallback": "none"})
+            json!({"lexical": "matched", "fallback": "none", "terms_truncated": false})
         );
         assert_eq!(lexical["results"][0]["slug"], "newest-unrelated");
         assert_eq!(
