@@ -1139,6 +1139,10 @@ writes are admitted in its absence.
 6. **Version still first.** A fence whose version does not match refuses `fence_conflict`, not the
    deadline reason, even when the deadline has also passed: the caller learns the older failure.
 7. **One clock.** Two entries carrying deadlines in one write read the clock once.
-8. **Mutation.** Removing the deadline evaluation makes arm 1 go red on the fence side while the
+8. **The fenced write may be a creation.** A `create` under an expired fence is refused and creates
+   nothing, and under a live one it creates; the object fence form carries no index while the list
+   form of the same refusal differs by that field alone. Every other arm fences an update through a
+   list, so without this one the created side and the singleton form have no witness.
+9. **Mutation.** Removing the deadline evaluation makes arm 1 go red on the fence side while the
    batch side stays green, which is the arm that would otherwise pass on a shared fixture by
    accident.

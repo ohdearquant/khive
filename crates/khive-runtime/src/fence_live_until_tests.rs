@@ -540,3 +540,117 @@ async fn fence_live_until_arm7_two_deadline_entries_read_one_clock() {
         }
     }
 }
+
+async fn fenced_create(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    key: &str,
+    fence: NoteFences,
+) -> RuntimeResult<Note> {
+    runtime
+        .create_note_with_options(
+            token,
+            "head",
+            None,
+            "{}",
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+            NoteWriteOptions {
+                key: Some(key.into()),
+                embed: Some(false),
+                fence: Some(fence),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|(note, _)| note)
+}
+
+/// Arm 9. The fenced write may be a creation, not only an update, and the
+/// fence may be a single object rather than a list. Both are part of the
+/// surface this amendment changes and neither is covered by the arms above:
+/// every one of those fences an update through a list.
+#[tokio::test]
+async fn fence_live_until_arm9_a_creation_is_fenced_too_and_the_object_form_has_no_index() {
+    let (runtime, token, _) = fixture();
+    let expires_at = expired();
+    head(
+        &runtime,
+        &token,
+        "lease/create",
+        json!({"expires_at": expires_at}),
+    )
+    .await;
+
+    let object = NoteFences::One(NoteFence {
+        key: "lease/create".into(),
+        kind: "head".into(),
+        expected_version: Some(1),
+        live_until: Some("expires_at".into()),
+    });
+    let error = fenced_create(&runtime, &token, "created/refused", object.clone())
+        .await
+        .unwrap_err();
+    let refused = details(error);
+    assert_eq!(refused["reason"], "expired");
+    assert_eq!(refused["key"], "lease/create");
+    assert_eq!(refused["field"], "expires_at");
+    assert_eq!(refused["value"], json!(format!("\"{expires_at}\"")));
+    assert!(
+        refused.get("index").is_none(),
+        "the object form has no entry to index: {refused}"
+    );
+
+    // The list form of the same refusal differs by that one field and nothing
+    // else, which is what makes the object form's absence an omission rather
+    // than a different shape.
+    let listed = details(
+        fenced_create(
+            &runtime,
+            &token,
+            "created/refused",
+            NoteFences::Many(object.entries().to_vec()),
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(listed["index"], "0");
+    let mut without_index = listed.clone();
+    without_index.as_object_mut().unwrap().remove("index");
+    without_index["now"] = refused["now"].clone();
+    assert_eq!(without_index, refused);
+
+    // Nothing was created on either refusal, and a live deadline creates.
+    assert!(runtime
+        .notes(&token)
+        .unwrap()
+        .get_live_notes_by_key(token.namespace().as_str(), "created/refused", Some("head"))
+        .await
+        .unwrap()
+        .is_empty());
+    head(
+        &runtime,
+        &token,
+        "lease/create-live",
+        json!({"expires_at": live()}),
+    )
+    .await;
+    let created = fenced_create(
+        &runtime,
+        &token,
+        "created/admitted",
+        NoteFences::One(NoteFence {
+            key: "lease/create-live".into(),
+            kind: "head".into(),
+            expected_version: Some(1),
+            live_until: Some("expires_at".into()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.version, 1);
+}
