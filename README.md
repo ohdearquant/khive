@@ -1,8 +1,5 @@
 # khive
 
-A knowledge graph runtime for agents that need structure: typed substrates, closed
-taxonomies, and a verb-consolidated MCP surface.
-
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
