@@ -939,3 +939,71 @@ dedicated ADR. v1 is compile-time.
 - ADR-023: Pack Verb Surface, Visibility, and Composition — third-party packs ship as
   Rust crates implementing the `Pack` trait and self-register via `inventory::submit!`;
   the YAML-manifest model is rescinded.
+
+## Amendment (2026-09-12): a runtime-owned adapter, because static declarations are not an install format
+
+**Status**: proposed
+
+`Pack` is const associated items in `khive-types` — `NAME`, `NOTE_KINDS`, `ENTITY_KINDS`,
+`HANDLERS`, `EDGE_RULES`, `REQUIRES` — and "Why const associated items in `Pack`?" gives the
+reason: vocabulary is static, methods would force vtable dispatch and allocation for metadata
+that never changes. That reasoning is sound and this amendment does not touch it.
+
+It also makes `Pack` unable to describe an installed distribution. Every field is
+`&'static str` by construction, which is another way of saying the metadata must be known to
+the compiler. The metadata of an installed pack is read from a package at install time and
+lives exactly as long as the installation. No amount of care with the trait closes that gap:
+the trait is a compile-time contract and an install format is not a compile-time thing.
+
+### The amendment
+
+**The runtime owns an adapter** that presents an installed distribution through the same
+`PackRuntime` seam the linked packs use. The adapter holds owned metadata, validated at
+install, and answers the questions `Pack`'s consts answer for a linked pack: which note and
+entity kinds it registers, its handler definitions with their visibility, its edge endpoint
+rules, and what it requires.
+
+`Pack` itself is unchanged. It is not made dynamic, not given methods, and not parameterized
+over ownership. Linked packs keep the exact shape and the exact cost they have today.
+
+### What this buys, and it is the reason for doing it this way
+
+Everything downstream of the seam keeps **one** code path. Vocabulary merging, the boot-time
+collision checks, pack-extensible edge endpoints, the storage profile and pack-auxiliary
+schema, and the dispatch path do not learn that two kinds of pack exist. A rule that holds for
+linked packs holds for installed ones because the same code enforces it on the same shape.
+
+What moves is the **moment** of validation, not its content. For a linked pack, a kind
+collision or a malformed edge rule is caught at boot, and some of it is caught by the compiler
+before that. For an installed pack the same checks run at install time, against the live
+accepted set, and a failure refuses the installation rather than failing a restart. Same
+invariant, earlier or later clock.
+
+### The four costs this ADR named, answered per profile
+
+"Compile-time vs runtime composition" rejected dynamic loading on ABI compatibility, version
+skew, security surface, and linking complexity, and said that if a marketplace of third-party
+packs became a real need it would get its own ADR. Taking them in order:
+
+- **ABI.** The data-only profile has no ABI, because it ships no code. The component profile
+  pins an interface world, which is a versioned contract checked at install, not a native
+  calling convention that must match a build.
+- **Version skew.** The installation pins package, host interface, schema and resource
+  revisions separately, and an upgrade that would increase permissions or downgrade a revision
+  is refused rather than resolved.
+- **Security surface.** For data-only there is no code to sandbox; the surface is the
+  validator, and it refuses unknown predicates instead of ignoring them. For components the
+  surface is the guest sandbox and the typed imports the host grants, not the host process.
+- **Linking complexity.** `dlopen` stays rejected, so no symbol resolution or lifetime
+  management enters the host.
+
+### What does not change
+
+- `Pack`'s const shape for linked packs, and `inventory` as their only discovery mechanism.
+- `kg` owning shared CRUD, `KindHook` as the specialization route, closed relations with
+  additive-only endpoint rules.
+- **"Why no special treatment for built-in packs?"**, which now cuts in both directions: an
+  installed pack gets no special treatment either. It receives no privilege a linked pack
+  lacks, and no exemption from a check a linked pack passes.
+
+Nothing in this amendment authorizes implementation.

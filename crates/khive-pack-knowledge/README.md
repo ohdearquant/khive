@@ -11,6 +11,9 @@ rerank, and composed into markdown briefings under a token budget.
   decomposition, and RRF fusion against an ANN pass when an embedder is configured.
   Scores are not calibrated probabilities; interpret rank together with
   `score_provenance` and the response's `candidate_provenance`
+- **Bounded lexical fan-out** — one 32-term allowance covers the full query and
+  decomposed passes, including rarity and eligibility probes. Search reports
+  `candidate_provenance.terms_truncated` when it omits terms.
 - **Section-level records** (`knowledge.edit`) — a closed 10-value `section_type`
   enum (`overview`, `core_model`, `formalism`, `failure_modes`, ... `other`) per
   atom, each independently disputable and adjudicable (ADR-051)

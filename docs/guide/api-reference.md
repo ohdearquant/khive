@@ -2061,6 +2061,14 @@ A custom slug outside that convention is outside the guarantee. The probe shares
 pass's remaining deadline and namespace, status, and kind filters; a role hint does not change
 the raw query used for lookup.
 
+`candidate_provenance.terms_truncated` is `true` when a lexical pass exceeds the request's
+shared allowance of 32 distinct expanded terms. The full query and both decomposed passes
+draw from the same allowance; a repeated term in a later pass counts again. Admission uses
+deterministic spelling order before rarest-first scheduling. Frequency, rowid, eligibility,
+and namespace-existence probes all stay within those admitted terms, while retaining their
+own row and time limits. The lexical state describes only admitted terms: a match reachable
+only through an untested term does not make a truncated miss `filtered`.
+
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
 no returned result has lexical evidence; otherwise it is `none`, including for an empty
 result. Each `knowledge.search` result includes `score_provenance`:

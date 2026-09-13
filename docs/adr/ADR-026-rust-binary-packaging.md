@@ -404,3 +404,44 @@ skips every package already on the registry at the release version and publishes
 is missing. Its alias skip requires the published alias to carry the exact `khive`
 dependency; a published alias with a different dependency stops the script with an error
 instead of being reported as done.
+
+## Amendment 4 (2026-09-12): two different WebAssembly questions, separated
+
+**Status**: proposed
+
+"Why not WASM" and "Future WASM subpackage (optional, not v1)" answer one question: should
+the kkernel itself be compiled to WebAssembly and shipped as a guest? **That answer stands,
+unchanged, for the reasons given there** — `sqlite-vec` has no upstream WASM build, embedding
+inference wants native SIMD, the multi-threaded tokio runtime does not exist in WASM, SQLite
+throughput is native-bound, and atomic `tmp+rename` is awkward across WASI host shims. Open
+question 1, a reduced-functionality fallback subpackage for esoteric platforms, is untouched
+and still open.
+
+What this amendment changes is a reading, not a measurement. "WASM is not v1" has been taken
+to mean that WebAssembly has no place anywhere in khive. Two questions were riding on one
+sentence:
+
+1. **The kernel as a guest.** Rejected here, and the rejection stands.
+2. **Components as guests hosted by the native kernel.** Not a deferral any more. This
+   becomes a gated phase: a pack distribution that supplies an algorithm the host does not
+   have may ship as a component compiled to WebAssembly, loaded and driven by the native
+   binary.
+
+The two are consistent because every constraint listed above is about the kernel's hot path.
+Trigram indexing, vector search and embedding inference stay native and in-process. A guest
+component does not run that path. It runs its own work, pays guest cost for its own work
+only, and reaches the host solely through typed imports the host grants.
+
+### What gates the phase
+
+No component is admitted until all of the following exist and have been demonstrated: a
+pinned interface world and a pinned runtime revision; an enumerated set of denied imports; a
+hook that is bounded and pure, with its bounds enforced by the host rather than promised by
+the guest; and containment of traps and timeouts, shown by a guest that traps and a guest
+that runs long, with the host unharmed in both.
+
+Until that phase passes, the only installable profile is data-only, which carries no
+executable payload at all.
+
+Nothing in this amendment authorizes implementation, and none of ADR-026's original
+performance figures were re-measured for it.

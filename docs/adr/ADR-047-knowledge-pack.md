@@ -1,6 +1,6 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30c)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
@@ -25,6 +25,32 @@ lexical degradation flags, with an internal `exact_name_probe` timing phase. It 
 the stage budget, rerun a timed-out pass, or change public timeout-detail redaction. Exact-name
 hits then follow the existing fusion, score normalization, status multiplier, and final
 `min_score` gates.
+
+The probe sits downstream of the term admission bound described in the 2026-08-30b
+amendment. It consumes no admission of its own, and a pass that was refused every
+admission opens no reader, so it never reaches the probe.
+
+## Amendment (2026-08-30b): request-wide bound on distinct FTS terms
+
+The lexical candidate stage admits at most 32 distinct expanded terms across one
+`knowledge.search` or `knowledge.suggest` request. Terms are deduplicated and expanded,
+then admitted in deterministic spelling order before any database read, including the
+rarest-first frequency probes. The full query and both optional decomposed passes share
+one allowance; repeating a term in a later pass consumes another admission because that
+pass repeats the retrieval work. A pass with no allowance left opens no reader.
+
+Within a pass, rarity ordering, phase-A rowid probes and widening, eligibility fallback,
+and namespace-only existence recovery all use the same admitted terms or their subsets.
+The bound limits combined distinct-term work, not the number of SQL statements: one term
+can require multiple bounded probes. Existing per-term row caps, widening ceilings, and
+lexical deadlines remain in force. Queries with no scoreable terms retain the raw-phrase
+fallback, which consumes one admission.
+
+`candidate_provenance.terms_truncated` is true when any lexical pass drops terms because
+the shared allowance is exhausted. It is independent of timeout reporting. `no_match`
+and `filtered` describe only admitted terms in the caller's namespace: a local match
+reachable only through an untested term must not turn a truncation-caused miss into
+`filtered`. ANN retrieval and scoring remain unchanged.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -395,6 +421,9 @@ eligible candidates or decomposed passes mix completion and timeout, and `timed_
 fetch times out with no retained candidates (or every decomposed pass does so).
 Completed empty terms alone do not make a fetch partial. These states supplement the
 lexical timeout diagnostics.
+
+`candidate_provenance.terms_truncated` reports whether any pass exceeded the shared
+32-term allowance described above; the lexical state applies only to admitted terms.
 
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and no
 returned hit has lexical evidence; otherwise it is `none`, including for an empty result.
