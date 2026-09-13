@@ -72,15 +72,24 @@ say which configuration the daemon should hold.
 
 Concretely:
 
-1. The runtime gains an explicit way to declare that daemon startup is owned elsewhere. It is read at
-   the point the client decides to spawn, not at process start, so a deployment can turn it on
-   without restarting every client.
-2. With that declaration present and no responsive socket, the client **refuses the request** rather
+1. The runtime gains an explicit way to declare that daemon startup is owned elsewhere. The
+   declaration lives in the daemon's configuration file, the same file the supervisor's own
+   invocation names, so an operator states it once in the place that already describes the process.
+   An environment variable overrides it for a single client. It is read at the point the client
+   decides to spawn, not at process start, so a deployment can turn it on without restarting every
+   client.
+2. Where the file and the environment disagree, the client takes the stricter of the two, refuses,
+   and names both values. Silently preferring one would make the failure above reachable again
+   through a disagreement that is invisible from either side on its own.
+3. With a declaration in force and no responsive socket, the client **refuses the request** rather
    than spawning, and the refusal names the owner and says the daemon is expected to be started by
    it. A refusal is correct here: a request that would otherwise be served by a daemon anchored on
    the caller's own configuration is a request whose result cannot be trusted by anyone else.
-3. The refusal is distinguishable in kind from "the daemon is starting", so a caller can retry the
-   second and must not retry the first in a loop.
+4. Before refusing, the client waits a bounded interval, at most 10 seconds, for the owner's daemon
+   to answer on the socket. Inside that wait the caller sees "the daemon is starting"; after it, "not
+   yours to start". The two are distinguishable in kind, so a caller can retry the first and must not
+   retry the second in a loop, and the wait is what lets the first call after a supervised start
+   succeed rather than refuse once.
 
 ### Alternatives considered
 
@@ -122,12 +131,9 @@ is the one the obvious remedy already failed:
   satisfied by any broken client.
 - A third arm covers the incumbent case that already works and must keep working: with a daemon
   already serving, a client neither spawns nor refuses, it connects.
+- A fourth arm covers a client whose configuration file and environment name different owners: it
+  must refuse and name both values rather than pick one. The agreeing case is its control and must
+  not refuse.
 - The refusal's kind is asserted, not just its text, since a caller has to tell "not yours to start"
-  from "starting, try again" without parsing prose.
-
-## Open questions
-
-- Whether the declaration belongs in the configuration file, the environment, or both, and what a
-  client should do when the two disagree.
-- Whether the refusal should carry a bounded wait for the owner to come up, so the first call after a
-  supervised start succeeds instead of refusing once.
+  from "starting, try again" without parsing prose. The bounded wait is asserted on both sides of
+  its boundary: inside the window the kind is "starting", past it the kind is "not yours to start".
