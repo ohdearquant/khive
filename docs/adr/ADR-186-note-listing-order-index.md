@@ -110,7 +110,11 @@ recorded because schema changes are recorded.
   queries, so the acceptance below asserts their plans are unchanged, on a fresh bootstrap as well as
   on an analyzed store.
 - Existing stores gain the index at migration time, which is an index build proportional to the live
-  note count on first open after upgrade.
+  note count on first open after upgrade. Measured on a file-backed synthetic store seeded by the same
+  fixture generator at 105,000 notes, which is the size of a long-lived store today: **166 ms**, and
+  **5.6 MiB** added to a 136 MiB database. The measurement was taken in a debug profile, so a release
+  build is not slower. An upgrade window plans for a sixth of a second of extra first-open time at
+  that size, and it grows linearly.
 
 ## Acceptance
 
@@ -125,7 +129,16 @@ recorded because schema changes are recorded.
   walking the namespace for a rare kind is a red test rather than a silent regression.
 - `comm_filter_plan_tests` passes unchanged, including its fresh-bootstrap and pre-analyzed-upgrade
   arms, and its actor-seek assertion still names the recipient and unread indexes. That is the arm
-  that would catch this index stealing a selective comm plan.
+  that would catch this index stealing a selective comm plan, and it is sufficient **only if those
+  arms run against a schema that holds the new index**. A suite that passes because the index it is
+  guarding against is absent from its fixture is not a guard, so the implementation adds a direct arm:
+  with `idx_notes_namespace_created` present, the inbox plan still names
+  `idx_notes_message_recipient_direction` and the unread plan still names
+  `idx_notes_unread_probe_recipient_direction`, asserted by index name rather than by absence of a
+  sorter. That arm runs on **both store shapes**, the fresh bootstrap and the pre-analyzed upgrade,
+  because catalog order differs between them and catalog order is what decides selection before
+  `ANALYZE` has run. The two shapes are separate arms, not one arm run twice, so a failure names which
+  shape broke.
 - The migration is a new versioned `.sql` file under `crates/khive-db/sql/`, registered in
   `migrations.rs`, with the fresh-store DDL in `notes-ddl.sql` carrying the same statement, since a
   fresh store does not replay migrations.
