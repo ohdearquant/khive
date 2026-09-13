@@ -741,7 +741,14 @@ log of a daemon that is on its way out.
 ### Decision
 
 The four transport channel loops (email poll, email outbox, telegram poll, telegram outbox) are
-spawned through `track_background_task` and observe `daemon_shutdown_token()`.
+spawned through `track_background_task` and observe a cancellation token handed to them at the
+spawn site. The daemon start path passes `daemon_shutdown_token()`, the same way the component
+supervisor start path already does; a loop never reads that singleton itself. The singleton is
+cancelled exactly once per process, and this crate's own test binary runs an in-process daemon
+whose shutdown cancels it for every later test in that process, so a loop that reaches for it
+directly returns before its first cycle in any test that runs after one of those. Taking the token
+as a parameter leaves the production wiring identical and makes a loop's shutdown observable in a
+test that owns the token it cancels.
 
 Cancellation is read between cycles and never inside one. A cycle issues verbs against the store,
 so dropping one mid-flight would abandon a cursor read or an ingest partway; stopping between
@@ -758,6 +765,8 @@ migration the base decision describes is unchanged and still owed.
   a wait that ignores the token fails the assertion instead of hanging the suite.
 - Each loop returns on that report and logs the loop it is leaving, so a shutdown that stops a
   channel loop is readable in the log rather than inferred from its absence.
+- A poll loop handed a token no other code holds returns when that token is cancelled. A loop that
+  read the process-wide token instead would ignore the cancellation and the arm would time out.
 - Because the loops are now tracked, `drain()` waits for their exit and its remaining-task count
   includes them. That count still names no task; naming what remains at a drain timeout is a
   separate gap this amendment does not close.

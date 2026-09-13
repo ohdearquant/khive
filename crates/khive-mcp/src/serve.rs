@@ -487,6 +487,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
+                            khive_runtime::daemon_shutdown_token(),
                         )
                         .await;
                     });
@@ -501,6 +502,7 @@ fn spawn_email_channel_loops(
                                 ingest_ns_outbox,
                                 mailbox_clone,
                                 allowlist_clone,
+                                khive_runtime::daemon_shutdown_token(),
                             ));
                             tracing::info!("email channel outbox loop started");
                         }
@@ -837,14 +839,22 @@ async fn handle_channel_ingest_failure(
     }
 }
 
-/// Wait `interval` between channel-loop cycles, unless daemon shutdown fires
-/// first. Returns `false` when the daemon is shutting down, which is the
+/// Wait `interval` between channel-loop cycles, unless the caller's shutdown
+/// token fires first. Returns `false` when shutdown is observed, which is the
 /// caller's signal to leave its loop.
 ///
 /// The wait is the only cancellation point on purpose: a channel cycle issues
 /// verbs against the store, so dropping one mid-flight would abandon a cursor
 /// read or an ingest partway. Between cycles there is nothing in flight, so
 /// the loop ends where a restart costs at most one re-poll.
+///
+/// The token is a parameter, never read from
+/// `khive_runtime::daemon_shutdown_token()` inside a loop. That singleton is
+/// cancelled once per process, and this crate's test binary runs an in-process
+/// daemon whose shutdown cancels it for every later test in the same process —
+/// so a loop reading it directly stops before its first cycle in any test that
+/// happens to run after one of those. Production passes the singleton at the
+/// spawn site, which is where the process's daemon role is already known.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 async fn channel_cycle_wait(
     interval: std::time::Duration,
@@ -877,6 +887,7 @@ async fn channel_poll_loop(
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
     default_inbound_actor: String,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
@@ -922,7 +933,6 @@ async fn channel_poll_loop(
     // channel is first seen on -- uses this single startup timestamp
     // instead of that tick's own `now`.
     let startup_since = Utc::now();
-    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
         if !channel_cycle_wait(next_interval, &shutdown).await {
@@ -1476,6 +1486,7 @@ async fn channel_outbox_loop(
     ingest_namespace: String,
     mailbox: String,
     allowlist: Vec<String>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
     let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
@@ -1489,8 +1500,6 @@ async fn channel_outbox_loop(
             return;
         }
     };
-
-    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
@@ -1832,7 +1841,13 @@ fn spawn_telegram_channel_loops(
                             );
                             return;
                         }
-                        telegram_poll_loop(tg_ch_poll, verb_reg_poll, ingest_ns_poll).await;
+                        telegram_poll_loop(
+                            tg_ch_poll,
+                            verb_reg_poll,
+                            ingest_ns_poll,
+                            khive_runtime::daemon_shutdown_token(),
+                        )
+                        .await;
                     });
                     tracing::info!("telegram channel polling loop started");
                 }
@@ -1843,6 +1858,7 @@ fn spawn_telegram_channel_loops(
                                 tg_ch_outbox,
                                 rt,
                                 ingest_ns_outbox,
+                                khive_runtime::daemon_shutdown_token(),
                             ));
                             tracing::info!("telegram channel outbox loop started");
                         }
@@ -1906,6 +1922,7 @@ async fn telegram_poll_loop(
     telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     use chrono::Utc;
     use khive_channel::Channel;
@@ -1913,7 +1930,6 @@ async fn telegram_poll_loop(
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
     let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
-    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
         // This loop polls before it waits, so shutdown is read at the top as
@@ -1997,6 +2013,7 @@ async fn telegram_outbox_loop(
     telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let namespace = match khive_runtime::Namespace::parse(&ingest_namespace) {
         Ok(ns) => ns,
@@ -2009,8 +2026,6 @@ async fn telegram_outbox_loop(
             return;
         }
     };
-
-    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
         if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
@@ -12411,6 +12426,7 @@ backend = "kg-backend"
                 registry,
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Iteration 1 (happy-path 5s sleep elapses, poll fails, backoff
@@ -12467,6 +12483,7 @@ backend = "kg-backend"
                 registry,
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Step the paused clock through both iterations; with no store
@@ -12603,6 +12620,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "local".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Three happy-path 5s ticks: the first drives the partial-failure
@@ -12769,6 +12787,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Wait for at least two poll_page calls (deterministic condition
@@ -12943,6 +12962,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "local".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             for _ in 0..2000 {
@@ -13097,6 +13117,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -13431,6 +13452,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Tick 1: control succeeds (records the tick's floor); the
@@ -13522,6 +13544,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Tick 1: control succeeds; the ingest-failing channel is polled
@@ -13602,6 +13625,7 @@ backend = "kg-backend"
                 registry.clone(),
                 "test-ns".to_string(),
                 "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
             ));
 
             // Real-time wait for the loop's first (~5s) tick to fire.
@@ -13776,5 +13800,36 @@ backend = "kg-backend"
             channel_cycle_wait(std::time::Duration::from_millis(10), &token).await,
             "an uncancelled wait must complete its interval and keep the loop polling"
         );
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn channel_poll_loop_leaves_on_its_own_token_not_a_process_global() {
+        // The loop is handed a token nobody else holds, so this asserts the
+        // parameter is the one it reads: with the pre-fix body (which read
+        // `khive_runtime::daemon_shutdown_token()`) cancelling this token
+        // does nothing and the join below times out.
+        let runtime = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        khive_runtime::PackRegistry::register_packs(
+            &["kg".to_string(), "comm".to_string()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .expect("register kg+comm through the factory path");
+        let registry = builder.build().expect("registry builds");
+        let token = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(channel_poll_loop(
+            std::sync::Arc::new(khive_channel::ChannelRegistry::new()),
+            registry,
+            "test-ns".to_string(),
+            "actor:test".to_string(),
+            token.clone(),
+        ));
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the loop must observe the token it was handed and return")
+            .expect("the loop task must not panic");
     }
 }
