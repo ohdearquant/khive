@@ -1344,8 +1344,16 @@ pub async fn ensure_loaded(
                     // A namespace swap parks this namespace's live state and
                     // restores it later in the same process, so its counters
                     // travel with it rather than restarting at zero.
-                    signals_applied: current_state.signals_applied,
-                    snapshot_serializations: current_state.snapshot_serializations,
+                    signals_applied: std::sync::atomic::AtomicU64::new(
+                        current_state
+                            .signals_applied
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                    snapshot_serializations: std::sync::atomic::AtomicU64::new(
+                        current_state
+                            .snapshot_serializations
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ),
                 };
                 // Release the state guard before mutating the tracker (save-restore
                 // path) so the re-acquire below cannot deadlock.

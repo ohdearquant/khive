@@ -76,14 +76,17 @@ pub(crate) async fn run_feedback_precommit_hook(profile_id: &str) {
     }
 }
 
-/// Sync the `balanced-recall-v1` profile record to match the live `balanced_recall` state.
+/// Sync the `balanced-recall-v1` profile record's cheap fields to match the
+/// live `balanced_recall` state.
+///
+/// The snapshot is deliberately not written here. It is serialized when it is
+/// read, by `BrainState::materialized_profile`, because this function runs on
+/// the signal path and the stored value was written far more often than any
+/// consumer read it. `total_events` stays eager: it is one integer.
 pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     let total_ev = state.balanced_recall.total_events;
-    let snap_val = serde_json::to_value(state.balanced_recall.to_snapshot()).ok();
-    state.snapshot_serializations = state.snapshot_serializations.saturating_add(1);
     if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
         record.total_events = total_ev;
-        record.state_snapshot = snap_val;
     }
 }
 
@@ -113,7 +116,9 @@ pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal
     match serving_profile {
         None | Some("balanced-recall-v1") => {
             state.balanced_recall.apply_signal(signal);
-            state.signals_applied = state.signals_applied.saturating_add(1);
+            state
+                .signals_applied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             sync_balanced_recall_record(state);
         }
         Some(profile_id) => {
@@ -126,12 +131,11 @@ pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal
             };
             profile_state.apply_signal(signal);
             let total_events = profile_state.total_events;
-            let state_snapshot = serde_json::to_value(profile_state.to_snapshot()).ok();
-            state.signals_applied = state.signals_applied.saturating_add(1);
-            state.snapshot_serializations = state.snapshot_serializations.saturating_add(1);
+            state
+                .signals_applied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(record) = state.profiles.get_mut(profile_id) {
                 record.total_events = total_events;
-                record.state_snapshot = state_snapshot;
             }
         }
     }

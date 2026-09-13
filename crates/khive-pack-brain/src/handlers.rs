@@ -721,8 +721,12 @@ impl BrainPack {
     pub(crate) async fn handle_state(&self, _params: Value) -> Result<Value, RuntimeError> {
         let state = self.state.lock().unwrap();
         let snapshot = state.to_snapshot();
-        let signals_applied = state.signals_applied;
-        let snapshot_serializations = state.snapshot_serializations;
+        let signals_applied = state
+            .signals_applied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let snapshot_serializations = state
+            .snapshot_serializations
+            .load(std::sync::atomic::Ordering::Relaxed);
         drop(state);
         let mut value = serde_json::to_value(&snapshot)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -1300,10 +1304,12 @@ impl BrainPack {
             .ok_or_else(|| RuntimeError::InvalidInput("missing field `profile_id`".into()))?;
 
         let state = self.state.lock().unwrap();
+        // The snapshot in the response is serialized here, on the read, rather
+        // than on every signal that preceded it.
         let record = state
-            .profiles
-            .get(&profile_id)
+            .materialized_profile(&profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
+        let record = &record;
 
         // Build per-section posterior summary for the response.
         let section_summary = if let Some(ss) = state.section_states.get(&profile_id) {
