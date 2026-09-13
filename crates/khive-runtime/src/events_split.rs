@@ -1015,7 +1015,7 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         let backend = Arc::clone(&backend);
         let stores = Arc::clone(&stores);
         let frame_budget = Arc::clone(&frame_budget);
-        crate::daemon::spawn_tracked_task(async move {
+        crate::daemon::spawn_named_tracked_task("events_connection", async move {
             serve_events_conn(stream, backend, stores, frame_budget).await;
             drop(permit);
         });
@@ -1395,14 +1395,17 @@ impl EventsSplitClient {
             preflight_store,
         });
 
-        crate::daemon::spawn_tracked_task(run_forwarder(
-            socket_path,
-            append_rx,
-            counters,
-            outage_logged,
-            delivery_timeout,
-            crate::daemon::daemon_shutdown_token(),
-        ));
+        crate::daemon::spawn_named_tracked_task(
+            "events_forwarder",
+            run_forwarder(
+                socket_path,
+                append_rx,
+                counters,
+                outage_logged,
+                delivery_timeout,
+                crate::daemon::daemon_shutdown_token(),
+            ),
+        );
         Ok(client)
     }
 

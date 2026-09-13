@@ -989,12 +989,68 @@ fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
 /// is cancelled — a plain post-`await` `fetch_sub` only covers the return
 /// path and leaks the count forever on a panic, since unwinding skips every
 /// statement after the panic point.
+// ── outstanding background-task names ────────────────────────────────────────
+//
+// Names of the tasks the background counter is currently holding, so a drain
+// timeout can say which ones held it open instead of printing a bare count.
+// Registered and released at exactly the points the counter is incremented and
+// decremented, and in the order that keeps the counter authoritative: the name
+// goes in after the increment and comes out before the decrement, so a reported
+// name always belongs to a task the counter already holds. The reverse ordering
+// would let the warning name a task that had already finished, which is the one
+// reading that would send someone looking in the wrong place.
+static BACKGROUND_TASK_NAMES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+> = std::sync::OnceLock::new();
+
+fn background_task_names_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, usize>> {
+    BACKGROUND_TASK_NAMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Name recorded for tasks spawned through the unnamed entry points, which
+/// stay on the public API of a published crate.
+pub const UNNAMED_BACKGROUND_TASK: &str = "unnamed";
+
+fn register_background_task_name(name: &'static str) {
+    let mut names = background_task_names_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *names.entry(name).or_insert(0) += 1;
+}
+
+fn release_background_task_name(name: &'static str) {
+    let mut names = background_task_names_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(count) = names.get_mut(name) {
+        *count -= 1;
+        if *count == 0 {
+            names.remove(name);
+        }
+    }
+}
+
+/// Names of the in-flight tracked background tasks, sorted and deduplicated.
+/// A diagnostic beside [`background_task_count`], never a substitute for it:
+/// the count is what drain waits on.
+pub fn background_task_names() -> Vec<String> {
+    let names = background_task_names_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut out: Vec<String> = names.keys().map(|name| (*name).to_string()).collect();
+    out.sort();
+    out
+}
+
 struct BackgroundTaskGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
+    name: &'static str,
 }
 
 impl Drop for BackgroundTaskGuard {
     fn drop(&mut self) {
+        release_background_task_name(self.name);
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1010,9 +1066,25 @@ where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    spawn_named_tracked_task(UNNAMED_BACKGROUND_TASK, fut)
+}
+
+/// [`spawn_tracked_task`] with a name that a drain timeout can print.
+///
+/// The name is a short static string describing the task, never a formatted or
+/// caller-supplied value: it is read by an operator staring at a shutdown that
+/// would not finish, so it is a label for a call site, not a record of one
+/// occurrence.
+pub fn spawn_named_tracked_task<F, T>(name: &'static str, fut: F) -> tokio::task::JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
     background_tasks().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    register_background_task_name(name);
     let guard = BackgroundTaskGuard {
         counter: background_tasks().clone(),
+        name,
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -1028,7 +1100,16 @@ pub fn track_background_task<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    drop(spawn_tracked_task(fut));
+    track_named_background_task(UNNAMED_BACKGROUND_TASK, fut);
+}
+
+/// [`track_background_task`] with a name that a drain timeout can print. See
+/// [`spawn_named_tracked_task`] for what belongs in the name.
+pub fn track_named_background_task<F>(name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    drop(spawn_named_tracked_task(name, fut));
 }
 
 /// Current count of in-flight tasks started via [`track_background_task`].
@@ -2048,13 +2129,16 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
         let cfg = CheckpointConfig::from_env();
         let checkpoint_task_count = checkpoint_tasks.len();
         for task in checkpoint_tasks {
-            track_background_task(run_checkpoint_task(
-                task.pool,
-                cfg.clone(),
-                task.lifecycle_owner,
-                checkpoint_shutdown_rx.clone(),
-                task.is_main,
-            ));
+            track_named_background_task(
+                "wal_checkpoint",
+                run_checkpoint_task(
+                    task.pool,
+                    cfg.clone(),
+                    task.lifecycle_owner,
+                    checkpoint_shutdown_rx.clone(),
+                    task.is_main,
+                ),
+            );
         }
         tracing::info!(checkpoint_task_count, "WAL checkpoint task(s) started");
     }
@@ -2484,6 +2568,7 @@ async fn drain_with_timeout(
             tracing::warn!(
                 remaining_connections = active.load(Ordering::SeqCst),
                 remaining_background_tasks = background_task_count(),
+                outstanding_background_tasks = %background_task_names().join(", "),
                 "drain timeout reached; forcing shutdown"
             );
             return false;
@@ -5196,5 +5281,138 @@ mod tests {
             "root is not special-cased: the rule is equality with the daemon's \
              euid, not a privilege comparison"
         );
+    }
+
+    /// Captures one tracing event's fields as `name=value ` text, so a test can
+    /// assert on what an operator reading the log actually sees rather than on
+    /// the value the log line was formatted from.
+    struct CapturedFields(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedFields {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // Shares the process-wide background-task statics with the counter tests
+    // above; see the `#[serial(background_tasks)]` note there.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn drain_timeout_warning_names_the_outstanding_tasks() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CapturedFields(lines.clone());
+        let _dispatch = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::broadcast::channel::<()>(1);
+        for name in ["test_task_alpha", "test_task_beta"] {
+            let mut rx = stop_rx.resubscribe();
+            track_named_background_task(name, async move {
+                let _ = rx.recv().await;
+            });
+        }
+        drop(stop_rx);
+
+        let drained = drain_with_timeout(&active, std::time::Duration::from_millis(150)).await;
+        assert!(
+            !drained,
+            "two unfinished tasks must make the drain time out"
+        );
+
+        let warned = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.contains("drain timeout reached"))
+            .cloned()
+            .expect("the drain timeout must emit its warning through the test subscriber");
+        assert!(
+            warned.contains("test_task_alpha") && warned.contains("test_task_beta"),
+            "the drain-timeout warning must name every outstanding task; got {warned}"
+        );
+
+        let _ = stop_tx.send(());
+        for _ in 0..100 {
+            if background_task_names().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    // Shares the process-wide background-task statics; see the
+    // `#[serial(background_tasks)]` note above.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn a_named_task_drops_its_name_when_it_finishes() {
+        let before = background_task_count();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_named_background_task("test_task_finishes", async move {
+            let _ = rx.await;
+        });
+        assert!(
+            background_task_names().contains(&"test_task_finishes".to_string()),
+            "a live named task must be listed while the counter holds it"
+        );
+        tx.send(()).expect("still awaiting");
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(background_task_count(), before);
+        assert!(
+            !background_task_names().contains(&"test_task_finishes".to_string()),
+            "a finished task's name must be released, not left to accumulate"
+        );
+    }
+
+    // Shares the process-wide background-task statics; see the
+    // `#[serial(background_tasks)]` note above.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn the_unnamed_entry_point_still_registers_and_releases() {
+        let before = background_task_count();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        track_background_task(async move {
+            let _ = rx.await;
+        });
+        assert_eq!(background_task_count(), before + 1);
+        assert!(
+            background_task_names().contains(&UNNAMED_BACKGROUND_TASK.to_string()),
+            "the unchanged public entry point must still register, under the placeholder name"
+        );
+        tx.send(()).expect("still awaiting");
+        for _ in 0..100 {
+            if background_task_count() == before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(background_task_count(), before);
     }
 }

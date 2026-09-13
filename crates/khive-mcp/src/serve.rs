@@ -414,7 +414,8 @@ fn start_daemon_components_if_daemon(
         tracing::info!("read-only deployment: events daemon supervision skipped");
     } else if let Some(split) = server.events_split_config() {
         if let Some(socket) = split.socket_path.clone() {
-            khive_runtime::daemon::track_background_task(
+            khive_runtime::daemon::track_named_background_task(
+                "events_daemon_supervision",
                 khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
             );
         }
