@@ -64,6 +64,12 @@ clients are started by anything asynchronous, the set is open, so no amount of o
 **Where a supervisor for the daemon is declared, the client must not auto-spawn.** Auto-spawn stays
 the default and stays unchanged for the single-starter case ADR-049 describes.
 
+This is the recommended shape rather than socket activation, for one reason: it is the only one that
+works on a deployment the platform does not help. Socket activation removes the race where the
+platform offers it and should be taken there, but a declaration the client reads is what makes the
+answer the same on every platform, and it is also the only shape that gives an operator somewhere to
+say which configuration the daemon should hold.
+
 Concretely:
 
 1. The runtime gains an explicit way to declare that daemon startup is owned elsewhere. It is read at
@@ -100,6 +106,24 @@ Concretely:
 - The single-starter case is untouched. No configuration, no declaration, no change.
 - The existing first-writer-wins refusal stays as it is. It is not the defect; it is the mechanism
   that made the defect one-sided, and it is still what protects a running daemon from a second one.
+
+## Acceptance
+
+The arm that decides whether this record is implemented, stated before anything is built, because it
+is the one the obvious remedy already failed:
+
+- **A client started while no daemon is serving and an owner is declared must not take the
+  rendezvous.** The test starts from no socket and no PID file, declares an owner, starts a client,
+  and asserts the client refused: no socket appeared, no PID file appeared, no daemon process exists,
+  and the refusal names the owner. Ordering is not part of the arm — the client is started at the
+  moment that would have won under today's behaviour.
+- The same arm with no owner declared is the control, and it must produce the opposite result: the
+  client spawns and serves, exactly as ADR-049 specifies. Without that control the first assertion is
+  satisfied by any broken client.
+- A third arm covers the incumbent case that already works and must keep working: with a daemon
+  already serving, a client neither spawns nor refuses, it connects.
+- The refusal's kind is asserted, not just its text, since a caller has to tell "not yours to start"
+  from "starting, try again" without parsing prose.
 
 ## Open questions
 
