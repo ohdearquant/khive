@@ -570,12 +570,12 @@ async fn fenced_create(
         .map(|(note, _)| note)
 }
 
-/// Arm 9. The fenced write may be a creation, not only an update, and the
+/// Arm 8. The fenced write may be a creation, not only an update, and the
 /// fence may be a single object rather than a list. Both are part of the
 /// surface this amendment changes and neither is covered by the arms above:
 /// every one of those fences an update through a list.
 #[tokio::test]
-async fn fence_live_until_arm9_a_creation_is_fenced_too_and_the_object_form_has_no_index() {
+async fn fence_live_until_arm8_a_creation_is_fenced_too_and_the_object_form_has_no_index() {
     let (runtime, token, _) = fixture();
     let expires_at = expired();
     head(
