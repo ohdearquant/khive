@@ -38,25 +38,31 @@ is why it is recorded rather than fixed in place.
 
 **Give entities a version, on the same terms notes have one, and then accept the same fence.**
 
-1. A new versioned migration adds `version` to `entities`, defaulted so existing rows are valid, with
-   the counterpart in `entities-ddl.sql` for fresh stores.
+1. A new versioned migration runs `ALTER TABLE entities ADD COLUMN version INTEGER NOT NULL DEFAULT 1`,
+   with the counterpart column in `entities-ddl.sql` for fresh stores. SQLite does not rewrite the
+   table for a column added with a constant default, so the upgrade cost is expected to be
+   near-constant rather than proportional to the entity count. That expectation is measured at the
+   fleet's entity count and the number written into Consequences before this merges. A measurement
+   that disagrees is a finding about the migration, not a number to round off.
 2. A trigger increments it on update, mirroring `bump_note_version`, so the version moves for every
    writer rather than only for writers that remember to move it. A trigger rather than handler code,
    for the same reason notes use one: a write path that forgets is the failure the fence exists to
    catch.
 3. `Entity` carries `version`, and entity reads return it. A caller cannot use a fence it cannot
    observe.
-4. `update` accepts a positive `expected_version` for entities, checked **inside the writer
-   transaction**, refusing a stale value without mutation, with the same `reason`,
-   `expected_version` and `current_version` fields notes return. Omitting it preserves today's
-   unconditional semantics exactly.
+4. `update`, `merge` and `delete` each accept a positive `expected_version` for entities, checked
+   **inside the writer transaction**, refusing a stale value without mutation, with the same
+   `reason`, `expected_version` and `current_version` fields notes return. Omitting it preserves
+   today's unconditional semantics exactly, for all three. Every verb that writes an entity carries
+   the parameter, because a guarantee that depends on which verb a competing writer happened to call
+   is not a guarantee: a fenced `update` racing an unfenced `merge` loses in silence.
 
 The refusal shape is shared rather than parallel. Two refusal shapes that mean the same thing is how a
 client ends up special-casing a substrate, which is the state this record is removing.
 
 ### What this does not do
 
-- It does not rewrite stored entities. Existing rows start at the default version.
+- It does not rewrite stored entities. Existing rows start at version 1.
 - It does not make the fence mandatory. A caller that never passes `expected_version` sees no change.
 - It does not decide what a no-op update should do. Whether an update that changes nothing bumps the
   version is a separate open question that applies to both substrates, and whatever is decided there
@@ -84,12 +90,13 @@ client ends up special-casing a substrate, which is the state this record is rem
   every entity update, which is a cost paid by every writer, including those that never fence.
 - Entity read responses gain a field. Additive for a client that ignores unknown fields, and a change
   for anything asserting an exact shape.
-- The migration backfills nothing but does rewrite the table if SQLite chooses to, which is an upgrade
-  cost proportional to the entity count and should be measured and recorded in this ADR before it
-  merges, the way the listing index's build cost was.
-- `merge` and `delete` also write entities. Whether those paths participate in the fence is decided by
-  the implementation and asserted either way, since a merge that bypasses the fence makes the
-  guarantee conditional on which verb a competing writer used.
+- The migration adds a column with a constant default, which SQLite records in the schema without
+  rewriting the table. The measured cost at the fleet's entity count is written here before this
+  merges, the way the listing index's build cost was. If that cost turns out to scale with the row
+  count, the assumption above is wrong and that is the finding.
+- Three verbs grow a refusal path rather than one. `merge` and `delete` carry the parameter on the
+  same terms as `update`, which is what makes the guarantee unconditional and is the reason the cost
+  is worth paying.
 
 ## Acceptance
 
@@ -106,5 +113,11 @@ client ends up special-casing a substrate, which is the state this record is rem
 - An arm reading an entity and asserting `version` is present, since a fence a caller cannot observe
   is not usable.
 - An arm for an entity update with no `expected_version`, asserting it still succeeds unconditionally.
+- A stale `merge` is refused without mutation of either side: neither the surviving entity nor the
+  one that would have been merged away has moved, and no merge event was recorded.
+- A stale `delete` is refused and the entity is still readable afterwards.
+- A `merge` and a `delete` with no `expected_version`, each asserting today's unconditional behaviour
+  is unchanged.
 - The migration's cost at the fleet's entity count, measured on a synthetic store and written into
-  Consequences before merge.
+  Consequences before merge, with the row count stated beside it so the shape of the cost is readable
+  and not only its magnitude.
