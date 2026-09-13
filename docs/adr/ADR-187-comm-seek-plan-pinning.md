@@ -62,6 +62,11 @@ the failure this record is about, and it is the same exposure `PROBE_SQL` alread
 indexes are declared in the fresh-store DDL and created by migration, so a store that can run these
 verbs has them.
 
+A store that does not have them is broken, and this record says so rather than routing around it: a
+missing pinned index is a store-integrity error, surfaced loudly with the index named, never a
+fallback to an unpinned plan. Migration runs before any verb, so mid-upgrade is not a state in which
+these seeks execute.
+
 ## Alternatives considered
 
 - **Leave it to the planner.** The status quo, and the measurement above says it breaks the guarantee
@@ -99,6 +104,13 @@ verbs has them.
 - A rows arm: for each pinned seek, the ids returned with the pin equal the ids returned without it, on
   a fixture where a wrong index would return a different page. A pin that changes the answer is a
   defect, not an optimization.
-- An arm for the loud-failure direction: with a pinned index absent from the schema, the seek's
-  behaviour is whatever this ADR's implementation decides it should be, and the test states which.
-  The point is that the behaviour is chosen and asserted rather than discovered in production.
+- **A pinned index missing from the schema is a store-integrity error, surfaced loudly, and never a
+  fallback to an unpinned plan.** The pinned indexes are created by migration before any verb runs, so
+  a store executing these seeks without them is broken and has to say so; mid-upgrade is not a state
+  in which these seeks execute. The arm drops the index and asserts the seek returns that error with
+  the index name in it. A silent fallback here would reintroduce exactly the quiet loss of the
+  guarantee this record exists to remove.
+- **The match condition is asserted against the compiler's own emitted predicate text**, by feeding
+  the emitted SQL back to the matcher, rather than against a spelling written by hand in the test. A
+  hand-written spelling makes the arm pass while a compiler change quietly un-pins every seek, which
+  is the same silent-loss shape one layer down.
