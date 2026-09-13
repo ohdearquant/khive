@@ -233,6 +233,7 @@ impl PackRuntime for KgPack {
             "get" => self.handle_get(token, graph_token, params, registry).await,
             "update" => self.handle_update(graph_token, params, registry).await,
             "delete" => self.handle_delete(graph_token, params, registry).await,
+            "restore" => self.handle_restore(graph_token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),

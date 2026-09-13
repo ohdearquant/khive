@@ -12,9 +12,9 @@ use khive_types::pack::PACK_REGISTRY_TAGS;
 
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    optional_string_patch, parse_relation, resolve_kind_spec, resolve_uuid_unfiltered,
-    resolve_uuid_unfiltered_including_deleted, string_value, to_json, validate_entity_type,
-    DeleteParams, KindSpec, UpdateParams,
+    optional_string_patch, parse_relation, remap_note_status, resolve_kind_spec,
+    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, string_value, to_json,
+    validate_entity_type, DeleteParams, KindSpec, RestoreParams, UpdateParams,
 };
 use crate::KgPack;
 
@@ -316,11 +316,15 @@ impl KgPack {
                     embed: p.embed,
                     key: None,
                 });
+                let original_version = note.version;
                 let (note, report) = self
                     .runtime
                     .update_note_from_snapshot_with_embedding_report(token, note, patch)
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&note)?);
+                if note.version == original_version {
+                    response["unchanged"] = serde_json::json!(true);
+                }
                 super::create::add_embedding_truncation_warning(
                     &mut response,
                     report.any_truncated(),
@@ -464,6 +468,103 @@ impl KgPack {
             KindSpec::Event => Err(immutable_event_error()),
             KindSpec::Proposal => Err(RuntimeError::InvalidInput(
                 "proposal events are immutable — use `withdraw` to rescind a proposal".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn handle_restore(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        let p: RestoreParams = deser(params)?;
+        let explicit_spec = p
+            .kind
+            .as_deref()
+            .map(|kind| resolve_kind_spec(kind, registry))
+            .transpose()?;
+        let id = resolve_uuid_unfiltered_including_deleted(&p.id, &self.runtime, token).await?;
+        let spec = match explicit_spec {
+            Some(spec) => spec,
+            None => {
+                self.infer_kind_from_uuid_including_deleted(token, id, &p.id)
+                    .await?
+            }
+        };
+
+        match spec {
+            KindSpec::Entity { specific } => {
+                let existing = self
+                    .runtime
+                    .get_entity_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                if let Some(expected) = specific.as_ref() {
+                    if existing.kind != *expected {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, existing.kind, expected
+                        )));
+                    }
+                }
+                let Some((entity, restored)) = self.runtime.restore_entity(token, id).await? else {
+                    return Err(RuntimeError::NotFound(format!(
+                        "restore requires a tombstone in the caller's namespace: {}",
+                        p.id
+                    )));
+                };
+                let mut response = normalize_entity_timestamps(to_json(&entity)?);
+                response["restored"] = serde_json::json!(restored);
+                Ok(response)
+            }
+            KindSpec::Note { specific } => {
+                let existing = self
+                    .runtime
+                    .get_note_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                if let Some(expected) = specific.as_ref() {
+                    if existing.kind != *expected {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, existing.kind, expected
+                        )));
+                    }
+                }
+                let Some((note, restored)) = self.runtime.restore_note(token, id).await? else {
+                    return Err(RuntimeError::NotFound(format!(
+                        "restore requires a tombstone in the caller's namespace: {}",
+                        p.id
+                    )));
+                };
+                let mut response = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
+                response["restored"] = serde_json::json!(restored);
+                Ok(response)
+            }
+            KindSpec::Edge => {
+                let existing = self
+                    .runtime
+                    .get_edge_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                let Some((edge, restored)) = self.runtime.restore_edge(token, id).await? else {
+                    return Err(RuntimeError::NotFound(format!(
+                        "restore requires a tombstone in the caller's namespace: {}",
+                        p.id
+                    )));
+                };
+                let mut response = to_json(&edge)?;
+                response["kind"] = serde_json::json!("edge");
+                response["restored"] = serde_json::json!(restored);
+                if existing.deleted_at.is_some() && restored {
+                    response["deleted_at"] = Value::Null;
+                }
+                Ok(response)
+            }
+            KindSpec::Event => Err(immutable_event_error()),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "proposal events are immutable — restore is not supported".into(),
             )),
         }
     }

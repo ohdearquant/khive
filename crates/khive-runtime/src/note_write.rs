@@ -688,14 +688,54 @@ impl KhiveRuntime {
         }
         let expected_updated_at = snapshot.updated_at;
         let expected_deleted_at = snapshot.deleted_at;
-        let next_version = snapshot
-            .version
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::InvalidInput("note version exhausted".into()))?;
-        let (mut note, text_changed) = self
+        let (mut note, text_changed, changed) = self
             .prepare_update_note_from_snapshot(token, snapshot, patch)
             .await?;
         validate_head(&note)?;
+        if !changed && options.embed.is_none() {
+            let mut assertion = SqlStatement {
+                sql: "SELECT 1 FROM notes WHERE id=?1 AND updated_at=?2 AND deleted_at IS ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Integer(expected_updated_at),
+                    expected_deleted_at
+                        .map(SqlValue::Integer)
+                        .unwrap_or(SqlValue::Null),
+                ],
+                label: Some("note-noop-assertion".into()),
+            };
+            if let Some(version) = options.expected_version {
+                assertion.params.push(SqlValue::Integer(version));
+                assertion
+                    .sql
+                    .push_str(&format!(" AND version = ?{}", assertion.params.len()));
+            }
+            let plan = UpdatePlan {
+                target_id: note.id,
+                statements: vec![PlanStatement {
+                    statement: assertion,
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }],
+                post_commit: PostCommitEffect::None,
+                edge_natural_key: None,
+                idempotent_noop: true,
+                note_guard: Some(NoteWriteGuard {
+                    namespace: token.namespace().as_str().into(),
+                    target_id: note.id,
+                    expected_version: options.expected_version,
+                    fence: options.fence,
+                    create_key: None,
+                }),
+                note_vector_purge: None,
+                note_embedding_inheritance: None,
+            };
+            return Ok((note, plan));
+        }
+        let next_version = note
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidInput("note version exhausted".into()))?;
         note.version = next_version;
         let mut update = if self.stream_member_error(&note).await?.is_some() {
             khive_db::stores::note::note_metadata_replace_if_unchanged_statement(
@@ -775,6 +815,7 @@ impl KhiveRuntime {
             statements,
             post_commit,
             edge_natural_key: None,
+            idempotent_noop: false,
             note_guard: Some(NoteWriteGuard {
                 namespace: token.namespace().as_str().into(),
                 target_id: note.id,

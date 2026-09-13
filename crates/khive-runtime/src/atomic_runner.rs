@@ -327,7 +327,9 @@ pub(crate) async fn apply_plan(
         let label = stmt.statement.label.clone();
         // No-op GTD plans are typed read assertions, not equal-value writes:
         // even assigning a column to itself would fire the version trigger.
-        let result = if matches!(plan, AtomicOpPlan::GtdTransition(p) if p.idempotent_noop) {
+        let result = if matches!(plan, AtomicOpPlan::GtdTransition(p) if p.idempotent_noop)
+            || matches!(plan, AtomicOpPlan::Update(p) if p.idempotent_noop)
+        {
             writer
                 .query_all(stmt.statement)
                 .await
@@ -767,6 +769,7 @@ mod tests {
             }],
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
+            idempotent_noop: false,
         })
     }
 

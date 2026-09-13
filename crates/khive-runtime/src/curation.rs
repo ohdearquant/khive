@@ -1648,7 +1648,13 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         mut note: khive_storage::note::Note,
         patch: NotePatch,
-    ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+    ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        let original_name = note.name.clone();
+        let original_content = note.content.clone();
+        let original_salience = note.salience;
+        let original_decay_factor = note.decay_factor;
+        let original_properties = note.properties.clone();
+        let original_status = note.status.clone();
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1775,6 +1781,20 @@ impl KhiveRuntime {
             note.status = status;
         }
 
+        // JSON object key order is not meaningful to callers. Tags are also
+        // set-like in every existing note reader, so their order is ignored
+        // for the no-op decision while duplicate entries remain meaningful.
+        // All other arrays retain ordinary JSON ordering semantics.
+        let changed = original_name != note.name
+            || original_content != note.content
+            || original_salience != note.salience
+            || original_decay_factor != note.decay_factor
+            || !note_update_values_equal(&original_properties, &note.properties)
+            || original_status != note.status;
+        if !changed {
+            return Ok((note, text_changed, false));
+        }
+
         // `updated_at` is also the optimistic-concurrency revision for
         // full-note replacement. Make it strictly advance even when two
         // operations land inside one clock microsecond. Saturation is not a
@@ -1789,7 +1809,7 @@ impl KhiveRuntime {
         note.updated_at = chrono::Utc::now()
             .timestamp_micros()
             .max(minimum_updated_at);
-        Ok((note, text_changed))
+        Ok((note, text_changed, true))
     }
 
     /// Patch-style note update.
@@ -4202,6 +4222,48 @@ pub(crate) fn merge_properties(
             let (merged, added) = merge_json(into_val, from_val, strategy);
             (Some(merged), added)
         }
+    }
+}
+
+/// Compare note-update values using the semantics exposed by note readers.
+/// `serde_json::Value` already compares objects without depending on insertion
+/// order; the special `tags` array is compared as an ordered-independent
+/// multiset because readers treat it as a set while preserving duplicate
+/// entries as a meaningful representation change.
+fn note_update_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
+    fn equal(left: &Value, right: &Value, property: Option<&str>) -> bool {
+        match (left, right) {
+            (Value::Object(a), Value::Object(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(key, value)| {
+                        b.get(key)
+                            .is_some_and(|other| equal(value, other, Some(key.as_str())))
+                    })
+            }
+            (Value::Array(a), Value::Array(b)) if property == Some("tags") => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut left = a.iter().map(Value::to_string).collect::<Vec<_>>();
+                let mut right = b.iter().map(Value::to_string).collect::<Vec<_>>();
+                left.sort_unstable();
+                right.sort_unstable();
+                left == right
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(left, right)| equal(left, right, None))
+            }
+            _ => left == right,
+        }
+    }
+
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => equal(left, right, None),
+        _ => false,
     }
 }
 

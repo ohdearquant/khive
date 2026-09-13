@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use chrono::Utc;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -31,8 +32,21 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
+fn restore_key_conflict(key: &str, holder: &Note) -> RuntimeError {
+    KhiveError::conflict(format!(
+        "restore_key_conflict: key {key:?} is already held by live note {}",
+        holder.id
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "restore_key_conflict".into()),
+        ("key", key.to_owned()),
+        ("existing_id", holder.id.to_string()),
+    ]))
+    .into()
+}
+
 use crate::atomic_plan::{
-    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
+    AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
@@ -4873,6 +4887,242 @@ impl KhiveRuntime {
                 "hard delete + edge purge for {node_id}: atomic unit seam failure: {}",
                 e.0
             ))),
+        }
+    }
+
+    /// Restore an entity tombstone owned by the caller's primary namespace.
+    ///
+    /// The restore is guarded by both the tombstone's id/namespace and the
+    /// current uniqueness state, so a caller cannot resurrect over a newer
+    /// live record. Indexes are rebuilt only after the row restore commits.
+    pub async fn restore_entity(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<(Entity, bool)>> {
+        let Some(entity) = self
+            .entities(token)?
+            .get_entity_including_deleted(id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if entity.namespace != token.namespace().as_str() {
+            return Ok(None);
+        }
+        if entity.deleted_at.is_none() {
+            return Ok(Some((entity, false)));
+        }
+        let updated_at =
+            Utc::now()
+                .timestamp_micros()
+                .max(entity.updated_at.checked_add(1).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "entity {id} updated_at is already at i64::MAX and cannot advance"
+                    ))
+                })?);
+        let plan = AtomicOpPlan::Update(UpdatePlan {
+            target_id: id,
+            statements: vec![PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1 \
+                          WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                        .into(),
+                    params: vec![
+                        SqlValue::Integer(updated_at),
+                        SqlValue::Text(id.to_string()),
+                        SqlValue::Text(token.namespace().as_str().to_owned()),
+                    ],
+                    label: Some("entity-restore".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: false,
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+        });
+        match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => {
+                let mut restored = entity;
+                restored.deleted_at = None;
+                restored.updated_at = updated_at;
+                self.reindex_entity(token, &restored).await?;
+                Ok(Some((restored, true)))
+            }
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                format!("entity restore rolled back: {failure:?}"),
+            )),
+            Err(error) => Err(RuntimeError::Storage(error.0)),
+        }
+    }
+
+    /// Restore a note tombstone owned by the caller's primary namespace.
+    ///
+    /// A live note holding the tombstone's `(namespace, kind, key)` refuses
+    /// the operation before any row changes. The same condition is repeated
+    /// in the guarded restore statement for the concurrent race.
+    pub async fn restore_note(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<(Note, bool)>> {
+        let Some(note) = self.notes(token)?.get_note_including_deleted(id).await? else {
+            return Ok(None);
+        };
+        if note.namespace != token.namespace().as_str() {
+            return Ok(None);
+        }
+        if note.deleted_at.is_none() {
+            return Ok(Some((note, false)));
+        }
+        if let Some(key) = note.key.as_deref() {
+            if let Some(holder) = self
+                .notes(token)?
+                .get_live_notes_by_key(&note.namespace, key, Some(&note.kind))
+                .await?
+                .into_iter()
+                .find(|holder| holder.id != note.id)
+            {
+                return Err(restore_key_conflict(key, &holder));
+            }
+        }
+        let updated_at =
+            Utc::now()
+                .timestamp_micros()
+                .max(note.updated_at.checked_add(1).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "note {id} updated_at is already at i64::MAX and cannot advance"
+                    ))
+                })?);
+        let mut params = vec![
+            SqlValue::Text("active".into()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(id.to_string()),
+            SqlValue::Text(note.namespace.clone()),
+            SqlValue::Text(note.kind.clone()),
+        ];
+        let key_clause = if let Some(key) = note.key.as_deref() {
+            params.push(SqlValue::Text(key.to_owned()));
+            format!(
+                " AND (key IS NULL OR NOT EXISTS (SELECT 1 FROM notes live \
+                          WHERE live.namespace=?4 AND live.kind=?5 AND live.key=?{} \
+                            AND live.deleted_at IS NULL AND live.id != notes.id))",
+                params.len()
+            )
+        } else {
+            String::new()
+        };
+        let plan = AtomicOpPlan::Update(UpdatePlan {
+            target_id: id,
+            statements: vec![PlanStatement {
+                statement: SqlStatement {
+                    sql: format!(
+                        "UPDATE notes SET status=?1, version=version+1, deleted_at=NULL, updated_at=?2 \
+                         WHERE id=?3 AND namespace=?4 AND kind=?5 AND deleted_at IS NOT NULL{key_clause}"
+                    ),
+                    params,
+                    label: Some("note-restore".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: false,
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+        });
+        match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => {
+                let mut restored = note;
+                restored.status = "active".into();
+                restored.deleted_at = None;
+                restored.updated_at = updated_at;
+                restored.version = restored.version.checked_add(1).ok_or_else(|| {
+                    RuntimeError::Internal(format!("note {id} version is exhausted"))
+                })?;
+                self.reindex_note(token, &restored).await?;
+                Ok(Some((restored, true)))
+            }
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::GuardFailed { .. },
+                ..
+            }) => {
+                if let Some(key) = note.key.as_deref() {
+                    if let Some(holder) = self
+                        .notes(token)?
+                        .get_live_notes_by_key(&note.namespace, key, Some(&note.kind))
+                        .await?
+                        .into_iter()
+                        .find(|holder| holder.id != note.id)
+                    {
+                        return Err(restore_key_conflict(key, &holder));
+                    }
+                }
+                Err(RuntimeError::NotFound(format!(
+                    "note {id} is no longer a caller-owned tombstone"
+                )))
+            }
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                format!("note restore rolled back: {failure:?}"),
+            )),
+            Err(error) => Err(RuntimeError::Storage(error.0)),
+        }
+    }
+
+    /// Restore an edge tombstone owned by the caller's primary namespace.
+    pub async fn restore_edge(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<(Edge, bool)>> {
+        let Some(edge) = self.get_edge_including_deleted(token, id).await? else {
+            return Ok(None);
+        };
+        if edge.namespace != token.namespace().as_str() {
+            return Ok(None);
+        }
+        if edge.deleted_at.is_none() {
+            return Ok(Some((edge, false)));
+        }
+        let updated_at = Utc::now();
+        let plan = AtomicOpPlan::Update(UpdatePlan {
+            target_id: id,
+            statements: vec![PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE graph_edges SET deleted_at=NULL, updated_at=?1 \
+                          WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                        .into(),
+                    params: vec![
+                        SqlValue::Integer(updated_at.timestamp_micros()),
+                        SqlValue::Text(id.to_string()),
+                        SqlValue::Text(edge.namespace.clone()),
+                    ],
+                    label: Some("edge-restore".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }],
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: false,
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+        });
+        match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => {
+                let mut restored = edge;
+                restored.deleted_at = None;
+                restored.updated_at = updated_at;
+                Ok(Some((restored, true)))
+            }
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
+                format!("edge restore rolled back: {failure:?}"),
+            )),
+            Err(error) => Err(RuntimeError::Storage(error.0)),
         }
     }
 

@@ -1,5 +1,5 @@
 use super::{parse_relation, UpdateParams};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
@@ -179,16 +179,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 24 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
+// KG pack must expose exactly 25 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics/restore
 #[test]
-fn kg_pack_exposes_24_handlers() {
+fn kg_pack_exposes_25_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        24,
-        "kg pack must expose 24 handlers including ordered streams and stream.batch"
+        25,
+        "kg pack must expose 25 handlers including ordered streams, stream.batch, and restore"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -3003,6 +3003,79 @@ async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity()
     );
 }
 
+#[tokio::test]
+async fn update_note_noop_keeps_version_and_reports_unchanged() {
+    let (rt, token, _pack, registry) = configured_kg_pack().await;
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            Some("no-op update"),
+            &"long content ".repeat(32),
+            Some(0.4),
+            Some(json!({
+                "first": 1,
+                "nullable": "keep",
+                "tags": ["alpha", "beta"]
+            })),
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let response = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "properties": {"tags": ["beta", "alpha"], "first": 1},
+                "salience": 0.4,
+            }),
+        )
+        .await
+        .expect("equal normalized patch");
+
+    assert_eq!(response["unchanged"], json!(true));
+    assert_eq!(response["version"], json!(note.version));
+
+    let omitted = registry
+        .dispatch("update", json!({"id": note.id.to_string(), "kind": "note"}))
+        .await
+        .expect("omitting a field must leave it unchanged");
+    assert_eq!(omitted["unchanged"], json!(true));
+    assert_eq!(omitted["version"], json!(note.version));
+
+    let explicitly_null = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "properties": {"nullable": null}
+            }),
+        )
+        .await
+        .expect("an explicit null must be applied, not treated as omission");
+    assert_ne!(explicitly_null["unchanged"], json!(true));
+    assert_eq!(explicitly_null["version"], json!(note.version + 1));
+    assert_eq!(explicitly_null["properties"]["nullable"], Value::Null);
+
+    let changed = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "content": format!("{}x", "long content ".repeat(32)),
+            }),
+        )
+        .await
+        .expect("one-byte content change");
+    assert_ne!(changed["unchanged"], json!(true));
+    assert_eq!(changed["version"], json!(note.version + 2));
+}
+
 // #1669: `get(include_deleted=true)` must also reach soft-deleted notes and edges.
 
 #[tokio::test]
@@ -3217,6 +3290,224 @@ async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
     assert!(
         !msg.contains("merged into"),
         "a never-existed id must not gain a merge hint, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_note_refuses_a_live_key_holder_and_restores_when_free() {
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let first = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "first tombstone",
+                "key": "restore-key"
+            }),
+        )
+        .await
+        .expect("create keyed note");
+    let first_id = first["id"].as_str().expect("first id").to_owned();
+    assert!(rt
+        .delete_note(&token, first_id.parse().unwrap(), false)
+        .await
+        .expect("delete first note"));
+
+    let second = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "replacement holder",
+                "key": "restore-key"
+            }),
+        )
+        .await
+        .expect("create replacement keyed note");
+    let second_id = second["id"].as_str().expect("second id");
+    let conflict = pack
+        .handle_restore(&token, json!({"id": first_id}), &registry)
+        .await
+        .expect_err("restore must refuse a live key holder");
+    let conflict_text = format!("{conflict}");
+    assert!(conflict_text.contains("restore_key_conflict"));
+    assert!(conflict_text.contains("restore-key"));
+    assert!(conflict_text.contains(second_id));
+
+    let tombstone = registry
+        .dispatch("get", json!({"id": first_id, "include_deleted": true}))
+        .await
+        .expect("conflicting restore leaves tombstone intact");
+    assert!(tombstone["deleted_at"].is_string());
+    let live = registry
+        .dispatch("get", json!({"id": second_id}))
+        .await
+        .expect("replacement holder remains live");
+    assert_eq!(live["content"], "replacement holder");
+
+    assert!(rt
+        .delete_note(&token, second_id.parse().unwrap(), false)
+        .await
+        .expect("delete replacement"));
+    let restored = pack
+        .handle_restore(&token, json!({"id": first_id}), &registry)
+        .await
+        .expect("restore after freeing key");
+    assert_eq!(restored["restored"], true);
+    assert_eq!(restored["content"], "first tombstone");
+    assert_eq!(restored["deleted_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn include_deleted_and_restore_are_scoped_to_the_callers_namespace() {
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let token_a = rt
+        .authorize(khive_runtime::Namespace::parse("restore-a").unwrap())
+        .expect("authorize first namespace");
+    let token_b = rt
+        .authorize(khive_runtime::Namespace::parse("restore-b").unwrap())
+        .expect("authorize second namespace");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    let pack = crate::KgPack::new(rt.clone());
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(
+            &token_a,
+            "concept",
+            None,
+            "private tombstone",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
+
+    let owned = pack
+        .handle_get(
+            &token_a,
+            &token_a,
+            json!({"id": entity.id.to_string(), "include_deleted": true}),
+            &registry,
+        )
+        .await
+        .expect("owner can read tombstone");
+    assert!(owned["deleted_at"].is_string());
+    let foreign = pack
+        .handle_get(
+            &token_b,
+            &token_b,
+            json!({"id": entity.id.to_string(), "include_deleted": true}),
+            &registry,
+        )
+        .await
+        .expect_err("foreign caller cannot read tombstone");
+    assert!(matches!(foreign, khive_runtime::RuntimeError::NotFound(_)));
+
+    let restored = pack
+        .handle_restore(&token_a, json!({"id": entity.id.to_string()}), &registry)
+        .await
+        .expect("owner can restore tombstone");
+    assert_eq!(restored["restored"], true);
+    let foreign_restore = pack
+        .handle_restore(&token_b, json!({"id": entity.id.to_string()}), &registry)
+        .await
+        .expect_err("foreign caller cannot restore tombstone");
+    assert!(matches!(
+        foreign_restore,
+        khive_runtime::RuntimeError::NotFound(_)
+    ));
+}
+
+#[tokio::test]
+async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge() {
+    use khive_types::EdgeRelation;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let source = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "traverse source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "traverse target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    let edge = rt
+        .link(
+            &token,
+            source.id,
+            target.id,
+            EdgeRelation::Extends,
+            0.8,
+            None,
+        )
+        .await
+        .expect("create edge");
+
+    let before = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("initial traversal");
+    assert_eq!(before.as_array().map(Vec::len), Some(1));
+    assert!(before[0]["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.len() >= 2));
+
+    assert!(rt.delete_entity(&token, target.id, false).await.unwrap());
+    let edge_read = registry
+        .dispatch("get", json!({"id": edge.id.to_string()}))
+        .await
+        .expect("edge remains directly readable");
+    assert_eq!(edge_read["id"], edge.id.to_string());
+    let suppressed = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("traversal after endpoint deletion");
+    assert_eq!(suppressed.as_array().map(Vec::len), Some(1));
+    assert_eq!(suppressed[0]["nodes"].as_array().map(Vec::len), Some(1));
+
+    let restored = pack
+        .handle_restore(&token, json!({"id": target.id.to_string()}), &registry)
+        .await
+        .expect("restore endpoint");
+    assert_eq!(restored["restored"], true);
+    let after = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("traversal after endpoint restore");
+    assert_eq!(
+        after[0]["nodes"].as_array().map(Vec::len),
+        before[0]["nodes"].as_array().map(Vec::len)
     );
 }
 

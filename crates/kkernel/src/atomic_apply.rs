@@ -1044,44 +1044,49 @@ async fn build_op_result(
                 })?;
             Ok(serde_json::to_value(&edge)?)
         }
-        ("update", AtomicOpPlan::Update(p)) => match runtime
-            .resolve_by_id(token, p.target_id())
-            .await?
-        {
-            Some(Resolved::Entity(entity)) => {
-                Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
-                    serde_json::to_value(&entity)?,
-                ))
+        ("update", AtomicOpPlan::Update(p)) => {
+            match runtime.resolve_by_id(token, p.target_id()).await? {
+                Some(Resolved::Entity(entity)) => {
+                    Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
+                        serde_json::to_value(&entity)?,
+                    ))
+                }
+                Some(Resolved::Note(note)) => {
+                    let mut value = serde_json::to_value(&note)?;
+                    if p.is_idempotent_noop() {
+                        value["unchanged"] = json!(true);
+                    }
+                    Ok(khive_pack_kg::handlers::normalize_entity_timestamps(value))
+                }
+                Some(Resolved::Event(_)) | Some(Resolved::PackRecord { .. }) => {
+                    Err(anyhow::anyhow!(
+                        "atomic update result: target {} resolved to an unsupported record",
+                        p.target_id()
+                    ))
+                }
+                // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so a
+                // non-symmetric edge update's `p.target_id` (unambiguous — see
+                // `prepare_update_edge`'s non-symmetric branch, which never
+                // changes the edge's own id) falls through here. Canonical
+                // shape: `to_json(&edge)` with no `normalize_entity_timestamps`
+                // wrapper (update.rs:220 — entity/note timestamps are ISO-8601
+                // strings needing normalization; `Edge`'s `created_at`/
+                // `updated_at` already serialize as RFC3339 via its own
+                // `Serialize` impl).
+                None => {
+                    let edge = runtime
+                        .get_edge(token, p.target_id())
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "atomic update result: target {} not found post-commit",
+                                p.target_id()
+                            )
+                        })?;
+                    Ok(serde_json::to_value(&edge)?)
+                }
             }
-            Some(Resolved::Note(note)) => Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
-                serde_json::to_value(&note)?,
-            )),
-            // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so a
-            // non-symmetric edge update's `p.target_id` (unambiguous — see
-            // `prepare_update_edge`'s non-symmetric branch, which never
-            // changes the edge's own id) falls through here. Canonical
-            // shape: `to_json(&edge)` with no `normalize_entity_timestamps`
-            // wrapper (update.rs:220 — entity/note timestamps are ISO-8601
-            // strings needing normalization; `Edge`'s `created_at`/
-            // `updated_at` already serialize as RFC3339 via its own
-            // `Serialize` impl).
-            None => {
-                let edge = runtime
-                    .get_edge(token, p.target_id())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "atomic update result: target {} not found post-commit",
-                            p.target_id()
-                        )
-                    })?;
-                Ok(serde_json::to_value(&edge)?)
-            }
-            _ => anyhow::bail!(
-                "atomic update result: target {} not found post-commit",
-                p.target_id()
-            ),
-        },
+        }
         // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
         // (update.rs:327/:356/:360) — `p.id`/`p.kind` are the CALLER's
         // original strings (pre id-resolution), not the resolved UUID.
@@ -2585,8 +2590,7 @@ mod tests {
     /// GAP-6 (ADR-099 B3): an idempotent atomic `gtd.transition` (current ==
     /// target after `normalize_status`) must perform no persisted mutation.
     /// Its guarded no-effect statement only revalidates the snapshot. This
-    /// matches canonical when no note was supplied; canonical note-bearing
-    /// no-ops have a separate note-event contract outside atomic v1. The
+    /// matches canonical for both note-omitting and note-bearing requests. The
     /// pre-fix atomic prepare only special-cased `current != target` inside
     /// its `can_transition` guard, so a current==target call fell through
     /// to an unconditional `UPDATE` that bumped `updated_at` for nothing.

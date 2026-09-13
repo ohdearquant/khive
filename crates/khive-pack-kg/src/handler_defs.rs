@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (25 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -220,9 +220,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return soft-deleted entities (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
-                     to soft-deleted entities when no live record matches.",
+                     to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -230,7 +230,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering. Offset-mode results always use \
+        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool}; clients advance offset by items.length, while M \
                       discloses the server cap and is not a guaranteed row count. \
@@ -583,6 +583,29 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "boolean",
                 required: false,
                 description: "If true, permanently remove with edge cascade (default false = soft delete).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    // Declaration: declares a caller-owned tombstone live again
+    HandlerDef {
+        name: "restore",
+        description: "Restore a caller-owned soft-deleted entity, note, or edge; live records are returned unchanged and key conflicts refuse without modifying either record.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "Complete UUID or globally unique 8+ hex prefix of the tombstone to restore. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
