@@ -1341,6 +1341,11 @@ pub async fn ensure_loaded(
                         .collect(),
                     router_state: current_state.router_state.clone(),
                     adapter_set: current_state.adapter_set.clone(),
+                    // A namespace swap parks this namespace's live state and
+                    // restores it later in the same process, so its counters
+                    // travel with it rather than restarting at zero.
+                    signals_applied: current_state.signals_applied,
+                    snapshot_serializations: current_state.snapshot_serializations,
                 };
                 // Release the state guard before mutating the tracker (save-restore
                 // path) so the re-acquire below cannot deadlock.

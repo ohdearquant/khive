@@ -28,6 +28,17 @@ pub struct BrainState {
     pub section_states: HashMap<String, SectionPosteriorState>,
     pub router_state: HashMap<String, RouterStateBlob>,
     pub adapter_set: HashMap<String, Vec<AdapterRecord>>,
+    /// Dispatch-signal counters for this process. Diagnostics only: they are
+    /// not part of the persisted snapshot, they start at zero on every load,
+    /// and nothing reads them to make a decision. They exist so the cost of
+    /// the signal path has a denominator: a duty cycle with no signal count
+    /// beside it cannot say whether the work was too much or merely frequent.
+    pub signals_applied: u64,
+    /// Profile-record snapshot serializations performed in this process. This
+    /// counts every one, not only the dispatch path's, because the question it
+    /// answers is how much serialization the process is doing; the signal
+    /// count beside it is what makes the ratio readable.
+    pub snapshot_serializations: u64,
 }
 
 impl BrainState {
@@ -46,6 +57,8 @@ impl BrainState {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: 0,
+            snapshot_serializations: 0,
         }
     }
 
@@ -95,6 +108,8 @@ impl BrainState {
             section_states,
             router_state: snapshot.router_state,
             adapter_set: snapshot.adapter_set,
+            signals_applied: 0,
+            snapshot_serializations: 0,
         }
     }
 
@@ -468,6 +483,8 @@ mod tests {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: 0,
+            snapshot_serializations: 0,
         };
         state_a.profiles.insert(p_early.id.clone(), p_early.clone());
         state_a.profiles.insert(p_later.id.clone(), p_later.clone());
@@ -480,6 +497,8 @@ mod tests {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: 0,
+            snapshot_serializations: 0,
         };
         // Insert in the opposite order.
         state_b.profiles.insert(p_later.id.clone(), p_later.clone());
