@@ -16,6 +16,13 @@ pub struct NoteFence {
     pub kind: String,
     /// None asserts absence; the JSON field is still required.
     pub expected_version: Option<i64>,
+    /// Dotted document path whose RFC 3339 value must exceed the writer clock,
+    /// on the same semantics a batch observation's `live_until` carries. A
+    /// version comparison alone cannot express live ownership: a lease that
+    /// merely ran out changes no document and moves no version, so the version
+    /// still matches and the write commits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_until: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for NoteFence {
@@ -27,6 +34,7 @@ impl<'de> Deserialize<'de> for NoteFence {
             kind: String,
             #[serde(alias = "version")]
             expected_version: Option<i64>,
+            live_until: Option<String>,
         }
 
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -45,6 +53,7 @@ impl<'de> Deserialize<'de> for NoteFence {
             key: fields.key,
             kind: fields.kind,
             expected_version: fields.expected_version,
+            live_until: fields.live_until,
         })
     }
 }
@@ -60,6 +69,18 @@ impl NoteFence {
         if self.expected_version.is_some_and(|version| version < 1) {
             return Err(RuntimeError::InvalidInput(
                 "fence requires expected_version (positive integer or null)".into(),
+            ));
+        }
+        if self.live_until.is_some() && self.expected_version.is_none() {
+            // An absence assertion has no document, so there is nothing to read
+            // a deadline out of. The batch route refuses the same pairing.
+            return Err(RuntimeError::InvalidInput(
+                "fence live_until requires a positive expected_version".into(),
+            ));
+        }
+        if self.live_until.as_ref().is_some_and(|path| path.is_empty()) {
+            return Err(RuntimeError::InvalidInput(
+                "fence live_until requires a document path".into(),
             ));
         }
         Ok(())
@@ -298,6 +319,23 @@ pub enum NoteWriteConflict {
         key: String,
         existing_id: String,
     },
+    /// A fence whose `live_until` path did not admit the write. Separate from
+    /// `Fence` because the version matched: what failed is the deadline. Boxed
+    /// so this variant does not set the size of every conflict result.
+    FenceDeadline(Box<FenceDeadline>),
+}
+
+/// The fields a deadline refusal reports: what was fenced, at which version and
+/// path, and the predicate's own reason and evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceDeadline {
+    pub key: String,
+    pub kind: String,
+    pub version: i64,
+    pub field: String,
+    pub index: Option<usize>,
+    pub reason: &'static str,
+    pub evidence: Vec<(&'static str, String)>,
 }
 
 impl NoteWriteConflict {
@@ -345,6 +383,29 @@ impl NoteWriteConflict {
                     ("existing_id", existing_id),
                 ],
             ),
+            Self::FenceDeadline(deadline) => {
+                let FenceDeadline {
+                    key,
+                    kind,
+                    version,
+                    field,
+                    index,
+                    reason,
+                    evidence,
+                } = *deadline;
+                let mut fields = vec![
+                    ("reason", reason.into()),
+                    ("key", key),
+                    ("kind", kind),
+                    ("version", version.to_string()),
+                    ("field", field),
+                ];
+                if let Some(index) = index {
+                    fields.push(("index", index.to_string()));
+                }
+                fields.extend(evidence);
+                ("note fence time precondition failed", fields)
+            }
         };
         if let Some(member) = member {
             details.push(("member", member.to_string()));
@@ -369,6 +430,10 @@ impl NoteWriteGuard {
         let Some(fences) = &self.fence else {
             return Ok(None);
         };
+        // One clock reading for this transaction, taken only when some entry
+        // asks for one, and shared by all of them: two entries in one write
+        // must not be judged against two instants.
+        let mut now: Option<i64> = None;
         for (index, fence) in fences.entries().iter().enumerate() {
             let current = writer.query_scalar(statement(
             "SELECT version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
@@ -391,6 +456,43 @@ impl NoteWriteGuard {
                     current,
                     index: matches!(fences, NoteFences::Many(_)).then_some(index),
                 }));
+            }
+            if let Some(field) = &fence.live_until {
+                let clock = match now {
+                    Some(clock) => clock,
+                    None => {
+                        let clock =
+                            crate::live_until::writer_clock(writer, "note-write-guard-clock")
+                                .await?;
+                        now = Some(clock);
+                        clock
+                    }
+                };
+                if let Some(refusal) = crate::live_until::evaluate(
+                    writer,
+                    &self.namespace,
+                    &fence.kind,
+                    &fence.key,
+                    field,
+                    clock,
+                    "note-write-guard-live-until",
+                )
+                .await?
+                {
+                    return Ok(Some(NoteWriteConflict::FenceDeadline(Box::new(
+                        FenceDeadline {
+                            key: fence.key.clone(),
+                            kind: fence.kind.clone(),
+                            // validate() refuses live_until without a positive
+                            // expected_version, so the version is present here.
+                            version: fence.expected_version.unwrap_or_default(),
+                            field: field.clone(),
+                            index: matches!(fences, NoteFences::Many(_)).then_some(index),
+                            reason: refusal.reason(),
+                            evidence: refusal.details(),
+                        },
+                    ))));
+                }
             }
         }
         Ok(None)
