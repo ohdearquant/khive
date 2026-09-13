@@ -1072,3 +1072,77 @@ the hold, but it would pay for the work first, and the refusal exists precisely 
 The implementing change publishes the measured writer hold time at the cap beside the hold at the
 largest member count the 8 MiB frame admits, so the number this amendment fixes is defended by a
 measurement rather than by an argument.
+
+## Amendment 8 (2026-09-13): the single-head `create`/`update` fence takes `live_until`
+
+### Context
+
+Amendment 5 put `live_until` on a `stream.batch` `observed` entry, so a batched write can say where
+the ownership document keeps its deadline and the store re-reads that path against the writer clock
+inside the writing transaction. That closed, for that route, the window between a caller's liveness
+read and the store's commit.
+
+The single-head write fence never got it. A `create`/`update` fence was `{key, kind,
+expected_version}`, a version comparison and nothing else, and a version comparison cannot express
+live ownership: a lease that merely ran out changes no document and moves no version, so the
+observation still holds and the write commits. A caller could not close that window from this route,
+because there was no field to send.
+
+The asymmetry was a landing-order artifact of Amendment 5, not a position. Nothing in the base
+decision says the single-head fence is deliberately a version comparison only, and the shape it
+fails on, one head, one owner, one compare-and-set, is the common one. A guarantee that depends on
+which route the caller picked is not a guarantee.
+
+### Decision
+
+A fence entry is `{key, kind, expected_version, live_until?}` on `create`, `update`, the `stream`
+append fences and the `stream.batch` fence, list entries included.
+
+`live_until` is a dotted document path into the fenced head, holding an RFC 3339 timestamp that must
+be strictly later than the writer clock. It is evaluated inside the writing transaction, against one
+clock reading taken after writer admission and shared by every entry in that write: two entries in
+one write are never judged against two instants.
+
+`live_until` requires a positive `expected_version`. An absence assertion has no document to read a
+deadline from, so the pairing is refused as `invalid_input` rather than interpreted.
+
+A deadline that has passed refuses with reason `expired`, naming the deadline it read and the clock
+it compared. A path that resolves to nothing, or to a value that is not an RFC 3339 timestamp,
+refuses with reason `live_until_unreadable`, naming `value_type` and never the value: the path is
+caller-chosen, so echoing whatever it lands on would read an arbitrary field of the document back
+out. List refusals carry the index they already carry.
+
+The two routes share one implementation of the predicate rather than two that agree today. The batch
+observation path was moved onto it in the same change, so "the same semantics" is a property of the
+code and not a claim in this document.
+
+### What this does not change
+
+The version comparison is unchanged, and a fence without `live_until` behaves exactly as before.
+Nothing about absence assertions changes. This amendment adds a predicate; it does not alter which
+writes are admitted in its absence.
+
+### Acceptance
+
+1. **Both routes, one fixture.** A single head with an expired deadline is refused by a `stream.batch`
+   `observed` entry and by a single-head `update` fence, and the two refusals carry the same reason
+   and the same evidence fields. This is the arm that makes the guarantee route-independent, and it
+   is the reason the predicate is shared rather than duplicated.
+2. **Live deadline admits.** The same fixture with a deadline in the future commits through the fence,
+   so the predicate is not refusing everything.
+3. **Unreadable path.** A path that resolves to nothing, and a path that resolves to a non-timestamp,
+   both refuse `live_until_unreadable` and report `value_type`, with the value absent from the
+   refusal.
+4. **Expired evidence.** An expired refusal carries the deadline and the clock.
+5. **Pairing refused.** `live_until` beside `expected_version: null` refuses `invalid_input` before
+   any writer is requested.
+6. **Version still first.** A fence whose version does not match refuses `fence_conflict`, not the
+   deadline reason, even when the deadline has also passed: the caller learns the older failure.
+7. **One clock.** Two entries carrying deadlines in one write read the clock once.
+8. **The fenced write may be a creation.** A `create` under an expired fence is refused and creates
+   nothing, and under a live one it creates; the object fence form carries no index while the list
+   form of the same refusal differs by that field alone. Every other arm fences an update through a
+   list, so without this one the created side and the singleton form have no witness.
+9. **Mutation.** Removing the deadline evaluation makes arm 1 go red on the fence side while the
+   batch side stays green, which is the arm that would otherwise pass on a shared fixture by
+   accident.

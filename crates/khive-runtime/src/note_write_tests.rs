@@ -182,6 +182,7 @@ fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
             key: format!("fence-cap/{index}"),
             kind: "head".into(),
             expected_version: Some(1),
+            live_until: None,
         })
         .collect();
     let at_cap = NoteFences::Many(entries.clone());
@@ -193,6 +194,7 @@ fn ordered_fences_cap_precedes_entry_validation_for_json_and_typed_inputs() {
         key: "fence-cap/100".into(),
         kind: "head".into(),
         expected_version: Some(1),
+        live_until: None,
     });
     for malformed in [false, true] {
         let mut entries = over_cap.clone();
@@ -307,6 +309,7 @@ async fn absence_fence_observes_prior_create_in_same_transaction_and_rolls_back(
             key: "absence/holder".into(),
             kind: "head".into(),
             expected_version: None,
+            live_until: None,
         };
         let mut update = patch("{\"changed\":true}", 1, None);
         update.write_options.fence = Some(if listed {
@@ -724,6 +727,7 @@ async fn version_fence_and_prior_operation_roll_back_together() {
                 key: key.into(),
                 kind: "head".into(),
                 expected_version: Some(expected),
+                live_until: None,
             }
             .into(),
         );
@@ -761,6 +765,7 @@ async fn version_fence_and_prior_operation_roll_back_together() {
             key: fence.key.clone().unwrap(),
             kind: "head".into(),
             expected_version: Some(1),
+            live_until: None,
         }
         .into(),
     );
@@ -1440,3 +1445,6 @@ async fn assert_legacy_creation_revision_guard(multimodel: bool, fail: bool) {
 
 #[path = "note_fence_race_tests.rs"]
 mod fence_races;
+
+#[path = "fence_live_until_tests.rs"]
+mod fence_live_until;

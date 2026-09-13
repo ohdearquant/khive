@@ -30,6 +30,7 @@ pub mod keyed_memory;
 #[cfg(test)]
 mod keyed_memory_tests;
 pub mod keyed_message;
+mod live_until;
 mod note_create;
 mod note_index;
 mod note_read;
