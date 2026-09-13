@@ -2044,6 +2044,8 @@ The response is `{results, total, candidate_provenance, ...}`. A genuine FTS mis
 not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` reports:
 
 - `matched`: eligible lexical candidates were found.
+- `exact_name`: FTS found no match, and a query with no scoreable terms recovered an eligible
+  atom by its exact normalized slug.
 - `no_match`: no lexical match was found in the caller's namespace.
 - `filtered`: lexical matches were removed by eligibility, such as kind or status filters.
 - `partial_timeout`: a timed-out fetch retains eligible candidates, or decomposed passes
@@ -2053,6 +2055,11 @@ not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` re
 
 These states supplement `degraded.lexical_timeout` and any public timeout details. A lexical
 stage timeout does not by itself mean the request's broader read deadline has expired.
+
+Short queries such as `AI` use the pack's import slug convention for this indexed recovery.
+A custom slug outside that convention is outside the guarantee. The probe shares the lexical
+pass's remaining deadline and namespace, status, and kind filters; a role hint does not change
+the raw query used for lookup.
 
 `candidate_provenance.terms_truncated` is `true` when a lexical pass exceeds the request's
 shared allowance of 32 distinct expanded terms. The full query and both decomposed passes

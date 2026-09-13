@@ -139,6 +139,7 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "namespace_existence",
             "zzoraclezz",
         ),
+        (LexicalPhase::ExactNameProbe, "exact_name_probe", "AI"),
     ] {
         let events = TimeoutEvents::default();
         let outcome = with_timeout(
@@ -169,6 +170,60 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "elapsed must be frozen at capture"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn short_exact_name_timeout_degrades_within_original_lexical_budget() {
+    let runtime = fixture(false).await;
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let configured = Duration::from_millis(2000);
+    khive_storage::scope_request_read_deadline(Duration::from_millis(1000), async {
+        let started = tokio::time::Instant::now();
+        let mut stage = LexicalStage::new(LexicalPass::Full, started, configured);
+        stage
+            .read(LexicalPhase::ReaderOpen, async {
+                tokio::time::advance(Duration::from_millis(30)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let sql = runtime.sql();
+        let mut reader = sql.reader().await.unwrap();
+        let outcome = with_timeout(
+            vec![LexicalPhase::ExactNameProbe],
+            Duration::from_millis(7),
+            fetch_exact_name_candidate(reader.as_mut(), "local", "AI", None, &[], &[], &mut stage),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ExactNameProbe::TimedOut));
+        let timeout = stage.timeout.unwrap();
+        assert_eq!(timeout.configured_budget_ms, 2000);
+        assert_eq!(timeout.effective_budget_ms, 1000);
+        assert_eq!(timeout.stage_elapsed_ms, 37);
+        assert_eq!(timeout.operation_elapsed_ms, 7);
+    })
+    .await;
+
+    let response = with_timeout(
+        vec![LexicalPhase::ExactNameProbe],
+        Duration::from_millis(7),
+        KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "rerank": false}),
+            &vamana::new_shared(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["total"], 0);
+    assert_eq!(response["candidate_provenance"]["lexical"], "timed_out");
+    assert_eq!(response["degraded"]["lexical_timeout"], true);
+    assert_eq!(response["degraded"]["lexical_timeout_instrumented"], true);
+    assert!(response["degraded"]
+        .get("lexical_timeout_details")
+        .is_none());
 }
 
 #[tokio::test(start_paused = true)]

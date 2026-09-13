@@ -42,10 +42,14 @@ request(ops="knowledge.search(query=\"block-max wand posting list pruning\", lim
 Each `knowledge.search` result includes `score_provenance`: the contributing
 `sources` (`lexical`, `ann`, or both), whether `embedding_rerank` ran successfully,
 `normalization: "s_over_s_plus_1"`, and `calibrated: false`. The response's
-`candidate_provenance.lexical` distinguishes `matched`, `no_match`, `filtered`,
+`candidate_provenance.lexical` distinguishes `matched`, `exact_name`, `no_match`, `filtered`,
 `partial_timeout`, and `timed_out`. Its `fallback` is `ann` only when returned
 results have ANN evidence and none has lexical evidence; otherwise it is `none`.
 A genuine lexical miss contributes no candidates from unrelated recent rows.
+Queries with no scoreable terms, such as `AI`, can recover an atom through an
+indexed lookup of the query's normalized slug when FTS finds no match. The probe
+shares the lexical pass's remaining deadline and eligibility rules; custom slugs
+outside the pack's import convention are outside this recovery guarantee.
 
 The same DSL runs from the shell without an MCP client via `kkernel exec`:
 

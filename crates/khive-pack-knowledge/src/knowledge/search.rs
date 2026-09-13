@@ -23,6 +23,7 @@ use super::scoring::{
     compute_idf, exact_name_bonus, expand_terms, load_candidates_from_atoms, score_candidate,
     Candidate, Weights,
 };
+use super::sections::to_slug;
 use super::util::{
     atom_embed_text, atom_from_row, compose_item_char_cost, deser, domain_from_row,
     estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
@@ -575,6 +576,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexicalCandidateState {
     Matched,
+    ExactName,
     NoMatch,
     Filtered,
     PartialTimeout,
@@ -585,6 +587,7 @@ impl LexicalCandidateState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Matched => "matched",
+            Self::ExactName => "exact_name",
             Self::NoMatch => "no_match",
             Self::Filtered => "filtered",
             Self::PartialTimeout => "partial_timeout",
@@ -603,6 +606,8 @@ impl LexicalCandidateState {
             Self::PartialTimeout
         } else if states.contains(&Self::Matched) {
             Self::Matched
+        } else if states.contains(&Self::ExactName) {
+            Self::ExactName
         } else if states.contains(&Self::Filtered) {
             Self::Filtered
         } else {
@@ -1061,11 +1066,126 @@ async fn fetch_fts_candidates(
         });
     }
 
+    let no_scoreable_terms = !matching::tokenize_field(raw_query)
+        .iter()
+        .any(|term| term.len() >= MIN_TERM_LEN && !is_stop(term));
+    if no_scoreable_terms {
+        match fetch_exact_name_candidate(
+            reader.as_mut(),
+            ns,
+            raw_query,
+            type_filter,
+            statuses,
+            exclude_statuses,
+            &mut stage,
+        )
+        .await?
+        {
+            ExactNameProbe::Hit(atom) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: vec![*atom],
+                    timeout: None,
+                    state: LexicalCandidateState::ExactName,
+                })
+            }
+            ExactNameProbe::Filtered => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timeout: None,
+                    state: LexicalCandidateState::Filtered,
+                })
+            }
+            ExactNameProbe::TimedOut => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timeout: stage.timeout,
+                    state: LexicalCandidateState::TimedOut,
+                })
+            }
+            ExactNameProbe::Miss => {}
+        }
+    }
+
     Ok(FtsFetchOutcome {
         atoms: Vec::new(),
         timeout: None,
         state: LexicalCandidateState::NoMatch,
     })
+}
+
+fn exact_name_statement(
+    ns: &str,
+    slug: &str,
+    type_filter: Option<&str>,
+    statuses: &[String],
+    exclude_statuses: &[&str],
+) -> SqlStatement {
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
+    let type_clause = type_eligibility_sql(type_filter, "knowledge_atoms");
+    let mut params = vec![
+        SqlValue::Text(ns.to_owned()),
+        SqlValue::Text(slug.to_owned()),
+    ];
+    params.extend(status_params);
+    SqlStatement {
+        sql: format!(
+            "SELECT *, CASE WHEN 1{status_clause}{type_clause} THEN 1 ELSE 0 END AS exact_name_eligible \
+             FROM knowledge_atoms \
+             WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1"
+        ),
+        params,
+        label: Some("knowledge.exact_name".into()),
+    }
+}
+
+/// Reuse the lexical pass's reader and remaining deadline: opening a fresh
+/// stage here would give a short query a second, unaccounted retrieval budget.
+/// The unique namespace/slug key bounds this to one row. Custom slugs outside
+/// the import convention remain outside the exact-name recovery guarantee.
+async fn fetch_exact_name_candidate(
+    reader: &mut dyn khive_storage::SqlReader,
+    ns: &str,
+    raw_query: &str,
+    type_filter: Option<&str>,
+    statuses: &[String],
+    exclude_statuses: &[&str],
+    stage: &mut LexicalStage,
+) -> Result<ExactNameProbe, RuntimeError> {
+    let slug = to_slug(raw_query);
+    if slug.is_empty() {
+        return Ok(ExactNameProbe::Miss);
+    }
+    let row = stage
+        .read(
+            LexicalPhase::ExactNameProbe,
+            reader.query_row(exact_name_statement(
+                ns,
+                &slug,
+                type_filter,
+                statuses,
+                exclude_statuses,
+            )),
+        )
+        .await;
+    match row {
+        Ok(Some(row)) if row_i64(&row, "exact_name_eligible") != Some(1) => {
+            Ok(ExactNameProbe::Filtered)
+        }
+        Ok(Some(row)) => Ok(atom_from_row(&row).map_or(ExactNameProbe::Miss, |atom| {
+            ExactNameProbe::Hit(Box::new(atom))
+        })),
+        Ok(None) => Ok(ExactNameProbe::Miss),
+        Err(e) if is_timeout(&e) => Ok(ExactNameProbe::TimedOut),
+        Err(e) => Err(sql_err("search exact-name query", e)),
+    }
+}
+
+#[derive(Debug)]
+enum ExactNameProbe {
+    Hit(Box<Atom>),
+    Miss,
+    Filtered,
+    TimedOut,
 }
 
 // ─── search context ───────────────────────────────────────────────────────────
@@ -1197,7 +1317,9 @@ async fn search_core(
     let mut scored: Vec<(f32, &Candidate)> = candidates
         .iter()
         .filter_map(|cand| {
-            let base = if terms_only_exact {
+            let base = if lexical_state == LexicalCandidateState::ExactName {
+                w.w_exact_name
+            } else if terms_only_exact {
                 exact_name_bonus(&cand.name_raw, &raw_query, w.w_exact_name)
             } else {
                 score_candidate(
@@ -4030,6 +4152,26 @@ mod tests {
                 "candidate_provenance": {"lexical": "no_match", "fallback": "none", "terms_truncated": false},
             })
         );
+        let lexical = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "ordinary", "rerank": false}),
+            &vamana::new_shared(),
+        )
+        .await
+        .expect("matching lexical control");
+        assert_eq!(
+            lexical["candidate_provenance"],
+            json!({"lexical": "matched", "fallback": "none", "terms_truncated": false})
+        );
+        assert_eq!(lexical["results"][0]["slug"], "newest-unrelated");
+        assert_eq!(
+            lexical["results"][0]["score_provenance"],
+            json!({
+                "sources": ["lexical"], "embedding_rerank": false,
+                "normalization": "s_over_s_plus_1", "calibrated": false,
+            })
+        );
     }
 
     #[tokio::test]
@@ -4519,6 +4661,7 @@ mod tests {
                 .await
                 .expect("fetch must not error");
         assert!(outcome.timeout.is_none());
+        assert_eq!(outcome.state, LexicalCandidateState::Matched);
         assert_eq!(outcome.atoms.len(), fetch_limit);
 
         let beta_present = outcome
@@ -5288,6 +5431,428 @@ mod tests {
             "a concurrently running task with no override of its own must \
              never observe another task's override; got {baseline:?}"
         );
+    }
+
+    /// Issue: `MIN_TERM_LEN=3` drops every token of a query like "AI" before
+    /// FTS ever sees it, and the trigram tokenizer cannot match a phrase that
+    /// short either, so the atom was unreachable without ANN. The indexed
+    /// slug probe in the lexical stage must restore discoverability for both the
+    /// atom's exact-case name and a case-insensitive spelling, while a query
+    /// that matches no slug at all must still report a genuine miss.
+    #[tokio::test]
+    async fn short_exact_name_is_discoverable_without_ann() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '93000000-0000-0000-0000-000000000001', 'local', \
+                              'ai', 'AI', \
+                              'artificial intelligence overview content for the corpus', '[]', \
+                              NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed short-name atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+
+        let exact_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("exact-case short-name search must not error");
+        assert_eq!(exact_case["total"], 1);
+        assert_eq!(exact_case["results"][0]["slug"], "ai");
+        assert_eq!(exact_case["candidate_provenance"]["lexical"], "exact_name");
+        assert_eq!(exact_case["candidate_provenance"]["fallback"], "none");
+        assert_eq!(
+            exact_case["results"][0]["score_provenance"]["sources"],
+            json!(["lexical"])
+        );
+        assert!(exact_case["results"][0]["score"].as_f64().unwrap() > 0.0);
+
+        let lower_case = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "ai", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("lower-case short-name search must not error");
+        assert_eq!(lower_case["total"], 1);
+        assert_eq!(lower_case["results"][0]["slug"], "ai");
+        assert_eq!(lower_case["candidate_provenance"]["lexical"], "exact_name");
+
+        let miss = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "zz", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("non-matching short query must not error");
+        assert_eq!(miss["total"], 0);
+        assert_eq!(miss["candidate_provenance"]["lexical"], "no_match");
+
+        // A role prefix is scored, never searched: it must not hide the probe.
+        let role_qualified = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "role": "researcher", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("role-qualified short-name search must not error");
+        assert_eq!(role_qualified["total"], 1);
+        assert_eq!(role_qualified["results"][0]["slug"], "ai");
+        assert_eq!(
+            role_qualified["candidate_provenance"]["lexical"],
+            "exact_name"
+        );
+    }
+
+    /// A deadline that expires inside the exact-name probe is a lexical
+    /// timeout, not a miss: the caller degrades the response on `TimedOut`
+    /// and would otherwise reach the final active-read check and error.
+    #[tokio::test]
+    async fn exact_name_probe_reports_an_expired_deadline_as_a_timeout() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = runtime.sql();
+        let mut reader = sql.reader().await.expect("reader before deadline");
+        let configured = lexical_stage_budget();
+
+        let expired =
+            khive_storage::scope_request_read_deadline(std::time::Duration::ZERO, async {
+                let mut stage =
+                    LexicalStage::new(LexicalPass::Full, tokio::time::Instant::now(), configured);
+                let outcome = fetch_exact_name_candidate(
+                    reader.as_mut(),
+                    "local",
+                    "AI",
+                    None,
+                    &[],
+                    &[],
+                    &mut stage,
+                )
+                .await;
+                let timeout = stage.timeout.expect("exact probe captures timeout details");
+                assert_eq!(timeout.phase, LexicalPhase::ExactNameProbe);
+                assert_eq!(timeout.effective_budget_ms, 0);
+                outcome
+            })
+            .await;
+        assert!(
+            matches!(expired, Ok(ExactNameProbe::TimedOut)),
+            "an expired read deadline must surface as TimedOut, never as a \
+             miss; got {expired:?}"
+        );
+
+        let mut stage =
+            LexicalStage::new(LexicalPass::Full, tokio::time::Instant::now(), configured);
+        let healthy =
+            fetch_exact_name_candidate(reader.as_mut(), "local", "AI", None, &[], &[], &mut stage)
+                .await
+                .expect("undeadlined probe must succeed");
+        assert!(
+            matches!(healthy, ExactNameProbe::Miss),
+            "control: without a deadline an unseeded name is a plain miss; got {healthy:?}"
+        );
+        assert!(stage.timeout.is_none());
+    }
+
+    /// The indexed exact-name probe must use the unique `(namespace, slug)`
+    /// index, never a full-namespace scan on `name` — no such index exists.
+    /// Same `EXPLAIN QUERY PLAN` style as
+    /// `crud::get_prefix_query_plan_uses_primary_key_range_seeks`.
+    #[tokio::test]
+    async fn exact_name_probe_query_plan_uses_slug_index() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut reader = runtime.sql().reader().await.expect("exact-name reader");
+        let rows = reader
+            .explain(exact_name_statement(
+                "local",
+                "ai",
+                Some("atom"),
+                &[],
+                &["draft", "deprecated"],
+            ))
+            .await
+            .expect("explain exact-name probe");
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            details.iter().any(|d| d.contains("SEARCH knowledge_atoms")
+                && d.contains("USING INDEX")
+                && d.contains("namespace=? AND slug=?")),
+            "exact-name probe must use an index seek, not a table scan: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("SCAN knowledge_atoms")),
+            "exact-name probe must never full-scan knowledge_atoms: {details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_exact_name_probe_respects_namespace_status_type_and_soft_deletion() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.unwrap();
+        for (index, (ns, slug, name, status, tags, deleted)) in [
+            ("local", "ai", "AI", "draft", "[]", SqlValue::Null),
+            ("tenant-b", "ai", "AI", "reviewed", "[]", SqlValue::Null),
+            (
+                "local",
+                "ml",
+                "ML",
+                "reviewed",
+                "[\"type:domain\"]",
+                SqlValue::Null,
+            ),
+            (
+                "local",
+                "zz",
+                "ZZ",
+                "reviewed",
+                "[]",
+                SqlValue::Integer(1000),
+            ),
+            (
+                "local",
+                "custom-name",
+                "UI",
+                "reviewed",
+                "[]",
+                SqlValue::Null,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writer.execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at, deleted_at) \
+                      VALUES (?1, ?2, ?3, ?4, 'unrelated overview', ?5, 1, ?6, 0, 0, ?7)".into(),
+                params: vec![SqlValue::Text(format!("93000000-0000-0000-0001-{index:012}")), SqlValue::Text(ns.into()), SqlValue::Text(slug.into()), SqlValue::Text(name.into()), SqlValue::Text(tags.into()), SqlValue::Text(status.into()), deleted],
+                label: None,
+            }).await.unwrap();
+        }
+        drop(writer);
+        for (ns, query, kind, statuses, expected_state, expected_count) in [
+            (
+                "local",
+                "AI",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::Filtered,
+                0,
+            ),
+            (
+                "local",
+                "AI",
+                Some("atom"),
+                vec!["draft".to_string()],
+                LexicalCandidateState::ExactName,
+                1,
+            ),
+            (
+                "tenant-b",
+                "AI",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::ExactName,
+                1,
+            ),
+            (
+                "tenant-c",
+                "AI",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::NoMatch,
+                0,
+            ),
+            (
+                "local",
+                "ML",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::Filtered,
+                0,
+            ),
+            (
+                "local",
+                "ML",
+                Some("domain"),
+                vec![],
+                LexicalCandidateState::ExactName,
+                1,
+            ),
+            (
+                "local",
+                "ZZ",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::NoMatch,
+                0,
+            ),
+            (
+                "local",
+                "UI",
+                Some("atom"),
+                vec![],
+                LexicalCandidateState::NoMatch,
+                0,
+            ),
+        ] {
+            let outcome = fetch_fts_candidates(
+                &runtime,
+                ns,
+                query,
+                kind,
+                &statuses,
+                &["draft", "deprecated"],
+                5,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.timeout.is_none());
+            assert_eq!(
+                outcome.state, expected_state,
+                "{ns}/{query}/{kind:?}/{statuses:?}"
+            );
+            assert_eq!(outcome.atoms.len(), expected_count);
+            assert!(outcome.atoms.iter().all(|atom| atom.namespace == ns));
+        }
+    }
+
+    #[test]
+    fn fts_candidate_expression_recalls_non_contiguous_terms() {
+        assert_eq!(
+            fts5_candidate_terms("alpha beta alpha and").join(" OR "),
+            "\"alpha\" OR \"alphas\" OR \"beta\" OR \"betas\""
+        );
+        assert_eq!(
+            fts5_candidate_terms("RAG").join(" OR "),
+            "\"rag\" OR \"rags\""
+        );
+        assert_eq!(
+            fts5_candidate_terms("the and").join(" OR "),
+            "\"the and\"",
+            "stop-only queries retain the exact-phrase fallback"
+        );
+    }
+
+    #[test]
+    fn rrf_fusion_preserves_per_hit_score_sources_and_ann_fallback() {
+        let mut hybrid = vec![make_hit("shared", Some("reviewed"), 0.8)];
+        let ann = vec![make_ann_hit("shared", Some("reviewed"), 0.9)];
+        fuse_ann_hits(&mut hybrid, &ann, 0.0);
+        assert_eq!(hybrid.len(), 1);
+        assert_eq!(
+            hybrid[0].provenance.to_json()["sources"],
+            json!(["lexical", "ann"])
+        );
+        assert_eq!(candidate_fallback(&hybrid), "none");
+
+        let mut ann_only = Vec::new();
+        fuse_ann_hits(
+            &mut ann_only,
+            &[make_ann_hit("semantic", Some("reviewed"), 0.9)],
+            0.0,
+        );
+        assert_eq!(ann_only.len(), 1);
+        assert_eq!(ann_only[0].provenance.to_json()["sources"], json!(["ann"]));
+        assert_eq!(candidate_fallback(&ann_only), "ann");
+        assert_eq!(
+            ann_only[0].provenance.to_json(),
+            json!({
+                "sources": ["ann"],
+                "embedding_rerank": false,
+                "normalization": "s_over_s_plus_1",
+                "calibrated": false,
+            })
+        );
+
+        let lexical_only = vec![make_hit("lexical", Some("reviewed"), 0.7)];
+        assert_eq!(
+            lexical_only[0].provenance.to_json()["sources"],
+            json!(["lexical"])
+        );
+        assert_eq!(candidate_fallback(&lexical_only), "none");
+    }
+
+    #[tokio::test]
+    async fn embedding_rerank_provenance_is_true_when_rerank_runs() {
+        let (runtime, _, fail_query) = rt_with_role_aware_recording_embedder();
+        fail_query.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) VALUES ( \
+                              '94000000-0000-0000-0000-000000000001', 'local', \
+                              'rerank-target', 'Rerank Target', \
+                              'content that the lexical stage must match for the rerank pass', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, 1000, 1000, NULL \
+                          )"
+                    .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed rerank target atom");
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "rerank target content", "rerank": true}),
+            &ann,
+        )
+        .await
+        .expect("rerank-enabled search must not error");
+
+        assert_eq!(out["total"], 1);
+        assert_eq!(
+            out["results"][0]["score_provenance"]["embedding_rerank"], true,
+            "a successful embedding rerank must record embedding_rerank: true; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn exact_name_provenance_survives_merge_without_hiding_timeouts() {
+        use LexicalCandidateState::{ExactName, Matched, NoMatch, PartialTimeout, TimedOut};
+        for (states, expected) in [
+            (vec![NoMatch, ExactName], ExactName),
+            (vec![ExactName, Matched], Matched),
+            (vec![ExactName, TimedOut], PartialTimeout),
+            (vec![ExactName, PartialTimeout], PartialTimeout),
+        ] {
+            assert_eq!(LexicalCandidateState::merge(&states), expected);
+        }
     }
 
     #[tokio::test]

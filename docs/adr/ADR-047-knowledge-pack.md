@@ -1,11 +1,34 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-08-30c): indexed exact-name recovery for short queries
+
+A query such as `AI` has no scoreable term, and the trigram FTS tokenizer cannot match
+a phrase below three characters. When a completed lexical pass finds no match and the raw
+query contains no scoreable non-stopword term, `knowledge.search` probes the unique
+`(namespace, slug)` index using the same slug normalization as the pack's import path.
+An eligible hit reports `candidate_provenance.lexical: "exact_name"` with lexical score
+provenance. This is an exact normalized-slug lookup, not a general name index or substring
+search: an atom with a caller-chosen slug outside the import convention remains outside
+this guarantee. A role prefix affects scoring but cannot suppress the raw-query probe.
+
+The probe runs after FTS retrieval, using the same reader and remaining lexical-stage
+deadline. It retains namespace, live-row, status, and atom/domain eligibility; an existing
+ineligible slug reports `filtered`. An expired probe reports `timed_out` and the existing
+lexical degradation flags, with an internal `exact_name_probe` timing phase. It does not reset
+the stage budget, rerun a timed-out pass, or change public timeout-detail redaction. Exact-name
+hits then follow the existing fusion, score normalization, status multiplier, and final
+`min_score` gates.
+
+The probe sits downstream of the term admission bound described in the 2026-08-30b
+amendment. It consumes no admission of its own, and a pass that was refused every
+admission opens no reader, so it never reaches the probe.
 
 ## Amendment (2026-08-30b): request-wide bound on distinct FTS terms
 
@@ -391,7 +414,8 @@ Every `knowledge.search` result carries `score_provenance` with these fields:
 - `calibrated`: `false`.
 
 The response's `candidate_provenance.lexical` records the lexical candidate-stage outcome:
-`matched` for eligible candidates, `no_match` for no lexical match in the caller's namespace,
+`matched` for eligible FTS candidates, `exact_name` for indexed short-query recovery,
+`no_match` for no lexical match in the caller's namespace,
 `filtered` for matches removed by eligibility, `partial_timeout` when a timed-out fetch retains
 eligible candidates or decomposed passes mix completion and timeout, and `timed_out` when a
 fetch times out with no retained candidates (or every decomposed pass does so).
