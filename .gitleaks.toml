@@ -1,0 +1,14 @@
+title = "khive credential scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "The two non-credential keys in the cache lock serialization fixture"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^(abcdef0123456789|fedcba9876543210)$''']
+paths = ['''^crates/khive-pack-git/src/cache\.rs$''']
