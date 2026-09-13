@@ -175,6 +175,34 @@ fn sent_filter() -> NoteFilter {
     }
 }
 
+fn outbox_filter() -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".into()),
+        unordered: true,
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".into()),
+            },
+            PropertyFilter {
+                json_path: "$.delivered_at".into(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.delivery".into(),
+                op: FilterOp::NotInOrMissing(vec![
+                    SqlValue::Text("delivered".into()),
+                    SqlValue::Text("failed".into()),
+                ]),
+                value: SqlValue::Null,
+            },
+        ],
+        ..Default::default()
+    }
+}
+
 fn measure(conn: &Connection, filter: &NoteFilter) -> Value {
     let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
     params.push(Box::new(21_i64));
@@ -201,6 +229,42 @@ fn measure(conn: &Connection, filter: &NoteFilter) -> Value {
         .unwrap();
     json!({"sql":sql, "plan":plan, "ids":ids,
            "vm_steps":statement.get_status(StatementStatus::VmStep)})
+}
+
+#[test]
+fn outbox_filter_plan_has_no_temporary_ordering_btree() {
+    let result = measure(&fixture(0, 10_000), &outbox_filter());
+    let plan = result["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|detail| detail.as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_comm_message_direction")
+                || detail.contains("idx_comm_message_outbound_ref")),
+        "outbox filter must use a comm outbound candidate index, got plan: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+        "outbox filter must not materialize a temporary ordering b-tree, got plan: {plan:?}"
+    );
+}
+
+#[test]
+fn outbox_filter_work_is_bounded_by_outbound_candidates() {
+    let small = measure(&fixture(0, 0), &outbox_filter());
+    let large = measure(&fixture(0, 10_000), &outbox_filter());
+
+    assert_eq!(large["ids"], small["ids"]);
+    let small_steps = small["vm_steps"].as_i64().unwrap();
+    let large_steps = large["vm_steps"].as_i64().unwrap();
+    assert!(
+        large_steps <= small_steps + 128,
+        "inbound message growth must not add row-proportional outbox work: {small_steps} -> {large_steps}"
+    );
 }
 
 #[test]

@@ -15,8 +15,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_db::SqliteError;
-use khive_storage::note::Note;
-use khive_storage::types::{EdgeFilter, TextDocument};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::types::{EdgeFilter, PageRequest, SqlValue, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
@@ -1939,10 +1939,12 @@ impl KhiveRuntime {
 
     /// Non-wire outbox scan for the channel delivery loops.
     ///
-    /// Pages newest-first through live `message` notes (the same order and
-    /// 10k scan cap as the generic `list` verb's filtered offset path) and
-    /// returns those with `properties.direction == "outbound"` that are still
-    /// pending delivery, capped at `limit`. Pending means `delivered_at` is
+    /// Fetches live `message` notes matching the SQL-side pending predicate,
+    /// sorts that bounded candidate set newest-first, and returns those that
+    /// are still pending delivery, capped at `limit`.
+    /// Direction, `delivered_at`, and terminal `delivery` state are filtered
+    /// by SQLite; a valid `next_attempt_at` and the optional `to_actor`
+    /// channel prefix remain Rust checks. Pending means `delivered_at` is
     /// absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
@@ -1962,78 +1964,79 @@ impl KhiveRuntime {
         to_prefix: Option<&str>,
         limit: u32,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
-        const PAGE_SIZE: u32 = 200;
         const MAX_SCAN_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            unordered: true,
+            property_filters: vec![
+                PropertyFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("outbound".to_string()),
+                },
+                PropertyFilter {
+                    json_path: "$.delivered_at".to_string(),
+                    op: FilterOp::JsonTypeMissingOrNullIndexed,
+                    value: SqlValue::Null,
+                },
+                PropertyFilter {
+                    json_path: "$.delivery".to_string(),
+                    op: FilterOp::NotInOrMissing(vec![
+                        SqlValue::Text("delivered".to_string()),
+                        SqlValue::Text("failed".to_string()),
+                    ]),
+                    value: SqlValue::Null,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut candidates = self
+            .notes(token)?
+            .query_notes_filtered_count_free(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: MAX_SCAN_TOTAL,
+                    offset: 0,
+                },
+            )
+            .await?
+            .items;
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
-        let mut db_offset: u32 = 0;
-        loop {
-            let remaining_scan = MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
-            if remaining_scan == 0 {
-                break;
-            }
-            let page = self
-                .list_notes(token, Some("message"), remaining_scan, db_offset)
-                .await?;
-            let fetched = page.len() as u32;
-            for note in page {
-                if note.deleted_at.is_some() {
-                    continue;
-                }
-                let props = note.properties.as_ref().and_then(|v| v.as_object());
-                let outbound = props
-                    .and_then(|p| p.get("direction"))
+        for note in candidates {
+            let props = note.properties.as_ref().and_then(|v| v.as_object());
+            if let Some(prefix) = to_prefix {
+                let to_matches = props
+                    .and_then(|p| p.get("to_actor"))
                     .and_then(|v| v.as_str())
-                    == Some("outbound");
-                if !outbound {
+                    .is_some_and(|actor| actor.starts_with(prefix));
+                if !to_matches {
                     continue;
-                }
-                if let Some(prefix) = to_prefix {
-                    let to_matches = props
-                        .and_then(|p| p.get("to_actor"))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|actor| actor.starts_with(prefix));
-                    if !to_matches {
-                        continue;
-                    }
-                }
-                // Must match the delivery loop's terminal-state guard: a
-                // present-but-null `delivered_at` is undelivered, and a
-                // terminal `delivery` state ("delivered"/"failed") is not
-                // pending even without `delivered_at` (ADR-122 §1).
-                let delivered = props
-                    .and_then(|p| p.get("delivered_at"))
-                    .is_some_and(|v| !v.is_null());
-                if delivered {
-                    continue;
-                }
-                let terminal = props
-                    .and_then(|p| p.get("delivery"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|state| state == "delivered" || state == "failed");
-                if terminal {
-                    continue;
-                }
-                let retry_deferred = props
-                    .and_then(|p| p.get("next_attempt_at"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                    .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
-                if retry_deferred {
-                    continue;
-                }
-                collected.push(note);
-                if collected.len() >= limit as usize {
-                    return Ok(collected);
                 }
             }
-            if fetched < PAGE_SIZE {
-                break;
+            let retry_deferred = props
+                .and_then(|p| p.get("next_attempt_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
+            if retry_deferred {
+                continue;
             }
-            db_offset += fetched;
+            collected.push(note);
+            if collected.len() >= limit as usize {
+                return Ok(collected);
+            }
         }
         Ok(collected)
     }
@@ -4386,6 +4389,183 @@ mod tests {
             .await
             .expect("zero-limit scan succeeds");
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    fn legacy_outbox_pending(note: &Note, to_prefix: Option<&str>, now_micros: i64) -> bool {
+        if note.deleted_at.is_some() {
+            return false;
+        }
+        let props = note.properties.as_ref().and_then(|value| value.as_object());
+        if props
+            .and_then(|properties| properties.get("direction"))
+            .and_then(Value::as_str)
+            != Some("outbound")
+        {
+            return false;
+        }
+        if let Some(prefix) = to_prefix {
+            let matches = props
+                .and_then(|properties| properties.get("to_actor"))
+                .and_then(Value::as_str)
+                .is_some_and(|actor| actor.starts_with(prefix));
+            if !matches {
+                return false;
+            }
+        }
+        if props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null())
+        {
+            return false;
+        }
+        if props
+            .and_then(|properties| properties.get("delivery"))
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "delivered" || state == "failed")
+        {
+            return false;
+        }
+        let retry_deferred = props
+            .and_then(|properties| properties.get("next_attempt_at"))
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
+        !retry_deferred
+    }
+
+    /// The SQL-prefiltered scan must return exactly what the former full-note
+    /// scan selected, including every legacy and channel-partition edge case.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_matches_legacy_predicate() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let make_note = |created_at, properties, deleted_at| {
+            let mut note = Note::new("local", "message", "outbox fixture");
+            note.created_at = created_at;
+            note.updated_at = created_at;
+            note.properties = Some(properties);
+            note.deleted_at = deleted_at;
+            note
+        };
+        let notes = vec![
+            make_note(
+                110,
+                serde_json::json!({"direction": "outbound", "to_actor": "email:absent"}),
+                None,
+            ),
+            make_note(
+                109,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:null",
+                    "delivered_at": null
+                }),
+                None,
+            ),
+            make_note(
+                108,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:terminal-failed",
+                    "delivery": "failed"
+                }),
+                None,
+            ),
+            make_note(
+                107,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:terminal-delivered",
+                    "delivery": "delivered"
+                }),
+                None,
+            ),
+            make_note(
+                106,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:malformed",
+                    "next_attempt_at": "not-a-timestamp"
+                }),
+                None,
+            ),
+            make_note(
+                105,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:future",
+                    "next_attempt_at": "2999-01-01T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                104,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:due",
+                    "next_attempt_at": "2000-01-01T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                103,
+                serde_json::json!({"direction": "inbound", "to_actor": "email:inbound"}),
+                None,
+            ),
+            make_note(
+                102,
+                serde_json::json!({"direction": "outbound", "to_actor": "telegram:other"}),
+                None,
+            ),
+            make_note(
+                101,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:already-delivered",
+                    "delivered_at": "2026-08-28T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                100,
+                serde_json::json!({"direction": "outbound", "to_actor": "email:deleted"}),
+                Some(100),
+            ),
+        ];
+        for note in &notes {
+            store.upsert_note(note.clone()).await.expect("seed note");
+        }
+
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let all_rows = rt
+            .list_notes(&tok, Some("message"), 200, 0)
+            .await
+            .expect("legacy scan fixture loads");
+        let expected_ids: Vec<_> = all_rows
+            .iter()
+            .filter(|note| legacy_outbox_pending(note, Some("email:"), now_micros))
+            .map(|note| note.id)
+            .collect();
+        let actual_ids: Vec<_> = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 200)
+            .await
+            .expect("filtered scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+
+        assert_eq!(
+            expected_ids.len(),
+            4,
+            "fixture must exercise all exclusions"
+        );
+        assert_eq!(
+            actual_ids, expected_ids,
+            "filtered scan changed answer or order"
+        );
     }
 
     #[tokio::test]
