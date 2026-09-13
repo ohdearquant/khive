@@ -473,7 +473,7 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
-                    tokio::task::spawn(async move {
+                    khive_runtime::track_background_task(async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
                             tracing::error!(
@@ -495,7 +495,7 @@ fn spawn_email_channel_loops(
                 if admission.outbound_delivery {
                     match runtime_outbox {
                         Some(rt) => {
-                            tokio::task::spawn(channel_outbox_loop(
+                            khive_runtime::track_background_task(channel_outbox_loop(
                                 email_ch_clone,
                                 rt,
                                 ingest_ns_outbox,
@@ -837,6 +837,25 @@ async fn handle_channel_ingest_failure(
     }
 }
 
+/// Wait `interval` between channel-loop cycles, unless daemon shutdown fires
+/// first. Returns `false` when the daemon is shutting down, which is the
+/// caller's signal to leave its loop.
+///
+/// The wait is the only cancellation point on purpose: a channel cycle issues
+/// verbs against the store, so dropping one mid-flight would abandon a cursor
+/// read or an ingest partway. Between cycles there is nothing in flight, so
+/// the loop ends where a restart costs at most one re-poll.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn channel_cycle_wait(
+    interval: std::time::Duration,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = tokio::time::sleep(interval) => true,
+    }
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -903,9 +922,13 @@ async fn channel_poll_loop(
     // channel is first seen on -- uses this single startup timestamp
     // instead of that tick's own `now`.
     let startup_since = Utc::now();
+    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
-        tokio::time::sleep(next_interval).await;
+        if !channel_cycle_wait(next_interval, &shutdown).await {
+            tracing::info!("email channel polling loop: daemon shutdown observed, stopping");
+            return;
+        }
         next_interval = CHANNEL_POLL_INTERVAL;
 
         let now = Utc::now();
@@ -1467,8 +1490,13 @@ async fn channel_outbox_loop(
         }
     };
 
+    let shutdown = khive_runtime::daemon_shutdown_token();
+
     loop {
-        tokio::time::sleep(OUTBOUND_RETRY_BASE).await;
+        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
+            tracing::info!("email channel outbox loop: daemon shutdown observed, stopping");
+            return;
+        }
         let stop = channel_outbox_once(
             email_channel.as_ref(),
             &runtime,
@@ -1795,7 +1823,7 @@ fn spawn_telegram_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
-                    tokio::task::spawn(async move {
+                    khive_runtime::track_background_task(async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
                             tracing::error!(
@@ -1811,7 +1839,7 @@ fn spawn_telegram_channel_loops(
                 if admission.outbound_delivery {
                     match outbox_runtime {
                         Some(rt) => {
-                            tokio::task::spawn(telegram_outbox_loop(
+                            khive_runtime::track_background_task(telegram_outbox_loop(
                                 tg_ch_outbox,
                                 rt,
                                 ingest_ns_outbox,
@@ -1885,8 +1913,15 @@ async fn telegram_poll_loop(
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
     let mut unknown_ingest_attempts = std::collections::HashMap::<String, u8>::new();
+    let shutdown = khive_runtime::daemon_shutdown_token();
 
     loop {
+        // This loop polls before it waits, so shutdown is read at the top as
+        // well as inside the error backoff below.
+        if shutdown.is_cancelled() {
+            tracing::info!("telegram channel polling loop: daemon shutdown observed, stopping");
+            return;
+        }
         match telegram_channel.poll(Utc::now()).await {
             Ok(envelopes) => {
                 let kind = telegram_channel.kind();
@@ -1942,7 +1977,12 @@ async fn telegram_poll_loop(
                     channel = telegram_channel.kind(),
                     "telegram channel poll failed: {e}"
                 );
-                tokio::time::sleep(ERROR_BACKOFF).await;
+                if !channel_cycle_wait(ERROR_BACKOFF, &shutdown).await {
+                    tracing::info!(
+                        "telegram channel polling loop: daemon shutdown observed, stopping"
+                    );
+                    return;
+                }
             }
         }
     }
@@ -1970,8 +2010,13 @@ async fn telegram_outbox_loop(
         }
     };
 
+    let shutdown = khive_runtime::daemon_shutdown_token();
+
     loop {
-        tokio::time::sleep(OUTBOUND_RETRY_BASE).await;
+        if !channel_cycle_wait(OUTBOUND_RETRY_BASE, &shutdown).await {
+            tracing::info!("telegram channel outbox loop: daemon shutdown observed, stopping");
+            return;
+        }
         telegram_outbox_once(telegram_channel.as_ref(), &runtime, &namespace).await;
     }
 }
@@ -13696,6 +13741,40 @@ backend = "kg-backend"
             "the guard must await sweep shutdown before returning on the \
              transport-resolution error path — an unawaited (dropped) handle \
              leaves this flag unset at the moment the guard returns"
+        );
+    }
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[tokio::test]
+    async fn channel_cycle_wait_reports_shutdown_instead_of_finishing_its_interval() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+        // The interval outlasts the cancellation by minutes, so a wait that
+        // does not read the token cannot return inside this bound: the arm
+        // fails on the timeout rather than hanging the suite.
+        let ran_a_full_interval = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            channel_cycle_wait(std::time::Duration::from_secs(300), &token),
+        )
+        .await
+        .expect("shutdown must end the wait, well inside the daemon's drain window");
+        assert!(
+            !ran_a_full_interval,
+            "a cancelled token must report shutdown so the loop stops, not a completed interval"
+        );
+    }
+
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[tokio::test]
+    async fn channel_cycle_wait_completes_its_interval_while_the_daemon_runs() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            channel_cycle_wait(std::time::Duration::from_millis(10), &token).await,
+            "an uncancelled wait must complete its interval and keep the loop polling"
         );
     }
 }
