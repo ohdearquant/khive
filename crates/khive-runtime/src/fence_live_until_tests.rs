@@ -425,12 +425,27 @@ struct LabelTrace {
     labels: Vec<String>,
     deadline: String,
     version: i64,
+    holder: uuid::Uuid,
 }
 
 #[async_trait]
 impl SqlReader for LabelTrace {
-    async fn query_row(&mut self, _: SqlStatement) -> StorageResult<Option<SqlRow>> {
-        unreachable!("the fence guard reads scalars")
+    async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+        let label = statement.label.clone().unwrap_or_default();
+        self.labels.push(label.clone());
+        assert_eq!(label, "note-write-guard", "unexpected labelled row read");
+        Ok(Some(SqlRow {
+            columns: vec![
+                khive_storage::types::SqlColumn {
+                    name: "id".into(),
+                    value: SqlValue::Text(self.holder.to_string()),
+                },
+                khive_storage::types::SqlColumn {
+                    name: "version".into(),
+                    value: SqlValue::Integer(self.version),
+                },
+            ],
+        }))
     }
     async fn query_all(&mut self, _: SqlStatement) -> StorageResult<Vec<SqlRow>> {
         unreachable!("the fence guard reads scalars")
@@ -439,7 +454,6 @@ impl SqlReader for LabelTrace {
         let label = statement.label.clone().unwrap_or_default();
         self.labels.push(label.clone());
         Ok(Some(match label.as_str() {
-            "note-write-guard" => SqlValue::Integer(self.version),
             "note-write-guard-clock" => SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
             "note-write-guard-live-until" => {
                 SqlValue::Text(json!({"expires_at": self.deadline}).to_string())
@@ -471,6 +485,7 @@ fn entry(key: &str, live_until: Option<&str>) -> NoteFence {
         kind: "head".into(),
         expected_version: Some(1),
         live_until: live_until.map(Into::into),
+        id: None,
     }
 }
 
@@ -507,6 +522,7 @@ async fn fence_live_until_arm7_two_deadline_entries_read_one_clock() {
             labels: vec![],
             deadline: live(),
             version: 1,
+            holder: uuid::Uuid::nil(),
         };
         assert!(
             guard.check_fence(&mut trace).await.unwrap().is_none(),
@@ -591,6 +607,7 @@ async fn fence_live_until_arm8_a_creation_is_fenced_too_and_the_object_form_has_
         kind: "head".into(),
         expected_version: Some(1),
         live_until: Some("expires_at".into()),
+        id: None,
     });
     let error = fenced_create(&runtime, &token, "created/refused", object.clone())
         .await
@@ -648,6 +665,7 @@ async fn fence_live_until_arm8_a_creation_is_fenced_too_and_the_object_form_has_
             kind: "head".into(),
             expected_version: Some(1),
             live_until: Some("expires_at".into()),
+            id: None,
         }),
     )
     .await

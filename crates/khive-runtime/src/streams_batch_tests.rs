@@ -803,6 +803,7 @@ async fn stream_batch_fence_rechecks_after_writer_admission() {
             kind: "head".into(),
             expected_version: Some(1),
             live_until: None,
+            id: None,
         }),
         vec![],
     )
@@ -883,12 +884,14 @@ async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission
                             kind: "head".into(),
                             expected_version: Some(1),
                             live_until: None,
+                            id: None,
                         },
                         NoteFence {
                             key: "renewed".into(),
                             kind: "head".into(),
                             expected_version: Some(1),
                             live_until: None,
+                            id: None,
                         },
                     ],
                 ),
@@ -948,12 +951,13 @@ struct TraceAccess(Arc<Mutex<Vec<SqlStatement>>>);
 #[async_trait]
 impl SqlReader for TraceAccess {
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
-        // Both trace arms share this reader: the observed check reads the holder row, and the
-        // write member reads its own write time. Either label is expected; anything else is not.
+        // Three trace arms share this reader: the observed check reads the holder row, a member
+        // fence reads the same row through the note-write guard, and the write member reads its
+        // own write time. Those labels are expected; anything else is not.
         assert!(
             matches!(
                 statement.label.as_deref(),
-                Some("stream-batch-observed" | "stream-batch-write-time")
+                Some("stream-batch-observed" | "stream-batch-write-time" | "note-write-guard")
             ),
             "unexpected labelled row read: {:?}",
             statement.label
@@ -1226,12 +1230,14 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
                                 kind: "head".into(),
                                 expected_version: Some(1),
                                 live_until: None,
+                                id: None,
                             },
                             NoteFence {
                                 key: "second".into(),
                                 kind: "head".into(),
                                 expected_version: Some(if stale { 2 } else { 1 }),
                                 live_until: None,
+                                id: None,
                             },
                         ],
                     ),
@@ -1257,7 +1263,7 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
             .enumerate()
             .filter(|(_, s)| {
                 s.label.as_deref() == Some("note-write-guard")
-                    && s.sql.starts_with("SELECT version")
+                    && s.sql.starts_with("SELECT id, version")
             })
             .collect();
         assert_eq!(checks.len(), 2, "each append-member fence checked once");
