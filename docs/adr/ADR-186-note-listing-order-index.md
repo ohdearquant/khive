@@ -62,7 +62,13 @@ transient-b-tree workload on the serving process.
 
 ## Decision
 
-**Add one index, in a new migration:**
+**This index is not safe to add on its own.** On a store without statistics it takes the comm
+recipient seeks' plan, and the record says so here rather than in a footnote, because the first
+implementation of this decision went red for exactly that reason. The index below is the right shape
+and it is deferred behind the plan-pinning work named at the end of this section. The measured cost
+this ADR was written for is resolved meanwhile by fixing the caller, not by the schema.
+
+**The index, when it can be added:**
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_notes_namespace_created
@@ -70,7 +76,52 @@ CREATE INDEX IF NOT EXISTS idx_notes_namespace_created
     WHERE deleted_at IS NULL;
 ```
 
-One, not two. The kind-bearing variant is faster for a kind-filtered page, 245 steps against 1,929,
+### What the first implementation measured
+
+The migration was written exactly as stated, declared with the generic note indexes ahead of the comm
+block. Three of the six `comm_filter_plan_tests` went red on one assertion, the unread inbox query
+planning as
+
+```
+SEARCH notes USING INDEX idx_notes_namespace_created (namespace=?)
+```
+
+instead of `idx_notes_unread_probe_recipient_direction`. The three are the fresh-bootstrap arm, the
+fresh half of the recreated-unread arm, and the arm whose purpose is that unread work stays bounded as
+other mailboxes grow. The pre-analyzed-upgrade arm passed.
+
+So the boundary is statistics, not catalog order. The kind-bearing variant was tried on the chance
+that sharing the comm indexes' `(namespace, kind)` prefix would keep the cost comparison honest; it
+fails identically with the plan reading `(namespace=? AND kind=?)`. What the regression costs is this
+ADR's own defect moved to another query: an unread listing for a recipient with nothing unread would
+walk the namespace's whole message history newest-first rather than touching only that recipient's
+unread inbound rows.
+
+### What happens instead, and in what order
+
+1. **The caller is fixed first.** The outbox loop's pending-delivery predicate moves into the
+   statement, so the loop stops issuing the unindexed listing fifty times every five seconds. That
+   resolves the measured CPU cost without a schema change, and its acceptance is plan-shaped: no
+   temporary b-tree in the outbox statement's plan, plus the duty-cycle before and after on the same
+   daemon instrument once the binary serves it.
+2. **Plan pinning is its own record and its own lane.** khive compiles the comm filter SQL itself, so
+   the recipient and unread seeks can carry `INDEXED BY` when the predicate shape matches. That
+   removes the whole class rather than this one instance: today it is this index, tomorrow it is
+   anyone's.
+3. **Only then** may a general listing index be added, as a follow-on to this record rather than on
+   its own.
+
+A maintenance job that runs `ANALYZE` was considered as a way to guarantee statistics and is
+**rejected**: a plan whose correctness depends on `sqlite_stat1` being present makes a maintenance
+task a correctness precondition, and the hazard this ADR documents is precisely the store that has not
+analyzed yet.
+
+This record stays **proposed** until the pinning lane exists.
+
+### One index, not two
+
+That part of the decision is unchanged by the above, and it is what the index should be whenever it is
+added. One, not two. The kind-bearing variant is faster for a kind-filtered page, 245 steps against 1,929,
 but every index on `notes` is paid for on every note insert and `notes` is the table a serving process
 writes most. 1,684 VM steps on a read that already dropped from 117,107 does not buy a second b-tree
 on that table. If a future measurement shows a kind-filtered listing dominating some deployment's
@@ -89,9 +140,12 @@ recorded because schema changes are recorded.
   later deployment can reopen it.
 - **Make the statement selective instead.** The outbox scan reads up to 10,000 rows every 5 seconds to
   find, almost always, nothing pending, because its predicate (outbound direction, no `delivered_at`,
-  no terminal delivery state, `next_attempt_at` due) runs in Rust rather than in SQL. That is the
-  larger inefficiency and this ADR does not address it. It is a query-shape change with its own
-  correctness surface, and pushing it into a schema change would hide it. It is filed separately.
+  no terminal delivery state, `next_attempt_at` due) runs in Rust rather than in SQL. It was filed
+  separately as a query-shape change with its own correctness surface, on the reasoning that pushing it
+  into a schema change would hide it. **It is now the first thing that lands**, for the reason given
+  under the Decision: it resolves the measured cost without touching the schema, and the schema change
+  turned out to carry a regression that needs its own lane first. The reasoning for separating it was
+  right and the ordering it implied was wrong.
 - **Select fewer columns before the page is chosen.** The sorter is expensive partly because it
   carries `content` and `properties`. Selecting ids first and hydrating the page would shrink it
   without any index. It is a real option, it changes the store's read path rather than its schema,
