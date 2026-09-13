@@ -1,7 +1,8 @@
 //! Vocabulary, schema plan and handler table for the tool pack.
 
 use khive_types::{
-    EntityKind, EntityTypeDef, HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility,
+    EntityKind, EntityTypeDef, HandlerDef, IdResolutionMode, PackColumnAddition,
+    PackColumnAffinity, ParamDef, VerbCategory, Visibility,
 };
 
 /// Canonical pack name; every verb is `tool.<name>`.
@@ -62,33 +63,36 @@ pub static ENTITY_TYPES: [EntityTypeDef; 4] = [
 ];
 
 /// Pack-owned tables, applied idempotently at boot.
-pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 4] = [
-    "CREATE TABLE IF NOT EXISTS tool_policy (\
-        id         TEXT PRIMARY KEY,\
-        namespace  TEXT NOT NULL,\
-        actor      TEXT NOT NULL,\
-        tool       TEXT NOT NULL,\
-        decision   TEXT NOT NULL,\
-        note       TEXT,\
-        created_at INTEGER NOT NULL,\
-        created_by TEXT\
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_tool_policy_lookup ON tool_policy(namespace, actor, tool)",
-    "CREATE TABLE IF NOT EXISTS tool_grants (\
-        id            TEXT PRIMARY KEY,\
-        namespace     TEXT NOT NULL,\
-        actor         TEXT NOT NULL,\
-        tool          TEXT NOT NULL,\
-        scope         TEXT,\
-        reason        TEXT,\
-        status        TEXT NOT NULL,\
-        requested_at  INTEGER NOT NULL,\
-        decided_at    INTEGER,\
-        decided_by    TEXT,\
-        expires_at    INTEGER,\
-        decision_note TEXT\
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_tool_grants_lookup ON tool_grants(namespace, actor, tool, status)",
+pub static TOOL_SCHEMA_PLAN_STMTS: [&str; 5] = [
+    include_str!("../sql/000-policy.sql"),
+    include_str!("../sql/001-policy-index.sql"),
+    include_str!("../sql/002-grants.sql"),
+    include_str!("../sql/003-grants-index.sql"),
+    include_str!("../sql/grant-invalidation.sql"),
+];
+
+/// Legacy grant rows have no evidence of an approved registry definition.
+pub static TOOL_SCHEMA_COLUMN_ADDITIONS: [PackColumnAddition; 4] = [
+    PackColumnAddition {
+        table: "tool_grants",
+        column: "registry_id",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "tool_grants",
+        column: "definition_digest",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "tool_grants",
+        column: "invalidated_by_registry_id",
+        affinity: PackColumnAffinity::Text,
+    },
+    PackColumnAddition {
+        table: "tool_grants",
+        column: "invalidated_at",
+        affinity: PackColumnAffinity::Integer,
+    },
 ];
 
 const P_NAMESPACE: ParamDef = ParamDef {

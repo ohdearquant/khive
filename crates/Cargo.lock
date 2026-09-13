@@ -2529,8 +2529,10 @@ name = "khive-pack-tool"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "inventory",
+ "khive-db",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",

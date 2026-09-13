@@ -15,6 +15,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use khive_pack_tool::policy::{actor_label, decide};
+use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
@@ -587,6 +588,38 @@ struct Ready {
     entries: Vec<TreeEntry>,
 }
 
+fn preflight_registry_pin(entity: &khive_storage::Entity) -> Result<RegistryPin, RuntimeError> {
+    let bytes =
+        khive_types::canonical_json_bytes(&registry_policy_inputs(entity)).map_err(|error| {
+            RuntimeError::Internal(format!("tool definition serialization: {error}"))
+        })?;
+    Ok(RegistryPin::from_canonical_bytes(entity.id, bytes))
+}
+
+async fn preflight_policy(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    actor: &str,
+    entity: &khive_storage::Entity,
+) -> Result<khive_pack_tool::policy::Decision, RuntimeError> {
+    // Bind authorization to the same snapshot that supplied the executable.
+    let pin = preflight_registry_pin(entity)?;
+    let side_effect = entity
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("side_effect"))
+        .and_then(Value::as_str);
+    decide(
+        rt,
+        token.namespace().as_str(),
+        actor,
+        &entity.name,
+        side_effect,
+        Some(&pin),
+    )
+    .await
+}
+
 /// Every rule that refuses before the disk is touched. `Err(reason)` is the
 /// refusal reason; the receipt is filled with whatever was decided so far.
 async fn preflight(
@@ -616,20 +649,9 @@ async fn preflight(
         .chain(req.args.iter().cloned())
         .collect();
     // Policy.
-    let side_effect = serde_json::to_value(&entity.properties).ok().and_then(|p| {
-        p.get("side_effect")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    let decision = decide(
-        rt,
-        token.namespace().as_str(),
-        &req.actor,
-        &entity.name,
-        side_effect.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("policy evaluation failed: {e}"))?;
+    let decision = preflight_policy(rt, token, &req.actor, &entity)
+        .await
+        .map_err(|e| format!("policy evaluation failed: {e}"))?;
     let decision_json = json!({
         "decision": decision.decision,
         "source": decision.source,
@@ -1164,6 +1186,10 @@ fn read_limit_report(reader: libc::c_int) -> Value {
     let _ = file.read_to_string(&mut text);
     serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
 }
+
+#[cfg(all(test, unix))]
+#[path = "grant_pin_tests.rs"]
+mod grant_pin_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

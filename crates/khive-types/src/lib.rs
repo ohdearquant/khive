@@ -13,6 +13,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod agent;
+#[cfg(feature = "serde")]
+pub mod canonical_json;
 pub mod edge;
 pub mod entity;
 pub mod entity_type;
@@ -31,6 +33,8 @@ pub mod timestamp;
 pub mod vector;
 
 pub use agent::{AgentRecord, AgentState, TerminalReason};
+#[cfg(feature = "serde")]
+pub use canonical_json::canonical_json_bytes;
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
 pub use entity_type::{
@@ -59,8 +63,8 @@ pub use note::{Note, NoteStatus};
 pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteKindSpec, NoteLifecycleSpec,
-    Pack, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
-    RESERVED_ENVELOPE_ARGS,
+    Pack, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};

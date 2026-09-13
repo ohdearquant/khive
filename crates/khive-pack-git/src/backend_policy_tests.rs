@@ -11,7 +11,6 @@ use khive_runtime::engine_config::{GitWriteEntryConfig, GitWriteSectionConfig};
 use khive_runtime::{
     KhiveRuntime, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::types::SqlStatement;
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -21,19 +20,12 @@ use crate::GitPack;
 const NAMESPACE: &str = "backend-policy-tenant";
 const BAKED_ACTOR: &str = "backend-policy-daemon";
 
-async fn apply_pack_schema<P: Pack>(runtime: &KhiveRuntime) {
+fn apply_pack_schema<P: Pack>(runtime: &KhiveRuntime) {
     if let Some(plan) = P::SCHEMA_PLAN {
-        let mut writer = runtime.sql().writer().await.expect("schema writer");
-        for statement in plan.statements {
-            writer
-                .execute(SqlStatement {
-                    sql: (*statement).to_string(),
-                    params: vec![],
-                    label: Some(format!("{}_backend_policy_test_schema", plan.pack)),
-                })
-                .await
-                .expect("pack-owned schema on its assigned backend");
-        }
+        runtime
+            .backend()
+            .apply_pack_ddl_statements_with_columns(plan.statements, P::SCHEMA_COLUMN_ADDITIONS)
+            .expect("pack-owned schema on its assigned backend");
     }
 }
 
@@ -140,12 +132,12 @@ async fn authoritative_tool_backend_case(stale_decision: &str, current_decision:
         },
     );
     let tool_runtime = file_runtime(&directory.path().join("tool.db"), Default::default());
-    apply_pack_schema::<KgPack>(&core_runtime).await;
-    apply_pack_schema::<GitPack>(&git_runtime).await;
-    apply_pack_schema::<ToolPack>(&tool_runtime).await;
+    apply_pack_schema::<KgPack>(&core_runtime);
+    apply_pack_schema::<GitPack>(&git_runtime);
+    apply_pack_schema::<ToolPack>(&tool_runtime);
     // Simulate a tool backend migration that left old tables behind. Use the
     // pack's actual schema and handler, not a hand-written policy row or DDL.
-    apply_pack_schema::<ToolPack>(&git_runtime).await;
+    apply_pack_schema::<ToolPack>(&git_runtime);
     let stale_registry = registry(&core_runtime, &git_runtime, None);
     let registry = registry(&core_runtime, &tool_runtime, Some(&git_runtime));
     let stale_id = seed_policy(&stale_registry, &identity, &actor, stale_decision).await;
