@@ -8586,7 +8586,7 @@ mod tests {
 
         let rt = rt();
         let tok = NamespaceToken::local();
-        let (into, _) = create_keyed_memory(
+        let (into, _, _) = create_keyed_memory(
             &rt,
             &tok,
             KeyedMemorySpec {
