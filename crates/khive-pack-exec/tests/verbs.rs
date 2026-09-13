@@ -8,7 +8,10 @@ use khive_pack_exec::ExecPack;
 use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
 use khive_runtime::engine_config::{ExecLimitsConfig, ExecSectionConfig};
-use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    runtime_error_value, DomainDisposition, KhiveRuntime, RuntimeConfig, VerbRegistry,
+    VerbRegistryBuilder,
+};
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -746,6 +749,90 @@ async fn refusals_write_receipts_and_touch_no_disk() {
     let events = f.call("exec.events", json!({})).await;
     assert_eq!(events["count"], 0, "refusals write no execution events");
     assert!(root_is_empty(&f));
+}
+
+/// A consumer of a refused `exec.run` must be able to reach the durable receipt
+/// without a regular expression over the refusal sentence. The wording of that
+/// sentence is not a contract; `receipt_id` on the error envelope is.
+#[tokio::test]
+async fn a_refused_run_names_its_receipt_in_the_envelope_not_only_in_the_message() {
+    let f = fixture();
+    let tree = f.tree(&[]).await;
+    let error = f
+        .registry
+        .dispatch(
+            "exec.run",
+            json!({ "tree": tree, "tool": "nope", "args": [], "actor": "local" }),
+        )
+        .await
+        .expect_err("an unregistered tool is refused");
+    // `Unknown` is what the dispatch boundary hands in for a call whose write
+    // state it cannot decide. A receipt-bearing refusal decides it.
+    let value = runtime_error_value(error, DomainDisposition::Unknown);
+
+    assert_eq!(value["code"], "exec_refused");
+    assert_eq!(value["domain_disposition"], "not_committed");
+    let receipt_id = value["receipt_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal envelope carries no receipt_id: {value}"))
+        .to_string();
+
+    // The field names a row that exists and records the refusal, not just any id.
+    let receipt = f
+        .call("exec.receipt", json!({ "id": receipt_id.clone() }))
+        .await;
+    assert_eq!(receipt["id"], receipt_id);
+    assert_eq!(receipt["denied"], true);
+    assert!(receipt["exit_code"].is_null(), "nothing ran: {receipt}");
+
+    // And it is the same id the sentence carries, so a consumer moving off the
+    // regular expression onto the field reads the same receipt, not a second one.
+    let from_message = value["message"]
+        .as_str()
+        .expect("message")
+        .split("receipt_id=")
+        .nth(1)
+        .expect("the existing wording is unchanged")
+        .trim_end_matches(')')
+        .to_string();
+    assert_eq!(from_message, receipt_id);
+}
+
+/// The control for the arm above: a refusal that writes no receipt must not
+/// grow the field. Without it, stamping `receipt_id` on every exec error would
+/// pass, and a consumer would trust an id that names nothing.
+#[tokio::test]
+async fn an_exec_error_that_wrote_no_receipt_carries_no_receipt_id() {
+    let f = fixture();
+    // A missing `tool` fails in parsing, before an actor is known and before any
+    // receipt is minted; handlers::run treats that as plain invalid input.
+    let error = f
+        .registry
+        .dispatch("exec.run", json!({ "args": [], "actor": "local" }))
+        .await
+        .expect_err("a request with no tree or tool is rejected");
+    let value = runtime_error_value(error, DomainDisposition::Unknown);
+
+    assert!(
+        value.get("receipt_id").is_none(),
+        "an error with no durable receipt named one: {value}"
+    );
+    let runs = f.call("exec.runs", json!({ "actor": "local" })).await;
+    assert_eq!(runs["count"], 0, "no receipt was written: {runs}");
+
+    // The zero above is only a finding if this reader can see a receipt at all,
+    // so make one through the same listing in the same test: an unregistered
+    // tool refuses after the actor is known and writes its row.
+    let tree = f.tree(&[]).await;
+    f.registry
+        .dispatch(
+            "exec.run",
+            json!({ "tree": tree, "tool": "nope", "args": [], "actor": "local" }),
+        )
+        .await
+        .expect_err("an unregistered tool is refused");
+    let runs = f.call("exec.runs", json!({ "actor": "local" })).await;
+    assert_eq!(runs["count"], 1, "the control must move the count: {runs}");
 }
 
 #[tokio::test]

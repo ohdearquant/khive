@@ -22,6 +22,9 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         // shared predicate rather than by a reason string so the two consumers of that
         // predicate and this projection cannot drift into disagreeing about it.
         error if error.is_stream_policy_refusal() => Some("not_committed"),
+        // A refusal that wrote a receipt is a definite no-write of the thing it
+        // refused: the receipt exists precisely to record that nothing ran.
+        RuntimeError::RefusedWithReceipt { .. } => Some("not_committed"),
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
             (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
                 Some("not_committed")
@@ -69,6 +72,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "reason": reason,
             "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
             "audit_outcome": receipt.audit_outcome.wire_code(),
+        }),
+        RuntimeError::RefusedWithReceipt {
+            code,
+            message,
+            receipt_id,
+        } => json!({
+            "kind": "runtime_error",
+            "code": code,
+            "message": message,
+            "receipt_id": receipt_id,
         }),
         RuntimeError::AuditObligation {
             failure,
@@ -245,6 +258,49 @@ mod tests {
             runtime_error_value(denied, DomainDisposition::NotCommitted),
             expected
         );
+    }
+
+    /// A refusal that wrote a durable receipt must name it as its own field.
+    /// The consumer contract is `error.receipt_id`, not a substring of the
+    /// sentence: the sentence is free to be reworded and a regular expression
+    /// over it breaks without failing anything.
+    #[test]
+    fn a_refusal_receipt_id_is_a_field_and_not_only_a_substring_of_the_message() {
+        let error = RuntimeError::RefusedWithReceipt {
+            code: "exec_refused",
+            message: "exec.run refused: tool not registered (receipt_id=r-1)".into(),
+            receipt_id: "r-1".into(),
+        };
+
+        // Disposition is deliberately the wrong one on the way in: a receipt-bearing
+        // refusal establishes its own no-write, so the boundary's guess is overridden.
+        let value = runtime_error_value(error, DomainDisposition::Unknown);
+
+        assert_eq!(value["receipt_id"], "r-1");
+        assert_eq!(value["code"], "exec_refused");
+        assert_eq!(value["kind"], "runtime_error");
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(
+            value["message"], "exec.run refused: tool not registered (receipt_id=r-1)",
+            "the existing wording is kept so a reader that parses it today keeps working"
+        );
+    }
+
+    /// The control for the arm above: a refusal carrying no receipt is a
+    /// different error entirely and must not grow a `receipt_id`. Without this,
+    /// an implementation that stamped the field unconditionally would pass.
+    #[test]
+    fn an_ordinary_invalid_input_has_no_receipt_id() {
+        let value = runtime_error_value(
+            RuntimeError::InvalidInput("exec.run refused: tool not registered".into()),
+            DomainDisposition::Unknown,
+        );
+
+        assert!(
+            value.get("receipt_id").is_none(),
+            "an error with no durable receipt must not name one: {value}"
+        );
+        assert_eq!(value["domain_disposition"], "unknown");
     }
 
     #[test]

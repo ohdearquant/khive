@@ -504,7 +504,14 @@ fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
 }
 
 fn refusal_error(reason: &str, id: &str) -> RuntimeError {
-    RuntimeError::InvalidInput(format!("exec.run refused: {reason} (receipt_id={id})"))
+    RuntimeError::RefusedWithReceipt {
+        code: "exec_refused",
+        // Unchanged wording: the id stays inside the sentence for readers that
+        // already parse it, and rides beside it as `receipt_id` for readers that
+        // should not have to.
+        message: format!("exec.run refused: {reason} (receipt_id={id})"),
+        receipt_id: id.to_string(),
+    }
 }
 
 pub async fn run(
