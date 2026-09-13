@@ -724,3 +724,49 @@ contract.
 - Schedule drain tests prove creator-bound gate evaluation and legacy generic fail-closed
   behavior; schedule-pack tests prove both creation verbs persist the creator.
 - Existing multi-backend and CAS regressions remain the routing and state-machine fences.
+
+## Amendment 5: Transport channel loops join the shutdown handoff (2026-09-13)
+
+### Context
+
+The base decision names the email ingest loops as work that is hand-spawned and shares no
+lifecycle contract. They are still spawned inline by the serve entrypoints rather than
+registered as components, and until now they were started with a bare task spawn and read no
+cancellation signal at all. Two consequences followed. `drain()` could not see them, because it
+counts only tasks registered through `track_background_task`, so a shutting-down daemon reported
+a background population that excluded every channel loop. And the loops kept issuing verbs while
+the store was closing underneath them, which surfaces as audit-obligation write failures in the
+log of a daemon that is on its way out.
+
+### Decision
+
+The four transport channel loops (email poll, email outbox, telegram poll, telegram outbox) are
+spawned through `track_background_task` and observe a cancellation token handed to them at the
+spawn site. The daemon start path passes `daemon_shutdown_token()`, the same way the component
+supervisor start path already does; a loop never reads that singleton itself. The singleton is
+cancelled exactly once per process, and this crate's own test binary runs an in-process daemon
+whose shutdown cancels it for every later test in that process, so a loop that reaches for it
+directly returns before its first cycle in any test that runs after one of those. Taking the token
+as a parameter leaves the production wiring identical and makes a loop's shutdown observable in a
+test that owns the token it cancels.
+
+Cancellation is read between cycles and never inside one. A cycle issues verbs against the store,
+so dropping one mid-flight would abandon a cursor read or an ingest partway; stopping between
+cycles costs at most one re-poll on the next start. The two halves ship together on purpose:
+tracking an uncancellable infinite loop would spend the whole drain window on every shutdown.
+
+This does not make the loops components. They remain outside the registry, and the component
+migration the base decision describes is unchanged and still owed.
+
+### Verify by
+
+- `channel_cycle_wait` reports shutdown when its token is cancelled during the wait, and reports a
+  completed interval when the interval elapses first. The shutdown arm is bounded by a timeout, so
+  a wait that ignores the token fails the assertion instead of hanging the suite.
+- Each loop returns on that report and logs the loop it is leaving, so a shutdown that stops a
+  channel loop is readable in the log rather than inferred from its absence.
+- A poll loop handed a token no other code holds returns when that token is cancelled. A loop that
+  read the process-wide token instead would ignore the cancellation and the arm would time out.
+- Because the loops are now tracked, `drain()` waits for their exit and its remaining-task count
+  includes them. That count still names no task; naming what remains at a drain timeout is a
+  separate gap this amendment does not close.
