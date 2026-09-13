@@ -606,6 +606,23 @@ pub enum RuntimeError {
         param: String,
     },
 
+    /// A handler refused the call and wrote a durable receipt naming the refusal.
+    ///
+    /// The durable id rides as its own field. Without it a consumer has to find
+    /// the id inside the refusal sentence with a regular expression, which makes
+    /// the wording of a message part of the contract and breaks silently the
+    /// first time someone rewords it. `message` keeps whatever text the refusal
+    /// already produced, so a reader that does parse it today keeps working.
+    #[error("{message}")]
+    RefusedWithReceipt {
+        /// Wire `code`, naming which refusal surface produced this.
+        code: &'static str,
+        /// The refusal's own sentence, unchanged.
+        message: String,
+        /// Id of the durable row the refusal wrote.
+        receipt_id: String,
+    },
+
     /// Gate denied this verb invocation.
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
@@ -825,6 +842,7 @@ impl RuntimeError {
             Self::SecretDetected(_) => "SecretDetected",
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
+            Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
         }
     }
 
