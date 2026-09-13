@@ -399,10 +399,10 @@ jobs:
   kg-editor:
     name: KG Studio (Next.js)
     runs-on: ubuntu-latest
-    # 12 not 10: the two bounded install steps below may legitimately consume
-    # up to 240s each on their retry paths; 600s left showcase tests no budget
-    # after a timed-out first attempt.
-    timeout-minutes: 12
+    # Allow the browser download's four-minute retry budget and the OS
+    # dependency install's eight-minute backstop, with eight minutes remaining
+    # for setup, build, and showcase tests when both install budgets are spent.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/kg-editor
@@ -471,8 +471,9 @@ jobs:
         # DPkg::Lock::Timeout for lock waits, so a failed first attempt exits
         # cleanly and the retry is lock-safe. The step timeout is the backstop
         # for hangs apt cannot bound (dpkg maintainer scripts); it fails the
-        # job fast instead of eating the whole job budget.
-        timeout-minutes: 4
+        # job while reserving time for the other steps. Slow but progressing
+        # package downloads can exceed the former four-minute backstop.
+        timeout-minutes: 8
         run: npx playwright install-deps chromium || npx playwright install-deps chromium
       - name: Repository showcase dogfood
         run: npx playwright test
