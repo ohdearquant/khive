@@ -474,7 +474,7 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
-                    khive_runtime::track_background_task(async move {
+                    khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
                             tracing::error!(
@@ -497,14 +497,17 @@ fn spawn_email_channel_loops(
                 if admission.outbound_delivery {
                     match runtime_outbox {
                         Some(rt) => {
-                            khive_runtime::track_background_task(channel_outbox_loop(
-                                email_ch_clone,
-                                rt,
-                                ingest_ns_outbox,
-                                mailbox_clone,
-                                allowlist_clone,
-                                khive_runtime::daemon_shutdown_token(),
-                            ));
+                            khive_runtime::track_named_background_task(
+                                "email_channel_outbox",
+                                channel_outbox_loop(
+                                    email_ch_clone,
+                                    rt,
+                                    ingest_ns_outbox,
+                                    mailbox_clone,
+                                    allowlist_clone,
+                                    khive_runtime::daemon_shutdown_token(),
+                                ),
+                            );
                             tracing::info!("email channel outbox loop started");
                         }
                         None => {
@@ -1833,34 +1836,41 @@ fn spawn_telegram_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
-                    khive_runtime::track_background_task(async move {
-                        if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
-                        {
-                            tracing::error!(
-                                error = %error,
-                                "telegram polling disabled: quarantine blob storage is unavailable"
-                            );
-                            return;
-                        }
-                        telegram_poll_loop(
-                            tg_ch_poll,
-                            verb_reg_poll,
-                            ingest_ns_poll,
-                            khive_runtime::daemon_shutdown_token(),
-                        )
-                        .await;
-                    });
+                    khive_runtime::track_named_background_task(
+                        "telegram_channel_poll",
+                        async move {
+                            if let Err(error) =
+                                ensure_channel_quarantine_storage(&verb_reg_poll).await
+                            {
+                                tracing::error!(
+                                    error = %error,
+                                    "telegram polling disabled: quarantine blob storage is unavailable"
+                                );
+                                return;
+                            }
+                            telegram_poll_loop(
+                                tg_ch_poll,
+                                verb_reg_poll,
+                                ingest_ns_poll,
+                                khive_runtime::daemon_shutdown_token(),
+                            )
+                            .await;
+                        },
+                    );
                     tracing::info!("telegram channel polling loop started");
                 }
                 if admission.outbound_delivery {
                     match outbox_runtime {
                         Some(rt) => {
-                            khive_runtime::track_background_task(telegram_outbox_loop(
-                                tg_ch_outbox,
-                                rt,
-                                ingest_ns_outbox,
-                                khive_runtime::daemon_shutdown_token(),
-                            ));
+                            khive_runtime::track_named_background_task(
+                                "telegram_channel_outbox",
+                                telegram_outbox_loop(
+                                    tg_ch_outbox,
+                                    rt,
+                                    ingest_ns_outbox,
+                                    khive_runtime::daemon_shutdown_token(),
+                                ),
+                            );
                             tracing::info!("telegram channel outbox loop started");
                         }
                         None => {
