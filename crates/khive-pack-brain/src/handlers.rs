@@ -721,7 +721,24 @@ impl BrainPack {
     pub(crate) async fn handle_state(&self, _params: Value) -> Result<Value, RuntimeError> {
         let state = self.state.lock().unwrap();
         let snapshot = state.to_snapshot();
-        serde_json::to_value(&snapshot).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
+        let signals_applied = state.signals_applied;
+        let snapshot_serializations = state.snapshot_serializations;
+        drop(state);
+        let mut value = serde_json::to_value(&snapshot)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        // Beside the state rather than inside it: the snapshot is the persisted
+        // shape, and these counters are process-local diagnostics that restart
+        // at zero on every load.
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "dispatch_counters".to_string(),
+                serde_json::json!({
+                    "signals_applied": signals_applied,
+                    "snapshot_serializations": snapshot_serializations,
+                }),
+            );
+        }
+        Ok(value)
     }
 
     // ── brain.config ──────────────────────────────────────────────────────

@@ -11072,3 +11072,128 @@ mod feedback_actor_tests {
         );
     }
 }
+
+/// The dispatch-signal counters: the denominator a duty-cycle reading needs.
+///
+/// A profiler can say the process spends its time serializing snapshots. It
+/// cannot say whether that is one serialization per signal or a thousand, and
+/// the remedy differs. These arms pin what each counter counts, including the
+/// two paths that deliberately count nothing.
+mod dispatch_counters {
+    use khive_brain_core::{BalancedRecallState, BrainSignal, BrainState, ServeAttribution};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn hit(profile: Option<&str>, attribution: ServeAttribution) -> BrainSignal {
+        BrainSignal::RecallHit {
+            target_id: Uuid::new_v4(),
+            latency_us: 1_000,
+            served_by_profile_id: profile.map(str::to_string),
+            serve_attribution: attribution,
+        }
+    }
+
+    #[test]
+    fn the_default_profile_path_counts_one_signal_and_one_serialization_each() {
+        let mut state = BrainState::new(8);
+        for _ in 0..5 {
+            crate::apply_dispatch_signal(&mut state, &hit(None, ServeAttribution::Unspecified));
+        }
+        assert_eq!(state.signals_applied, 5);
+        assert_eq!(
+            state.snapshot_serializations, 5,
+            "today every applied signal serializes; this equality is the before-measurement"
+        );
+    }
+
+    #[test]
+    fn a_named_resident_profile_counts_on_its_own_branch() {
+        let mut state = BrainState::new(8);
+        state
+            .profile_states
+            .insert("other-v1".to_string(), BalancedRecallState::new(8));
+        for _ in 0..3 {
+            crate::apply_dispatch_signal(
+                &mut state,
+                &hit(Some("other-v1"), ServeAttribution::Profile),
+            );
+        }
+        assert_eq!(state.signals_applied, 3);
+        assert_eq!(state.snapshot_serializations, 3);
+    }
+
+    #[test]
+    fn an_unattributed_signal_is_dropped_and_counts_nothing() {
+        let mut state = BrainState::new(8);
+        crate::apply_dispatch_signal(&mut state, &hit(None, ServeAttribution::Unattributed));
+        assert_eq!(
+            (state.signals_applied, state.snapshot_serializations),
+            (0, 0),
+            "a failed profile read proves no profile served, so nothing was applied to count"
+        );
+    }
+
+    #[test]
+    fn a_named_profile_that_is_not_resident_counts_nothing() {
+        let mut state = BrainState::new(8);
+        crate::apply_dispatch_signal(
+            &mut state,
+            &hit(Some("absent-v1"), ServeAttribution::Profile),
+        );
+        assert_eq!(
+            (state.signals_applied, state.snapshot_serializations),
+            (0, 0)
+        );
+        let mut control = BrainState::new(8);
+        control
+            .profile_states
+            .insert("absent-v1".to_string(), BalancedRecallState::new(8));
+        crate::apply_dispatch_signal(
+            &mut control,
+            &hit(Some("absent-v1"), ServeAttribution::Profile),
+        );
+        assert_eq!(
+            (control.signals_applied, control.snapshot_serializations),
+            (1, 1),
+            "same signal, profile resident: the arm above measured residency, not the signal"
+        );
+    }
+
+    #[test]
+    fn the_counters_stay_out_of_the_persisted_snapshot() {
+        let mut state = BrainState::new(8);
+        crate::apply_dispatch_signal(&mut state, &hit(None, ServeAttribution::Unspecified));
+        let persisted = serde_json::to_value(state.to_snapshot()).expect("snapshot serializes");
+        assert!(
+            persisted.get("signals_applied").is_none()
+                && persisted.get("snapshot_serializations").is_none(),
+            "process-local diagnostics must not enter the durable shape: {persisted}"
+        );
+        assert!(
+            persisted.get("balanced_recall").is_some(),
+            "control: the snapshot really was produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_state_reports_the_counters_beside_the_state() {
+        let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = crate::BrainPack::new(rt);
+        {
+            let mut state = pack.state.lock().unwrap();
+            for _ in 0..2 {
+                crate::apply_dispatch_signal(&mut state, &hit(None, ServeAttribution::Unspecified));
+            }
+        }
+        let value = pack
+            .handle_state(json!({}))
+            .await
+            .expect("brain.state must answer");
+        assert_eq!(value["dispatch_counters"]["signals_applied"], 2);
+        assert_eq!(value["dispatch_counters"]["snapshot_serializations"], 2);
+        assert!(
+            value.get("balanced_recall").is_some(),
+            "control: the state itself is still reported"
+        );
+    }
+}
