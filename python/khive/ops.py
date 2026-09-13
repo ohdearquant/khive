@@ -20,7 +20,8 @@ import json
 from typing import Any
 
 
-def op(tool: str, **args: Any) -> dict[str, Any]:
+def op(tool: str, /, **args: Any) -> dict[str, Any]:
+    """Build an operation; the verb is positional so args can include ``tool``."""
     # A stream record may be JSON null. A supplied fence (even null) must
     # reach the server so input validation cannot be bypassed.
     preserve_null = {"record", "fence"} if tool == "stream.append" else set()
