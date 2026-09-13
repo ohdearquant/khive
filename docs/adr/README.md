@@ -202,6 +202,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-183](ADR-183-batched-write-disposition.md)                         | Batched Write Disposition: Commit What Passes, Name What Refuses                                           |
 | [ADR-184](ADR-184-telemetry-pack.md)                                    | Telemetry Pack — Channel Table, Emit Outcome, and Read-Time Rollup                                         |
 | [ADR-185](ADR-185-daemon-rendezvous-ownership.md)                       | Daemon Rendezvous Ownership — a client must not take the socket a supervisor is for                        |
+| [ADR-188](ADR-188-entity-version-fence.md)                              | Entities get a version, and then a fence                                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 
