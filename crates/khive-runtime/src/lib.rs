@@ -93,8 +93,10 @@ pub use curation::{
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
-    active_phase_names, background_task_count, daemon_shutdown_token, register_active_phase,
-    track_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard, PROTOCOL_VERSION,
+    active_phase_names, background_task_count, background_task_names, daemon_shutdown_token,
+    register_active_phase, spawn_named_tracked_task, track_background_task,
+    track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
+    PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{

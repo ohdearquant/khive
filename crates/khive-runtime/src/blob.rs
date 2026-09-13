@@ -232,7 +232,7 @@ impl BlobHydrator {
         let (sender, receiver) = tokio::sync::oneshot::channel::<RuntimeResult<VerifiedBlob>>();
         let store = Arc::clone(&self.store);
         let content_ref = content_ref.clone();
-        crate::track_background_task(async move {
+        crate::track_named_background_task("blob_hydration", async move {
             // The tracked supervisor itself owns backend work and the lease.
             // Dropping a request only drops `receiver`; the supervisor stays
             // visible to daemon drain until the backend future actually ends.

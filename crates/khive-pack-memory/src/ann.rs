@@ -800,7 +800,7 @@ fn spawn_rebuild_task_inner(
         ann: ann.clone(),
         key: key.clone(),
     };
-    khive_runtime::track_background_task(async move {
+    khive_runtime::track_named_background_task("memory_ann_rebuild", async move {
         if chained {
             tokio::time::sleep(rebuild_chain_debounce()).await;
         }
@@ -911,7 +911,7 @@ pub(crate) fn start_rotation_watcher(rt: &KhiveRuntime, ann: &SharedAnn) {
 
     let ann = Arc::downgrade(ann);
     let shutdown = khive_runtime::daemon_shutdown_token();
-    khive_runtime::track_background_task(async move {
+    khive_runtime::track_named_background_task("memory_ann_rotation_watch", async move {
         let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
         let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
