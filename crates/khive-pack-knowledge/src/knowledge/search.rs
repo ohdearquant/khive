@@ -4,6 +4,7 @@
 //! FTS/ANN pipeline, reranking, hydration, and handler dispatch.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -425,6 +426,42 @@ fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
 /// limit; application TF-IDF scoring ranks only the admitted candidates.
 const FTS_TERM_LIMIT: usize = 500;
 
+/// Shared by the full query and both decomposed passes. Admission happens
+/// before rarity probes; every later stage reuses that admitted term set.
+const FTS_TERM_COUNT_LIMIT: usize = 32;
+
+struct FtsTermBudget {
+    remaining: AtomicUsize,
+    truncated: AtomicBool,
+}
+
+impl FtsTermBudget {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(FTS_TERM_COUNT_LIMIT),
+            truncated: AtomicBool::new(false),
+        }
+    }
+
+    fn admit(&self, mut terms: Vec<String>) -> Vec<String> {
+        let remaining = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(terms.len()))
+            })
+            .expect("term reservation always succeeds");
+        if terms.len() > remaining {
+            self.truncated.store(true, Ordering::Relaxed);
+            terms.truncate(remaining);
+        }
+        terms
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
+    }
+}
+
 fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
     SqlStatement {
         sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
@@ -682,10 +719,19 @@ async fn fetch_fts_candidates(
     statuses: &[String],
     exclude_statuses: &[&str],
     fetch_limit: usize,
+    term_budget: &FtsTermBudget,
     mut stage: LexicalStage,
 ) -> Result<FtsFetchOutcome, RuntimeError> {
+    let mut terms = term_budget.admit(fts5_candidate_terms(raw_query));
+    if terms.is_empty() {
+        return Ok(FtsFetchOutcome {
+            atoms: Vec::new(),
+            timeout: None,
+            state: LexicalCandidateState::NoMatch,
+        });
+    }
     let sql = runtime.sql();
-    let mut reader = match stage.read(LexicalPhase::ReaderOpen, sql.reader()).await {
+    let reader = match stage.read(LexicalPhase::ReaderOpen, sql.reader()).await {
         Ok(reader) => reader,
         Err(e) if is_timeout(&e) => {
             return Ok(FtsFetchOutcome {
@@ -697,7 +743,9 @@ async fn fetch_fts_candidates(
         Err(e) => return Err(sql_err("search fts reader", e)),
     };
 
-    let mut terms = fts5_candidate_terms(raw_query);
+    #[cfg(test)]
+    let reader = tests::record_term_probes(reader);
+    let mut reader = reader;
     let type_clause = type_eligibility_sql(type_filter, "a");
     let per_term_limit = if terms.len() == 1 {
         fetch_limit
@@ -1032,6 +1080,7 @@ struct SearchCtx<'a> {
     fetch_limit: usize,
     statuses: &'a [String],
     exclude_statuses: &'a [&'a str],
+    term_budget: &'a FtsTermBudget,
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
@@ -1116,6 +1165,7 @@ async fn search_core(
             ctx.statuses,
             ctx.exclude_statuses,
             CANDIDATE_POOL,
+            ctx.term_budget,
             stage,
         )
         .await
@@ -1228,6 +1278,7 @@ async fn search_decomposed(
         fetch_limit: sub_limit,
         statuses: ctx.statuses,
         exclude_statuses: ctx.exclude_statuses,
+        term_budget: ctx.term_budget,
     };
     let SearchCoreOutcome {
         hits: s1,
@@ -2603,6 +2654,7 @@ impl KnowledgeHandlers {
         let allow_deprecated =
             deprecated_allowed_by_status_policy(&requested_statuses, &effective_exclude_statuses);
 
+        let term_budget = FtsTermBudget::new();
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2613,6 +2665,7 @@ impl KnowledgeHandlers {
             fetch_limit,
             statuses: &requested_statuses,
             exclude_statuses: &effective_exclude_statuses,
+            term_budget: &term_budget,
         };
 
         // Trigger background warm — never block search on the ANN rebuild.
@@ -2776,6 +2829,7 @@ impl KnowledgeHandlers {
             "candidate_provenance": {
                 "lexical": lexical_state.as_str(),
                 "fallback": candidate_fallback(&hits),
+                "terms_truncated": term_budget.truncated(),
             },
         });
         if ann_unavailable {
@@ -2849,6 +2903,7 @@ impl KnowledgeHandlers {
         // should not drive auto-compose or agent orientation.
         const SUGGEST_EXCLUDE: &[&str] = &["draft", "deprecated"];
 
+        let term_budget = FtsTermBudget::new();
         let ctx = SearchCtx {
             runtime,
             ns: &ns,
@@ -2859,6 +2914,7 @@ impl KnowledgeHandlers {
             fetch_limit: limit * 3,
             statuses: &[],
             exclude_statuses: SUGGEST_EXCLUDE,
+            term_budget: &term_budget,
         };
 
         // Fetch ANN candidates BEFORE the lexical stage — same rationale as
@@ -3680,6 +3736,230 @@ mod lexical_timeout_tests;
 mod tests {
     use super::*;
     use khive_storage::types::{SqlRow, StorageResult};
+    use std::sync::{Arc, Mutex};
+
+    tokio::task_local! {
+        static TERM_PROBES: Arc<Mutex<Vec<SqlStatement>>>;
+    }
+
+    struct TermRecordingReader {
+        inner: Box<dyn khive_storage::SqlReader>,
+        probes: Arc<Mutex<Vec<SqlStatement>>>,
+    }
+
+    impl TermRecordingReader {
+        fn record(&self, statement: &SqlStatement) {
+            if statement.sql.contains("fts_knowledge MATCH") {
+                self.probes
+                    .lock()
+                    .expect("term probes")
+                    .push(statement.clone());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for TermRecordingReader {
+        async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            self.record(&statement);
+            self.inner.query_row(statement).await
+        }
+
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.record(&statement);
+            self.inner.query_all(statement).await
+        }
+
+        async fn query_scalar(
+            &mut self,
+            statement: SqlStatement,
+        ) -> StorageResult<Option<SqlValue>> {
+            self.record(&statement);
+            self.inner.query_scalar(statement).await
+        }
+
+        async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.inner.explain(statement).await
+        }
+    }
+
+    pub(super) fn record_term_probes(
+        inner: Box<dyn khive_storage::SqlReader>,
+    ) -> Box<dyn khive_storage::SqlReader> {
+        match TERM_PROBES.try_with(Arc::clone) {
+            Ok(probes) => Box::new(TermRecordingReader { inner, probes }),
+            Err(_) => inner,
+        }
+    }
+
+    fn distinct_term_query(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("distinctterm{index}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn probed_term(statement: &SqlStatement) -> &str {
+        match &statement.params[0] {
+            SqlValue::Text(term) => term,
+            other => panic!("expected bound FTS term, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_term_fan_out_is_bounded_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        for query in [
+            distinct_term_query(FTS_TERM_COUNT_LIMIT * 2),
+            "alpha beta gamma".into(),
+        ] {
+            let terms = fts5_candidate_terms(&query);
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let response = TERM_PROBES
+                .scope(
+                    probes.clone(),
+                    KnowledgeHandlers::search(
+                        &runtime,
+                        &token,
+                        json!({"query": query, "rerank": false}),
+                        &vamana::new_shared(),
+                    ),
+                )
+                .await
+                .expect("bounded search");
+            let probes = probes.lock().expect("term probes");
+            assert_eq!(probes.len(), terms.len().min(FTS_TERM_COUNT_LIMIT));
+            assert_eq!(
+                probes.iter().map(probed_term).collect::<Vec<_>>(),
+                terms
+                    .iter()
+                    .take(FTS_TERM_COUNT_LIMIT)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "admission must precede even the rarity-frequency probes"
+            );
+            assert_eq!(
+                response["candidate_provenance"]["terms_truncated"],
+                terms.len() > FTS_TERM_COUNT_LIMIT
+            );
+            assert_eq!(response["candidate_provenance"]["lexical"], "no_match");
+        }
+    }
+
+    #[tokio::test]
+    async fn term_budget_is_shared_across_decomposed_sub_queries() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        // Ten raw terms expand to twenty: the full query fits, but the
+        // combined work of all three passes must still consume one budget.
+        for count in [10, FTS_TERM_COUNT_LIMIT + 18] {
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let response = TERM_PROBES.scope(probes.clone(), KnowledgeHandlers::search(
+                &runtime, &token,
+                json!({"query": distinct_term_query(count), "decompose": true, "rerank": false}),
+                &vamana::new_shared(),
+            )).await.expect("decomposed bounded search");
+            assert_eq!(
+                probes.lock().expect("term probes").len(),
+                FTS_TERM_COUNT_LIMIT
+            );
+            assert_eq!(response["candidate_provenance"]["terms_truncated"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn term_bound_covers_staged_fallback_and_namespace_probes() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let query = distinct_term_query(FTS_TERM_COUNT_LIMIT * 2);
+        let terms = fts5_candidate_terms(&query);
+        let content = terms
+            .iter()
+            .map(|term| term.trim_matches('"'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for index in 0..4 {
+            let (namespace, content) = if index < 3 {
+                ("foreign", content.as_str())
+            } else {
+                ("local", terms.last().unwrap().trim_matches('"'))
+            };
+            writer.execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, finalized, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?3, ?4, '[]', 1, 'reviewed', 0, 0)".into(),
+                params: vec![
+                    SqlValue::Text(Uuid::new_v4().to_string()),
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(format!("term-bound-{index}")),
+                    SqlValue::Text(content.into()),
+                ],
+                label: None,
+            }).await.expect("seed bounded-stage fixture");
+        }
+        drop(writer);
+        let budget = FtsTermBudget::new();
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let outcome = TERM_PROBES
+            .scope(
+                probes.clone(),
+                with_phase_a_widen_ceiling_override(
+                    2,
+                    super::fetch_fts_candidates(
+                        &runtime,
+                        "local",
+                        &query,
+                        None,
+                        &[],
+                        &[],
+                        5,
+                        &budget,
+                        LexicalStage::new(
+                            LexicalPass::Full,
+                            tokio::time::Instant::now(),
+                            lexical_stage_budget(),
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .expect("bounded staged fetch");
+        assert_eq!(outcome.state, LexicalCandidateState::NoMatch);
+        assert!(outcome.atoms.is_empty() && outcome.timeout.is_none());
+        assert!(budget.truncated());
+        let probes = probes.lock().expect("term probes");
+        let allowed: HashSet<_> = terms
+            .iter()
+            .take(FTS_TERM_COUNT_LIMIT)
+            .map(String::as_str)
+            .collect();
+        assert!(probes
+            .iter()
+            .all(|statement| allowed.contains(probed_term(statement))));
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT rowid"))
+                .count(),
+            2 * FTS_TERM_COUNT_LIMIT
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT a.*"))
+                .count(),
+            FTS_TERM_COUNT_LIMIT
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement
+                    .sql
+                    .starts_with("SELECT 1 AS present FROM fts_knowledge"))
+                .count(),
+            FTS_TERM_COUNT_LIMIT
+        );
+    }
 
     #[test]
     fn lexical_candidate_state_merge_preserves_completed_and_timed_out_passes() {
@@ -3747,7 +4027,7 @@ mod tests {
             response,
             json!({
                 "results": [], "total": 0,
-                "candidate_provenance": {"lexical": "no_match", "fallback": "none"},
+                "candidate_provenance": {"lexical": "no_match", "fallback": "none", "terms_truncated": false},
             })
         );
     }
@@ -3769,7 +4049,7 @@ mod tests {
             .expect("filtered search");
             assert_eq!(
                 response["candidate_provenance"],
-                json!({"lexical": state, "fallback": "none"})
+                json!({"lexical": state, "fallback": "none", "terms_truncated": false})
             );
             assert_eq!(response["total"], total);
             if include_drafts {
@@ -3795,6 +4075,7 @@ mod tests {
             statuses,
             exclude_statuses,
             fetch_limit,
+            &FtsTermBudget::new(),
             LexicalStage::new(
                 LexicalPass::Full,
                 tokio::time::Instant::now(),
@@ -4803,7 +5084,7 @@ mod tests {
                 response,
                 json!({
                     "results": [], "total": 0,
-                    "candidate_provenance": {"lexical": "filtered", "fallback": "none"},
+                    "candidate_provenance": {"lexical": "filtered", "fallback": "none", "terms_truncated": false},
                 }),
                 "foreign matches must not change the same local filtered result: {foreign_prefix}"
             );

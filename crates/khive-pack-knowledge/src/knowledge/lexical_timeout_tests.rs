@@ -60,6 +60,7 @@ async fn fetch(runtime: &KhiveRuntime, query: &str) -> FtsFetchOutcome {
             &[],
             &[],
             5,
+            &FtsTermBudget::new(),
             LexicalStage::new(LexicalPass::Full, started, configured),
         )
         .await
@@ -223,7 +224,7 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
         let expected = if verb == "knowledge.search" {
             json!({
                 "results": [], "total": 0,
-                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
                 "degraded": {"lexical_timeout": true}
             })
         } else {
@@ -264,7 +265,7 @@ async fn healthy_dispatch_omits_timeout_details() {
         if verb == "knowledge.search" {
             assert_eq!(
                 response["candidate_provenance"],
-                json!({"lexical": "matched", "fallback": "none"})
+                json!({"lexical": "matched", "fallback": "none", "terms_truncated": false})
             );
             assert_eq!(
                 response["results"][0]["score_provenance"],
@@ -301,7 +302,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             healthy,
             json!({
                 "results": [], "total": 0,
-                "candidate_provenance": {"lexical": "no_match", "fallback": "none"},
+                "candidate_provenance": {"lexical": "no_match", "fallback": "none", "terms_truncated": false},
             }),
             "a healthy miss must not reveal a foreign match: {foreign}"
         );
@@ -338,7 +339,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             assert_eq!(
                 response,
                 json!({"results": [], "total": 0,
-                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
                 "degraded": {
                     "lexical_timeout": true, "lexical_timeout_instrumented": true,
                     "lexical_timeout_details": [{
@@ -364,7 +365,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
         assert_eq!(
             *response,
             json!({"results": [], "total": 0,
-            "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+            "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
             "degraded": {
                 "lexical_timeout": true, "lexical_timeout_instrumented": true
             }})
@@ -439,7 +440,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
         assert_eq!(
             response,
             json!({"results": [], "total": 0,
-            "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none"},
+            "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none", "terms_truncated": false},
             "degraded": {
                 "lexical_timeout": true, "lexical_timeout_instrumented": true,
                 "lexical_timeout_details": [{
@@ -461,7 +462,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
 #[test]
 fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases() {
     let base = json!({"results": [],
-    "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+    "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
     "degraded": {
         "lexical_timeout": true, "reason": "ann_unavailable", "mode": "no_match", "cache_safe": false,
         "body_lines_timeout": true, "hydration_failures": 2, "member_sizing_timeout": ["domain"]
@@ -602,6 +603,7 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
     let runtime = KhiveRuntime::memory().expect("runtime");
     seed_low_overlap_corpus(&runtime, 1_000, 20).await;
     let weights = Weights::default();
+    let term_budget = FtsTermBudget::new();
     let ctx = SearchCtx {
         runtime: &runtime,
         ns: "local",
@@ -612,6 +614,7 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
         fetch_limit: 100,
         statuses: &[],
         exclude_statuses: &[],
+        term_budget: &term_budget,
     };
     for query in ["term1 term18", "term18 term1"] {
         let outcome = with_fts_deadline_advance_after_term(
@@ -675,7 +678,7 @@ async fn configured_budget_uses_the_stage_override() {
     .expect("public dispatch");
     assert_eq!(
         response["candidate_provenance"],
-        json!({"lexical": "timed_out", "fallback": "none"})
+        json!({"lexical": "timed_out", "fallback": "none", "terms_truncated": false})
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["configured_budget_ms"],

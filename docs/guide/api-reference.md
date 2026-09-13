@@ -2054,6 +2054,14 @@ not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` re
 These states supplement `degraded.lexical_timeout` and any public timeout details. A lexical
 stage timeout does not by itself mean the request's broader read deadline has expired.
 
+`candidate_provenance.terms_truncated` is `true` when a lexical pass exceeds the request's
+shared allowance of 32 distinct expanded terms. The full query and both decomposed passes
+draw from the same allowance; a repeated term in a later pass counts again. Admission uses
+deterministic spelling order before rarest-first scheduling. Frequency, rowid, eligibility,
+and namespace-existence probes all stay within those admitted terms, while retaining their
+own row and time limits. The lexical state describes only admitted terms: a match reachable
+only through an untested term does not make a truncated miss `filtered`.
+
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
 no returned result has lexical evidence; otherwise it is `none`, including for an empty
 result. Each `knowledge.search` result includes `score_provenance`:
