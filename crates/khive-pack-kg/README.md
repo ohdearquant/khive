@@ -139,12 +139,13 @@ chain (`|`) preserves caller order; a request array gives dense numbers in write
 admission order, which need not be array order.
 
 `stream.append`, singleton note `create`/`update`, and `stream.batch` append
-members accept a `fence` object `{key, kind, expected_version, live_until?}` or
-a non-empty ordered list of at most 100 distinct `(kind, key)` objects. Each
-entry requires `expected_version`: an integer at least 1 asserts the live
-holder's exact version in the write namespace; explicit null asserts that no
-live note holds that `(kind, key)`. Missing and soft-deleted notes satisfy an
-absence assertion.
+members accept a `fence` object
+`{key, kind, expected_version, live_until?, id?}` or a non-empty ordered list of
+at most 100 distinct `(kind, key)` objects. Each entry requires
+`expected_version`: an integer at least 1 asserts the live holder's exact
+version in the write namespace; explicit null asserts that no live note holds
+that `(kind, key)`. Missing and soft-deleted notes satisfy an absence
+assertion.
 `version` is accepted as an input alias instead of `expected_version`; supplying
 both names, omitting both, or supplying unknown fields is invalid. Serialization
 always emits `expected_version`, including an explicit null for absence.
@@ -152,15 +153,19 @@ always emits `expected_version`, including an explicit null for absence.
 Fences are checked in order in the same writer transaction as the write. A
 mismatch returns `fence_conflict`; an absence conflict carries string-valued
 `expected_version="absent"` and the live `current_version`. List refusals also
-carry a zero-based string `index`. A `live_until` deadline that has passed is a
-separate refusal, `expired`, carrying the deadline read and the writer clock; a
-path resolving to nothing or to a value that is not an RFC 3339 timestamp
-refuses `live_until_unreadable` naming the value's type and never the value.
-The version is compared first, so a stale version reports `fence_conflict` even
-when the deadline has also passed. Oversized lists are rejected with
-`invalid_input` naming the cap and count sent before entry interpretation or
-writer admission. Empty lists, duplicate `(kind, key)` entries and outer
-`fence:null` are invalid on these surfaces.
+carry a zero-based string `index`. An entry that pins `id` is compared before
+anything else: a key held by a different live note refuses `identity_conflict`,
+naming the asserted id and the `current_id` holding the key, while an absent
+holder has no identity to name and is reported by the version comparison
+instead. A `live_until` deadline that has passed is a separate refusal,
+`expired`, carrying the deadline read and the writer clock; a path resolving to
+nothing or to a value that is not an RFC 3339 timestamp refuses
+`live_until_unreadable` naming the value's type and never the value. The order
+is identity, then version, then deadline, so a stale version reports
+`fence_conflict` even when the deadline has also passed. Oversized lists are
+rejected with `invalid_input` naming the cap and count sent before entry
+interpretation or writer admission. Empty lists, duplicate `(kind, key)` entries
+and outer `fence:null` are invalid on these surfaces.
 
 The batch-wide `stream.batch(fence=...)` accepts one object with the same entry
 contract, not a list. An object selects atomic mode and is checked before the
@@ -171,12 +176,13 @@ member writes in their transaction; an atomic member refusal also carries its
 string `member` position.
 
 `stream.batch(observed=...)` is unchanged: each observation still requires its
-`version` field, with no `expected_version` alias. Its optional `id` contract
-does not apply to fence objects. Its `live_until` contract does: a fence entry
-takes the same dotted document path into the fenced head, resolved inside the
-writing transaction against one clock reading shared by every entry in that
-write, and requires a positive `expected_version` because an absence assertion
-has no document to read a deadline out of.
+`version` field, with no `expected_version` alias. Both of its optional
+contracts now apply to a fence entry as well: `live_until` takes the same dotted
+document path into the fenced head, resolved inside the writing transaction
+against one clock reading shared by every entry in that write, and `id` names
+the note that must still hold `(kind, key)`. Each requires a positive
+`expected_version`, because an absence assertion has no document to read a
+deadline out of and no identity to compare.
 
 ```text
 request(ops='stream.append(stream="run", record={"step":1}, expected_seq=1)', presentation="verbose")

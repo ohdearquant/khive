@@ -23,6 +23,12 @@ pub struct NoteFence {
     /// still matches and the write commits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_until: Option<String>,
+    /// The note that must hold this key, on the same semantics a batch
+    /// observation's `id` carries. A recreated note starts at version 1, so a
+    /// version comparison alone cannot tell the note the caller read from a
+    /// different note sitting at the same number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
 }
 
 impl<'de> Deserialize<'de> for NoteFence {
@@ -35,6 +41,7 @@ impl<'de> Deserialize<'de> for NoteFence {
             #[serde(alias = "version")]
             expected_version: Option<i64>,
             live_until: Option<String>,
+            id: Option<Uuid>,
         }
 
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -54,6 +61,7 @@ impl<'de> Deserialize<'de> for NoteFence {
             kind: fields.kind,
             expected_version: fields.expected_version,
             live_until: fields.live_until,
+            id: fields.id,
         })
     }
 }
@@ -81,6 +89,13 @@ impl NoteFence {
         if self.live_until.as_ref().is_some_and(|path| path.is_empty()) {
             return Err(RuntimeError::InvalidInput(
                 "fence live_until requires a document path".into(),
+            ));
+        }
+        if self.id.is_some() && self.expected_version.is_none() {
+            // An absence assertion has no note, so there is nothing for an
+            // identity to name. The batch route refuses the same pairing.
+            return Err(RuntimeError::InvalidInput(
+                "fence id requires a positive expected_version".into(),
             ));
         }
         Ok(())
@@ -323,6 +338,21 @@ pub enum NoteWriteConflict {
     /// `Fence` because the version matched: what failed is the deadline. Boxed
     /// so this variant does not set the size of every conflict result.
     FenceDeadline(Box<FenceDeadline>),
+    /// A fence whose `id` did not hold the key. Separate from `Fence` because
+    /// the version is not what disagreed, and it may well agree: a recreated
+    /// note starts at version 1. Boxed for the same reason as `FenceDeadline`.
+    FenceIdentity(Box<FenceIdentity>),
+}
+
+/// The fields an identity refusal reports: what was fenced, at which version,
+/// and both identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceIdentity {
+    pub key: String,
+    pub kind: String,
+    pub version: i64,
+    pub index: Option<usize>,
+    pub evidence: Vec<(&'static str, String)>,
 }
 
 /// The fields a deadline refusal reports: what was fenced, at which version and
@@ -406,6 +436,26 @@ impl NoteWriteConflict {
                 fields.extend(evidence);
                 ("note fence time precondition failed", fields)
             }
+            Self::FenceIdentity(identity) => {
+                let FenceIdentity {
+                    key,
+                    kind,
+                    version,
+                    index,
+                    evidence,
+                } = *identity;
+                let mut fields = vec![
+                    ("reason", "identity_conflict".into()),
+                    ("key", key),
+                    ("kind", kind),
+                    ("version", version.to_string()),
+                ];
+                fields.extend(evidence);
+                if let Some(index) = index {
+                    fields.push(("index", index.to_string()));
+                }
+                ("note fence identity precondition failed", fields)
+            }
         };
         if let Some(member) = member {
             details.push(("member", member.to_string()));
@@ -435,20 +485,35 @@ impl NoteWriteGuard {
         // must not be judged against two instants.
         let mut now: Option<i64> = None;
         for (index, fence) in fences.entries().iter().enumerate() {
-            let current = writer.query_scalar(statement(
-            "SELECT version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
-            vec![SqlValue::Text(self.namespace.clone()), SqlValue::Text(fence.kind.clone()),
-                 SqlValue::Text(fence.key.clone())],
-        )).await?;
-            let current = match current {
-                None => None,
-                Some(SqlValue::Integer(version)) => Some(version),
-                Some(_) => {
-                    return Err(StorageError::Internal(
-                        "invalid persisted note version".into(),
-                    ))
+            let holder = crate::fence_identity::read_holder(
+                writer,
+                &self.namespace,
+                &fence.kind,
+                &fence.key,
+                "note-write-guard",
+            )
+            .await?;
+            // Identity first, then version, then the deadline: the batch route
+            // orders them this way, and a caller must not learn a different
+            // failure for the same state depending on which route it used. An
+            // absent holder has no identity to name, so it falls through to the
+            // version comparison that already reports it.
+            if let (Some(asserted), Some(holder)) = (fence.id, holder.as_ref()) {
+                if asserted != holder.id {
+                    return Ok(Some(NoteWriteConflict::FenceIdentity(Box::new(
+                        FenceIdentity {
+                            key: fence.key.clone(),
+                            kind: fence.kind.clone(),
+                            // validate() refuses id without a positive
+                            // expected_version, so the version is present here.
+                            version: fence.expected_version.unwrap_or_default(),
+                            index: matches!(fences, NoteFences::Many(_)).then_some(index),
+                            evidence: crate::fence_identity::identity_evidence(asserted, holder.id),
+                        },
+                    ))));
                 }
-            };
+            }
+            let current = holder.map(|holder| holder.version);
             if current != fence.expected_version {
                 return Ok(Some(NoteWriteConflict::Fence {
                     key: fence.key.clone(),

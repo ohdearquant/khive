@@ -372,56 +372,38 @@ async fn check_observed(
     now: Option<i64>,
 ) -> Result<Option<KhiveError>, StorageError> {
     for (index, entry) in observed.iter().enumerate() {
-        let current = writer.query_row(SqlStatement {
-            sql: "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
-            params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
-            label: Some("stream-batch-observed".into()),
-        }).await?;
-        let current = current
-            .map(|row| {
-                let id = match row.get("id") {
-                    Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|_| {
-                        StorageError::Internal("invalid observed note identity".into())
-                    })?,
-                    _ => {
-                        return Err(StorageError::Internal(
-                            "invalid observed note identity".into(),
-                        ))
-                    }
-                };
-                let version = match row.get("version") {
-                    Some(SqlValue::Integer(version)) => *version,
-                    _ => {
-                        return Err(StorageError::Internal(
-                            "invalid observed note version".into(),
-                        ))
-                    }
-                };
-                Ok::<_, StorageError>((id, version))
-            })
-            .transpose()?;
+        let current = crate::fence_identity::read_holder(
+            writer,
+            namespace,
+            &entry.kind,
+            &entry.key,
+            "stream-batch-observed",
+        )
+        .await?;
         // No live holder is the existing version conflict. Identity conflict
         // specifically names a replacement, so current_id is always present.
-        if let (Some(asserted), Some((current_id, _))) = (entry.id, current) {
-            if asserted != current_id {
+        if let (Some(asserted), Some(holder)) = (entry.id, current.as_ref()) {
+            if asserted != holder.id {
                 let version = entry.version.ok_or_else(|| {
                     StorageError::Internal("identity observation missing version".into())
                 })?;
+                let mut details = vec![
+                    ("reason", "identity_conflict".into()),
+                    ("key", entry.key.clone()),
+                    ("kind", entry.kind.clone()),
+                    ("version", version.to_string()),
+                ];
+                details.extend(crate::fence_identity::identity_evidence(
+                    asserted, holder.id,
+                ));
+                details.push(("index", index.to_string()));
                 return Ok(Some(
                     KhiveError::conflict("stream observation identity precondition failed")
-                        .with_details(Details::new_owned(vec![
-                            ("reason", "identity_conflict".into()),
-                            ("key", entry.key.clone()),
-                            ("kind", entry.kind.clone()),
-                            ("version", version.to_string()),
-                            ("id", asserted.to_string()),
-                            ("current_id", current_id.to_string()),
-                            ("index", index.to_string()),
-                        ])),
+                        .with_details(Details::new_owned(details)),
                 ));
             }
         }
-        let current = current.map(|(_, version)| version);
+        let current = current.map(|holder| holder.version);
         if current != entry.version {
             let mut details = vec![
                 ("reason", "version_conflict".into()),

@@ -1146,3 +1146,96 @@ writes are admitted in its absence.
 9. **Mutation.** Removing the deadline evaluation makes arm 1 go red on the fence side while the
    batch side stays green, which is the arm that would otherwise pass on a shared fixture by
    accident.
+
+## Amendment 9 (2026-09-13): the single-head fence takes `id`, so a recreated key does not satisfy it
+
+### Context
+
+Amendment 6 put `id` on a `stream.batch` `observed` entry, so a batched write can pin which live note
+holds the key and refuse when that note has been replaced. Amendment 8 closed the deadline half of the
+same asymmetry for the single-head fence. The identity half was still open: a fence entry was
+`{key, kind, expected_version, live_until?}` and had no way to say which note it read.
+
+A version comparison does not cover it. A recreated note starts at version 1, so a caller that read a
+key at version 1, and a writer that removes that key and recreates it under different ownership,
+leaves a fence at version 1 matching the new note. The fence passes and the write commits against a
+holder the caller never read. The batch route refuses that case; the single-head route commits it, and
+one head with one owner and one compare-and-set is the route a caller would naturally reach for.
+
+This is the same landing-order artifact as the deadline, one field over, and it survived the previous
+amendment because that amendment's acceptance enumerated semantic rules while the axis that was
+missing was the route.
+
+### Decision
+
+A fence entry is `{key, kind, expected_version, live_until?, id?}` on `create`, `update`, the `stream`
+append fences and the `stream.batch` fence, list entries included.
+
+`id` names the note that must hold `(kind, key)` live at the observed version. It requires a positive
+`expected_version`: an absence assertion has no note to compare an identity against, so the pairing is
+refused as `invalid_input` rather than interpreted.
+
+Ordering matches the batch route exactly, because a guarantee that differs by route is the defect this
+amendment exists to close: identity is compared first, then the version, then the deadline. A caller
+whose note was replaced learns that, rather than a version or a deadline belonging to a document it
+never observed. A mismatch refuses with reason `identity_conflict`, naming the key, kind, version, the
+pinned identity and the identity actually holding the key, plus the list index. An absent holder is
+not an identity refusal, because there is no identity to name: it falls through to the version
+comparison, which is what already reports it.
+
+Both routes evaluate one shared implementation of the predicate, as they now do for the deadline, so
+identical semantics is a property of the code rather than a claim in this document.
+
+### What this does not change
+
+The version comparison, the deadline predicate, and absence assertions are all unchanged, and a fence
+without `id` behaves exactly as before. The batch route's behaviour does not change at all: it already
+does this and is the reference for what the fence route now does.
+
+One asymmetry stays, and is recorded here rather than quietly fixed because it predates this work and
+changing it would change refusal strings callers already parse: the version half reports
+`version_conflict` on the batch route and `fence_conflict` on the fence route. The acceptance arm for
+an absent holder asserts both spellings rather than one, so the difference is written down in a place
+that fails if it moves.
+
+### Acceptance
+
+1. **Both routes, one fixture.** A key whose live note was replaced at the same version is refused by a
+   `stream.batch` `observed` entry carrying `id` and by a single-head `update` fence carrying `id`, and
+   the two refusals carry the same reason and the same evidence fields.
+2. **Identity before deadline.** A replaced note whose document also holds an expired deadline reports
+   `identity_conflict`, not the deadline reason: the caller learns the older failure.
+3. **Identity before version.** A note that was replaced _and_ sits at a different version reports
+   `identity_conflict`, not the version refusal, on both routes. This is the arm that would catch the
+   two routes disagreeing about which failure a caller is shown.
+4. **A matching identity admits**, so the check is not refusing everything.
+5. **Pairing refused.** `id` beside `expected_version: null` refuses `invalid_input` while the call is
+   still being shaped, in both the object and list fence forms.
+6. **An absent holder is a version refusal**, not an identity one.
+7. **The fenced write may be a creation**, and the object fence form's refusal differs from the list
+   form's by the entry index alone.
+8. **Mutation.** Removing the identity comparison makes arm 1 go red on the fence side while the batch
+   side stays green.
+
+### The same semantics, read per route
+
+The previous amendment's acceptance enumerated semantic rules, and the axis that was missing was the
+route, so this one states the coverage as a matrix. A row is a rule about identity; a column is a
+place a caller can assert one. The batch column is Amendment 6's arms, unchanged; the fence column is
+this amendment's. A future field on this shape fills in a row of this table before it is considered
+covered.
+
+| Rule about `id`                                    | `stream.batch` `observed`  | single-head fence                              |
+| -------------------------------------------------- | -------------------------- | ---------------------------------------------- |
+| A replaced holder refuses `identity_conflict`      | A6 acceptance 1            | A9 acceptance 1, 7                             |
+| A matching identity admits                         | A6 acceptance 1 control, 3 | A9 acceptance 4                                |
+| Identity is reported before the version            | A6 acceptance 4            | A9 acceptance 3, on both routes in one fixture |
+| Identity is reported before the deadline           | A6 acceptance 6            | A9 acceptance 2                                |
+| `id` without a positive version is `invalid_input` | A6 acceptance 5            | A9 acceptance 5                                |
+| An absent holder is a version refusal              | A6 acceptance 5b           | A9 acceptance 6                                |
+| The entry index names the offending entry          | A6 acceptance 7            | A9 acceptance 7                                |
+
+The form axis is not symmetric, which is why it is written here rather than given a column:
+`observed` is a list and has one form, while a fence is an object or a list, so the fence column
+carries both forms wherever the rule can be expressed in either. The fenced write being a creation has no batch counterpart at
+all, because a batch member is an append.
