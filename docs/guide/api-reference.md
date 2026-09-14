@@ -650,17 +650,21 @@ the edge's mutation history.
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
+Immediate graph neighbors. Without an explicit `limit` the response is the bare array of hits it has always been. An explicit `limit` returns a page instead: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
 
-| Param        | Type            | Required | Notes                                            |
-| ------------ | --------------- | -------- | ------------------------------------------------ |
-| `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
-| `direction`  | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`). |
-| `relations`  | array\<string\> | no       | Restrict to these relation types.                |
-| `min_weight` | number          | no       | Exclude edges below this weight.                 |
+| Param            | Type            | Required | Notes                                                                                                                                                                                        |
+| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `node_id`        | uuid            | yes      | Node whose neighbors to return.                                                                                                                                                              |
+| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
+| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
+| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
+| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
+| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
+| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
 
 ```
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
@@ -760,6 +764,12 @@ One embedding inference when `query` is used; zero for a pure `entity_ids` call.
 | `fanout`     | integer         | no       | Max neighbors per expanded node per hop, clamped 1..=50 (default 10).                 |
 
 \* at least one of `query`/`entity_ids` required.
+
+Every number the caller supplies that the verb clamps is reported back beside the body, under its
+own name: `requested_hops` / `effective_hops` / `hops_clamped`, and likewise for `budget`, `limit`
+and `fanout`. A raise to a minimum counts as a clamp (`budget=1` reports `effective_budget: 256`,
+`budget_clamped: true`). A number the caller did not supply is not reported; the default is not a
+clamp.
 
 ```
 request(ops="context(query=\"rotary position embedding\", hops=1, budget=4096)")

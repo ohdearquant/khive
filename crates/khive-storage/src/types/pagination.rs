@@ -92,6 +92,29 @@ pub struct BoundedCount {
     pub saturated: bool,
 }
 
+/// The common response metadata for an operation that bounds a caller's
+/// requested limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LimitReport {
+    pub requested_limit: u32,
+    pub effective_limit: u32,
+    pub limit_clamped: bool,
+}
+
+impl LimitReport {
+    pub fn new(requested_limit: u32, effective_limit: u32) -> Self {
+        Self {
+            requested_limit,
+            effective_limit,
+            limit_clamped: requested_limit > effective_limit,
+        }
+    }
+
+    pub fn value(self) -> serde_json::Value {
+        serde_json::to_value(self).expect("LimitReport serialization cannot fail")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +143,25 @@ mod tests {
         });
         let result: Result<PageRequest, _> = serde_json::from_value(raw);
         assert!(result.is_ok(), "offset == i64::MAX must be accepted");
+    }
+
+    #[test]
+    fn limit_report_has_one_shared_wire_shape() {
+        assert_eq!(
+            LimitReport::new(201, 200).value(),
+            serde_json::json!({
+                "requested_limit": 201,
+                "effective_limit": 200,
+                "limit_clamped": true,
+            })
+        );
+        assert_eq!(
+            LimitReport::new(2, 2).value(),
+            serde_json::json!({
+                "requested_limit": 2,
+                "effective_limit": 2,
+                "limit_clamped": false,
+            })
+        );
     }
 }

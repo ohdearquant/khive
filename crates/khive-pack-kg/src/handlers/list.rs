@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{LimitReport, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
 use khive_runtime::EdgeListFilter;
@@ -28,18 +28,20 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
 }
 
 pub(super) fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
-    serde_json::json!({
-        "items": items,
-        "requested_limit": requested,
-        "effective_limit": effective,
-        "limit_clamped": requested > effective,
-    })
+    let mut response = serde_json::json!({"items": items});
+    add_list_limit_metadata(&mut response, requested, effective);
+    response
 }
 
 pub(super) fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
-    response["requested_limit"] = serde_json::json!(requested);
-    response["effective_limit"] = serde_json::json!(effective);
-    response["limit_clamped"] = serde_json::json!(requested > effective);
+    let report = LimitReport::new(requested, effective).value();
+    let Some(fields) = report.as_object() else {
+        return;
+    };
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    object.extend(fields.clone());
 }
 
 fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
