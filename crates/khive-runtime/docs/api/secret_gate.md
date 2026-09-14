@@ -405,6 +405,9 @@ that `mask_bounded` has already decided to truncate.
 
 ## mask_secrets
 
+The preview uses the fixed `***MASKED***` marker as a position-only redaction, with no candidate
+prefix or length; it is distinct from the internal `SecretMatch.masked` excerpt (`first6...Nchars`).
+
 A transcript line cannot be rejected wholesale, so each credential span is replaced in place
 while the surrounding prose is preserved. Spans are discovered left to right against the ORIGINAL
 text via `scan_from`: each scan advances a `from` cursor past the previous span but always
