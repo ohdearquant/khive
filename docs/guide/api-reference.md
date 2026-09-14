@@ -267,8 +267,9 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 ### `restore` — Declaration
 
 Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live record is an
-idempotent no-op. A note restore refuses when another live note already holds the same
-namespace/kind/key identity; neither record is changed. An entity that was merged into another
+idempotent no-op. A note restore refuses with the conflict error `restore_key_conflict` when
+another live note already holds the same namespace/kind/key identity (details: `reason`, `key`,
+`existing_id`); neither record is changed. An entity that was merged into another
 entity is a merge tombstone, not a plain soft delete: restore refuses it with `merge_tombstone`
 and names the kept id.
 
@@ -1093,6 +1094,12 @@ Create a GTD task (note with `kind=task`).
 | `depends_on`        | array\<uuid\>   | no       | Blocking task complete UUIDs or unique 8+ hex prefixes resolved in the caller's primary namespace.                                                                   |
 | `context_entity_id` | uuid            | no       | Full UUID of a related KG entity. Prefixes are rejected because the stored relationship is an explicit stable reference; Agent responses preserve it canonically.    |
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
+| `idempotency_key`   | string          | no       | Key scoped to the caller's namespace, at most 512 UTF-8 bytes, no NUL. See the replay rule below.                                                                    |
+
+With `idempotency_key`, a replay whose stored content matches the original returns the original
+task with `replayed=true` and records no new dependency edges. Different content under the same
+key is refused with the conflict error `idempotency_key_conflict`; its details carry `reason`,
+`key` and `existing_id` (the task that holds the key).
 
 ```
 request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
@@ -1160,6 +1167,11 @@ Explicit GTD status transition with lifecycle validation.
 | `status` | string | yes      | Target status (same set/aliases as above). |
 | `note`   | string | no       | Note attached to the transition.           |
 
+A task already in the target status is a read assertion, not a lifecycle event: the response
+carries `transitioned=false`, `from`, `to` and `note: "already in target status"`, no lifecycle
+audit row is written, and a `note` passed with the request is not persisted, reported as
+`note_recorded=false`.
+
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
 ```
@@ -1175,16 +1187,22 @@ Salience- and decay-weighted memory notes. Optional; load with
 
 Create a memory note with salience and decay.
 
-| Param             | Type   | Required | Notes                                                                                                                       |
-| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `content`         | string | yes      | Memory content.                                                                                                             |
-| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                           |
-| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay. |
-| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                      |
-| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                           |
-| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                             |
-| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                       |
+| Param             | Type   | Required | Notes                                                                                                                                 |
+| ----------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`         | string | yes      | Memory content.                                                                                                                       |
+| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                                     |
+| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.           |
+| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                                |
+| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
+| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
+| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
+| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
+| `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+With `idempotency_key`, a replay whose content matches the stored memory returns the original
+memory with `replayed=true`. Different content under the same key is refused with the conflict
+error `idempotency_key_conflict`; its details carry `reason`, `key` and `existing_id` (the memory
+that holds the key).
 
 ```
 request(ops="memory.remember(content=\"ADR-016 fixes the DSL grammar\", salience=0.7, memory_type=\"semantic\")")
