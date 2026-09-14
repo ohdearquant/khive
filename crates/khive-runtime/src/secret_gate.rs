@@ -984,25 +984,12 @@ fn check_known_patterns(text: &str) -> Option<(&str, &'static str)> {
     }
 
     // --- PEM private key block ---
-    // "-----BEGIN <TYPE> PRIVATE KEY-----"
-    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
-        if let Some(pos) = text.find("-----BEGIN") {
-            // Measure only the key block itself (up to END marker or end-of-string),
-            // not the rest of the surrounding text, so build_match reports the
-            // block length rather than the remaining string length.
-            let block_end = text[pos..]
-                .find("-----END")
-                .map(|rel| {
-                    text[pos + rel..]
-                        .find('\n')
-                        .map(|l| pos + rel + l + 1)
-                        .unwrap_or(text.len())
-                })
-                .unwrap_or(text.len());
-            let excerpt = &text[pos..block_end];
-            keep_leftmost(&mut best, Some((excerpt, "pem-private-key")), base);
-        }
-    }
+    // "-----BEGIN <TYPE> PRIVATE KEY-----" followed by a body.
+    keep_leftmost(
+        &mut best,
+        find_pem_private_key_block(text).map(|m| (m, "pem-private-key")),
+        base,
+    );
 
     // --- JWT triple: eyJ...eyJ...eyJ (header.payload.signature) ---
     // A JWT starts with "eyJ" (base64url of `{"`) and has exactly two dots.
@@ -1112,6 +1099,79 @@ fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
 
 /// Scan for a JWT pattern: at least two "eyJ" segments separated by a `.`
 /// character, with each segment at least 10 chars.
+/// Shortest line of base64 that counts as PEM key material. Real key blocks
+/// wrap at 64 columns; the last line of a block can be shorter, but a block
+/// with no END marker is recognised by a full-width line, so a short tail on
+/// its own is a mention rather than a key.
+const PEM_BODY_LINE_MIN: usize = 40;
+
+/// A line consisting only of base64 alphabet characters, long enough to be a
+/// wrapped line of a key block.
+fn is_pem_body_line(line: &str) -> bool {
+    line.len() >= PEM_BODY_LINE_MIN
+        && line
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// Find the leftmost PEM private key block: a `-----BEGIN <TYPE> PRIVATE
+/// KEY-----` header line followed by a body. The body is either a matching
+/// `-----END ... PRIVATE KEY-----` marker before the next BEGIN, or at
+/// least one line of base64 of key-block width directly under it. A header
+/// with neither is a mention of the format (a documentation page, code that
+/// prints the label) and carries no key, so it is not a candidate. The
+/// returned slice is bounded to the block: through the END line when one is
+/// present, otherwise through the last base64 line under the header.
+fn find_pem_private_key_block(text: &str) -> Option<&str> {
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("-----BEGIN") {
+        let pos = search + rel;
+        let header_end = text[pos..]
+            .find('\n')
+            .map(|l| pos + l)
+            .unwrap_or(text.len());
+        let header = &text[pos..header_end];
+        // Resume after this header on the next pass whatever it turns out to be.
+        search = header_end;
+        if !header.contains("PRIVATE KEY-----") {
+            continue;
+        }
+        let body_start = text[header_end..]
+            .find('\n')
+            .map(|l| header_end + l + 1)
+            .unwrap_or(text.len());
+        // The END marker must belong to this header: stop looking at the
+        // next BEGIN so a mention above a real block does not claim it.
+        let next_begin = text[body_start..]
+            .find("-----BEGIN")
+            .map(|r| body_start + r)
+            .unwrap_or(text.len());
+        if let Some(end_rel) = text[body_start..next_begin].find("-----END") {
+            let end_pos = body_start + end_rel;
+            let end_line = text[end_pos..]
+                .find('\n')
+                .map(|l| end_pos + l + 1)
+                .unwrap_or(text.len());
+            if text[end_pos..end_line].contains("PRIVATE KEY-----") {
+                return Some(&text[pos..end_line]);
+            }
+        }
+        let mut body_end = None;
+        let mut cursor = body_start;
+        for line in text[body_start..].split_inclusive('\n') {
+            if !is_pem_body_line(line.trim_end_matches(['\r', '\n'])) {
+                break;
+            }
+            cursor += line.len();
+            body_end = Some(cursor);
+        }
+        if let Some(end) = body_end {
+            return Some(&text[pos..end]);
+        }
+    }
+    None
+}
+
 fn find_jwt(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -3604,6 +3664,106 @@ mod tests {
         let header = ["-----BEGIN EC", " PRIVATE KEY-----"].concat(); // gitleaks:allow
         let fake = format!("{}\nMHQCAQEE\u{2026}\n-----END EC PRIVATE KEY-----", header);
         assert!(scan(&fake).is_some(), "EC PEM must be caught");
+    }
+
+    #[test]
+    fn pem_header_alone_is_a_mention_not_a_key() {
+        // A documentation page names the header label with no END marker and
+        // no base64 under it: the format is mentioned, no key is present.
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let doc = format!(
+            "A PEM private key file starts with the line `{}` and the key\n\
+             material follows it on wrapped lines. Keep such files out of chat.\n",
+            header
+        );
+        assert!(
+            scan(&doc).is_none(),
+            "a header with no body must not be reported as a key"
+        );
+        // Positive control on the same predicate: the same header with a
+        // matching END marker is a block, however short its body.
+        let block = format!("{}\nMIIEo\u{2026}\n-----END RSA PRIVATE KEY-----", header);
+        assert_eq!(scan(&block).unwrap().detector, "pem-private-key");
+    }
+
+    #[test]
+    fn pem_many_headers_without_bodies_are_accepted() {
+        // Eight header mentions across a page (the second reported shape),
+        // none followed by an END marker or a base64 line.
+        let header = ["-----BEGIN EC", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let mut doc = String::new();
+        for kind in [
+            "RSA",
+            "EC",
+            "DSA",
+            "OPENSSH",
+            "ENCRYPTED",
+            "",
+            "PGP",
+            "X25519",
+        ] {
+            doc.push_str(&format!(
+                "Use `-----BEGIN {} PRIVATE KEY-----` for this key type.\n",
+                kind
+            ));
+        }
+        assert!(doc.matches("-----BEGIN").count() == 8);
+        assert!(scan(&doc).is_none(), "{:?}", scan(&doc));
+        // Same page with one real block appended is refused, and the
+        // candidate is that block, not the page from the first mention down.
+        let block = format!("{header}\nMHQCAQEE\u{2026}\n-----END EC PRIVATE KEY-----\n");
+        let with_block = format!("{doc}{block}");
+        let m = scan(&with_block).unwrap();
+        assert_eq!(m.detector, "pem-private-key");
+        assert!(
+            m.masked
+                .ends_with(&format!("...{}chars", block.chars().count())),
+            "masked: {}",
+            m.masked
+        );
+    }
+
+    #[test]
+    fn pem_header_with_base64_body_and_no_end_marker_is_refused() {
+        // Key material pasted without its END line is still a key.
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let body_line = "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGYPYFqHlZ4kUmUqQ7fEd7Uw";
+        let trailing =
+            "and then a long paragraph of ordinary prose that is not part of the key block at all";
+        let text = format!("{header}\n{body_line}\n{body_line}\n\n{trailing}\n");
+        let m = scan(&text).expect("a header with a base64 body is a key");
+        assert_eq!(m.detector, "pem-private-key");
+        // The candidate is bounded to the header plus its base64 lines.
+        let block_len = header.chars().count() + 1 + (body_line.len() + 1) * 2;
+        let reported_len: usize = m
+            .masked
+            .trim_end_matches("chars")
+            .rsplit("...")
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("masked preview ends in the candidate length");
+        assert_eq!(reported_len, block_len, "masked: {}", m.masked);
+        // A short base64 tail alone (below key-block width) is not a body.
+        let short = format!("{header}\nMIIEowIBAAKCAQEA\n{trailing}\n");
+        assert!(scan(&short).is_none(), "{:?}", scan(&short));
+    }
+
+    #[test]
+    fn pem_block_after_an_unrelated_begin_marker_is_still_caught() {
+        // A certificate header earlier in the text must not hide the key
+        // block behind it, and the candidate starts at the key header.
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let text = format!(
+            "-----BEGIN CERTIFICATE-----\nMIIB\u{2026}\n-----END CERTIFICATE-----\n{}\nMIIEo\u{2026}\n-----END RSA PRIVATE KEY-----\n",
+            header
+        );
+        let m = scan(&text).expect("the key block must be caught");
+        assert_eq!(m.detector, "pem-private-key");
+        assert!(
+            !m.masked.starts_with("-----BEGIN C"),
+            "candidate must start at the key header: {}",
+            m.masked
+        );
     }
 
     #[test]
