@@ -232,4 +232,4 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 
 ## Proposed amendments
 
-- [ADR-179 Amendment 1: Message-pair identity](ADR-179-operation-identity-memory-remember.md#amendment-1-message-pair-identity-proposed-2026-09-09).
+None at present. ADR-179 Amendment 1 (message-pair identity) was accepted on 2026-09-09.

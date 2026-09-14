@@ -368,7 +368,9 @@ items priority-sorted.
 These verbs do not have shared-CRUD equivalents. Lifecycle semantics belong in the
 pack that defines them.
 
-### Proposed amendment: dependency diagnostic ownership (#2675)
+### Amendment (2026-09-14): dependency diagnostic ownership (#2675)
+
+**Status**: Accepted (2026-09-14).
 
 The task hook rejects incoming `properties.blocked_by`,
 `properties.dependency_state`, and `properties.actionable` on generic task updates,
