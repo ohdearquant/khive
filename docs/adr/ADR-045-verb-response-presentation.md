@@ -402,7 +402,7 @@ empty field named `items`, `entities`, `notes`, or `edges` still drops it. The
 three limit-metadata fields identify a list envelope at the presentation
 boundary.
 
-[Proposed Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes)
+[Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes)
 explicitly applies this rule to the new knowledge-list/topic `results` envelopes
 on acceptance, while retaining ordinary row transforms.
 
@@ -664,8 +664,8 @@ completion signals and a caller that cannot see them cannot terminate. The
 exception is envelope-scoped in the same way: a `results` array without a
 sibling `next_after` key receives the ordinary transform.
 
-That last sentence is qualified, on acceptance, by
-[proposed Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes):
+That last sentence is qualified by
+[Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes):
 the new knowledge-list/topic report siblings also identify a structural envelope
 without a cursor. Existing keyset completion behavior does not change.
 
@@ -679,7 +679,7 @@ without a cursor. Existing keyset completion behavior does not change.
 
 ## Amendment 5 (2026-09-14): structural knowledge limit envelopes
 
-**Status: Proposed — pending owner/spec approval.**
+**Status: Accepted (2026-09-14).**
 **Related issue:** #2679.
 
 This amendment accompanies
