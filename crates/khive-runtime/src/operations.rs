@@ -32,6 +32,17 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
+fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) -> RuntimeError {
+    KhiveError::conflict(format!(
+        "merge_tombstone: {id} was merged into {kept_id}; a merge tombstone is not restorable, query the kept id"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "merge_tombstone".into()),
+        ("merged_into", kept_id.to_string()),
+    ]))
+    .into()
+}
+
 fn restore_key_conflict(key: &str, holder: &Note) -> RuntimeError {
     KhiveError::conflict(format!(
         "restore_key_conflict: key {key:?} is already held by live note {}",
@@ -4912,6 +4923,14 @@ impl KhiveRuntime {
         }
         if entity.deleted_at.is_none() {
             return Ok(Some((entity, false)));
+        }
+        // A merge tombstone is not a plain soft delete: the source row carries
+        // merge provenance and its content already lives on the kept entity.
+        // Clearing only `deleted_at` would bring the source back as a live
+        // duplicate that still claims to have been merged. Refuse and name
+        // the kept id; restore does not undo a merge.
+        if let Some(kept_id) = entity.merged_into {
+            return Err(merge_tombstone_restore_refused(id, kept_id));
         }
         let updated_at =
             Utc::now()
