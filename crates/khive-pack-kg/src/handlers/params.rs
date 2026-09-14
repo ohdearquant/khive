@@ -253,9 +253,20 @@ pub(crate) struct NeighborsParams {
     pub(crate) limit: Option<u32>,
     pub(crate) min_weight: Option<f64>,
     pub(crate) relations: Option<Vec<String>>,
+    pub(crate) after: Option<String>,
+    pub(crate) neighbor_kinds: Option<Vec<String>>,
+    pub(crate) projection: Option<NeighborProjection>,
     /// When true, each neighbor in the result carries its `entity_type` field.
     /// Absent or false: result shape is identical to today (no `entity_type` key).
     pub(crate) include_entity_type: Option<bool>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NeighborProjection {
+    Edge,
+    Summary,
+    Record,
 }
 
 #[derive(Deserialize)]

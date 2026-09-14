@@ -900,11 +900,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate live graph neighbors, returned as a bare array of hits rather than the \
-                      {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
-                      queried node, edge_id, relation, weight, and the neighbor's id, kind and \
-                      name; include_entity_type=true adds entity_type when the neighbor has one. \
-                      This verb does not accept `include_deleted`.",
+        description: "Immediate graph neighbors. With no explicit `limit`, the response remains a \
+                      bare array of hits. An explicit limit returns a `neighbors` page with \
+                      `requested_limit`, `effective_limit`, `limit_clamped`, and `next_after`. \
+                      Each record hit carries origin_id for the queried node, edge_id, relation, \
+                      weight, and the neighbor's id, kind and name; include_entity_type=true adds \
+                      entity_type when the neighbor has one. This verb does not accept \
+                      `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -936,6 +938,34 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "number",
                 required: false,
                 description: "Minimum edge weight for returned neighbors (0.0–1.0). Edges below this threshold are excluded.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum neighbors to return (default: all for compatibility). Explicit values are capped at 1000 and report requested_limit, effective_limit, and limit_clamped.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after",
+                param_type: "string",
+                required: false,
+                description: "Opaque cursor from a prior limited response. Pass an empty string to start a cursor walk; requires an explicit limit. Results continue in weight-descending, neighbor-id-ascending, edge-id-ascending order.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "neighbor_kinds",
+                param_type: "array of string",
+                required: false,
+                description: "Filter neighbors to these entity or note kinds before the limit is applied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "projection",
+                param_type: "string",
+                required: false,
+                description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -1083,7 +1113,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 param_type: "integer",
                 required: false,
                 description: "Max anchors taken from the `query` search leg, clamped 1..=20 \
-                              (default 5). Does not clamp explicit entity_ids.",
+                              (default 5). Does not clamp explicit entity_ids. An explicit \
+                              value reports requested_limit, effective_limit, and limit_clamped.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

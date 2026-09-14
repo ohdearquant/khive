@@ -11607,6 +11607,92 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn context_reports_every_clamped_number_and_only_when_supplied() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxClampAnchor", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create anchor");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    // Every clamped number reports requested / effective / clamped under its
+    // own name, on both sides of its range.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({
+                "entity_ids": [a_id],
+                "hops": 9,
+                "budget": 1,
+                "limit": 1000,
+                "fanout": 999
+            }),
+        )
+        .await
+        .expect("context with out-of-range numbers must still succeed");
+    assert_eq!(resp["requested_hops"], 9);
+    assert_eq!(resp["effective_hops"], 2);
+    assert_eq!(resp["hops_clamped"], true);
+    assert_eq!(resp["requested_budget"], 1);
+    assert_eq!(resp["effective_budget"], 256);
+    assert_eq!(
+        resp["budget_clamped"], true,
+        "a raise to the minimum is a clamp"
+    );
+    assert_eq!(resp["requested_limit"], 1000);
+    assert_eq!(resp["effective_limit"], 20);
+    assert_eq!(resp["limit_clamped"], true);
+    assert_eq!(resp["requested_fanout"], 999);
+    assert_eq!(resp["effective_fanout"], 50);
+    assert_eq!(resp["fanout_clamped"], true);
+    assert!(resp["anchors"].is_array(), "the response body is unchanged");
+
+    // In-range values report unclamped.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "budget": 4096, "limit": 5, "fanout": 10}),
+        )
+        .await
+        .expect("context in range");
+    assert_eq!(resp["hops_clamped"], false);
+    assert_eq!(resp["budget_clamped"], false);
+    assert_eq!(resp["limit_clamped"], false);
+    assert_eq!(resp["fanout_clamped"], false);
+    assert_eq!(resp["effective_budget"], 4096);
+
+    // A number the caller did not supply is not reported: the default is not
+    // a clamp, and the fields stay absent so existing readers see no new keys.
+    let resp = pack
+        .dispatch("context", json!({"entity_ids": [a_id]}))
+        .await
+        .expect("context with defaults");
+    for key in [
+        "requested_hops",
+        "effective_hops",
+        "hops_clamped",
+        "requested_budget",
+        "effective_budget",
+        "budget_clamped",
+        "requested_limit",
+        "effective_limit",
+        "limit_clamped",
+        "requested_fanout",
+        "effective_fanout",
+        "fanout_clamped",
+    ] {
+        assert!(
+            resp.get(key).is_none(),
+            "{key} must be absent when not supplied"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
     // a syntactically valid but nonexistent UUID must
     // error, not silently vanish from the response.

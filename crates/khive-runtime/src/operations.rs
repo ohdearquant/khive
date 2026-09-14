@@ -15,8 +15,8 @@ use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
     EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedEdgeUpsertOutcome,
-    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow,
-    SqlStatement, SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
+    LinkId, NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SortOrder,
+    SqlRow, SqlStatement, SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{
     Attachment, AttachmentSubstrate, Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter,
@@ -2894,7 +2894,23 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         node_id: Uuid,
+        query: NeighborQuery,
+    ) -> RuntimeResult<Vec<NeighborHit>> {
+        self.neighbors_with_query_page(token, node_id, query, None, None, true)
+            .await
+    }
+
+    /// Get a deterministic neighbor page, optionally applying a continuation
+    /// cursor and filtering entity/note kinds before the storage limit.
+    /// `enrich` is false for the lightweight edge projection.
+    pub async fn neighbors_with_query_page(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
         mut query: NeighborQuery,
+        after: Option<NeighborCursor>,
+        neighbor_kinds: Option<Vec<String>>,
+        enrich: bool,
     ) -> RuntimeResult<Vec<NeighborHit>> {
         if !self.substrate_exists_in_ns(token, node_id).await? {
             return Ok(Vec::new());
@@ -2905,12 +2921,17 @@ impl KhiveRuntime {
         let mut hits = Vec::new();
         for ns in token.visible_namespaces() {
             let temp = NamespaceToken::for_namespace(ns.clone());
-            let mut ns_hits = self.graph(&temp)?.neighbors(node_id, query.clone()).await?;
+            let mut ns_hits = self
+                .graph(&temp)?
+                .neighbors_page(node_id, query.clone(), after, neighbor_kinds.clone())
+                .await?;
             hits.append(&mut ns_hits);
         }
         hits.sort_by_key(|h| (h.node_id, h.edge_id));
         hits.dedup_by_key(|h| (h.node_id, h.edge_id));
-        self.enrich_neighbor_hits(token, &mut hits).await;
+        if enrich {
+            self.enrich_neighbor_hits(token, &mut hits).await;
+        }
         // Filter out soft-deleted entity nodes.
         let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
         let deleted = self.deleted_entity_ids(candidate_ids).await?;
@@ -2928,6 +2949,7 @@ impl KhiveRuntime {
                 .partial_cmp(&a.weight)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.node_id.cmp(&b.node_id))
+                .then(a.edge_id.cmp(&b.edge_id))
         });
         Ok(hits)
     }
@@ -3060,6 +3082,7 @@ impl KhiveRuntime {
                 .partial_cmp(&a.hit.weight)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.hit.node_id.cmp(&b.hit.node_id))
+                .then(a.hit.edge_id.cmp(&b.hit.edge_id))
         });
         Ok(hits.into_iter().map(|h| (h.hit, h.direction)).collect())
     }
