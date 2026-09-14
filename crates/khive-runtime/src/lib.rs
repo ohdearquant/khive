@@ -109,9 +109,10 @@ pub use engine_config::{
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
     ChannelIngestFailureClass, DenialAuditOutcome, DenialReceipt, DispatchError, DomainDisposition,
-    GuardedWriteFailure, RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext,
-    WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-    WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
+    GuardedWriteFailure, ReceiptRefusal, RuntimeError, RuntimeResult,
+    WriterPoolCheckoutTimeoutContext, WriterTaskFailureContext, WRITER_ADMISSION_SCOPE,
+    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
 pub use error_projection::runtime_error_value;
 pub use event_store_guard::EventAttribution;
