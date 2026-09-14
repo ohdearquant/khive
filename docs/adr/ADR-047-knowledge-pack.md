@@ -324,7 +324,7 @@ list(
 Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
 declared total order of `created_at DESC, id DESC`.
 
-The [proposed 2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
+The [2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
 extends this response shape and specifies the existing lower bound on acceptance;
 this section's pagination and projection rules otherwise remain in force.
 
@@ -525,7 +525,7 @@ topic(domain?, query?, limit?) → {results: [...], total: N}
   reflects the capped limit via `items` and `total`.
 - The domain filter is case-insensitive tag match (`eq_ignore_ascii_case`).
 
-The [proposed 2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
+The [2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
 replaces this section's silent-cap, `items`, and cap-through-`total` description
 on acceptance, with separate definitions for the two existing `total` values.
 
@@ -591,15 +591,15 @@ existing `concept` entity kind in ADR-001 is the correct substrate; no new kind 
 
 ## Amendment (2026-09-14): knowledge list and topic limit reports
 
-**Status: Proposed — pending owner/spec approval.**
+**Status: Accepted (2026-09-14).**
 **Related issue:** #2679.
 
 This amendment adds numeric normalization reports to `knowledge.list` and
 `knowledge.topic` and proposes the associated structural empty-result behavior
 in [ADR-045 Amendment 5 (2026-09-14)](ADR-045-verb-response-presentation.md#amendment-5-2026-09-14-structural-knowledge-limit-envelopes).
-Both decisions require approval before dependent implementation merges. A later
-fix marks only these new amendments Accepted; the accepted parent ADRs retain
-their status. Proposed text is not implementation acceptance.
+Both decisions were approved on 2026-09-14; the accepted parent ADRs retain
+their status. Acceptance of the text is not implementation acceptance: the
+dependent implementation lands on its own gates.
 
 On acceptance, this amendment extends §2's `knowledge.list` response signature
 and limit description. It replaces only §5's statement that the topic cap is
@@ -727,4 +727,4 @@ fixtures that cannot establish their positive control require correction and
 refreezing, not weakened inequalities. Fixed runs must pass the same controls.
 A mutant kill requires the intended semantic assertion with a nonzero selected
 test count; compilation, setup failure and unrelated errors do not qualify.
-No test or mutation result is claimed by this proposed contract.
+No test or mutation result is claimed by this contract.
