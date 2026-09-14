@@ -7,10 +7,10 @@
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
 
-## Proposed amendment: existing atom properties-only updates
+## Amendment (2026-09-14): existing atom properties-only updates
 
-**Status: Proposed.** This amendment is pending acceptance and does not supersede
-the accepted contract until that decision.
+**Status: Accepted (2026-09-14).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates.
 
 `knowledge.upsert_atoms` gains a second atom row form:
 `{id: <complete UUID>, properties: <JSON value or null>}`. Both keys are required.
