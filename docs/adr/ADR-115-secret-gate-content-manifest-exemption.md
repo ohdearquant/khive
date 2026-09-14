@@ -1053,8 +1053,8 @@ schema nor exemption-manifest identity.
 
 ## Proposed amendment: prose-shaped names and stored UUID references (2026-09-14)
 
-**Status**: Proposed — the policy split has been ruled; this exact grammar, scope and
-operational contract still require signature before any detector change.
+**Status**: Items 1, 3 and 4 signed; item 2 ruled (a); item 5 held. UUID admission remains
+disabled until the separate addendum is signed.
 
 This proposal qualifies the content-shape rationale above for a closed syntax exception. It does
 not infer provenance from explanatory prose. An admitted spelling can still be a credential; the
@@ -1063,16 +1063,17 @@ requirements and its activation gates remain unchanged. No automatic manifest en
 
 ### 1. Recommended name grammars and their limits
 
-Each grammar is ASCII and matches a complete whitespace-delimited member, either bare or enclosed
-in exactly one matching pair of backticks. No other punctuation is removed to obtain a match.
+Each grammar is ASCII and matches a complete whitespace-delimited member. Environment-variable
+names and LaTeX controls may be bare or enclosed in exactly one matching pair of backticks. Code
+identifiers require exactly one matching pair of backticks. No other punctuation is removed to obtain a match.
 No Unicode normalization, case folding or substring matching participates in admission. Lengths
-are bytes after removal of that one optional backtick pair.
+are bytes after removal of that backtick pair when present.
 
-| Form                      | Proposed exact grammar         | Bounds and additional requirements                                                                                |
-| ------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| Environment-variable name | `[A-Z_][A-Z0-9_]{0,127}`       | At least one ASCII letter; no value assignment.                                                                   |
-| Code identifier           | `[A-Za-z_][A-Za-z0-9_]{0,127}` | At least one ASCII letter; no value assignment.                                                                   |
-| LaTeX control             | `\\[A-Za-z]{1,64}`             | One literal backslash followed by 1–64 ASCII letters; no digits, braces, arguments, star or additional backslash. |
+| Form                      | Proposed exact grammar         | Bounds and additional requirements                                                                                                    |
+| ------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Environment-variable name | `[A-Z_][A-Z0-9_]{0,127}`       | Bare or backticked; at least one ASCII letter; no value assignment.                                                                   |
+| Code identifier           | `[A-Za-z_][A-Za-z0-9_]{0,127}` | Backtick-enclosed only; at least one ASCII letter; no value assignment.                                                               |
+| LaTeX control             | `\\[A-Za-z]{1,64}`             | Bare or backticked; one literal backslash followed by 1–64 ASCII letters; no digits, braces, arguments, star or additional backslash. |
 
 The 128-byte name bound and 64-letter control bound are proposed limits requiring exact-doc
 signature. The environment grammar is a subset of the code grammar; prose labels do not select
@@ -1213,12 +1214,10 @@ include this disclosure and dual-use risk; namespace attribution cannot be offer
 - **`high-entropy-token`:** cloud-resource names must remain refused where the ordinary scanner
   refuses them, and gain no cloud/provider-name exemption. Opaque
   values, assignment values, protected inner runs and external reconstruction retain refusal;
-  only the exact §1 syntax admits override their specified entropy checks. A cloud name that is
-  byte-identical to an admitted underscore name is indistinguishable from that name by content;
-  preserving refusal for that overlap requires the explicit scope ruling in §5. Until the overlap
-  is resolved, the environment/code syntax exception is not an implementable authorization to
-  admit that cloud spelling. A prefix list chosen only to exclude an example is not a general
-  cloud-resource discriminator.
+  only the exact §1 syntax admits override their specified entropy checks. Under ruling (a), code
+  identifiers require backticks; environment-variable names and LaTeX controls admit bare or
+  backticked. The residual is explicit: a cloud resource name an author backticks is admitted by that act.
+  A prefix list chosen only to exclude an example is not a general cloud-resource discriminator.
 
 Known credential-prefix, JWT and PEM private-key detectors retain their priority and behavior.
 No prose label such as “example”, “hash”, “resource”, “identifier” or “macro” rescues a failed shape.
@@ -1228,10 +1227,10 @@ No prose label such as “example”, “hash”, “resource”, “identifier�
 Predeclare tests and mutants before executing a baseline. Preserve the existing twelve-case
 proposal unchanged as evidence of the broader request; it is not this split's accepted test matrix.
 The three name probes can change under this proposal. The bare UUID probe has no store context;
-the hex probe remains refused. The cloud probe reveals the unresolved grammar overlap in §5:
-`GCP_Project_EuropeWest1_ExampleKeyRingBackup` also matches the proposed code-name grammar and has
-no protected long inner run. Claiming both an unconditional grammar admit and refusal of that same
-spelling would be inconsistent. No claim that this split resolves all six is made.
+the hex probe remains refused. The cloud probe is carried both ways under ruling (a):
+`GCP_Project_EuropeWest1_ExampleKeyRingBackup` is refused bare and admitted when backtick-enclosed;
+it has no protected long inner run. This is the overlap witness, with the residual stated in §3.
+No claim that this split resolves all six is made.
 
 For each admitted name, pair the real whole-name entropy crossing with an ordinary passing name,
 the retained known-prefix/inner-run/bridge controls, and a same-grammar credential residual case.
@@ -1258,10 +1257,8 @@ source analysis and synthetic examples are not executed results or replay of a r
    environment/code names, plus the explicitly different full letters-only LaTeX-body admission.
    Removing the name inner-run veto too would admit opaque alphanumeric credentials that match
    the name grammar; the proposal does not do that.
-2. Resolve overlap with cloud resource names: the code-name grammar has no provenance. Before
-   implementation, choose a narrower grammar or an authoritative input surface that can distinguish
-   the prohibited resource cases. Prose labels are forgeable. Relaxing
-   cloud refusal instead would change the ruled split and is not authorized by this proposal.
+2. Resolved (a): code identifiers admit only when backtick-enclosed; environment-variable names
+   and LaTeX controls admit bare or backticked. The cloud-overlap residual is stated in §3.
 3. Confirm entities and all shared notes regardless of registered note kind, including task and
    session, as the only initially consulted records. Confirm exclusion of edges, events and private
    records including the `sessions` and `session_messages` mirror tables, live-only same-store scope,
