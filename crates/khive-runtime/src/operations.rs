@@ -53,6 +53,19 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
     .into()
 }
 
+fn live_merged_entity_refused(id: Uuid, kept_id: impl std::fmt::Display) -> RuntimeError {
+    KhiveError::conflict(format!(
+        "live_merged_entity: {id} is live but still carries merged_into {kept_id}; a row an \
+         earlier restore left live over its merge is not restorable, re-tombstone it or query the \
+         kept id"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "live_merged_entity".into()),
+        ("merged_into", kept_id.to_string()),
+    ]))
+    .into()
+}
+
 fn restore_key_conflict(key: &str, holder: &Note) -> RuntimeError {
     KhiveError::conflict(format!(
         "restore_key_conflict: key {key:?} is already held by live note {}",
@@ -4933,16 +4946,25 @@ impl KhiveRuntime {
         if entity.namespace != token.namespace().as_str() {
             return Ok(None);
         }
-        if entity.deleted_at.is_none() {
-            return Ok(Some((entity, false)));
-        }
         // A merge tombstone is not a plain soft delete: the source row carries
         // merge provenance and its content already lives on the kept entity.
         // Clearing only `deleted_at` would bring the source back as a live
         // duplicate that still claims to have been merged. Refuse and name
         // the kept id; restore does not undo a merge.
+        //
+        // The merge check runs before the already-live short cut on purpose:
+        // a live row that still carries `merged_into` is what an earlier
+        // restore left behind before this guard existed, and answering it
+        // "already live" would hide the invariant violation from the one
+        // caller who is looking at the row. Name it instead.
         if let Some(kept_id) = entity.merged_into {
+            if entity.deleted_at.is_none() {
+                return Err(live_merged_entity_refused(id, kept_id));
+            }
             return Err(merge_tombstone_restore_refused(id, kept_id));
+        }
+        if entity.deleted_at.is_none() {
+            return Ok(Some((entity, false)));
         }
         let updated_at =
             Utc::now()
