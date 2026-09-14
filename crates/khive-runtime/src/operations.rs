@@ -4928,7 +4928,7 @@ impl KhiveRuntime {
         // merge provenance and its content already lives on the kept entity.
         // Clearing only `deleted_at` would bring the source back as a live
         // duplicate that still claims to have been merged. Refuse and name
-        // the kept id; a merge is undone by a merge rollback, not by restore.
+        // the kept id; restore does not undo a merge.
         if let Some(kept_id) = entity.merged_into {
             return Err(merge_tombstone_restore_refused(id, kept_id));
         }
