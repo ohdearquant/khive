@@ -12,6 +12,14 @@
 # `#` comments are ignored. No file, or an empty one, means run unserialized,
 # which is what CI and a single-developer machine want.
 #
+# A commit issued from inside a script that already holds one of these locks
+# must not queue behind its own ancestor: flock has no reentrancy, so the hook
+# would wait out the full timeout and then refuse. Before taking a lock the hook
+# lists the lock file's holders and, when one of them is an ancestor of this
+# process, runs that step without the lock (it is already inside the queue).
+# An unrelated holder still queues as written. Holder detection needs lsof;
+# without it the hook queues on every declared lock.
+#
 # usage: scripts/hook-cargo.sh fmt|clippy
 set -euo pipefail
 
@@ -20,6 +28,29 @@ case "${1:-}" in
   clippy) cmd=(cargo clippy --workspace --all-targets -- -D warnings) ;;
   *) echo "hook-cargo.sh: expected fmt or clippy, got '${1:-}'" >&2; exit 2 ;;
 esac
+
+# Space-separated pids from this process up to init; used to recognise a lock
+# held by the script that issued the commit.
+ancestors=""
+pid=$$
+while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+  ancestors="$ancestors $pid"
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+done
+
+lsof_bin=$(command -v lsof || true)
+[ -z "$lsof_bin" ] && [ -x /usr/sbin/lsof ] && lsof_bin=/usr/sbin/lsof
+
+# Prints the pid of an ancestor holding $1, or nothing.
+held_by_ancestor() {
+  [ -n "$lsof_bin" ] && [ -e "$1" ] || return 0
+  local holder
+  for holder in $("$lsof_bin" -t -- "$1" 2>/dev/null); do
+    case " $ancestors " in
+      *" $holder "*) echo "$holder"; return 0 ;;
+    esac
+  done
+}
 
 locks="${XDG_CONFIG_HOME:-$HOME/.config}/khive/cargo-hook-locks"
 wrapper=()
@@ -31,9 +62,16 @@ if [ -f "$locks" ]; then
   while read -r mode path; do
     case "$mode" in
       ""|\#*) continue ;;
+      shared|exclusive) ;;
+      *) echo "hook-cargo.sh: $locks: unknown lock mode '$mode' (want shared or exclusive)" >&2; exit 3 ;;
+    esac
+    if holder=$(held_by_ancestor "$path") && [ -n "$holder" ]; then
+      echo "hook-cargo.sh: $path is held by ancestor pid $holder; running $1 inside that hold" >&2
+      continue
+    fi
+    case "$mode" in
       shared) wrapper+=(flock -o -s -w 1800 "$path") ;;
       exclusive) wrapper+=(flock -o -w 1800 "$path") ;;
-      *) echo "hook-cargo.sh: $locks: unknown lock mode '$mode' (want shared or exclusive)" >&2; exit 3 ;;
     esac
   done < "$locks"
 fi
