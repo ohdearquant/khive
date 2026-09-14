@@ -8367,6 +8367,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_refuses_a_merge_tombstone_and_keeps_the_disclosure() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge_tombstone") && msg.contains(&into.id.to_string()),
+            "restore of a merge tombstone must be refused naming the kept id, got {msg:?}"
+        );
+
+        // The refusal wrote nothing: the source is still a merge tombstone.
+        let err = rt.get_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+            "after a refused restore the merged_into disclosure must survive, got {msg:?}"
+        );
+        let tombstone = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("tombstone row still present");
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(tombstone.merged_into, Some(into.id));
+    }
+
+    #[tokio::test]
     async fn get_entity_on_plain_soft_delete_stays_bare_not_found() {
         let rt = rt();
         let tok = NamespaceToken::local();

@@ -268,7 +268,9 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 
 Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live record is an
 idempotent no-op. A note restore refuses when another live note already holds the same
-namespace/kind/key identity; neither record is changed.
+namespace/kind/key identity; neither record is changed. An entity that was merged into another
+entity is a merge tombstone, not a plain soft delete: restore refuses it with `merge_tombstone`
+and names the kept id.
 
 | Param  | Type   | Required | Notes                                                         |
 | ------ | ------ | -------- | ------------------------------------------------------------- |
