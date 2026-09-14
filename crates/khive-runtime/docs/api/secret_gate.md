@@ -209,7 +209,7 @@ fails closed).
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a
 word boundary (`contains_bounded_word`), so `auth` does not fire inside `authorized` or
-`authentication`, nor `key` inside `monkey`/`keyword`. The candidate token is excluded from its
+`authentication`, nor `key` inside `monkey`/`keyword`. A structured assignment member ending in `_key` (such as `association_key:`) does not supply the bare `key` trigger unless it names a credential compound: `api_key`, `secret_key`, `private_key`, `access_key`, `signing_key`, `encryption_key`, or `auth_key`. This exception requires an immediately following assignment delimiter, allowing a closing quote or backtick; natural-language labels such as `the key is` and `api key` retain their existing trigger behavior. The candidate token is excluded from its
 own surrounding context. This prevents an internal path segment such as `cli-auth-and-kg` from
 making the path self-trigger. Assignment-shaped candidates such as `auth=<value>` and
 `api_key=<value>` are checked separately, including when whitespace splits the label from the

@@ -2417,7 +2417,42 @@ fn contains_word(low_window: &str, needle: &str, underscore_is_word_char: bool) 
 /// still match (on the `secret`/`auth`/`key` half), while pure letter-joined
 /// collisions like `authorized`/`authentication`/`monkey`/`keyword` do not.
 fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
-    contains_word(low_window, needle, false)
+    if needle != "key" {
+        return contains_word(low_window, needle, false);
+    }
+    low_window
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|label| {
+            if !contains_word(label, needle, false) {
+                return false;
+            }
+            let end = label.as_ptr() as usize - low_window.as_ptr() as usize + label.len();
+            let after = low_window[end..].trim_start_matches(is_assignment_label_gap);
+            !(is_lookup_key_label(label) && after.starts_with([':', '=']))
+        })
+}
+
+fn is_assignment_label_gap(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`')
+}
+
+fn is_lookup_key_label(label: &str) -> bool {
+    label.ends_with("_key")
+        && ![
+            "api_key",
+            "secret_key",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "encryption_key",
+            "auth_key",
+        ]
+        .iter()
+        .any(|known| {
+            label
+                .strip_suffix(*known)
+                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
+        })
 }
 
 /// Finds a canonical compound credential label beginning at an identifier
@@ -2477,10 +2512,14 @@ fn assignment_credential_trigger(low_text: &str) -> Option<&'static str> {
             .copied()
             .find(|needle| label.contains(needle))
             .or_else(|| {
-                TRIGGER_WORDS
-                    .iter()
-                    .copied()
-                    .find(|tw| contains_bounded_word(label, tw))
+                TRIGGER_WORDS.iter().copied().find(|tw| {
+                    (*tw != "key"
+                        || !is_lookup_key_label(label)
+                        || !low_text[before.len()..index]
+                            .chars()
+                            .all(is_assignment_label_gap))
+                        && contains_bounded_word(label, tw)
+                })
             })
             .or_else(|| (label == "token").then_some("token"))
     })
@@ -7053,6 +7092,92 @@ mod tests {
                 scan(content)
             );
         }
+    }
+
+    #[test]
+    fn issue_2654_lookup_members_accept_record_references() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        for label in [
+            "association_key",
+            "partition_key",
+            "sort_key",
+            "cache_key",
+            "idempotency_key",
+            "primary_key",
+        ] {
+            for value in [id, "", "runtime/current", "record-slug"] {
+                for separator in [",", ", "] {
+                    let content = format!(r#"{{"{label}":"{value}"{separator}"neighbor":"{id}"}}"#);
+                    assert!(check(&content).is_ok(), "{content}: {:?}", check(&content));
+                    assert_eq!(mask_secrets(&content), content);
+                }
+            }
+        }
+        let renamed = format!(r#"{{"association_ref":"{id}","neighbor":"{id}"}}"#);
+        assert!(check(&renamed).is_ok());
+    }
+
+    #[test]
+    fn issue_2654_credential_compounds_and_natural_assignments_stay_refused() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        for label in [
+            "key",
+            "api_key",
+            "secret_key",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "encryption_key",
+            "auth_key",
+            "service_signing_key",
+        ] {
+            for content in [
+                format!("{label}={id}"),
+                format!("{label}: {id}"),
+                format!(r#"{{"{label}":"{id}"}}"#),
+            ] {
+                assert!(check(&content).is_err(), "{content}");
+                assert!(!mask_secrets(&content).contains(id), "{content}");
+            }
+        }
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        for content in [
+            format!("the key is {opaque}"),
+            format!("api key {opaque}"),
+            format!("association_key {id}"),
+            format!("_key_ = {id}"),
+            format!("association_key=x key={id}"),
+        ] {
+            assert!(check(&content).is_err(), "{content}");
+        }
+        assert!(check("secret docs/guide.md").is_ok());
+        assert!(check("auth release-slug").is_ok());
+    }
+
+    #[test]
+    fn issue_2654_lookup_exception_requires_an_assignment_gap() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        for gap in ["***", ")", "}", "\\", "!", " ", "\" "] {
+            let content = format!("association_key{gap}:{id}");
+            assert!(check(&content).is_err(), "{content}");
+            assert!(!mask_secrets(&content).contains(id), "{content}");
+        }
+        for gap in ["", "\"", "'", "`"] {
+            let content = format!("association_key{gap}:{id}");
+            assert!(check(&content).is_ok(), "{content}");
+        }
+    }
+
+    #[test]
+    fn issue_2654_repeated_key_identifier_is_scanned_once() {
+        let content = format!("{}key=x", "key_".repeat(262_144));
+        assert!(check(&content).is_ok());
+    }
+
+    #[test]
+    fn issue_2654_unicode_before_lookup_member_keeps_boundaries() {
+        let content = "記録association_key: 550e8400-e29b-41d4-a716-446655440000";
+        assert!(check(content).is_ok(), "{:?}", check(content));
     }
 
     #[test]
