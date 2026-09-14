@@ -167,12 +167,17 @@ async fn dispatch_refusal_secret_blocked_append_and_ephemeral_policy_have_distin
 
     // Synthetic detector input, not key material. The append's real note
     // preparation rejects this payload before storage; no ledger guards change.
-    // Split the header as in the secret-gate unit fixtures.
+    // Split the header as in the secret-gate unit fixtures, and give it one
+    // line of key-block width under it: the detector needs a body, a bare
+    // header is a mention of the format.
     let synthetic_header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+    let synthetic_block = format!(
+        "{synthetic_header}\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGYPYFqHlZ4kUmUqQ7fEd7Uw"
+    );
     let incident = emit(
         &registry,
         "run.started",
-        json!({"synthetic_secret_shape":synthetic_header}),
+        json!({"synthetic_secret_shape":synthetic_block}),
     )
     .await;
     let policy = emit(&registry, "turn.delta", json!({"policy":true})).await;
