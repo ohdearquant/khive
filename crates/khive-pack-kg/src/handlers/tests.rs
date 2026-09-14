@@ -179,16 +179,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 25 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics/restore
+// KG pack must expose exactly 26 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/scan/db_diagnostics/restore
 #[test]
-fn kg_pack_exposes_25_handlers() {
+fn kg_pack_exposes_26_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        25,
-        "kg pack must expose 25 handlers including ordered streams, stream.batch, and restore"
+        26,
+        "kg pack must expose 26 handlers including ordered streams, stream.batch, restore, and scan"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -4063,4 +4063,97 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
         format!("{err}").contains("kind mismatch"),
         "expected a kind mismatch refusal, got: {err}"
     );
+}
+
+// ---- scan: the secret gate's verdict without a write ----
+
+/// The probe and the write path must agree on both signs, and the probe's
+/// `message` must be byte-identical to the refusal the write returns, because
+/// consumers use the probe to decide whether to spend the write at all.
+#[tokio::test]
+async fn scan_agrees_with_the_note_write_on_a_refused_and_an_accepted_body() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let secret = format!("sk-proj-{}", "A".repeat(80));
+    let refused = format!("rotate this credential before the release: {secret}");
+
+    let probe = registry
+        .dispatch("scan", json!({"content": refused}))
+        .await
+        .expect("scan reports a refusal, it does not fail on one");
+    assert_eq!(probe["would_refuse"], json!(true), "{probe}");
+    assert_eq!(probe["location"], json!("note.content"), "{probe}");
+    assert!(probe["detector"].is_string(), "{probe}");
+    assert!(
+        !probe.to_string().contains(&secret),
+        "the probe response must never echo the candidate: {probe}"
+    );
+
+    let write_err = registry
+        .dispatch("create", json!({"kind": "observation", "content": refused}))
+        .await
+        .expect_err("the write must refuse the same body");
+    assert_eq!(
+        Some(write_err.to_string().as_str()),
+        probe["message"].as_str(),
+        "probe message must equal the write's refusal text"
+    );
+
+    let clean = "a plain observation about the build cache".to_string();
+    let probe = registry
+        .dispatch("scan", json!({"content": clean}))
+        .await
+        .expect("scan succeeds on a clean body");
+    assert_eq!(probe["would_refuse"], json!(false), "{probe}");
+    assert!(probe["message"].is_null(), "{probe}");
+    assert!(probe["detector"].is_null(), "{probe}");
+    assert_eq!(probe["masked_preview"]["content"], json!(clean), "{probe}");
+    registry
+        .dispatch("create", json!({"kind": "observation", "content": clean}))
+        .await
+        .expect("the write must accept the same body");
+}
+
+/// A credential inside `properties` is refused by the write path with the
+/// location `note.properties`; the probe reports the same field.
+#[tokio::test]
+async fn scan_locates_a_secret_in_properties_where_the_write_refuses_it() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let secret = format!("sk-proj-{}", "B".repeat(80));
+    let params = json!({
+        "content": "clean body",
+        "name": "clean name",
+        "properties": {"neighbor": "550e8400-e29b-41d4-a716-446655440000", "token": secret},
+    });
+
+    let probe = registry
+        .dispatch("scan", params.clone())
+        .await
+        .expect("scan succeeds");
+    assert_eq!(probe["would_refuse"], json!(true), "{probe}");
+    assert_eq!(probe["location"], json!("note.properties"), "{probe}");
+    assert!(!probe.to_string().contains(&secret), "{probe}");
+
+    let mut write = params;
+    write["kind"] = json!("observation");
+    let write_err = registry
+        .dispatch("create", write)
+        .await
+        .expect_err("the write must refuse");
+    assert_eq!(
+        Some(write_err.to_string().as_str()),
+        probe["message"].as_str(),
+        "{write_err}"
+    );
+}
+
+/// `scan` takes only what a note write scans; an unknown field is refused so
+/// a caller cannot believe a field was checked that never was.
+#[tokio::test]
+async fn scan_refuses_unknown_fields() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let err = registry
+        .dispatch("scan", json!({"content": "x", "tags": ["a"]}))
+        .await
+        .expect_err("unknown field must be refused");
+    assert!(err.to_string().contains("tags"), "{err}");
 }

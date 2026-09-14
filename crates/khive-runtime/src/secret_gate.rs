@@ -356,6 +356,8 @@ pub enum RedactionSurface {
     SessionMirror,
     /// MCP diagnostics are bounded caller-visible transport data, not records.
     McpDiagnostic,
+    /// The kg `scan` verb's masked preview: caller-visible, never stored.
+    GateProbe,
 }
 
 /// Whether a redaction surface can consume a secret-gate exemption.
@@ -396,7 +398,7 @@ pub const fn redaction_surface_contract(surface: RedactionSurface) -> RedactionS
     let final_stored_target = match surface {
         RedactionSurface::GitIngest => Some(GIT_INGEST_STORED_TARGET),
         RedactionSurface::SessionMirror => Some(SESSION_MIRROR_STORED_TARGET),
-        RedactionSurface::McpDiagnostic => None,
+        RedactionSurface::McpDiagnostic | RedactionSurface::GateProbe => None,
     };
 
     RedactionSurfaceContract {
@@ -5880,6 +5882,7 @@ mod tests {
                 Some(SESSION_MIRROR_STORED_TARGET),
             ),
             (RedactionSurface::McpDiagnostic, None),
+            (RedactionSurface::GateProbe, None),
         ];
 
         for (surface, expected_target) in contracts {
@@ -5899,6 +5902,7 @@ mod tests {
             RedactionSurface::GitIngest,
             RedactionSurface::SessionMirror,
             RedactionSurface::McpDiagnostic,
+            RedactionSurface::GateProbe,
         ] {
             let masked = mask_for_redaction_surface(surface, &content);
             assert!(masked.contains(REDACTION_MARKER));

@@ -406,15 +406,15 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 25 verbs: 11 base + propose/review/withdraw (3) + verbs
-        // + stats (2) + context (1, ADR-089) + resolve (1) + whoami (1)
+        // kg pack ships 26 verbs: 11 base + propose/review/withdraw (3) + verbs
+        // + stats (2) + context (1, ADR-089) + resolve (1) + whoami (1) + scan (1)
         // + db_diagnostics (1, ADR-091) + stream.append/read/stat/batch (4,
         // ADR-174 section 2 and Amendment 1: registered by kg because the
         // entries are its notes)
         assert_eq!(
             info.verbs.len(),
-            25,
-            "kg pack must expose 25 verbs; got {}: {:?}",
+            26,
+            "kg pack must expose 26 verbs; got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );

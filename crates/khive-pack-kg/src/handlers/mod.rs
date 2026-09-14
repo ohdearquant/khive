@@ -13,6 +13,7 @@ mod note_list;
 mod params;
 mod proposal;
 mod resolve;
+mod scan;
 mod search;
 mod stats;
 mod stream;
