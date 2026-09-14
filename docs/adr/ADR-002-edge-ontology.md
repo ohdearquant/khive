@@ -847,3 +847,78 @@ are rejected with the valid list in the error message.
 
 Endpoint validation lives in `khive-runtime` (not the type layer). The base contract tables
 above are the default. Packs extend via `EDGE_RULES` (additive only, cannot tighten).
+
+## Proposed 2026-09-14 amendment: project origin documents
+
+**Status**: Proposed
+**Issue**: #2579
+
+### Decision
+
+Add exactly one base entity endpoint pair: `Project introduced_by Document`.
+The source is a codebase, library, pack or other project; the target is the
+specification, design record or paper that first described it. This is an
+intellectual-origin claim, following the existing Service origin rule. A
+codebase remains Project under [ADR-001](ADR-001-entity-kind-taxonomy.md).
+
+A later document that merely discusses a project does not establish its origin.
+This edge does not assert ongoing conformance to a specification, nor that a
+particular release implements all of that document. `Project implements Concept`
+continues to express realization of an idea; `implements` does not gain a
+Document target. No new relation or reverse edge is introduced.
+
+Keep `Document depends_on Concept` absent from the base endpoint contract. This
+is the scope decision for this amendment, not an assertion that its historical
+omission was deliberate. A normative dependency on another document uses
+`Document depends_on Document`; evidence about a concept uses `supports` or
+`refutes`, and classification uses `instance_of`. These express different claims
+and must not substitute for a conceptual dependency. A concrete use case for
+that distinct dependency requires a separate endpoint proposal.
+
+### Shared validation and citation
+
+The new pair belongs to the runtime's shared base table. Ordinary, resolved,
+bulk and request-atomic link validation, query diagnostics and offline endpoint
+checks consume that table. Existing endpoint existence, substrate, namespace,
+authorization, audit and transactional checks continue to apply. No pack-only
+exception, wildcard, kind migration, provenance backfill or extra inverse edge
+is authorized by this amendment.
+
+The existing `knowledge.cite` handler resolves complete UUIDs and delegates an
+`introduced_by` edge to the same runtime validator. Although its argument is
+named `concept_id` and its documented purpose is concept citation, it has no
+separate Concept-kind guard. Consequently, a live Project UUID as `concept_id`
+and a live Document UUID as `source_id` also become admissible through that
+consumer. Preserve this delegation and the existing citation receipt fields;
+do not add a Concept-only guard as part of this change.
+
+### Implementation and acceptance
+
+This Proposed appendix does not itself change the canonical endpoint matrix
+above. When implementing the accepted amendment, update the Derivation matrix,
+its direction summary, the literal runtime triple and public link help together.
+The ADR/runtime matrix equality check and endpoint-signature certificates must
+remain enabled; their exception sets are not widened for this additional pair.
+
+Regression witnesses must reach the real registered routes and read back exact
+persisted endpoints and relation. They include:
+
+- Project→Document origin and the inherited Project citation, preceded by live
+  creation/read controls and a normal Concept→Document citation control.
+- Singleton, bulk atomic, bulk best-effort and request-atomic link behavior,
+  including a mixed invalid batch with each mode's existing rollback or partial
+  result contract. No mode's test substitutes for another mode.
+- Refusals for the reverse Document→Project origin, Project→Person or Org
+  origin, Project→Document through `derived_from` or `implements`, and
+  Document→Concept dependency; unchanged Service→Document origin and
+  Project→Concept implementation remain successful controls.
+- Missing and deleted endpoints, with no new edge on refusal; new-pair query
+  diagnostics and offline predicate admission, wrong-direction rejection,
+  public help/table equality and the unchanged signature certificates.
+
+Before native execution, identify each test's semantic failure and the mutations
+that remove or reverse the row, broaden an endpoint, fork a consumer's admission,
+change persistence or bypass transactional refusal. An expected old-code refusal
+must be reached after its setup and legacy controls succeed; compilation or
+fixture failures do not establish that baseline. Static source review alone does
+not establish runtime acceptance.
