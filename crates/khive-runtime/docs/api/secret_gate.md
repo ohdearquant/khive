@@ -537,6 +537,15 @@ For each token, in order:
    benign marker-adjacent revision); a genuinely split credential hiding one fragment behind a
    marker is still caught because every OTHER fragment anchors its own chain and accumulates the
    exempted fragment's hex into the total (`blocks_split_hex_credential_with_marker_adjacent_fragment`).
+   **Lookup-key exception** (`is_lookup_key_label`, issue #2654): a member name ending in `_key`
+   disarms `key` as a credential trigger only when the name is in the closed vocabulary
+   `LOOKUP_KEY_LABELS` (`association_key`, `partition_key`, `sort_key`, `cache_key`, `idempotency_key`,
+   `primary_key`, ...) and sits directly before its `:`/`=` delimiter. The exception is an allowlist on
+   purpose: an unlisted compound (`hmac_key`, `master_key`, `ssh_key`, `jwt_key`, ...) keeps every
+   refusal it had, and a credential word inside the prefix (`secret_partition_key`) still triggers on
+   its own. A corpus replay that is identical across such a change certifies preservation on the corpus
+   population only; the opened shape class carries its own before/after arms.
+
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a
    chain that would otherwise reconstruct a blocked credential.
