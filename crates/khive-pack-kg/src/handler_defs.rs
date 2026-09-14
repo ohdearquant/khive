@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (25 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (26 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -1322,6 +1322,41 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
+    },
+    // Assertive: the secret gate's verdict for a note body, without a write
+    HandlerDef {
+        name: "scan",
+        description: "Report whether the secret gate would refuse a note body, without writing \
+                      anything: would_refuse, the detector that fired, its trigger word, the \
+                      masked candidate (first6...N), the field it sat in (note.content, \
+                      note.name, note.properties), the exact refusal message a write would \
+                      return, and a masked preview of content and name. Runs the same checks \
+                      in the same order as a note write. Stores nothing and emits no event.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: true,
+                description: "Note body to scan, exactly as it would be written.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: false,
+                description: "Note name to scan alongside the body.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Properties object to scan; every string leaf is checked.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
     // Assertive: reader/writer contention, edge-integrity, and WAL diagnostics.
     HandlerDef {

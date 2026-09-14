@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 25    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -211,7 +211,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 25 verbs
+## `kg` pack — 26 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -912,6 +912,22 @@ and immutable build metadata without invoking database diagnostics or a checkpoi
 
 ```
 request(ops="whoami()")
+```
+
+### `scan` — Assertive
+
+Report whether the secret gate would refuse a note body, without writing anything. Takes
+`content` (required) plus optional `name` and `properties`, and runs the same checks in the same
+order a note write runs before it stores: content, then name, then every string leaf of
+properties. Returns `{would_refuse, detector, trigger, masked, location, message,
+masked_preview: {content, name}}`. On a refusal `message` is the exact text the write would
+have failed with, `location` names the field (`note.content`, `note.name`, `note.properties`)
+and `masked` is the candidate as `first6...N`; on acceptance those fields are null.
+`masked_preview` is the input through the canonical masker either way. Nothing is stored and
+no event is emitted, so the verb is safe to call on a body you do not intend to keep.
+
+```
+request(ops="scan(content=\"api_key=sk-...\")")
 ```
 
 ### `db_diagnostics` — Assertive

@@ -1846,6 +1846,9 @@ impl VerbRegistry {
         ("kg", "query"),
         ("kg", "resolve"),
         ("kg", "whoami"),
+        // scan runs the secret gate over caller-supplied text in process: no
+        // store read, no store write, no event.
+        ("kg", "scan"),
         ("kg", "verbs"),
         ("kg", "stream.read"),
         ("kg", "stream.stat"),
