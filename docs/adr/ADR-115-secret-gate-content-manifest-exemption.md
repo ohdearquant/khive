@@ -1053,8 +1053,8 @@ schema nor exemption-manifest identity.
 
 ## Proposed amendment: prose-shaped names and stored UUID references (2026-09-14)
 
-**Status**: Items 1, 3 and 4 signed; item 2 ruled (a); item 5 held. UUID admission remains
-disabled until the separate addendum is signed.
+**Status**: Items 1, 3 and 4 signed; item 2 ruled (a); item 5 signed; UUID admission remains
+disabled until activation.
 
 This proposal qualifies the content-shape rationale above for a closed syntax exception. It does
 not infer provenance from explanatory prose. An admitted spelling can still be a credential; the
@@ -1273,3 +1273,71 @@ source analysis and synthetic examples are not executed results or replay of a r
    and carry rules before UUID admission can run.
    Extending destination scope to knowledge or other reservation-only writes requires its own
    final-target atomicity contract. No implementation should guess these unresolved choices.
+
+### Item 5 addendum: UUID admission posture and composition (Proposed, 2026-09-14)
+
+**Status**: Signed 2026-09-14. UUID admission remains disabled until the acceptance list below is executed and activation is authorized in a separate record.
+This addendum qualifies Decision §4 and Amendment 1 §4 only for the UUID arm in §2 above. It does
+not change the signed name grammar, reference kinds, namespace/read authority, 32-UUID request
+budget, transaction timing, span restrictions, destination scope or permanent mask-only surfaces.
+The existing manifest mechanism, stamp and activation gates remain unchanged.
+
+**Typed outcome and stamp.** Keep `Exempted` as the only successful finalizer outcome, with a
+closed mechanism variant `StoredUuidReferenceV1` distinct from manifest admission.
+Only that runtime-created variant may set
+`properties["khive:secret_gate"] = "exempted:stored-uuid-reference-v1"`. It carries the evidence
+for UUID spans actually exempted under §2; merely finding a UUID or passing the ordinary scanner
+produces neither this stamp nor an exemption event. It has no `manifest_id` and must not fabricate
+one. The existing reserved-key prohibition and byte-exact echo normalization apply to the new
+stamp as well; a caller-provided discriminator, stamp, digest or reference list grants no admission.
+
+**One event and one atomic unit.** Every fresh UUID-only admission writes one queryable `audit`
+event with `outcome=success`, `payload_schema_version=1`, the actual canonical mutation verb,
+entity/note substrate, destination `target_id`, and actor/namespace derived from the authorized
+runtime token. Its typed payload discriminator is `mechanism="stored-uuid-reference-v1"`, with
+`outcome="exempted"`, the distinct admitted-UUID count, the actually overridden detector labels,
+and full SHA-256 digests paired with runtime-owned field scopes for the scanned values whose UUID
+spans were exempted. Use Decision §3's exact decoded-byte scoped digest; do not log content,
+reference UUIDs, detector excerpts or lookup failure details. The success event is the durable
+linkage for this target and admission, not a second caller-writable property. The record, stamp,
+synchronous derived state and this one success event commit in the same atomic unit, after the
+§2 final lookup and before acknowledgement. A retry cannot leave two success events for one
+committed admission. Any record, stamp or success-event failure rolls the unit back; the typed
+failure and independent failure-log rules of Amendment 1 §4 still apply. General dispatch audit,
+best-effort event batching or a pending asynchronous event is not this success event. A storage
+configuration unable to make it queryable atomically with the record cannot activate UUID admission.
+
+**Mixed records: no composite mechanism.** First consider the existing valid manifest-only
+admission, with its unchanged match cardinality and fault rules. If it alone covers every scanner
+refusal on the candidate, use only the existing manifest stamp and event, even if covered content
+contains a UUID; no UUID admission is consumed. Otherwise evaluate the candidate for UUID-only
+admission without consuming any manifest exemption. Every remaining refusal must be discharged
+by the exact §2 UUID span rules. A record that needs both a manifest exemption and a UUID exemption
+is refused: neither mechanism partially authorizes the write, and no composite stamp or second
+success event is invented. Existing manifest-invalid outcomes cannot be converted into UUID success.
+An ordinary manifest miss or the inactive empty manifest is not itself a UUID refusal. Neither
+this composition rule nor UUID admission activates a non-empty manifest.
+
+**Updates and carry.** A stamp is historical admission evidence, not a reusable authorization.
+For the same target record, an update may carry a UUID stamp and its prior success-event linkage
+without a new lookup or event only when the complete decoded scanned-field bytes and their
+runtime scopes are unchanged, and the prior typed event and recorded scope/digests agree with
+that stored state. Compare the old and final candidate directly; a caller echo is not evidence.
+An absent, ambiguous or inconsistent prior linkage refuses carry and the write. Deletion of a
+referenced record after the original commit does not revoke unchanged stored prose, as §2 states.
+Any changed scanned input is fresh admission for the complete final candidate: do not carry the
+old UUID exemption over even an unchanged UUID substring. Re-extract, authorize and revalidate
+under §2, including the same-request create/restore exclusion and retry rule, then apply the
+manifest-only/UUID-only composition above. The runtime atomically replaces the old stamp/linkage
+with the selected fresh admission, or removes the stamp if the ordinary scanner now passes without
+an exemption. A refused candidate leaves the old record and evidence intact. Historical success
+events remain immutable. Copying into another record is fresh admission, never carry. Manifest-only
+updates retain Decision §4's existing carry rule; no new permission is granted to excluded paths.
+
+Before activation, acceptance must cover UUID-only admission/readback with exactly one event;
+manifest-only precedence and a mixed-required refusal; exact echo versus forged/replaced/removed
+stamps; unchanged carry after reference deletion; changed-byte revalidation and transition to a
+clean or manifest-only result; missing/inconsistent linkage; same-request eligibility and retry;
+and rollback on record/stamp/event failure with the second-order failure-log control. The §4
+resolving/non-resolving, authority, span and unrelated-credential controls remain required. Source
+analysis and this Proposed addendum supply no executed acceptance or activation authorization.

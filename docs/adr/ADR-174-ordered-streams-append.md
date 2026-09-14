@@ -1,6 +1,6 @@
 # ADR-174: Ordered streams — dense per-stream append with `expected_seq` and a lease fence
 
-- Status: Proposed
+- Status: Accepted (2026-09-14)
 - Date: 2026-09-07
 - Depends on: ADR-172 (`version`, `key`, `fence`). It merges first; the migration here takes the number after
   ADR-172's.
@@ -282,7 +282,7 @@ Stated before implementation, checked at the PR that lands the code; every arm n
 
 ## Amendment 1 (2026-09-08): `stream.batch`, one request over several streams, all-or-nothing under a fence
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-14).
 
 ### The gap
 
@@ -445,6 +445,8 @@ serial execution under the writer lock.
 
 ## Amendment 2 (2026-09-08): the ledger refuses updates, an isolating fixture for the check constraint
 
+**Status**: Accepted (2026-09-14).
+
 Adopted on the source audit that preceded the first implementation of Amendment 1. Nothing above is
 withdrawn; item 1 adds a guard the Decision claimed by implication, item 2 corrects an acceptance
 arm that could not fail.
@@ -483,7 +485,7 @@ one snapshot, and a divergence between them is a ledger defect, never a race bet
 
 ## Amendment 3 (2026-09-08): entries are not embedded by default, prefix truncation, two acceptance corrections
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-14).
 
 ### The gap
 
@@ -604,7 +606,7 @@ codes. ADR-172 Amendment 2 records the same arm for `expected_version` and `fenc
 
 ## Amendment 4 (2026-09-09): an `observed` entry may assert that a key is unheld
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-14).
 
 **Implementation (2026-09-09):** `observed` entries with a version or `null` are checked inside the atomic writer transaction before member writes.
 
@@ -690,7 +692,7 @@ acceptance 2.
 
 ## Amendment 5 (2026-09-10): an `observed` entry may assert that a document's time field is still in the future, and write members return their write time
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-14).
 
 **Implementation (2026-09-10):** `live_until` checks share one SQL clock reading inside the atomic writer transaction; write results return the stored `updated_at` before commit.
 
@@ -834,7 +836,7 @@ acceptance 2.
 
 ## Amendment 6 (2026-09-10): an `observed` entry may pin the note it read, so an observation does not survive that note's recreation
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-14).
 
 **Implementation (2026-09-10):** Observed entries may pin the live note UUID beside its version in one transactional read. Replacements refuse before version and deadline checks; absent holders retain version refusals. The replacement UUID follows the existing holder-disclosure policy, while identity pins remain usable by batch-only callers.
 
@@ -1003,6 +1005,8 @@ acceptance 2.
 
 ## Amendment 7 (2026-09-10): the batch admits a bounded list
 
+**Status**: Accepted (2026-09-14).
+
 ### The gap
 
 `stream.batch` refuses an empty `ops` list and says why: an empty list takes the writer for a batch
@@ -1074,6 +1078,8 @@ largest member count the 8 MiB frame admits, so the number this amendment fixes 
 measurement rather than by an argument.
 
 ## Amendment 8 (2026-09-13): the single-head `create`/`update` fence takes `live_until`
+
+**Status**: Accepted (2026-09-14).
 
 ### Context
 
@@ -1148,6 +1154,8 @@ writes are admitted in its absence.
    accident.
 
 ## Amendment 9 (2026-09-13): the single-head fence takes `id`, so a recreated key does not satisfy it
+
+**Status**: Accepted (2026-09-14).
 
 ### Context
 
