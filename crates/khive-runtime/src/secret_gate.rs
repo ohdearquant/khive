@@ -1114,32 +1114,51 @@ fn is_pem_body_line(line: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
+/// Byte offset of the first line break at or after `from`: a real newline,
+/// or the two-character escape `\\n` that a newline becomes once the text
+/// is serialized JSON (a note's properties, a stream payload). Returns the
+/// break's start and the offset just past it, or `None` when the rest of
+/// the text is one line.
+fn next_line_break(text: &str, from: usize) -> Option<(usize, usize)> {
+    let rest = &text[from..];
+    let real = rest.find('\n').map(|i| (from + i, from + i + 1));
+    let escaped = rest.find("\\n").map(|i| (from + i, from + i + 2));
+    match (real, escaped) {
+        (Some(r), Some(e)) => Some(if r.0 <= e.0 { r } else { e }),
+        (r, e) => r.or(e),
+    }
+}
+
+/// End of the line starting at `from` (exclusive of its break) and the start
+/// of the following line.
+fn line_bounds(text: &str, from: usize) -> (usize, usize) {
+    match next_line_break(text, from) {
+        Some((end, next)) => (end, next),
+        None => (text.len(), text.len()),
+    }
+}
+
 /// Find the leftmost PEM private key block: a `-----BEGIN <TYPE> PRIVATE
 /// KEY-----` header line followed by a body. The body is either a matching
 /// `-----END ... PRIVATE KEY-----` marker before the next BEGIN, or at
 /// least one line of base64 of key-block width directly under it. A header
 /// with neither is a mention of the format (a documentation page, code that
-/// prints the label) and carries no key, so it is not a candidate. The
-/// returned slice is bounded to the block: through the END line when one is
-/// present, otherwise through the last base64 line under the header.
+/// prints the label) and carries no key, so it is not a candidate. Lines
+/// break on a newline or on its JSON escape, so a key inside a serialized
+/// document is read the same way as one in plain text. The returned slice
+/// is bounded to the block: through the END line when one is present,
+/// otherwise through the last base64 line under the header.
 fn find_pem_private_key_block(text: &str) -> Option<&str> {
     let mut search = 0;
     while let Some(rel) = text[search..].find("-----BEGIN") {
         let pos = search + rel;
-        let header_end = text[pos..]
-            .find('\n')
-            .map(|l| pos + l)
-            .unwrap_or(text.len());
+        let (header_end, body_start) = line_bounds(text, pos);
         let header = &text[pos..header_end];
         // Resume after this header on the next pass whatever it turns out to be.
         search = header_end;
         if !header.contains("PRIVATE KEY-----") {
             continue;
         }
-        let body_start = text[header_end..]
-            .find('\n')
-            .map(|l| header_end + l + 1)
-            .unwrap_or(text.len());
         // The END marker must belong to this header: stop looking at the
         // next BEGIN so a mention above a real block does not claim it.
         let next_begin = text[body_start..]
@@ -1148,22 +1167,35 @@ fn find_pem_private_key_block(text: &str) -> Option<&str> {
             .unwrap_or(text.len());
         if let Some(end_rel) = text[body_start..next_begin].find("-----END") {
             let end_pos = body_start + end_rel;
-            let end_line = text[end_pos..]
-                .find('\n')
-                .map(|l| end_pos + l + 1)
-                .unwrap_or(text.len());
+            let (end_line, end_next) = line_bounds(text, end_pos);
             if text[end_pos..end_line].contains("PRIVATE KEY-----") {
-                return Some(&text[pos..end_line]);
+                return Some(&text[pos..end_next]);
             }
         }
         let mut body_end = None;
         let mut cursor = body_start;
-        for line in text[body_start..].split_inclusive('\n') {
-            if !is_pem_body_line(line.trim_end_matches(['\r', '\n'])) {
-                break;
+        while cursor < text.len() {
+            let (line_end, next) = line_bounds(text, cursor);
+            let line = text[cursor..line_end]
+                .trim_end_matches('\r')
+                .trim_end_matches("\\r");
+            if is_pem_body_line(line) {
+                body_end = Some(next);
+                cursor = next;
+                continue;
             }
-            cursor += line.len();
-            body_end = Some(cursor);
+            // Inside a serialized JSON string the last body line runs into
+            // the closing quote instead of a line break; the base64 run
+            // before that quote is still a body line, and the block ends
+            // where it ends.
+            let run = line
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
+                .count();
+            if run >= PEM_BODY_LINE_MIN && line[run..].starts_with('"') {
+                body_end = Some(cursor + run);
+            }
+            break;
         }
         if let Some(end) = body_end {
             return Some(&text[pos..end]);
@@ -3746,6 +3778,41 @@ mod tests {
         // A short base64 tail alone (below key-block width) is not a body.
         let short = format!("{header}\nMIIEowIBAAKCAQEA\n{trailing}\n");
         assert!(scan(&short).is_none(), "{:?}", scan(&short));
+    }
+
+    #[test]
+    fn pem_block_inside_serialized_json_is_still_caught_and_a_mention_is_not() {
+        // A note's properties or a stream payload reach the gate as compact
+        // JSON, where every newline is the two-character escape. The same
+        // rules apply on that form.
+        let header = ["-----BEGIN RSA", " PRIVATE KEY-----"].concat(); // gitleaks:allow
+        let body_line = "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGYPYFqHlZ4kUmUqQ7fEd7Uw";
+        let block = serde_json::json!({"payload": format!("{header}\n{body_line}\n{body_line}")});
+        let serialized = serde_json::to_string(&block).unwrap();
+        assert!(
+            serialized.contains("\\n"),
+            "fixture must carry escaped newlines"
+        );
+        let m = scan(&serialized).expect("a key block in serialized JSON is a key");
+        assert_eq!(m.detector, "pem-private-key");
+        // Bounded to the block: the closing quote and brace are not part of it.
+        let block_len = header.chars().count() + 2 + (body_line.len() + 2) + body_line.len();
+        assert!(
+            m.masked.ends_with(&format!("...{block_len}chars")),
+            "masked: {}",
+            m.masked
+        );
+        let with_end = serde_json::json!({
+            "payload": format!("{header}\nMIIEo\u{2026}\n-----END RSA PRIVATE KEY-----\ntrailing")
+        });
+        let serialized = serde_json::to_string(&with_end).unwrap();
+        assert_eq!(scan(&serialized).unwrap().detector, "pem-private-key");
+
+        let mention = serde_json::json!({
+            "doc": format!("A key file starts with `{header}` and continues on wrapped lines.")
+        });
+        let serialized = serde_json::to_string(&mention).unwrap();
+        assert!(scan(&serialized).is_none(), "{:?}", scan(&serialized));
     }
 
     #[test]
