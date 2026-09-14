@@ -5,6 +5,9 @@
 - Depends on: ADR-006 (deterministic scoring), ADR-012 (retrieval composition),
   ADR-029 (substrate coordinator), ADR-033 (recall pipeline),
   ADR-045 (verb response presentation)
+- Proposed amendment: [Amendment 5, successful MCP search-limit disclosure](#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14).
+  Existing decisions remain accepted; Amendment 5 is unsigned and requires
+  acceptance before dependent implementation merges.
 
 ## Context
 
@@ -119,6 +122,13 @@ For successful search responses:
 both governed surfaces — the KG `search` verb and the MCP multi-backend path
 emit it identically. It is not a per-hit field and never appears inside the
 hit array.
+
+Proposed Amendment 5 qualifies the scope of "both governed surfaces" here and
+"Both emit the same response envelope" in Context: the KG route is governed at
+its MCP operation wrapper, after registry dispatch. Raw registry `search`
+dispatch continues to return the canonical hit array; it does not acquire an
+operation envelope. The amendment adds normalization fields only at the
+successful MCP wrapper boundary and preserves this section's completeness rules.
 
 If any selected backend fails and no hit survives all server-side filters, the
 operation MUST return:
@@ -850,6 +860,126 @@ omitted envelope (the operation's `ok` flips to `false` once its result is
 discarded, so the two fields move under the synthesized `error` object rather
 than staying beside a `result` that no longer exists). They still survive
 omission; they do not survive at the _same_ location.
+
+## Amendment 5 (proposed): search limit disclosure at the MCP operation boundary (2026-09-14)
+
+**Status**: proposed and unsigned. Acceptance is required before dependent
+implementation merges. This amendment qualifies the KG/MCP surface wording in
+Context and §1 as described above; it adds fields to successful MCP `search`
+operation envelopes, not to the raw pack result. The reciprocal qualification is
+recorded in [ADR-023](ADR-023-declarative-pack-format.md#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14).
+
+### Successful operation fields
+
+Every successful MCP `search` operation MUST carry these flat siblings beside
+its existing `status` and `result`, including registry single, parallel and chain
+execution and coordinator dispatch in each supported execution mode:
+
+- `requested_limit`: the accepted unsigned integer supplied as `limit`, or `10`
+  when omitted or null.
+- `effective_limit`: `min(requested_limit, 100)`, the limit actually used for
+  the final search result.
+- `limit_clamped`: the boolean `requested_limit != effective_limit`.
+
+The fields belong to each successful operation, never to the aggregate batch
+wrapper, a hit row or the hit array. Explicit zero remains zero and reports
+`0 / 0 / false`; omitted/null reports `10 / 10 / false`; 101 reports
+`101 / 100 / true`. The strict `Option<u32>` input and existing authorization and
+validation order are unchanged: negative or fractional numbers, strings,
+booleans, arrays, objects and integers above `4294967295` remain errors. No alias,
+coercion, newly invalid request or new limit admission rule is introduced.
+
+The report discloses normalized settings, not returned-hit count, truncation,
+backend completeness or retrieval work. Candidate overfetch and coordinator
+merge windows remain separate internal settings and MUST NOT be reported as the
+effective result limit. Normalization must supply both execution and disclosure
+from the same validated request; a second interpretation of the raw input MUST
+NOT change route behavior or error precedence.
+
+### Result and client compatibility
+
+Raw `VerbRegistry` search dispatch MUST remain an exact hit array, without the
+new fields. Canonical MCP `result` MUST remain that route's exact array: no
+metadata row, wrapping object, score change, field addition/removal, identifier
+change, reordering or altered null/empty representation is authorized. For fixed
+fixtures, canonical/JSON result-array bytes serialized with the same serializer
+and presentation MUST be identical with and without the new report, separately
+within each route. This is not a requirement that registry and coordinator
+retrieval produce identical arrays to each other. Existing non-JSON rendering
+may turn `result` into a string; rendered-result stability is a separate control,
+not an assertion that every presentation returns an array.
+
+Client authors who need the report MUST retain the successful per-operation
+envelope through Python `Khive.raw`, `Khive.batch` or `Session.request`, or the
+contract harness's `KhiveMcpSession.request`/`request_batch`; Python `_one` and
+`Khive.search`, harness `KhiveMcpSession.verb`, and chain `$prev` expose only
+`result` and therefore exclude these siblings.
+
+`Session.request` preserves per-operation dictionaries, not the aggregate request
+envelope; the harness request methods retain the aggregate envelope containing
+those operations. This amendment changes none of these accessors or `$prev`
+semantics. It does not make a raw non-MCP dispatch return wrapper metadata or
+introduce a generic sidecar framework. In contrast, the proposed comm and resolve
+fields are inside their canonical payloads and follow the existing result-only
+access paths.
+
+### Completeness, help, errors and rendering
+
+A healthy empty search remains `ok=true`, `status="complete"`, `result=[]` and
+carries the report. A partial search with surviving hits retains its existing
+partial/backend/arm evidence and carries the report. Degraded-empty search MUST
+remain `ok=false` with `error.kind="search_incomplete"`, no successful `result`
+and no new report fields; retryability and existing error search evidence remain
+governed by the accepted amendments. Empty-hit classification MUST inspect the
+canonical hit array, not the existence or member count of its wrapper metadata.
+A metadata-only object cannot satisfy the search result-array contract.
+
+Help, authorization/validation/execution errors, and non-search operations MUST
+NOT acquire this successful search report. Help retains its existing pre-dispatch
+short circuit even when unused search arguments would otherwise be invalid.
+Presentation and format rendering MUST preserve the three wrapper siblings as
+numbers/boolean on successful operations, including zero and false, while
+preserving existing result rendering/elision. A compact fallback that remains
+successful likewise retains the report.
+
+If frame-budget or depth omission changes an operation to `ok=false`, the new
+success-only fields MUST be absent, including under `error.search`. Amendment 4's
+relocation of existing completeness, arm and backend evidence under `error.search`
+remains unchanged. This amendment adds no error metadata or larger error frame.
+
+The ranking and threshold contracts in §2, §3 and Compatibility are not amended
+by this proposal. In particular, this additive report neither resolves nor
+asserts implementation conformance with the separately specified `rank_score`,
+`rank_score_kind`, `signals` or `min_rank_score` migration. Existing hit bytes and
+accepted ranking obligations remain separate concerns.
+
+### Acceptance controls
+
+Before dependent implementation merges, each registry route (single, parallel,
+chain) and coordinator route (single, parallel, chain) MUST prove route-local
+canonical/JSON hit-array byte identity with and without the report, for entity
+and note fixtures, including populated and empty arrays. Compare only `result`
+bytes under fixed data and the same serializer/presentation; the containing
+operation intentionally gains fields. Chain controls MUST prove that `$prev`
+continues to bind the canonical result array, including indexed references, and
+cannot observe the new operation siblings.
+
+Controls cover omitted/null, zero, 100, 101 and `u32::MAX`, a populated fixture
+that proves the executed cap, typed-invalid inputs, help, healthy-empty,
+partial-with-hits, degraded-empty, authorization failures and non-search siblings
+in a mixed batch. Each supported Agent/Human/Verbose and JSON/Auto/Table path
+checks report preservation and existing result rendering; omission/error controls
+check report absence while preserving the existing error evidence.
+
+Required mutations include metadata inserted into the hit array and a
+metadata-only object substituted for a no-hit array or treated as nonempty.
+The first MUST fail byte/shape identity; the second MUST fail array-shape or
+empty-hit/degraded-empty controls. Adding valid report siblings beside `result=[]`
+MUST never turn no hits into a hit. Omitting a route's report, executing the raw
+limit while reporting the cap, using an overfetch window as `effective_limit`,
+changing help/error ordering, or dropping false/zero during successful rendering
+MUST also be detected. These are pending acceptance requirements, not executed
+test results.
 
 ## References
 
