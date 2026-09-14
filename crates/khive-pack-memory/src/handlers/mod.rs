@@ -1,6 +1,6 @@
 //! Memory verb handlers — split by concern.
 
-mod common;
+pub(crate) mod common;
 mod feedback;
 #[cfg(test)]
 mod fresh_tail_tests;

@@ -307,6 +307,7 @@ struct StreamCreateFields {
     properties: Option<Value>,
     tags: Option<Vec<String>>,
     salience: Option<f64>,
+    decay_factor: Option<f64>,
     embed: Option<bool>,
 }
 
@@ -1191,6 +1192,7 @@ impl KhiveRuntime {
                     },
                     options: AtomicNoteOptions {
                         salience: create.fields.salience,
+                        decay_factor: create.fields.decay_factor,
                         key: Some(&create.key),
                         embed: Some(create.fields.embed.unwrap_or(create.kind != "head")),
                         ..Default::default()

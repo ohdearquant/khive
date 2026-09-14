@@ -237,6 +237,8 @@ warning is derived from the embedding outcome, not from a separate registry pred
 | `tags`              | array\<string\> | no          | Tag list.                                                                                                                                                                                                                                                                                  |
 | `entity_type`       | string          | no          | First-class type tag, e.g. `"paper"`, `"algorithm"`, `"tool"`.                                                                                                                                                                                                                             |
 | `properties`        | object          | no          | Arbitrary JSON properties.                                                                                                                                                                                                                                                                 |
+| `salience`          | number          | no          | Notes only, 0.0–1.0. A kind that owns a writer applies that writer's default when unset: memory notes take episodic=0.3 / semantic=0.5 by `properties.memory_type`.                                                                                                                        |
+| `decay_factor`      | number          | no          | Notes only, >= 0. Memory notes take episodic=0.02 / semantic=0.005 when unset, the same defaults `memory.remember` stores.                                                                                                                                                                 |
 | `items`             | array\<object\> | no          | Bulk entity creation, each `{kind, name, entity_kind?, entity_type?, description?, properties?, tags?}`. Capped at 1000/request. Bulk-created entities skip embedding until a later `reindex`.                                                                                             |
 | `atomic`            | bool            | no          | Bulk path. Default true = all-or-nothing; false = per-item errors collected.                                                                                                                                                                                                               |
 | `verbose`           | bool            | no          | Bulk path. When true, response includes full entity objects.                                                                                                                                                                                                                               |
@@ -1215,6 +1217,12 @@ Create a memory note with salience and decay.
 | `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
 | `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
 | `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+A memory note written through the generic `create(kind="memory", ...)` path takes the same
+stored form: the memory kind hook resolves `memory_type` (from `properties.memory_type`),
+`salience` and `decay_factor` with these defaults and validations before the row is written, so
+`get` reads the same values whichever verb created the note. The namespace rule above belongs to
+`memory.remember`; `create` writes to the caller's namespace like any other note.
 
 With `idempotency_key`, a replay whose content matches the stored memory returns the original
 memory with `replayed=true`. Different content under the same key is refused with the conflict

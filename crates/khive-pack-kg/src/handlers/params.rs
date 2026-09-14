@@ -33,6 +33,7 @@ pub(crate) struct CreateParams {
     pub(crate) description: Option<String>,
     pub(crate) content: Option<String>,
     pub(crate) salience: Option<f64>,
+    pub(crate) decay_factor: Option<f64>,
     pub(crate) annotates: Option<Vec<String>>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,

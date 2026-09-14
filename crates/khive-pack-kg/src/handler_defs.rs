@@ -162,6 +162,20 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "salience",
+                param_type: "number",
+                required: false,
+                description: "Notes only, 0.0–1.0. A kind that owns a writer applies that writer's default when unset: memory notes take episodic=0.3 / semantic=0.5 by properties.memory_type.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "decay_factor",
+                param_type: "number",
+                required: false,
+                description: "Notes only, >= 0. Memory notes take episodic=0.02 / semantic=0.005 when unset, the same defaults memory.remember stores.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "items",
                 param_type: "array of object",
                 required: false,
@@ -1812,6 +1826,23 @@ mod tests {
             assert!(
                 tags.description.contains(detail),
                 "missing tag contract: {detail}"
+            );
+        }
+    }
+
+    /// create.help must document the ranking fields a note can be written with.
+    #[test]
+    fn create_params_document_salience_and_decay_factor_for_notes() {
+        let h = find_handler("create");
+        for name in ["salience", "decay_factor"] {
+            let param = h
+                .params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("create must document '{name}' param (notes only)"));
+            assert!(
+                param.description.contains("Notes only") && param.description.contains("memory"),
+                "create.{name} description must state the notes-only scope and the memory defaults"
             );
         }
     }

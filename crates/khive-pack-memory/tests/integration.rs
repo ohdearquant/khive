@@ -5370,3 +5370,148 @@ async fn recall_include_source_id_reads_the_annotates_edge() {
         "unsourced memory carries null, not absence"
     );
 }
+
+fn number(value: &Value, field: &str) -> f64 {
+    value[field]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{field} must be a number, got {}", value[field]))
+}
+
+/// `create(kind=memory)` stores the same `memory_type`, `salience` and `decay_factor` that
+/// `memory.remember` stores, instead of leaving the columns null for recall to fill in.
+#[tokio::test]
+async fn create_of_a_memory_note_stores_the_remember_defaults() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    let remembered = registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "written through memory.remember with no ranking fields" }),
+        )
+        .await
+        .expect("remember succeeds");
+    let remembered = registry
+        .dispatch("get", json!({ "id": remembered["id"] }))
+        .await
+        .expect("get remembered");
+
+    let created = registry
+        .dispatch(
+            "create",
+            json!({ "kind": "memory", "content": "written through create with no ranking fields" }),
+        )
+        .await
+        .expect("create kind=memory succeeds");
+    let created = registry
+        .dispatch("get", json!({ "id": created["id"] }))
+        .await
+        .expect("get created");
+
+    assert_eq!(created["kind"], json!("memory"));
+    assert_eq!(created["properties"]["memory_type"], json!("episodic"));
+    assert!(
+        (number(&created, "salience") - 0.3).abs() < 1e-9,
+        "{created}"
+    );
+    assert!(
+        (number(&created, "decay_factor") - 0.02).abs() < 1e-9,
+        "{created}"
+    );
+    for field in ["salience", "decay_factor"] {
+        assert_eq!(
+            created[field], remembered[field],
+            "{field} must match the remember path: create={created} remember={remembered}"
+        );
+    }
+    assert_eq!(
+        created["properties"]["memory_type"], remembered["properties"]["memory_type"],
+        "memory_type must match the remember path"
+    );
+
+    let semantic = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "memory",
+                "content": "semantic memory through create",
+                "properties": { "memory_type": "semantic" }
+            }),
+        )
+        .await
+        .expect("semantic create succeeds");
+    let semantic = registry
+        .dispatch("get", json!({ "id": semantic["id"] }))
+        .await
+        .expect("get semantic");
+    assert_eq!(semantic["properties"]["memory_type"], json!("semantic"));
+    assert!(
+        (number(&semantic, "salience") - 0.5).abs() < 1e-9,
+        "{semantic}"
+    );
+    assert!(
+        (number(&semantic, "decay_factor") - 0.005).abs() < 1e-9,
+        "{semantic}"
+    );
+
+    let explicit = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "memory",
+                "content": "explicit ranking fields through create",
+                "salience": 0.9,
+                "decay_factor": 0.1,
+                "properties": { "memory_type": "semantic", "topic": "kept" }
+            }),
+        )
+        .await
+        .expect("explicit create succeeds");
+    let explicit = registry
+        .dispatch("get", json!({ "id": explicit["id"] }))
+        .await
+        .expect("get explicit");
+    assert!(
+        (number(&explicit, "salience") - 0.9).abs() < 1e-9,
+        "{explicit}"
+    );
+    assert!(
+        (number(&explicit, "decay_factor") - 0.1).abs() < 1e-9,
+        "{explicit}"
+    );
+    assert_eq!(explicit["properties"]["topic"], json!("kept"));
+    assert_eq!(explicit["properties"]["memory_type"], json!("semantic"));
+}
+
+/// The create path refuses the same inputs `memory.remember` refuses.
+#[tokio::test]
+async fn create_of_a_memory_note_validates_like_remember() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    let cases: [(Value, &str); 3] = [
+        (
+            json!({ "kind": "memory", "content": "x", "properties": { "memory_type": "durable" } }),
+            "unknown memory_type",
+        ),
+        (
+            json!({ "kind": "memory", "content": "x", "salience": 1.5 }),
+            "salience must be in [0, 1]",
+        ),
+        (
+            json!({ "kind": "memory", "content": "x", "decay_factor": -0.1 }),
+            "decay_factor must be a finite number >= 0",
+        ),
+    ];
+    for (args, expected) in cases {
+        let err = registry
+            .dispatch("create", args.clone())
+            .await
+            .expect_err("create must refuse");
+        let message = err.to_string();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)) && message.contains(expected),
+            "{args}: expected invalid_input containing {expected:?}, got {message}"
+        );
+    }
+}

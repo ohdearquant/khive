@@ -291,6 +291,64 @@ pub(super) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
     }
 }
 
+/// The stored form of a memory note's ranking fields, whichever verb writes it.
+pub(crate) struct MemoryDefaults {
+    pub(crate) memory_type: &'static str,
+    pub(crate) salience: f64,
+    pub(crate) decay_factor: f64,
+}
+
+/// Resolve `memory_type`, `salience` and `decay_factor` to the values
+/// `memory.remember` stores: an unset field takes the type-differentiated
+/// default, a set one is range-checked. The `memory` kind hook runs the same
+/// resolution for `create(kind=memory)`, so a memory note carries one stored
+/// form whichever path wrote it instead of leaving the columns null for the
+/// read path to fill in.
+pub(crate) fn resolve_memory_defaults(
+    memory_type: Option<&str>,
+    salience: Option<f64>,
+    decay_factor: Option<f64>,
+) -> Result<MemoryDefaults, RuntimeError> {
+    let memory_type = memory_type.unwrap_or("episodic");
+    validate_memory_type(memory_type)?;
+    let memory_type: &'static str = if memory_type == "semantic" {
+        "semantic"
+    } else {
+        "episodic"
+    };
+    let salience = match salience {
+        Some(v) if !(0.0..=1.0).contains(&v) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "salience must be in [0, 1], got {v}"
+            )));
+        }
+        Some(v) => v,
+        // Short-lived episodes start below durable semantic facts.
+        None => match memory_type {
+            "semantic" => DEFAULT_SALIENCE_SEMANTIC,
+            _ => DEFAULT_SALIENCE_EPISODIC,
+        },
+    };
+    let decay_factor = match decay_factor {
+        Some(v) if !v.is_finite() || v < 0.0 => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "decay_factor must be a finite number >= 0, got {v}"
+            )));
+        }
+        Some(v) => v,
+        // Episodic context decays at ~35 days; semantic facts at ~139 days.
+        None => match memory_type {
+            "semantic" => DEFAULT_DECAY_SEMANTIC,
+            _ => DEFAULT_DECAY_EPISODIC,
+        },
+    };
+    Ok(MemoryDefaults {
+        memory_type,
+        salience,
+        decay_factor,
+    })
+}
+
 pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, RuntimeError> {
     match s {
         "rrf" => Ok(FusionStrategy::Rrf { k: 60 }),

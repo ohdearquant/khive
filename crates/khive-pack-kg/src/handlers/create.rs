@@ -68,6 +68,7 @@ impl KgPack {
             "tags",
             "properties",
             "salience",
+            "decay_factor",
             "annotates",
             "embedding_content",
             "key",
@@ -388,6 +389,19 @@ impl KgPack {
                 "key, embed and fence apply only to notes".into(),
             ));
         }
+        match p.decay_factor {
+            Some(_) if p.kind != "note" => {
+                return Err(RuntimeError::InvalidInput(
+                    "decay_factor applies only to notes".into(),
+                ));
+            }
+            Some(v) if !v.is_finite() || v < 0.0 => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "decay_factor must be a finite number >= 0, got {v}"
+                )));
+            }
+            _ => {}
+        }
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 
         let dedup_name: Option<String> = if !skip_dedup && p.kind == "entity" {
@@ -459,6 +473,7 @@ impl KgPack {
                     || p.key.is_some()
                     || p.embed.is_some()
                     || p.fence.is_some()
+                    || p.decay_factor.is_some()
                 {
                     self.runtime
                         .create_note_with_options(
@@ -468,7 +483,7 @@ impl KgPack {
                             &content,
                             p.embedding_content.as_deref(),
                             p.salience,
-                            None,
+                            p.decay_factor,
                             properties,
                             annotates,
                             None,

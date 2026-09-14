@@ -11,10 +11,7 @@ use khive_storage::EdgeRelation;
 use crate::ann;
 use crate::MemoryPack;
 
-use super::common::{
-    deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
-    DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
-};
+use super::common::{deser, resolve_memory_defaults, to_json, MemoryDefaults, RememberParams};
 
 impl MemoryPack {
     pub(crate) async fn handle_remember(
@@ -32,8 +29,11 @@ impl MemoryPack {
             ));
         }
 
-        let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
-        validate_memory_type(memory_type)?;
+        let MemoryDefaults {
+            memory_type,
+            salience,
+            decay_factor,
+        } = resolve_memory_defaults(p.memory_type.as_deref(), p.salience, p.decay_factor)?;
 
         // Explicit namespace wins; otherwise episodic uses actor scope and semantic uses local.
         // Direct-call defense in depth mirrors dispatch's Rule-3 namespace escape.
@@ -55,33 +55,6 @@ impl MemoryPack {
             None
         };
         let write_token: &NamespaceToken = write_token_owned.as_ref().unwrap_or(token);
-
-        let salience = match p.salience {
-            Some(v) if !(0.0..=1.0).contains(&v) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "salience must be in [0, 1], got {v}"
-                )));
-            }
-            Some(v) => v,
-            // Short-lived episodes start below durable semantic facts.
-            None => match memory_type {
-                "semantic" => DEFAULT_SALIENCE_SEMANTIC,
-                _ => DEFAULT_SALIENCE_EPISODIC,
-            },
-        };
-        let decay_factor = match p.decay_factor {
-            Some(v) if !v.is_finite() || v < 0.0 => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "decay_factor must be a finite number >= 0, got {v}"
-                )));
-            }
-            Some(v) => v,
-            // Episodic context decays at ~35 days; semantic facts at ~139 days.
-            None => match memory_type {
-                "semantic" => DEFAULT_DECAY_SEMANTIC,
-                _ => DEFAULT_DECAY_EPISODIC,
-            },
-        };
 
         let mut props = json!({ "memory_type": memory_type });
         if let Some(tags) = &p.tags {

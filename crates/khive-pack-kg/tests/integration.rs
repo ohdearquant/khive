@@ -153,6 +153,36 @@ async fn dispatch_unknown_verb_returns_error() {
 // ---- Kind validation via create: entities ----
 
 #[tokio::test]
+async fn create_note_stores_an_explicit_decay_factor_and_refuses_it_for_entities() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "decay through create", "decay_factor": 0.25 }),
+        )
+        .await
+        .expect("note create with decay_factor succeeds");
+    let got = fixture
+        .dispatch("get", json!({ "id": created["id"] }))
+        .await
+        .expect("get");
+    assert_eq!(got["decay_factor"], json!(0.25), "{got}");
+
+    let err = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "decay on an entity", "decay_factor": 0.25 }),
+        )
+        .await
+        .expect_err("entities carry no decay_factor");
+    assert!(is_invalid_input(&err), "{err}");
+    assert!(
+        invalid_input_message(&err).contains("decay_factor applies only to notes"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn create_entity_valid_kind_concept_succeeds() {
     let pack = pack();
     let result = pack
