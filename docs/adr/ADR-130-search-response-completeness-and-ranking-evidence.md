@@ -989,10 +989,10 @@ test results.
   presentation
 - issue #1829 (backend failure causes were discarded from response and logs)
 
-## Amendment 6 (proposed): explain zero text contribution (2026-09-14)
+## Amendment 6: explain zero text contribution (2026-09-14)
 
-**Status: Proposed.** Pending acceptance; the earlier accepted arm contract and
-the separate proposed limit-disclosure amendment retain their current status.
+**Status: Accepted (2026-09-14).** The earlier accepted arm contract and the
+separate proposed limit-disclosure amendment retain their current status.
 
 When and only when `arm_participation.text.status` is `ran` and its
 `candidate_count` is zero, MCP adds `reason` with this bounded literal value:
