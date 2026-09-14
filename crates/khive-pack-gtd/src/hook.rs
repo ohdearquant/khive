@@ -38,6 +38,13 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
                 )));
             }
         }
+        for field in ["blocked_by", "dependency_state", "actionable"] {
+            if properties.contains_key(field) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "properties.{field} is derived from task dependencies and cannot be patched on a task; update properties.depends_on to change blockers"
+                )));
+            }
+        }
     }
 
     let content_patch = root

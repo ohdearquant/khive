@@ -402,6 +402,10 @@ empty field named `items`, `entities`, `notes`, or `edges` still drops it. The
 three limit-metadata fields identify a list envelope at the presentation
 boundary.
 
+[Proposed Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes)
+explicitly applies this rule to the new knowledge-list/topic `results` envelopes
+on acceptance, while retaining ordinary row transforms.
+
 On synthetic 10-item task listings with full timestamps and UUIDs, the Agent
 transform reduced response JSON byte length by ~55–60%. On smaller responses
 (single record, few fields), savings are proportionally lower (~20–30%).
@@ -660,6 +664,11 @@ completion signals and a caller that cannot see them cannot terminate. The
 exception is envelope-scoped in the same way: a `results` array without a
 sibling `next_after` key receives the ordinary transform.
 
+That last sentence is qualified, on acceptance, by
+[proposed Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes):
+the new knowledge-list/topic report siblings also identify a structural envelope
+without a cursor. Existing keyset completion behavior does not change.
+
 ## References
 
 - ADR-016 (Request DSL) §"UUID arguments" — short-prefix resolution on input
@@ -667,3 +676,88 @@ sibling `next_after` key receives the ordinary transform.
 - ADR-017 (Pack Standard) — verb declaration, handler return shape
 - ADR-016 (Request DSL) — single-tool `request` envelope shape
 - Design request 2026-05-23 — "verb should include a handler for verbose output…"
+
+## Amendment 5 (2026-09-14): structural knowledge limit envelopes
+
+**Status: Proposed — pending owner/spec approval.**
+**Related issue:** #2679.
+
+This amendment accompanies
+[ADR-047's 2026-09-14 knowledge list and topic limit reports](ADR-047-knowledge-pack.md#amendment-2026-09-14-knowledge-list-and-topic-limit-reports).
+It proposes the observable empty-result consequence of those two verbs adding
+`requested_limit`, `effective_limit`, and `limit_clamped` beside `results`.
+Numeric-report approval alone does not accept this presentation change. Both
+proposals require owner/spec approval before dependent implementation merges;
+only the new amendments become Accepted with the later fix.
+
+### Scope of the structural envelope
+
+On acceptance, §7's **Amendment 1 (2026-08-08)** stable-envelope rule explicitly
+includes all four `knowledge.list` successes (atom/domain × offset/cursor) and
+both `knowledge.topic` successes (query/listing) carrying the three report
+siblings. Agent mode must retain the siblings and envelope `results` even when
+it is `[]`. This newly retains empty offset-list/topic results previously
+removed by ordinary empty-field dropping.
+
+This amendment also qualifies **Amendment 4 (2026-09-03)**'s final sentence:
+absence of `next_after` does not imply an ordinary transform when those three
+report siblings identify a knowledge limit envelope. A results array without
+either structural discriminator still follows the existing ordinary transform.
+Knowledge-list cursor pages already retain empty results and `next_after:null`;
+this proposal preserves that completion contract without adding cursor fields
+to offset pages or to topic.
+
+The exception is scoped to the envelope. Fields within records retain all
+existing UUID, timestamp, score and empty-field transformations. No new
+per-verb rendering exception, response wrapper or renderer change is required.
+Adding report siblings to an envelope does not make an ordinary record or its
+properties structural; each object keeps its existing classification.
+
+### Presentation and format behavior
+
+The rule applies before output-format rendering. For each presentation mode
+Agent, Verbose and Human, preserve the existing behavior of each format `json`,
+`auto` and `table`. Verbose/Human canonical payloads already include empty
+results; Agent now retains the scoped empty results in all three formats.
+Existing zero/one-row JSON fallback, multi-row tables, sibling scalar rendering,
+full_id redundancy policy, field order policy and ordinary record transforms
+continue to govern. `format` does not undo the presentation transform.
+
+For example, topic listing with two matching concepts and limit 0 yields the
+canonical `{results:[],total:2,requested_limit:0,effective_limit:0,
+limit_clamped:false}`. Agent preserves the empty array and report; `total` is
+still 2, not the output length. A topic query with effective 0 instead retains its
+existing total 0. For an empty list cursor with requested 501, results and
+`next_after:null` remain present as before, alongside legacy limit 500 and the
+new `501 / 500 / true` report.
+
+Removing the new siblings from a nonempty result must leave the same legacy
+payload under the same existing presentation/format rules. Empty offset-list
+and topic Agent results have exactly one further allowed structural difference:
+`results: []` is now present. Existing empty cursor completion is unchanged.
+This contract does not require rendered-byte identity after additive fields.
+
+### Acceptance and mutation witnesses
+
+- **KP-MATRIX:** Exercise all nine presentation × format pairs on zero-, one-
+  and multi-row responses, including false/zero report values, full_id, local
+  namespace, row order and null cursor. Check complete old row/payload behavior
+  as well as new siblings; distinguish empty offset/topic retention from
+  already-retained cursor completion.
+- **KP-WIRE:** A real MCP request must retain empty offset-list and topic
+  results and their three report siblings in Agent output. A populated route
+  control must precede each empty-route assertion. A separate ordinary result
+  fixture without either structural discriminator must still drop an empty
+  results array under the unchanged renderer.
+- **KP-MISSING-REPORT:** Independently omit one report sibling from an empty
+  atom-offset response and rename one from an empty topic-listing response.
+  The intended metadata/empty-array assertion must fail while baseline route
+  controls pass. These mutations affect handler output only; the renderer and
+  its row, identifier, namespace and cursor-completion controls stay unchanged.
+
+Witnesses and individual mutants are named and frozen before running them.
+Baseline controls establish existing transformations before an expected failure
+on missing new metadata or the proposed new empty-array retention. Fixed runs
+must satisfy the unchanged controls and the new assertions. Zero selected
+tests, compilation failures or invalid fixtures are not acceptance or mutant
+kills. This proposed text records no executed result.
