@@ -556,3 +556,79 @@ stated here because a caller reasoning about a tombstone should not have to deri
 
 Out of scope, both on the same object: a deadline or expiry on the fence, and any fence on entities
 or edges.
+
+## Amendment 5 (2026-09-14): an accepted fenced write always mints a version; the no-op answer is for unfenced updates only
+
+**Status**: Proposed. Originating report: [#2715](https://github.com/ohdearquant/khive/issues/2715).
+
+### The gap
+
+#2694 made write verbs idempotent: a note `update` whose normalized patch equals the stored value
+returns the stored row with `unchanged: true`, its version and `updated_at` untouched, and no event.
+The implementation puts that decision in the shared update planner
+(`prepare_versioned_note_update`), which serves both `update` and the `stream.batch` `write` member,
+so a write that names `expected_version` and changes nothing is also answered as a no-op. A caller
+using the version as a compare-and-set fence then holds a stale expectation:
+
+```
+write key=K doc={"n": 1} expected_version=0   -> version 1
+write key=K doc={"n": 1} expected_version=1   -> version 1 (no-op)     before #2694: version 2
+write key=K doc={"n": 2} expected_version=2   -> version_conflict, current_version 1
+```
+
+Two rivals racing the same unchanged document both succeed at the same expected version and neither
+learns it lost; a heartbeat or lease renewal that rewrites an unchanged document no longer moves the
+fence. §1 already says every statement that touches a note row advances the version, and Acceptance
+item 1 already says an accepted `update(expected_version=N)` leaves the row at N+1; neither sentence
+carries a content qualifier. [ADR-188](ADR-188-entity-version-fence.md) names the unfenced no-op case
+an open question and deliberately does not decide it. This amendment states the rule for the three
+cases so that the fence's meaning is written down rather than inferred from a trigger.
+
+### A5.1 A fenced write that is accepted advances the version by exactly one
+
+`update(expected_version=N)` and a `stream.batch` `write` member with a positive `expected_version`
+that are accepted leave the row at N+1 and move `updated_at`, whether or not the content, name,
+tags or properties differ from the stored row. The result carries the new version, and `unchanged`
+is never set on a fenced write. A version is a count of accepted writes, not of content revisions:
+the caller that names `expected_version` is asking for exactly one accepted write at that version,
+and the only thing a rival can fail against is the version that write minted. This restates §1 and
+Acceptance item 1; it is written here because #2694 read them the other way.
+
+### A5.2 An unfenced identical update is a no-op, disclosed
+
+`update` without `expected_version`, whose normalized patch equals the stored value (`properties.tags`
+compared as an order-insensitive multiset, as #2694 states), returns the stored row with
+`unchanged: true`; version, `updated_at` and the event log are untouched. This is the #2694 contract,
+kept: an unfenced caller asked for a state, the state already holds, and nothing happened. A one-byte
+difference is a write. Under ADR-188's symmetry clause the same rule is the entity rule; the fix that
+lands against this amendment either carries an entity arm or files the gap as its own issue rather
+than asserting symmetry it did not test.
+
+### A5.3 A `stream.batch` write member is never a no-op
+
+A `write` member's `expected_version` is either a positive version, which is a fenced update under
+A5.1, or omitted/null, which creates only if the key is absent (ADR-174 §1). There is no unfenced
+update through the batch, so the no-op answer never applies to a batch write member: an accepted
+`write` at version V returns `{"id", "version": V+1, "updated_at"}` (ADR-174 A5.2) for an identical
+document as for a changed one. The `stream.batch` help and the `update` help each state which rule
+their route takes.
+
+### Acceptance
+
+Stated before implementation, checked at the PR that lands the code:
+
+1. **Batch, identical document, matching version.** Two consecutive `stream.batch` writes of the same
+   document at `expected_version` 1 then 2 succeed with versions 2 and 3, `updated_at` moving each
+   time; a third at `expected_version` 2 refuses with `version_conflict` and `current_version` 3.
+2. **Update, identical patch, matching version.** `update(expected_version=N)` with a patch equal to
+   the stored value returns version N+1 and no `unchanged` field.
+3. **Update, identical patch, no fence.** The same patch without `expected_version` returns
+   `unchanged: true`, the same version and the same `updated_at`, and appends no event.
+4. **Rivals on an unchanged document.** Two processes write the same document at `expected_version=N`
+   concurrently: exactly one succeeds, the other receives `version_conflict` with `current_version`
+   N+1, and the row is at N+1 after both.
+5. **Mutation.** With the fenced-path exclusion removed from the no-op condition, arms 1, 2 and 4 go
+   red while arm 3 stays green; the log is retained beside the PR evidence.
+6. **Help.** `stream.batch` help states that an accepted write member always advances the version;
+   `update` help states that an identical unfenced patch is a disclosed no-op and a fenced one is a
+   write.
