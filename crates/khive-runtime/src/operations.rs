@@ -32,6 +32,16 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
+/// The restore unit committed the row and its text index; only the
+/// post-commit embedding rebuild failed. Name that, so the caller does not
+/// read an ordinary restore failure over a record that is already live.
+fn restore_reindex_failed(kind: &str, id: Uuid, error: RuntimeError) -> RuntimeError {
+    RuntimeError::Internal(format!(
+        "{kind} {id} is restored and text-indexed, but its embedding rebuild failed \
+         and will be retried by the next reindex: {error}"
+    ))
+}
+
 fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) -> RuntimeError {
     KhiveError::conflict(format!(
         "merge_tombstone: {id} was merged into {kept_id}; a merge tombstone is not restorable, query the kept id"
@@ -177,7 +187,9 @@ fn consume_fault(arms: &FaultArmSet, namespace: &str) -> bool {
 static FTS_SEARCH_FAIL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Arm a one-shot FTS failure injection for `create_note_inner`/`create_entity_inner`
-/// targeting namespace `ns`.
+/// targeting namespace `ns`. `restore_note`/`restore_entity` consume the same
+/// arm at their post-commit reindex step, after the row and its FTS document
+/// are already committed in one unit.
 ///
 /// The next `create_note` or `create_entity` call whose namespace equals `ns` returns
 /// an injected error at the FTS upsert step (after the row is committed), then disarms
@@ -4940,22 +4952,45 @@ impl KhiveRuntime {
                         "entity {id} updated_at is already at i64::MAX and cannot advance"
                     ))
                 })?);
+        let mut restored = entity;
+        restored.deleted_at = None;
+        restored.updated_at = updated_at;
+        let mut statements = vec![PlanStatement {
+            statement: SqlStatement {
+                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1 \
+                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
+                    .into(),
+                params: vec![
+                    SqlValue::Integer(updated_at),
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_owned()),
+                ],
+                label: Some("entity-restore".into()),
+            },
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        // The soft delete removed the FTS row, so the text index is published
+        // in the same unit as the row: a live row that search cannot find is
+        // not a state this verb can leave behind. Order-sensitive pair — see
+        // `insert_document_statements`'s adjacency contract.
+        for statement in khive_db::stores::text::delete_document_statements(
+            "fts_entities",
+            &restored.namespace,
+            id,
+        )
+        .into_iter()
+        .chain(insert_document_statements(
+            "fts_entities",
+            &entity_fts_document(&restored),
+        )) {
+            statements.push(PlanStatement {
+                statement,
+                guard: None,
+            });
+        }
         let plan = AtomicOpPlan::Update(UpdatePlan {
             target_id: id,
-            statements: vec![PlanStatement {
-                statement: SqlStatement {
-                    sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1 \
-                          WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL"
-                        .into(),
-                    params: vec![
-                        SqlValue::Integer(updated_at),
-                        SqlValue::Text(id.to_string()),
-                        SqlValue::Text(token.namespace().as_str().to_owned()),
-                    ],
-                    label: Some("entity-restore".into()),
-                },
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }],
+            statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
@@ -4965,10 +5000,19 @@ impl KhiveRuntime {
         });
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
-                let mut restored = entity;
-                restored.deleted_at = None;
-                restored.updated_at = updated_at;
-                self.reindex_entity(token, &restored).await?;
+                // Embeddings are rebuilt after the commit; the row and its
+                // text index are already live, so a failure here names that.
+                #[cfg(any(test, feature = "fault-injection"))]
+                if consume_fault(&FTS_FAIL_NS, &restored.namespace) {
+                    return Err(restore_reindex_failed(
+                        "entity",
+                        id,
+                        RuntimeError::Internal("injected FTS failure".to_string()),
+                    ));
+                }
+                self.reindex_entity(token, &restored)
+                    .await
+                    .map_err(|e| restore_reindex_failed("entity", id, e))?;
                 Ok(Some((restored, true)))
             }
             Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
@@ -5034,19 +5078,42 @@ impl KhiveRuntime {
         } else {
             String::new()
         };
+        let mut restored = note.clone();
+        restored.status = "active".into();
+        restored.deleted_at = None;
+        restored.updated_at = updated_at;
+        restored.version = restored
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Internal(format!("note {id} version is exhausted")))?;
+        let mut statements = vec![PlanStatement {
+            statement: SqlStatement {
+                sql: format!(
+                    "UPDATE notes SET status=?1, deleted_at=NULL, updated_at=?2 \
+                     WHERE id=?3 AND namespace=?4 AND kind=?5 AND deleted_at IS NOT NULL{key_clause}"
+                ),
+                params,
+                label: Some("note-restore".into()),
+            },
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        // Text index published in the same unit as the row; see restore_entity.
+        for statement in
+            khive_db::stores::text::delete_document_statements("fts_notes", &restored.namespace, id)
+                .into_iter()
+                .chain(insert_document_statements(
+                    "fts_notes",
+                    &note_fts_document(&restored),
+                ))
+        {
+            statements.push(PlanStatement {
+                statement,
+                guard: None,
+            });
+        }
         let plan = AtomicOpPlan::Update(UpdatePlan {
             target_id: id,
-            statements: vec![PlanStatement {
-                statement: SqlStatement {
-                    sql: format!(
-                        "UPDATE notes SET status=?1, deleted_at=NULL, updated_at=?2 \
-                         WHERE id=?3 AND namespace=?4 AND kind=?5 AND deleted_at IS NOT NULL{key_clause}"
-                    ),
-                    params,
-                    label: Some("note-restore".into()),
-                },
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }],
+            statements,
             post_commit: PostCommitEffect::None,
             edge_natural_key: None,
             idempotent_noop: false,
@@ -5056,14 +5123,17 @@ impl KhiveRuntime {
         });
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
-                let mut restored = note;
-                restored.status = "active".into();
-                restored.deleted_at = None;
-                restored.updated_at = updated_at;
-                restored.version = restored.version.checked_add(1).ok_or_else(|| {
-                    RuntimeError::Internal(format!("note {id} version is exhausted"))
-                })?;
-                self.reindex_note(token, &restored).await?;
+                #[cfg(any(test, feature = "fault-injection"))]
+                if consume_fault(&FTS_FAIL_NS, &restored.namespace) {
+                    return Err(restore_reindex_failed(
+                        "note",
+                        id,
+                        RuntimeError::Internal("injected FTS failure".to_string()),
+                    ));
+                }
+                self.reindex_note(token, &restored)
+                    .await
+                    .map_err(|e| restore_reindex_failed("note", id, e))?;
                 Ok(Some((restored, true)))
             }
             Ok(AtomicRunOutcome::RolledBack {
@@ -14030,6 +14100,132 @@ mod tests {
         assert_eq!(
             fts_count, 0,
             "fts_entities must be empty after FTS-failure rollback; found {fts_count}"
+        );
+    }
+
+    // Restore publishes the text index inside the same unit as the row (#2699).
+    //
+    // The soft delete removed the FTS row. Before this change the restore
+    // committed `deleted_at=NULL` and only then reindexed, so a reindex
+    // failure left a live row that `get` returned and `search` could not
+    // find. The fault is armed at the post-commit step; the row and its FTS
+    // document must already be live when the error comes back.
+    #[tokio::test]
+    async fn restore_note_publishes_fts_in_the_same_unit_as_the_row() {
+        let ns = format!("restore-fts-note-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "quartz tombstone restore lookup marker",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let fts = rt.text_for_notes(&tok).unwrap();
+        let filter = || TextFilter {
+            ids: vec![note.id],
+            kinds: vec![],
+            record_kinds: vec![],
+            namespaces: vec![ns.clone()],
+        };
+        assert_eq!(
+            fts.count(filter()).await.unwrap(),
+            1,
+            "control: the filter must see the live note's FTS row before the delete"
+        );
+        assert!(rt.delete_note(&tok, note.id, false).await.unwrap());
+        assert_eq!(
+            fts.count(filter()).await.unwrap(),
+            0,
+            "soft delete must remove the FTS row"
+        );
+
+        let _arm = arm_fts_fail_scoped(&ns);
+        let err = rt
+            .restore_note(&tok, note.id)
+            .await
+            .expect_err("the post-commit reindex failure must surface");
+        assert!(
+            err.to_string().contains("is restored and text-indexed"),
+            "the error must name the live row: {err}"
+        );
+
+        let live = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .expect("the row is live after the committed unit");
+        assert!(live.deleted_at.is_none());
+        assert_eq!(
+            fts.count(filter()).await.unwrap(),
+            1,
+            "the FTS row must be published by the restore unit, not by the reindex"
+        );
+        let hits = rt
+            .search_notes(&tok, "quartz tombstone", None, 5, None, false, &[], None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.note_id == note.id),
+            "search must find the restored note: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_entity_publishes_fts_in_the_same_unit_as_the_row() {
+        let ns = format!("restore-fts-entity-{}", uuid::Uuid::new_v4().as_simple());
+        let rt = rt();
+        let tok = NamespaceToken::for_namespace(Namespace::parse(&ns).unwrap());
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "QuartzRestoreMarker",
+                Some("tombstone restore lookup marker"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let fts = rt.text(&tok).unwrap();
+        let filter = || TextFilter {
+            ids: vec![entity.id],
+            kinds: vec![],
+            record_kinds: vec![],
+            namespaces: vec![ns.clone()],
+        };
+        assert_eq!(
+            fts.count(filter()).await.unwrap(),
+            1,
+            "control: the filter must see the live entity's FTS row before the delete"
+        );
+        assert!(rt.delete_entity(&tok, entity.id, false).await.unwrap());
+        assert_eq!(fts.count(filter()).await.unwrap(), 0);
+
+        let _arm = arm_fts_fail_scoped(&ns);
+        let err = rt
+            .restore_entity(&tok, entity.id)
+            .await
+            .expect_err("the post-commit reindex failure must surface");
+        assert!(
+            err.to_string().contains("is restored and text-indexed"),
+            "{err}"
+        );
+        let live = rt.get_entity(&tok, entity.id).await.unwrap();
+        assert!(live.deleted_at.is_none());
+        assert_eq!(
+            fts.count(filter()).await.unwrap(),
+            1,
+            "the FTS row must be published by the restore unit, not by the reindex"
         );
     }
 
