@@ -115,6 +115,10 @@ refused for a run that has a lease is policy above khive and is not decided here
 
 ### 3. `key`, and create-if-absent
 
+**Partial supersession:** Amendment 6 qualifies this section's duplicate-conflict and one-success
+sentences for generic singleton note `create`: an identical validated payload can return a successful
+replay under the existing disclosure gate. Key scope, uniqueness and lifetime remain unchanged.
+
 Migration 028 also adds `key TEXT` (nullable) to `notes` and a partial unique index:
 
 ```sql
@@ -247,6 +251,9 @@ uniqueness is not offered: the index is per namespace by construction.
 
 Stated before implementation, checked at the PR that lands the code:
 
+**Partial supersession:** Amendment 6 replaces only the generic keyed-create duplicate outcomes in
+items 2 and 8 below. Their one-live-holder requirement and the update/CAS acceptance remain intact.
+
 1. **Compare-and-set, cross-process.** Two processes read a note at version N and both send
    `update(expected_version=N)`. Exactly one succeeds, the other receives `version_conflict` with
    `current_version: N+1`, and `version` is N+1 after both, never N+2. Run through two socket clients and
@@ -294,6 +301,10 @@ Four corrections to §3 and §4, none of which changes a verb signature. Where t
 sections above disagree, the amendment governs: it supersedes §4's order and cursor sentences (`updated_at
 DESC, key DESC`; `next_after` encoding `(updated_at, key)`) and §4's `after_key` resolution sentence, and
 it narrows §3's `key_conflict` details.
+
+**Partial supersession:** Amendment 6 adds successful identical replay under this same second `list`
+gate. The disclosure rule below and acceptance item 13 still govern every key conflict; an allowed
+identical duplicate now returns the minimal replay result rather than a conflict with `existing_id`.
 
 **Keyed cursor.** A key may be held by one live note of each kind, and a keyed listing that omits
 `note_kind` spans kinds, so two rows can share `(updated_at, key)`; a keyset cursor on that pair alone
@@ -632,3 +643,110 @@ Stated before implementation, checked at the PR that lands the code:
 6. **Help.** `stream.batch` help states that an accepted write member always advances the version;
    `update` help states that an identical unfenced patch is a disclosed no-op and a fenced one is a
    write.
+
+## Amendment 6 (2026-09-14): identical generic keyed-create replay
+
+**Status**: Proposed.
+
+### Scope and result
+
+A caller retrying a generic keyed note create after losing its response needs the existing ID without
+creating another record. This amendment partially supersedes §3, base acceptance items 2 and 8, and
+Amendment 1's duplicate outcome for this case only. It does not change key scope or lifetime, update
+CAS, restore, unkeyed/bulk create, [stream writes](ADR-174-ordered-streams-append.md), or the separate
+[`memory.remember` operation-identity contract](ADR-179-operation-identity-memory-remember.md).
+
+Amendment 5's rules remain unchanged: an accepted `update(expected_version=N)` or `stream.batch`
+write member with positive `expected_version` advances the version. This amendment does not add
+replay to either route. A supplied note-create `fence` must still pass before replay; successful
+replay does not update the holder.
+
+A valid singleton note `create(key=K, ...)` has these outcomes within the caller's primary namespace
+and canonical note kind:
+
+- No live holder: insert one note and return the existing full creation response with `created:true`.
+- An equal live holder, with disclosure allowed: return only `{id:<canonical UUID>,created:false}`.
+  This is a successful request result, using the existing `ok:true` envelope.
+- A different live holder payload: return `key_conflict`, with `existing_id` only when disclosure is
+  allowed.
+- An equal holder with disclosure denied or unavailable: return `key_conflict` with only `reason` and
+  `key` in its details. Return no holder ID, payload or equality indicator.
+
+Disclosure uses Amendment 1's second Gate check for `list`, with the same caller, namespace,
+canonical note kind and key prefix. A Gate error fails closed. Admission to `create`, knowledge of
+the key, or unscoped by-ID access does not replace that check. The replay's minimal result does not
+grant disclosure of the holder's other fields.
+
+### Equality and no-op behavior
+
+Compare the candidate's validated content and properties with the live holder. Content is exact text,
+without whitespace, case or JSON-document normalization. Properties use typed JSON value equality:
+object member order is irrelevant; member presence, array order and value types are significant;
+numbers use the existing typed JSON equality without coercion. Omitted properties and wire
+`properties:null` both produce absent properties; absence differs from `{}` and from a stored JSON
+null value.
+
+The candidate retains normal input, kind-hook, identity and secret validation. Compare properties
+after kind-hook normalization, tag merging and runtime-owned derivation, including generated members
+such as actor attribution and task defaults. Do not suppress hooks or discard generated properties
+to force equality. A newly generated property value can therefore make the payload different.
+The note's generated ID, timestamp and version columns do not participate in equality; a property
+with one of those names still does.
+
+Other valid creation-only fields and options, such as name, salience, embedding and requested links,
+neither defeat equal replay nor update the holder. Replay leaves its row, version, timestamps,
+annotations, edges and indexes unchanged and runs no creation or after-create effects. It does not
+retry a previously failed best-effort edge or hook. An actual mutation requires the corresponding
+write operation.
+
+### Transaction and preparation boundary
+
+Supplied fences retain their existing order and semantics and must pass in the writer transaction
+before either creation or successful replay is decided. An equal payload does not bypass a stale,
+missing, replaced or expired fence, including an absence fence contradicted by a live holder.
+
+The authoritative comparison is against the current live holder inside the writer transaction;
+an earlier read grants neither an ID receipt nor a right to insert. A successful replay waits for
+successful transaction completion. A failed or ambiguous writer transaction must not be reclassified
+as replay from a later lookup.
+
+Creation-only annotation resolution and embedding work run outside the writer transaction and after
+an initial authoritative holder check. An equal replay must not require its old annotation target or
+embedding model to remain available, even when the same options are supplied again. For an initially
+absent key, revalidate fences and the current holder in the final writer transaction after preparation,
+before consuming either its plan or its failure. An equal holder now yields replay; a different
+payload conflicts; continued absence permits insertion or preserves the preparation failure. Insert
+and its final check share the same transaction and retain the live-key unique index as arbiter.
+
+This staging can cost an extra writer transaction when the key is initially absent. It avoids holding
+the writer across model calls or asynchronous annotation resolution. Ordinary request auditing can
+still occur, and preparation after observing absence can perform lazy vector-table setup even if a
+concurrent holder later makes the result a replay. The no-op promise concerns domain mutation; it is
+not a promise of no audit, schema preparation or writer admission.
+
+### Acceptance
+
+These are implementation requirements, not reported test results:
+
+1. Through public dispatch, repeat an identical keyed create: one `created:true`, then `created:false`
+   with the same full ID and the complete stored note unchanged. Two unkeyed controls create distinct
+   IDs. Object-order and equivalent derived-property controls replay; changed content, properties,
+   array order or generated identity conflict. Ignoring properties or comparing raw request/serialized
+   JSON instead of the validated values must fail a corresponding control.
+2. Repeat equal and different payloads under allow, deny and Gate-error disclosure policies. Deny/error
+   responses expose no holder ID or equality indicator; an admitted first create still succeeds when
+   listing is denied. Removing the second gate or treating its error as allow must fail the control.
+3. Race identical creates through two independent clients: both succeed, exactly one creates, their
+   IDs agree, and one live holder remains. Different-content and different-property racers retain one
+   creator and one conflict without changing the winner. Move the final comparison outside the writer
+   transaction and the controlled interleaving must fail.
+4. Keep validating hooks and fences active. Change/delete/replace a holder or invalidate a fence between
+   initial observation and final writer admission; only current state governs. A replay with changed
+   creation-only options, a lost annotation target or an unavailable model leaves the holder and
+   creation-effect counts unchanged. Eagerly running creation-only work or bypassing fences must fail.
+5. Park preparation outside the writer and prove an independent writer can proceed. Insert an equal
+   holder before allowing preparation to fail: replay succeeds. Different-holder and absent-holder
+   controls respectively conflict and retain the preparation error. Fresh insertion faults still roll
+   back note/index/edge writes and leave the key free; uncertain writer failures remain errors.
+   Propagating preparation failure before revalidation or converting insertion failure into replay must
+   fail. Preserve the specialized-memory, stream-write and update-CAS controls unchanged.
