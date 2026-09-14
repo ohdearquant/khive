@@ -353,9 +353,10 @@ effects.
 ### Lifecycle verbs stay pack-owned
 
 `complete` and `transition` enforce the GTD state machine. They are not equivalent to
-kg `update` — `update` patches arbitrary fields without lifecycle awareness, while
-`transition` validates against the allowed-set table. A `done → inbox` `update` would
-silently succeed; `gtd.transition(id, "inbox")` from `done` returns `InvalidInput`.
+kg `update` — the task hook rejects incoming `properties.status`,
+`properties.completed_at`, and `properties.transition_history`, while `transition`
+validates against the allowed-set table. Both a generic attempt to patch a done task's
+status to inbox and `gtd.transition(id, "inbox")` from done return `InvalidInput`.
 The dependency-integrity amendment is deliberately narrower: the task hook validates
 `properties.depends_on` updates because graph cycles are a cross-record invariant,
 without moving the lifecycle state machine into shared CRUD.
@@ -366,6 +367,25 @@ items priority-sorted.
 
 These verbs do not have shared-CRUD equivalents. Lifecycle semantics belong in the
 pack that defines them.
+
+### Proposed amendment: dependency diagnostic ownership (#2675)
+
+The task hook rejects incoming `properties.blocked_by`,
+`properties.dependency_state`, and `properties.actionable` on generic task updates,
+including null values. These are query-derived diagnostics. The refusal names the
+field and directs callers to `properties.depends_on`; canonical dispatch and atomic
+preparation reject the entire patch before writing. This does not reject unrelated
+updates to a legacy task with those stored properties or scrub its historical data.
+Other note kinds and generic task creation retain their existing property semantics.
+
+Scheduling dependencies come from the task's `properties.depends_on`, a validated
+array of canonical full task UUIDs. Setting it to an empty array clears scheduling
+blockers. A generic task-to-task `link(source_id=dependent, target_id=blocker,
+relation="depends_on")` creates a traversable graph relationship when KG and GTD are
+loaded; it does not update that property or change scheduling state. Generic property
+updates likewise do not synchronize the graph edges. Task creation stores the
+dependency property and attempts a best-effort edge projection. Completing a blocker
+changes derived readiness without rewriting the dependent's lifecycle or its edges.
 
 ### Hybrid search composition
 

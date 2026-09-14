@@ -1208,6 +1208,278 @@ async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_prope
 }
 
 #[tokio::test]
+async fn issue_2675_task_update_refuses_derived_properties() {
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let blocker = assign(&fixture, json!({"title": "real blocker"})).await;
+    let task = assign(
+        &fixture,
+        json!({
+            "title": "unchanged title", "description": "unchanged body", "status": "next"
+        }),
+    )
+    .await;
+    let id = task["full_id"].as_str().unwrap();
+    let uuid = uuid::Uuid::parse_str(id).unwrap();
+    let store = runtime.notes(&token).unwrap();
+    let before = store.get_note(uuid).await.unwrap().unwrap();
+    let edges_before = fixture
+        .dispatch("neighbors", json!({"id": id}))
+        .await
+        .unwrap();
+    assert!(edges_before.as_array().unwrap().is_empty());
+
+    for (field, meaningful) in [
+        ("blocked_by", json!([blocker["full_id"]])),
+        ("dependency_state", json!("blocked")),
+        ("actionable", json!(false)),
+    ] {
+        for value in [meaningful, Value::Null] {
+            let error = fixture
+                .dispatch(
+                    "update",
+                    json!({
+                        "id": id, "name": "must not rename", "content": "must not write",
+                        "properties": {
+                            field: value, "description": "must not write", "priority": "p1",
+                            "depends_on": [blocker["full_id"]]
+                        }
+                    }),
+                )
+                .await
+                .expect_err("derived property must refuse the entire patch");
+            assert_eq!(error.to_string(), format!(
+                "invalid input: properties.{field} is derived from task dependencies and cannot be patched on a task; update properties.depends_on to change blockers"
+            ));
+            assert_eq!(
+                store.get_note(uuid).await.unwrap().unwrap(),
+                before,
+                "refusal must preserve the complete stored task for {field}"
+            );
+            assert_eq!(
+                fixture
+                    .dispatch("neighbors", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                edges_before,
+                "refusal must not add dependency edges"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_2675_unrelated_updates_preserve_legacy_shadows_and_other_note_properties() {
+    let fixture = pack(rt());
+    let shadows = json!({"blocked_by": ["legacy"], "dependency_state": "old", "actionable": false});
+    let task = fixture
+        .dispatch(
+            "create",
+            json!({
+                "kind": "task", "title": "legacy diagnostic shadows", "properties": shadows
+            }),
+        )
+        .await
+        .expect("existing create semantics permit legacy shadows");
+    let id = task["id"].as_str().unwrap();
+    let before = fixture.dispatch("get", json!({"id": id})).await.unwrap();
+    for field in ["blocked_by", "dependency_state", "actionable"] {
+        assert_eq!(
+            before["properties"][field], shadows[field],
+            "non-vacuous legacy fixture"
+        );
+    }
+    let updated = fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": id, "content": "updated legitimate body",
+                "properties": {"priority": "p1", "planning_label": "reviewed"}
+            }),
+        )
+        .await
+        .expect("incoming keys, not stored legacy shadows, determine refusal");
+    assert_eq!(updated["content"], "updated legitimate body");
+    assert_eq!(
+        updated["properties"]["description"],
+        "updated legitimate body"
+    );
+    assert_eq!(updated["properties"]["priority"], "p1");
+    assert_eq!(updated["properties"]["planning_label"], "reviewed");
+    for field in ["blocked_by", "dependency_state", "actionable"] {
+        assert_eq!(
+            updated["properties"][field], shadows[field],
+            "do not scrub historical data"
+        );
+    }
+    let persisted = fixture.dispatch("get", json!({"id": id})).await.unwrap();
+    assert_eq!(persisted["properties"], updated["properties"]);
+
+    let observation = fixture
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation", "content": "ordinary note"
+            }),
+        )
+        .await
+        .unwrap();
+    fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": observation["id"], "properties": shadows
+            }),
+        )
+        .await
+        .expect("task-only ownership must not restrict other notes");
+    let persisted = fixture
+        .dispatch("get", json!({"id": observation["id"]}))
+        .await
+        .unwrap();
+    for field in ["blocked_by", "dependency_state", "actionable"] {
+        assert_eq!(persisted["properties"][field], shadows[field]);
+    }
+}
+
+#[tokio::test]
+async fn issue_2675_task_link_does_not_set_scheduling_dependencies() {
+    use khive_storage::types::{Direction, NeighborQuery};
+    use khive_storage::EdgeRelation;
+
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let blocker = assign(
+        &fixture,
+        json!({"title": "pending blocker", "status": "inbox"}),
+    )
+    .await;
+    let dependent = assign(&fixture, json!({"title": "dependent", "status": "next"})).await;
+    let id = dependent["full_id"].as_str().unwrap();
+    let uuid = uuid::Uuid::parse_str(id).unwrap();
+    let blocker_uuid = uuid::Uuid::parse_str(blocker["full_id"].as_str().unwrap()).unwrap();
+    let notes = runtime.notes(&token).unwrap();
+    let before = notes.get_note(uuid).await.unwrap().unwrap();
+    fixture
+        .dispatch(
+            "link",
+            json!({
+                "source_id": id, "target_id": blocker["full_id"], "relation": "depends_on"
+            }),
+        )
+        .await
+        .expect("KG+GTD permits dependent-task to blocker-task links");
+    assert_eq!(
+        notes.get_note(uuid).await.unwrap().unwrap(),
+        before,
+        "graph link must not mutate the scheduling property or task lifecycle"
+    );
+    let graph = runtime.graph(&token).unwrap();
+    let edges = graph
+        .neighbors(
+            uuid,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: Some(vec![EdgeRelation::DependsOn]),
+                limit: Some(16),
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].node_id, blocker_uuid);
+
+    for (properties, expected_state, actionable) in [
+        (None, "ready", true),
+        (
+            Some(json!({"depends_on": [blocker["full_id"]]})),
+            "blocked",
+            false,
+        ),
+        (Some(json!({"depends_on": []})), "ready", true),
+        (
+            Some(json!({"depends_on": [blocker["full_id"]]})),
+            "blocked",
+            false,
+        ),
+    ] {
+        if let Some(properties) = properties {
+            fixture
+                .dispatch("update", json!({"id": id, "properties": properties}))
+                .await
+                .expect("depends_on is the supported scheduling property");
+        }
+        let tasks = fixture
+            .dispatch("gtd.tasks", json!({"status": "next"}))
+            .await
+            .unwrap();
+        let task = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["full_id"] == id)
+            .unwrap();
+        assert_eq!(task["dependency_state"], expected_state);
+        assert_eq!(task["actionable"], actionable);
+        let next = fixture.dispatch("gtd.next", json!({})).await.unwrap();
+        assert_eq!(
+            next.as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["full_id"] == id),
+            actionable
+        );
+        let all_next = fixture
+            .dispatch("gtd.next", json!({"include_blocked": true}))
+            .await
+            .unwrap();
+        assert_eq!(all_next.as_array().unwrap().len(), 1);
+        assert_eq!(all_next[0]["full_id"], id);
+        assert_eq!(all_next[0]["dependency_state"], expected_state);
+        assert_eq!(all_next[0]["actionable"], actionable);
+    }
+    let dependent_before_completion = notes.get_note(uuid).await.unwrap().unwrap();
+    fixture
+        .dispatch("gtd.complete", json!({"id": blocker["full_id"]}))
+        .await
+        .unwrap();
+    let next = fixture.dispatch("gtd.next", json!({})).await.unwrap();
+    assert_eq!(next.as_array().unwrap().len(), 1);
+    assert_eq!(next[0]["full_id"], id);
+    assert_eq!(next[0]["dependency_state"], "ready");
+    assert_eq!(next[0]["actionable"], true);
+    assert_eq!(
+        notes.get_note(uuid).await.unwrap().unwrap(),
+        dependent_before_completion,
+        "completing a blocker must not rewrite its dependent"
+    );
+    assert_eq!(
+        graph
+            .neighbors(
+                uuid,
+                NeighborQuery {
+                    direction: Direction::Out,
+                    relations: Some(vec![EdgeRelation::DependsOn]),
+                    limit: Some(16),
+                    min_weight: None,
+                }
+            )
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "property changes/completion retain the existing graph edge"
+    );
+}
+
+#[tokio::test]
 async fn salience_only_update_succeeds_for_legacy_nameless_task() {
     let runtime = rt();
     let pack = pack(runtime.clone());

@@ -57,6 +57,11 @@ the row cap.
 
 ## Dependency diagnostics
 
+Dependency scheduling reads `properties.depends_on`. To change blockers, use
+`update(id="<dependent task UUID>", properties={"depends_on":["<blocker task UUID>"]})`;
+an empty array clears the scheduling dependencies. Targets must be live task notes
+in the dependent task's namespace, and self-dependencies and cycles are refused.
+
 Every task returned by `gtd.tasks` carries `dependency_state`, `actionable`,
 and `blocked_by`. A dependency state is `ready` when every blocker is done,
 `blocked` when at least one live blocker is still pending, and `broken` when a
@@ -64,6 +69,20 @@ blocker is cancelled, soft-deleted, missing after hard deletion, malformed, or
 no longer a compatible task. Each `blocked_by` entry names the blocker id and
 its structural state, so a task does not remain an unexplained plain `next`
 record after its blocker becomes terminal or disappears.
+
+These three fields are derived output. Generic task updates reject incoming
+`properties.blocked_by`, `properties.dependency_state`, and `properties.actionable`,
+including null, before any part of the patch writes. Unrelated updates to legacy
+records containing those properties remain supported; the query continues deriving
+its diagnostics and does not clean up historical properties.
+
+With KG and GTD loaded, a task-to-task
+`link(source_id="<dependent task UUID>", target_id="<blocker task UUID>", relation="depends_on")`
+is supported. That graph link is traversable but does not set the scheduling
+property. Generic `properties.depends_on` updates do not synchronize graph edges
+either. Task creation stores dependencies and attempts a best-effort edge
+projection. Completing a blocker changes readiness without rewriting the dependent
+task's lifecycle or deleting its existing edges.
 
 `gtd.next` remains actionable-only by default. Set `include_blocked=true` to
 include blocked and broken `next`/`active` tasks in the same array; ready work
