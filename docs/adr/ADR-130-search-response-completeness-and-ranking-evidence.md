@@ -988,3 +988,43 @@ test results.
   substrate coordinator; ADR-033 recall pipeline; ADR-045 verb response
   presentation
 - issue #1829 (backend failure causes were discarded from response and logs)
+
+## Amendment 6 (proposed): explain zero text contribution (2026-09-14)
+
+**Status: Proposed.** Pending acceptance; the earlier accepted arm contract and
+the separate proposed limit-disclosure amendment retain their current status.
+
+When and only when `arm_participation.text.status` is `ran` and its
+`candidate_count` is zero, MCP adds `reason` with this bounded literal value:
+
+> No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms.
+
+This qualifies Amendment 3's no-second-cause-taxonomy clause only for the clean
+zero-contribution outcome. It explains the known final count and current
+conjunctive Plain-query semantics, including existing implicit-AND short-term
+leniency; it does not identify which stage eliminated a
+particular candidate, assert a query-length threshold, or establish corpus
+absence. A zero caused by an explicit zero result limit gets the same truthful
+stage-inclusive explanation. Backend error causes retain their existing fields.
+
+The reason is absent for text `skipped` or `error`, text with positive count, and
+the vector arm. It contains no caller query, token or backend exception. Existing
+status, counts, results, ranking, retrieval, source labels and error behavior are
+unchanged. The rule applies to the shared single-backend/coordinator serializer,
+including text ran/zero with vector-only degradation and complete top-level
+status. A whole-backend failure makes text error, so partial/search_incomplete
+responses receive no reason. Presentation retains the string with its arm object; frame omission retains it under `error.search`
+as Amendment 4 specifies. Raw pack results and result-only client accessors are
+unchanged. Strict wrapper consumers must accept the new optional text member.
+
+Acceptance must reproduce the short/dense query contrast using controlled real
+lexical storage and deterministic vector evidence, with existing IDs, sources
+and counts asserted before the new field. Three short-query controls retain
+positive text contribution; the dense form retains text zero and positive vector
+contribution while gaining the exact reason. A no-match query and empty corpus
+remain zero; text positive/skipped/error and vector omit the field. Existing
+partial/error/frame-omission behavior must remain covered. Independently removing
+the reason write must restore the original dense-query result and fail the new
+assertion; separate wrong-condition and count mutations must fail their intended
+witnesses. Valid fixture controls and nonzero test selection are required; this
+proposed amendment records no executed acceptance result.
