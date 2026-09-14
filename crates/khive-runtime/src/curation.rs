@@ -1649,6 +1649,10 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        // The stored row as read. A no-op answers with this, not with the
+        // patched snapshot: the patch may differ from the row in ways the
+        // no-op decision ignores (tag order), and nothing was written.
+        let stored = note.clone();
         let original_name = note.name.clone();
         let original_content = note.content.clone();
         let original_salience = note.salience;
@@ -1792,7 +1796,7 @@ impl KhiveRuntime {
             || !note_update_values_equal(&original_properties, &note.properties)
             || original_status != note.status;
         if !changed {
-            return Ok((note, text_changed, false));
+            return Ok((stored, text_changed, false));
         }
 
         // `updated_at` is also the optimistic-concurrency revision for

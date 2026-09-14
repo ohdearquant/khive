@@ -3038,6 +3038,15 @@ async fn update_note_noop_keeps_version_and_reports_unchanged() {
 
     assert_eq!(response["unchanged"], json!(true));
     assert_eq!(response["version"], json!(note.version));
+    // #2697: the no-op answers with the stored row, not the patched snapshot;
+    // the request's tag order must not leak into the response.
+    assert_eq!(response["properties"]["tags"], json!(["alpha", "beta"]));
+    let read_back = registry
+        .dispatch("get", json!({"id": note.id.to_string()}))
+        .await
+        .expect("read back the stored row");
+    assert_eq!(read_back["properties"]["tags"], json!(["alpha", "beta"]));
+    assert_eq!(response["properties"], read_back["properties"]);
 
     let omitted = registry
         .dispatch("update", json!({"id": note.id.to_string(), "kind": "note"}))
