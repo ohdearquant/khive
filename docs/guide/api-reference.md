@@ -1059,7 +1059,11 @@ object returned by `dbstat`. `size_composition_error` explains an unavailable re
 count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
 walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
 intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
-live edge table. `graph_edge_integrity_error` explains a missing integrity section.
+live edge table. `live_entities_carrying_merged_into` counts entity rows across all namespaces
+that are live while still carrying `merged_into`, the state an earlier restore left behind before
+restore refused merge tombstones; `restore` names such a row as `live_merged_entity` instead of
+reporting it already live, and this count is where an operator finds the rest.
+`graph_edge_integrity_error` explains a missing integrity section.
 
 The handler additionally annotates `graph_edge_integrity` with four derived fields:
 `graph_edges_rows_scope` (`{"namespaces": "all", "rows": "live_and_soft_deleted"}`),

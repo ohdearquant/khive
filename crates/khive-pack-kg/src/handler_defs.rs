@@ -1379,6 +1379,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       expected non-negative ledger delta explicit; a negative delta is unexpected \
                       unless the report also flags the pre-V14 duplicate-edge state, which is \
                       classified as ledger_behind_pre_v14_duplicate_edge_state. \
+                      live_entities_carrying_merged_into counts live entity rows that still carry \
+                      merge provenance, the state an earlier restore left behind; restore names \
+                      such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
                       row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
                       WAL checkpoint counters, a PASSIVE \

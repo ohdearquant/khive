@@ -8370,6 +8370,67 @@ mod tests {
         );
     }
 
+    /// A row an earlier restore left live over its merge (deleted_at cleared,
+    /// merged_into kept) is an invariant violation, not a state restore may
+    /// report as "already live". Restore names it and writes nothing.
+    #[tokio::test]
+    async fn restore_names_a_live_row_that_still_carries_merged_into() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+        // Reproduce what the pre-guard restore wrote: the tombstone cleared,
+        // the merge provenance left in place.
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        let cleared = writer
+            .execute(khive_storage::SqlStatement {
+                sql: "UPDATE entities SET deleted_at = NULL \
+                      WHERE id = ?1 AND merged_into IS NOT NULL"
+                    .to_string(),
+                params: vec![SqlValue::Text(from.id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("seed the pre-guard state");
+        assert_eq!(
+            cleared, 1,
+            "control: the seed must have found the merge tombstone"
+        );
+        drop(writer);
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("live_merged_entity") && msg.contains(&into.id.to_string()),
+            "restore of a live merged row must be named, not reported already live, got {msg:?}"
+        );
+
+        // Nothing was written: the row is still live and still carries the merge.
+        let row = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(row.merged_into, Some(into.id));
+    }
+
     #[tokio::test]
     async fn restore_refuses_a_merge_tombstone_and_keeps_the_disclosure() {
         let rt = rt();
