@@ -770,3 +770,36 @@ migration the base decision describes is unchanged and still owed.
 - Because the loops are now tracked, `drain()` waits for their exit and its remaining-task count
   includes them. That count still names no task; naming what remains at a drain timeout is a
   separate gap this amendment does not close.
+
+## Amendment 6: Cancellation during inbound transport reads (2026-09-14)
+
+**Status:** Proposed
+
+For the email and Telegram inbound poll loops covered by Amendment 5, its
+between-cycle-only rule has one exception: select the supplied shutdown token
+against the transport-read future (`poll_page` for email, `poll` for Telegram).
+If cancellation wins, drop that future and return without waiting for the network
+request to finish. Prefer cancellation when both branches are ready at selection;
+if a poll result was already selected, finish its existing processing before the
+next cancellation point.
+
+This exception does not cover store work: cursor loading, lifecycle and heartbeat
+writes, ingestion, quarantine, and checkpoint commits remain uninterrupted by this
+cooperative cancellation. A cancelled poll does not advance the email checkpoint
+or bootstrap floor, advance or clear Telegram's confirmed/pending offsets, or invoke
+`commit_offset`. Existing completed writes remain committed; cancellation neither
+removes queued rows nor marks outbound delivery complete. The existing full-page
+handling and commit conditions, including quarantine/disposition rules, are unchanged.
+Outbound loops retain Amendment 5's between-cycle boundary.
+
+An abandoned poll may be fetched again under the existing checkpoint, bootstrap,
+and deduplication rules. Cancellation itself produces no successful or failed poll
+result, recovery event, or heartbeat; a `ChannelPollStarted` already written remains.
+This removes the transport wait from cooperative shutdown latency. It does not bound
+store work already in progress or change the daemon's final drain timeout/abort policy.
+
+Verify both parked transport paths exit on cancellation without acknowledgement,
+and that later polling preserves replay and deduplication. Verify cancellation wins
+when both selection branches are ready, while cancellation after result selection
+does not interrupt the page's store/commit phases. Preserve the existing interval,
+caller-token, quarantine, cursor, offset, and outbound delivery controls.
