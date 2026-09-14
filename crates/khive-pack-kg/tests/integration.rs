@@ -91,14 +91,14 @@ fn list_items(response: &Value) -> &[Value] {
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
-// db_diagnostics (ADR-091 operator surface), then restore.
+// db_diagnostics (ADR-091 operator surface), then restore, then scan.
 #[test]
-fn pack_verbs_returns_twenty_five() {
+fn pack_verbs_returns_twenty_six() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        25,
-        "KgPack must expose exactly 25 verbs including ordered streams and restore"
+        26,
+        "KgPack must expose exactly 26 verbs including ordered streams, restore, and scan"
     );
 }
 
@@ -126,6 +126,7 @@ fn pack_verbs_names_are_correct() {
         "context",
         "resolve",
         "whoami",
+        "scan",
         "db_diagnostics",
         "stream.append",
         "stream.batch",
@@ -150,6 +151,116 @@ async fn dispatch_unknown_verb_returns_error() {
 }
 
 // ---- Kind validation via create: entities ----
+
+/// ADR-172 Amendment 5, acceptance arm 2: an identical patch with
+/// `expected_version` is a write that advances the version and never reports
+/// `unchanged`, and the version it mints is what a stale writer fails against.
+#[tokio::test]
+async fn identical_update_is_a_write_when_fenced_and_a_disclosed_noop_when_not() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "lease heartbeat", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["version"], json!(1));
+
+    let fenced = fixture
+        .dispatch(
+            "update",
+            json!({ "id": id, "content": "lease heartbeat", "expected_version": 1 }),
+        )
+        .await
+        .expect("identical fenced update is accepted");
+    assert_eq!(fenced["version"], json!(2), "{fenced}");
+    assert!(
+        fenced.get("unchanged").is_none(),
+        "a fenced write is never reported unchanged: {fenced}"
+    );
+
+    let stale = fixture
+        .dispatch(
+            "update",
+            json!({ "id": id, "content": "lease heartbeat", "expected_version": 1 }),
+        )
+        .await
+        .expect_err("the version the fenced write minted is what a stale writer fails against");
+    assert!(
+        format!("{stale:?}").contains("version_conflict"),
+        "{stale:?}"
+    );
+}
+
+/// ADR-172 Amendment 5, acceptance arm 3: the same identical patch without a
+/// fence is the disclosed no-op, and stays one when the fenced rule changes.
+#[tokio::test]
+async fn identical_unfenced_update_is_a_disclosed_noop() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "lease heartbeat", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    let unfenced = fixture
+        .dispatch("update", json!({ "id": id, "content": "lease heartbeat" }))
+        .await
+        .expect("identical unfenced update is accepted");
+    assert_eq!(unfenced["unchanged"], json!(true), "{unfenced}");
+    assert_eq!(unfenced["version"], json!(1), "{unfenced}");
+    assert_eq!(unfenced["updated_at"], created["updated_at"], "{unfenced}");
+}
+
+/// ADR-172 Amendment 5, acceptance arm 4: two writers racing the same
+/// unchanged document at the same expected version: exactly one wins, and the
+/// loser is told the version the winner minted.
+#[tokio::test]
+async fn rivals_writing_an_unchanged_document_at_one_version_get_one_winner() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "claim", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    let patch = json!({ "id": id, "content": "claim", "expected_version": 1 });
+    let (left, right) = tokio::join!(
+        fixture.dispatch("update", patch.clone()),
+        fixture.dispatch("update", patch.clone())
+    );
+    let outcomes = [left, right];
+    let winners = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert_eq!(winners, 1, "exactly one rival wins: {outcomes:?}");
+    let winner = outcomes.iter().find_map(|o| o.as_ref().ok()).unwrap();
+    assert_eq!(winner["version"], json!(2), "{winner}");
+    let loser = outcomes.iter().find_map(|o| o.as_ref().err()).unwrap();
+    let RuntimeError::Khive(conflict) = loser else {
+        panic!("loser must carry the shared conflict shape: {loser:?}");
+    };
+    let details = conflict.details().expect("conflict details");
+    assert_eq!(
+        details.get("reason"),
+        Some("version_conflict"),
+        "{conflict:?}"
+    );
+    assert_eq!(
+        details.get("current_version"),
+        Some("2"),
+        "loser is told the minted version: {conflict:?}"
+    );
+    let got = fixture
+        .dispatch("get", json!({ "id": id }))
+        .await
+        .expect("get");
+    assert_eq!(got["version"], json!(2), "{got}");
+}
 
 #[tokio::test]
 async fn create_entity_valid_kind_concept_succeeds() {
@@ -11492,6 +11603,92 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
     assert_eq!(resp["truncated"], false);
     assert_eq!(resp["dropped"]["anchors"], 0);
     assert_eq!(resp["dropped"]["neighbors"], 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn context_reports_every_clamped_number_and_only_when_supplied() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxClampAnchor", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create anchor");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    // Every clamped number reports requested / effective / clamped under its
+    // own name, on both sides of its range.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({
+                "entity_ids": [a_id],
+                "hops": 9,
+                "budget": 1,
+                "limit": 1000,
+                "fanout": 999
+            }),
+        )
+        .await
+        .expect("context with out-of-range numbers must still succeed");
+    assert_eq!(resp["requested_hops"], 9);
+    assert_eq!(resp["effective_hops"], 2);
+    assert_eq!(resp["hops_clamped"], true);
+    assert_eq!(resp["requested_budget"], 1);
+    assert_eq!(resp["effective_budget"], 256);
+    assert_eq!(
+        resp["budget_clamped"], true,
+        "a raise to the minimum is a clamp"
+    );
+    assert_eq!(resp["requested_limit"], 1000);
+    assert_eq!(resp["effective_limit"], 20);
+    assert_eq!(resp["limit_clamped"], true);
+    assert_eq!(resp["requested_fanout"], 999);
+    assert_eq!(resp["effective_fanout"], 50);
+    assert_eq!(resp["fanout_clamped"], true);
+    assert!(resp["anchors"].is_array(), "the response body is unchanged");
+
+    // In-range values report unclamped.
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "budget": 4096, "limit": 5, "fanout": 10}),
+        )
+        .await
+        .expect("context in range");
+    assert_eq!(resp["hops_clamped"], false);
+    assert_eq!(resp["budget_clamped"], false);
+    assert_eq!(resp["limit_clamped"], false);
+    assert_eq!(resp["fanout_clamped"], false);
+    assert_eq!(resp["effective_budget"], 4096);
+
+    // A number the caller did not supply is not reported: the default is not
+    // a clamp, and the fields stay absent so existing readers see no new keys.
+    let resp = pack
+        .dispatch("context", json!({"entity_ids": [a_id]}))
+        .await
+        .expect("context with defaults");
+    for key in [
+        "requested_hops",
+        "effective_hops",
+        "hops_clamped",
+        "requested_budget",
+        "effective_budget",
+        "budget_clamped",
+        "requested_limit",
+        "effective_limit",
+        "limit_clamped",
+        "requested_fanout",
+        "effective_fanout",
+        "fanout_clamped",
+    ] {
+        assert!(
+            resp.get(key).is_none(),
+            "{key} must be absent when not supplied"
+        );
+    }
 }
 
 #[tokio::test]

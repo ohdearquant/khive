@@ -11,8 +11,8 @@ use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedBatchOutcome,
     GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, LinkId,
-    NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
-    TraversalRequest,
+    NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder,
+    StorageResult, TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -301,6 +301,39 @@ pub trait GraphStore: Send + Sync + 'static {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> StorageResult<Vec<NeighborHit>>;
+    /// Return one deterministic neighbor page. `after` is exclusive and
+    /// `neighbor_kinds`, when present, filters entity and note kinds before
+    /// the limit is applied. Backends that do not implement kind-aware paging
+    /// retain an explicit unsupported result rather than silently returning a
+    /// misleading page.
+    async fn neighbors_page(
+        &self,
+        node_id: Uuid,
+        mut query: NeighborQuery,
+        after: Option<NeighborCursor>,
+        neighbor_kinds: Option<Vec<String>>,
+    ) -> StorageResult<Vec<NeighborHit>> {
+        if neighbor_kinds
+            .as_ref()
+            .is_some_and(|kinds| !kinds.is_empty())
+        {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "neighbors_page".into(),
+                message: "this backend does not implement neighbor kind filtering".into(),
+            });
+        }
+        let limit = query.limit;
+        query.limit = None;
+        let mut hits = self.neighbors(node_id, query).await?;
+        if let Some(cursor) = after {
+            hits.retain(|hit| cursor.is_after(hit));
+        }
+        if let Some(limit) = limit {
+            hits.truncate(limit as usize);
+        }
+        Ok(hits)
+    }
     /// Return neighbors in BOTH directions in a single call, each tagged with
     /// the direction (`Out`/`In`) it was found in. `query.direction` is
     /// ignored — this always fetches both directions.

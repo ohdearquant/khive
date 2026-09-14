@@ -503,15 +503,18 @@ fn tool_binary(entity: &khive_storage::Entity) -> Result<String, RuntimeError> {
     }
 }
 
-fn refusal_error(reason: &str, id: &str) -> RuntimeError {
-    RuntimeError::RefusedWithReceipt {
+fn refusal_error(reason: &str, id: &str, effective_max_output_bytes: u64) -> RuntimeError {
+    RuntimeError::RefusedWithReceipt(Box::new(khive_runtime::ReceiptRefusal {
         code: "exec_refused",
         // Unchanged wording: the id stays inside the sentence for readers that
         // already parse it, and rides beside it as `receipt_id` for readers that
-        // should not have to.
+        // should not have to. `reason` and the resolved cap ride the same way,
+        // so the envelope carries what the denied receipt records.
         message: format!("exec.run refused: {reason} (receipt_id={id})"),
         receipt_id: id.to_string(),
-    }
+        reason: reason.to_string(),
+        detail: json!({ "effective_max_output_bytes": effective_max_output_bytes }),
+    }))
 }
 
 pub async fn run(
@@ -581,7 +584,11 @@ pub async fn run(
             receipt.reason = Some(reason.clone());
             let value = receipt.to_json();
             receipts::insert(rt, &ns, &value).await?;
-            Err(refusal_error(&reason, &id))
+            Err(refusal_error(
+                &reason,
+                &id,
+                receipt.effective_max_output_bytes,
+            ))
         }
     }
 }

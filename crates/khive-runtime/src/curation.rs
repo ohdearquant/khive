@@ -1649,6 +1649,10 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        // The stored row as read. A no-op answers with this, not with the
+        // patched snapshot: the patch may differ from the row in ways the
+        // no-op decision ignores (tag order), and nothing was written.
+        let stored = note.clone();
         let original_name = note.name.clone();
         let original_content = note.content.clone();
         let original_salience = note.salience;
@@ -1792,7 +1796,7 @@ impl KhiveRuntime {
             || !note_update_values_equal(&original_properties, &note.properties)
             || original_status != note.status;
         if !changed {
-            return Ok((note, text_changed, false));
+            return Ok((stored, text_changed, false));
         }
 
         // `updated_at` is also the optimistic-concurrency revision for
@@ -8364,6 +8368,113 @@ mod tests {
             "expected a merged_into disclosure naming {}, got {msg:?}",
             into.id
         );
+    }
+
+    /// A row an earlier restore left live over its merge (deleted_at cleared,
+    /// merged_into kept) is an invariant violation, not a state restore may
+    /// report as "already live". Restore names it and writes nothing.
+    #[tokio::test]
+    async fn restore_names_a_live_row_that_still_carries_merged_into() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+        // Reproduce what the pre-guard restore wrote: the tombstone cleared,
+        // the merge provenance left in place.
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        let cleared = writer
+            .execute(khive_storage::SqlStatement {
+                sql: "UPDATE entities SET deleted_at = NULL \
+                      WHERE id = ?1 AND merged_into IS NOT NULL"
+                    .to_string(),
+                params: vec![SqlValue::Text(from.id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("seed the pre-guard state");
+        assert_eq!(
+            cleared, 1,
+            "control: the seed must have found the merge tombstone"
+        );
+        drop(writer);
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("live_merged_entity") && msg.contains(&into.id.to_string()),
+            "restore of a live merged row must be named, not reported already live, got {msg:?}"
+        );
+
+        // Nothing was written: the row is still live and still carries the merge.
+        let row = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(row.merged_into, Some(into.id));
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_merge_tombstone_and_keeps_the_disclosure() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge_tombstone") && msg.contains(&into.id.to_string()),
+            "restore of a merge tombstone must be refused naming the kept id, got {msg:?}"
+        );
+
+        // The refusal wrote nothing: the source is still a merge tombstone.
+        let err = rt.get_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+            "after a refused restore the merged_into disclosure must survive, got {msg:?}"
+        );
+        let tombstone = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("tombstone row still present");
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(tombstone.merged_into, Some(into.id));
     }
 
     #[tokio::test]

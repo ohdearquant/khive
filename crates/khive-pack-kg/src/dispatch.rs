@@ -223,6 +223,7 @@ impl PackRuntime for KgPack {
             "stream.stat" => self.handle_stream_stat(token, params).await,
             "stream.batch" => self.handle_stream_batch(token, params, registry).await,
             "whoami" => self.handle_whoami(graph_token, params).await,
+            "scan" => self.handle_scan(graph_token, params).await,
             "db_diagnostics" => {
                 self.handle_db_diagnostics(graph_token, params, registry)
                     .await

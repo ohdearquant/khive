@@ -117,7 +117,7 @@ through to explicit detection instead of being silently allowed.
   contract or a human-reviewed ingestion path.
 
 The path and ordinary-marker VCS exemptions above are gated by a **clause-label guard**
-(`has_clause_credential_label`):
+(`has_clause_credential_label_with_inline`):
 the exemption is refused when the candidate carries an inline credential shape
 (`api_key=<value>`) or when a credential label is reachable by walking backwards through the
 current clause. The walk steps over connector words that commonly sit between a label and its
@@ -209,11 +209,19 @@ fails closed).
 Trigger-word matching only fires on genuine mentions, not substring collisions: trigger words
 (`key`, `secret`, `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are matched at a
 word boundary (`contains_bounded_word`), so `auth` does not fire inside `authorized` or
-`authentication`, nor `key` inside `monkey`/`keyword`. The candidate token is excluded from its
+`authentication`, nor `key` inside `monkey`/`keyword`. A structured assignment member ending in `_key` (such as `association_key:`) does not supply the bare `key` trigger unless it names a credential compound: `api_key`, `secret_key`, `private_key`, `access_key`, `signing_key`, `encryption_key`, or `auth_key`. This exception requires an immediately following assignment delimiter, allowing a closing quote or backtick; natural-language labels such as `the key is` and `api key` retain their existing trigger behavior. The candidate token is excluded from its
 own surrounding context. This prevents an internal path segment such as `cli-auth-and-kg` from
 making the path self-trigger. Assignment-shaped candidates such as `auth=<value>` and
 `api_key=<value>` are checked separately, including when whitespace splits the label from the
-value, so the exclusion does not weaken credential-shaped writes.
+value, so the exclusion does not weaken credential-shaped writes. Within a whitespace-free
+structured token, inline context stops at commas, semicolons, and ampersands. An assignment label
+governs the value after its delimiter and nested carriers within that member; it cannot label an
+earlier value or a sibling member. Thus `{"a_secret":"x","digest":"<hex>"}` leaves the digest
+unlabeled, while `secret=label=<hex>` remains credential-shaped. Underscore carriers such as
+`session_secret_<value>` remain recognized when nested or padded. The original ASCII tokenization
+and external 120-byte context window stay unchanged, so adding whitespace can still put a nearby
+credential word inside a value's external window. The same member context governs shape checks,
+entropy checks, exemption guards, reconstruction, masking, and the trigger named in a refusal.
 
 A structured-identifier-shaped token sitting near a **genuinely standalone** trigger word (e.g.
 `auth work saved at .../repo-audit.md`, where `auth` is an actual topical mention rather than a
@@ -286,15 +294,15 @@ the token.
 
 ## value_candidates
 
-Yields every candidate value that an assignment/wrapper-glued whitespace token could contain, so
+Yields every exact-shape value within the caller-selected member or governed assignment value, so
 shape allowlists that require an EXACT match (`is_uuid_canonical`, `is_base64_content_hash`) still
 recognize the credential once it is glued to normal storage syntax: `key=value`, `(value)`,
 `{"key":"value"}`, `key1=key2=value`, a trailing sentence period, or a label itself containing
 `:`/`=` (`{"api:key":"value"}`). Used only to derive candidates for the near-trigger
-UUID/content-hash checks in `check_entropy_heuristic` — it does NOT replace `token` for the
+UUID/content-hash checks in `check_entropy_candidate` — it does NOT replace `token` for the
 entropy, hex, or structured-identifier paths, none of which require an exact shape match.
 
-Strips wrapper punctuation from both ends first, then yields the wrapper-stripped whole token,
+Strips wrapper punctuation from both ends first, then yields the wrapper-stripped input,
 plus the wrapper-stripped suffix after EVERY internal `=`/`:` occurrence (skipping empty
 suffixes). No single separator position can be assumed correct: the true key/value or JSON-label
 boundary might be the first separator (`secret=sha256-...`), but a base64/base64url value can
@@ -306,8 +314,8 @@ suffix and letting the caller test each one is the only choice that is sound in 
 the true value always appears as _some_ suffix, and a `=`/`:` that lands inside padding or a label
 simply yields a non-matching suffix that the caller's shape check harmlessly rejects.
 
-Byte-scan via `char_indices` over an already-short token (whitespace-delimited, so bounded by
-realistic line length) — no allocation, since this runs in the hot scan path.
+The `char_indices` scan returns borrowed slices without allocating. Member selection and inline
+label association occur before this helper; suffix extraction cannot widen that context.
 
 ## contains_word
 
@@ -403,10 +411,11 @@ text via `scan_from`: each scan advances a `from` cursor past the previous span 
 evaluates trigger context over the full input. This closes the entropy-context gap — a
 high-entropy value whose only trigger word sits to the left of an earlier-redacted secret is
 still detected, because the trigger window is never sliced away. The entropy detector tokenizes
-the full input once per masking call, then uses the first token at or after the cursor on each
-pass; the known-prefix detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
-Stripe, …) remain context-free and scan the suffix. Masking limits cumulative suffix bytes
-submitted to those repeated detector sweeps to 2 MiB; the first sweep is always allowed for
+the full input once per masking call, then resumes within the original token containing the
+cursor, or at the next token, on each pass; the known-prefix detectors (real API keys: `sk-ant-`, `sk-proj-`, `AKIA`/`ASIA`, GitHub,
+Stripe, …) remain context-free and scan the suffix. Masking limits cumulative scan bytes to
+2 MiB, charging both the remaining suffix and any original-token prefix revisited while rebuilding
+member candidates. The first sweep is always allowed for
 larger or multibyte callers. If dense credential-shaped input reaches that work budget with text
 remaining, the last confirmed secret span is extended through the rest of the input. This
 fail-closed tail redaction bounds repeated scan work without allowing an unscanned credential to
@@ -528,7 +537,18 @@ For each token, in order:
    benign marker-adjacent revision); a genuinely split credential hiding one fragment behind a
    marker is still caught because every OTHER fragment anchors its own chain and accumulates the
    exempted fragment's hex into the total (`blocks_split_hex_credential_with_marker_adjacent_fragment`).
-7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label`)
+   **Lookup-key exception** (`is_lookup_key_label`, issue #2654): a member name ending in `_key`
+   disarms `key` as a credential trigger only when the name is in the closed vocabulary
+   `LOOKUP_KEY_LABELS` (`association_key`, `partition_key`, `sort_key`, `cache_key`, `idempotency_key`,
+   `primary_key`, ...) and sits directly before its `:`/`=` delimiter. The exception is an allowlist on
+   purpose: an unlisted compound (`hmac_key`, `master_key`, `ssh_key`, `jwt_key`, ...) keeps every
+   refusal it had. The match is the whole label, so a qualified spelling (`left_association_key`,
+   `hmac_cache_key`) is refused as well: a prefix rule would re-open the closed compounds, because
+   stems such as `hmac` are not trigger words. A corpus replay that is identical across such a change
+   certifies preservation on the corpus population only; the opened shape class carries its own
+   before/after arms.
+
+7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a
    chain that would otherwise reconstruct a blocked credential.
 8. **Structured-identifier exemption** off-trigger only — must come after the UUID/content-hash

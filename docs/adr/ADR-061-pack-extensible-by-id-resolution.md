@@ -117,6 +117,10 @@ UUID, call `resolver.delete_by_id(id, hard)`. If none match, re-raise `NotFound`
 re-raising, probe resolvers. If any claims the UUID, return `InvalidInput` explaining that
 pack-private record update is not yet supported via the generic `update` verb.
 
+**`handle_merge`**: [Amendment 1](#amendment-1-unsupported-generic-mutation-of-pack-private-records)
+adds diagnostic-only resolver probes after existing pre-mutation operand lookups return `NotFound`.
+Generic merge does not gain private-record mutation support.
+
 ### 5. Knowledge pack implementation
 
 `KnowledgePack` implements `PackByIdResolver`:
@@ -183,8 +187,12 @@ Add to the `PackRuntime` section of ADR-017:
 - `Resolved::PackRecord` is a breaking enum change requiring three exhaustive match updates.
 - `KindSpec` is NOT extended — no cascade across `list.rs`, `create.rs`, `search.rs`,
   `merge.rs`, `common.rs`.
+  **Amendment 1 qualification:** `KindSpec` remains unchanged, but `merge.rs` gains the
+  diagnostic-only resolver use specified below.
 - `merge(into_id=<pack-uuid>)` returns `NotFound` (unchanged; no `KindSpec` extension means
   `merge` never reaches a resolver probe).
+  **Superseded for diagnostics by Amendment 1:** a live private-record resolver claim now
+  directs callers to the owning pack; generic merge remains unsupported for that record.
 - `update(id=<pack-uuid>)` returns `InvalidInput` directing callers to pack-specific verbs.
   Deferred to a future ADR.
 
@@ -209,3 +217,62 @@ wrong direction. Rejected.
 - ADR-017: Pack Standard — this ADR amends the PackRuntime trait surface
 - ADR-018: Authorization Gate — gate fires at verb dispatch, not in resolver hooks
 - Issue #158: `get`/`delete` cannot resolve knowledge pack records
+
+---
+
+## Amendment 1: unsupported generic mutation of pack-private records
+
+**Status**: Proposed, 2026-09-14; pending contract acceptance. **Issue**: #558.
+
+### Decision and scope
+
+Generic `update` and generic `merge` do not mutate records owned by pack-private tables.
+Callers use the owning pack's mutation verbs, such as `knowledge.upsert_atoms`,
+`knowledge.upsert_domains` and `knowledge.edit` for knowledge records. These examples are
+ways to edit records, not a promise of an equivalent pack-specific merge operation. This
+amendment adds neither mutation methods to `PackByIdResolver` nor a `KindSpec` variant.
+
+During generic merge's existing pre-mutation operand checks, a `NotFound` for a resolved
+UUID triggers the registered live by-ID resolver probes for that same operand. A resolver
+claim produces `InvalidInput` stating that generic merge of pack-private records is
+unsupported and directing the caller to the owning pack's verbs. This applies to both
+`into_id` and `from_id` in the default/entity and explicit note or granular-kind branches.
+`force` and `dry_run` retain that refusal. The directing error does not include private
+record payloads.
+
+If no resolver claims the UUID, return the original `NotFound` unchanged, including its
+message. Other lookup and resolver errors propagate unchanged. Successful ordinary
+substrate lookups do not trigger these probes. Preserve existing validation and operand
+order: an earlier failure or malformed request is not replaced by a diagnostic about a
+later operand. This mapping does not wrap the mutating runtime merge call or reinterpret
+its errors after a possible commit.
+
+Resolver use is diagnostic-only and performs no generic private-record mutation. Existing
+`get`/`delete` support remains unchanged. Generic update's existing inferred-kind diagnostic
+also remains unchanged; this amendment does not extend it to explicit-kind update routes.
+Full UUID parsing and existing prefix/name resolution retain their current reachability;
+no private-record short-ID lookup is added. Gate authorization remains at dispatch, and
+by-ID resolver lookup remains namespace-blind.
+
+### Compatibility and validation
+
+The observable change is the error class and useful direction for a live pack-private UUID
+reached during a merge operand lookup. Ordinary missing IDs, kind mismatches, malformed
+requests, aliases, ownership checks, safety floors, ordinary merge and dry-run behavior
+retain their contracts. No private data, schema or record migration is required. Generic
+private-record mutation support remains a separate future decision.
+
+Before implementation acceptance, real registered knowledge atom and domain fixtures must
+prove positive generic-get reachability and the new directing refusal at either operand
+position, across default/entity and note/granular routes, including aliases, force and
+dry-run. Compare complete authoritative records, domain mirrors, incident edges and merge
+events before and after refusals. Positive ordinary entity/note merges and dry-run previews
+must still work; original missing-ID and validation errors must remain unchanged. Resolver
+errors must propagate, while an unclaimed UUID retains its original error. Existing
+get/delete and inferred-kind update controls remain green.
+
+A tests-only baseline must fail at the intended new directing-error assertions. Isolated
+mutations that omit either operand or the note route, ignore resolver claims or failures,
+replace the direction with a bare error, or refuse all merges must be caught by the
+corresponding negative and positive controls. These are acceptance requirements, not
+reported native results. Implementation and merged-main validation remain pending.

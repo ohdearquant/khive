@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 25    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -211,7 +211,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 25 verbs
+## `kg` pack — 26 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -267,8 +267,12 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 ### `restore` — Declaration
 
 Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live record is an
-idempotent no-op. A note restore refuses when another live note already holds the same
-namespace/kind/key identity; neither record is changed.
+idempotent no-op. A note restore refuses with the conflict error `restore_key_conflict` when
+another live note already holds the same namespace/kind/key identity (details: `reason`, `key`,
+`existing_id`); neither record is changed. An entity that was merged into another
+entity is a merge tombstone, not a plain soft delete: restore refuses it with `merge_tombstone`
+and names the kept id. A tombstone the caller does not own is answered not found, with or
+without a `kind` hint; the hint is compared only after ownership is established.
 
 | Param  | Type   | Required | Notes                                                         |
 | ------ | ------ | -------- | ------------------------------------------------------------- |
@@ -430,6 +434,12 @@ Note tags remain stored and returned in `properties.tags`. Updating that propert
 also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
 `tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
 as usual.
+
+An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
+comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
+names `expected_version` is always a write when it is accepted, identical patch included: the
+version advances by exactly one and `unchanged` is never set, because the version a fenced write
+mints is the only thing a rival writer can fail against.
 
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")
@@ -646,17 +656,21 @@ the edge's mutation history.
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
+Immediate graph neighbors. Without an explicit `limit` the response is the bare array of hits it has always been. An explicit `limit` returns a page instead: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
 
-| Param        | Type            | Required | Notes                                            |
-| ------------ | --------------- | -------- | ------------------------------------------------ |
-| `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
-| `direction`  | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`). |
-| `relations`  | array\<string\> | no       | Restrict to these relation types.                |
-| `min_weight` | number          | no       | Exclude edges below this weight.                 |
+| Param            | Type            | Required | Notes                                                                                                                                                                                        |
+| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `node_id`        | uuid            | yes      | Node whose neighbors to return.                                                                                                                                                              |
+| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
+| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
+| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
+| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
+| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
+| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
 
 ```
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
@@ -756,6 +770,12 @@ One embedding inference when `query` is used; zero for a pure `entity_ids` call.
 | `fanout`     | integer         | no       | Max neighbors per expanded node per hop, clamped 1..=50 (default 10).                 |
 
 \* at least one of `query`/`entity_ids` required.
+
+Every number the caller supplies that the verb clamps is reported back beside the body, under its
+own name: `requested_hops` / `effective_hops` / `hops_clamped`, and likewise for `budget`, `limit`
+and `fanout`. A raise to a minimum counts as a clamp (`budget=1` reports `effective_budget: 256`,
+`budget_clamped: true`). A number the caller did not supply is not reported; the default is not a
+clamp.
 
 ```
 request(ops="context(query=\"rotary position embedding\", hops=1, budget=4096)")
@@ -912,6 +932,22 @@ and immutable build metadata without invoking database diagnostics or a checkpoi
 request(ops="whoami()")
 ```
 
+### `scan` — Assertive
+
+Report whether the secret gate would refuse a note body, without writing anything. Takes
+`content` (required) plus optional `name` and `properties`, and runs the same checks in the same
+order a note write runs before it stores: content, then name, then every string leaf of
+properties. Returns `{would_refuse, detector, trigger, masked, location, message,
+masked_preview: {content, name}}`. On a refusal `message` is the exact text the write would
+have failed with, `location` names the field (`note.content`, `note.name`, `note.properties`)
+and `masked` is the candidate as `first6...N`; on acceptance those fields are null.
+`masked_preview` is the input through the canonical masker either way. Nothing is stored and
+no event is emitted, so the verb is safe to call on a body you do not intend to keep.
+
+```
+request(ops="scan(content=\"api_key=sk-...\")")
+```
+
 ### `db_diagnostics` — Assertive
 
 Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
@@ -1033,7 +1069,11 @@ object returned by `dbstat`. `size_composition_error` explains an unavailable re
 count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
 walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
 intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
-live edge table. `graph_edge_integrity_error` explains a missing integrity section.
+live edge table. `live_entities_carrying_merged_into` counts entity rows across all namespaces
+that are live while still carrying `merged_into`, the state an earlier restore left behind before
+restore refused merge tombstones; `restore` names such a row as `live_merged_entity` instead of
+reporting it already live, and this count is where an operator finds the rest.
+`graph_edge_integrity_error` explains a missing integrity section.
 
 The handler additionally annotates `graph_edge_integrity` with four derived fields:
 `graph_edges_rows_scope` (`{"namespaces": "all", "rows": "live_and_soft_deleted"}`),
@@ -1091,6 +1131,12 @@ Create a GTD task (note with `kind=task`).
 | `depends_on`        | array\<uuid\>   | no       | Blocking task complete UUIDs or unique 8+ hex prefixes resolved in the caller's primary namespace.                                                                   |
 | `context_entity_id` | uuid            | no       | Full UUID of a related KG entity. Prefixes are rejected because the stored relationship is an explicit stable reference; Agent responses preserve it canonically.    |
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
+| `idempotency_key`   | string          | no       | Key scoped to the caller's namespace, at most 512 UTF-8 bytes, no NUL. See the replay rule below.                                                                    |
+
+With `idempotency_key`, a replay whose stored content matches the original returns the original
+task with `replayed=true` and records no new dependency edges. Different content under the same
+key is refused with the conflict error `idempotency_key_conflict`; its details carry `reason`,
+`key` and `existing_id` (the task that holds the key).
 
 ```
 request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
@@ -1158,6 +1204,11 @@ Explicit GTD status transition with lifecycle validation.
 | `status` | string | yes      | Target status (same set/aliases as above). |
 | `note`   | string | no       | Note attached to the transition.           |
 
+A task already in the target status is a read assertion, not a lifecycle event: the response
+carries `transitioned=false`, `from`, `to` and `note: "already in target status"`, no lifecycle
+audit row is written, and a `note` passed with the request is not persisted, reported as
+`note_recorded=false`.
+
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
 ```
@@ -1173,16 +1224,22 @@ Salience- and decay-weighted memory notes. Optional; load with
 
 Create a memory note with salience and decay.
 
-| Param             | Type   | Required | Notes                                                                                                                       |
-| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `content`         | string | yes      | Memory content.                                                                                                             |
-| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                           |
-| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay. |
-| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                      |
-| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                           |
-| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                             |
-| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                       |
+| Param             | Type   | Required | Notes                                                                                                                                 |
+| ----------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`         | string | yes      | Memory content.                                                                                                                       |
+| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                                     |
+| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.           |
+| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                                |
+| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
+| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
+| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
+| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
+| `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+With `idempotency_key`, a replay whose content matches the stored memory returns the original
+memory with `replayed=true`. Different content under the same key is refused with the conflict
+error `idempotency_key_conflict`; its details carry `reason`, `key` and `existing_id` (the memory
+that holds the key).
 
 ```
 request(ops="memory.remember(content=\"ADR-016 fixes the DSL grammar\", salience=0.7, memory_type=\"semantic\")")

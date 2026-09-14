@@ -785,6 +785,22 @@ async fn a_refused_run_names_its_receipt_in_the_envelope_not_only_in_the_message
     assert_eq!(receipt["denied"], true);
     assert!(receipt["exit_code"].is_null(), "nothing ran: {receipt}");
 
+    // The envelope also carries the refusal's reason and the resolved output
+    // cap as fields, and they are the receipt's own values, not a restatement.
+    let reason = value["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal envelope carries no reason: {value}"));
+    assert!(!reason.is_empty());
+    assert_eq!(receipt["reason"], reason);
+    assert!(
+        value["effective_max_output_bytes"].is_u64(),
+        "the refusal envelope carries no effective_max_output_bytes: {value}"
+    );
+    assert_eq!(
+        receipt["effective_max_output_bytes"],
+        value["effective_max_output_bytes"]
+    );
+
     // And it is the same id the sentence carries, so a consumer moving off the
     // regular expression onto the field reads the same receipt, not a second one.
     let from_message = value["message"]

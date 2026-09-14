@@ -14,8 +14,8 @@ use khive_storage::types::{
     EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
     GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
     GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, MissingEndpoints,
-    NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage, SortDirection,
-    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
+    NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage,
+    SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
     TraversalRequest,
 };
 use khive_storage::GraphStore;
@@ -1040,6 +1040,8 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
 fn neighbor_extra_clause(
     query: &NeighborQuery,
     start_param_idx: usize,
+    after: Option<&NeighborCursor>,
+    neighbor_kinds: Option<&[String]>,
 ) -> (String, String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1064,6 +1066,47 @@ fn neighbor_extra_clause(
         extra_params.push(Box::new(min_w));
         conditions.push(format!("weight >= ?{}", param_idx));
         param_idx += 1;
+    }
+
+    if let Some(cursor) = after {
+        extra_params.push(Box::new(cursor.weight));
+        let weight_idx = param_idx;
+        param_idx += 1;
+        extra_params.push(Box::new(cursor.node_id.to_string()));
+        let node_idx = param_idx;
+        param_idx += 1;
+        extra_params.push(Box::new(cursor.edge_id.to_string()));
+        let edge_idx = param_idx;
+        param_idx += 1;
+        conditions.push(format!(
+            "(weight < ?{weight_idx} OR (weight = ?{weight_idx} AND node_id > ?{node_idx}) OR (weight = ?{weight_idx} AND node_id = ?{node_idx} AND edge_id > ?{edge_idx}))"
+        ));
+    }
+
+    if let Some(kinds) = neighbor_kinds.filter(|kinds| !kinds.is_empty()) {
+        let placeholders: Vec<String> = kinds
+            .iter()
+            .map(|kind| {
+                extra_params.push(Box::new(kind.clone()));
+                let p = format!("?{param_idx}");
+                param_idx += 1;
+                p
+            })
+            .collect();
+        let entity_placeholders = placeholders.join(",");
+        let note_placeholders: Vec<String> = kinds
+            .iter()
+            .map(|kind| {
+                extra_params.push(Box::new(kind.clone()));
+                let p = format!("?{param_idx}");
+                param_idx += 1;
+                p
+            })
+            .collect();
+        conditions.push(format!(
+            "(EXISTS (SELECT 1 FROM entities AS neighbor_entities WHERE neighbor_entities.id = node_id AND neighbor_entities.namespace = ?1 AND neighbor_entities.deleted_at IS NULL AND neighbor_entities.kind IN ({entity_placeholders})) OR EXISTS (SELECT 1 FROM notes AS neighbor_notes WHERE neighbor_notes.id = node_id AND neighbor_notes.namespace = ?1 AND neighbor_notes.deleted_at IS NULL AND neighbor_notes.kind IN ({})))",
+            note_placeholders.join(",")
+        ));
     }
 
     let where_extra = if conditions.is_empty() {
@@ -1740,6 +1783,89 @@ fn run_bounded_traversal(
     conn.progress_handler(0, None::<fn() -> bool>)
         .map_err(|e| map_err(e, "traverse_progress_handler_clear"))?;
     result
+}
+
+impl SqlGraphStore {
+    async fn query_neighbors_page(
+        &self,
+        operation: &'static str,
+        node_id: Uuid,
+        query: NeighborQuery,
+        after: Option<NeighborCursor>,
+        neighbor_kinds: Option<Vec<String>>,
+    ) -> Result<Vec<NeighborHit>, StorageError> {
+        count_neighbor_select();
+
+        let namespace = self.namespace.clone();
+        let node_str = node_id.to_string();
+        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closure_queries = Arc::clone(&counted_queries);
+        let closure_rows = Arc::clone(&counted_rows);
+        let result = self
+            .with_reader(operation, move |conn| {
+                let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
+                            FROM graph_edges \
+                            WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
+                let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight \
+                           FROM graph_edges \
+                           WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
+                let sql = match query.direction {
+                    Direction::Out => base_out.to_string(),
+                    Direction::In => base_in.to_string(),
+                    Direction::Both => format!("{} UNION ALL {}", base_out, base_in),
+                };
+                let (where_extra, limit_clause, extra_params) =
+                    neighbor_extra_clause(&query, 3, after.as_ref(), neighbor_kinds.as_deref());
+                let full_sql = format!(
+                    "SELECT node_id, edge_id, relation, weight FROM ({}){} \
+                 ORDER BY weight DESC, node_id ASC, edge_id ASC{}",
+                    sql, where_extra, limit_clause
+                );
+                let mut stmt = conn.prepare(&full_sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                all_params.push(Box::new(namespace.clone()));
+                all_params.push(Box::new(node_str.clone()));
+                all_params.extend(extra_params);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+
+                closure_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let nid_str: String = row.get(0)?;
+                    let eid_str: String = row.get(1)?;
+                    let relation_str: String = row.get(2)?;
+                    let weight: f64 = row.get(3)?;
+                    Ok((nid_str, eid_str, relation_str, weight))
+                })?;
+                let mut hits = Vec::new();
+                for row in rows {
+                    let (nid_str, eid_str, relation_str, weight) = row?;
+                    closure_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    hits.push(NeighborHit {
+                        node_id: parse_uuid(&nid_str)?,
+                        edge_id: parse_uuid(&eid_str)?,
+                        relation,
+                        weight,
+                        name: None,
+                        kind: None,
+                        entity_type: None,
+                    });
+                }
+                Ok(hits)
+            })
+            .await;
+
+        report_graph_usage(&counted_queries, &counted_rows);
+        result
+    }
 }
 
 #[async_trait]
@@ -2686,89 +2812,19 @@ impl GraphStore for SqlGraphStore {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> Result<Vec<NeighborHit>, StorageError> {
-        count_neighbor_select();
+        self.query_neighbors_page("neighbors", node_id, query, None, None)
+            .await
+    }
 
-        let namespace = self.namespace.clone();
-        let node_str = node_id.to_string();
-
-        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let closure_queries = Arc::clone(&counted_queries);
-        let closure_rows = Arc::clone(&counted_rows);
-        let result = self
-            .with_reader("neighbors", move |conn| {
-                let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
-                            FROM graph_edges \
-                            WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
-                let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight \
-                           FROM graph_edges \
-                           WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
-
-                let sql = match query.direction {
-                    Direction::Out => base_out.to_string(),
-                    Direction::In => base_in.to_string(),
-                    Direction::Both => format!("{} UNION ALL {}", base_out, base_in),
-                };
-
-                let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
-
-                // Deterministic weight-descending order, tie-broken by node_id ascending,
-                // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
-                // drop high-weight neighbors in favor of arbitrary SQLite row order
-                // (ADR-089 context-verb review).
-                let full_sql = format!(
-                    "SELECT node_id, edge_id, relation, weight FROM ({}){} \
-                 ORDER BY weight DESC, node_id ASC{}",
-                    sql, where_extra, limit_clause
-                );
-
-                let mut stmt = conn.prepare(&full_sql)?;
-
-                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                all_params.push(Box::new(namespace.clone()));
-                all_params.push(Box::new(node_str.clone()));
-                all_params.extend(extra_params);
-
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    all_params.iter().map(|p| p.as_ref()).collect();
-
-                closure_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                    let nid_str: String = row.get(0)?;
-                    let eid_str: String = row.get(1)?;
-                    let relation_str: String = row.get(2)?;
-                    let weight: f64 = row.get(3)?;
-                    Ok((nid_str, eid_str, relation_str, weight))
-                })?;
-
-                let mut hits = Vec::new();
-                for row in rows {
-                    let (nid_str, eid_str, relation_str, weight) = row?;
-                    closure_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                    hits.push(NeighborHit {
-                        node_id: parse_uuid(&nid_str)?,
-                        edge_id: parse_uuid(&eid_str)?,
-                        relation,
-                        weight,
-                        name: None,
-                        kind: None,
-                        entity_type: None,
-                    });
-                }
-
-                Ok(hits)
-            })
-            .await;
-
-        report_graph_usage(&counted_queries, &counted_rows);
-        result
+    async fn neighbors_page(
+        &self,
+        node_id: Uuid,
+        query: NeighborQuery,
+        after: Option<NeighborCursor>,
+        neighbor_kinds: Option<Vec<String>>,
+    ) -> Result<Vec<NeighborHit>, StorageError> {
+        self.query_neighbors_page("neighbors_page", node_id, query, after, neighbor_kinds)
+            .await
     }
 
     /// Single-query both-direction neighbor fetch (ADR-089 context-verb
@@ -2801,7 +2857,8 @@ impl GraphStore for SqlGraphStore {
                            WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
                 let sql = format!("{} UNION ALL {}", base_out, base_in);
 
-                let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
+                let (where_extra, limit_clause, extra_params) =
+                    neighbor_extra_clause(&query, 3, None, None);
 
                 // Same global weight-descending/node_id-ascending order as `neighbors`
                 // (ADR-089 context-verb review),

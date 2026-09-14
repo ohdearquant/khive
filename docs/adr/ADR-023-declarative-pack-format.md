@@ -5,6 +5,9 @@
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-084](ADR-084-verb-surface-consistency.md), which records
 the live ontology-introspection contract.
+**Proposed amendment**: [resolve fallback-limit disclosure](#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14)
+adds response fields upon acceptance. Existing decisions remain accepted; this
+proposed addition requires acceptance before dependent implementation merges.
 
 ## Context
 
@@ -195,6 +198,17 @@ endpoint. It is a pure read operation with no side effects. It excludes internal
 `request` tool's MCP description advertises.
 
 `context` was added under ADR-089 (2026-07-04) as a bare kg-substrate verb — it composes the existing `search`/`neighbors` runtime ops (`hybrid_search`, `neighbors_with_query`) into a single call rather than introducing new storage or a new runtime operation, matching the "reuse runtime ops unchanged, compose in the handler" precedent already used by `traverse`.
+
+Upon acceptance of the [resolve amendment below](#amendment-proposed-resolve-fallback-limit-disclosure-2026-09-14),
+`resolve` retains its existing `results` array and adds three payload siblings
+that disclose the stage-4 fallback candidate limit; earlier resolution stages
+and their ambiguity outputs remain unchanged.
+
+Reciprocally, proposed [ADR-130 Amendment 5](ADR-130-search-response-completeness-and-ranking-evidence.md#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14)
+places `search` limit metadata on successful MCP operation wrappers beside
+`status` and `result`; raw registry dispatch and canonical search hit arrays
+retain their exact array contract. This does not introduce a uniform metadata
+object into every pack handler's return value.
 
 Every other pack prefixes its verbs with the pack name and a single dot:
 
@@ -742,3 +756,70 @@ ABI because it has no code, and the component profile pins an interface world ra
 native ABI, so neither reopens the cost §10 was avoiding.
 
 Nothing in this amendment authorizes implementation.
+
+## Amendment (proposed): resolve fallback-limit disclosure (2026-09-14)
+
+**Status**: proposed. Acceptance is required before dependent implementation merges.
+This amendment partially qualifies the `resolve` response description in the
+KG verb table by adding three flat fields beside its existing `results` array.
+It changes neither the stage ordering nor any resolution, ranking, ambiguity or
+visibility rule.
+
+Every successful canonical `resolve` payload MUST include:
+
+- `requested_limit`: the accepted unsigned integer supplied as `limit`, or `5`
+  when omitted or null.
+- `effective_limit`: `clamp(requested_limit, 1, 20)`, the setting used to bound
+  rendered candidates from stage-4 hybrid-search fallback.
+- `limit_clamped`: the boolean `requested_limit != effective_limit`.
+
+The existing strict `Option<u32>` input is preserved. Negative or fractional
+numbers, strings, booleans, arrays, objects and integers above `4294967295`
+remain errors, with no new alias or coercion. Explicit zero reports
+`0 / 1 / true`; omitted/null reports `5 / 5 / false`; a request for 21 reports
+`21 / 20 / true`. Existing authorization and validation order remains unchanged.
+
+The setting bounds rendered stage-4 fallback candidates, not the number of input
+references, all returned ambiguities, internal search overfetch or total work.
+UUID passthrough, the recently-referenced ring and exact-name matching precede
+fallback. Ring or exact-name ambiguities MAY contain more than `effective_limit`
+candidates; their existing sampling and limits MUST NOT be retroactively capped
+by this amendment. In particular, exact-name matching keeps its separate existing
+sampling limit. Internal fallback retrieval may overfetch before rendering the
+bounded candidate list.
+
+All successful responses MUST carry the report, even when every reference
+resolves before fallback, no fallback candidate is found, or one request mixes
+UUID, ring, exact-name, ambiguous and not-found outcomes. The per-reference
+`resolved`, `ambiguous` and `not_found` status strings, order, identifiers and
+candidate arrays MUST remain unchanged. The report describes the configured
+fallback setting, not evidence that fallback ran or that a search was complete.
+An empty `refs` input remains an error and MUST NOT become a successful
+metadata-only object. Help and error responses MUST NOT carry a successful
+normalization report.
+
+Presentation MUST retain the numeric/boolean fields, including zero and false,
+while preserving the existing payload's elision rules. Auto/table output may
+render those payload scalars in the existing string form. Unlike search's
+MCP-only wrapper fields in proposed ADR-130 Amendment 5, these fields belong to
+`resolve`'s canonical payload and are consequently available through existing
+result-only clients and `$prev`; no client or chain extraction rule changes.
+
+Validation MUST compare canonical pre/post payloads after removing only the
+three new fields. Controls cover omitted/null, zero, 1, 20, 21 and `u32::MAX`,
+typed-invalid inputs, empty `refs`, help, every early stage, mixed references,
+and a populated fallback fixture that proves the executed candidate cap.
+Requests normalized to the same effective limit (including 0/1 and 21/20) MUST
+produce the same existing results for a fixed fixture. Ring/exact ambiguity
+fixtures exceeding a requested limit of 1 MUST retain their previous candidates.
+Agent/Human/Verbose and JSON/Auto/Table controls check report propagation without
+changing existing rendering. Mutations using `>` instead of `!=`, applying the
+fallback cap to all stages, reordering results, omitting early-success metadata,
+or returning a metadata-only success for empty `refs` MUST be detected.
+These are pending acceptance requirements, not test results.
+
+This proposal does not amend `list`'s accepted offset/cursor contracts, the
+separate `context` or GTD lanes, or the existing search score/threshold contract.
+The reciprocal search qualification above is confined to successful MCP
+operation wrappers; no generic dispatch sidecar framework or new runtime
+resolution algorithm is authorized here.

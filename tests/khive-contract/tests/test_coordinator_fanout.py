@@ -40,7 +40,7 @@ from typing import Iterator
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, error_text
+from khive_contract.client import KhiveMcpSession, OwnedContractStore, error_text
 
 VERBS_UNDER_TEST = {"create", "search", "link"}
 
@@ -52,44 +52,24 @@ class TwoBackendHarness:
     tasks_db: Path
 
 
-@pytest.fixture(scope="module")
-def khive_two_backend_session(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[TwoBackendHarness]:
-    """KG on ``main`` plus GTD on a second physical SQLite backend."""
-    root = tmp_path_factory.mktemp("coordinator-fanout")
-    main_db = root / "main.db"
-    tasks_db = root / "tasks.db"
-    config = root / "khive.toml"
-    config.write_text(
-        "\n".join(
-            [
-                "[[backends]]",
-                'name = "main"',
-                'kind = "sqlite"',
-                f"path = {json.dumps(str(main_db))}",
-                "",
-                "[[backends]]",
-                'name = "tasks"',
-                'kind = "sqlite"',
-                f"path = {json.dumps(str(tasks_db))}",
-                "",
-                "[packs.gtd]",
-                'backend = "tasks"',
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    with KhiveMcpSession(
-        db=None,
-        config=config,
-        packs=("kg", "gtd"),
-        no_embed=True,
-        log="error",
-    ) as session:
-        yield TwoBackendHarness(session=session, main_db=main_db, tasks_db=tasks_db)
+@pytest.fixture
+def khive_two_backend_session() -> Iterator[TwoBackendHarness]:
+    """One test's KG backend plus a second physical backend routed to GTD."""
+    with OwnedContractStore() as store:
+        main_db = store.root / "main.db"
+        tasks_db = store.root / "tasks.db"
+        store.write_config(topology="\n".join([
+            "[[backends]]", 'name = "main"', 'kind = "sqlite"',
+            f"path = {json.dumps(str(main_db))}", "",
+            "[[backends]]", 'name = "tasks"', 'kind = "sqlite"',
+            f"path = {json.dumps(str(tasks_db))}", "",
+            "[packs.gtd]", 'backend = "tasks"', "",
+        ]))
+        with KhiveMcpSession(
+            store=store, db=None, config=store.config, packs=("kg", "gtd"),
+            no_embed=True, log="error",
+        ) as session:
+            yield TwoBackendHarness(session=session, main_db=main_db, tasks_db=tasks_db)
 
 
 def _note_kind(db: Path, note_id: str) -> str | None:

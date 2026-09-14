@@ -904,12 +904,21 @@ impl WriterContentionDiagnostics {
 /// one row during ID-based deduplication. The two raw row counts are reported
 /// separately because sequence rows intentionally survive hard deletion;
 /// count inequality by itself is therefore not proof of corruption.
+///
+/// `live_entities_carrying_merged_into` counts entity rows that are live
+/// (`deleted_at IS NULL`) while still carrying merge provenance. A merge
+/// tombstones its source; a restore that ran before restore refused merge
+/// tombstones cleared the tombstone and left the provenance, so such rows
+/// read as merged by `get` and as live by `list` and `search`. Restore now
+/// names them as `live_merged_entity`; this count is where an operator finds
+/// them across all namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct GraphEdgeIntegrity {
     pub duplicate_edge_id_groups: i64,
     pub graph_edges_rows: i64,
     pub graph_edges_seq_rows: i64,
     pub pre_v14_duplicate_edge_state_detected: bool,
+    pub live_entities_carrying_merged_into: i64,
 }
 
 fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrity> {
@@ -919,7 +928,9 @@ fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrit
                  SELECT id FROM graph_edges GROUP BY id HAVING COUNT(*) > 1
              )),
              (SELECT COUNT(*) FROM graph_edges),
-             (SELECT COUNT(*) FROM graph_edges_seq)",
+             (SELECT COUNT(*) FROM graph_edges_seq),
+             (SELECT COUNT(*) FROM entities
+              WHERE deleted_at IS NULL AND merged_into IS NOT NULL)",
         [],
         |row| {
             let duplicate_edge_id_groups = row.get(0)?;
@@ -928,6 +939,7 @@ fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrit
                 graph_edges_rows: row.get(1)?,
                 graph_edges_seq_rows: row.get(2)?,
                 pre_v14_duplicate_edge_state_detected: duplicate_edge_id_groups > 0,
+                live_entities_carrying_merged_into: row.get(3)?,
             })
         },
     )
@@ -1692,6 +1704,7 @@ mod tests {
                 .conn()
                 .execute_batch(
                     "CREATE TABLE t (x INTEGER); \
+                     CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT); \
                      CREATE TABLE graph_edges (
                          namespace TEXT NOT NULL,
                          id TEXT NOT NULL,
@@ -2070,6 +2083,7 @@ mod tests {
                 graph_edges_rows: 0,
                 graph_edges_seq_rows: 0,
                 pre_v14_duplicate_edge_state_detected: false,
+                live_entities_carrying_merged_into: 0,
             })
         );
         assert!(report.graph_edge_integrity_error.is_none());
@@ -2275,6 +2289,7 @@ mod tests {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  edge_id TEXT NOT NULL UNIQUE
              );
+             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
              INSERT INTO graph_edges(namespace, id)
              VALUES ('alpha', 'shared-edge'), ('beta', 'shared-edge');
              INSERT INTO graph_edges_seq(edge_id) VALUES ('shared-edge');",
@@ -2290,6 +2305,38 @@ mod tests {
     }
 
     #[test]
+    fn graph_edge_integrity_counts_only_live_rows_that_still_carry_merge_provenance() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE graph_edges (
+                 namespace TEXT NOT NULL,
+                 id TEXT NOT NULL,
+                 PRIMARY KEY (namespace, id)
+             );
+             CREATE TABLE graph_edges_seq (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 edge_id TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
+             INSERT INTO entities(id, deleted_at, merged_into) VALUES
+                 ('kept', NULL, NULL),
+                 ('tombstoned-source', 1, 'kept'),
+                 ('left-live-by-an-old-restore', NULL, 'kept'),
+                 ('plain-soft-delete', 1, NULL);",
+        )
+        .expect("seed one row of each shape");
+
+        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
+
+        assert_eq!(
+            integrity.live_entities_carrying_merged_into, 1,
+            "a merge tombstone and a plain live row are both in order; only the live row \
+             carrying merged_into is the invariant violation"
+        );
+        assert_eq!(integrity.duplicate_edge_id_groups, 0);
+    }
+
+    #[test]
     fn graph_edge_integrity_does_not_mislabel_retained_delete_history_as_a_duplicate() {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
         conn.execute_batch(
@@ -2302,6 +2349,7 @@ mod tests {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  edge_id TEXT NOT NULL UNIQUE
              );
+             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
              INSERT INTO graph_edges(namespace, id) VALUES ('local', 'live-edge');
              INSERT INTO graph_edges_seq(edge_id)
              VALUES ('deleted-edge'), ('live-edge');",

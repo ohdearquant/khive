@@ -1,7 +1,7 @@
 """Shared pytest fixtures for the khive-contract test suite.
 
-All fixtures here are deterministic except the unique namespace suffix.
-Tests must pass namespace=temp_namespace to all verbs that accept it.
+Each test function owns a private store and enrolled caller. ``temp_namespace``
+supplies a unique explicit routing namespace; the private store provides isolation.
 """
 
 from __future__ import annotations
@@ -14,65 +14,70 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession
+from khive_contract.client import KhiveMcpSession, OwnedContractStore
 
 
 # ---------------------------------------------------------------------------
-# Session fixtures — one MCP process per test session, shared across tests.
-# Tests MUST use temp_namespace to avoid cross-test contamination.
+# Every runtime fixture is function-scoped and uses an owned file-backed store.
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
-def khive_session() -> Iterator[KhiveMcpSession]:
+@pytest.fixture
+def contract_store() -> Iterator[OwnedContractStore]:
+    with OwnedContractStore() as store:
+        yield store
+
+
+@pytest.fixture
+def khive_session(contract_store: OwnedContractStore) -> Iterator[KhiveMcpSession]:
     """KG-only MCP session.
 
     ADR: ADR-027 (single-tool MCP surface)
-    Spawn config: packs=("kg",), db=":memory:", no_embed=True, log="error".
+    An enrolled caller with an isolated file-backed database and no embeddings.
     """
-    with KhiveMcpSession(packs=("kg",), db=":memory:", no_embed=True, log="error") as session:
+    with KhiveMcpSession(packs=("kg",), store=contract_store, no_embed=True, log="error") as session:
         yield session
 
 
-@pytest.fixture(scope="session")
-def khive_gtd_session() -> Iterator[KhiveMcpSession]:
+@pytest.fixture
+def khive_gtd_session(contract_store: OwnedContractStore) -> Iterator[KhiveMcpSession]:
     """KG + GTD MCP session.
 
     ADR: ADR-019 (GTD pack)
-    Spawn config: packs=("kg", "gtd"), db=":memory:", no_embed=True, log="error".
+    Session options: packs=("kg", "gtd"), store=contract_store, no_embed=True, log="error".
     """
     with KhiveMcpSession(
-        packs=("kg", "gtd"), db=":memory:", no_embed=True, log="error"
+        packs=("kg", "gtd"), store=contract_store, no_embed=True, log="error"
     ) as session:
         yield session
 
 
-@pytest.fixture(scope="session")
-def khive_memory_session() -> Iterator[KhiveMcpSession]:
+@pytest.fixture
+def khive_memory_session(contract_store: OwnedContractStore) -> Iterator[KhiveMcpSession]:
     """KG + memory MCP session.
 
     ADR: ADR-021 (memory pack)
-    Spawn config: packs=("kg", "memory"), db=":memory:", no_embed=True, log="error".
+    Session options: packs=("kg", "memory"), store=contract_store, no_embed=True, log="error".
     """
     with KhiveMcpSession(
-        packs=("kg", "memory"), db=":memory:", no_embed=True, log="error"
+        packs=("kg", "memory"), store=contract_store, no_embed=True, log="error"
     ) as session:
         yield session
 
 
-@pytest.fixture(scope="session")
-def khive_formal_session() -> Iterator[KhiveMcpSession]:
+@pytest.fixture
+def khive_formal_session(contract_store: OwnedContractStore) -> Iterator[KhiveMcpSession]:
     """KG + formal-math ontology MCP session.
 
     ADR: ADR-017 (pack standard, edge endpoint rules)
-    Spawn config: packs=("kg", "formal"), db=":memory:", no_embed=True, log="error".
+    Session options: packs=("kg", "formal"), store=contract_store, no_embed=True, log="error".
 
     The formal pack (crates/khive-pack-formal) registers 21 EntityOfType edge
     endpoint rules for six concept subtypes (theorem, definition, structure,
     instance, axiom, goal) — no verbs, pure ontology extension.
     """
     with KhiveMcpSession(
-        packs=("kg", "formal"), db=":memory:", no_embed=True, log="error"
+        packs=("kg", "formal"), store=contract_store, no_embed=True, log="error"
     ) as session:
         yield session
 

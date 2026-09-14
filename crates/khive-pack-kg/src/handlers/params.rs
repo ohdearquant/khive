@@ -171,6 +171,14 @@ pub(crate) struct RestoreParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ScanParams {
+    pub(crate) content: String,
+    pub(crate) name: Option<String>,
+    pub(crate) properties: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeParams {
     #[serde(alias = "winner_id", alias = "target_id")]
     pub(crate) into_id: String,
@@ -245,9 +253,20 @@ pub(crate) struct NeighborsParams {
     pub(crate) limit: Option<u32>,
     pub(crate) min_weight: Option<f64>,
     pub(crate) relations: Option<Vec<String>>,
+    pub(crate) after: Option<String>,
+    pub(crate) neighbor_kinds: Option<Vec<String>>,
+    pub(crate) projection: Option<NeighborProjection>,
     /// When true, each neighbor in the result carries its `entity_type` field.
     /// Absent or false: result shape is identical to today (no `entity_type` key).
     pub(crate) include_entity_type: Option<bool>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NeighborProjection {
+    Edge,
+    Summary,
+    Record,
 }
 
 #[derive(Deserialize)]

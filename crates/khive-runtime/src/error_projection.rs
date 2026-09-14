@@ -24,7 +24,7 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         error if error.is_stream_policy_refusal() => Some("not_committed"),
         // A refusal that wrote a receipt is a definite no-write of the thing it
         // refused: the receipt exists precisely to record that nothing ran.
-        RuntimeError::RefusedWithReceipt { .. } => Some("not_committed"),
+        RuntimeError::RefusedWithReceipt(_) => Some("not_committed"),
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
             (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
                 Some("not_committed")
@@ -73,16 +73,27 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
             "audit_outcome": receipt.audit_outcome.wire_code(),
         }),
-        RuntimeError::RefusedWithReceipt {
-            code,
-            message,
-            receipt_id,
-        } => json!({
-            "kind": "runtime_error",
-            "code": code,
-            "message": message,
-            "receipt_id": receipt_id,
-        }),
+        RuntimeError::RefusedWithReceipt(refusal) => {
+            let crate::error::ReceiptRefusal {
+                code,
+                message,
+                receipt_id,
+                reason,
+                detail,
+            } = *refusal;
+            // Surface evidence first, contract fields last: a detail member that
+            // happens to share a name with a contract field cannot shadow it.
+            let mut error = match detail {
+                Value::Object(members) => members,
+                _ => serde_json::Map::new(),
+            };
+            error.insert("kind".into(), json!("runtime_error"));
+            error.insert("code".into(), json!(code));
+            error.insert("message".into(), json!(message));
+            error.insert("receipt_id".into(), json!(receipt_id));
+            error.insert("reason".into(), json!(reason));
+            Value::Object(error)
+        }
         RuntimeError::AuditObligation {
             failure,
             domain_result,
@@ -266,20 +277,27 @@ mod tests {
     /// over it breaks without failing anything.
     #[test]
     fn a_refusal_receipt_id_is_a_field_and_not_only_a_substring_of_the_message() {
-        let error = RuntimeError::RefusedWithReceipt {
+        let error = RuntimeError::RefusedWithReceipt(Box::new(crate::error::ReceiptRefusal {
             code: "exec_refused",
             message: "exec.run refused: tool not registered (receipt_id=r-1)".into(),
             receipt_id: "r-1".into(),
-        };
+            reason: "tool not registered".into(),
+            detail: json!({ "effective_max_output_bytes": 65536, "receipt_id": "shadow" }),
+        }));
 
         // Disposition is deliberately the wrong one on the way in: a receipt-bearing
         // refusal establishes its own no-write, so the boundary's guess is overridden.
         let value = runtime_error_value(error, DomainDisposition::Unknown);
 
-        assert_eq!(value["receipt_id"], "r-1");
+        assert_eq!(
+            value["receipt_id"], "r-1",
+            "a detail member cannot shadow a contract field"
+        );
         assert_eq!(value["code"], "exec_refused");
         assert_eq!(value["kind"], "runtime_error");
         assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["reason"], "tool not registered");
+        assert_eq!(value["effective_max_output_bytes"], 65536);
         assert_eq!(
             value["message"], "exec.run refused: tool not registered (receipt_id=r-1)",
             "the existing wording is kept so a reader that parses it today keeps working"
