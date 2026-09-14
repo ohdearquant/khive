@@ -1097,8 +1097,6 @@ fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b'-' | b'/' | b'.'))
 }
 
-/// Scan for a JWT pattern: at least two "eyJ" segments separated by a `.`
-/// character, with each segment at least 10 chars.
 /// Shortest line of base64 that counts as PEM key material. Real key blocks
 /// wrap at 64 columns; the last line of a block can be shorter, but a block
 /// with no END marker is recognised by a full-width line, so a short tail on
@@ -1184,16 +1182,24 @@ fn find_pem_private_key_block(text: &str) -> Option<&str> {
                 cursor = next;
                 continue;
             }
-            // Inside a serialized JSON string the last body line runs into
-            // the closing quote instead of a line break; the base64 run
-            // before that quote is still a body line, and the block ends
-            // where it ends.
+            // The last line of a wrapped block is usually shorter than the
+            // others. Once at least one full-width line has been seen, a
+            // trailing base64-only run of any length belongs to the block,
+            // so a masked surface never keeps the tail of the key. Inside a
+            // serialized JSON string that run ends at the closing quote
+            // instead of a line break; the block ends where the run ends.
             let run = line
                 .bytes()
                 .take_while(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
                 .count();
-            if run >= PEM_BODY_LINE_MIN && line[run..].starts_with('"') {
-                body_end = Some(cursor + run);
+            let whole_line = run == line.len();
+            let json_end = line[run..].starts_with('"');
+            if run > 0 && (whole_line || json_end) {
+                if body_end.is_some() {
+                    body_end = Some(if whole_line { next } else { cursor + run });
+                } else if run >= PEM_BODY_LINE_MIN && json_end {
+                    body_end = Some(cursor + run);
+                }
             }
             break;
         }
@@ -1204,6 +1210,8 @@ fn find_pem_private_key_block(text: &str) -> Option<&str> {
     None
 }
 
+/// Scan for a JWT pattern: at least two "eyJ" segments separated by a `.`
+/// character, with each segment at least 10 chars.
 fn find_jwt(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -3778,6 +3786,19 @@ mod tests {
         // A short base64 tail alone (below key-block width) is not a body.
         let short = format!("{header}\nMIIEowIBAAKCAQEA\n{trailing}\n");
         assert!(scan(&short).is_none(), "{:?}", scan(&short));
+        // After a full-width line, a short final line is the end of the block
+        // and stays inside the candidate rather than surviving past it.
+        let tail = "MIIEowIBAAKCAQEA";
+        let with_tail = format!("{header}\n{body_line}\n{tail}\n{trailing}\n");
+        let m = scan(&with_tail).expect("a full line plus a short tail is a key");
+        let tail_len = header.chars().count() + 1 + body_line.len() + 1 + tail.len() + 1;
+        assert!(
+            m.masked.ends_with(&format!("...{tail_len}chars")),
+            "masked: {}",
+            m.masked
+        );
+        let masked = mask_secrets(&with_tail);
+        assert!(!masked.contains(tail), "tail survived masking: {masked}");
     }
 
     #[test]
