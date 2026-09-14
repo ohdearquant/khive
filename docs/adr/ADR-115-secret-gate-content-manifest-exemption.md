@@ -1050,3 +1050,226 @@ trigger when applicable, with no candidate excerpt. The existing masked field re
 in the structured value. Known-prefix detections need no trigger; typed permanent-failure
 classification does not depend on the display string. This amendment changes neither storage
 schema nor exemption-manifest identity.
+
+## Proposed amendment: prose-shaped names and stored UUID references (2026-09-14)
+
+**Status**: Items 1, 3 and 4 signed; item 2 ruled (a); item 5 held. UUID admission remains
+disabled until the separate addendum is signed.
+
+This proposal qualifies the content-shape rationale above for a closed syntax exception. It does
+not infer provenance from explanatory prose. An admitted spelling can still be a credential; the
+residuals below are part of the decision. The exact-content manifest, its operator-adjudication
+requirements and its activation gates remain unchanged. No automatic manifest enrollment is added.
+
+### 1. Recommended name grammars and their limits
+
+Each grammar is ASCII and matches a complete whitespace-delimited member. Environment-variable
+names and LaTeX controls may be bare or enclosed in exactly one matching pair of backticks. Code
+identifiers require exactly one matching pair of backticks. No other punctuation is removed to obtain a match.
+No Unicode normalization, case folding or substring matching participates in admission. Lengths
+are bytes after removal of that backtick pair when present.
+
+| Form                      | Proposed exact grammar         | Bounds and additional requirements                                                                                                    |
+| ------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Environment-variable name | `[A-Z_][A-Z0-9_]{0,127}`       | Bare or backticked; at least one ASCII letter; no value assignment.                                                                   |
+| Code identifier           | `[A-Za-z_][A-Za-z0-9_]{0,127}` | Backtick-enclosed only; at least one ASCII letter; no value assignment.                                                               |
+| LaTeX control             | `\\[A-Za-z]{1,64}`             | Bare or backticked; one literal backslash followed by 1–64 ASCII letters; no digits, braces, arguments, star or additional backslash. |
+
+The 128-byte name bound and 64-letter control bound are proposed limits requiring exact-doc
+signature. The environment grammar is a subset of the code grammar; prose labels do not select
+a weaker rule. Leading, trailing and repeated underscores are permitted, but an all-underscore
+member is not. These are complete name forms, not qualified names or paths. Unseparated opaque
+alphanumeric values may match the name grammar but remain subject to the inner-run veto below.
+The existing guarded exception for dense LaTeX formulae remains separate and unchanged.
+
+There must be no attached or adjacent assignment value: the raw member must contain neither `=`
+nor `:`, and the immediately preceding or following whitespace-delimited member must not start
+or end with either character. This rejects `NAME=value`, `NAME: value`, `NAME = value` and
+`NAME :value` as admission forms. The existing inline-trigger and immediate-credential-label
+guards also remain vetoes. A failed grammar or context condition falls through to the ordinary
+scanner; it does not create a new refusal for strings that the ordinary scanner already allows.
+
+Known-provider patterns, JWT and PEM private-key detection always take precedence. For environment
+and code names, credential-length hex runs, normalized hex reconstruction, every alphanumeric
+inner run of at least 24 bytes with Shannon entropy at least 4.5, and existing multi-member bridge
+reconstruction remain refusal grounds. Only the final **whole-name** entropy refusal is suppressed
+for a qualifying name after those checks. The constants, trigger vocabulary and context radii do
+not change. This is a real near-trigger exception, not a requirement that the whole name already
+have entropy below 4.5.
+
+A qualifying LaTeX control suppresses entropy detection on exactly its complete letters-only
+control body, including the body considered as a single inner run. Otherwise a long bare macro
+would remain refused and the proposed exception would do nothing. Provider-pattern and
+credential-length hex checks still take precedence, and no argument, sibling value, reconstruction
+extending outside that exact member, or letters-and-digits body inherits this exception. For all
+three forms, scanning continues over all other content and fields; an admitted member must never
+terminate the scan of the enclosing text.
+
+Residual exposure is explicit. An environment name can be a real password composed of uppercase
+letters and underscores, such as `CORRECT_HORSE_BATTERY_STAPLE`; a code identifier can be a real
+credential such as `Garden_river_copper_cloud`. Digits are allowed in both grammars, so a credential
+such as `Garden7_river8_copper9` can also qualify when its component runs evade the retained checks.
+The example strings are synthetic, not verified secrets. A letters-only LaTeX control can encode a
+credential after the backslash, including a high-entropy letters-only value. Shape and nearby prose
+cannot distinguish any of these from the intended name or control. These exposures must not be
+described as preservation of every same-shaped credential refusal.
+
+### 2. Proposed UUID admission at the write path
+
+A UUID receives no content-only exception merely because it is a UUID or is called a record id.
+The proposed exception requires an exact stored-record lookup bound to the destination write.
+The following is a concrete recommendation pending the authority and scope rulings in §5.
+
+The lookup unit is a complete 36-byte dashed UUID substring found inside the original token being
+evaluated for masking, with ASCII hexadecimal groups of lengths 8–4–4–4–12. A token containing a
+UUID beside adjacent characters resolves that embedded UUID, not the whole token. Hex letters may
+be either case and are normalized only for lookup. Prefixes, undashed spellings, names, fuzzy
+references, nested values and concatenated fragments do not qualify as that complete substring.
+A token with no complete UUID substring retains the ordinary refusal. The no-assignment/context
+conditions from §1 still apply to the original token and its context; the complete-member/backtick
+restriction does not apply to UUID extraction. The generic word `token` retains its existing UUID
+treatment; this does not broaden UUID trigger detection.
+
+**Consulted store and kinds.** Use only the exact shared SQLite storage instance that receives the
+destination entity or note mutation. The initial reference-kind recommendation is the `entities`
+and `notes` tables, with `deleted_at IS NULL`. All live shared notes qualify regardless of registered
+note kind, explicitly including task and session notes; neither requires a separate pack lookup.
+Edges and events do **not** count. Proposals, knowledge atoms/domains, the private `sessions` and
+`session_messages` mirror tables, external stores and arbitrary registered pack resolvers do **not**
+count in this initial recommendation. Their inclusion requires a named extension; a UUID resolving only in an excluded
+store retains the ordinary refusal. No federation, catalog search, remote call or payload fetch is
+part of this lookup. A duplicate live claim in both included tables is ambiguous and is refused.
+
+**Identity and namespace.** Eligibility must be no broader than an ordinary authorized by-ID read
+using the request identity already established by the runtime. The recommendation is an explicit
+ordinary `get` authorization decision at the existing Gate seam before writer acquisition, in
+addition to destination-write authorization; neither a caller assertion nor write permission alone
+proves this read authority. Whether this extra Gate decision is the correct authority for implicit
+lookup is unresolved and must be ruled before implementation. For the shared store, the lookup
+itself remains namespace-blind under ADR-007 Rule 2 and ADR-061; adding
+`record.namespace == caller_namespace` would contradict those contracts. This proposal creates no
+connection identity, same-uid isolation or hosted multi-principal support. Principal-scoped backends
+are ineligible until their own authorization and same-store transaction contract is specified.
+
+**Bounds and timing.** Extract at most 32 distinct candidate UUIDs per top-level write request,
+sharing that budget across records, fields and repeated occurrences. An over-budget request gets no
+UUID exception; its ordinary scan determines the result. This count is a proposed operational
+bound, not a measured capacity. Each UUID needs at most two indexed existence probes, each returning
+only whether a live row exists. Do not hydrate properties, content or incident edges. Hold no
+successful lookup across requests. Perform extraction and authorization before writer acquisition;
+perform the final lookup in the same transaction snapshot as the destination mutation, before any
+mutation in that transaction. A row created or restored earlier in the same request is not eligible,
+including one committed by an earlier operation in that request. Enforcing this exclusion requires
+request-scoped mutation/eligibility state in addition to transaction-local revalidation; the two
+existence probes alone do not suffice. Recheck if the finalization transaction is retried. A concurrent deletion committed before that
+snapshot prevents admission; deletion after the write commits does not retract stored prose.
+No new writer acquisition is allowed from inside an already-held writer guard. A backend lacking
+these bounded, transaction-local probes cannot activate the exception.
+
+**Lookup outcomes and span isolation.** Missing, deleted, excluded, ambiguous, denied, unavailable,
+failed or timed-out lookup provides no exemption. With no independently valid existing manifest
+exemption, the original scanner refusal and its sanitized diagnostics remain the result; lookup
+payload or failure detail is not returned. Existing request cancellation still aborts the request
+and never authorizes a write. A successful lookup suppresses `uuid-near-trigger` only for the exact
+matched UUID substring and the normalized-hex representation derived solely from that same UUID.
+This second qualification is necessary because its dashed groups also reconstruct as 32 hex digits.
+Adjacent characters receive no exemption. Neither standalone 32-hex text nor a larger reconstruction
+involving adjacent or other material is exempted.
+All provider matches and every other candidate, field and cross-member reconstruction retain their
+ordinary checks. The runtime must retain the original text and span boundaries; substituting a
+placeholder before scanning could hide a credential spanning that boundary.
+
+**Destination and durable posture.** Initially recommend only the entity/note constructor paths
+already declared admission-capable by Amendment 1 §3. Referenced-record kinds and destination-write
+paths are different sets. Knowledge writes and the other reservation-only paths do not become
+admission-capable through this proposal. UUID admission is not an operator-adjudicated manifest
+match and must not emit `exempted:content-sha256-manifest-v1` or invent a manifest id. Recommend a
+separate typed admission mechanism with an atomic reserved posture and success event, preserving
+the accepted one-record/one-event invariant. The exact stamp value, audit fields, mixed-manifest/
+UUID record behavior and update/carry rules require a further explicit ruling before activation;
+this Proposed text does not silently extend the closed durable schema. If those are not defined
+and atomic with the record write, UUID admission remains disabled.
+
+The standalone content scanner and permanent mask-only surfaces lack the target-store/transaction
+context and retain UUID refusal or masking. In particular, GitIngest, SessionMirror, McpDiagnostic
+and GateProbe gain no lookup or admission. Name syntax is a shared detector classification, but the
+UUID decision is a write-only admission mechanism; this intentional distinction qualifies the
+otherwise shared detector/masker behavior.
+
+Record existence is not proof that the UUID is non-secret. A UUID can simultaneously identify a
+record here and be a credential elsewhere. A caller able to create a chosen UUID can arrange the
+existence precondition. The differing write outcome, and potentially its timing, also disclose
+eligible record existence even when no payload is returned. An ordinary-read authorization check
+does not eliminate these residuals or authenticate the connecting peer. Acceptance must expressly
+include this disclosure and dual-use risk; namespace attribution cannot be offered as mitigation.
+
+### 3. Refusal families retained
+
+- **`uuid-near-trigger`:** non-resolving UUIDs and all UUIDs outside the narrowly authorized
+  write-path case retain refusal. This includes otherwise valid UUIDs in excluded stores.
+- **`hex-credential-token`:** hex digests beside credential triggers remain refused under the
+  current detector rules, even when prose calls them hashes. Existing guarded revision exceptions
+  remain unchanged. Only the exact resolved UUID's own dashed-to-hex representation is qualified
+  by §2; there is no general digest exemption. `content-hash-near-trigger` likewise remains.
+- **`high-entropy-token`:** cloud-resource names must remain refused where the ordinary scanner
+  refuses them, and gain no cloud/provider-name exemption. Opaque
+  values, assignment values, protected inner runs and external reconstruction retain refusal;
+  only the exact §1 syntax admits override their specified entropy checks. Under ruling (a), code
+  identifiers require backticks; environment-variable names and LaTeX controls admit bare or
+  backticked. The residual is explicit: a cloud resource name an author backticks is admitted by that act.
+  A prefix list chosen only to exclude an example is not a general cloud-resource discriminator.
+
+Known credential-prefix, JWT and PEM private-key detectors retain their priority and behavior.
+No prose label such as “example”, “hash”, “resource”, “identifier” or “macro” rescues a failed shape.
+
+### 4. Required acceptance witnesses before implementation acceptance
+
+Predeclare tests and mutants before executing a baseline. Preserve the existing twelve-case
+proposal unchanged as evidence of the broader request; it is not this split's accepted test matrix.
+The three name probes can change under this proposal. The bare UUID probe has no store context;
+the hex probe remains refused. The cloud probe is carried both ways under ruling (a):
+`GCP_Project_EuropeWest1_ExampleKeyRingBackup` is refused bare and admitted when backtick-enclosed;
+it has no protected long inner run. This is the overlap witness, with the residual stated in §3.
+No claim that this split resolves all six is made.
+
+For each admitted name, pair the real whole-name entropy crossing with an ordinary passing name,
+the retained known-prefix/inner-run/bridge controls, and a same-grammar credential residual case.
+Test the exact boundaries, wrappers, assignment directions and multiple values in one field. The
+mandatory falsifiers are (a) a qualifying environment-variable NAME with an attached or adjacent
+credential value, (b) a backslash body containing letters **and digits** whose ordinary scan is a
+refusal, and (c) a complete non-resolving UUID near a credential trigger, including a complete
+non-resolving UUID embedded beside adjacent characters in a token. Use values that actually reach
+the relevant detector; merely failing a grammar is not sufficient evidence of a refusal.
+
+UUID witnesses must use newly minted eligible record UUIDs for resolving acceptance, never corpus
+rows, with deleted, excluded, duplicate, wrong-store, denied, lookup-error, budget and
+transaction-race controls. Cover all shared note kinds, explicitly task-as-note and session-as-note,
+and exclusion of the private `sessions` and `session_messages` mirror tables. Cover a resolving
+complete UUID substring beside adjacent characters, a refused token with no complete UUID, the
+exact same bytes in a content-only/mask-only call, and unrelated, adjacent and cross-span
+credentials. Cover same-request create/restore exclusion even after an earlier operation commits,
+rollback of stamp/event/record failure, and retry without stale eligibility. Baseline predictions,
+source analysis and synthetic examples are not executed results or replay of a real corpus.
+
+### 5. Decisions still required for this exact candidate
+
+1. Confirm the exact bounds, wrapper/assignment rules and retained inner-run veto for
+   environment/code names, plus the explicitly different full letters-only LaTeX-body admission.
+   Removing the name inner-run veto too would admit opaque alphanumeric credentials that match
+   the name grammar; the proposal does not do that.
+2. Resolved (a): code identifiers admit only when backtick-enclosed; environment-variable names
+   and LaTeX controls admit bare or backticked. The cloud-overlap residual is stated in §3.
+3. Confirm entities and all shared notes regardless of registered note kind, including task and
+   session, as the only initially consulted records. Confirm exclusion of edges, events and private
+   records including the `sessions` and `session_messages` mirror tables, live-only same-store scope,
+   and the two-probe/32-UUID bound.
+4. Confirm whether the proposed ordinary-read Gate decision authorizes this implicit lookup, and
+   expressly accept the existence disclosure, namespace-blind shared-store behavior and dual-use
+   UUID residual. Define any alternative authority rather than assuming one from a writer handle.
+5. Confirm request-scoped mutation/eligibility state plus transaction-local revalidation, including
+   exclusion of same-request create/restore after an earlier operation commits. Confirm qualification
+   of only the complete matched UUID substring and its own normalized hex, with adjacent characters
+   and cross-span reconstruction still checked. Settle the distinct atomic stamp/event mechanism
+   and carry rules before UUID admission can run.
+   Extending destination scope to knowledge or other reservation-only writes requires its own
+   final-target atomicity contract. No implementation should guess these unresolved choices.
