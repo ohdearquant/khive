@@ -771,3 +771,38 @@ reads or lifecycle validation. Any manual repair requires independently verified
 source timestamps/units, an operator-reviewed correction, and preserved original
 values; this amendment supplies neither an automatic repair nor speculative
 timestamp diagnostics.
+
+## Amendment 3 (proposed, 2026-09-14): additive task-query filters (#2678)
+
+**Status: proposed; awaiting contract approval.** This amendment extends the
+`gtd.tasks` input contract. It does not change the accepted response shapes,
+status defaults, ordering, limit handling, dependency diagnostics, or timestamps.
+
+`gtd.tasks` accepts three additional optional parameters:
+
+| Parameter           | Contract                                                                                                                                                                                                                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tags`              | Array of strings. Omission, JSON null, or an empty array adds no restriction. Tag membership uses the existing note-query SQLite `NOCASE` comparator (ASCII case-insensitive, not general Unicode case folding). Duplicate query tags do not duplicate rows or change membership.                  |
+| `tag_mode`          | `any` or `all`; omission or JSON null defaults to `any`. `any` matches at least one requested tag; `all` requires each requested tag. With no tags, either mode adds no restriction. Other spellings and types are invalid.                                                                        |
+| `context_entity_id` | A complete UUID spelling accepted by the existing UUID parser, normalized to canonical lowercase dashed form for equality against the stored `properties.context_entity_id` string. Omission or JSON null adds no restriction. Short prefixes, malformed UUIDs, and non-string values are invalid. |
+
+The context parameter compares a stored reference; it neither creates one nor
+resolves an entity in the caller's primary namespace. A task can therefore match
+its retained context UUID after the context entity is deleted. A supplied UUID
+absent from all visible tasks' stored references yields no matches, without
+requiring or creating an entity. Tasks with no stored context do not match a
+supplied context filter. This query does not rewrite historical property values;
+a noncanonical stored string is not silently normalized by the comparison.
+
+All supplied filters combine with AND, including the existing namespace, status,
+assignee, and priority filters. Explicit namespace routing remains precise;
+omitted routing uses the caller's existing visible task namespaces. The context
+parameter itself does not widen or narrow that task-row visibility policy.
+
+Both tag membership and the constant-path context predicate are applied by the
+storage query before limit/offset pagination. The bounded one-row query that
+explains an empty default-status result applies the same filters, changing only
+the status predicate. Unrelated terminal tasks must not cause `filter_excluded`
+to appear. Ordinary results remain arrays; the existing special empty-result
+object remains limited to a matching excluded task. No response-envelope
+migration or storage migration is part of this amendment.
