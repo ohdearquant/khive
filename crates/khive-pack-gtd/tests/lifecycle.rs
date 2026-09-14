@@ -612,7 +612,7 @@ async fn noop_transition_with_note_does_not_change_properties() {
         .await
         .expect("noop transition with note should succeed");
     assert_eq!(r["transitioned"], false);
-    assert!(r.get("note_recorded").is_none());
+    assert_eq!(r["note_recorded"], false);
     assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();
@@ -664,7 +664,7 @@ async fn repeated_noop_notes_leave_properties_unchanged() {
             .await
             .expect("noop transition with note should succeed");
         assert_eq!(r["transitioned"], false);
-        assert!(r.get("note_recorded").is_none());
+        assert_eq!(r["note_recorded"], false);
         assert!(r.get("audit_persisted").is_none());
     }
 
@@ -714,7 +714,7 @@ async fn empty_string_noop_note_is_ignored() {
         .await
         .expect("noop transition with empty note should succeed");
     assert_eq!(r["transitioned"], false);
-    assert!(r.get("note_recorded").is_none());
+    assert_eq!(r["note_recorded"], false);
     assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();

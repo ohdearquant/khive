@@ -3358,6 +3358,20 @@ async fn restore_note_refuses_a_live_key_holder_and_restores_when_free() {
     assert_eq!(restored["restored"], true);
     assert_eq!(restored["content"], "first tombstone");
     assert_eq!(restored["deleted_at"], Value::Null);
+    // The restore response reports the version the store now holds: a
+    // re-read returns the same number, one past the tombstone's version.
+    let reread = registry
+        .dispatch("get", json!({"id": first_id}))
+        .await
+        .expect("restored note reads back live");
+    assert_eq!(reread["version"], restored["version"]);
+    assert_eq!(
+        reread["version"].as_i64().expect("version is an integer"),
+        tombstone["version"]
+            .as_i64()
+            .expect("tombstone version is an integer")
+            + 1
+    );
 }
 
 #[tokio::test]

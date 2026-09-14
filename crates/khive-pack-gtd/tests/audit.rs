@@ -228,7 +228,7 @@ async fn lifecycle_success_reports_audit_degradation_when_insert_fails() {
         .await
         .expect("canonical note-bearing no-op remains successful");
     assert_eq!(noop["transitioned"], false);
-    assert!(noop.get("note_recorded").is_none());
+    assert_eq!(noop["note_recorded"], false);
     assert!(noop.get("audit_persisted").is_none());
 
     let mut reader = rt.sql().reader().await.expect("sql reader");
@@ -542,7 +542,10 @@ async fn noop_transition_with_note_is_audit_free() {
         "noop must still report transitioned=false"
     );
     assert_eq!(r["note"], "already in target status");
-    assert!(r.get("note_recorded").is_none());
+    assert_eq!(
+        r["note_recorded"], false,
+        "a caller note on a same-status request is reported as not recorded"
+    );
     assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();

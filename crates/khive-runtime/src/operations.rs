@@ -5020,7 +5020,7 @@ impl KhiveRuntime {
             statements: vec![PlanStatement {
                 statement: SqlStatement {
                     sql: format!(
-                        "UPDATE notes SET status=?1, deleted_at=NULL, updated_at=?2 \
+                        "UPDATE notes SET status=?1, deleted_at=NULL, updated_at=?2, version=version+1 \
                          WHERE id=?3 AND namespace=?4 AND kind=?5 AND deleted_at IS NOT NULL{key_clause}"
                     ),
                     params,

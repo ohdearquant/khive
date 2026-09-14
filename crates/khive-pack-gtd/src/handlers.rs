@@ -1748,14 +1748,18 @@ impl GtdPack {
                 // Same-status is a read assertion, not a lifecycle event. A
                 // caller note describes a transition that did not happen, so
                 // neither the note nor an audit row is persisted.
-                return Ok(json!({
+                let mut response = json!({
                     "transitioned": false,
                     "id": short_id(note.id),
                     "full_id": note.id.as_hyphenated().to_string(),
                     "from": current,
                     "to": target,
                     "note": "already in target status",
-                }));
+                });
+                if p.note.is_some() {
+                    response["note_recorded"] = json!(false);
+                }
+                return Ok(response);
             }
             TransitionDecision::Write {
                 mut note,
