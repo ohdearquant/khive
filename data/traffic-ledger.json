@@ -275,13 +275,91 @@
       "unique_clones": 65,
       "views": 30,
       "unique_views": 9
+    },
+    "2026-09-01": {
+      "clones": 363,
+      "unique_clones": 50,
+      "views": 20,
+      "unique_views": 1
+    },
+    "2026-09-02": {
+      "clones": 2273,
+      "unique_clones": 66,
+      "views": 58,
+      "unique_views": 3
+    },
+    "2026-09-03": {
+      "clones": 2567,
+      "unique_clones": 114,
+      "views": 57,
+      "unique_views": 8
+    },
+    "2026-09-04": {
+      "clones": 1219,
+      "unique_clones": 107,
+      "views": 35,
+      "unique_views": 3
+    },
+    "2026-09-05": {
+      "clones": 541,
+      "unique_clones": 119,
+      "views": 8,
+      "unique_views": 8
+    },
+    "2026-09-06": {
+      "clones": 513,
+      "unique_clones": 96,
+      "views": 49,
+      "unique_views": 4
+    },
+    "2026-09-07": {
+      "clones": 1460,
+      "unique_clones": 100,
+      "views": 83,
+      "unique_views": 8
+    },
+    "2026-09-08": {
+      "clones": 1685,
+      "unique_clones": 123,
+      "views": 157,
+      "unique_views": 7
+    },
+    "2026-09-09": {
+      "clones": 2838,
+      "unique_clones": 176,
+      "views": 134,
+      "unique_views": 5
+    },
+    "2026-09-10": {
+      "clones": 2590,
+      "unique_clones": 215,
+      "views": 83,
+      "unique_views": 2
+    },
+    "2026-09-11": {
+      "clones": 3674,
+      "unique_clones": 221,
+      "views": 35,
+      "unique_views": 4
+    },
+    "2026-09-12": {
+      "clones": 2752,
+      "unique_clones": 366,
+      "views": 68,
+      "unique_views": 32
+    },
+    "2026-09-13": {
+      "clones": 1889,
+      "unique_clones": 281,
+      "views": 58,
+      "unique_views": 17
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-09-01T05:30:19Z",
-    "clones_14d": 51164,
-    "unique_clones_14d": 685,
-    "views_14d": 580,
-    "unique_views_14d": 88
+    "taken_at": "2026-09-14T10:46:28Z",
+    "clones_14d": 24582,
+    "unique_clones_14d": 1402,
+    "views_14d": 875,
+    "unique_views_14d": 94
   }
 }
