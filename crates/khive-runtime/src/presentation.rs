@@ -553,8 +553,15 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// survive Agent-mode compaction. Dropping these turns an empty page into a
 /// different response type and leaves callers unable to distinguish an empty
 /// result from a missing/unsupported field.
-const EMPTY_ARRAY_PRESERVE: &[&str] =
-    &["items", "entities", "notes", "edges", "results", "entries"];
+const EMPTY_ARRAY_PRESERVE: &[&str] = &[
+    "items",
+    "entities",
+    "notes",
+    "edges",
+    "results",
+    "entries",
+    "neighbors",
+];
 
 fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
     map.contains_key("requested_limit")
@@ -1115,6 +1122,7 @@ mod tests {
             "edges": [],
             "results": [],
             "entries": [],
+            "neighbors": [],
             "next_after": null,
             "requested_limit": 10,
             "effective_limit": 10,

@@ -6,7 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{hex_prefix_to_uuid_pattern, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::{LimitReport, SqlStatement, SqlValue};
 use khive_storage::SubstrateKind;
 use khive_types::{
     EventKind, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
@@ -575,12 +575,13 @@ impl KgPack {
             })
             .collect();
 
-        let items = to_json(&items)?;
-        Ok(serde_json::json!({
-            "items": items,
-            "requested_limit": requested,
-            "effective_limit": effective,
-            "limit_clamped": requested > effective,
-        }))
+        let mut response = serde_json::json!({"items": to_json(&items)?});
+        if let Some(fields) = LimitReport::new(requested, effective).value().as_object() {
+            response
+                .as_object_mut()
+                .expect("proposal list response is an object")
+                .extend(fields.clone());
+        }
+        Ok(response)
     }
 }
