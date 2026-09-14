@@ -542,9 +542,11 @@ For each token, in order:
    `LOOKUP_KEY_LABELS` (`association_key`, `partition_key`, `sort_key`, `cache_key`, `idempotency_key`,
    `primary_key`, ...) and sits directly before its `:`/`=` delimiter. The exception is an allowlist on
    purpose: an unlisted compound (`hmac_key`, `master_key`, `ssh_key`, `jwt_key`, ...) keeps every
-   refusal it had, and a credential word inside the prefix (`secret_partition_key`) still triggers on
-   its own. A corpus replay that is identical across such a change certifies preservation on the corpus
-   population only; the opened shape class carries its own before/after arms.
+   refusal it had. The match is the whole label, so a qualified spelling (`left_association_key`,
+   `hmac_cache_key`) is refused as well: a prefix rule would re-open the closed compounds, because
+   stems such as `hmac` are not trigger words. A corpus replay that is identical across such a change
+   certifies preservation on the corpus population only; the opened shape class carries its own
+   before/after arms.
 
 7. **File-path exemption** (`is_plausible_file_path`, gated by `has_clause_credential_label_with_inline`)
    applies after all of the above, never before — a path-shaped anchor must not be able to skip a

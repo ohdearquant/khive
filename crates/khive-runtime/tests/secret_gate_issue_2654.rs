@@ -100,3 +100,30 @@ fn issue_2654_unlisted_key_compounds_stay_refused_with_hex_and_opaque_values() {
         );
     }
 }
+
+#[test]
+fn issue_2654_qualified_lookup_labels_keep_their_trigger() {
+    // Whole-label vocabulary: a qualified spelling of a listed lookup label is
+    // not listed, so `hmac_cache_key=<hex64>` refuses like `hmac_key=<hex64>`.
+    let hex = "0123456789abcdef".repeat(4);
+    for label in [
+        "hmac_cache_key",
+        "master_routing_key",
+        "jwt_lookup_key",
+        "ssh_row_key",
+        "webhook_search_key",
+        "license_index_key",
+    ] {
+        for content in [
+            format!("{label}={hex}"),
+            format!(r#"{{"{label}":"{hex}"}}"#),
+        ] {
+            assert!(check(&content).is_err(), "{content}");
+            assert!(
+                !mask_for_redaction_surface(RedactionSurface::SessionMirror, &content)
+                    .contains(hex.as_str()),
+                "{content}"
+            );
+        }
+    }
+}

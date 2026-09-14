@@ -2616,9 +2616,11 @@ fn is_assignment_label_gap(c: char) -> bool {
 /// identifier rather than a credential (issue #2654). The exception is an
 /// allowlist on purpose: any other `*_key` label keeps `key` as a credential
 /// trigger, so unknown compounds such as `hmac_key`, `master_key`, `ssh_key`,
-/// `jwt_key`, `webhook_key` or `license_key` stay refused. A prefix ending in
-/// `_` is allowed (`left_association_key`); a credential word inside the
-/// prefix still triggers on its own.
+/// `jwt_key`, `webhook_key` or `license_key` stay refused. The match is the
+/// whole label: a qualified spelling such as `left_association_key` or
+/// `hmac_cache_key` is not in the vocabulary and keeps its trigger, because a
+/// prefix rule would re-open every compound the list closes (`hmac_` is not a
+/// trigger word, so `hmac_cache_key` would strip to a listed suffix).
 const LOOKUP_KEY_LABELS: &[&str] = &[
     "association_key",
     "cache_key",
@@ -2643,11 +2645,7 @@ const LOOKUP_KEY_LABELS: &[&str] = &[
 ];
 
 fn is_lookup_key_label(label: &str) -> bool {
-    LOOKUP_KEY_LABELS.iter().any(|known| {
-        label
-            .strip_suffix(*known)
-            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
-    })
+    LOOKUP_KEY_LABELS.contains(&label)
 }
 
 /// Finds a canonical compound credential label beginning at an identifier
@@ -7683,11 +7681,7 @@ mod tests {
     fn issue_2654_listed_lookup_labels_accept_identifier_shapes() {
         let hex = "0123456789abcdef".repeat(4);
         let id = "550e8400-e29b-41d4-a716-446655440000";
-        for label in LOOKUP_KEY_LABELS
-            .iter()
-            .copied()
-            .chain(["left_association_key", "record_partition_key"])
-        {
+        for label in LOOKUP_KEY_LABELS {
             for value in [id, hex.as_str(), "runtime/current", "record-slug"] {
                 for content in [
                     format!("{label}={value}"),
@@ -7701,6 +7695,35 @@ mod tests {
         // A credential word in the prefix is its own trigger.
         assert!(check(&format!("secret_partition_key={id}")).is_err());
         assert!(check(&format!("api_key_cache_key={id}")).is_err());
+    }
+
+    #[test]
+    fn issue_2654_qualified_lookup_labels_stay_refused() {
+        // The vocabulary matches whole labels. A prefix rule ("anything ending
+        // in `_` before a listed suffix") re-opens exactly the compounds the
+        // list closes, because stems such as `hmac` or `jwt` are not trigger
+        // words of their own. The cost is that a qualified lookup spelling
+        // (`left_association_key`) is refused too; that is the fail-closed side.
+        let hex = "0123456789abcdef".repeat(4);
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        for label in [
+            "hmac_cache_key",
+            "master_routing_key",
+            "jwt_lookup_key",
+            "ssh_row_key",
+            "webhook_search_key",
+            "license_index_key",
+            "left_association_key",
+            "record_partition_key",
+        ] {
+            for content in [
+                format!("{label}={hex}"),
+                format!(r#"{{"{label}":"{hex}","neighbor":"{id}"}}"#),
+            ] {
+                assert!(check(&content).is_err(), "{content}");
+                assert!(!mask_secrets(&content).contains(hex.as_str()), "{content}");
+            }
+        }
     }
 
     #[test]
