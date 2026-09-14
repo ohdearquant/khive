@@ -270,7 +270,8 @@ Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live reco
 idempotent no-op. A note restore refuses when another live note already holds the same
 namespace/kind/key identity; neither record is changed. An entity that was merged into another
 entity is a merge tombstone, not a plain soft delete: restore refuses it with `merge_tombstone`
-and names the kept id.
+and names the kept id. A tombstone the caller does not own is answered not found, with or
+without a `kind` hint; the hint is compared only after ownership is established.
 
 | Param  | Type   | Required | Notes                                                         |
 | ------ | ------ | -------- | ------------------------------------------------------------- |

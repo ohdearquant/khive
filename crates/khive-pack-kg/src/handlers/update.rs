@@ -500,6 +500,13 @@ impl KgPack {
                     .get_entity_including_deleted(token, id)
                     .await?
                     .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                // Ownership before the kind hint: the by-id read has no
+                // namespace term, so comparing a hint first would disclose a
+                // foreign tombstone's kind. A foreign row gets the same answer
+                // the hint-less path gives it.
+                if existing.namespace != token.namespace().as_str() {
+                    return Err(foreign_restore_target(&p.id));
+                }
                 if let Some(expected) = specific.as_ref() {
                     if existing.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -509,10 +516,7 @@ impl KgPack {
                     }
                 }
                 let Some((entity, restored)) = self.runtime.restore_entity(token, id).await? else {
-                    return Err(RuntimeError::NotFound(format!(
-                        "restore requires a tombstone in the caller's namespace: {}",
-                        p.id
-                    )));
+                    return Err(foreign_restore_target(&p.id));
                 };
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
                 response["restored"] = serde_json::json!(restored);
@@ -524,6 +528,9 @@ impl KgPack {
                     .get_note_including_deleted(token, id)
                     .await?
                     .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                if existing.namespace != token.namespace().as_str() {
+                    return Err(foreign_restore_target(&p.id));
+                }
                 if let Some(expected) = specific.as_ref() {
                     if existing.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -533,10 +540,7 @@ impl KgPack {
                     }
                 }
                 let Some((note, restored)) = self.runtime.restore_note(token, id).await? else {
-                    return Err(RuntimeError::NotFound(format!(
-                        "restore requires a tombstone in the caller's namespace: {}",
-                        p.id
-                    )));
+                    return Err(foreign_restore_target(&p.id));
                 };
                 let mut response = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
                 response["restored"] = serde_json::json!(restored);
@@ -549,10 +553,7 @@ impl KgPack {
                     .await?
                     .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
                 let Some((edge, restored)) = self.runtime.restore_edge(token, id).await? else {
-                    return Err(RuntimeError::NotFound(format!(
-                        "restore requires a tombstone in the caller's namespace: {}",
-                        p.id
-                    )));
+                    return Err(foreign_restore_target(&p.id));
                 };
                 let mut response = to_json(&edge)?;
                 response["kind"] = serde_json::json!("edge");
@@ -568,4 +569,13 @@ impl KgPack {
             )),
         }
     }
+}
+
+/// The one answer a restore gives for an id that is not a tombstone the
+/// caller owns: absent, live elsewhere, or a foreign tombstone all read the
+/// same, so the kind hint cannot be used as an existence or kind oracle.
+fn foreign_restore_target(id: &str) -> RuntimeError {
+    RuntimeError::NotFound(format!(
+        "restore requires a tombstone in the caller's namespace: {id}"
+    ))
 }

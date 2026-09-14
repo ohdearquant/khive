@@ -3439,6 +3439,112 @@ async fn include_deleted_and_restore_are_scoped_to_the_callers_namespace() {
 }
 
 #[tokio::test]
+async fn restore_kind_hint_does_not_disclose_a_foreign_tombstone() {
+    // #2701: the restore preflight reads the row by id alone, so a kind hint
+    // compared before ownership told a foreign caller the tombstone's kind.
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let token_a = rt
+        .authorize(khive_runtime::Namespace::parse("hint-a").unwrap())
+        .expect("authorize first namespace");
+    let token_b = rt
+        .authorize(khive_runtime::Namespace::parse("hint-b").unwrap())
+        .expect("authorize second namespace");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    let pack = crate::KgPack::new(rt.clone());
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(
+            &token_a,
+            "concept",
+            None,
+            "foreign tombstone",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
+    let note = rt
+        .create_note(
+            &token_a,
+            "observation",
+            None,
+            "foreign note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    assert!(rt.delete_note(&token_a, note.id, false).await.unwrap());
+
+    // Every hint shape a foreign caller can send reads the same: NotFound,
+    // never a kind mismatch that names the stored kind.
+    let arms: [(uuid::Uuid, Option<&str>); 6] = [
+        (entity.id, Some("person")),
+        (entity.id, Some("concept")),
+        (entity.id, None),
+        (note.id, Some("decision")),
+        (note.id, Some("observation")),
+        (note.id, None),
+    ];
+    let mut foreign_messages = Vec::new();
+    for (id, hint) in arms {
+        let mut params = json!({"id": id.to_string()});
+        if let Some(hint) = hint {
+            params["kind"] = json!(hint);
+        }
+        let err = pack
+            .handle_restore(&token_b, params, &registry)
+            .await
+            .expect_err("foreign caller must not restore or learn the kind");
+        assert!(
+            matches!(err, khive_runtime::RuntimeError::NotFound(_)),
+            "hint {hint:?} on {id}: expected NotFound, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("kind mismatch") && !message.contains("exists with kind"),
+            "hint {hint:?} on {id} disclosed the kind: {message}"
+        );
+        foreign_messages.push(message.replace(&id.to_string(), "<id>"));
+    }
+    foreign_messages.dedup();
+    assert_eq!(
+        foreign_messages.len(),
+        1,
+        "hinted and hint-less foreign restores must be indistinguishable: {foreign_messages:?}"
+    );
+
+    // Control: the owner still gets the kind mismatch for a wrong hint, and
+    // restores with the right one.
+    let owner_mismatch = pack
+        .handle_restore(
+            &token_a,
+            json!({"id": entity.id.to_string(), "kind": "person"}),
+            &registry,
+        )
+        .await
+        .expect_err("owner with a wrong hint gets the mismatch");
+    assert!(
+        matches!(owner_mismatch, khive_runtime::RuntimeError::InvalidInput(ref m) if m.contains("kind mismatch")),
+        "owner control: {owner_mismatch:?}"
+    );
+    let restored = pack
+        .handle_restore(
+            &token_a,
+            json!({"id": entity.id.to_string(), "kind": "concept"}),
+            &registry,
+        )
+        .await
+        .expect("owner restores with the right hint");
+    assert_eq!(restored["restored"], true);
+}
+
+#[tokio::test]
 async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge() {
     use khive_types::EdgeRelation;
 
