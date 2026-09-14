@@ -12,6 +12,7 @@ const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
 const CURATION: &str = "khive-runtime/src/curation.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
+const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -309,6 +310,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
+        (OPERATIONS, "restore_note"),
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
@@ -333,6 +335,19 @@ fn fixture(kind: &str, properties: &str) -> Connection {
     conn.execute(
         "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at) \
          VALUES (?1,'local',?2,'active','fixture',?3,100,100)",
+        params![ID, kind, properties],
+    )
+    .unwrap();
+    install_authorizer(&conn);
+    conn
+}
+
+fn deleted_fixture(kind: &str, properties: &str) -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    khive_db::migrations::run_migrations(&mut conn).unwrap();
+    conn.execute(
+        "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at,deleted_at) \
+         VALUES (?1,'local',?2,'deleted','fixture',?3,100,100,150)",
         params![ID, kind, properties],
     )
     .unwrap();
@@ -369,6 +384,8 @@ fn note_version_production_writers_never_assign_version() {
                 .replace("{p3}", "3")
                 .replace("{p4}", "4")
                 .replace("{where_clause}", "WHERE namespace='local'")
+        } else if owner == "restore_note" {
+            sql.replace("{key_clause}", "")
         } else {
             sql
         };
@@ -414,6 +431,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         ),
         (CURATION, "merge_note_sql", "memory", "{}"),
         (CREATE, "prepare_note_create", "memory", "{}"),
+        (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
         (MESSAGE, "create_keyed_message_pair", "message", "{}"),
@@ -427,7 +445,11 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         cases.iter().map(|(file, ..)| *file).collect()
     );
     for (file, owner, kind, properties) in cases {
-        let conn = fixture(kind, properties);
+        let conn = if file == OPERATIONS {
+            deleted_fixture(kind, properties)
+        } else {
+            fixture(kind, properties)
+        };
         let sql = &writers[&(file.to_owned(), owner.to_owned())];
         assert_eq!(version(&conn), 1);
         let changed = match file {
@@ -447,6 +469,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
+            OPERATIONS => conn.execute(
+                &sql.replace("{key_clause}", ""),
+                params!["active", 200_i64, ID, "local", "memory"],
+            ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),

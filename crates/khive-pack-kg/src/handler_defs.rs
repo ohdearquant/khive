@@ -448,7 +448,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
                       live rows across caller-visible namespaces; count_scope repeats this scope \
                       in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
@@ -681,7 +681,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over knowledge-graph entities and notes. Corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -900,10 +900,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
+        description: "Immediate live graph neighbors, returned as a bare array of hits rather than the \
                       {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
                       queried node, edge_id, relation, weight, and the neighbor's id, kind and \
-                      name; include_entity_type=true adds entity_type when the neighbor has one.",
+                      name; include_entity_type=true adds entity_type when the neighbor has one. \
+                      This verb does not accept `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -942,12 +943,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Bounded multi-hop BFS traversal returning one path per distinct root. \
+        description: "Bounded multi-hop BFS traversal over live nodes and edges, returning one path per distinct root. \
                       At most 100 roots, depth 10, 1,000 non-root results per root, 100,000 \
                       adjacency rows, and five seconds of storage expansion per request; \
                       over-budget calls fail without partial paths. Entity and note nodes \
                       both include name/kind; note names use the same fallback as \
-                      `neighbors` when no explicit name is stored.",
+                      `neighbors` when no explicit name is stored. This verb does not accept \
+                      `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -1015,12 +1017,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // Assertive: entity-anchored graph context in one call (ADR-089)
     HandlerDef {
         name: "context",
-        description: "Entity-anchored graph context: resolve anchors from `query` and/or \
+        description: "Entity-anchored live graph context: resolve anchors from `query` and/or \
                       `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
                       a budgeted, deterministically-ordered response. `direction` defaults to \
                       \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
                       least one of `query`/`entity_ids` is required. One embedding inference \
-                      when `query` is used; zero for a pure `entity_ids` call.",
+                      when `query` is used; zero for a pure `entity_ids` call. This verb does not \
+                      accept `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -1104,7 +1107,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "GQL or SPARQL pattern query string (read-only). GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+                description: "GQL or SPARQL pattern query string over the live graph (read-only); this verb does not accept `include_deleted`. GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1253,7 +1256,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     // executes a plan; `ask` (a later slice) is the write-planning entrance.
     HandlerDef {
         name: "resolve",
-        description: "Resolve natural-language references to ids. Each ref in \
+        description: "Resolve natural-language references to live ids. This verb does not accept `include_deleted`. Each ref in \
                        `refs` is resolved through, in order: (1) id-string \
                        passthrough (UUID / 8+ hex prefix) via the by-ID path; \
                        Entity ids only: note, edge, and event ids return \

@@ -4227,20 +4227,21 @@ pub(crate) fn merge_properties(
 
 /// Compare note-update values using the semantics exposed by note readers.
 /// `serde_json::Value` already compares objects without depending on insertion
-/// order; the special `tags` array is compared as an ordered-independent
-/// multiset because readers treat it as a set while preserving duplicate
-/// entries as a meaningful representation change.
+/// order; the top-level `properties.tags` array is compared as an
+/// order-independent multiset because readers treat it as a set while
+/// preserving duplicate entries as a meaningful representation change.
 fn note_update_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
-    fn equal(left: &Value, right: &Value, property: Option<&str>) -> bool {
+    fn equal(left: &Value, right: &Value, is_tags_field: bool, is_properties_object: bool) -> bool {
         match (left, right) {
             (Value::Object(a), Value::Object(b)) => {
                 a.len() == b.len()
                     && a.iter().all(|(key, value)| {
-                        b.get(key)
-                            .is_some_and(|other| equal(value, other, Some(key.as_str())))
+                        b.get(key).is_some_and(|other| {
+                            equal(value, other, is_properties_object && key == "tags", false)
+                        })
                     })
             }
-            (Value::Array(a), Value::Array(b)) if property == Some("tags") => {
+            (Value::Array(a), Value::Array(b)) if is_tags_field => {
                 if a.len() != b.len() {
                     return false;
                 }
@@ -4254,7 +4255,7 @@ fn note_update_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool
                 a.len() == b.len()
                     && a.iter()
                         .zip(b)
-                        .all(|(left, right)| equal(left, right, None))
+                        .all(|(left, right)| equal(left, right, false, false))
             }
             _ => left == right,
         }
@@ -4262,7 +4263,7 @@ fn note_update_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool
 
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => equal(left, right, None),
+        (Some(left), Some(right)) => equal(left, right, false, true),
         _ => false,
     }
 }

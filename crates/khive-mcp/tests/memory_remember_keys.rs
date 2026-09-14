@@ -121,11 +121,24 @@ fn assert_conflict(receipt: &Value, key: &str, holder_id: &str) {
     );
     let error = &receipt["error"];
     assert_eq!(error["kind"], "conflict", "{receipt}");
-    assert_eq!(error["details"]["reason"], "key_conflict", "{receipt}");
+    assert_eq!(
+        error["details"]["reason"], "idempotency_key_conflict",
+        "{receipt}"
+    );
     assert_eq!(error["details"]["key"], key, "{receipt}");
     assert_eq!(error["details"]["existing_id"], holder_id, "{receipt}");
-    assert_eq!(error["domain_disposition"], "not_committed", "{receipt}");
+    assert_eq!(error["domain_disposition"], "unknown", "{receipt}");
     assert!(error.get("domain_result").is_none(), "{receipt}");
+}
+
+fn assert_replay(receipt: &Value, holder_id: &str) {
+    assert_eq!(receipt["ok"], true, "replay must succeed: {receipt}");
+    assert_eq!(receipt["result"]["replayed"], true, "{receipt}");
+    assert_eq!(
+        id(&receipt["result"]),
+        holder_id,
+        "replay must return holder"
+    );
 }
 
 async fn memories(
@@ -189,9 +202,8 @@ async fn memory_keys_mcp_replay_preserves_holder_and_single_source_edge() -> any
         json!({"id": id(&first), "namespace": namespace}),
     )
     .await?;
-    assert_conflict(
+    assert_replay(
         &request(&client, "memory.remember", args.clone()).await?,
-        "operation-a",
         id(&first),
     );
     let mut changed = args;
@@ -237,9 +249,8 @@ async fn memory_keys_mcp_empty_key_is_present_and_unkeyed_calls_remain_distinct(
     let namespace = "keys:mcp-empty";
     let empty = remember(Some(""), Some(namespace), None);
     let first = ok(&client, "memory.remember", empty.clone()).await?;
-    assert_conflict(
+    assert_replay(
         &request(&client, "memory.remember", empty).await?,
-        "",
         id(&first),
     );
     let unkeyed = remember(None, Some(namespace), None);
@@ -265,7 +276,7 @@ async fn memory_keys_mcp_namespace_pin_is_exact_and_independent_of_actor_default
         remember(Some(key), Some(ACTOR), None),
     )
     .await?;
-    assert_conflict(&explicit_actor, key, id(&implicit));
+    assert_replay(&explicit_actor, id(&implicit));
     let namespace = "keys:mcp-pin";
     let pinned = ok(
         &client,
@@ -274,14 +285,13 @@ async fn memory_keys_mcp_namespace_pin_is_exact_and_independent_of_actor_default
     )
     .await?;
     assert_ne!(id(&implicit), id(&pinned));
-    assert_conflict(
+    assert_replay(
         &request(
             &client,
             "memory.remember",
             remember(Some(key), Some(namespace), None),
         )
         .await?,
-        key,
         id(&pinned),
     );
     assert_eq!(memories(&client, ACTOR).await?.len(), 1);
@@ -328,9 +338,8 @@ async fn memory_keys_mcp_validation_counts_utf8_bytes_before_note_or_edge_writes
     for key in ["x".repeat(512), "\u{00e9}".repeat(256)] {
         let args = remember(Some(&key), Some(namespace), Some(id(&source)));
         let first = ok(&client, "memory.remember", args.clone()).await?;
-        assert_conflict(
+        assert_replay(
             &request(&client, "memory.remember", args).await?,
-            &key,
             id(&first),
         );
     }
