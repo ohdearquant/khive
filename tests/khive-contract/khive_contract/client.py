@@ -139,6 +139,21 @@ def _resolve_binary(binary: str | Path | None) -> Path:
     )
 
 
+def _load_shared_harness():
+    repo_root = _find_repo_root(Path(__file__).parent)
+    if repo_root is None:
+        raise FileNotFoundError("contract harness repository root not found")
+    path = repo_root / "tests/contract_harness.py"
+    spec = importlib.util.spec_from_file_location("contract_harness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_harness = _load_shared_harness()
+OwnedContractStore = _harness.OwnedContractStore
+
+
 class KhiveMcpSession:
     """Context-manager wrapper around a khive-mcp stdio subprocess.
 
@@ -146,15 +161,16 @@ class KhiveMcpSession:
 
         with KhiveMcpSession(packs=("kg",)) as session:
             result = session.verb("create", {"kind": "entity", "entity_kind": "concept",
-                                              "name": "Test", "namespace": "ns"})
+                                              "name": "Test"})
     """
 
     def __init__(
         self,
         binary: str | Path | None = None,
         *,
-        db: str | Path | None = ":memory:",
+        db: str | Path | None = None,
         config: str | Path | None = None,
+        store: OwnedContractStore | None = None,
         packs: Sequence[str] = ("kg",),
         namespace: str | None = None,
         no_embed: bool = True,
@@ -163,9 +179,14 @@ class KhiveMcpSession:
         timeout: float = 10.0,
         presentation: Literal["agent", "verbose", "human"] = "verbose",
     ) -> None:
-        self._binary = _resolve_binary(binary)
-        self._db = db
-        self._config = config
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._binary = _resolve_binary(binary).resolve()
+        self._db = db if db in (None, ":memory:") else Path(db).resolve()
+        self._config = Path(config).resolve() if config is not None else None
+        self._store = store
+        self._owns_store = store is None
+        self._transport = None
         self._packs = list(packs)
         self._namespace = namespace
         self._no_embed = no_embed
@@ -174,7 +195,7 @@ class KhiveMcpSession:
         self._timeout = timeout
         self._default_presentation = presentation
         self._id_counter = 0
-        self.proc: subprocess.Popen[str] | None = None
+        self.proc: subprocess.Popen | None = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -187,12 +208,14 @@ class KhiveMcpSession:
                 f"kkernel binary not found at {binary}. "
                 "Build with: cd crates && cargo build --release -p kkernel"
             )
-        # The MCP server is the `mcp` subcommand of the unified kkernel binary.
+        if self._store is None:
+            self._store = OwnedContractStore()
         cmd = [str(binary), "mcp"]
-        if self._db is not None:
-            cmd += ["--db", str(self._db)]
-        if self._config is not None:
-            cmd += ["--config", str(self._config)]
+        db = self._db if self._db is not None else (None if self._config else self._store.db)
+        if db is not None:
+            cmd += ["--db", str(db)]
+        config = self._config or self._store.config
+        cmd += ["--config", str(config)]
         if self._no_embed:
             cmd.append("--no-embed")
         cmd += ["--log", self._log]
@@ -200,23 +223,21 @@ class KhiveMcpSession:
             cmd += ["--pack", pack]
         if self._namespace is not None:
             cmd += ["--namespace", self._namespace]
-
-        child_env = dict(os.environ)
-        if self._db is None:
-            child_env.pop("KHIVE_DB", None)
-        child_env.update(self._env or {})
-
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=child_env,
-        )
-        self._do_initialize()
-        return self
+        source_env = dict(os.environ)
+        source_env.update(self._env or {})
+        child_env = self._store.child_env(source_env)
+        child_env["KHIVE_CONFIG"] = str(config)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, env=child_env, cwd=self._store.root,
+            )
+            self._transport = _harness.attach_transport(self.proc, self._timeout)
+            self._do_initialize()
+            return self
+        except BaseException:
+            self.close(force=True)
+            raise
 
     def __exit__(
         self,
@@ -226,17 +247,17 @@ class KhiveMcpSession:
     ) -> None:
         self.close()
 
-    def close(self) -> None:
-        if self.proc is None:
-            return
-        try:
-            if self.proc.stdin and not self.proc.stdin.closed:
-                self.proc.stdin.close()
-            self.proc.wait(timeout=self._timeout)
-        except Exception:
-            self.proc.kill()
-        finally:
+    def close(self, *, force: bool = False) -> None:
+        if self.proc is not None:
+            if self._transport is not None:
+                self._transport.close(force=force)
+            else:
+                _harness.reap_child(self.proc, timeout=self._timeout, force=force)
             self.proc = None
+            self._transport = None
+        if self._owns_store and self._store is not None:
+            self._store.close()
+            self._store = None
 
     # ------------------------------------------------------------------
     # JSON-RPC framing
@@ -251,57 +272,30 @@ class KhiveMcpSession:
         msg: dict[str, Any] = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
         if params is not None:
             msg["params"] = params
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write(json.dumps(msg) + "\n")
-        self.proc.stdin.flush()
+        assert self._transport is not None
+        self._transport.send(msg)
         return rpc_id
 
     def _send_notification(self, method: str, params: Any = None) -> None:
         msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write(json.dumps(msg) + "\n")
-        self.proc.stdin.flush()
+        assert self._transport is not None
+        self._transport.send(msg)
 
     def _read_response(self, expected_id: int) -> dict[str, Any]:
-        assert self.proc and self.proc.stdout
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                stderr_tail = self._read_stderr()
-                raise KhiveRpcError(
-                    "MCP server closed stdout unexpectedly",
-                    rpc_id=expected_id,
-                    stderr_tail=stderr_tail,
-                )
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise KhiveRpcError(
-                    f"Malformed JSON from server: {line!r}",
-                    rpc_id=expected_id,
-                ) from exc
-            # Skip notifications (no "id" field)
-            if "id" not in msg:
-                continue
-            if msg["id"] == expected_id:
-                return msg
-            # Unexpected id — skip (shouldn't happen in single-threaded flow)
+        assert self._transport is not None
+        try:
+            return self._transport.response(expected_id)
+        except (TimeoutError, EOFError, OSError, ValueError) as exc:
+            stderr_tail = self._read_stderr()
+            self.close(force=True)
+            raise KhiveRpcError(str(exc), rpc_id=expected_id, stderr_tail=stderr_tail) from exc
 
     def _read_stderr(self) -> str:
-        if self.proc is None or self.proc.stderr is None:
+        if self._transport is None:
             return ""
-        try:
-            # Non-blocking read of available stderr
-            import select as _select
-
-            ready, _, _ = _select.select([self.proc.stderr], [], [], 0.1)
-            if ready:
-                return self.proc.stderr.read(4096)
-        except Exception:
-            pass
-        return ""
+        return self._transport.stderr.decode(errors="replace").strip()
 
     # ------------------------------------------------------------------
     # MCP handshake
@@ -310,9 +304,7 @@ class KhiveMcpSession:
     def _do_initialize(self) -> None:
         assert self.proc is not None
         if self.proc.poll() is not None:
-            stderr_tail = ""
-            if self.proc.stderr:
-                stderr_tail = self.proc.stderr.read()
+            stderr_tail = self._read_stderr()
             raise KhiveRpcError(
                 "khive-mcp process exited before initialize",
                 stderr_tail=stderr_tail,

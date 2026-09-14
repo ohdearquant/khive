@@ -10,7 +10,7 @@ implementation detail.  A contract test that passes gives evidence that the
 system respects a specific design commitment documented in an ADR.
 
 Concretely, these tests cover:
-  1. Namespace isolation — entities from ns-A are invisible from ns-B.
+  1. Namespace semantics — by-ID reads are blind; list/search filters control visibility.
   2. Short-UUID prefix resolution — 8-hex resolves; <8 or non-hex errors.
   3. GQL property projection — only valid column names compile; invalid ones
      return a compile error listing the valid set.
@@ -45,14 +45,14 @@ The KKERNEL_BINARY env var overrides the default binary path. The server is the
 
 import json
 import os
-import shutil
+from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import traceback
 from typing import Any
 
 from kkernel_binary import resolve_binary_path
+from contract_harness import OwnedContractStore, attach_transport, reap_child
 
 BINARY = resolve_binary_path()
 
@@ -73,25 +73,11 @@ def _send(proc: subprocess.Popen, method: str, params: Any = None) -> None:
     msg: dict = {"jsonrpc": "2.0", "id": _next_id(), "method": method}
     if params is not None:
         msg["params"] = params
-    line = json.dumps(msg) + "\n"
-    proc.stdin.write(line.encode())
-    proc.stdin.flush()
+    proc.contract_transport.send(msg)
 
 
 def _recv(proc: subprocess.Popen) -> dict:
-    line = proc.stdout.readline()
-    if not line:
-        message = "MCP server closed stdout unexpectedly"
-        try:
-            proc.wait(timeout=0.1)
-        except subprocess.TimeoutExpired:
-            pass
-        if proc.poll() is not None and proc.stderr is not None:
-            stderr = proc.stderr.read().decode(errors="replace").strip()
-            if stderr:
-                message = f"{message}\nstderr:\n{stderr}"
-        raise RuntimeError(message)
-    return json.loads(line)
+    return proc.contract_transport.response()
 
 
 def _request_raw(proc: subprocess.Popen, ops_string: str) -> dict:
@@ -221,40 +207,35 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_server(db_path: str, config_path: str) -> subprocess.Popen:
-    """Spawn a fresh `kkernel mcp` process backed by a temp SQLite file."""
-    env = {
-        **os.environ,
-        "KHIVE_CONFIG": config_path,
-        "KHIVE_NO_DAEMON": "1",
-    }
+def _start_server(store: OwnedContractStore, *, timeout: float = 10, env=None) -> subprocess.Popen:
+    """Spawn an enrolled daemonless server backed by one owned SQLite file."""
     proc = subprocess.Popen(
-        [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
+        [str(Path(BINARY).resolve()), "mcp", "--db", str(store.db), "--config", str(store.config),
+         "--pack", "kg", "--no-embed", "--log", "error"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=0, env=store.child_env(env), cwd=store.root,
     )
-    # MCP handshake
-    _send(proc, "initialize", {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "contract-test", "version": "0.1.0"},
-    })
-    init = _recv(proc)
-    assert init["result"]["serverInfo"]["name"] == "khive-mcp", f"bad init: {init}"
-    notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-    proc.stdin.write((json.dumps(notify) + "\n").encode())
-    proc.stdin.flush()
-    return proc
-
-
-def _stop_server(proc: subprocess.Popen) -> None:
     try:
-        proc.stdin.close()
-        proc.wait(timeout=5)
-    except Exception:
-        proc.kill()
+        attach_transport(proc, timeout)
+        _send(proc, "initialize", {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "contract-test", "version": "0.1.0"},
+        })
+        init = _recv(proc)
+        assert init["result"]["serverInfo"]["name"] == "khive-mcp", f"bad init: {init}"
+        proc.contract_transport.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        return proc
+    except BaseException:
+        _stop_server(proc, force=True)
+        raise
+
+
+def _stop_server(proc: subprocess.Popen, *, force: bool = False) -> None:
+    transport = getattr(proc, "contract_transport", None)
+    if transport is None:
+        reap_child(proc, force=force)
+    else:
+        transport.close(force=force)
 
 
 # ---------------------------------------------------------------------------
@@ -264,22 +245,25 @@ def _stop_server(proc: subprocess.Popen) -> None:
 _results: list[tuple[str, bool, str]] = []
 
 
-def _run_test(name: str, fn) -> None:
-    """Execute a test function; record pass/fail.
-
-    The database lives inside a private (0700) temporary directory, not bare
-    in /tmp: the events sidecar database is opened beside the main database,
-    and the server refuses to serve events from a directory other local
-    users can write (a bare /tmp parent fails that trust walk).
-    """
-    work_dir = tempfile.mkdtemp(prefix="khive-contract-")
-    db_path = os.path.join(work_dir, "contract.db")
-    config_path = os.path.join(work_dir, "contract.toml")
-    with open(config_path, "w", encoding="utf-8"):
-        pass
-    proc = _start_server(db_path, config_path)
+def _run_test(name: str, fn, *, ambient_home: bool = False) -> None:
+    """Record setup and assertion failures, reaping children before deleting their store."""
     try:
-        fn(proc)
+        with OwnedContractStore() as store:
+            if ambient_home:
+                config_dir = store.home / ".khive"
+                config_dir.mkdir()
+                (config_dir / "config.toml").write_text(
+                    "[[backends]]\nname = \"main\"\nkind = \"sqlite\"\n"
+                    f"path = {json.dumps(str(store.root / 'ambient-main.db'))}\n\n"
+                    "[[backends]]\nname = \"sessions\"\nkind = \"sqlite\"\n"
+                    f"path = {json.dumps(str(store.root / 'ambient-sessions.db'))}\n",
+                    encoding="utf-8",
+                )
+            proc = _start_server(store)
+            try:
+                fn(proc)
+            finally:
+                _stop_server(proc)
         _results.append((name, True, ""))
         print(f"  [pass] {name}")
     except Exception as exc:
@@ -287,9 +271,6 @@ def _run_test(name: str, fn) -> None:
         _results.append((name, False, detail))
         print(f"  [FAIL] {name}")
         print(f"         {exc}")
-    finally:
-        _stop_server(proc)
-        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +284,7 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     UUID and apply NO ``namespace ==`` check, so a by-ID read returns the record
     regardless of the caller's namespace token.  The token's namespace is for write
     attribution plus multi-record list/search filtering only; cross-namespace read
-    authorization is the gate's job (allow-all in OSS), never an inline by-ID storage
+    authorization is the configured enrollment gate's job, never an inline by-ID storage
     check.  This test is the regression guard: re-introducing by-ID namespace
     filtering flips the cross-namespace get assertions below back to failures.
     """
@@ -313,10 +294,17 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
         "kind": "entity",
         "entity_kind": "concept",
         "name": "AlphaEntity",
-        "description": "Written in ns-alpha",
+        "description": "contractnamespaceprobe written in ns-alpha",
         "namespace": "ns-alpha",
     })
     full_id = entity["id"]
+    beta = _tool(proc, "create", {
+        "kind": "concept", "name": "BetaEntity",
+        "description": "contractnamespaceprobe written in ns-beta", "namespace": "ns-beta",
+    })
+    beta_id = beta["id"]
+    assert _tool(proc, "get", {"id": full_id})["namespace"] == "ns-alpha"
+    assert _tool(proc, "get", {"id": beta_id})["namespace"] == "ns-beta"
 
     # get from ns-alpha (the write namespace) MUST succeed
     fetched_alpha = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
@@ -344,6 +332,18 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     assert full_id not in ids_beta, (
         f"AlphaEntity must NOT be visible in ns-beta list (ADR-007 list filtering): {ids_beta}"
     )
+
+    assert beta_id in ids_beta, "beta list must contain its own positive fixture"
+    for namespace, present, absent in [("ns-alpha", full_id, beta_id), ("ns-beta", beta_id, full_id)]:
+        for verb, args in [("list", {"kind": "entity"}), ("search", {"kind": "entity", "query": "contractnamespaceprobe"})]:
+            rows = _tool(proc, verb, {**args, "namespace": namespace})
+            ids = {row["id"] for row in rows}
+            assert present in ids and absent not in ids, (verb, namespace, rows)
+    for verb, args in [("list", {"kind": "entity"}), ("search", {"kind": "entity", "query": "contractnamespaceprobe"})]:
+        assert not {full_id, beta_id} & {row["id"] for row in _tool(proc, verb, args)}
+    assert _tool(proc, "get", {"id": full_id[:8], "namespace": "ns-beta"})["id"] == full_id
+    local = _tool(proc, "create", {"kind": "concept", "name": "LocalControl"})
+    assert _tool(proc, "get", {"id": local["id"]})["namespace"] == "local"
 
     # same-namespace link MUST succeed
     alpha_entity2 = _tool(proc, "create", {
@@ -1137,31 +1137,7 @@ def main() -> int:
         ("batch_outcome_status", test_batch_outcome_status),
     ]
 
-    with tempfile.TemporaryDirectory(prefix="khive-contract-home-") as home:
-        config_dir = os.path.join(home, ".khive")
-        os.makedirs(config_dir)
-        config_path = os.path.join(config_dir, "config.toml")
-        with open(config_path, "w", encoding="utf-8") as config:
-            config.write(
-                "[[backends]]\n"
-                'name = "main"\n'
-                'kind = "sqlite"\n'
-                f"path = {json.dumps(os.path.join(home, 'main.db'))}\n\n"
-                "[[backends]]\n"
-                'name = "sessions"\n'
-                'kind = "sqlite"\n'
-                f"path = {json.dumps(os.path.join(home, 'sessions.db'))}\n"
-            )
-
-        previous_home = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
-            _run_test("home_config_isolation", test_home_config_isolation)
-        finally:
-            if previous_home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = previous_home
+    _run_test("home_config_isolation", test_home_config_isolation, ambient_home=True)
 
     for name, fn in tests:
         _run_test(name, fn)
