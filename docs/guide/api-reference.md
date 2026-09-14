@@ -435,6 +435,12 @@ also replaces the list. When a request supplies both `tags` and `properties.tags
 `tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
 as usual.
 
+An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
+comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
+names `expected_version` is always a write when it is accepted, identical patch included: the
+version advances by exactly one and `unchanged` is never set, because the version a fenced write
+mints is the only thing a rival writer can fail against.
+
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")
 ```

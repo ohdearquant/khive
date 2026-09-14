@@ -692,7 +692,13 @@ impl KhiveRuntime {
             .prepare_update_note_from_snapshot(token, snapshot, patch)
             .await?;
         validate_head(&note)?;
-        if !changed && options.embed.is_none() {
+        // ADR-172 Amendment 5: the no-op answer is for unfenced updates only.
+        // A write that names `expected_version` is asking for exactly one
+        // accepted write at that version, and the version it mints is the only
+        // thing a rival can fail against, so an identical fenced patch is still
+        // a write. This branch serves `update` and the `stream.batch` write
+        // member alike, and a batch write member is always fenced.
+        if !changed && options.embed.is_none() && options.expected_version.is_none() {
             let mut assertion = SqlStatement {
                 sql: "SELECT 1 FROM notes WHERE id=?1 AND updated_at=?2 AND deleted_at IS ?3"
                     .into(),
@@ -731,6 +737,21 @@ impl KhiveRuntime {
                 note_embedding_inheritance: None,
             };
             return Ok((note, plan));
+        }
+        if !changed {
+            // A fenced write of an identical patch rewrites the row as it is,
+            // and the replace statement admits only a strictly newer
+            // `updated_at`, so advance the revision here the way a changed
+            // patch does (see `prepare_update_note_from_snapshot`).
+            let minimum_updated_at = note.updated_at.checked_add(1).ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "note {} updated_at is already at i64::MAX and cannot advance",
+                    note.id
+                ))
+            })?;
+            note.updated_at = chrono::Utc::now()
+                .timestamp_micros()
+                .max(minimum_updated_at);
         }
         let next_version = note
             .version
