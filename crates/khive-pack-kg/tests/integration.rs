@@ -152,6 +152,116 @@ async fn dispatch_unknown_verb_returns_error() {
 
 // ---- Kind validation via create: entities ----
 
+/// ADR-172 Amendment 5, acceptance arm 2: an identical patch with
+/// `expected_version` is a write that advances the version and never reports
+/// `unchanged`, and the version it mints is what a stale writer fails against.
+#[tokio::test]
+async fn identical_update_is_a_write_when_fenced_and_a_disclosed_noop_when_not() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "lease heartbeat", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["version"], json!(1));
+
+    let fenced = fixture
+        .dispatch(
+            "update",
+            json!({ "id": id, "content": "lease heartbeat", "expected_version": 1 }),
+        )
+        .await
+        .expect("identical fenced update is accepted");
+    assert_eq!(fenced["version"], json!(2), "{fenced}");
+    assert!(
+        fenced.get("unchanged").is_none(),
+        "a fenced write is never reported unchanged: {fenced}"
+    );
+
+    let stale = fixture
+        .dispatch(
+            "update",
+            json!({ "id": id, "content": "lease heartbeat", "expected_version": 1 }),
+        )
+        .await
+        .expect_err("the version the fenced write minted is what a stale writer fails against");
+    assert!(
+        format!("{stale:?}").contains("version_conflict"),
+        "{stale:?}"
+    );
+}
+
+/// ADR-172 Amendment 5, acceptance arm 3: the same identical patch without a
+/// fence is the disclosed no-op, and stays one when the fenced rule changes.
+#[tokio::test]
+async fn identical_unfenced_update_is_a_disclosed_noop() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "lease heartbeat", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    let unfenced = fixture
+        .dispatch("update", json!({ "id": id, "content": "lease heartbeat" }))
+        .await
+        .expect("identical unfenced update is accepted");
+    assert_eq!(unfenced["unchanged"], json!(true), "{unfenced}");
+    assert_eq!(unfenced["version"], json!(1), "{unfenced}");
+    assert_eq!(unfenced["updated_at"], created["updated_at"], "{unfenced}");
+}
+
+/// ADR-172 Amendment 5, acceptance arm 4: two writers racing the same
+/// unchanged document at the same expected version: exactly one wins, and the
+/// loser is told the version the winner minted.
+#[tokio::test]
+async fn rivals_writing_an_unchanged_document_at_one_version_get_one_winner() {
+    let fixture = pack();
+    let created = fixture
+        .dispatch(
+            "create",
+            json!({ "kind": "observation", "content": "claim", "salience": 0.4 }),
+        )
+        .await
+        .expect("create");
+    let id = created["id"].as_str().expect("id").to_string();
+    let patch = json!({ "id": id, "content": "claim", "expected_version": 1 });
+    let (left, right) = tokio::join!(
+        fixture.dispatch("update", patch.clone()),
+        fixture.dispatch("update", patch.clone())
+    );
+    let outcomes = [left, right];
+    let winners = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert_eq!(winners, 1, "exactly one rival wins: {outcomes:?}");
+    let winner = outcomes.iter().find_map(|o| o.as_ref().ok()).unwrap();
+    assert_eq!(winner["version"], json!(2), "{winner}");
+    let loser = outcomes.iter().find_map(|o| o.as_ref().err()).unwrap();
+    let RuntimeError::Khive(conflict) = loser else {
+        panic!("loser must carry the shared conflict shape: {loser:?}");
+    };
+    let details = conflict.details().expect("conflict details");
+    assert_eq!(
+        details.get("reason"),
+        Some("version_conflict"),
+        "{conflict:?}"
+    );
+    assert_eq!(
+        details.get("current_version"),
+        Some("2"),
+        "loser is told the minted version: {conflict:?}"
+    );
+    let got = fixture
+        .dispatch("get", json!({ "id": id }))
+        .await
+        .expect("get");
+    assert_eq!(got["version"], json!(2), "{got}");
+}
+
 #[tokio::test]
 async fn create_entity_valid_kind_concept_succeeds() {
     let pack = pack();

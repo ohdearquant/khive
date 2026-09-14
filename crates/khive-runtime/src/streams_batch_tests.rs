@@ -316,6 +316,56 @@ async fn stream_batch_write_tags_and_embedding_transitions_use_canonical_plans()
     );
 }
 
+/// ADR-172 Amendment 5, acceptance arm 1: a batch write member at a matching
+/// version is a fenced write and mints a version even when the document is
+/// byte-equal to the stored head, so the caller's next expectation stays live.
+#[tokio::test]
+async fn stream_batch_identical_write_at_matching_version_still_mints_a_version() {
+    let (runtime, token, registry) = fixture();
+    let same = |version: Option<i64>| {
+        let mut spec = write("lease", version);
+        spec.doc = json!({"holder": "worker-1", "n": 1});
+        spec
+    };
+    let first = batch_write(&runtime, &token, &registry, same(None)).await;
+    assert_eq!(first["version"], 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let second = batch_write(&runtime, &token, &registry, same(Some(1))).await;
+    assert_eq!(
+        second["version"], 2,
+        "identical fenced write mints: {second}"
+    );
+    assert_ne!(
+        second["updated_at"], first["updated_at"],
+        "an accepted fenced write moves updated_at"
+    );
+
+    let third = batch_write(&runtime, &token, &registry, same(Some(2))).await;
+    assert_eq!(third["version"], 3, "{third}");
+
+    // The stale expectation a no-op would have left behind is refused.
+    let result = runtime
+        .stream_batch_atomic(
+            &token,
+            vec![StreamBatchMember::Write(same(Some(2)))],
+            None,
+            vec![],
+            &registry,
+        )
+        .await
+        .unwrap();
+    let refusal = result.unwrap_err();
+    let error = serde_json::to_value(refusal.error).unwrap();
+    assert_eq!(error["details"]["reason"], "version_conflict", "{error}");
+    assert_eq!(error["details"]["current_version"], "3", "{error}");
+    let note = runtime
+        .get_note_by_key(&token, "lease", Some("head"), false)
+        .await
+        .unwrap();
+    assert_eq!(note.version, 3);
+}
+
 #[tokio::test]
 async fn stream_batch_write_missing_and_late_key_conflicts_keep_member_index() {
     let (runtime, token, registry) = fixture();
