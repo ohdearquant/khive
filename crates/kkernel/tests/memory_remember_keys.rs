@@ -415,7 +415,7 @@ fn assert_conflict(receipt: &Value, key: &str, existing_id: &str) {
     assert_eq!(receipt["ok"], false, "replay must refuse: {receipt}");
     assert_eq!(receipt["error"]["kind"], "conflict", "{receipt}");
     assert_eq!(
-        receipt["error"]["details"]["reason"], "key_conflict",
+        receipt["error"]["details"]["reason"], "idempotency_key_conflict",
         "{receipt}"
     );
     assert_eq!(receipt["error"]["details"]["key"], key, "{receipt}");
@@ -424,8 +424,18 @@ fn assert_conflict(receipt: &Value, key: &str, existing_id: &str) {
         "{receipt}"
     );
     assert_eq!(
-        receipt["error"]["domain_disposition"], "not_committed",
+        receipt["error"]["domain_disposition"], "unknown",
         "{receipt}"
+    );
+}
+
+fn assert_replay(receipt: &Value, holder_id: &str) {
+    assert_eq!(receipt["ok"], true, "replay must succeed: {receipt}");
+    assert_eq!(receipt["result"]["replayed"], true, "{receipt}");
+    assert_eq!(
+        id(&receipt["result"]),
+        holder_id,
+        "replay must return holder"
     );
 }
 
@@ -471,7 +481,7 @@ fn memory_keys_cli_replay_decoy_and_unkeyed_control() {
     let retained = fixture.history_count(namespace, "operation-a");
     eprintln!("first replay: retained_keyed_rows={retained}, receipt={replay}");
     assert_eq!(retained, 1, "replay must retain exactly one keyed holder");
-    assert_conflict(&replay, "operation-a", id(&first));
+    assert_replay(&replay, id(&first));
     let mut changed_payload = op.clone();
     changed_payload["args"]["content"] = json!("a replay must not replace the holder's payload");
     assert_conflict(
@@ -488,7 +498,7 @@ fn memory_keys_cli_replay_decoy_and_unkeyed_control() {
         remember(Some("operation-b"), Some(namespace), Some(id(&source))),
     );
     assert_ne!(id(&first), id(&decoy));
-    assert_conflict(&fixture.call(0, ACTOR, op), "operation-a", id(&first));
+    assert_replay(&fixture.call(0, ACTOR, op), id(&first));
     assert_eq!(fixture.memories(namespace).len(), 2);
     let edges = fixture.ok(0, ACTOR, operation("list", json!({"kind": "edge", "namespace": namespace, "target_id": id(&source), "relations": ["annotates"]})));
     assert_eq!(edges["items"].as_array().unwrap().len(), 2);
@@ -520,10 +530,26 @@ fn memory_keys_two_processes_two_daemons_share_one_holder() {
             successes.len(),
             notes.len()
         );
-        assert_eq!(successes.len(), 1, "exactly one create: {results:?}");
+        assert_eq!(
+            successes.len(),
+            2,
+            "both requests must succeed: {results:?}"
+        );
         let winner = id(&successes[0]["result"]);
-        let loser = results.iter().find(|result| result["ok"] == false).unwrap();
-        assert_conflict(loser, "same-operation", winner);
+        assert!(
+            successes
+                .iter()
+                .all(|result| id(&result["result"]) == winner),
+            "concurrent replay must return the same holder: {results:?}"
+        );
+        assert_eq!(
+            successes
+                .iter()
+                .filter(|result| result["result"]["replayed"] == true)
+                .count(),
+            1,
+            "one concurrent request creates and one replays: {results:?}"
+        );
         assert_eq!(
             notes.len(),
             1,
@@ -613,11 +639,7 @@ fn memory_keys_actor_scope_and_explicit_namespace_pin() {
     let other = "test:recovering-writer";
     let op = remember(Some("unpinned-operation"), None, None);
     let first = fixture.ok(0, ACTOR, op.clone());
-    assert_conflict(
-        &fixture.call(0, ACTOR, op.clone()),
-        "unpinned-operation",
-        id(&first),
-    );
+    assert_replay(&fixture.call(0, ACTOR, op.clone()), id(&first));
     let changed_actor = fixture.ok(1, other, op);
     assert_ne!(
         id(&first),
@@ -628,11 +650,7 @@ fn memory_keys_actor_scope_and_explicit_namespace_pin() {
     assert_eq!(fixture.memories(other).len(), 1);
     let pinned = remember(Some("pinned-operation"), Some(ACTOR), None);
     let original = fixture.ok(0, ACTOR, pinned.clone());
-    assert_conflict(
-        &fixture.call(1, other, pinned),
-        "pinned-operation",
-        id(&original),
-    );
+    assert_replay(&fixture.call(1, other, pinned), id(&original));
     assert_eq!(fixture.memories(ACTOR).len(), 2);
     assert_eq!(fixture.memories(other).len(), 1);
     fixture.assert_executed(11);
@@ -669,12 +687,14 @@ fn memory_keys_prune_replay_race_bounds_retained_history() {
             (1..=2).contains(&after),
             "one original plus at most one replay, never a third"
         );
-        if results[0]["ok"] == true {
-            assert_ne!(id(&results[0]["result"]), id(&original));
-            assert_eq!((after, live), (2, 1));
-        } else {
-            assert_conflict(&results[0], key, id(&original));
-            assert_eq!((after, live), (1, 0));
+        assert_eq!(
+            results[0]["ok"], true,
+            "memory replay/create failed: {results:?}"
+        );
+        match (after, live) {
+            (1, 0) => assert_eq!(id(&results[0]["result"]), id(&original)),
+            (2, 1) => assert_ne!(id(&results[0]["result"]), id(&original)),
+            state => panic!("unexpected prune/replay state: {state:?}; {results:?}"),
         }
         outcomes[(after - 1) as usize] += 1;
     }
@@ -692,7 +712,7 @@ fn memory_keys_prune_replay_race_bounds_retained_history() {
 
 #[test]
 #[ignore = "requires KEYS_TEST_PYTHON pointing to an existing interpreter with the Python client dependencies"]
-fn memory_keys_native_python_conflict_matches_cli() {
+fn memory_keys_native_python_replay_matches_cli() {
     let python = std::env::var_os("KEYS_TEST_PYTHON")
         .expect("set KEYS_TEST_PYTHON to an existing interpreter; this fixture installs nothing");
     let mut fixture = Fixture::new(1);
@@ -731,8 +751,9 @@ args = dict(key=key, namespace=namespace, source_id=source_id,
 first = session.remember("keyed memory acceptance record", **args)
 assert first["ok"], first
 replay = session.remember("keyed memory acceptance record", **args)
-assert not replay["ok"], replay
-assert replay["error"]["details"]["existing_id"] == first["result"]["id"], replay
+assert replay["ok"], replay
+assert replay["result"]["replayed"], replay
+assert replay["result"]["id"] == first["result"]["id"], replay
 assert transport.memory_calls == 2, transport.memory_calls
 print(json.dumps(dict(first=first, replay=replay, memory_calls=transport.memory_calls)))
 "#;
@@ -770,7 +791,7 @@ print(json.dumps(dict(first=first, replay=replay, memory_calls=transport.memory_
         "reconciliation must stop at the holder, without a third memory call"
     );
     let holder = id(&python_result["first"]["result"]);
-    assert_conflict(&python_result["replay"], key, holder);
+    assert_replay(&python_result["replay"], holder);
     eprintln!("native Python recovery stopped after two memory calls: {python_result}");
     // This independent CLI invocation checks surface parity, not recovery retry policy.
     let cli = fixture.call(
@@ -778,10 +799,10 @@ print(json.dumps(dict(first=first, replay=replay, memory_calls=transport.memory_
         ACTOR,
         remember(Some(key), Some(namespace), Some(id(&source))),
     );
-    assert_conflict(&cli, key, holder);
+    assert_replay(&cli, holder);
     assert_eq!(
-        python_result["replay"]["error"], cli["error"],
-        "Python must retain the entire CLI conflict object"
+        python_result["replay"]["result"], cli["result"],
+        "Python must retain the entire CLI replay object"
     );
     assert_eq!(fixture.memories(namespace).len(), 1);
     fixture.assert_executed(4);

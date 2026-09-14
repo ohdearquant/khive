@@ -19,16 +19,30 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::note_write::NoteWriteOptions;
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_types::{Details, KhiveError};
 
 use crate::schema::{
     allowed_transitions, can_transition, is_terminal, is_valid_priority, is_valid_status,
     normalize_status, TASK_LIFECYCLE_HELP, TASK_STATUSES,
 };
 use crate::GtdPack;
+
+fn idempotency_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
+    KhiveError::conflict(format!(
+        "idempotency_key_conflict: key {key:?} already exists; stored content differs (existing task {existing_id})"
+    ))
+    .with_details(Details::new_owned([
+        ("reason", "idempotency_key_conflict".into()),
+        ("key", key.to_owned()),
+        ("existing_id", existing_id.to_string()),
+    ]))
+    .into()
+}
 
 // ── lifecycle audit schema ────────────────────────────────────────────────────
 
@@ -180,6 +194,9 @@ pub async fn write_audit_record_with_status(
 #[serde(deny_unknown_fields)]
 struct AssignParams {
     title: String,
+    /// Optional namespace-scoped replay key for this task create.
+    #[serde(default)]
+    idempotency_key: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -1277,18 +1294,79 @@ impl GtdPack {
         let prepared =
             crate::task_create::prepare_task_create(self.runtime(), token, input).await?;
 
-        let note = self
-            .runtime()
-            .create_note(
-                token,
-                "task",
-                Some(prepared.title.as_str()),
-                &prepared.content,
-                Some(prepared.salience),
-                Some(prepared.properties.clone()),
-                prepared.annotates.clone(),
+        let (note, replayed) = if let Some(key) = p.idempotency_key.as_deref() {
+            khive_runtime::keyed_memory::validate_memory_key(key)?;
+            let existing = self
+                .runtime()
+                .notes(token)?
+                .get_live_notes_by_key(token.namespace().as_str(), key, Some("task"))
+                .await?
+                .into_iter()
+                .next();
+            if let Some(existing) = existing {
+                if existing.content == prepared.content {
+                    (existing, true)
+                } else {
+                    return Err(idempotency_conflict(key, existing.id));
+                }
+            } else {
+                match self
+                    .runtime()
+                    .create_note_with_options(
+                        token,
+                        "task",
+                        Some(prepared.title.as_str()),
+                        &prepared.content,
+                        None,
+                        Some(prepared.salience),
+                        None,
+                        Some(prepared.properties.clone()),
+                        prepared.annotates.clone(),
+                        None,
+                        NoteWriteOptions {
+                            key: Some(key.to_owned()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok((note, _)) => (note, false),
+                    Err(error) => {
+                        let raced = self
+                            .runtime()
+                            .notes(token)?
+                            .get_live_notes_by_key(token.namespace().as_str(), key, Some("task"))
+                            .await?
+                            .into_iter()
+                            .next();
+                        match raced {
+                            Some(existing) if existing.content == prepared.content => {
+                                (existing, true)
+                            }
+                            Some(existing) => {
+                                return Err(idempotency_conflict(key, existing.id));
+                            }
+                            None => return Err(error),
+                        }
+                    }
+                }
+            }
+        } else {
+            (
+                self.runtime()
+                    .create_note(
+                        token,
+                        "task",
+                        Some(prepared.title.as_str()),
+                        &prepared.content,
+                        Some(prepared.salience),
+                        Some(prepared.properties.clone()),
+                        prepared.annotates.clone(),
+                    )
+                    .await?,
+                false,
             )
-            .await?;
+        };
 
         // Record `depends_on` as graph edges (the GTD pack's `EDGE_RULES` extends
         // the entity-default contract to allow task→task). Endpoints were
@@ -1297,16 +1375,22 @@ impl GtdPack {
         // mislead the caller with `ok: false` for a task that's already on disk.
         // The property captures the same dependency information for queries that
         // bypass the graph.
-        crate::task_create::link_depends_on_edges(
-            self.runtime(),
-            token,
-            note.id,
-            &prepared.properties,
-            "assign",
-        )
-        .await;
+        if !replayed {
+            crate::task_create::link_depends_on_edges(
+                self.runtime(),
+                token,
+                note.id,
+                &prepared.properties,
+                "assign",
+            )
+            .await;
+        }
 
-        Ok(render_task(&note))
+        let mut response = render_task(&note);
+        if replayed {
+            response["replayed"] = json!(true);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn handle_next(
@@ -1661,51 +1745,9 @@ impl GtdPack {
                 current,
                 target,
             } => {
-                // Idempotent by status (current == target) — but a caller-supplied
-                // `note` was being silently discarded here. `transitioned`
-                // stays an accurate statement about status; persisting the note is a
-                // separate effect.
-                let mut note_recorded = None;
-                let mut audit_persisted = None;
-                if let Some(n) = p.note.as_deref() {
-                    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-                    let obj = props.as_object_mut().ok_or_else(|| {
-                        RuntimeError::InvalidInput(
-                            "task properties must be a JSON object".to_string(),
-                        )
-                    })?;
-                    obj.insert("transition_note".into(), json!(n));
-                    let updated_at = next_lifecycle_updated_at(note.updated_at)?;
-                    // Same conditional UPDATE `atomic_gtd_transition` uses elsewhere —
-                    // here expected == target, so it only wins if the status is still
-                    // what `prepare_transition` just observed (loses the race to a
-                    // concurrent real transition without clobbering it).
-                    let rows_affected = atomic_gtd_transition(
-                        self.runtime(),
-                        &note,
-                        &current,
-                        &target,
-                        &props,
-                        updated_at,
-                    )
-                    .await?;
-                    if rows_affected > 0 {
-                        ensure_audit_schema(self.runtime()).await;
-                        audit_persisted = Some(
-                            write_audit_record_with_status(
-                                self.runtime(),
-                                note.id,
-                                &current,
-                                &target,
-                                Some(n),
-                                token.namespace().as_str(),
-                            )
-                            .await,
-                        );
-                    }
-                    note_recorded = Some(rows_affected > 0);
-                }
-
+                // Same-status is a read assertion, not a lifecycle event. A
+                // caller note describes a transition that did not happen, so
+                // neither the note nor an audit row is persisted.
                 let mut response = json!({
                     "transitioned": false,
                     "id": short_id(note.id),
@@ -1714,11 +1756,8 @@ impl GtdPack {
                     "to": target,
                     "note": "already in target status",
                 });
-                if let Some(recorded) = note_recorded {
-                    response["note_recorded"] = json!(recorded);
-                }
-                if let Some(persisted) = audit_persisted {
-                    response["audit_persisted"] = json!(persisted);
+                if p.note.is_some() {
+                    response["note_recorded"] = json!(false);
                 }
                 return Ok(response);
             }

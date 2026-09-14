@@ -19,6 +19,40 @@ async fn assign_creates_a_task_with_defaults() {
 }
 
 #[tokio::test]
+async fn assign_idempotency_key_replays_and_rejects_different_content() {
+    let pack = pack(rt());
+    let args = json!({"title": "idempotent task", "idempotency_key": "assign-replay"});
+    let first = pack
+        .dispatch("gtd.assign", args.clone())
+        .await
+        .expect("first assign");
+    let second = pack
+        .dispatch("gtd.assign", args)
+        .await
+        .expect("identical replay");
+    assert_eq!(second["full_id"], first["full_id"]);
+    assert_eq!(second["replayed"], true);
+
+    let conflict = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "different task", "idempotency_key": "assign-replay"}),
+        )
+        .await
+        .expect_err("different content under one key must refuse");
+    let message = conflict.to_string();
+    assert!(message.contains("idempotency_key_conflict"));
+    assert!(message.contains("assign-replay"));
+
+    let tasks = pack
+        .dispatch("gtd.tasks", json!({"status": "inbox"}))
+        .await
+        .expect("read tasks after refused replay");
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1));
+    assert_eq!(tasks[0]["full_id"], first["full_id"]);
+}
+
+#[tokio::test]
 async fn assign_rejects_empty_title() {
     let pack = pack(rt());
     let err = pack

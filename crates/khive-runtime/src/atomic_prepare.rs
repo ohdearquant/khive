@@ -1003,6 +1003,7 @@ pub async fn prepare_update_entity_plan(
         statements,
         post_commit,
         edge_natural_key: None,
+        idempotent_noop: false,
     }))
 }
 
@@ -1211,6 +1212,7 @@ async fn prepare_update_edge(
         statements,
         post_commit: PostCommitEffect::None,
         edge_natural_key,
+        idempotent_noop: false,
     }))
 }
 

@@ -65,7 +65,8 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// Pack-auxiliary schema for GTD lifecycle audit.
 ///
 /// `gtd_lifecycle_audit` receives best-effort rows for successful real
-/// `transition`/`complete` changes and canonical same-status note events. The
+/// `transition`/`complete` changes. Same-status assertions are not lifecycle
+/// events and therefore do not create audit rows. The
 /// table is idempotent (`CREATE TABLE IF NOT EXISTS`) and is NOT part of the
 /// core versioned migration chain.
 ///
@@ -105,6 +106,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "string",
                 required: true,
                 description: "Task title.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Optional key scoped to the caller's namespace. An identical replay returns the original task with `replayed=true`; different content under the same key is refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

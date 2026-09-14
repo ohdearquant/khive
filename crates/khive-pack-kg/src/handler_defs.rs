@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (25 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 25] = [
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -220,9 +220,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return soft-deleted entities (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
-                     to soft-deleted entities when no live record matches.",
+                     to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -230,7 +230,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering. Offset-mode results always use \
+        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool}; clients advance offset by items.length, while M \
                       discloses the server cap and is not a guaranteed row count. \
@@ -448,7 +448,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
                       live rows across caller-visible namespaces; count_scope repeats this scope \
                       in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
@@ -587,6 +587,29 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
         ],
     },
+    // Declaration: declares a caller-owned tombstone live again
+    HandlerDef {
+        name: "restore",
+        description: "Restore a caller-owned soft-deleted entity, note, or edge; live records are returned unchanged and key conflicts refuse without modifying either record.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "Complete UUID or globally unique 8+ hex prefix of the tombstone to restore. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
@@ -658,7 +681,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over knowledge-graph entities and notes. Corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -877,10 +900,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
+        description: "Immediate live graph neighbors, returned as a bare array of hits rather than the \
                       {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
                       queried node, edge_id, relation, weight, and the neighbor's id, kind and \
-                      name; include_entity_type=true adds entity_type when the neighbor has one.",
+                      name; include_entity_type=true adds entity_type when the neighbor has one. \
+                      This verb does not accept `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -919,12 +943,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Bounded multi-hop BFS traversal returning one path per distinct root. \
+        description: "Bounded multi-hop BFS traversal over live nodes and edges, returning one path per distinct root. \
                       At most 100 roots, depth 10, 1,000 non-root results per root, 100,000 \
                       adjacency rows, and five seconds of storage expansion per request; \
                       over-budget calls fail without partial paths. Entity and note nodes \
                       both include name/kind; note names use the same fallback as \
-                      `neighbors` when no explicit name is stored.",
+                      `neighbors` when no explicit name is stored. This verb does not accept \
+                      `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -992,12 +1017,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: entity-anchored graph context in one call (ADR-089)
     HandlerDef {
         name: "context",
-        description: "Entity-anchored graph context: resolve anchors from `query` and/or \
+        description: "Entity-anchored live graph context: resolve anchors from `query` and/or \
                       `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
                       a budgeted, deterministically-ordered response. `direction` defaults to \
                       \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
                       least one of `query`/`entity_ids` is required. One embedding inference \
-                      when `query` is used; zero for a pure `entity_ids` call.",
+                      when `query` is used; zero for a pure `entity_ids` call. This verb does not \
+                      accept `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -1081,7 +1107,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "GQL or SPARQL pattern query string (read-only). GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+                description: "GQL or SPARQL pattern query string over the live graph (read-only); this verb does not accept `include_deleted`. GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1230,7 +1256,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // executes a plan; `ask` (a later slice) is the write-planning entrance.
     HandlerDef {
         name: "resolve",
-        description: "Resolve natural-language references to ids. Each ref in \
+        description: "Resolve natural-language references to live ids. This verb does not accept `include_deleted`. Each ref in \
                        `refs` is resolved through, in order: (1) id-string \
                        passthrough (UUID / 8+ hex prefix) via the by-ID path; \
                        Entity ids only: note, edge, and event ids return \

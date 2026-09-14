@@ -164,6 +164,13 @@ pub struct DeleteParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RestoreParams {
+    pub(crate) id: String,
+    pub(crate) kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeParams {
     #[serde(alias = "winner_id", alias = "target_id")]
     pub(crate) into_id: String,

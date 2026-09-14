@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 24    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 25    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -211,7 +211,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 24 verbs
+## `kg` pack — 25 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -249,10 +249,10 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                           |
-| `include_deleted` | bool | no       | Return soft-deleted records too (default false); requires a full UUID. |
+| Param             | Type | Required | Notes                                                                                                                  |
+| ----------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                           |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -264,9 +264,20 @@ notes annotate the edge), and each full note object includes `annotation_edge_id
 `annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
 annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
 
+### `restore` — Declaration
+
+Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live record is an
+idempotent no-op. A note restore refuses when another live note already holds the same
+namespace/kind/key identity; neither record is changed.
+
+| Param  | Type   | Required | Notes                                                         |
+| ------ | ------ | -------- | ------------------------------------------------------------- |
+| `id`   | uuid   | yes      | Full UUID or unique short hex prefix of the tombstone.        |
+| `kind` | string | no       | `entity`\|`note`\|`edge`, or a registered granular kind hint. |
+
 ### `list` — Assertive
 
-List records with optional filtering.
+List live records with optional filtering. `list` does not accept `include_deleted` and always excludes soft-deleted rows.
 
 For entity `entity_type` filtering, the non-null column takes precedence. Only
 when it is null does `list` compare a string-valued `properties.type`, before

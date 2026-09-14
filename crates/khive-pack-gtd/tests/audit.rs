@@ -228,8 +228,8 @@ async fn lifecycle_success_reports_audit_degradation_when_insert_fails() {
         .await
         .expect("canonical note-bearing no-op remains successful");
     assert_eq!(noop["transitioned"], false);
-    assert_eq!(noop["note_recorded"], true);
-    assert_eq!(noop["audit_persisted"], false);
+    assert_eq!(noop["note_recorded"], false);
+    assert!(noop.get("audit_persisted").is_none());
 
     let mut reader = rt.sql().reader().await.expect("sql reader");
     let rows = reader
@@ -512,7 +512,7 @@ async fn cc1_complete_cancelled_writes_audit_record() {
 }
 
 #[tokio::test]
-async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
+async fn noop_transition_with_note_is_audit_free() {
     let rt = rt();
     let fixture = pack(rt.clone());
 
@@ -528,8 +528,8 @@ async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
         .await
         .expect("real transition should succeed");
 
-    // issue #15: a noop transition (current == target) with a caller-supplied
-    // `note` must persist the note instead of silently discarding it.
+    // A same-status request is not a lifecycle event. A caller-supplied note
+    // must not claim that a transition happened.
     let r = fixture
         .dispatch(
             "gtd.transition",
@@ -543,10 +543,10 @@ async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
     );
     assert_eq!(r["note"], "already in target status");
     assert_eq!(
-        r["note_recorded"], true,
-        "note_recorded must be true when a note is persisted"
+        r["note_recorded"], false,
+        "a caller note on a same-status request is reported as not recorded"
     );
-    assert_eq!(r["audit_persisted"], true);
+    assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -563,19 +563,7 @@ async fn noop_transition_with_note_writes_audit_record_and_persists_note() {
 
     assert_eq!(
         rows.len(),
-        1,
-        "issue #15: a same-status transition carrying a note must write one \
-         same-status audit row; got {rows:?}"
-    );
-    assert_eq!(
-        rows[0].get("note").and_then(|v| {
-            if let SqlValue::Text(s) = v {
-                Some(s.as_str())
-            } else {
-                None
-            }
-        }),
-        Some("still working on it"),
-        "audit note text must match the caller-supplied note"
+        0,
+        "a same-status transition must not write an audit row; got {rows:?}"
     );
 }

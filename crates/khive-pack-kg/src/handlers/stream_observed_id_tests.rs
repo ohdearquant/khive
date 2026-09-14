@@ -126,7 +126,7 @@ async fn observed_id_arm3_same_identity_version_move() {
     let original = lease(&reg, "lease").await;
     reg.dispatch(
         "update",
-        json!({"id":original["id"],"content":"{}","expected_version":1}),
+        json!({"id":original["id"],"content":"{\"moved\":true}","expected_version":1}),
     )
     .await
     .unwrap();
@@ -232,7 +232,7 @@ async fn observed_id_arm7_mixed_list_checks_both_directions() {
         } else if bad == Some(1) {
             reg.dispatch(
                 "update",
-                json!({"id":unpinned["id"],"content":"{}","expected_version":1}),
+                json!({"id":unpinned["id"],"content":"{\"moved\":true}","expected_version":1}),
             )
             .await
             .unwrap();

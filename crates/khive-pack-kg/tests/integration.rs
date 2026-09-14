@@ -91,14 +91,14 @@ fn list_items(response: &Value) -> &[Value] {
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
 // (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
-// db_diagnostics (ADR-091 operator surface).
+// db_diagnostics (ADR-091 operator surface), then restore.
 #[test]
-fn pack_verbs_returns_twenty_four() {
+fn pack_verbs_returns_twenty_five() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        24,
-        "KgPack must expose exactly 24 verbs including ordered streams"
+        25,
+        "KgPack must expose exactly 25 verbs including ordered streams and restore"
     );
 }
 
