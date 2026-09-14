@@ -7,6 +7,39 @@
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
 
+## Proposed amendment: existing atom properties-only updates
+
+**Status: Proposed.** This amendment is pending acceptance and does not supersede
+the accepted contract until that decision.
+
+`knowledge.upsert_atoms` gains a second atom row form:
+`{id: <complete UUID>, properties: <JSON value or null>}`. Both keys are required.
+Every other row key, including `content`, `slug`, and `name`, is rejected rather
+than assigned precedence. Malformed IDs, slugs, and short prefixes are invalid
+input; complete UUID spellings accepted by the UUID parser are canonicalized.
+
+The target must be an existing live ordinary atom. An absent or soft-deleted UUID
+returns `NotFound`; this form never inserts a row. A domain or its mirror atom is
+invalid input and must be changed through the domain's own verbs. UUID lookup is
+namespace-agnostic under ADR-007, with authorization at registry dispatch. The
+record retains its stored namespace.
+
+The supplied properties replace the complete stored value, following the existing
+upsert implementation: keys are not merged, an empty object replaces the value
+with `{}`, and explicit null stores SQL NULL. Existing acceptance of arbitrary
+JSON values is retained. Caller-supplied properties undergo the same secret scan
+and reserved-property rejection as the ordinary row form. Only `properties` and
+`updated_at` change. All other fields, including stored content bytes, remain
+unchanged; stored short or empty content is neither trimmed nor revalidated.
+
+The original `(namespace, slug)` row form remains unchanged and requires content
+meeting the 20-word minimum whenever creating or replacing atom content, even
+when supplied content matches the stored value. Its source/finalization tri-state
+rules remain in force. Batches may mix the two forms, preserve input write order,
+and validate all inputs and resolve targets before writing any row. A refused
+row must not commit a valid prefix. The existing `{created, updated, total}`
+response remains, with successful id rows counted as updated.
+
 ## Amendment (2026-08-30c): indexed exact-name recovery for short queries
 
 A query such as `AI` has no scoreable term, and the trigram FTS tokenizer cannot match
