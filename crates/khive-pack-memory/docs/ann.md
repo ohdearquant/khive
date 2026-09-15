@@ -166,7 +166,14 @@ disclosure — so no exceptional class is silently treated as healthy:
   that. `None` means the full `(candidates, tail)` pair was assembled — no degradation.
 - **`Skipped(reason)`** — the leg sat out the query entirely (disabled, unregistered
   consumer, or an unrecoverable read failure); the caller's prior candidates are unaffected,
-  but the non-empty `reason` must still be disclosed.
+  but the non-empty `reason` must still be disclosed. `reason` is a failure-site label plus,
+  whenever the site was holding the error that caused the skip, that error's own message,
+  bounded to `SKIP_DETAIL_MAX_CHARS` characters and marked when cut. One label covers causes
+  that differ in what the caller should do next — a segment directory rewritten underneath the
+  read self-heals on the next query, a truncated segment does not, and both arrive as
+  "re-resolved segment load failed" — so a site that discards an error must pass it, and a site
+  that genuinely has none keeps emitting the bare label. The rendering is one string: callers
+  may depend on the reason's presence, never on its wording.
 
 ### Merge semantics
 
