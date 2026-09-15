@@ -823,3 +823,14 @@ separate `context` or GTD lanes, or the existing search score/threshold contract
 The reciprocal search qualification above is confined to successful MCP
 operation wrappers; no generic dispatch sidecar framework or new runtime
 resolution algorithm is authorized here.
+
+## Proposed amendment (2026-09-15): diagnostics process identity
+
+**Status: Proposed.** Addresses [#2346](https://github.com/ohdearquant/khive/issues/2346).
+
+Every `db_diagnostics` response carries `build` and `process` identity. `process.pid` is the
+serving OS process ID; `process.started_at` is its OS-reported creation time in whole Unix epoch
+seconds (UTC), or `null` with `process.started_at_unavailable_reason` when unavailable. It is not
+pool creation or first-request time. Checkpoint counters are process-global, while reader and
+writer acquisition/task counters can reset when the main pool is reconstructed within the same
+process.
