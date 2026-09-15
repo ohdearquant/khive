@@ -678,6 +678,88 @@ async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
     }
 }
 
+/// An empty or whitespace `query` stays on the query branch.
+///
+/// ADR-047's 2026-09-15 amendment decides this as behaviour, and `handle_topic`
+/// implements it by matching `Some(ref query)` with no trim and no emptiness
+/// check. Nothing asserted it. The reason that matters is three lines above the
+/// branch, in the same function: the sibling parameter is normalized the other
+/// way round.
+///
+/// ```ignore
+/// let domain_filter = p.domain.as_deref()
+///     .map(|d| d.trim().to_lowercase())
+///     .filter(|d| !d.is_empty());
+/// ```
+///
+/// So inside one handler an empty string means "no filter" for `domain` and
+/// "search for nothing" for `query`. Adding `.filter(|q| !q.trim().is_empty())`
+/// to the query branch reads as tidying that asymmetry away, and it would move an
+/// empty query onto the listing branch, changing which count key the response
+/// carries from `candidate_window_count` to `total`. A caller keyed on the
+/// presence of one of those two fields sees the shape change with no error.
+#[tokio::test]
+async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..17 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["count-domain".into()],
+        )
+        .await
+        .unwrap();
+    }
+
+    // The three spellings the amendment says are one branch, asserted together so
+    // a reader sees them treated alike rather than inferring it from `Some(_)`.
+    // The empty and whitespace cases carry no expected count: what is under test
+    // is WHICH branch answers, and the number a search for nothing returns is not
+    // part of that decision.
+    for query in [QUERY, "", "   "] {
+        let response = f
+            .dispatch("knowledge.topic", json!({"query": query, "limit": 3}))
+            .await
+            .unwrap();
+        assert!(
+            response.get("candidate_window_count").is_some(),
+            "query {query:?} must answer on the query branch: {response}"
+        );
+        assert!(
+            response.get("total").is_none(),
+            "query {query:?} must not report a corpus total: {response}"
+        );
+    }
+
+    // The positive control for the `total` absence above, in the same arm and on
+    // the same fixture. Without it `total.is_none()` would also hold in a build
+    // where nothing emits `total` at all, and the negative assertion would read
+    // as coverage while testing nothing.
+    //
+    // One case, not two: the arm above this one already asserts the omitted-query
+    // and null-query listings against this same corpus, and a second copy here
+    // would be a second place to update rather than a second thing checked.
+    let listing = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"domain": "count-domain", "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing["total"], 17, "{listing}");
+    assert!(listing.get("candidate_window_count").is_none(), "{listing}");
+}
+
 #[tokio::test]
 async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
     let runtime = rt();
