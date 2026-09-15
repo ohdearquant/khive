@@ -3733,9 +3733,9 @@ impl VerbRegistry {
     ///
     /// Errors from individual plans are logged via `tracing::warn!` and not
     /// propagated so that a single pack's schema failure does not prevent the
-    /// rest from loading. Callers that need hard-failure semantics should call
-    /// [`Self::all_schema_plans_with_columns`] and apply each complete plan
-    /// individually.
+    /// rest from loading. Serving hosts must instead use the fallible
+    /// [`Self::apply_schema_plans_with_map`] (with an empty map for one backend)
+    /// so a required schema failure cannot leave a pack's verbs unavailable.
     pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
         if backend.is_read_only() {
             tracing::info!(
@@ -3786,8 +3786,10 @@ impl VerbRegistry {
     /// auxiliary table (ADR-028 §7 collision policy: boot failure naming both
     /// packs and the conflicting table).
     ///
-    /// This is the multi-backend boot path (ADR-028). Single-backend callers
-    /// should continue using [`Self::apply_schema_plans`].
+    /// Both single- and multi-backend hosts use this boot path (ADR-028).
+    /// An empty map selects the default backend for every pack. Read-only
+    /// backends validate declared columns without applying SQL or acquiring a
+    /// writer; missing or incompatible columns refuse boot with the pack name.
     pub fn apply_schema_plans_with_map(
         &self,
         backend_for_pack: &HashMap<&str, &khive_db::StorageBackend>,
@@ -3851,10 +3853,13 @@ impl VerbRegistry {
             }
 
             if backend.is_read_only() {
-                tracing::info!(
-                    pack = pack_name,
-                    "skipping pack schema plan because its assigned backend is read-only"
-                );
+                backend.validate_pack_schema_columns(additions).map_err(|error| {
+                    crate::PackSchemaCollisionError {
+                        pack_a: pack_name,
+                        pack_b: pack_name,
+                        table: format!("read-only schema validation failed: {error}; open the database writable to apply the pack schema upgrade"),
+                    }
+                })?;
                 continue;
             }
 
@@ -14159,7 +14164,7 @@ mod help_tests {
     }
 
     #[test]
-    fn pack_column_upgrades_skip_read_only_backends_without_acquiring_writer() {
+    fn issue2768_pack_column_upgrades_refuse_read_only_old_schema_without_acquiring_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_column_schema.db");
         {
@@ -14173,10 +14178,16 @@ mod help_tests {
         let registry = column_schema_registry();
         let writes_before = backend.pool().writer_acquisition_snapshot();
 
-        registry.apply_schema_plans(&backend);
-        registry
+        let error = registry
             .apply_schema_plans_with_map(&HashMap::new(), &backend)
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("alpha"), "{error}");
+        assert!(error.contains("t_alpha.revision"), "{error}");
+        assert!(
+            error.contains("read-only schema validation failed"),
+            "{error}"
+        );
 
         assert_eq!(backend.pool().writer_acquisition_snapshot(), writes_before);
         assert_eq!(column_schema_count(&backend, "t_alpha", "revision"), 0);
