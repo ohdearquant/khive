@@ -4157,3 +4157,212 @@ async fn scan_refuses_unknown_fields() {
         .expect_err("unknown field must be refused");
     assert!(err.to_string().contains("tags"), "{err}");
 }
+
+const ISSUE_2738_RESERVED_ERROR: &str = concat!(
+    "invalid input: property key `khive:secret_gate` is runtime-owned and cannot be ",
+    "created, replaced, merged, or removed by callers"
+);
+
+#[tokio::test]
+async fn issue_2738_scan_reserved_key_matches_write_error() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    for properties in [
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"topic": "build"})),
+    ] {
+        let mut params = json!({"content": "ordinary observation", "name": "ordinary name"});
+        if let Some(properties) = properties {
+            params["properties"] = properties;
+        }
+        let before = registry.dispatch("stats", json!({})).await.unwrap();
+        let probe = registry.dispatch("scan", params.clone()).await.unwrap();
+        assert_eq!(
+            probe,
+            json!({
+                "would_refuse": false, "detector": null, "trigger": null,
+                "masked": null, "location": null, "message": null,
+                "masked_preview": {"content": "ordinary observation", "name": "ordinary name"},
+            })
+        );
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+        let expected_properties = params["properties"].clone();
+        params["kind"] = json!("observation");
+        let written = registry
+            .dispatch("create", params)
+            .await
+            .expect("clean control writes");
+        assert_eq!(written["properties"], expected_properties);
+        assert_eq!(written["content"], "ordinary observation");
+        let after = registry.dispatch("stats", json!({})).await.unwrap();
+        assert_eq!(
+            after["notes"].as_u64(),
+            before["notes"].as_u64().map(|n| n + 1)
+        );
+    }
+
+    for value in [Value::Null, json!(false), json!({}), json!("caller")] {
+        let params = json!({
+            "content": "ordinary observation", "name": "ordinary name",
+            "properties": {"khive:secret_gate": value},
+        });
+        let before = registry.dispatch("stats", json!({})).await.unwrap();
+        let mut write = params.clone();
+        write["kind"] = json!("observation");
+        let write_failure = registry
+            .dispatch_with_disposition("create", write, None)
+            .await
+            .expect_err("reserved key write refuses");
+        let (write_error, write_disposition) = write_failure.into_parts();
+        assert!(matches!(
+            &write_error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        assert_eq!(write_error.to_string(), ISSUE_2738_RESERVED_ERROR);
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+
+        let scan_failure = registry
+            .dispatch_with_disposition("scan", params, None)
+            .await
+            .expect_err("reserved top-level key must fail scan with the write error");
+        let (scan_error, scan_disposition) = scan_failure.into_parts();
+        assert!(matches!(
+            &scan_error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        assert_eq!(scan_error.to_string(), ISSUE_2738_RESERVED_ERROR);
+        assert_eq!(scan_error.to_string(), write_error.to_string());
+        let write_payload = khive_runtime::runtime_error_value(write_error, write_disposition);
+        let scan_payload = khive_runtime::runtime_error_value(scan_error, scan_disposition);
+        assert_eq!(
+            write_payload,
+            json!({
+                "kind": "runtime_error", "message": ISSUE_2738_RESERVED_ERROR,
+                "domain_disposition": "unknown",
+            })
+        );
+        assert_eq!(scan_payload, write_payload);
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn issue_2738_scan_nested_reserved_spelling_stays_content() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    for properties in [
+        json!({"metadata": {"khive:secret_gate": "ordinary"}}),
+        json!({"metadata": [{"khive:secret_gate": null}]}),
+        json!({"description": "khive:secret_gate"}),
+        json!({"khive:secret_gate_extra": "ordinary", "Khive:secret_gate": false}),
+    ] {
+        let params = json!({
+            "content": "ordinary observation", "name": "ordinary name",
+            "properties": properties,
+        });
+        let before = registry.dispatch("stats", json!({})).await.unwrap();
+        let probe = registry
+            .dispatch("scan", params.clone())
+            .await
+            .expect("nested spelling scans clean");
+        assert_eq!(
+            probe,
+            json!({
+                "would_refuse": false, "detector": null, "trigger": null,
+                "masked": null, "location": null, "message": null,
+                "masked_preview": {"content": "ordinary observation", "name": "ordinary name"},
+            })
+        );
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+        let mut write = params;
+        write["kind"] = json!("observation");
+        let written = registry
+            .dispatch("create", write)
+            .await
+            .expect("nested spelling writes");
+        let stored = registry
+            .dispatch("get", json!({"id": written["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(written["properties"], properties);
+        assert_eq!(stored["properties"], properties);
+        assert_eq!(stored["content"], "ordinary observation");
+        assert_eq!(stored["name"], "ordinary name");
+        let after = registry.dispatch("stats", json!({})).await.unwrap();
+        assert_eq!(
+            after["notes"].as_u64(),
+            before["notes"].as_u64().map(|n| n + 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_2738_scan_reserved_key_precedes_content_detectors() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let secret = format!("sk-proj-{}", "C".repeat(80));
+    let cases = [
+        (
+            "note.content",
+            json!({"content": secret, "name": "ordinary", "properties": {}}),
+        ),
+        (
+            "note.name",
+            json!({"content": "ordinary", "name": secret, "properties": {}}),
+        ),
+        (
+            "note.properties",
+            json!({"content": "ordinary", "name": "ordinary", "properties": {"token": secret}}),
+        ),
+    ];
+    // Establish every detector control before the first assertion that fails on the old scan.
+    for (location, params) in &cases {
+        let before = registry.dispatch("stats", json!({})).await.unwrap();
+        let probe = registry
+            .dispatch("scan", params.clone())
+            .await
+            .expect("detector verdict");
+        assert_eq!(probe["would_refuse"], true);
+        assert_eq!(probe["location"].as_str(), Some(*location));
+        assert!(probe["detector"].is_string());
+        assert!(!probe.to_string().contains(&secret));
+        let mut write = params.clone();
+        write["kind"] = json!("observation");
+        let write_error = registry
+            .dispatch("create", write)
+            .await
+            .expect_err("detector write refuses");
+        assert!(matches!(
+            &write_error,
+            khive_runtime::RuntimeError::SecretDetected(_)
+        ));
+        assert_eq!(probe["message"], json!(write_error.to_string()));
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+    }
+
+    for (_location, mut params) in cases {
+        params["properties"]["khive:secret_gate"] = json!({});
+        let before = registry.dispatch("stats", json!({})).await.unwrap();
+        let mut write = params.clone();
+        write["kind"] = json!("observation");
+        let write_error = registry
+            .dispatch("create", write)
+            .await
+            .expect_err("reservation wins on write");
+        assert!(matches!(
+            &write_error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        assert_eq!(write_error.to_string(), ISSUE_2738_RESERVED_ERROR);
+        let scan_error = registry
+            .dispatch("scan", params)
+            .await
+            .expect_err("reservation must precede content, name and properties detectors");
+        assert!(matches!(
+            &scan_error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        assert_eq!(scan_error.to_string(), write_error.to_string());
+        assert!(!scan_error.to_string().contains(&secret));
+        assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
+    }
+}
