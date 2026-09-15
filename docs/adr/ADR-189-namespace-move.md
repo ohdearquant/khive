@@ -19,17 +19,21 @@ credential paths resolved differently, and now wants them in one place. New writ
 the binding. The records already written are not.
 
 The only instrument available today is a hand-written `UPDATE` sweep from the host. It is the wrong
-one, for reasons that are properties of the schema rather than matters of taste: six of the affected
-tables are fts5 virtual tables that do not accept `UPDATE` at all, the vector tables are not
-enumerable from any static list, and the ANN bookkeeping has ordering semantics that an `UPDATE`
-silently violates. Each of those is developed below.
+one, for reasons that are properties of the schema rather than matters of taste: two of the affected
+tables are fts5 tables over external content, where an `UPDATE` of the namespace succeeds and
+changes nothing, the vector tables are not enumerable from any static list, and the ANN bookkeeping
+has ordering semantics that an `UPDATE` silently violates. Each of those is developed below.
 
 ### What was measured
 
 At `b17951432`, unless a line says otherwise.
 
 **The namespace-carrying tables.** Parsing every `CREATE TABLE` body under `crates/khive-db/sql` and
-`crates/khive-db/src/migrations.rs` for a namespace column returns 24 of 39 declared tables:
+`crates/khive-db/src/migrations.rs` for a namespace column returns 24 of 39 declarations. A
+declaration count is not a table count: `sql/023-fts-record-kind.sql:45,88` drops `fts_entities` and
+`fts_notes` and renames `fts_entities_v23` and `fts_notes_v23` over them, so those two names exist in
+no migrated store and the list below overstates the population by exactly them. The parse cannot see
+it, which is the argument for the census rather than an aside about it.
 
 ```
 notes entities graph_edges events knowledge_atoms knowledge_domains knowledge_sections
@@ -167,7 +171,7 @@ the refusal exact: the message names `note:observation` rather than `observation
 
 Only subject classes are routed. Everything else is carried:
 
-- the six fts5 tables and the two rowid maps, with their parent note or entity,
+- the four fts5 tables and the two rowid maps, with their parent note or entity,
 - `knowledge_sections` with its atom,
 - `proposals_open` with the namespace it belongs to,
 - every `vec_*` row, with its subject,
@@ -177,6 +181,18 @@ Only subject classes are routed. Everything else is carried:
 
 None of these appears in the route map. A caller cannot route them independently, because they have
 no independent existence.
+
+The four fts5 tables do not take one mechanism, and the split is measured rather than assumed.
+`fts_notes` and `fts_entities` are ordinary fts5 tables: an `UPDATE` of their `namespace` column is
+accepted, preserves the rowid the two maps are keyed on, and leaves the index intact. `fts_knowledge`
+and `fts_sections` are declared `content=` over `knowledge_atoms` and `knowledge_sections`, and there
+an `UPDATE` of the same column returns success and changes nothing, because the value a reader gets
+comes from the content table. That pair is maintained by schema triggers firing on
+`UPDATE OF ... namespace` (`sql/schema.sql`, `sql/026-knowledge-fts-repair.sql`), so writing the base
+row is both sufficient and the only thing that works. The dangerous half is the second: a sweep that
+writes the virtual table directly is not refused, it is answered `rc=0` with nothing done. Measured
+on SQLite 3.54.0; the runtime links its own build through `libsqlite3-sys`, so the arm pinning this
+belongs in the implementation's tests rather than in this document.
 
 ### A collision refuses the whole move
 
@@ -271,9 +287,10 @@ left under the source namespace survives a later delete of its record under the 
 and then keeps answering searches for content the caller deleted. Doing nothing to the vectors is
 the choice that breaks silently.
 
-Since no `UPDATE` against vec0 exists in the tree, the vector row moves by the same delete and
-re-insert the fts5 tables use, carrying the stored embedding. One mechanism covers every virtual
-table.
+Since no `UPDATE` against vec0 exists in the tree, the vector row moves by delete and re-insert,
+carrying the stored embedding. That is a third mechanism, not a shared one: the fts5 tables already
+split two ways above, and stating a single mechanism across every virtual table would be the kind of
+uniformity claim this document is written to avoid.
 
 The affected vector tables are enumerated from `sqlite_master` at move time and column-validated.
 A constant list would be wrong for any store using a model the list was not written against, and
