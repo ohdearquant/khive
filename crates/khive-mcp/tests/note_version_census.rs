@@ -129,6 +129,30 @@ fn assignment_list(sql: &str) -> Option<&str> {
             i += 1;
             continue;
         }
+        // Comments are skipped for the same reason quoted spans are, and they are
+        // the other half of one class: ANY run of text that can contain the
+        // characters ` WHERE ` without being a predicate will end the assignment
+        // list early if it is not skipped, and a shorter list is the direction
+        // that ADMITS. Measured on this scanner: with comments unhandled,
+        // `UPDATE {} SET a = ?1 /* WHERE */, version = ?2 WHERE id = ?3` produced
+        // the list `a = ?1 /*` and was admitted, and the `--` form did the same.
+        if c == b'-' && starts_with_ci(bytes, i, b"--") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && starts_with_ci(bytes, i, b"/*") {
+            i += 2;
+            while i < bytes.len() && !starts_with_ci(bytes, i, b"*/") {
+                i += 1;
+            }
+            // An unterminated comment runs to the end of the literal, which
+            // leaves `start` set and no top-level WHERE found, so the list
+            // becomes everything after SET. That is the refusing direction.
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
         match c {
             b'\'' => closes = Some(b'\''),
             b'"' => closes = Some(b'"'),
@@ -764,6 +788,47 @@ fn a_where_inside_a_quoted_identifier_does_not_end_the_assignment_list() {
             "a quoted identifier is not itself a reason to refuse: {benign}"
         );
     }
+}
+
+/// A comment cannot be used to hide the rest of the assignment list either.
+///
+/// Same class as the quoted identifier above and the same unsafe direction: a
+/// comment holding the text ` WHERE ` ends the list early, so everything assigned
+/// after the comment is never inspected. Both comment forms get an arm because
+/// they terminate differently, and an unterminated block comment gets one because
+/// its fallback has to be the refusing direction rather than a panic or a
+/// truncated read.
+#[test]
+fn a_where_inside_a_comment_does_not_end_the_assignment_list() {
+    for hidden in [
+        "UPDATE {} SET a = ?1 /* WHERE */, version = ?2 WHERE id = ?3",
+        "UPDATE {} SET a = ?1, -- WHERE \n version = ?2 WHERE id = ?3",
+        "UPDATE {} SET a = ?1 /* WHERE and never closed, version = ?2",
+    ] {
+        assert!(
+            !assignments_rule_out_version(hidden),
+            "a WHERE inside a comment must not end the list: {hidden}"
+        );
+    }
+
+    // The control: a comment that hides nothing is not itself a reason to refuse,
+    // so the arm above cannot be passing merely because comments now refuse.
+    assert!(assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 /* the move itself, nothing hidden */ WHERE id = ?1"
+    ));
+
+    // What that costs, executed rather than described. The comment's own text
+    // sits inside the assignment list, so a comment that merely spells the word
+    // refuses. The first draft of the control above read
+    // `/* the move, not a version write */` and failed right here. It is the same
+    // over-refusal `assignments_rule_out_version` already takes for a column named
+    // `versioned_at`, and it is recorded rather than removed: stripping comment
+    // text before the substring check would hand the word a place to sit where
+    // nothing looks at it, and a comment is not somewhere a caller needs an
+    // admission from.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 /* not a version write */ WHERE id = ?1"
+    ));
 }
 
 /// What would have to be true for the predicate to be wrong, executed rather
