@@ -93,9 +93,23 @@ move.
 
 So the refusal set is not maintained by hand. It is derived at move time from
 `PRAGMA index_list`/`PRAGMA index_xinfo` over the tables the census finds carrying a namespace
-column, which reports primary keys and uniqueness constraints alongside `CREATE INDEX` ones and
-names the namespace column inside an expression index like any other. A constraint added by a
-future migration is in the set on the next run, without an edit here.
+column, which reports primary keys and uniqueness constraints alongside `CREATE INDEX` ones. A
+constraint added by a future migration is in the set on the next run, without an edit here.
+
+That read has one gap, and it is the same shape as the misses above. An EXPRESSION key column is
+reported with a null name, so an index over `lower(namespace)` names nothing at all. Measured:
+`CREATE UNIQUE INDEX i ON t(lower(namespace), id)` gives key rows `-2|NULL` and `0|id`. The comm
+external-id index survives the column read only because its namespace is a literal first column and
+the expression sits on a different one, which makes it the worst possible witness - it passes while
+the class fails.
+
+The closure is exact rather than a caveat. An index carrying any expression key column is
+additionally read from its own `CREATE INDEX` text in `sqlite_master`, matching `namespace` as a
+word. Only an autoindex has a null `sql`, and an autoindex is a table constraint over a column list,
+which cannot carry an expression - so the column read covers exactly what the text read cannot, and
+the reverse. The text read is coarser than a parse and errs toward including a constraint, which
+refuses a move SQLite would have allowed and is visible in the refusal; a miss would corrupt rows
+silently.
 
 **Vectors.** The delete path is keyed on the pair:
 `DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2`, at `stores/vectors.rs:31`, `:506`
@@ -343,10 +357,10 @@ missed: the first skips rows, the second corrupts them.
 - A collision on any reachable constraint refuses the whole move and names the rows. The fixture
   carries at least the `(namespace, kind, key)` and `(namespace, slug)` shapes.
 - The runtime census reproduces the fourteen constraints in the table above on a freshly migrated
-  store, including the three this primitive cannot reach and the expression index. The arm that
-  matters adds a namespace-bearing unique index to the store and asserts the census finds it with no
-  code change, because the failure this guards against is a migration landing while nobody edits
-  this ADR.
+  store, including the three this primitive cannot reach and the expression index. Two arms matter
+  more than the count: one adds a namespace-bearing unique index and asserts the census finds it
+  with no code change, and one adds an index over `lower(namespace)` and asserts the same, with a
+  control proving the column read alone does NOT see it.
 - Full-text search and vector recall return the moved records under the target namespace and nothing
   under the source, and a delete issued after the move removes the vector.
 - Soft-deleted records move with `deleted_at` intact.
