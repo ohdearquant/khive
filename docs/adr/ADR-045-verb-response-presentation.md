@@ -764,7 +764,7 @@ kills. This proposed text records no executed result.
 
 ## Amendment 6 (2026-09-14): exact stream receipt timestamps
 
-**Status: Proposed.**
+**Status: Accepted.**
 **Related issue:** #2537.
 
 This amendment extends §6's declaration-based presentation policy and qualifies
@@ -919,5 +919,5 @@ before execution. A valid tests-only baseline reaches the real handlers and
 passes its legacy controls before failing on lost receipt precision. Fixed
 runs must satisfy both controls and exactness assertions. Compilation failures,
 invalid fixtures, missing cases and zero selected tests are neither a baseline
-proof nor mutation kills. This Proposed amendment records no executed outcome;
-native verification and dependent implementation remain held until signature.
+proof nor mutation kills. Verification outcomes belong to the implementing
+change; this amendment defines the accepted receipt contract.
