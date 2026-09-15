@@ -711,3 +711,38 @@ durable dispatch audit trail nor durable accounting and says so on every
 successful operation. Deployments that require ADR-103/ADR-133 audit durability
 must use a writable audit backend. These constraints preserve ADR-028's physical
 isolation and do not weaken any mutation path.
+
+## Amendment A3: backend route validation and search runtime selection (2026-09-14)
+
+**Status**: Proposed
+**Issues**: #2590, #2591, #2598, #2600
+
+Require `[[backends]]` / `[packs.<name>]` configuration to validate every
+explicit pack route. When no backends are declared, `main` is the sole implicit
+backend and the only accepted explicit route. Backend fields `cache_mb` and
+`journal_mode` remain parsed but rejected until their behavior is implemented.
+
+Backend `served_kinds` declarations constrain substrate search fan-out. An
+omitted declaration conservatively serves every substrate; an explicit one must
+be nonempty. Configured backends must collectively cover `note` and `entity`,
+and the completed coordinator registry checks the same coverage over loaded
+runtimes before serving. A declaration without a loaded runtime cannot provide
+search coverage. Event-only secondaries remain valid when the other backends
+cover both searchable substrates. Coverage errors identify the missing kinds
+and the backend names considered.
+
+The coordinator registers one search runtime per backend. Boot constructs pack
+runtimes from the same base embedding configuration, with `no_embed` clearing
+the default and additional models for that pack. For each backend, registration
+prefers a runtime retaining configured models, then the lexicographically first
+pack name as a stable tie-break. When all packs on a backend disable embeddings,
+the backend remains text-only. This selection changes neither the pack runtime
+used for writes nor its `no_embed` setting.
+
+`main` is registered first when loaded; remaining backend IDs are registered in
+lexicographic order. If no pack uses `main`, the first loaded backend in that
+order is primary. Backend selection is independent of hash-map iteration order.
+This preserves ADR-029's separation: each backend runtime owns its embedding
+search and engine fusion; the coordinator fuses backend result lists.
+
+Implementation acceptance must separately prove that the verbatim documented example validates; implicit-main routes reject unknown backends; explicit declarations and actual coordinator runtimes cover both searchable substrates; and mixed `no_embed` packs retain vector search without changing write opt-out. Existing invalid-field and empty-declaration guards remain. Default/extra-model and all-text-only controls accompany selection. The production coordinator-attached boot path is covered; APIs that construct a server without a coordinator do not gain a new fan-out claim from this amendment. Extra-model-only selection preserves configured models without changing the existing default-model vector-arm policy.
