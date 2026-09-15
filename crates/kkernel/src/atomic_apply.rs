@@ -3023,4 +3023,6 @@ mod tests {
         assert_eq!(result["completed"], true);
         assert_eq!(result["audit_persisted"], false);
     }
+
+    include!("atomic_project_origin_tests.rs");
 }

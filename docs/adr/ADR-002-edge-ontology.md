@@ -27,6 +27,9 @@ self-loops, and repricing" below. Motivated by issue #1667.
 base endpoint contract gains one derivation pair — `Service introduced_by Document` — so a
 service can record the specification, ADR, or paper that introduced it. See "Base endpoint
 contract" below.
+**Amended 2026-09-14**: base endpoint contract gains `Project introduced_by Document`
+for the specification, design record or paper that first described a project.
+See "Project origin documents" below.
 
 ## Context
 
@@ -63,12 +66,12 @@ classification ambiguity.
 
 ### Category 2: Derivation (intellectual lineage)
 
-| Relation        | Direction                                                                           | When                                                                                       |
-| --------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `extends`       | child → parent                                                                      | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
-| `variant_of`    | variant → original                                                                  | Modified version (QLoRA → LoRA)                                                            |
-| `introduced_by` | concept → document/person/org · document → person/org · artifact/service → document | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
-| `supersedes`    | new → old                                                                           | Replaces entirely; old stops being authoritative                                           |
+| Relation        | Direction                                                                                   | When                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `extends`       | child → parent                                                                              | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
+| `variant_of`    | variant → original                                                                          | Modified version (QLoRA → LoRA)                                                            |
+| `introduced_by` | concept → document/person/org · document → person/org · artifact/project/service → document | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
+| `supersedes`    | new → old                                                                                   | Replaces entirely; old stops being authoritative                                           |
 
 ### Category 3: Provenance (material/generative source lineage)
 
@@ -404,6 +407,7 @@ allowlist but cannot remove base rules.
 | `Document` | `introduced_by` | `Org`      |
 | `Concept`  | `introduced_by` | `Org`      |
 | `Service`  | `introduced_by` | `Document` |
+| `Project`  | `introduced_by` | `Document` |
 | `Concept`  | `supersedes`    | `Concept`  |
 | `Document` | `supersedes`    | `Document` |
 | `Artifact` | `supersedes`    | `Artifact` |
@@ -848,9 +852,10 @@ are rejected with the valid list in the error message.
 Endpoint validation lives in `khive-runtime` (not the type layer). The base contract tables
 above are the default. Packs extend via `EDGE_RULES` (additive only, cannot tighten).
 
-## Proposed 2026-09-14 amendment: project origin documents
+## Project origin documents
 
-**Status**: Proposed
+**Status**: Accepted
+**Amendment date**: 2026-09-14
 **Issue**: #2579
 
 ### Decision
@@ -894,9 +899,8 @@ do not add a Concept-only guard as part of this change.
 
 ### Implementation and acceptance
 
-This Proposed appendix does not itself change the canonical endpoint matrix
-above. When implementing the accepted amendment, update the Derivation matrix,
-its direction summary, the literal runtime triple and public link help together.
+The Derivation matrix and direction summary include this pair. The literal
+runtime triple and public link help must remain consistent with that contract.
 The ADR/runtime matrix equality check and endpoint-signature certificates must
 remain enabled; their exception sets are not widened for this additional pair.
 
