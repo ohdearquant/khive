@@ -371,9 +371,9 @@ pub enum TableDisposition {
 /// after this was written lands in no branch here, and a move that finds rows in
 /// it refuses by name rather than moving the subjects around it and leaving the
 /// new table pointing at a namespace nothing else is in.
-pub fn disposition(table: &str) -> Option<TableDisposition> {
+pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisposition> {
     use TableDisposition::*;
-    Some(match table {
+    Some(match table.name.as_str() {
         "notes" | "entities" | "graph_edges" | "knowledge_atoms" | "knowledge_domains" => Subject,
 
         // A section is not a subject: it carries `atom_id REFERENCES
@@ -409,15 +409,32 @@ pub fn disposition(table: &str) -> Option<TableDisposition> {
             subject_column: "target_id",
         },
 
-        // Created at runtime, one per embedding model, and in no source file.
-        // The prefix is the only thing that identifies them, which is why the
-        // census reads the live store rather than the schema.
-        other if other.starts_with("vec_") => Derived {
+        // Created at runtime, one per embedding model, and in no source file, so
+        // the live store is the only place they can be identified from.
+        //
+        // The NAME is not enough to identify one, and treating it as enough put a
+        // hole straight through the refusal above: a migration adding an ordinary
+        // namespace-bearing table called `vec_audit` would be classed here, handed
+        // to `move_vectors`, and die on `no such column: embedding` in the middle
+        // of the caller's transaction -- a bare SQLite error in place of the
+        // refusal by name that every other unnamed table gets. A vector table is a
+        // `CREATE VIRTUAL TABLE`, which an ordinary migration's table is not, so
+        // the census's own reading of that is the second half of the test.
+        _ if is_runtime_vector_table(table) => Derived {
             trigger_maintained: false,
         },
 
         _ => return None,
     })
+}
+
+/// A vector table created at runtime by an embedding model.
+///
+/// One predicate rather than two spellings of `starts_with("vec_")`: the
+/// disposition and the loop that moves them have to agree, or a table one of
+/// them admits reaches code the other never cleared.
+fn is_runtime_vector_table(table: &namespace_census::NamespaceTable) -> bool {
+    table.name.starts_with("vec_") && table.virtual_table
 }
 
 /// What the source namespace actually holds, read inside the caller's
@@ -487,7 +504,7 @@ fn read_source(
     };
 
     for table in &census.tables {
-        if disposition(&table.name).is_some() {
+        if disposition(table).is_some() {
             continue;
         }
         let count = count_in_namespace(conn, &table.name, source)?;
@@ -837,8 +854,7 @@ fn move_vectors(
     table: &str,
     source: &str,
     target: &str,
-    rows: &mut BTreeMap<String, u64>,
-) -> rusqlite::Result<u64> {
+) -> rusqlite::Result<VectorMove> {
     let quoted = namespace_census::quote_ident(table);
     let columns = "subject_id, namespace, kind, field, embedding_model, embedding";
 
@@ -871,17 +887,43 @@ fn move_vectors(
         ),
         [target],
     )? as u64;
-    conn.execute_batch("DROP TABLE temp.namespace_move_vectors")?;
-
     debug_assert_eq!(
         inserted, staged_rows as u64,
         "every staged vector is re-inserted or the move is losing embeddings"
     );
-    *rows.entry(table.to_string()).or_default() += inserted;
-    Ok(inserted)
+
+    // The staging table is still here because THIS is what the write log has to
+    // be built from. It holds the moved rows and nothing else; the live table now
+    // holds them beside whatever the target already had, and a log built by
+    // reading the target back cannot tell the two apart. Measured against the
+    // read-back form: a target already holding one other subject's vector
+    // produced a `delete` under the source for a subject the source never held,
+    // a second `upsert` for a vector that never moved, and an appended count of
+    // four where two vectors' worth of instructions were owed.
+    let appended = conn.execute(
+        "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+         SELECT ?1, embedding_model, kind, field, subject_id, 'delete' \
+         FROM temp.namespace_move_vectors",
+        [source],
+    )? as u64
+        + conn.execute(
+            "INSERT INTO ann_write_log \
+             (namespace, embedding_model, kind, field, subject_id, op) \
+             SELECT ?1, embedding_model, kind, field, subject_id, 'upsert' \
+             FROM temp.namespace_move_vectors",
+            [target],
+        )? as u64;
+
+    conn.execute_batch("DROP TABLE temp.namespace_move_vectors")?;
+
+    Ok(VectorMove {
+        moved: inserted,
+        ann_appended: appended,
+    })
 }
 
-/// Tell the ANN consumers what happened, on BOTH sides.
+/// What one vector table's move did: the rows carried, and the instructions
+/// appended for the ANN consumers on BOTH sides.
 ///
 /// The write log is appended to and never rewritten: its existing entries record
 /// writes that happened under the old name and are true. What a move adds is two
@@ -894,34 +936,9 @@ fn move_vectors(
 /// paired `delete` that index keeps answering searches with a subject that is no
 /// longer in its namespace — the same silent outcome as doing nothing to the
 /// vectors at all, moved one layer out.
-fn log_vector_move(
-    conn: &Connection,
-    vec_table: &str,
-    source: &str,
-    target: &str,
-) -> rusqlite::Result<u64> {
-    let quoted = namespace_census::quote_ident(vec_table);
-    // The rows are already under the target at this point, so the source side is
-    // reconstructed from them rather than read back from a table it has left.
-    let appended = conn.execute(
-        &format!(
-            "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-             SELECT ?1, embedding_model, kind, field, subject_id, 'delete' \
-             FROM {quoted} WHERE namespace = ?2"
-        ),
-        rusqlite::params![source, target],
-    )? as u64;
-    let appended = appended
-        + conn.execute(
-            &format!(
-                "INSERT INTO ann_write_log \
-                 (namespace, embedding_model, kind, field, subject_id, op) \
-                 SELECT ?1, embedding_model, kind, field, subject_id, 'upsert' \
-                 FROM {quoted} WHERE namespace = ?1"
-            ),
-            [target],
-        )? as u64;
-    Ok(appended)
+struct VectorMove {
+    moved: u64,
+    ann_appended: u64,
 }
 
 /// Move records out of one namespace, per the route map, inside the caller's
@@ -997,14 +1014,13 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     // store using a model this build was never compiled against still has its
     // `vec_*` table found here.
     for table in &census.tables {
-        if !table.name.starts_with("vec_") {
+        if !is_runtime_vector_table(table) {
             continue;
         }
         if let Some(target) = request.single_target() {
-            let moved = move_vectors(conn, &table.name, source, target, &mut counts.rows)?;
-            if moved > 0 {
-                counts.ann_log_appended += log_vector_move(conn, &table.name, source, target)?;
-            }
+            let moved = move_vectors(conn, &table.name, source, target)?;
+            *counts.rows.entry(table.name.clone()).or_default() += moved.moved;
+            counts.ann_log_appended += moved.ann_appended;
         } else {
             // A partitioning move cannot send one vector table to several
             // targets in one statement, and splitting it needs the subject each
@@ -1161,6 +1177,39 @@ mod tests {
         match error {
             MoveError::UnknownTable { table, rows } => {
                 assert_eq!(table, "later_migration_added_this");
+                assert_eq!(rows, 1);
+            }
+            other => panic!("expected an unknown table, got {other}"),
+        }
+    }
+
+    /// The same refusal, for a table whose NAME says it is a vector table.
+    ///
+    /// The vector tables are created at runtime by embedding models and appear in
+    /// no source file, so they are recognised from the live store. Recognising
+    /// them by name alone puts a hole through the refusal above: a migration
+    /// adding an ordinary table called `vec_audit` would be classed as a vector
+    /// table, handed to the vector move, and die on `no such column: embedding`
+    /// somewhere inside the caller's transaction. That is the one outcome the
+    /// refusal exists to prevent -- a bare SQLite error in place of a named
+    /// refusal. A real vector table is a `CREATE VIRTUAL TABLE` and this one is
+    /// not, which is what separates them here.
+    #[test]
+    fn a_table_named_like_a_vector_table_but_not_one_refuses_by_name() {
+        let conn = migrated();
+        seed_note(&conn, "n1", "source", "observation");
+        conn.execute_batch(
+            "CREATE TABLE vec_audit (\
+               id TEXT PRIMARY KEY, namespace TEXT NOT NULL);\
+             INSERT INTO vec_audit VALUES ('x', 'source');",
+        )
+        .expect("a migration lands a table whose name starts with the prefix");
+
+        let request = MoveRequest::new("source", vec![route("note:observation", "target")]);
+        let error = move_namespace(&conn, &request).expect_err("the prefix is not enough");
+        match error {
+            MoveError::UnknownTable { table, rows } => {
+                assert_eq!(table, "vec_audit");
                 assert_eq!(rows, 1);
             }
             other => panic!("expected an unknown table, got {other}"),
@@ -1367,6 +1416,81 @@ mod tests {
             )
             .expect("count");
         assert_eq!(taken_by_target, 1);
+    }
+
+    /// The instructions are about the vectors that MOVED, and a target is
+    /// allowed to have vectors of its own already.
+    ///
+    /// Built by reading the live table back after the insert, the source side is
+    /// "everything now under the target", which is the moved rows plus whatever
+    /// was already there. That tells the source's consumer to drop a subject the
+    /// source never held, re-upserts a vector that did not move, and reports an
+    /// appended count of four where two instructions were owed. The staged rows
+    /// are the only reading of "what moved" that survives the insert, which is
+    /// why the log is built before they are dropped.
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn a_vector_the_target_already_held_is_not_in_the_instructions() {
+        crate::extension::ensure_extensions_loaded();
+        let conn = migrated();
+        seed_note(&conn, "n1", "source", "observation");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_test_model USING vec0(\
+               subject_id TEXT PRIMARY KEY, \
+               namespace TEXT NOT NULL, \
+               kind TEXT NOT NULL, \
+               field TEXT NOT NULL, \
+               embedding_model TEXT NOT NULL, \
+               embedding float[4] distance_metric=cosine\
+             )",
+        )
+        .expect("the vector table an embedding model creates at runtime");
+        conn.execute(
+            "INSERT INTO vec_test_model \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES ('n1', 'source', 'observation', 'content', 'test-model', \
+                     '[0.1, 0.2, 0.3, 0.4]')",
+            [],
+        )
+        .expect("the vector that moves");
+        conn.execute(
+            "INSERT INTO vec_test_model \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES ('already-there', 'target', 'observation', 'content', 'test-model', \
+                     '[0.5, 0.6, 0.7, 0.8]')",
+            [],
+        )
+        .expect("a vector the target already holds");
+
+        let request = MoveRequest::new("source", vec![route("note:observation", "target")]);
+        let counts = move_namespace(&conn, &request).expect("a total move");
+
+        assert_eq!(
+            counts.ann_log_appended, 2,
+            "two instructions are owed for the one vector that moved"
+        );
+        let about_the_resident: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log WHERE subject_id = 'already-there'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            about_the_resident, 0,
+            "a vector that did not move is told nothing, and is certainly not \
+             dropped from a namespace it was never in"
+        );
+        // The control, so the arm cannot pass on a move that logged nothing at
+        // all: the vector that did move still has both of its instructions.
+        let about_the_mover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log WHERE subject_id = 'n1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(about_the_mover, 2);
     }
     /// Two routes bound for one target report a shared collision once, not twice.
     ///
