@@ -86,6 +86,8 @@ pack-moodboard = ["khive-pack-moodboard"]
 # only from downstream `[dev-dependencies]` re-declarations of this crate,
 # never from a release dependency.
 test-forward-seam = []
+# Opt-in actual Telegram adapter fixtures for coordinator timing tests.
+test-channel-timing = ["channel-telegram", "khive-channel-telegram/test-support"]
 
 [dev-dependencies]
 toml = { workspace = true }
