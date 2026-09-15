@@ -198,9 +198,11 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                // MAINTENANCE, deliberately kept out of the description: khive #744.
+                // khive #744 raised this cap as silent; khive #2679 added the signal.
                 description: "Maximum tasks to return (default 10). A `limit` above 200 is \
-                              capped to 200 without a separate signal in the response.",
+                              capped to 200; when that happens the response becomes an \
+                              object carrying `requested_limit`, `effective_limit`, and \
+                              `limit_clamped: true` instead of the usual bare task array.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -317,9 +319,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                // MAINTENANCE, deliberately kept out of the description: khive #744.
-                description: "Maximum results (default 20). A `limit` above 200 is capped to \
-                              200 without a separate signal in the response.",
+                // khive #744 raised this cap as silent; khive #2679 added the signal.
+                description: "Maximum results (default 50). A `limit` above 200 is capped to \
+                              200; when that happens the response becomes an object \
+                              carrying `requested_limit`, `effective_limit`, and \
+                              `limit_clamped: true` instead of the usual bare task array \
+                              (the `filter_excluded`/`hint` object wrap carries the same \
+                              three fields too).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
