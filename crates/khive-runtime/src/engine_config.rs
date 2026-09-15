@@ -61,6 +61,15 @@ pub enum ConfigError {
     EmptyBackendServedKinds { name: String },
 
     #[error(
+        "backend configuration leaves searchable substrate kinds {kinds:?} unserved; \
+         defined backends: {defined}"
+    )]
+    MissingBackendSearchKinds {
+        kinds: Vec<SubstrateKind>,
+        defined: String,
+    },
+
+    #[error(
         "[packs.{pack}].backend = {backend:?} references an unknown backend; \
          defined backends: {defined}"
     )]
@@ -280,14 +289,14 @@ pub enum BackendKind {
 /// When no `[[backends]]` section is present, a single implicit `main` backend
 /// is synthesised from the existing `--db` / `KHIVE_DB` / default-path resolution.
 /// All packs fall back to `main` when their name is absent from `[packs]`.
+/// `cache_mb` and `journal_mode` are parsed but rejected during validation
+/// because per-backend tuning is not implemented.
 ///
 /// ```toml
 /// [[backends]]
-/// name = "knowledge"
+/// name = "main"
 /// kind = "sqlite"
-/// path = "~/.khive/knowledge.db"
-/// cache_mb = 128
-/// journal_mode = "wal"
+/// path = "~/.khive/khive.db"
 /// read_only = false
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -300,14 +309,15 @@ pub struct BackendConfig {
     /// Filesystem path for `sqlite` kind. Tilde is expanded to `$HOME`.
     /// `None` for `memory` kind (path is ignored when present).
     pub path: Option<std::path::PathBuf>,
-    /// SQLite page-cache size in MiB.
+    /// SQLite page-cache size in MiB. Parsed but rejected as unsupported.
     pub cache_mb: Option<u32>,
-    /// SQLite journal mode (e.g. `"wal"`).
+    /// SQLite journal mode (e.g. `"wal"`). Parsed but rejected as unsupported.
     pub journal_mode: Option<String>,
     /// Substrate kinds this backend serves.
     ///
     /// Omission preserves conservative fan-out to this backend. An explicit
     /// declaration is closed over [`SubstrateKind`] and must not be empty.
+    /// The backend set must cover both `note` and `entity` search.
     #[serde(default)]
     pub served_kinds: Option<BTreeSet<SubstrateKind>>,
     /// Open the backend read-only. Defaults to `false`.
@@ -330,7 +340,8 @@ pub struct BackendConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct PackConfig {
-    /// Backend name this pack is assigned to. Must match a `[[backends]].name`.
+    /// Backend name this pack is assigned to. Must match a `[[backends]].name`,
+    /// or `main` when no backends are declared.
     pub backend: String,
     /// Disable vector embedding for this pack's runtime: rows it writes get
     /// FTS and metadata only, no `vec_*` rows and no ANN participation. The
@@ -1290,17 +1301,40 @@ impl KhiveConfig {
                     });
                 }
             }
+        }
 
-            // Every pack-referenced backend name must be declared in `backends`.
-            let defined: Vec<&str> = self.backends.iter().map(|b| b.name.as_str()).collect();
-            for (pack_name, pack_cfg) in &self.packs {
-                if !defined.contains(&pack_cfg.backend.as_str()) {
-                    return Err(ConfigError::UnknownPackBackend {
-                        pack: pack_name.clone(),
-                        backend: pack_cfg.backend.clone(),
-                        defined: defined.join(", "),
-                    });
-                }
+        let defined: Vec<&str> = if self.backends.is_empty() {
+            vec![BackendId::MAIN]
+        } else {
+            self.backends.iter().map(|b| b.name.as_str()).collect()
+        };
+        for (pack_name, pack_cfg) in &self.packs {
+            if !defined.contains(&pack_cfg.backend.as_str()) {
+                return Err(ConfigError::UnknownPackBackend {
+                    pack: pack_name.clone(),
+                    backend: pack_cfg.backend.clone(),
+                    defined: defined.join(", "),
+                });
+            }
+        }
+
+        if !self.backends.is_empty() {
+            let missing: Vec<_> = [SubstrateKind::Note, SubstrateKind::Entity]
+                .into_iter()
+                .filter(|kind| {
+                    !self.backends.iter().any(|backend| {
+                        backend
+                            .served_kinds
+                            .as_ref()
+                            .is_none_or(|served| served.contains(kind))
+                    })
+                })
+                .collect();
+            if !missing.is_empty() {
+                return Err(ConfigError::MissingBackendSearchKinds {
+                    kinds: missing,
+                    defined: defined.join(", "),
+                });
             }
         }
 
@@ -2662,8 +2696,7 @@ backend = "nonexistent"
     #[test]
     fn test_pack_config_without_backends_section_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        // When [[backends]] is absent/empty, packs are not validated: all
-        // packs fall through to the implicit main backend.
+        // Explicit pack routes may name the implicit main backend.
         let path = write_toml(
             &dir,
             r#"
@@ -2676,6 +2709,69 @@ backend = "main"
             .expect("file found");
         assert_eq!(cfg.backends.len(), 0);
         assert_eq!(cfg.packs.len(), 1);
+    }
+
+    #[test]
+    fn test_implicit_main_rejects_unknown_pack_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[packs.comm]\nbackend = 'does-not-exist'\n");
+        let error = KhiveConfig::load(Some(&path)).expect_err("unknown route must fail");
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::UnknownPackBackend { pack, backend, defined }
+                if pack == "comm" && backend == "does-not-exist" && defined == "main"
+        ));
+    }
+
+    #[test]
+    fn test_backend_search_coverage_rejects_missing_substrates() {
+        for (served, missing) in [
+            ("'note'", vec![SubstrateKind::Entity]),
+            ("'entity'", vec![SubstrateKind::Note]),
+            ("'event'", vec![SubstrateKind::Note, SubstrateKind::Entity]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_toml(
+                &dir,
+                &format!(
+                    "[[backends]]\nname = 'main'\nkind = 'memory'\nserved_kinds = [{served}]\n"
+                ),
+            );
+            let error = KhiveConfig::load(Some(&path)).expect_err("incomplete coverage");
+            assert!(
+                matches!(
+                    config_error_root(&error),
+                    ConfigError::MissingBackendSearchKinds { kinds, defined }
+                        if kinds == &missing && defined == "main"
+                ),
+                "unexpected coverage error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_backend_search_coverage_allows_split_substrates_and_event_only_secondary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = ["entity"]
+
+[[backends]]
+name = "notes"
+kind = "memory"
+served_kinds = ["note"]
+
+[[backends]]
+name = "events"
+kind = "memory"
+served_kinds = ["event"]
+"#,
+        );
+        KhiveConfig::load(Some(&path)).expect("search coverage is the union of backends");
     }
 
     #[test]
@@ -3778,4 +3874,5 @@ timezone = ""
             "expected InvalidDisplayTimezone, got {err:?}"
         );
     }
+    include!("engine_config_backend_batch_tests.rs");
 }

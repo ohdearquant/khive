@@ -204,6 +204,10 @@ fusion_weight = 0.5
 # By default khive uses ONE implicit backend named `main`, resolved from
 # --db / KHIVE_DB / the default ~/.khive/khive.db path, and every pack shares it.
 # Declare [[backends]] only to split packs across separate databases.
+# Without [[backends]], explicit [packs.<name>].backend routes must name `main`.
+# Declared and loaded backends must collectively serve both `note` and `entity`.
+# An event-only secondary is valid when other loaded backends supply that coverage.
+# cache_mb and journal_mode are parsed but rejected; per-backend tuning is unsupported.
 
 # [[backends]]
 # name = "main"                # unique; referenced by [packs.<name>].backend
