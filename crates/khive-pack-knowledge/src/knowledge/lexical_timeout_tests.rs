@@ -600,7 +600,12 @@ impl khive_storage::SqlReader for TimedFrequencyReader {
         self.0 += 1;
         if self.0 == 1 {
             tokio::time::advance(Duration::from_millis(25)).await;
-            Ok(Vec::new())
+            Ok(vec![khive_storage::types::SqlRow {
+                columns: vec![khive_storage::types::SqlColumn {
+                    name: "frequency".into(),
+                    value: SqlValue::Integer(0),
+                }],
+            }])
         } else {
             tokio::time::advance(Duration::from_millis(7)).await;
             Err(khive_storage::StorageError::Timeout {
