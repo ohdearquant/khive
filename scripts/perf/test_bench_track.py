@@ -229,6 +229,8 @@ class ErrorRecordTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["status"], "error")
             self.assertEqual(records[0]["metrics"], {})
+            self.assertEqual(records[0]["gate_exit_code"], 1)
+            self.assertEqual(records[0]["gate_status"], "fail")
 
     def test_cmd_record_writes_error_record_on_empty_criterion_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,6 +266,21 @@ class ShardAggregationTests(unittest.TestCase):
     logical run per sha with the full union of every shard's metrics, not
     one row per shard with only the last shard's metric names.
     """
+
+    def test_component_failure_survives_successful_shards_in_either_order(self):
+        for codes in ([0, 124], [124, 0], [None, 124, 0]):
+            with self.subTest(codes=codes):
+                records = [
+                    bench_track.build_record(
+                        "components", {f"component-{i}.mean_ns": float(i)},
+                        "a" * 40, "main", gate_exit_code=code,
+                    )
+                    for i, code in enumerate(codes)
+                ]
+                [merged] = bench_track._aggregate_shards(records)
+                self.assertEqual(merged["gate_status"], "fail")
+                self.assertEqual(merged["gate_exit_code"], 124)
+                self.assertEqual(len(merged["metrics"]), len(codes))
 
     def test_two_sha_two_shard_aggregates_to_two_runs_with_full_metric_union(self):
         with tempfile.TemporaryDirectory() as tmp:

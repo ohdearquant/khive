@@ -5,7 +5,19 @@
 # A commit hook that compiles the workspace is a build like any other. On a
 # machine where builds queue behind lock files, a hook that skips the queue runs
 # beside the build that holds it, so the hook takes the same locks the build
-# scripts take. Which locks, and in what mode, is machine configuration, not a
+# scripts take.
+#
+# That argument reaches clippy and not fmt, so only clippy takes the locks.
+# `cargo fmt --all -- --check` compiles nothing: measured on this workspace it
+# runs in about seven seconds, spawns rustfmt and never rustc, and leaves
+# target/ untouched. Serializing it bought nothing and cost every commit the
+# remainder of whatever build held the lock -- observed at eight minutes, with
+# two commits queued behind it. An unserialized fmt can now run beside a build,
+# which is real but below the noise floor of a machine already compiling; the
+# symptom if that is wrong would be build-time variance tracking commit
+# frequency.
+#
+# Which locks, and in what mode, is machine configuration, not a
 # property of this repository: the list lives in
 # $XDG_CONFIG_HOME/khive/cargo-hook-locks (default ~/.config/khive/...), one
 # lock per line as `<shared|exclusive> <path>`, outermost first. Blank lines and
@@ -60,7 +72,7 @@ held_by_ancestor() {
 
 locks="${XDG_CONFIG_HOME:-$HOME/.config}/khive/cargo-hook-locks"
 wrapper=()
-if [ -f "$locks" ]; then
+if [ "$1" = clippy ] && [ -f "$locks" ]; then
   if ! command -v flock >/dev/null 2>&1; then
     echo "hook-cargo.sh: $locks declares locks but flock is not on PATH; refusing to run unserialized" >&2
     exit 3

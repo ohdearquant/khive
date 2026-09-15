@@ -1,14 +1,10 @@
 name: Bench Trend Tracking
 
-# Informational trend tracking for BOTH component (Criterion) and e2e
-# (pipeline / bench-1m synthetic) benchmarks. Per the bench-program spec
-# (.khive/workspaces/20260710/bench-program/SPEC-draft.md, "Blocking-promotion
-# ladder"): every metric here is Advisory - measured, appended to
-# bench-data/<suite>.jsonl on the `perf-data` branch, and rendered as a trend
-# summary. Nothing in this workflow asserts pass/fail or sets a threshold;
-# that requires K>=10 same-SHA calibration (scripts/perf/bench_calibrate.py)
-# plus a >=2-week zero-alarm observation window before any promotion
-# conversation starts. This workflow is Wave 2's ledger-writer, not a gate.
+# Trend tracking for component (Criterion) and e2e (pipeline / bench-1m
+# synthetic) benchmarks. Metric values are advisory: they are appended to
+# bench-data/<suite>.jsonl on `perf-data` and rendered without performance
+# thresholds. Component compile failures, benchmark panics and timeouts fail
+# their job after the ledger and raw artifacts have had a chance to publish.
 #
 # Efficiency and coverage:
 #   - PRs run only affected Criterion components. The stable component jobs

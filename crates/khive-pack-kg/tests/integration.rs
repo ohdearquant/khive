@@ -8507,7 +8507,11 @@ async fn create_entity_with_mixed_edges_partial_success() {
 
 // ---- Issue #487: dedup guard tests ----
 
-// Creating a uniquely-named entity produces no `similar_existing` field.
+// Creating a uniquely-named entity reports an EMPTY comparison, not an absent
+// one. This test asserted absence until #2750: absence could not be told apart
+// from a similarity search that failed, and the caller reads this field to
+// decide whether to link instead of create. The two sibling cases below, where
+// no comparison happens at all, still assert absence — that is the distinction.
 #[tokio::test]
 async fn create_entity_dedup_no_similar_when_unique() {
     let pack = pack();
@@ -8522,9 +8526,15 @@ async fn create_entity_dedup_no_similar_when_unique() {
         .await
         .expect("create must succeed");
 
-    assert!(
-        result.get("similar_existing").is_none(),
-        "#487: no similar_existing when no duplicates exist; got: {result}"
+    assert_eq!(
+        result.get("similar_existing"),
+        Some(&json!([])),
+        "#2750: an entity create reports the comparison's result, empty included; got: {result}"
+    );
+    assert_eq!(
+        result.get("similar_existing_unavailable_reason"),
+        Some(&serde_json::Value::Null),
+        "#2750: the comparison ran, so nothing is unavailable; got: {result}"
     );
 }
 
@@ -15757,4 +15767,152 @@ async fn search_entity_hits_carry_updated_at_and_a_null_version() {
         "an updated entity still has no revision to report; got {}",
         after[0]
     );
+}
+
+#[tokio::test]
+async fn issue2757_get_and_list_parse_only_opted_in_note_content() {
+    let pack = pack();
+    type ContentPredicate = fn(&Value) -> bool;
+    let bodies: [(&str, ContentPredicate); 9] = [
+        (
+            r#" { "id": "11111111-1111-4111-8111-111111111111", "empty": [], "nil": null } "#,
+            Value::is_object,
+        ),
+        (r#"[{"value":1},{"value":2}]"#, Value::is_array),
+        ("42", Value::is_number),
+        ("false", Value::is_boolean),
+        ("null", Value::is_null),
+        (r#""2026-09-15T12:34:56.123456+03:00""#, Value::is_string),
+        (r#""""#, Value::is_string),
+        ("[]", Value::is_array),
+        ("{}", Value::is_object),
+    ];
+    for (index, (body, has_expected_type)) in bodies.iter().enumerate() {
+        let key = format!("issue2757/{index:02}");
+        let created = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "observation", "content": body, "key": key,
+                    "tags": [key], "skip_dedup_check": true,
+                }),
+            )
+            .await
+            .unwrap();
+        let expected = serde_json::from_str::<Value>(body).unwrap();
+        for args in [
+            json!({"id": created["id"]}),
+            json!({"key": key, "kind": "observation"}),
+        ] {
+            let baseline = pack.dispatch("get", args.clone()).await.unwrap();
+            assert_eq!(baseline["content"], *body);
+            let mut disabled = args.clone();
+            disabled["parse_content"] = json!(false);
+            assert_eq!(
+                serde_json::to_vec(&pack.dispatch("get", disabled).await.unwrap()).unwrap(),
+                serde_json::to_vec(&baseline).unwrap(),
+                "omitted and false get preserve the baseline bytes"
+            );
+            let mut enabled = args;
+            enabled["parse_content"] = json!(true);
+            let actual = pack.dispatch("get", enabled).await.unwrap();
+            assert!(
+                has_expected_type(&actual["content"]),
+                "get type for body {index}"
+            );
+            let mut expected_record = baseline;
+            expected_record["content"] = expected.clone();
+            assert_eq!(actual, expected_record, "get body {index}");
+        }
+        // Substrate, granular alias, ordinary cursor, filtered and keyed pages.
+        for args in [
+            json!({"kind":"note", "tags":[key]}),
+            json!({"kind":"observation", "tags":[key], "after":""}),
+            json!({"kind":"note", "note_kind":"observation", "key_prefix":key, "offset":0}),
+            json!({"kind":"observation", "key_prefix":key}),
+        ] {
+            let baseline = pack.dispatch("list", args.clone()).await.unwrap();
+            let mut disabled = args.clone();
+            disabled["parse_content"] = json!(false);
+            assert_eq!(
+                serde_json::to_vec(&pack.dispatch("list", disabled).await.unwrap()).unwrap(),
+                serde_json::to_vec(&baseline).unwrap(),
+                "omitted and false list preserve the baseline bytes"
+            );
+            let mut enabled = args;
+            enabled["parse_content"] = json!(true);
+            let actual = pack.dispatch("list", enabled).await.unwrap();
+            let mut expected_page = baseline;
+            let array_key = if expected_page.get("items").is_some() {
+                "items"
+            } else {
+                "notes"
+            };
+            assert_eq!(expected_page[array_key].as_array().unwrap().len(), 1);
+            assert_eq!(expected_page[array_key][0]["content"], *body);
+            assert!(
+                has_expected_type(&actual[array_key][0]["content"]),
+                "list type for body {index}"
+            );
+            expected_page[array_key][0]["content"] = expected.clone();
+            assert_eq!(actual, expected_page, "list body {index}");
+        }
+        let reread = pack
+            .dispatch("get", json!({"id":created["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(reread["content"], *body, "reads cannot rewrite storage");
+    }
+}
+
+#[tokio::test]
+async fn issue2757_deleted_notes_and_non_note_results() {
+    let pack = pack();
+    let note = pack
+        .dispatch("create", json!({"kind":"observation", "content":"null"}))
+        .await
+        .unwrap();
+    pack.dispatch("delete", json!({"id": note["id"]}))
+        .await
+        .unwrap();
+    let note = pack
+        .dispatch(
+            "get",
+            json!({
+                "id":note["id"], "include_deleted":true, "parse_content":true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(note.get("content"), Some(&Value::Null));
+    assert!(note["deleted_at"].is_string());
+
+    let entity = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind":"concept", "name":"issue2757 entity", "skip_dedup_check":true,
+                "properties":{"content":"{\"id\":null}", "parse_content":true},
+            }),
+        )
+        .await
+        .unwrap();
+    for (verb, args) in [
+        ("get", json!({"id":entity["id"]})),
+        ("list", json!({"kind":"entity"})),
+        ("list", json!({"kind":"concept", "after":""})),
+        ("list", json!({"kind":"edge"})),
+        ("list", json!({"kind":"event"})),
+        ("list", json!({"kind":"proposal"})),
+    ] {
+        let baseline = pack.dispatch(verb, args.clone()).await.unwrap();
+        let mut opted_in = args.clone();
+        opted_in["parse_content"] = json!(true);
+        assert_eq!(pack.dispatch(verb, opted_in).await.unwrap(), baseline);
+        let mut invalid = args;
+        invalid["parse_content"] = json!("true");
+        assert!(is_invalid_input(
+            &pack.dispatch(verb, invalid).await.unwrap_err()
+        ));
+    }
 }

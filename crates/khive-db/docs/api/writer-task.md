@@ -111,8 +111,11 @@ makes at most three total BEGIN attempts, sleeping 5 ms and then 10 ms between
 them, and the attempts together share a single configured `busy_timeout`
 acquisition budget rather than each waiting out a full window of their own:
 before each retry the connection's busy timeout is lowered to whatever
-remains of that budget and restored afterward, and a refusal that has
-already exhausted the budget is not retried. Persistent contention is
+remains of that budget and restored afterward. If lowering the timeout fails,
+the original busy/locked refusal is returned without another BEGIN or an
+absorbed-refusal increment. A refusal that has already exhausted the budget
+is likewise not retried. Restoration remains best-effort and is attempted
+only if an earlier reduction succeeded. Persistent contention is
 therefore bounded to at most one busy-timeout window plus 15 ms of explicit
 backoff, not the sum of three; the request's operation closure remains owned
 and uninvoked throughout. Non-busy BEGIN failures are never retried. After
@@ -170,10 +173,10 @@ exclusively at the `run_writer_task` drain loop's outer match on the
 per-request outcome, so they stay correct without anyone re-classifying a
 verb by hand:
 
-| Counter | Population |
-| --- | --- |
-| `writer_task_request_failures` | Incremented once for every dequeued request whose processing at the writer seam terminated in error — every row of the table above except `NotStarted` outcomes for requests that never reached the seam, plus a request whose blocking closure fails to join outside the panic boundary. |
-| `writer_task_side_effects_unknown` | The subset of `writer_task_request_failures` whose `WriterTaskRequestState` was exactly `SideEffectsUnknown`. |
+| Counter                            | Population                                                                                                                                                                                                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `writer_task_request_failures`     | Incremented once for every dequeued request whose processing at the writer seam terminated in error — every row of the table above except `NotStarted` outcomes for requests that never reached the seam, plus a request whose blocking closure fails to join outside the panic boundary. |
+| `writer_task_side_effects_unknown` | The subset of `writer_task_request_failures` whose `WriterTaskRequestState` was exactly `SideEffectsUnknown`.                                                                                                                                                                             |
 
 A request that is only ever buffered behind another request's terminal
 failure (`NotStarted`, drained via `close_and_fail_queued_requests`) never

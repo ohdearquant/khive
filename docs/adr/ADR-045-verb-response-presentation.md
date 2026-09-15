@@ -921,3 +921,34 @@ runs must satisfy both controls and exactness assertions. Compilation failures,
 invalid fixtures, missing cases and zero selected tests are neither a baseline
 proof nor mutation kills. Verification outcomes belong to the implementing
 change; this amendment defines the accepted receipt contract.
+
+## Amendment 7 (2026-09-15): opt-in parsed note content
+
+**Status: Accepted.** [Ratified by the owner on 2026-09-15](https://github.com/ohdearquant/khive/issues/2757#issuecomment-5684308086).
+This contract supersedes the earlier raw-string fallback and nested-cell placeholder proposal.
+
+`get` and `list` accept per-call boolean `parse_content`, default false. For note records only,
+true parses the stored JSON `content` string into a JSON value in place. JSON objects, arrays,
+strings, numbers, booleans, and null are supported. Invalid JSON refuses with `invalid_input`,
+naming the note UUID and `content` field, distinct from the existing missing-note refusal.
+One invalid returned note refuses its list operation. Omission or false retains byte-identical
+existing response behavior and the exact stored content string. Both parameter structs retain
+`deny_unknown_fields`; a client probing an older server gets an explicit unknown-field refusal.
+No connection state, storage or write contract changes. The option covers get by ID (including
+soft-deleted notes) and key, and note lists using substrate/granular kinds, filters, offset,
+insertion cursors, or keyed cursors. Non-note get/list responses, including edge annotation
+notes, are unchanged.
+
+The option changes only the note's content field, after the existing timestamp/status/label
+projection. In opt-in responses, content is opaque user data throughout presentation and output
+format preparation: it is not recursively shortened, rounded, compacted, emptied, deduplicated, or
+hoisted as record metadata. Parsed null and empty values remain present. The policy comes from the
+resolved request option and the actual note result; no response marker or caller-supplied payload
+field selects it. Chain substitution observes canonical parsed content, before presentation.
+
+Existing get/list metadata, pagination, request/output envelope keys, per-op presentation/format
+precedence, and AlwaysVerbose get behavior remain in force. JSON and AUTO preserve parsed content
+values, including on multi-note pages; AUTO uses JSON result text for these opt-in note responses.
+TABLE serializes parsed objects and arrays to JSON strings for display only, preserving scalar
+values. A get record's parsed content array is never selected as the response's record table.
+Existing response depth and size guards still apply.
