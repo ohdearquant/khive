@@ -1924,6 +1924,256 @@ mod tests {
         }
     }
 
+    /// #2587: a fresh-tail skip that discarded an error must carry it out to
+    /// the caller. One label covers causes that differ in what the caller
+    /// should do next, so the label alone cannot separate a retryable read
+    /// from a store that needs rebuilding. This is the non-empty response
+    /// shape: the per-hit stamp plus an enriched `degraded_reason`.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_2587_degraded_reason_carries_the_error_on_a_non_empty_response() {
+        const MODEL: &str = "recall-2587-non-empty-enriched-reason-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 2587 enriched degraded reason recall note";
+        const QUERY: &str = "2587 enriched degraded reason recall";
+
+        let rt = memory_runtime_with_fresh_tail(true);
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // Warm the bridge synchronously so the fresh-tail leg runs on the
+        // warm-index branch, as in the disabled-leg test above.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // Control, same store and same query: a healthy recall carries no
+        // degradation fields at all, so the assertions below cannot pass on a
+        // path that always reports degraded.
+        let clean = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({ "query": QUERY, "limit": 10 }),
+            )
+            .await
+            .expect("healthy recall must serve");
+        let clean_results = clean
+            .as_array()
+            .expect("a healthy recall keeps the bare-array shape");
+        assert!(
+            !clean_results.is_empty(),
+            "control: the seeded note must surface, got: {clean:?}"
+        );
+        for r in clean_results {
+            assert_eq!(
+                r.get("degraded"),
+                None,
+                "control: a healthy recall carries no degradation stamp, got: {r:?}"
+            );
+            assert_eq!(
+                r.get("degraded_reason"),
+                None,
+                "control: a healthy recall carries no reason, got: {r:?}"
+            );
+        }
+
+        // Fault injection: remove the write-log table the fresh-tail leg's
+        // tail fetch reads, so the leg skips for a nameable reason. (Test
+        // fixture database, mirroring the DROP TABLE fault pattern used by
+        // the event-store acquisition test further down this file.)
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("fault injection writer");
+            writer
+                .execute(khive_storage::types::SqlStatement {
+                    sql: "DROP TABLE ann_write_log".into(),
+                    params: vec![],
+                    label: Some("test_drop_write_log_for_enriched_reason".into()),
+                })
+                .await
+                .expect("drop the write-log table");
+        }
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({ "query": QUERY, "limit": 10 }),
+            )
+            .await
+            .expect("a degraded recall must still serve");
+
+        let results = result
+            .as_array()
+            .expect("a non-empty degraded recall keeps the bare-array shape");
+        assert!(
+            !results.is_empty(),
+            "the warm-index candidates must still be served, got: {result:?}"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "#2587 a skipped fresh-tail leg must still stamp the marker, got: {r:?}"
+            );
+            let reason = r
+                .get("degraded_reason")
+                .and_then(Value::as_str)
+                .expect("#2587 a degraded hit must carry a degraded_reason string");
+            assert!(
+                reason.contains("fresh-tail: tail fetch failed"),
+                "#2587 the reason must keep its failure-site label, got: {reason:?}"
+            );
+            assert!(
+                reason.contains("ann_write_log"),
+                "#2587 the reason must carry the error that caused the skip, \
+                 not only the label every read failure at that site shares, \
+                 got: {reason:?}"
+            );
+        }
+    }
+
+    /// #2587 companion: the empty-result shape must carry the same enriched
+    /// reason. Here the bounded ANN wait expires and the no-index fresh-tail
+    /// tier then fails its own read, so the response is the degraded-empty
+    /// envelope rather than a bare array.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_2587_degraded_reason_carries_the_error_on_an_empty_response() {
+        const MODEL: &str = "recall-2587-empty-enriched-reason-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "alpha bravo charlie delta echo foxtrot";
+        const QUERY: &str = "zulu yankee xray whiskey victor";
+
+        let rt = memory_runtime_with_fresh_tail(true);
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // One warm registers and activates this consumer, which the capped
+        // fresh-tail tier requires before it will run at all.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let key = crate::ann::AnnKey::new(MODEL);
+        // Evict the serving bridge and hold the warm lock so the recall's
+        // bounded wait expires: that is the branch whose fresh-tail leg runs
+        // on the no-index tier.
+        crate::ann::clear_key(&ann_handle, &key).await;
+        let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+        // Control, before the fault: a term-disjoint query over a degraded
+        // but readable store returns the degraded-empty envelope WITHOUT the
+        // fresh-tail skip folded in, so the assertion below is about the
+        // enrichment and not about degradation being reported at all.
+        let clean = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": QUERY,
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("bounded-wait recall must still serve");
+        let clean_reason = clean
+            .as_object()
+            .and_then(|obj| obj.get("degraded_reason"))
+            .and_then(Value::as_str)
+            .expect("control: a bounded-wait degradation carries its own reason");
+        assert!(
+            !clean_reason.contains("ann_write_log"),
+            "control: nothing has failed in the write log yet, got: {clean_reason:?}"
+        );
+
+        {
+            let sql = rt.sql();
+            let mut writer = sql.writer().await.expect("fault injection writer");
+            writer
+                .execute(khive_storage::types::SqlStatement {
+                    sql: "DROP TABLE ann_write_log".into(),
+                    params: vec![],
+                    label: Some("test_drop_write_log_for_empty_enriched_reason".into()),
+                })
+                .await
+                .expect("drop the write-log table");
+        }
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": QUERY,
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("a degraded-empty recall must not error");
+
+        let obj = result
+            .as_object()
+            .expect("#2587 a degraded-empty recall must return the envelope shape");
+        assert_eq!(
+            obj.get("results"),
+            Some(&serde_json::json!([])),
+            "#2587 this scenario is the empty shape, got: {result:?}"
+        );
+        assert_eq!(
+            obj.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "#2587 a degraded-empty recall must set degraded: true, got: {result:?}"
+        );
+        let reason = obj
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("#2587 a degraded-empty recall must carry a degraded_reason string");
+        assert!(
+            reason.contains("fresh-tail: tail-existence read failed"),
+            "#2587 the reason must keep its failure-site label, got: {reason:?}"
+        );
+        assert!(
+            reason.contains("ann_write_log"),
+            "#2587 the reason must carry the error that caused the skip, got: {reason:?}"
+        );
+    }
+
     /// A budget cutoff at the first ranked candidate and an ANN degradation
     /// can hold at once, and the budget-cap envelope returns before the
     /// degradation envelope: without the degraded fields on that early
