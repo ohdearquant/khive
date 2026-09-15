@@ -61,8 +61,10 @@ delivery and acknowledgement rules.
   Exception: `help=true` is short-circuited in `VerbRegistry::dispatch` before
   reaching the pack, so introspection passes through.
 - Pack-auxiliary schema plans are applied at server startup (before any handler
-  runs) so that pack tables are present. Errors are logged but not propagated
-  to avoid a single pack's schema failure aborting the whole server boot.
+  runs) so that pack tables are present. Single- and multi-backend constructors
+  propagate a pack-named boot refusal if a required schema plan fails. Read-only
+  backends validate declared column additions through a reader; missing or
+  incompatible columns refuse boot without applying SQL or acquiring a writer.
 - `register_embedders` is called on every pack after the registry is built so
   custom embedding providers are available before the first `remember`/`recall`.
 

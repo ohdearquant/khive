@@ -352,6 +352,9 @@ impl KhiveRuntime {
     }
 
     fn assemble_from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        if config.backend_id.as_str() == BackendId::MAIN {
+            backend.pool().main_pool_generation();
+        }
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
@@ -388,6 +391,7 @@ impl KhiveRuntime {
             BackendId::MAIN,
             "with_core_backend must not be called on the main runtime"
         );
+        core.pool().main_pool_generation();
         self.core_backend = Some(core);
         self
     }
@@ -620,7 +624,9 @@ impl KhiveRuntime {
         runtime_audit_batch_metrics: Option<khive_db::diagnostics::RuntimeAuditBatchMetrics>,
     ) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
         let pool = self.core().backend.pool_arc();
-        let interval = khive_db::CheckpointConfig::from_env().interval;
+        // Match housekeeping's compiled legacy-record fallback (ADR-091
+        // Amendment 6), independent of checkpoint or local sweep overrides.
+        let legacy_sweep_interval = khive_db::SessionSweepConfig::default().interval;
         let build_hash = crate::build_info::BUILD_INFO
             .is_stamped()
             .then_some(crate::build_info::BUILD_INFO.source_revision);
@@ -632,7 +638,7 @@ impl KhiveRuntime {
         khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
             build,
-            interval,
+            legacy_sweep_interval,
             crate::pack::audit_append_failure_count(),
             runtime_audit_batch_metrics,
         )

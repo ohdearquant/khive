@@ -12,7 +12,7 @@
 // dispatch and is intentionally co-located.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -35,8 +35,11 @@ use khive_request::{
     parse_request, parse_typed_json_batch, ArgValue, DslError, ExecutionMode, ParsedOp,
     ParsedRequest, PrevFailure, TypedJsonOp,
 };
+use khive_runtime::presentation::{
+    prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
+};
 use khive_runtime::{
-    prepare_format_value, present_with_policy, render_format, DispatchError, DomainDisposition,
+    present_with_policy, render_format, DispatchError, DomainDisposition,
     InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
     PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
     VerbRegistryBuilder,
@@ -1265,6 +1268,7 @@ pub enum PackRegFailure {
     MissingDependency { pack: String, dep: String },
     NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
+    Schema(khive_runtime::PackSchemaCollisionError),
 }
 
 /// Returned by [`KhiveMcpServer::with_packs`] when pack registration fails.
@@ -1284,6 +1288,7 @@ impl std::fmt::Debug for PackRegError {
             }
             PackRegFailure::NoPublicVerbs { pack } => dbg.field("pack", pack),
             PackRegFailure::Registry(source) => dbg.field("source", source),
+            PackRegFailure::Schema(source) => dbg.field("schema", source),
         }
         .finish_non_exhaustive()
     }
@@ -1309,6 +1314,7 @@ impl std::fmt::Display for PackRegError {
                  intentionally vocabulary- or ontology-only"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
+            PackRegFailure::Schema(source) => write!(f, "{source}"),
         }
     }
 }
@@ -1614,10 +1620,14 @@ impl KhiveMcpServer {
                 .collect(),
         );
         registry.call_register_note_write_validators(&runtime);
-        // Apply pack-auxiliary schema plans at startup so pack tables are
-        // present before any handler runs. Errors are logged but not propagated
-        // so a single pack's schema failure cannot abort startup.
-        registry.apply_schema_plans(runtime.backend());
+        // A required pack schema failure must refuse boot before any handler
+        // can run. Use the same validation and error path as multi-backend boot.
+        registry
+            .apply_schema_plans_with_map(&HashMap::new(), runtime.backend())
+            .map_err(|source| PackRegError {
+                failure: PackRegFailure::Schema(source),
+                runtime: runtime.clone(),
+            })?;
         // Capture the pool arc for the WAL checkpoint task. Only available for
         // file-backed databases; in-memory backends return None here.
         let pool = if runtime.backend().is_file_backed() && !runtime.is_read_only() {
@@ -2234,7 +2244,7 @@ impl KhiveMcpServer {
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
         context: RunParsedContext<'_>,
-    ) -> Value {
+    ) -> (Value, Vec<NoteContentScope>) {
         let RunParsedContext {
             enforce_response_budget,
             max_batch_concurrency,
@@ -2262,7 +2272,11 @@ impl KhiveMcpServer {
                 .unwrap_or(presentation)
         };
 
-        match mode {
+        let mut parse_content: Vec<bool> = ops
+            .iter()
+            .map(|op| parse_content_requested(op, None))
+            .collect();
+        let response = match mode {
             ExecutionMode::Single | ExecutionMode::Parallel => {
                 // Write-key conflict preflight.
                 //
@@ -2319,6 +2333,7 @@ impl KhiveMcpServer {
                     let op_vector_selected = vector_selected;
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
+                    let parse_content = parse_content[i];
                     BatchTask {
                         index: i,
                         tool: task_tool,
@@ -2401,6 +2416,7 @@ impl KhiveMcpServer {
                                             effective_mode,
                                             now_unix,
                                             presentation_policy,
+                                            NoteContentScope::None,
                                         ),
                                         Err(failure) => failure.into_entry(),
                                     };
@@ -2426,12 +2442,16 @@ impl KhiveMcpServer {
                                         result,
                                         op_vector_selected,
                                     );
+                                let content_scope = note_content_scope(
+                                    parse_content && !is_help, &tool, &success.result, &registry,
+                                );
                                 present_ok_envelope_or_depth_error(
                                     tool,
                                     success,
                                     effective_mode,
                                     now_unix,
                                     presentation_policy,
+                                    content_scope,
                                 )
                             }
                             Err(error) => {
@@ -2478,6 +2498,7 @@ impl KhiveMcpServer {
                         ))));
                         continue;
                     }
+                    parse_content[i] = parse_content_requested(&op, prev_result.as_ref());
                     let op_mode = mode_for_op(i);
                     // AlwaysVerbose verbs override the caller's presentation mode.
                     let presentation_policy = self.registry.presentation_policy_for(&op.tool);
@@ -2515,11 +2536,18 @@ impl KhiveMcpServer {
                                     prev_result = result_obj.get("result").cloned();
                                     // Apply presentation to the result field only,
                                     // using the effective mode (AlwaysVerbose override honored).
+                                    let content_scope = note_content_scope(
+                                        parse_content[i],
+                                        result_obj["tool"].as_str().unwrap_or_default(),
+                                        &result_obj["result"],
+                                        &self.registry,
+                                    );
                                     let presented_obj = apply_presentation_to_result(
                                         result_obj,
                                         effective_mode,
                                         now_unix,
                                         presentation_policy,
+                                        content_scope,
                                     );
                                     results.push(presented_obj);
                                 }
@@ -2549,8 +2577,77 @@ impl KhiveMcpServer {
                     "status": batch_status(failed, aborted),
                 })
             }
+        };
+        let content_scopes = response["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, entry)| {
+                note_content_scope(
+                    parse_content[i] && entry["ok"] == true,
+                    entry["tool"].as_str().unwrap_or_default(),
+                    &entry["result"],
+                    &self.registry,
+                )
+            })
+            .collect();
+        (response, content_scopes)
+    }
+}
+
+/// Request-derived policy stays outside the public response envelope and is
+/// limited to actual note results. Caller content never supplies a policy marker.
+fn parse_content_requested(op: &ParsedOp, prev_result: Option<&Value>) -> bool {
+    matches!(op.tool.as_str(), "get" | "list")
+        && op.args.get("parse_content").and_then(|arg| match arg {
+            ArgValue::Value(value) => Some(value.clone()),
+            _ => prev_result.and_then(|prev| arg.resolve_all(prev)),
+        }) == Some(Value::Bool(true))
+}
+
+fn note_content_scope(
+    enabled: bool,
+    tool: &str,
+    result: &Value,
+    registry: &VerbRegistry,
+) -> NoteContentScope {
+    if !enabled {
+        return NoteContentScope::None;
+    }
+    let note_kinds = registry.all_note_kinds();
+    let is_note = |record: &Value| {
+        // By-ID get and broad note lists can read a persisted kind whose pack
+        // is no longer loaded. Its versioned Note shape is still a note; do not
+        // let that one row disable opacity for an otherwise ordinary note page.
+        let versioned_note = record.get("version").and_then(Value::as_u64).is_some()
+            && record.get("id").is_some_and(Value::is_string)
+            && record.get("created_at").is_some_and(Value::is_string)
+            && record.get("updated_at").is_some_and(Value::is_string);
+        record
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| note_kinds.contains(&kind) || versioned_note)
+            && record.get("content").is_some()
+    };
+    if tool == "get" && is_note(result) {
+        return NoteContentScope::Record;
+    }
+    if tool == "list" {
+        for (key, scope) in [
+            ("items", NoteContentScope::Items),
+            ("notes", NoteContentScope::Notes),
+        ] {
+            if result
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|records| !records.is_empty() && records.iter().all(is_note))
+            {
+                return scope;
+            }
         }
     }
+    NoteContentScope::None
 }
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
@@ -3044,12 +3141,15 @@ fn present_ok_envelope_or_depth_error(
     mode: PresentationMode,
     now_unix: i64,
     policy: VerbPresentationPolicy,
+    content_scope: NoteContentScope,
 ) -> Value {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
         return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
-    success.result = present_with_policy(success.result, mode, now_unix, policy);
+    success.result = content_scope.protect(success.result, |value| {
+        present_with_policy(value, mode, now_unix, policy)
+    });
     ok_envelope(tool, success)
 }
 
@@ -3101,10 +3201,13 @@ fn apply_presentation_to_result(
     mode: PresentationMode,
     now_unix: i64,
     policy: VerbPresentationPolicy,
+    content_scope: NoteContentScope,
 ) -> Value {
     if result_obj.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(result_field) = result_obj.get("result").cloned() {
-            let presented = present_with_policy(result_field, mode, now_unix, policy);
+            let presented = content_scope.protect(result_field, |value| {
+                present_with_policy(value, mode, now_unix, policy)
+            });
             if let Some(obj) = result_obj.as_object_mut() {
                 obj.insert("result".to_string(), presented);
             }
@@ -4147,7 +4250,7 @@ impl KhiveMcpServer {
                 None
             };
 
-        let mut result = self
+        let (mut result, content_scopes) = self
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
@@ -4189,7 +4292,10 @@ impl KhiveMcpServer {
             &format_per_op,
             presentation,
             &presentation_per_op,
-            &self.registry,
+            &RenderContext {
+                registry: &self.registry,
+                content_scopes: &content_scopes,
+            },
             (origin == DispatchOrigin::Daemon).then_some(self.config_id.as_str()),
         ))
     }
@@ -4333,6 +4439,12 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
     }
 }
 
+/// Registered policies and per-operation content scopes used during rendering.
+struct RenderContext<'a> {
+    registry: &'a VerbRegistry,
+    content_scopes: &'a [NoteContentScope],
+}
+
 /// Render the `run_parsed` result envelope using per-op format dispatch (ADR-078 §8.4).
 ///
 /// For each op entry in `results`:
@@ -4365,7 +4477,7 @@ fn render_result(
     format_per_op: &Option<Vec<Option<OutputFormat>>>,
     presentation: PresentationMode,
     presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
-    registry: &VerbRegistry,
+    context: &RenderContext<'_>,
     daemon_frame_config_id: Option<&str>,
 ) -> String {
     // Try to detect the compound batch envelope shape: { results: [...], summary: {...} }
@@ -4382,14 +4494,18 @@ fn render_result(
                         format_per_op,
                         presentation,
                         presentation_per_op,
-                        registry,
+                        context,
                     )
                 })
                 .collect();
             let out_map = match daemon_frame_config_id {
-                Some(config_id) => {
-                    fit_rendered_batch_envelope(map, results, out_results, config_id, registry)
-                }
+                Some(config_id) => fit_rendered_batch_envelope(
+                    map,
+                    results,
+                    out_results,
+                    config_id,
+                    context.registry,
+                ),
                 None => {
                     let mut out_map = map.clone();
                     out_map.insert("results".to_string(), Value::Array(out_results));
@@ -4429,7 +4545,7 @@ fn render_batch_entry(
     format_per_op: &Option<Vec<Option<OutputFormat>>>,
     presentation: PresentationMode,
     presentation_per_op: &Option<Vec<Option<PresentationMode>>>,
-    registry: &VerbRegistry,
+    context: &RenderContext<'_>,
 ) -> Value {
     let per_op_format = format_per_op
         .as_ref()
@@ -4448,7 +4564,8 @@ fn render_batch_entry(
         .unwrap_or(presentation);
     let effective_presentation = match entry.get("tool").and_then(Value::as_str) {
         Some(tool)
-            if registry.presentation_policy_for(tool) == VerbPresentationPolicy::AlwaysVerbose =>
+            if context.registry.presentation_policy_for(tool)
+                == VerbPresentationPolicy::AlwaysVerbose =>
         {
             PresentationMode::Verbose
         }
@@ -4469,10 +4586,25 @@ fn render_batch_entry(
     let Some(result) = fields.remove("result") else {
         return rendered_entry;
     };
+    let content_scope = context
+        .content_scopes
+        .get(index)
+        .copied()
+        .unwrap_or_default();
     let formatted = if per_op_format == OutputFormat::Json {
-        prepare_format_value(result, per_op_format, effective_presentation)
+        prepare_format_value_with_note_content(
+            result,
+            per_op_format,
+            effective_presentation,
+            content_scope,
+        )
     } else {
-        Value::String(render_format(result, per_op_format, effective_presentation))
+        Value::String(render_format_with_note_content(
+            result,
+            per_op_format,
+            effective_presentation,
+            content_scope,
+        ))
     };
     fields.insert("result".to_string(), formatted);
     rendered_entry
@@ -4938,16 +5070,16 @@ mod tests {
         encode_backend_topology, ensure_bridge_request_id, entry_escaped_len, envelope_escaped_len,
         envelope_metadata, envelope_metadata_escaped_len, execute_bounded_batch,
         fit_rendered_batch_envelope, format_served_kinds_suffix, frame_budget_omission,
-        ok_envelope, parallel_batch_envelope, present_ok_envelope_or_depth_error, render_result,
-        rendered_response_daemon_frame_len, rendered_response_fits_daemon_frame,
-        request_read_timeout, result_exceeds_depth_limit, runtime_error_value,
-        scope_mcp_request_read_cancellation, search_diagnostic_value, search_diagnostic_wire_len,
-        search_retry_after_ms, serialize_response_value, serialized_response_len,
-        BackendErrorDiagnostic, BatchTask, DispatchOrigin, KhiveMcpServer, OpSuccess,
-        RunParsedContext, SearchArmEvidence, SearchArmParticipation, SearchArmStatus,
-        SearchDegradation, SearchStatus, BATCH_RESPONSE_BUDGET_BYTES, MAX_BACKEND_ERROR_ENTRIES,
-        MAX_BACKEND_ERROR_KEY_CHARS, MAX_BACKEND_ERROR_MESSAGE_CHARS, MAX_BATCH_CONCURRENCY,
-        MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP, MISSING_BACKEND_ERROR_MESSAGE,
+        note_content_scope, ok_envelope, parallel_batch_envelope,
+        present_ok_envelope_or_depth_error, render_result, rendered_response_daemon_frame_len,
+        rendered_response_fits_daemon_frame, request_read_timeout, result_exceeds_depth_limit,
+        runtime_error_value, scope_mcp_request_read_cancellation, search_diagnostic_value,
+        search_diagnostic_wire_len, search_retry_after_ms, serialize_response_value,
+        serialized_response_len, BackendErrorDiagnostic, BatchTask, DispatchOrigin, KhiveMcpServer,
+        OpSuccess, RenderContext, RunParsedContext, SearchArmEvidence, SearchArmParticipation,
+        SearchArmStatus, SearchDegradation, SearchStatus, BATCH_RESPONSE_BUDGET_BYTES,
+        MAX_BACKEND_ERROR_ENTRIES, MAX_BACKEND_ERROR_KEY_CHARS, MAX_BACKEND_ERROR_MESSAGE_CHARS,
+        MAX_BATCH_CONCURRENCY, MAX_SEARCH_DIAGNOSTIC_BYTES_PER_OP, MISSING_BACKEND_ERROR_MESSAGE,
     };
     #[cfg(unix)]
     use super::{stdio_serve_mode_for, ForwardFuture, StdioServeMode};
@@ -4956,6 +5088,7 @@ mod tests {
     };
     use crate::tools::request::RequestParams;
     use khive_request::{parse_request, ExecutionMode, TypedJsonOp};
+    use khive_runtime::presentation::NoteContentScope;
     use khive_runtime::{
         render_format, DomainDisposition, KhiveRuntime, Namespace, OutputFormat, PresentationMode,
         RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
@@ -8685,7 +8818,10 @@ mod tests {
             &None,
             PresentationMode::Agent,
             &None,
-            &large_result_test_server().registry,
+            &RenderContext {
+                registry: &large_result_test_server().registry,
+                content_scopes: &[],
+            },
             Some("test"),
         );
         let rendered_value: Value = serde_json::from_str(&rendered).expect("response envelope");
@@ -9704,6 +9840,7 @@ mod tests {
             PresentationMode::Agent,
             0,
             khive_types::VerbPresentationPolicy::Standard,
+            NoteContentScope::None,
         );
         assert_eq!(envelope["ok"], json!(false));
         assert_eq!(envelope["tool"], json!("context"));
@@ -9720,6 +9857,7 @@ mod tests {
             PresentationMode::Verbose,
             0,
             khive_types::VerbPresentationPolicy::Standard,
+            NoteContentScope::None,
         );
         assert_eq!(envelope["ok"], json!(true));
         assert_eq!(
@@ -9766,6 +9904,7 @@ mod tests {
             PresentationMode::Agent,
             0,
             khive_types::VerbPresentationPolicy::Standard,
+            NoteContentScope::None,
         );
 
         assert_eq!(envelope["ok"], json!(true));
@@ -9814,7 +9953,7 @@ mod tests {
         let parsed = parse_request(&dsl).expect("each op's own args stay shallow; DSL must parse");
         assert_eq!(parsed.mode, ExecutionMode::Chain);
 
-        let response = server
+        let (response, _) = server
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
@@ -9888,7 +10027,7 @@ mod tests {
         let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
 
         let parsed = parse_request(&params.ops).expect("literal newline inside quotes must parse");
-        let response = server
+        let (response, _) = server
             .run_parsed(
                 parsed.ops,
                 parsed.mode,
@@ -10995,6 +11134,39 @@ mod tests {
         assert_eq!(
             parsed["status"], "partial",
             "a chain with an aborted op must report status=partial; got {parsed}"
+        );
+    }
+    #[test]
+    fn issue2757_note_scope_handles_persisted_kinds_without_payload_markers() {
+        let server = large_result_test_server();
+        let note = json!({
+            "id":"11111111-1111-4111-8111-111111111111", "kind":"unloaded_pack_note",
+            "version":1, "created_at":"2026-09-15T12:00:00Z", "updated_at":"2026-09-15T12:00:00Z",
+            "content":null,
+        });
+        assert_eq!(
+            note_content_scope(true, "get", &note, &server.registry),
+            NoteContentScope::Record
+        );
+        let page = json!({"items":[note], "requested_limit":20, "effective_limit":20, "limit_clamped":false});
+        assert_eq!(
+            note_content_scope(true, "list", &page, &server.registry),
+            NoteContentScope::Items
+        );
+        assert_eq!(
+            note_content_scope(false, "list", &page, &server.registry),
+            NoteContentScope::None
+        );
+        assert_eq!(
+            note_content_scope(true, "search", &page, &server.registry),
+            NoteContentScope::None
+        );
+        let entity = json!({"id":"entity", "kind":"concept", "properties":{
+            "parse_content":true, "content":page, "kind":"observation", "version":1,
+        }});
+        assert_eq!(
+            note_content_scope(true, "get", &entity, &server.registry),
+            NoteContentScope::None
         );
     }
 }
@@ -12187,6 +12359,7 @@ mod issue_2537_tests {
                 PresentationMode::Agent,
                 1_767_225_780,
                 policy,
+                NoteContentScope::None,
             );
             let canonical = ok_envelope(tool.into(), OpSuccess::complete(payload.clone()));
             let chained = apply_presentation_to_result(
@@ -12194,6 +12367,7 @@ mod issue_2537_tests {
                 PresentationMode::Agent,
                 1_767_225_780,
                 policy,
+                NoteContentScope::None,
             );
             for result in [parallel, chained] {
                 assert_eq!(result["result"]["results"][0]["updated_at"], expected);
@@ -12256,7 +12430,8 @@ mod issue_2537_tests {
                 whole.clone(),
                 PresentationMode::Agent,
                 0,
-                VerbPresentationPolicy::StreamBatchReceipts
+                VerbPresentationPolicy::StreamBatchReceipts,
+                NoteContentScope::None,
             ),
             whole
         );
@@ -12266,7 +12441,8 @@ mod issue_2537_tests {
                 nested,
                 PresentationMode::Agent,
                 0,
-                VerbPresentationPolicy::StreamBatchReceipts
+                VerbPresentationPolicy::StreamBatchReceipts,
+                NoteContentScope::None,
             )["result"]["results"][0]["error"]["details"]["updated_at"],
             "2026-01-01T00:00"
         );
@@ -12296,6 +12472,7 @@ mod issue_2537_tests {
             PresentationMode::Agent,
             0,
             VerbPresentationPolicy::StreamAppendReceipt,
+            NoteContentScope::None,
         );
         assert_eq!(parallel["ok"], false);
         assert_eq!(parallel["error"]["kind"], "result_too_deep");

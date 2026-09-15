@@ -5,7 +5,9 @@ use khive_storage::note::{NoteFilter, NoteKeyCursor};
 use khive_storage::PageRequest;
 use serde_json::Value;
 
-use super::common::{normalize_entity_timestamps, remap_note_status, to_json, ListParams};
+use super::common::{
+    normalize_entity_timestamps, parse_note_content, remap_note_status, to_json, ListParams,
+};
 use super::list::{add_list_limit_metadata, note_matches_list_filters, render_list_response};
 
 pub(super) fn note_filter(p: &ListParams, kind: Option<&str>) -> Result<NoteFilter, RuntimeError> {
@@ -154,6 +156,7 @@ pub(super) async fn list_keyed_notes(
             to_json(note)
                 .map(normalize_entity_timestamps)
                 .map(remap_note_status)
+                .and_then(|note| parse_note_content(note, p.parse_content))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut response = if p.offset.is_some() {
