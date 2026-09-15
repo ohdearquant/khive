@@ -73,3 +73,38 @@ that can be scheduled from dependency diagnostics.
 The query path batches live blocker reads and probes only unresolved ids for a
 soft-deleted row. A hard-deleted blocker therefore classifies as `missing`,
 while a tombstone classifies as `soft_deleted` without resurrecting it.
+
+## Proposed additive `gtd.tasks` filters (#2678)
+
+This section implements the proposed ADR-019 Amendment 3; its contract approval
+is pending. `gtd.tasks` additionally accepts:
+
+- `tags`: array of strings, using SQLite `NOCASE` tag membership (ASCII
+  case-insensitive, not general Unicode case folding). Missing, null, or empty
+  tags add no restriction. Duplicate tags do not duplicate rows.
+- `tag_mode`: `any` (default, also for null) or `all`. Any-of requires at least
+  one requested tag; all-of requires every requested tag. With no tags, either
+  mode adds no restriction. Invalid modes or malformed tag arrays are refused.
+- `context_entity_id`: a complete UUID spelling accepted by the UUID parser,
+  canonicalized to lowercase dashed form and compared with the stored task
+  property. Missing/null adds no restriction. Short prefixes, malformed UUIDs,
+  and non-string values are refused. This is a stored-reference comparison,
+  with no entity lookup: a retained reference can match after its anchor is
+  deleted, and an unused UUID yields no matches. Historical noncanonical stored
+  strings are not rewritten or treated as canonical equivalents.
+
+These filters combine with namespace, status, assignee, and priority using AND.
+Explicit namespace routing remains precise; default reads keep the configured
+visible task namespaces. The context parameter does not impose an additional
+primary-namespace entity check.
+
+Both tags and context become storage predicates before `PageRequest` limit and
+offset. Newer nonmatching tasks cannot consume a filtered page. The one-row
+excluded-status probe clones the same complete filter and changes only status,
+so unrelated terminal tasks cannot produce an exclusion hint. No caller-defined
+SQL or JSON path is accepted.
+
+No filters preserves the current behavior: default limit 50, limits clamped to
+1–200, stable `created_at DESC, id ASC` order, ordinary array responses, and the
+existing special empty `tasks`/`filter_excluded` object only when a matching
+excluded task exists. Dependency diagnostics and timestamps are unchanged.

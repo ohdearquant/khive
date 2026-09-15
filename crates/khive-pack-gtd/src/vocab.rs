@@ -256,7 +256,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
     // signal and the default-filter rule are khive #96.
     HandlerDef {
         name: "gtd.tasks",
-        description: "List tasks filtered by status, assignee, priority. DEFAULT (no `status` \
+        description: "List tasks filtered by status, assignee, priority, tags and context. DEFAULT (no `status` \
                        given): includes canonical open states and the legacy missing/non-text \
                        inbox fallback; excludes terminal and unrecognized stored statuses so the default \
                        listing shows only active work. Pass status=\"done\" or \
@@ -291,6 +291,27 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Filter by priority: p0 | p1 | p2 | p3.",
                 resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Filter by tag membership using SQLite NOCASE (ASCII case-insensitive). Omitted, null or empty tags add no restriction; duplicate tags do not duplicate rows.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "tag_mode",
+                param_type: "string",
+                required: false,
+                description: "Tag combination: any (default, including null) or all. With no tags either mode adds no restriction. Combines with other filters before pagination.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "context_entity_id",
+                param_type: "uuid",
+                required: false,
+                description: "Compare the canonical lowercase dashed UUID with the stored task context reference. Omitted or null adds no restriction. No entity lookup is required; retained references still match after the context entity is deleted.",
+                resolution_mode: IdResolutionMode::UnscopedFullUuidOnly,
             },
             ParamDef {
                 name: "limit",

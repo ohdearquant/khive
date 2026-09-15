@@ -369,3 +369,62 @@ async fn transition_writes_status_column() {
         "notes.status column must be 'next' after transition (Fix 3); got: {status}"
     );
 }
+
+#[tokio::test]
+async fn issue_2678_task_filter_metadata_and_public_help_match_the_query_contract() {
+    use khive_runtime::pack::IdResolutionMode;
+    let fixture = pack(rt());
+    let verbs = fixture.verbs();
+    let tasks = verbs
+        .iter()
+        .find(|handler| handler.name == "gtd.tasks")
+        .unwrap();
+    for (name, kind) in [
+        ("tags", "array of string"),
+        ("tag_mode", "string"),
+        ("context_entity_id", "uuid"),
+    ] {
+        let param = tasks
+            .params
+            .iter()
+            .find(|param| param.name == name)
+            .expect("new filter must be advertised");
+        assert_eq!(param.param_type, kind);
+        assert!(!param.required);
+        if name == "context_entity_id" {
+            assert!(matches!(
+                param.resolution_mode,
+                IdResolutionMode::UnscopedFullUuidOnly
+            ));
+        }
+    }
+    let described = fixture.registry.describe_verb("gtd.tasks").unwrap();
+    let public_help = fixture
+        .dispatch("gtd.tasks", json!({"help": true}))
+        .await
+        .unwrap();
+    assert_eq!(public_help, described);
+    let params = public_help["params"].as_array().unwrap();
+    let description = |name: &str| {
+        params.iter().find(|param| param["name"] == name).unwrap()["description"]
+            .as_str()
+            .unwrap()
+    };
+    assert!(description("tags").contains("NOCASE"));
+    assert!(description("tags").contains("empty"));
+    assert!(description("tag_mode").contains("any") && description("tag_mode").contains("all"));
+    assert!(description("context_entity_id").contains("full UUID only, unscoped"));
+    assert!(description("context_entity_id").contains("deleted"));
+    assert!(!description("context_entity_id").contains("scoped to primary namespace"));
+    let schema = &public_help["input_schema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["properties"]["tags"]["type"], "array");
+    assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
+    assert_eq!(schema["properties"]["tag_mode"]["type"], "string");
+    assert_eq!(schema["properties"]["context_entity_id"]["type"], "string");
+    assert_eq!(schema["properties"]["context_entity_id"]["format"], "uuid");
+    let required = schema["required"].as_array().unwrap();
+    for name in ["tags", "tag_mode", "context_entity_id"] {
+        assert!(!required.contains(&json!(name)), "{name} stays optional");
+    }
+}
