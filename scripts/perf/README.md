@@ -157,20 +157,33 @@ git show origin/perf-data:bench-data/components.jsonl | tail -20
 
 ## CI wiring (`bench-track.yml`)
 
-Triggers: push to `main` (path-filtered to `crates/**`, `scripts/perf/**`,
-the workflow file itself - never a docs-only push), nightly cron, and
-`workflow_dispatch`. Never runs on `pull_request` - no bench work rides a
-PR. Two jobs:
+Pushes to `main` and release tags run the full component and e2e suite.
+Pull requests select only components affected by changed crate paths or
+shared benchmark infrastructure.
 
-- **`components`** - compile-checks every Criterion target
-  (`cargo bench --workspace --all-targets --no-run`), then runs them with
-  `--quick` under a `timeout`, bounded to fit the ~15 minute budget with
-  `Swatinem/rust-cache` warm.
+- **Component jobs** compile-check their selected packages with
+  `cargo bench -p <package> --benches --no-run`, then run those targets with
+  `--quick` under a ten-minute timeout. Compilation has a separate bound
+  that reserves time for benchmarking, termination and publication.
 - **`e2e`** - runs the pipeline daemon suite (via `bench_calibrate.py`'s
   `pipeline` extractor) and the hermetic `bench-1m --ci-synthetic` gate as a
   single informational data point each.
 
-Both jobs upload their raw output (Criterion trees / bench JSON / CSV
+All benchmark jobs upload their raw output (Criterion trees / bench JSON / CSV
 ledgers) as a 90-day-retention build artifact, write the rendered trend
 markdown to `$GITHUB_STEP_SUMMARY`, and are skipped entirely if the
 repository variable `BENCH_TRACK_DISABLED` is set to `true`.
+
+Component compile or benchmark failure is reported after publication.
+Partial Criterion estimates remain in the ledger, alongside the process
+`gate_exit_code` and `gate_status`; a run with no estimates produces a
+`status=error` record carrying that same exit code. A failed component's
+outcome survives aggregation with successful components from the same run.
+Push runs publish ledgers to `perf-data`; PR runs retain them in artifacts.
+Metric changes themselves remain advisory and do not fail a component job.
+
+The Criterion ledger identifies group/function paths, not Cargo benchmark
+binaries. It rejects an entirely empty estimate tree, but cannot yet prove
+that every compiled binary reported timings. Such a census needs explicit
+binary-to-metric provenance; comparing binary and metric counts would be
+incorrect because one binary can emit many groups and functions.

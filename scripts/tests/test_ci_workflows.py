@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -174,7 +175,7 @@ class BenchTrackWorkflowTests(unittest.TestCase):
                 "      - name:", 1
             )[0]
             script = textwrap.dedent(step.split("        run: |\n", 1)[1])
-            for rc in (0, 124, 137):
+            for rc in (0, 7, 124, 137):
                 with (
                     self.subTest(phase=phase, rc=rc),
                     tempfile.TemporaryDirectory() as tmp,
@@ -227,8 +228,135 @@ class BenchTrackWorkflowTests(unittest.TestCase):
                     )
                     if rc:
                         self.assertIn("::warning::", result.stdout)
-                    if phase == "compile":
-                        self.assertEqual(output.read_text(), f"exit_code={rc}\n")
+                    self.assertEqual(output.read_text(), f"exit_code={rc}\n")
+
+    def test_component_publishes_partial_or_error_evidence_before_failing(self):
+        workflow = workflow_text("bench-component.yml")
+
+        def step(name):
+            return workflow.split(f"      - name: {name}\n", 1)[1].split(
+                "      - name:", 1
+            )[0]
+
+        def script(name):
+            block = step(name)
+            if "        run: |\n" in block:
+                return textwrap.dedent(block.split("        run: |\n", 1)[1])
+            return block.split("        run: ", 1)[1].splitlines()[0]
+
+        compile_name = "Compile-check this component's bench targets"
+        criterion_name = "Run Criterion benches (quick profile, bounded to 10 minutes)"
+        record_name = "Record component trend ledger entry"
+        publish_name = "Publish ledger to perf-data branch"
+        artifact_name = "Upload raw Criterion output"
+        final_name = "Report benchmark failures after publication"
+        names = [compile_name, criterion_name, record_name, publish_name, artifact_name, final_name]
+        positions = [workflow.index(f"      - name: {name}\n") for name in names]
+        self.assertEqual(positions, sorted(positions), "failure must follow both publication steps")
+        self.assertIn("id: criterion", step(criterion_name))
+        for name in (record_name, final_name):
+            self.assertIn("if: ${{ !cancelled() }}", step(name))
+            self.assertIn("COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}", step(name))
+            self.assertIn("CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}", step(name))
+        self.assertIn("if: always()", step(artifact_name))
+        for evidence_path in (
+            "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
+        ):
+            self.assertIn(evidence_path, step(artifact_name))
+        self.assertIn("github.event_name == 'push'", step(publish_name))
+
+        # Execute the workflow's real shell and real recorder. Only the native
+        # benchmark, remote publisher and upload service are fixture boundaries.
+        for compile_rc, criterion_rc, estimates in [
+            (0, 0, True), (0, 7, True), (0, 124, True), (0, 137, True),
+            (0, 7, False), (124, None, False),
+            (0, None, True), (0, None, False),
+        ]:
+            with self.subTest(compile=compile_rc, criterion=criterion_rc, estimates=estimates):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    work = root / "crates"
+                    work.mkdir()
+                    bins = root / "bin"
+                    bins.mkdir()
+                    timeout = bins / "timeout"
+                    timeout.write_text('#!/bin/sh\nexit "$FAKE_RC"\n')
+                    timeout.chmod(0o755)
+                    publisher = root / "scripts/perf/publish_ledger.sh"
+                    publisher.parent.mkdir(parents=True)
+                    publisher.write_text(
+                        'set -eu\nmkdir published\ncp "$1" published/components.jsonl\n'
+                        'echo publish >> "$ORDER_LOG"\n'
+                    )
+                    env = {
+                        **os.environ,
+                        "PATH": f"{bins}:{os.environ['PATH']}",
+                        "COMPONENT_CRATES": "khive-pack-knowledge",
+                        "COMPONENT_JOB_MINUTES": "40",
+                        "GITHUB_OUTPUT": str(root / "output"),
+                        "GITHUB_STEP_SUMMARY": str(root / "summary"),
+                        "GITHUB_SHA": "a" * 40,
+                        "GITHUB_REF_NAME": "main",
+                        "GITHUB_RUN_ID": "fixture-run",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "ORDER_LOG": str(root / "order"),
+                        "FAKE_RC": str(compile_rc),
+                    }
+
+                    def run(name, cwd=root):
+                        command = script(name).replace(
+                            "python3 scripts/perf/bench_track.py",
+                            shlex.join([sys.executable, str(REPO_ROOT / "scripts/perf/bench_track.py")]),
+                        ).replace("/tmp/components-trend.md", str(root / "trend.md"))
+                        return subprocess.run(
+                            ["bash", "-c", command], cwd=cwd, env=env,
+                            capture_output=True, text=True, timeout=10, check=False,
+                        )
+
+                    result = run(compile_name, work)
+                    self.assertEqual(result.returncode, compile_rc, result.stderr)
+                    env["COMPILE_EXIT_CODE"] = (root / "output").read_text().strip().split("=")[1]
+                    env["CRITERION_EXIT_CODE"] = ""
+                    if compile_rc == 0:
+                        if estimates:
+                            estimate = work / "target/criterion/fixture/before_failure/new/estimates.json"
+                            estimate.parent.mkdir(parents=True)
+                            estimate.write_text(json.dumps({"mean": {"point_estimate": 42.0}}))
+                        if criterion_rc is not None:
+                            env["FAKE_RC"] = str(criterion_rc)
+                            (root / "output").unlink()
+                            result = run(criterion_name, work)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            env["CRITERION_EXIT_CODE"] = (root / "output").read_text().strip().split("=")[1]
+
+                    result = run(record_name)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run(publish_name)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # upload-artifact is an external action: retain its configured
+                    # local evidence here before executing the final workflow step.
+                    artifact = root / "artifact"
+                    artifact.mkdir()
+                    shutil.copy(root / "component-phases.log", artifact)
+                    shutil.copy(root / "bench-data/components.jsonl", artifact)
+                    if estimates:
+                        shutil.copytree(work / "target/criterion", artifact / "criterion")
+                    with (root / "order").open("a") as order:
+                        order.write("artifact\n")
+
+                    result = run(final_name)
+                    expected_rc = compile_rc or (criterion_rc if criterion_rc is not None else 1)
+                    self.assertEqual(result.returncode, expected_rc, result.stderr)
+                    self.assertEqual((root / "order").read_text(), "publish\nartifact\n")
+                    self.assertEqual(
+                        (root / "published/components.jsonl").read_bytes(),
+                        (artifact / "components.jsonl").read_bytes(),
+                    )
+                    record = json.loads((artifact / "components.jsonl").read_text())
+                    self.assertEqual(record["gate_exit_code"], expected_rc)
+                    self.assertEqual(record["gate_status"], "fail" if expected_rc else "pass")
+                    self.assertEqual(record["status"], "ok" if estimates else "error")
+                    self.assertEqual(bool(record["metrics"]), estimates)
 
     def test_component_compile_failure_still_reaches_diagnostics(self):
         workflow = workflow_text("bench-component.yml")

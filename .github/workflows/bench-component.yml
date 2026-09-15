@@ -70,12 +70,13 @@ jobs:
           exit "$rc"
 
       - name: Run Criterion benches (quick profile, bounded to 10 minutes)
+        id: criterion
         if: steps.compile.outcome == 'success'
         working-directory: crates
         env:
           COMPONENT_CRATES: ${{ inputs.crates }}
-        # This is an advisory tracker. Preserve every estimate produced before
-        # a benchmark assertion or the wall-clock bound terminates the pass.
+        # Preserve every estimate before reporting execution failure. Trend
+        # values remain advisory; a panic or timeout is a failed benchmark run.
         run: |
           set -euo pipefail
           pkg_args=()
@@ -87,12 +88,22 @@ jobs:
           # can leave timeout waiting forever for a benchmark that ignores it.
           timeout --kill-after=30s 600 cargo bench "${pkg_args[@]}" --benches -- --quick || rc=$?
           echo "phase=criterion elapsed_seconds=$SECONDS exit_code=$rc" | tee -a ../component-phases.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then echo "::warning::Criterion pass failed or timed out (exit $rc); retaining partial estimates"; fi
+          exit 0
 
       - name: Record component trend ledger entry
         id: record
+        if: ${{ !cancelled() }}
+        env:
+          COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}
+          CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}
         run: |
           set +e
+          bench_exit_code="${COMPILE_EXIT_CODE:-1}"
+          if [ "$bench_exit_code" -eq 0 ]; then
+            bench_exit_code="${CRITERION_EXIT_CODE:-1}"
+          fi
           python3 scripts/perf/bench_track.py record \
             --suite components \
             --source criterion \
@@ -101,6 +112,7 @@ jobs:
             --branch "$GITHUB_REF_NAME" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --gate-exit-code "$bench_exit_code" \
             --data-dir bench-data \
             --summary-out /tmp/components-trend.md
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
@@ -160,3 +172,19 @@ jobs:
             echo "::warning::tracking-issue comment failed (non-fatal)"
           fi
           exit 0
+
+      - name: Report benchmark failures after publication
+        if: ${{ !cancelled() }}
+        env:
+          COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}
+          CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          if [ "${COMPILE_EXIT_CODE:-1}" -ne 0 ]; then
+            echo "::error::Component compile failed or timed out (exit ${COMPILE_EXIT_CODE:-1}); diagnostic publication was attempted"
+            exit "${COMPILE_EXIT_CODE:-1}"
+          fi
+          if [ "${CRITERION_EXIT_CODE:-1}" -ne 0 ]; then
+            echo "::error::Criterion failed or timed out (exit ${CRITERION_EXIT_CODE:-1}); diagnostic publication was attempted"
+            exit "${CRITERION_EXIT_CODE:-1}"
+          fi

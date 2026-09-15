@@ -341,6 +341,7 @@ def build_error_record(
     error: str,
     run_id: str = "local",
     run_attempt: str = "1",
+    gate_exit_code: int | None = None,
 ) -> dict:
     """A build/extraction failure still gets a ledger row - `status: "error"`,
     empty metrics, and the failure message - instead of raising before
@@ -359,8 +360,8 @@ def build_error_record(
         "host": host_fingerprint(),
         "status": "error",
         "error": error,
-        "gate_exit_code": None,
-        "gate_status": None,
+        "gate_exit_code": gate_exit_code,
+        "gate_status": None if gate_exit_code is None else ("pass" if gate_exit_code == 0 else "fail"),
     }
 
 
@@ -441,6 +442,10 @@ def _aggregate_shards(records: list[dict]) -> list[dict]:
             if rec.get("status") == "error" and agg.get("status") != "error":
                 agg["status"] = "error"
                 agg["error"] = rec.get("error")
+            # A failed component must stay visible when another shard succeeds.
+            if rec.get("gate_status") == "fail" or agg.get("gate_status") is None:
+                agg["gate_exit_code"] = rec.get("gate_exit_code")
+                agg["gate_status"] = rec.get("gate_status")
     return [merged[key] for key in order]
 
 
@@ -546,7 +551,10 @@ def _cmd_record(args: argparse.Namespace) -> int:
         # error record FIRST, then surface the failure so the workflow step
         # still goes red.
         message = str(exc.code) if isinstance(exc, SystemExit) else str(exc)
-        error_record = build_error_record(args.suite, sha, branch, message, run_id=run_id, run_attempt=run_attempt)
+        error_record = build_error_record(
+            args.suite, sha, branch, message, run_id=run_id,
+            run_attempt=run_attempt, gate_exit_code=args.gate_exit_code,
+        )
         path = append_record(error_record, data_dir)
         print(
             f"[bench_track] build/extraction FAILED for suite={args.suite} sha={sha[:8]} "

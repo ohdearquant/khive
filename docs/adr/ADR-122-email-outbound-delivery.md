@@ -162,6 +162,51 @@ registration claim. In particular:
   `email-channel` and `email-outbound` remain separately addressable health
   identities.
 
+## Amendment 1 (2026-09-15): classify an AUTH failure by its credential, not by its stage
+
+The error taxonomy above classifies "definitive authentication errors" as component-level
+`Permanent`, which under [ADR-119](ADR-119-daemon-component-supervision.md) is terminal `Unhealthy`
+with no restart and no backoff. ADR-119 defines `Permanent` as a condition that **cannot change
+within the process lifetime**. Those are two different questions, and in this channel they come
+apart.
+
+The credentials are read once at boot: `client_id`, `tenant_id` and `client_secret` come from
+`std::env::var` in `EmailChannelConfig::from_env` (`crates/khive-channel-email/src/config.rs:227`).
+Those are process-lifetime constants, and a failure attributable to them answers ADR-119's question
+with "cannot change". The access token is not: it is cached with an expiry and refreshed in process
+(`crates/khive-channel-email/src/oauth.rs:150`, `:171`), so a rejection of a token that was
+successfully minted describes a condition a refresh can change without restarting anything.
+
+So the classification keys on which credential failed:
+
+| Failure                                                  | Cannot change in-process? | Classification                                                    |
+| -------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------- |
+| Token endpoint refuses the configured client credentials | yes                       | `Permanent`                                                       |
+| SMTP AUTH rejects a token that was successfully minted   | no                        | `Retryable`                                                       |
+| Post-auth per-message 5xx                                | —                         | unchanged: `delivery = "failed"` on that note, draining continues |
+
+Nothing else moves. A retryable AUTH failure consumes restart budget like any other retryable
+failure, and budget exhaustion is terminal `Unhealthy` that MUST NOT hot-loop, which is what bounds
+an authentication that keeps failing. No probe entrypoint and no rearm call is added: ADR-119's
+restart budget already is the bounded retry, and a second mechanism for it would be the surface
+nobody exercises. No credential reload path is added either — that would change what `Permanent`
+means for every ADR-119 component, which is a larger decision than this one.
+
+Component status stays operator-local structured logging and metrics. ADR-119 requires a separate
+additive decision for any public introspection surface, and this amendment does not make one.
+
+### Acceptance
+
+Three arms differing only in which credential fails, so an implementation that keeps the
+stage-based classification fails two of them:
+
+- An AUTH rejection of a minted token consumes one restart-budget unit, and delivery resumes after
+  a successful refresh with no daemon restart.
+- An AUTH rejection a refresh cannot fix exhausts the budget and the component goes terminal
+  `Unhealthy` without hot-looping.
+- A token-endpoint refusal of the configured client credentials is `Permanent` and terminal on the
+  first occurrence, with no budget consumed.
+
 ## Consequences
 
 - Operator-configured-recipient email delivery works, including the backlog written
