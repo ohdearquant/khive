@@ -203,6 +203,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "parse_content",
+                param_type: "boolean",
+                required: false,
+                description: "Default false. For returned notes only, parse content as JSON (object, array, number, boolean, string, or null). Invalid JSON refuses and names the note id and content field. Omitted/false preserve existing bytes. Storage, metadata and pagination are unchanged. JSON/auto preserve parsed values; table stringifies objects and arrays for display.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef { name: "key", param_type: "string", required: false, description: "Live note key in the caller's primary namespace; excludes id and include_deleted=true. With no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "kind", param_type: "string", required: false, description: "Optional note substrate or registered note-kind hint for key lookup only.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_kind", param_type: "string", required: false, description: "Optional registered note kind for key lookup, disambiguating the same key across note kinds.", resolution_mode: IdResolutionMode::NotApplicable },
@@ -241,6 +248,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "parse_content",
+                param_type: "boolean",
+                required: false,
+                description: "Default false. For returned notes only, parse content as JSON (object, array, number, boolean, string, or null). Invalid JSON refuses and names the note id and content field. Omitted/false preserve existing bytes. Storage, metadata and pagination are unchanged. JSON/auto preserve parsed values; table stringifies objects and arrays for display.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef { name: "key_prefix", param_type: "string", required: false, description: "Notes only, primary namespace: literal prefix over non-null keys; empty selects all keyed notes. Order is updated_at DESC, key DESC, id ASC. Cursor pages return notes and an opaque next_after; explicit offset retains the items envelope.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "after_key", param_type: "string", required: false, description: "Keyed notes only: resume after this live key's current position even when its row fails other filters. Excludes after and offset. Missing fails with after_key_missing; ambiguous kind fails with key_ambiguous.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },

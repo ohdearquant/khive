@@ -54,6 +54,8 @@ pub(crate) struct CreateParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
+    #[serde(default)]
+    pub(crate) parse_content: bool,
     pub(crate) id: Option<String>,
     pub(crate) key: Option<String>,
     pub(crate) kind: Option<String>,
@@ -64,6 +66,8 @@ pub(crate) struct GetParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListParams {
+    #[serde(default)]
+    pub(crate) parse_content: bool,
     pub(crate) kind: String,
     pub(crate) limit: Option<u32>,
     pub(crate) offset: Option<u32>,
@@ -343,6 +347,8 @@ pub(crate) struct WithdrawParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListProposalsParams {
+    #[serde(default, rename = "parse_content")]
+    pub(crate) _parse_content: bool,
     pub(crate) status: Option<String>,
     pub(crate) proposer: Option<String>,
     pub(crate) actor: Option<String>,
