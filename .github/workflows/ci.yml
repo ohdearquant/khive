@@ -107,14 +107,28 @@ jobs:
       # fail-fast on, the first red shard cancelled its siblings and the Clippy
       # step on the Linux shard did not run whenever another arm was red first.
       fail-fast: false
+      # The workspace test suite is nextest-partitioned 2-way per OS (see the
+      # "Workspace tests" step below). Every other phase in this job is gated to
+      # shard 1 so it still runs exactly once per OS — shard 2 exists only to
+      # carry the second test partition, not a second copy of lint/clippy/
+      # release/etc.
+      #
+      # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
+      # macos-pr step is gated `matrix.shard == 1`, so there is no second
+      # partition for macOS shard 2 to carry: it runs the one ungated
+      # placeholder scan and nothing else, in ~48s, while holding a macOS
+      # runner slot whose median queue time is 34.5 minutes against 0.1 for
+      # ubuntu. Pull requests therefore enumerate three jobs and leave that
+      # slot to a job that tests something. Push, nightly and manually
+      # dispatched runs are CI_SUITE == 'full', where macOS shard 2 does carry
+      # a real partition, so they keep all four.
+      #
+      # Written as an explicit include list rather than an `exclude` expression
+      # so both branches name every job they produce.
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # The workspace test suite is nextest-partitioned 2-way per OS (see the
-        # "Workspace tests" step below). Every other phase in this job is gated
-        # to shard 1 so it still runs exactly once per OS — shard 2 exists only
-        # to carry the second test partition, not a second copy of lint/clippy/
-        # release/etc.
-        shard: [1, 2]
+        include: ${{ fromJSON(github.event_name == 'pull_request'
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1}]'
+          || '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1},{"os":"macos-latest","shard":2}]') }}
     defaults:
       run:
         working-directory: crates
