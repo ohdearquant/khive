@@ -22,7 +22,9 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.8.0", path = "../khive-db" }

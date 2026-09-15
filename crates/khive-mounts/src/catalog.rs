@@ -1,23 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use khive_runtime::{mount_config::MountConfig, mounted_verb::MountedVerb};
+use khive_types::canonical_json_bytes;
 use serde_json::{json, Value};
 
 use crate::error::Failure;
-
-pub(crate) fn canonical(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted: BTreeMap<_, _> = map
-                .iter()
-                .map(|(key, value)| (key.clone(), canonical(value)))
-                .collect();
-            serde_json::to_value(sorted).expect("JSON values serialize")
-        }
-        Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
-        _ => value.clone(),
-    }
-}
 
 fn local_references(value: &Value) -> bool {
     match value {
@@ -86,7 +73,7 @@ pub(crate) fn pin(
             validate_schema(schema)?;
         }
         let definition = json!({"name": tool.name, "description": description, "inputSchema": input, "outputSchema": output});
-        let bytes = serde_json::to_vec(&canonical(&definition)).expect("JSON values serialize");
+        let bytes = canonical_json_bytes(&definition).expect("JSON values serialize");
         pins.push(MountedVerb {
             name: tool.name.clone(),
             description,
@@ -134,6 +121,20 @@ mod tests {
             timeout_ms: 30000,
         }
     }
+    #[test]
+    fn catalog_pin_preserves_canonical_definition_bytes() {
+        let tool = json!({
+            "name":"A", "description":"one",
+            "inputSchema":{"type":"object", "properties":{"x":{"type":"string"}}},
+            "outputSchema":{"type":"object"}
+        });
+        let expected = br#"{"description":"one","inputSchema":{"properties":{"x":{"type":"string"}},"type":"object"},"name":"A","outputSchema":{"type":"object"}}"#;
+        assert_eq!(
+            pin(&config(), &[tool], 1).unwrap()[0].digest,
+            blake3::hash(expected).to_hex().to_string(),
+        );
+    }
+
     #[test]
     fn canonical_digest_covers_all_four_fields_but_ignores_object_order() {
         let cfg = config();

@@ -116,6 +116,53 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("absent_select.sql: FAILED to prepare", result.stdout)
         self.assertIn("no such table: rows_never_seen", result.stdout)
 
+    def test_real_tool_schema_uses_core_fixture_and_preserves_query_preparation(self):
+        core = self.root / "crates/khive-db/sql"
+        core.mkdir(parents=True)
+        (core / "schema.sql").write_text(
+            "CREATE TABLE entities (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    namespace TEXT,\n"
+            "    kind TEXT,\n"
+            "    tags TEXT,\n"
+            "    name TEXT,\n"
+            "    created_at INTEGER,\n"
+            "    deleted_at INTEGER\n"
+            ");\n"
+        )
+        source = ROOT / "crates/khive-pack-tool/sql"
+        destination = self.root / "crates/khive-pack-tool/sql"
+        destination.mkdir(parents=True)
+        names = []
+        for path in sorted(source.glob("*.sql")):
+            if declares_schema(path):
+                shutil.copy2(path, destination / path.name)
+                names.append(path.name)
+        self.assertIn("002-grants.sql", names)
+        self.assertIn("grant-invalidation.sql", names)
+        (destination / "grant_marker_select.sql").write_text(
+            "SELECT invalidated_at FROM tool_grants WHERE id = ?1;\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"SQL lint: {len(names) + 2} file(s) OK "
+            f"(1 prepared, {len(names) + 1} executed)",
+            result.stdout,
+        )
+
+        # The core fixture belongs only to the tool directory, not every pack.
+        unrelated = self.root / "crates/unrelated/sql"
+        unrelated.mkdir(parents=True)
+        (unrelated / "unexpected_core_visibility.sql").write_text(
+            "CREATE TRIGGER unexpected_core_visibility AFTER INSERT ON entities "
+            "BEGIN SELECT 1; END;\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table", result.stdout)
+
     def test_each_directory_has_an_independent_database(self):
         for name in ["first", "second"]:
             directory = self.root / "crates" / name / "sql"

@@ -539,24 +539,24 @@ fn schema_plan(&self) -> SchemaPlan {
 
 `SchemaPlan` statements are primarily `CREATE TABLE IF NOT EXISTS` and `CREATE
 INDEX IF NOT EXISTS`, which are idempotent: running them on a database that
-already has the tables is a no-op. As a documented exception, a pack may include
-a nullable backward-compatible `ALTER TABLE` statement (e.g., the GTD namespace
-backfill) where startup error-handling swallows the duplicate-column error on
-re-runs.
+already has the tables is a no-op. ADR-017's 2026-09-12 nullable-column amendment
+adds typed, guarded declarations for additive upgrades to existing pack-owned
+tables. Those declarations are applied and validated in the same writer transaction
+as the SQL plan; bare `ALTER TABLE` is not implicitly made idempotent and duplicate-
+column errors are not swallowed by the generic installer.
 
 The runtime applies each loaded pack's `SchemaPlan` to its assigned backend
 (per pack's `StorageProfile`, ADR-003) at startup. Pack tables are created on
 the backends the pack uses, lazily, when the pack is first loaded.
 
-**Pack schema is normally non-evolving in v1.** New pack-auxiliary tables use
-idempotent `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`.
-If a pack needs to change a table shape after production use, the preferred path
-is still a coordinated `khive-db` versioned migration. The only shipped exception
-in v1 is GTD's nullable `gtd_lifecycle_audit.namespace` backfill: the GTD
-`SchemaPlan` includes an idempotent `ALTER TABLE ... ADD COLUMN namespace TEXT`
-and startup handling swallows SQLite's duplicate-column error. Legacy rows may
-therefore have `NULL` namespace; new GTD transition/complete audit rows write
-the caller's authorized namespace.
+**Pack schema has no general versioned evolution in v1.** New pack-auxiliary tables
+use idempotent `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`.
+Nullable `TEXT` and `INTEGER` additions without defaults are supported by ADR-017's
+typed declaration; other shape changes require a separate migration design. GTD's
+existing `ensure_audit_schema` remains a pack-local guarded namespace backfill:
+it inspects the table and adds `namespace` only when missing. Legacy rows may have
+`NULL` namespace; new GTD transition/complete audit rows write the caller's authorized
+namespace. Tool grant additions are owned by the loaded tool pack, not the core ledger.
 
 ### Note kinds and edge relations do not require migrations
 
@@ -674,8 +674,9 @@ governance overhead disproportionate to the value.
 Idempotent `CREATE TABLE IF NOT EXISTS` is the default tool for pack-auxiliary
 tables: they appear when the pack loads. Pack-local `ALTER TABLE` statements
 are allowed only as documented, nullable, backward-compatible exceptions for
-already-shipped pack tables; the current v1 example is GTD audit namespace
-backfill. Structural/core schema changes still belong in versioned migrations.
+already-shipped pack tables. GTD retains its guarded audit namespace backfill;
+tool grants use ADR-017's typed nullable-column additions. Structural/core schema
+changes still belong in versioned migrations.
 
 ### Why migration application is host/operator-context, not agent-context?
 
@@ -735,8 +736,9 @@ the codebase's migration set is global, but applied state is per-file.
 - Starting a newer production host may perform schema writes before serving.
   Mitigated: the async coordinator fails closed, V21 staging is durable and
   resumable, and `kkernel db check --strict` remains available for CI preflight.
-- Pack tables can't evolve through `ALTER` in v1.
-  Mitigated: deferred until a concrete pack use case justifies the machinery.
+- Pack tables have no general versioned evolution in v1.
+  Mitigated: ADR-017 supports validated nullable-column additions; broader changes
+  require a separate migration design.
 - A buggy migration can lock progress until fixed and shipped as a new version.
   Mitigated: same as any forward-only migration system; standard CI practices
   catch this.

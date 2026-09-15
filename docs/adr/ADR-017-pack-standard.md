@@ -630,8 +630,9 @@ Per ADR-003, each pack declares a `StorageProfile` describing its placement need
 `khive.toml` configuration + the pack's profile.
 
 Per ADR-015, packs also declare a `SchemaPlan` for pack-auxiliary tables (e.g., GTD's
-lifecycle audit table, memory's index table). Pack schemas use `CREATE TABLE IF NOT
-EXISTS` only and are applied at boot to the pack's assigned backend.
+lifecycle audit table, memory's index table). Pack schemas use idempotent SQL batches
+and are applied at boot to the pack's assigned backend. The nullable-column addition
+exception below permits bounded upgrades of an existing pack-owned table.
 
 ```rust
 pub struct SchemaPlan {
@@ -892,10 +893,41 @@ dedicated ADR. v1 is compile-time.
 - `KindHook` covers create specialization, note-update normalization/validation, and
   link-batch validation. Post-update and delete hooks extend the pattern when a real
   consumer asks.
-- Pack auxiliary schema is non-evolving in v1. If a pack needs to evolve its schema, it
-  coordinates with khive-db migrations (ADR-015).
+- Pack auxiliary schema has no general versioned evolution in v1. The nullable-column
+  addition exception below supports additive upgrades; other changes require a separate
+  migration design under ADR-015.
 - A pack invariant that must be race-safe across processes may use ADR-015's narrowly
   governed core-row trigger exception; it does not widen `SchemaPlan` beyond auxiliary DDL.
+
+### 2026-09-12 amendment: nullable pack-owned column additions
+
+A loaded pack may declare `Pack::SCHEMA_COLUMN_ADDITIONS` and the corresponding
+`PackRuntime::schema_column_additions()`. Each `PackColumnAddition` names one existing
+pack-owned table, a column and `Text` or `Integer` affinity. These declarations add only
+nullable columns without defaults, primary keys or generated expressions. They grant
+no permission to change core substrate tables or to rewrite existing column values.
+
+The backend validates identifiers and inspects `pragma_table_xinfo` within the same
+writer transaction that applies the pack's SQL batches. If a declared table exists,
+missing columns are added; existing columns must match the declared type, nullability,
+default, primary-key and hidden-column constraints. A compatible partial upgrade may
+be completed. An absent table is created by the pack's full `CREATE TABLE IF NOT EXISTS`
+declaration. All declared columns are validated again after the SQL batches. Any failure
+rolls back the additions and the rest of the plan together. Repeated installation
+preserves existing values and does not rely on swallowing duplicate-column errors.
+
+Column-addition targets participate in pack table-ownership collision checks. The
+registry carries declarations to the pack's assigned backend and preserves read-only
+startup's writer-free behavior. A pack that is not loaded supplies neither DDL nor
+additions. Tool grant pins use this mechanism; the core migration chain does not create
+or upgrade `tool_grants`. The tool pack installs its invalidation trigger and marker-only
+backfill in the same transaction as its auxiliary schema.
+
+`SchemaPlan` and `PackSchemaPlan` retain their SQL-only shape. Hosts that apply plans
+manually and need the full upgrade declaration must use
+`VerbRegistry::all_schema_plans_with_columns()` and
+`StorageBackend::apply_pack_ddl_statements_with_columns()`. SQL-only installers remain
+available for plans with no column additions.
 
 ## Implementation
 

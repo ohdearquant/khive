@@ -12,8 +12,10 @@
 
 mod handlers;
 mod pack;
+mod pin;
 pub mod policy;
 pub mod vocab;
 
 pub use handlers::resolve_registered;
 pub use pack::ToolPack;
+pub use pin::{registry_policy_inputs, RegistryPin};

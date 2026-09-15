@@ -15,6 +15,7 @@ use crate::vocab::{
     CAPABILITY_TAG, DECISIONS, KINDS, REGISTRY_ENTITY_KIND, REGISTRY_TAG, SIDE_EFFECTS,
     TRUST_ORIGINS,
 };
+use crate::RegistryPin;
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -152,11 +153,12 @@ async fn find_by_name(
     token: &NamespaceToken,
     name: &str,
 ) -> Result<Option<Entity>, RuntimeError> {
-    let all = registry_entities(rt, token, 5000, 0).await?;
-    if let Some(e) = all.iter().find(|e| e.name == name) {
-        return Ok(Some(e.clone()));
-    }
-    Ok(all.into_iter().find(|e| e.name.eq_ignore_ascii_case(name)))
+    let Some(snapshot) =
+        crate::pin::current_registration(rt, token.namespace().as_str(), name).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(rt.get_entity(token, snapshot.id).await?))
 }
 
 async fn resolve_tool(
@@ -579,12 +581,14 @@ pub(crate) async fn suggest(
                 continue;
             }
         }
+        let registration = RegistryPin::from_entity(&entity)?;
         let decision = policy::decide(
             rt,
             &ns,
             &actor,
             &entity.name,
             side_effect_of(&entity).as_deref(),
+            Some(&registration),
         )
         .await?;
         let mut item = summary(&entity);
@@ -614,12 +618,14 @@ pub(crate) async fn describe(
     let ns = token.namespace().as_str().to_string();
     let entity = resolve_tool(rt, token, &reference).await?;
     let capabilities = capabilities_of(rt, token, entity_uuid(&entity)).await?;
+    let registration = RegistryPin::from_entity(&entity)?;
     let decision = policy::decide(
         rt,
         &ns,
         &actor,
         &entity.name,
         side_effect_of(&entity).as_deref(),
+        Some(&registration),
     )
     .await?;
     let mut v = full(&entity);
@@ -677,18 +683,20 @@ async fn decision_for(
     let ns = token.namespace().as_str().to_string();
     match resolve_tool(rt, token, reference).await {
         Ok(entity) => {
+            let registration = RegistryPin::from_entity(&entity)?;
             let d = policy::decide(
                 rt,
                 &ns,
                 actor,
                 &entity.name,
                 side_effect_of(&entity).as_deref(),
+                Some(&registration),
             )
             .await?;
             Ok((entity.name.clone(), true, d))
         }
         Err(RuntimeError::NotFound(_)) => {
-            let d = policy::decide(rt, &ns, actor, reference, None).await?;
+            let d = policy::decide(rt, &ns, actor, reference, None, None).await?;
             Ok((reference.to_string(), false, d))
         }
         Err(e) => Err(e),
@@ -786,28 +794,8 @@ pub(crate) async fn decide_request(
     let note = opt_str(&params, "note")?;
     let ns = token.namespace().as_str().to_string();
     let current = policy::get_grant(rt, &ns, &id).await?;
-    let allowed = match status {
-        "granted" => matches!(current.status.as_str(), "requested" | "denied"),
-        "denied" => matches!(current.status.as_str(), "requested" | "granted"),
-        "revoked" => current.status == "granted",
-        _ => false,
-    };
-    if !allowed {
-        return Err(RuntimeError::InvalidInput(format!(
-            "grant {} is {}; cannot move it to {status}",
-            &current.id[..8],
-            current.status
-        )));
-    }
     let decider = actor_label(token);
-    if status == "granted" && current.actor == decider {
-        return Err(RuntimeError::InvalidInput(format!(
-            "grant {} is {} and was requested by {}; a requester cannot grant its own request",
-            &current.id[..8],
-            current.status,
-            current.actor
-        )));
-    }
+    policy::validate_transition(&current, status, &decider)?;
     let expires_at = if status == "granted" {
         opt_i64(&params, "expires_in_s")?.map(|s| now_micros() + s.max(0) * 1_000_000)
     } else {
@@ -816,7 +804,7 @@ pub(crate) async fn decide_request(
     let row = policy::set_grant_status(
         rt,
         &ns,
-        &current.id,
+        &current,
         status,
         &decider,
         expires_at,

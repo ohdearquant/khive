@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use khive_runtime::{NamedVectorIdentity, RuntimeError};
+use khive_types::canonical_json_bytes;
 
 pub(crate) const MODEL_NAME: &str = "qwen3.5-vlm-pooled-visual";
 pub(crate) const PROMPT: &str =
@@ -103,7 +104,13 @@ impl DescriptorIdentity {
             dimensions,
             normalization: "l2",
         };
-        let canonical = canonical_json_bytes(&core)?;
+        let canonical = serde_json::to_value(&core)
+            .and_then(|value| canonical_json_bytes(&value))
+            .map_err(|error| {
+                RuntimeError::Internal(format!(
+                    "serializing moodboard descriptor identity: {error}"
+                ))
+            })?;
         let fingerprint = sha256_hex(&canonical);
         let model_key = format!("moodboard_{fingerprint}_{dimensions}");
         Ok(Self {
@@ -1170,61 +1177,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, RuntimeError> {
-    let value = serde_json::to_value(value).map_err(|error| {
-        RuntimeError::Internal(format!(
-            "serializing moodboard descriptor identity: {error}"
-        ))
-    })?;
-    let mut out = String::new();
-    write_canonical_json(&value, &mut out)?;
-    Ok(out.into_bytes())
-}
-
-fn write_canonical_json(value: &serde_json::Value, out: &mut String) -> Result<(), RuntimeError> {
-    match value {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        serde_json::Value::Number(value) => out.push_str(&value.to_string()),
-        serde_json::Value::String(value) => {
-            out.push_str(&serde_json::to_string(value).map_err(|error| {
-                RuntimeError::Internal(format!(
-                    "canonicalizing moodboard descriptor string: {error}"
-                ))
-            })?);
-        }
-        serde_json::Value::Array(values) => {
-            out.push('[');
-            for (index, value) in values.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(value, out)?;
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(values) => {
-            out.push('{');
-            let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
-            keys.sort_unstable();
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(key).map_err(|error| {
-                    RuntimeError::Internal(format!(
-                        "canonicalizing moodboard descriptor key: {error}"
-                    ))
-                })?);
-                out.push(':');
-                write_canonical_json(&values[key], out)?;
-            }
-            out.push('}');
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1277,7 +1229,8 @@ mod tests {
             dimensions: 4,
             normalization: "l2",
         };
-        let fingerprint = sha256_hex(&canonical_json_bytes(&core).unwrap());
+        let fingerprint =
+            sha256_hex(&canonical_json_bytes(&serde_json::to_value(&core).unwrap()).unwrap());
         assert_eq!(
             fingerprint,
             "b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5"

@@ -1,12 +1,17 @@
 //! Policy rows and grant rows: the two pack-owned tables, and the decision
 //! function that turns them into allow, deny or ask for one actor and tool.
 
+use std::any::Any;
+
 use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+
+use crate::pin::{current_registration, invalidating_registration, registration_snapshot};
+use crate::RegistryPin;
 
 pub fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
@@ -124,6 +129,10 @@ pub(crate) struct GrantRow {
     pub decided_by: Option<String>,
     pub expires_at: Option<i64>,
     pub decision_note: Option<String>,
+    pub registry_id: Option<String>,
+    pub definition_digest: Option<String>,
+    pub invalidated_by_registry_id: Option<String>,
+    pub invalidated_at: Option<i64>,
 }
 
 impl GrantRow {
@@ -140,11 +149,30 @@ impl GrantRow {
             decided_by: text(row, "decided_by"),
             expires_at: int(row, "expires_at"),
             decision_note: text(row, "decision_note"),
+            registry_id: text(row, "registry_id"),
+            definition_digest: text(row, "definition_digest"),
+            invalidated_by_registry_id: text(row, "invalidated_by_registry_id"),
+            invalidated_at: int(row, "invalidated_at"),
         })
     }
 
-    pub(crate) fn is_active(&self, now: i64) -> bool {
-        self.status == "granted" && self.expires_at.is_none_or(|e| e > now)
+    pub(crate) fn is_active(&self, now: i64, registration: Option<&RegistryPin>) -> bool {
+        let matches_registration = match (
+            self.registry_id.as_deref(),
+            self.definition_digest.as_deref(),
+            registration,
+        ) {
+            (None, None, None) => true,
+            (Some(id), Some(digest), Some(pin)) => {
+                id == pin.registry_id().to_string() && digest == pin.definition_digest()
+            }
+            _ => false,
+        };
+        self.status == "granted"
+            && self.expires_at.is_none_or(|e| e > now)
+            && self.invalidated_by_registry_id.is_none()
+            && self.invalidated_at.is_none()
+            && matches_registration
     }
 
     pub(crate) fn to_json(&self) -> Value {
@@ -160,11 +188,15 @@ impl GrantRow {
             "decided_by": self.decided_by,
             "expires_at": iso(self.expires_at),
             "decision_note": self.decision_note,
+            "registry_id": self.registry_id,
+            "definition_digest": self.definition_digest,
+            "invalidated_by_registry_id": self.invalidated_by_registry_id,
+            "invalidated_at": iso(self.invalidated_at),
         })
     }
 }
 
-const GRANT_COLUMNS: &str = "id, actor, tool, scope, reason, status, requested_at, decided_at, decided_by, expires_at, decision_note";
+const GRANT_COLUMNS: &str = "id, actor, tool, scope, reason, status, requested_at, decided_at, decided_by, expires_at, decision_note, registry_id, definition_digest, invalidated_by_registry_id, invalidated_at";
 const POLICY_COLUMNS: &str = "id, actor, tool, decision, note, created_at, created_by";
 
 pub(crate) async fn list_policies(
@@ -385,6 +417,10 @@ pub(crate) async fn insert_grant_request(
         decided_by: None,
         expires_at: None,
         decision_note: None,
+        registry_id: None,
+        definition_digest: None,
+        invalidated_by_registry_id: None,
+        invalidated_at: None,
     };
     let mut writer = rt.sql().writer().await?;
     writer
@@ -411,38 +447,113 @@ pub(crate) async fn insert_grant_request(
 pub(crate) async fn set_grant_status(
     rt: &KhiveRuntime,
     ns: &str,
-    id: &str,
+    prepared: &GrantRow,
     status: &str,
     decided_by: &str,
     expires_at: Option<i64>,
     note: Option<&str>,
 ) -> Result<GrantRow, RuntimeError> {
     let now = now_micros();
-    let mut writer = rt.sql().writer().await?;
-    let affected = writer
-        .execute(SqlStatement {
-            sql: "UPDATE tool_grants SET status = ?1, decided_at = ?2, decided_by = ?3, \
-                  expires_at = ?4, decision_note = ?5 WHERE namespace = ?6 AND id = ?7"
-                .into(),
-            params: vec![
-                SqlValue::Text(status.to_string()),
-                SqlValue::Integer(now),
-                SqlValue::Text(decided_by.to_string()),
-                opt_int(expires_at),
-                opt_text(note),
-                SqlValue::Text(ns.to_string()),
-                SqlValue::Text(id.to_string()),
-            ],
-            label: Some("tool_grants_decide".into()),
-        })
-        .await?;
-    drop(writer);
-    if affected == 0 {
-        return Err(RuntimeError::NotFound(format!(
-            "tool grant {id:?} not found"
+    let registration = if status == "granted" {
+        current_registration(rt, ns, &prepared.tool).await?
+    } else {
+        None
+    };
+    let pin = registration.as_ref().map(|row| row.pin()).transpose()?;
+    let prepared = prepared.clone();
+    let ns = ns.to_string();
+    let status = status.to_string();
+    let decided_by = decided_by.to_string();
+    let note = note.map(str::to_string);
+
+    // Only SQL and snapshot comparisons run under the writer. In particular,
+    // canonicalizing caller-supplied schemas happens before atomic_unit.
+    let result = rt.sql().atomic_unit(Box::new(move |writer| Box::pin(async move {
+        let row = writer.query_row(SqlStatement {
+            sql: format!("SELECT {GRANT_COLUMNS} FROM tool_grants WHERE namespace = ?1 AND id = ?2"),
+            params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(prepared.id.clone())],
+            label: Some("tool_grants_revalidate".into()),
+        }).await?;
+        let current = row.as_ref().and_then(GrantRow::from_row);
+        let outcome = if let Some(current) = current {
+            if current.actor != prepared.actor || current.tool != prepared.tool {
+                Err(RuntimeError::InvalidInput(format!("grant {} changed while preparing the decision; retry", &current.id[..8])))
+            } else if let Err(error) = validate_transition(&current, &status, &decided_by) {
+                Err(error)
+            } else if status == "granted" && registration_snapshot(writer, &ns, &current.tool).await? != registration {
+                Err(RuntimeError::InvalidInput(format!("tool {:?} registration changed while preparing the grant; retry", current.tool)))
+            } else {
+                let (registry_id, definition_digest) = if status == "granted" {
+                    (pin.as_ref().map(|pin| pin.registry_id().to_string()), pin.as_ref().map(|pin| pin.definition_digest().to_string()))
+                } else {
+                    (current.registry_id, current.definition_digest)
+                };
+                let (invalidated_by_registry_id, invalidated_at) = if status == "granted" && pin.is_some() {
+                    (None, None)
+                } else if status == "granted" && current.invalidated_by_registry_id.is_none() && current.invalidated_at.is_none() {
+                    match invalidating_registration(writer, &ns, &current.tool).await? {
+                        Some((id, at)) => (Some(id), Some(at)),
+                        None => (None, None),
+                    }
+                } else {
+                    (current.invalidated_by_registry_id, current.invalidated_at)
+                };
+                writer.execute(SqlStatement {
+                    sql: "UPDATE tool_grants SET status = ?1, decided_at = ?2, decided_by = ?3, \
+                          expires_at = ?4, decision_note = ?5, registry_id = ?6, definition_digest = ?7, \
+                          invalidated_by_registry_id = ?8, invalidated_at = ?9 \
+                          WHERE namespace = ?10 AND id = ?11".into(),
+                    params: vec![SqlValue::Text(status.clone()), SqlValue::Integer(now),
+                        SqlValue::Text(decided_by.clone()), opt_int(expires_at), opt_text(note.as_deref()),
+                        opt_text(registry_id.as_deref()), opt_text(definition_digest.as_deref()),
+                        opt_text(invalidated_by_registry_id.as_deref()), opt_int(invalidated_at),
+                        SqlValue::Text(ns.clone()), SqlValue::Text(prepared.id.clone())],
+                    label: Some("tool_grants_decide".into()),
+                }).await?;
+                let row = writer.query_row(SqlStatement {
+                    sql: format!("SELECT {GRANT_COLUMNS} FROM tool_grants WHERE namespace = ?1 AND id = ?2"),
+                    params: vec![SqlValue::Text(ns), SqlValue::Text(prepared.id)],
+                    label: Some("tool_grants_decided".into()),
+                }).await?;
+                row.as_ref().and_then(GrantRow::from_row).ok_or_else(|| RuntimeError::Internal("decided tool grant disappeared".into()))
+            }
+        } else {
+            Err(RuntimeError::NotFound(format!("tool grant {:?} not found", prepared.id)))
+        };
+        Ok(Box::new(outcome) as Box<dyn Any + Send>)
+    }))).await?;
+    *result
+        .downcast::<Result<GrantRow, RuntimeError>>()
+        .map_err(|_| RuntimeError::Internal("unexpected tool grant transaction result".into()))?
+}
+
+pub(crate) fn validate_transition(
+    current: &GrantRow,
+    status: &str,
+    decider: &str,
+) -> Result<(), RuntimeError> {
+    let allowed = match status {
+        "granted" => matches!(current.status.as_str(), "requested" | "denied"),
+        "denied" => matches!(current.status.as_str(), "requested" | "granted"),
+        "revoked" => current.status == "granted",
+        _ => false,
+    };
+    if !allowed {
+        return Err(RuntimeError::InvalidInput(format!(
+            "grant {} is {}; cannot move it to {status}",
+            &current.id[..8],
+            current.status
         )));
     }
-    get_grant(rt, ns, id).await
+    if status == "granted" && current.actor == decider {
+        return Err(RuntimeError::InvalidInput(format!(
+            "grant {} is {} and was requested by {}; a requester cannot grant its own request",
+            &current.id[..8],
+            current.status,
+            current.actor
+        )));
+    }
+    Ok(())
 }
 
 /// One policy decision and where it came from.
@@ -478,11 +589,14 @@ pub async fn decide(
     actor: &str,
     tool: &str,
     side_effect: Option<&str>,
+    registration: Option<&RegistryPin>,
 ) -> Result<Decision, RuntimeError> {
     let now = now_micros();
     let grants = list_grants(rt, ns, Some("granted"), None, None, 500).await?;
     if let Some(g) = grants.iter().find(|g| {
-        g.is_active(now) && pattern_matches(&g.actor, actor) && pattern_matches(&g.tool, tool)
+        g.is_active(now, registration)
+            && pattern_matches(&g.actor, actor)
+            && pattern_matches(&g.tool, tool)
     }) {
         return Ok(Decision {
             decision: "allow".into(),
