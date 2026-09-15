@@ -17,8 +17,9 @@
 # would wait out the full timeout and then refuse. Before taking a lock the hook
 # lists the lock file's holders and, when one of them is an ancestor of this
 # process, runs that step without the lock (it is already inside the queue).
-# An unrelated holder still queues as written. Holder detection needs lsof;
-# without it the hook queues on every declared lock.
+# An unrelated holder still queues as written. Holder detection needs ps and
+# lsof; when process inspection is unavailable, the hook takes every declared
+# lock instead of inferring that an ancestor already holds it.
 #
 # usage: scripts/hook-cargo.sh fmt|clippy
 set -euo pipefail
@@ -35,7 +36,12 @@ ancestors=""
 pid=$$
 while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
   ancestors="$ancestors $pid"
-  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  if ! pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); then
+    # Sandboxed callers may be unable to inspect even their parent. This only
+    # disables the reentrancy optimization; the configured locks still apply.
+    ancestors=""
+    break
+  fi
 done
 
 lsof_bin=$(command -v lsof || true)
