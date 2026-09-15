@@ -328,19 +328,28 @@ jobs:
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh channel-email
-      # Gated like every other shard-1 phase in this job: the introducing
-      # commit (cad6479dc) left no rationale for the lone ungated condition,
-      # and the macos-pr lane already runs the whole khive-mcp suite once via
-      # macos-pr-tests, so the focused portability lane keeps one serial run
-      # of the pair while push/nightly/manual full lanes repeat it 25x per OS
-      # (ADR-049 Amendment 3). timeout-minutes: a warm iteration measures
-      # Observed on ubuntu-latest runners: ~24s per iteration (2 tests,
-      # serial, plus per-iteration cargo overhead), so 25 iterations need
-      # ~10 minutes of test time alone before the initial build. Budget
-      # accordingly; a timeout here means the gate ran out of wall clock,
-      # not that a recovery flake was caught.
+      # Gated to ONE shard per OS, as every non-partitioned phase here is, but
+      # to shard 2 rather than shard 1, which is the only thing "exactly once
+      # per OS" actually requires. Everything else in this job sits on shard 1,
+      # and this step is its largest single contributor at ~14.8 min, so the
+      # two-way split carried ~29 min of work on one side: measured over 12
+      # pull_request runs, ubuntu shard 1 ran a median 48.6 min against shard
+      # 2's 11.2, and CI gate cannot report until both conclude. Moving this
+      # one step puts them at roughly 26 each.
+      #
+      # It runs 25x per OS on push/nightly/manual full lanes; the macos-pr lane
+      # already covers the khive-mcp suite once via macos-pr-tests, so the
+      # focused portability lane keeps one serial run of the pair (ADR-049
+      # Amendment 3). The introducing commit (cad6479dc) left no rationale for
+      # the lone ungated condition it originally carried.
+      #
+      # timeout-minutes: a warm iteration measures ~24s on ubuntu-latest (2
+      # tests, serial, plus per-iteration cargo overhead), so 25 iterations
+      # need ~10 minutes of test time alone before the initial build. Budget
+      # accordingly; a timeout here means the gate ran out of wall clock, not
+      # that a recovery flake was caught.
       - name: Daemon recovery flake gate
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        if: env.CI_SUITE == 'full' && matrix.shard == 2
         timeout-minutes: 25
         run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check
