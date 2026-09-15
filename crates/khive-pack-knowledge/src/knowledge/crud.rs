@@ -11,7 +11,8 @@ use khive_runtime::{
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
-    DeleteAtomsParams, GetParams, ListParams, StatsParams, UpsertAtomsParams, UpsertDomainsParams,
+    AtomWrite, DeleteAtomsParams, GetParams, ListParams, StatsParams, UpsertAtomsParams,
+    UpsertDomainsParams,
 };
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
@@ -253,6 +254,20 @@ impl KnowledgeHandlers {
         let now = now_us();
 
         for (index, atom_in) in p.atoms.iter().enumerate() {
+            let atom_in = match atom_in {
+                AtomWrite::Upsert(atom_in) => atom_in,
+                AtomWrite::PropertiesOnly(atom_in) => {
+                    khive_runtime::secret_gate::check_json_at(
+                        &atom_in.properties,
+                        &format!("atoms[{index}]"),
+                        "properties",
+                    )?;
+                    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(
+                        &atom_in.properties,
+                    ))?;
+                    continue;
+                }
+            };
             let slug = atom_in.slug.trim().to_string();
             if slug.is_empty() {
                 return Err(RuntimeError::InvalidInput(
@@ -299,6 +314,43 @@ impl KnowledgeHandlers {
         let mut ids_by_slug: HashMap<String, String> = HashMap::new();
         let mut operations = Vec::with_capacity(p.atoms.len());
         for atom_in in &p.atoms {
+            let atom_in = match atom_in {
+                AtomWrite::Upsert(atom_in) => atom_in,
+                AtomWrite::PropertiesOnly(atom_in) => {
+                    let id = atom_in.id.to_string();
+                    let domain = reader
+                        .query_row(SqlStatement {
+                            sql: "SELECT id FROM knowledge_domains WHERE id = ?1".into(),
+                            params: vec![SqlValue::Text(id.clone())],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("upsert_atoms domain lookup", e))?;
+                    if domain.is_some() {
+                        return Err(RuntimeError::InvalidInput(
+                            "properties-only target is a domain; use domain verbs instead".into(),
+                        ));
+                    }
+                    let row = reader
+                        .query_row(SqlStatement {
+                            sql: "SELECT tags FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL".into(),
+                            params: vec![SqlValue::Text(id.clone())],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| sql_err("upsert_atoms id lookup", e))?
+                        .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id}")))?;
+                    let tags = row_str(&row, "tags").unwrap_or_default();
+                    if tags.contains("type:domain") {
+                        return Err(RuntimeError::InvalidInput(
+                            "properties-only target is a domain mirror; use domain verbs instead"
+                                .into(),
+                        ));
+                    }
+                    operations.push((id, false));
+                    continue;
+                }
+            };
             let slug = atom_in.slug.trim().to_string();
             if let Some(id) = ids_by_slug.get(&slug) {
                 operations.push((id.clone(), false));
@@ -354,6 +406,27 @@ impl KnowledgeHandlers {
         let mut updated = 0usize;
         let mut statements = Vec::with_capacity(p.atoms.len());
         for (atom_in, (id, insert)) in p.atoms.iter().zip(operations) {
+            let atom_in = match atom_in {
+                AtomWrite::Upsert(atom_in) => atom_in,
+                AtomWrite::PropertiesOnly(atom_in) => {
+                    statements.push(SqlStatement {
+                        sql: "UPDATE knowledge_atoms SET properties=?1, updated_at=?2 WHERE id=?3"
+                            .into(),
+                        params: vec![
+                            if atom_in.properties.is_null() {
+                                SqlValue::Null
+                            } else {
+                                SqlValue::Text(atom_in.properties.to_string())
+                            },
+                            SqlValue::Integer(now),
+                            SqlValue::Text(id),
+                        ],
+                        label: None,
+                    });
+                    updated += 1;
+                    continue;
+                }
+            };
             let slug = atom_in.slug.trim().to_string();
             let raw_content = atom_in.content.as_deref().unwrap_or("");
             let content = if preserve_content_whitespace {

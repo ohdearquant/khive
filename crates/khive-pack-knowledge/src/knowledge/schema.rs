@@ -121,12 +121,44 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpsertAtomsParams {
-    pub atoms: Vec<AtomInput>,
+    pub atoms: Vec<AtomWrite>,
     #[serde(default)]
     // REASON: chunk_size is accepted from callers as a hint for client-side pagination;
     // server-side chunking is not yet implemented but the field must be deserialized
     // so callers that send it don't receive unexpected errors.
     pub chunk_size: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) enum AtomWrite {
+    Upsert(AtomInput),
+    PropertiesOnly(AtomPropertiesInput),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AtomPropertiesInput {
+    pub id: Uuid,
+    #[serde(deserialize_with = "Value::deserialize")]
+    pub properties: Value,
+}
+
+impl<'de> Deserialize<'de> for AtomWrite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if value.get("id").is_some() {
+            serde_json::from_value(value)
+                .map(Self::PropertiesOnly)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Upsert)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 // ── upsert_domains ─────────────────────────────────────────────────────────────
