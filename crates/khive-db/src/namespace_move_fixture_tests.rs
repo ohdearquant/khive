@@ -291,6 +291,84 @@ fn an_edge_triple_already_taken_is_named_before_anything_is_written() {
     );
 }
 
+/// The refusal a caller receives must not depend on how finely they split the
+/// request. One clash, one entry, whether one route points at the namespace
+/// holding it or three do.
+///
+/// This is the property rather than the mechanism, which is why it is the arm
+/// worth having: it fails on a pre-flight that asks its question once per ROUTE
+/// instead of once per TARGET without anyone reading the loop that does it.
+/// Both requests route every class — an unrouted class with rows refuses on its
+/// own and would answer a different question — and the only thing that differs
+/// between them is how many routes name the namespace the planted row sits in.
+#[test]
+fn the_same_clash_reads_the_same_however_finely_the_caller_split_the_request() {
+    let (conn, built) = fixture(FixtureSpec::movable("tenant:tnt_fixture"));
+    let kg = built.spec.kg.clone();
+    let gtd = built.spec.gtd.clone();
+    let knowledge = built.spec.knowledge.clone();
+
+    // One clash, in kg: an edge already holding the triple the source edge
+    // would carry there.
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (id, namespace, source_id, target_id, relation, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, 'annotates', ?5, ?5)",
+        rusqlite::params![
+            "33333333-3333-4333-8333-000000000099",
+            &kg,
+            ENTITY,
+            NOTE_OBSERVATION,
+            1_700_000_000_i64
+        ],
+    )
+    .expect("plant one clash in kg");
+
+    let build_request = |pairs: Vec<(&str, String)>| {
+        MoveRequest::new(
+            built.spec.source.clone(),
+            pairs
+                .into_iter()
+                .map(|(key, target)| MoveRoute {
+                    class: SubjectClass::parse(key).expect("a route key this fixture wrote"),
+                    target,
+                })
+                .collect(),
+        )
+    };
+
+    // Three routes name kg.
+    let three = collisions(attempt(
+        &conn,
+        &build_request(vec![
+            ("note:observation", kg.clone()),
+            ("note:task", gtd.clone()),
+            ("entity:concept", kg.clone()),
+            ("edge", kg.clone()),
+            ("atom", knowledge.clone()),
+        ]),
+    ));
+    // One does. Same store, same clash, same classes routed.
+    let one = collisions(attempt(
+        &conn,
+        &build_request(vec![
+            ("note:observation", gtd.clone()),
+            ("note:task", gtd.clone()),
+            ("entity:concept", gtd.clone()),
+            ("edge", kg.clone()),
+            ("atom", knowledge),
+        ]),
+    ));
+
+    assert_eq!(
+        three, one,
+        "the caller's partitioning is not a fact about what is in the way"
+    );
+    assert_eq!(three.len(), 1, "{three:?}");
+    assert_eq!(three[0].table, "graph_edges");
+    assert_eq!(three[0].target, kg);
+}
+
 /// The pre-flight asks each constraint against every route's target, and the
 /// question it asks is about the whole table rather than about the rows that
 /// route would move. So a clash sitting under a namespace this class never
@@ -333,19 +411,18 @@ fn a_clash_under_a_namespace_the_class_never_routes_to_still_refuses_the_move() 
     )
     .expect("plant a slug under a namespace atoms never reach");
 
+    // Keyed on PRESENCE, never on length. How many times one clash appears in
+    // the list is a separate property with its own arm, and an arm that reads
+    // the count would fire this upgrade instruction for that unrelated reason
+    // and say something false in its own failure message.
     let found = collisions(attempt(&conn, &request(&built)));
-    assert_eq!(
-        found.len(),
-        1,
+    assert!(
+        found
+            .iter()
+            .any(|c| c.table == "knowledge_atoms" && c.target == kg),
         "the pre-flight has learned per-route populations: upgrade this arm to \
          assert the move SUCCEEDS, because this clash was never reachable. \
          {found:?}"
-    );
-    assert_eq!(found[0].table, "knowledge_atoms");
-    assert_eq!(
-        found[0].target, kg,
-        "and the target it names is the one no atom was going to: that is the \
-         whole of the over-refusal, readable off the refusal itself"
     );
 }
 
