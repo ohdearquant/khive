@@ -77,10 +77,15 @@ fn emit_slow_recall_warning(
         total_ms,
         threshold_ms = RECALL_SLOW_THRESHOLD_MS,
         embed_ms = timings.embed_ms(),
+        embed_attempted = timings.embed_attempted(),
         fts_ms = timings.fts_ms(),
+        fts_attempted = timings.fts_attempted(),
         ann_ms = timings.ann_ms(),
+        ann_attempted = timings.ann_attempted(),
         fresh_tail_ms = timings.fresh_tail_ms(),
+        fresh_tail_attempted = timings.fresh_tail_attempted(),
         hydrate_ms = timings.hydrate_ms(),
+        hydrate_attempted = timings.hydrate_attempted(),
         result_count,
         query_bytes,
         ann_degraded,
@@ -6730,11 +6735,61 @@ mod tests {
             ("ann_ms", "33"),
             ("fresh_tail_ms", "44"),
             ("hydrate_ms", "55"),
+            ("embed_attempted", "true"),
+            ("fts_attempted", "true"),
+            ("ann_attempted", "true"),
+            ("fresh_tail_attempted", "true"),
+            ("hydrate_attempted", "true"),
         ] {
             assert_eq!(
                 warning.fields.get(field).map(String::as_str),
                 Some(expected),
                 "missing or incorrect {field}: {warning:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_recall_warning_keeps_skipped_and_fast_stages_distinct() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: Arc::clone(&buffer),
+        };
+        let mut timings = super::RecallStageTimings::default();
+        timings.add_hydration(std::time::Duration::from_micros(500));
+        tracing::subscriber::with_default(subscriber, || {
+            super::emit_slow_recall_warning(
+                super::RECALL_SLOW_THRESHOLD_MS,
+                &timings,
+                0,
+                0,
+                false,
+                false,
+                false,
+            );
+        });
+        let events = buffer.lock().unwrap();
+        let warning = events
+            .iter()
+            .find(|event| {
+                event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+            })
+            .expect("slow warning must be emitted");
+        for stage in ["embed", "fts", "ann", "fresh_tail", "hydrate"] {
+            assert_eq!(
+                warning
+                    .fields
+                    .get(&format!("{stage}_ms"))
+                    .map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                warning
+                    .fields
+                    .get(&format!("{stage}_attempted"))
+                    .map(String::as_str),
+                Some(if stage == "hydrate" { "true" } else { "false" }),
+                "{stage}: {warning:?}",
             );
         }
     }
