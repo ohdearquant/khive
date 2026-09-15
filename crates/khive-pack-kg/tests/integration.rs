@@ -15719,7 +15719,7 @@ async fn search_entity_hits_carry_updated_at_and_a_null_version() {
         .unwrap_or_else(|| panic!("entity hits must carry updated_at; got {}", before[0]))
         .to_string();
     assert!(
-        first_updated
+        first_updated.as_str()
             >= before[0]["created_at"]
                 .as_str()
                 .expect("entity hits carry created_at"),
