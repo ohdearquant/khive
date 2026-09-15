@@ -249,10 +249,11 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                           |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix. |
+| Param             | Type | Required | Notes                                                                                                                                     |
+| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -311,10 +312,25 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 | `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `parse_content`              | bool                     | no       | Default false. Parse each returned note's `content` as JSON, including granular note kinds and keyed/cursor pages. Invalid JSON refuses with the note id and field; non-note lists are unchanged.                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
+
+`parse_content=true` replaces only a note's returned `content` field with its JSON value:
+objects, arrays, numbers, booleans, strings, and null are supported. Omission or false preserves
+the existing string representation, including whitespace and escapes. Parsing is a read projection;
+storage, sibling metadata, and pagination envelopes are unchanged. It does not parse note annotations
+inside a non-note `get` response. Content stays opaque to Agent presentation and format reductions,
+so IDs, timestamps, nulls, and empty values inside the payload are preserved. `format=json` returns
+that value directly, and `format=auto` preserves parsed values in its JSON result text.
+`format=table` serializes parsed objects and arrays back to JSON strings for display only;
+a parsed content array inside one `get` record does not itself become a table.
+Invalid JSON under `parse_content=true` returns `invalid_input`, naming the note UUID and
+`content` field; it does not fall back to a string and is distinct from the existing missing-note
+refusal. One invalid returned note refuses its list operation. Both verbs reject
+unknown fields by name; older servers without `parse_content` explicitly reject that parameter.
 
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the

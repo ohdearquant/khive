@@ -13,6 +13,85 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Exact note-body locations selected by the request boundary for
+/// `get/list(parse_content=true)`. No policy marker is inferred from user JSON.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteContentScope {
+    #[default]
+    None,
+    Record,
+    Items,
+    Notes,
+}
+
+impl NoteContentScope {
+    /// Keep note bodies outside a metadata-only transform, including nulls,
+    /// empty containers/strings, and fields that resemble IDs or timestamps.
+    /// The transform must preserve record order and the get/list envelope.
+    pub fn protect(self, mut value: Value, transform: impl FnOnce(Value) -> Value) -> Value {
+        if self == Self::None {
+            return transform(value);
+        }
+        fn take_content(record: &mut Value) -> Option<Value> {
+            record.as_object_mut()?.remove("content")
+        }
+        fn restore_content(record: &mut Value, content: Option<Value>) {
+            if let (Some(record), Some(content)) = (record.as_object_mut(), content) {
+                record.insert("content".to_string(), content);
+            }
+        }
+        if self == Self::Record {
+            let content = take_content(&mut value);
+            let mut value = transform(value);
+            restore_content(&mut value, content);
+            return value;
+        }
+        let key = if self == Self::Items {
+            "items"
+        } else {
+            "notes"
+        };
+        let contents: Vec<_> = value
+            .get_mut(key)
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .map(take_content)
+            .collect();
+        let mut value = transform(value);
+        if let Some(records) = value.get_mut(key).and_then(Value::as_array_mut) {
+            for (record, content) in records.iter_mut().zip(contents) {
+                restore_content(record, content);
+            }
+        }
+        value
+    }
+
+    fn stringify_table_content(self, value: &mut Value) {
+        fn stringify(record: &mut Value) {
+            if let Some(content) = record.get_mut("content") {
+                if content.is_object() || content.is_array() {
+                    *content = Value::String(content.to_string());
+                }
+            }
+        }
+        match self {
+            Self::None => {}
+            Self::Record => stringify(value),
+            Self::Items | Self::Notes => {
+                let key = if self == Self::Items {
+                    "items"
+                } else {
+                    "notes"
+                };
+                if let Some(records) = value.get_mut(key).and_then(Value::as_array_mut) {
+                    records.iter_mut().for_each(stringify);
+                }
+            }
+        }
+    }
+}
+
 // ── OutputFormat ─────────────────────────────────────────────────────────────
 
 /// Output serialization format for verb results (ADR-078).
@@ -44,8 +123,8 @@ pub enum OutputFormat {
     /// compact-JSON fallback for every other shape.
     Auto,
     /// Force the markdown-table renderer regardless of detected shape.
-    /// Since the kv-block renderer was removed (ADR-078 §3 amendment),
-    /// `Table` and `Auto` share the same dispatch.
+    /// Ordinary results share Auto's dispatch. Opt-in parsed note bodies are
+    /// stringified for table display; Auto preserves their JSON values.
     Table,
 }
 
@@ -77,12 +156,29 @@ const PROPERTY_HOIST_FIELDS: &[&str] = &["trigger_at", "due", "status"];
 /// to the shape-aware renderer. Verbose also disables cell truncation in the
 /// table renderer (§3a).
 pub fn render_format(value: Value, format: OutputFormat, presentation: PresentationMode) -> String {
-    let value = prepare_format_value(value, format, presentation);
+    render_format_with_note_content(value, format, presentation, NoteContentScope::None)
+}
+
+/// Render an opt-in parsed-note response without treating its body as metadata
+/// or a top-level record table. Auto preserves parsed values; Table stringifies
+/// non-scalar content for display only.
+pub fn render_format_with_note_content(
+    value: Value,
+    format: OutputFormat,
+    presentation: PresentationMode,
+    content_scope: NoteContentScope,
+) -> String {
+    let value = prepare_format_value_with_note_content(value, format, presentation, content_scope);
     match format {
         OutputFormat::Json => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
-        OutputFormat::Auto | OutputFormat::Table => {
-            render_auto(value, presentation != PresentationMode::Verbose)
+        OutputFormat::Auto if content_scope != NoteContentScope::None => {
+            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
         }
+        OutputFormat::Auto | OutputFormat::Table => render_auto_with_note_content(
+            value,
+            presentation != PresentationMode::Verbose,
+            content_scope,
+        ),
     }
 }
 
@@ -111,6 +207,22 @@ pub fn prepare_format_value(
         Some(scope) => apply_redundancy_drop(value, scope),
         None => value,
     }
+}
+
+/// Apply format reductions to record metadata while preserving parsed bodies.
+pub fn prepare_format_value_with_note_content(
+    value: Value,
+    format: OutputFormat,
+    presentation: PresentationMode,
+    content_scope: NoteContentScope,
+) -> Value {
+    let mut value = content_scope.protect(value, |value| {
+        prepare_format_value(value, format, presentation)
+    });
+    if format == OutputFormat::Table {
+        content_scope.stringify_table_content(&mut value);
+    }
+    value
 }
 
 // ── Redundancy-reduction pre-pass (ADR-078 §7, Amendment 3) ────────────────
@@ -260,8 +372,12 @@ struct RecordArray {
 /// Every other shape → compact JSON, lossless by construction. The former
 /// kv-block renderer for single records is removed: its truncation destroyed
 /// single-record payloads (e.g. a compose briefing's `markdown` field).
-fn render_auto(value: Value, truncate: bool) -> String {
-    match locate_record_array(&value) {
+fn render_auto_with_note_content(
+    value: Value,
+    truncate: bool,
+    content_scope: NoteContentScope,
+) -> String {
+    match locate_record_array_with_note_content(&value, content_scope) {
         Some(found) => render_table_with_siblings(&value, &found, truncate),
         None => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
     }
@@ -272,7 +388,10 @@ fn render_auto(value: Value, truncate: bool) -> String {
 /// Checks:
 /// 1. `value` itself is an array of 2+ objects.
 /// 2. `value` is an object with a key whose value is an array of 2+ objects.
-fn locate_record_array(value: &Value) -> Option<RecordArray> {
+fn locate_record_array_with_note_content(
+    value: &Value,
+    content_scope: NoteContentScope,
+) -> Option<RecordArray> {
     let build = |key: Option<String>, arr: &[Value]| {
         let records: Vec<Value> = arr.iter().cloned().map(hoist_table_scalars).collect();
         let columns = collect_keys(&records);
@@ -285,6 +404,7 @@ fn locate_record_array(value: &Value) -> Option<RecordArray> {
     match value {
         Value::Array(arr) if is_record_array(arr) => Some(build(None, arr)),
         Value::Object(map) => map.iter().find_map(|(k, v)| match v {
+            _ if content_scope == NoteContentScope::Record && k == "content" => None,
             Value::Array(arr) if is_record_array(arr) => Some(build(Some(k.clone()), arr)),
             _ => None,
         }),
@@ -2135,5 +2255,58 @@ mod stream_presentation_tests {
         }
         let empty = json!({"entries": [], "head_seq": 0, "next_after": null});
         assert_eq!(present(empty.clone(), PresentationMode::Agent, 0), empty);
+    }
+}
+
+#[cfg(test)]
+mod parsed_note_content_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue2757_content_is_opaque_to_metadata_and_format_reductions() {
+        let payload = json!([
+            {"id":"11111111-1111-4111-8111-111111111111", "full_id":"keep", "namespace":"local",
+             "created_at":"2026-09-15T12:34:56.123456Z", "score":0.123456789,
+             "nil":null, "empty":"", "array":[], "object":{},
+             "properties":{"id":"11111111-1111-4111-8111-111111111111"}},
+            {"status":"pending"}
+        ]);
+        for (scope, response, pointer) in [
+            (
+                NoteContentScope::Record,
+                json!({"id":"22222222-2222-4222-8222-222222222222", "content":payload}),
+                "/content",
+            ),
+            (
+                NoteContentScope::Items,
+                json!({"items":[{"id":"22222222-2222-4222-8222-222222222222", "content":payload}], "requested_limit":1, "effective_limit":1, "limit_clamped":false}),
+                "/items/0/content",
+            ),
+            (
+                NoteContentScope::Notes,
+                json!({"notes":[{"id":"22222222-2222-4222-8222-222222222222", "content":payload}], "next_after":null}),
+                "/notes/0/content",
+            ),
+        ] {
+            let presented =
+                scope.protect(response, |value| present(value, PresentationMode::Agent, 0));
+            for format in [OutputFormat::Json, OutputFormat::Auto, OutputFormat::Table] {
+                let rendered = render_format_with_note_content(
+                    presented.clone(),
+                    format,
+                    PresentationMode::Agent,
+                    scope,
+                );
+                let actual: Value = serde_json::from_str(&rendered)
+                    .expect("single note stays a JSON record, never a table of its body");
+                let expected = if format == OutputFormat::Table {
+                    Value::String(payload.to_string())
+                } else {
+                    payload.clone()
+                };
+                assert_eq!(actual.pointer(pointer), Some(&expected));
+            }
+        }
     }
 }

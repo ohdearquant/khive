@@ -17,8 +17,9 @@ use khive_types::EventKind;
 
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
-    parse_event_kind, parse_event_outcome, parse_event_substrate, remap_note_status,
-    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json, GetParams,
+    parse_event_kind, parse_event_outcome, parse_event_substrate, parse_note_content,
+    remap_note_status, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, to_json,
+    GetParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -61,7 +62,10 @@ impl KgPack {
                 .await?;
             return flatten_get_result(
                 "note",
-                remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
+                parse_note_content(
+                    remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
+                    p.parse_content,
+                )?,
             );
         }
         if p.kind.is_some() || p.note_kind.is_some() {
@@ -154,7 +158,7 @@ impl KgPack {
         {
             let note_val = normalize_entity_timestamps(to_json(&note)?);
             let remapped = remap_note_status(note_val);
-            return flatten_get_result("note", remapped);
+            return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
         }
         if include_deleted {
             if let Some(deleted) = self
@@ -165,7 +169,7 @@ impl KgPack {
             {
                 let note_val = normalize_entity_timestamps(to_json(&deleted)?);
                 let remapped = remap_note_status(note_val);
-                return flatten_get_result("note", remapped);
+                return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
             }
         }
 
