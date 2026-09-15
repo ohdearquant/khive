@@ -15329,3 +15329,432 @@ async fn search_refuses_a_score_floor_outside_the_declared_range() {
         );
     }
 }
+
+// ---- search result ordering ----
+
+/// Dispatch a search and hand back the hit rows in the order the handler
+/// returned them.
+async fn search_hits(pack: &Fixture, args: Value) -> Vec<Value> {
+    let response = pack
+        .dispatch("search", args)
+        .await
+        .expect("search must succeed");
+    response
+        .as_array()
+        .unwrap_or_else(|| panic!("search returns an array; got {response}"))
+        .clone()
+}
+
+fn hit_ids(hits: &[Value]) -> Vec<String> {
+    hits.iter()
+        .map(|hit| {
+            hit["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every hit carries a string id; got {hit}"))
+                .to_string()
+        })
+        .collect()
+}
+
+fn hit_strings(hits: &[Value], field: &str) -> Vec<String> {
+    hits.iter()
+        .map(|hit| {
+            hit[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("every hit carries a string {field}; got {hit}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Three notes sharing one query token, created alpha then beta then gamma,
+/// with alpha touched last. Creation order is [alpha, beta, gamma], so the
+/// most-recently-created order is [gamma, beta, alpha] and the
+/// most-recently-updated order is [alpha, gamma, beta] — two different answers,
+/// neither of which is the relevance order.
+async fn order_fixture(pack: &Fixture) -> Vec<String> {
+    let mut ids = Vec::new();
+    for tail in ["alpha", "beta", "gamma"] {
+        let created = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "note",
+                    "note_kind": "observation",
+                    "content": format!("orderfixture_marker {tail}"),
+                }),
+            )
+            .await
+            .expect("note creation must succeed");
+        ids.push(
+            created["id"]
+                .as_str()
+                .expect("create returns a string id")
+                .to_string(),
+        );
+    }
+    let touched = pack
+        .dispatch(
+            "update",
+            json!({
+                "kind": "note",
+                "id": &ids[0],
+                "content": "orderfixture_marker alpha touched",
+            }),
+        )
+        .await
+        .expect("update must succeed");
+    assert_eq!(
+        touched["version"],
+        json!(2),
+        "control: the fixture's update must actually land, or updated_at never moves: {touched}"
+    );
+    ids
+}
+
+/// Passing the default order by name must change nothing, and the rows a
+/// caller gets without the parameter must still be ranked by relevance.
+#[tokio::test]
+async fn search_default_order_is_the_unchanged_relevance_order() {
+    let pack = pack();
+    order_fixture(&pack).await;
+
+    let implicit = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10}),
+    )
+    .await;
+    let explicit = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10, "order_by": "score"}),
+    )
+    .await;
+
+    assert_eq!(
+        implicit.len(),
+        3,
+        "control: all three fixture notes must be findable; got {implicit:?}"
+    );
+    assert_eq!(
+        implicit, explicit,
+        "naming the default order must return the same rows in the same order"
+    );
+
+    let scores: Vec<f64> = implicit
+        .iter()
+        .map(|hit| hit["score"].as_f64().expect("every hit carries a score"))
+        .collect();
+    assert!(
+        scores.windows(2).all(|pair| pair[0] >= pair[1]),
+        "the default order stays descending by score; got {scores:?}"
+    );
+}
+
+/// The ordering the parameter exists for: most recently updated first, which
+/// is a different answer from the relevance order the same query returns.
+#[tokio::test]
+async fn search_order_by_updated_at_returns_the_most_recently_updated_first() {
+    let pack = pack();
+    let ids = order_fixture(&pack).await;
+
+    let by_score = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10}),
+    )
+    .await;
+    let by_updated = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10, "order_by": "updated_at"}),
+    )
+    .await;
+
+    assert_eq!(
+        hit_ids(&by_updated),
+        vec![ids[0].clone(), ids[2].clone(), ids[1].clone()],
+        "alpha was touched last, then gamma and beta were created in that order; \
+         got rows {by_updated:?}"
+    );
+    let stamps = hit_strings(&by_updated, "updated_at");
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] >= pair[1]),
+        "the rows' own updated_at values must be non-increasing; got {stamps:?}"
+    );
+    assert_ne!(
+        hit_ids(&by_updated),
+        hit_ids(&by_score),
+        "the fixture is built so the two orders disagree; if they match, the \
+         ordering was not applied"
+    );
+}
+
+/// The created_at order is a third answer again: newest record first,
+/// unaffected by the update that moved the updated_at order.
+#[tokio::test]
+async fn search_order_by_created_at_returns_the_most_recently_created_first() {
+    let pack = pack();
+    let ids = order_fixture(&pack).await;
+
+    let by_score = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10}),
+    )
+    .await;
+    let by_created = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "orderfixture_marker", "limit": 10, "order_by": "created_at"}),
+    )
+    .await;
+
+    assert_eq!(
+        hit_ids(&by_created),
+        vec![ids[2].clone(), ids[1].clone(), ids[0].clone()],
+        "gamma, beta then alpha were created in that order; got rows {by_created:?}"
+    );
+    let stamps = hit_strings(&by_created, "created_at");
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] >= pair[1]),
+        "the rows' own created_at values must be non-increasing; got {stamps:?}"
+    );
+    assert_ne!(
+        hit_ids(&by_created),
+        hit_ids(&by_score),
+        "the fixture is built so the two orders disagree; if they match, the \
+         ordering was not applied"
+    );
+}
+
+/// The entity substrate has its own hit-ordering path, so it gets its own arm.
+#[tokio::test]
+async fn search_entity_order_by_updated_at_returns_the_most_recently_updated_first() {
+    let pack = pack();
+    let mut ids = Vec::new();
+    for name in ["EntityOrderAlpha", "EntityOrderBeta", "EntityOrderGamma"] {
+        let created = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "entity_kind": "concept", "name": name}),
+            )
+            .await
+            .expect("entity creation must succeed");
+        ids.push(
+            created["id"]
+                .as_str()
+                .expect("create returns a string id")
+                .to_string(),
+        );
+    }
+    pack.dispatch(
+        "update",
+        json!({"kind": "entity", "id": &ids[0], "description": "touched last"}),
+    )
+    .await
+    .expect("update must succeed");
+
+    let by_updated = search_hits(
+        &pack,
+        json!({"kind": "entity", "query": "EntityOrder", "limit": 10, "order_by": "updated_at"}),
+    )
+    .await;
+
+    assert_eq!(
+        hit_ids(&by_updated),
+        vec![ids[0].clone(), ids[2].clone(), ids[1].clone()],
+        "the first entity was touched last; got rows {by_updated:?}"
+    );
+}
+
+/// An unrecognised order must be refused. Falling back to the score order
+/// would answer a different question and report success doing it.
+#[tokio::test]
+async fn search_refuses_an_unknown_order_by_value() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "OrderByControl"}),
+    )
+    .await
+    .unwrap();
+
+    // Load-bearing control: the row IS findable under an accepted order, so the
+    // refusals below cannot be an empty corpus answering for the parameter.
+    let hits = pack
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "OrderByControl", "order_by": "score"}),
+        )
+        .await
+        .expect("the default order must be accepted by name");
+    assert!(
+        !hits.as_array().expect("array").is_empty(),
+        "control: the row must be findable"
+    );
+
+    for bad in ["updated", "created_at desc", "SCORE", "salience", ""] {
+        let error = pack
+            .dispatch(
+                "search",
+                json!({"kind": "entity", "query": "OrderByControl", "order_by": bad}),
+            )
+            .await
+            .expect_err("an unrecognised order must be refused, not silently scored");
+        assert!(
+            is_invalid_input(&error),
+            "{bad:?} must be an input refusal, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("order_by"),
+            "the refusal must name the parameter: {error}"
+        );
+    }
+}
+
+/// A note hit carries the stored revision and the time it was last written,
+/// and both move when the note is updated.
+#[tokio::test]
+async fn search_note_hits_carry_updated_at_and_version_across_an_update() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "versionfixture_marker first",
+            }),
+        )
+        .await
+        .expect("note creation must succeed");
+    let id = created["id"].as_str().expect("string id").to_string();
+
+    let before = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "versionfixture_marker"}),
+    )
+    .await;
+    assert_eq!(before.len(), 1, "control: one fixture note; got {before:?}");
+    assert_eq!(
+        before[0]["version"],
+        json!(1),
+        "a freshly created note is revision 1; got {}",
+        before[0]
+    );
+    let first_updated = before[0]["updated_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("note hits must carry updated_at; got {}", before[0]))
+        .to_string();
+    let first_created = before[0]["created_at"]
+        .as_str()
+        .expect("note hits carry created_at")
+        .to_string();
+    assert!(
+        first_updated >= first_created,
+        "a note is never written before it is created; got {first_updated} < {first_created}"
+    );
+
+    let touched = pack
+        .dispatch(
+            "update",
+            json!({"kind": "note", "id": &id, "content": "versionfixture_marker second"}),
+        )
+        .await
+        .expect("update must succeed");
+    assert_eq!(
+        touched["version"],
+        json!(2),
+        "control: the update must bump the stored revision: {touched}"
+    );
+
+    let after = search_hits(
+        &pack,
+        json!({"kind": "note", "query": "versionfixture_marker"}),
+    )
+    .await;
+    assert_eq!(after.len(), 1, "control: still one note; got {after:?}");
+    assert_eq!(
+        after[0]["version"],
+        json!(2),
+        "the hit must carry the bumped revision, not the one it was found with; got {}",
+        after[0]
+    );
+    let second_updated = after[0]["updated_at"].as_str().expect("updated_at");
+    assert!(
+        second_updated > first_updated.as_str(),
+        "updated_at must advance with the write; got {second_updated} after {first_updated}"
+    );
+    assert_eq!(
+        after[0]["created_at"].as_str(),
+        Some(first_created.as_str()),
+        "created_at must not move when the note is updated; got {}",
+        after[0]
+    );
+}
+
+/// An entity hit carries updated_at too. Entities have no persisted revision,
+/// so `version` is present for row-shape parity and null — a caller reading the
+/// field learns that, rather than reading a number that was never stored.
+#[tokio::test]
+async fn search_entity_hits_carry_updated_at_and_a_null_version() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": "VersionFixtureEntity"}),
+        )
+        .await
+        .expect("entity creation must succeed");
+    let id = created["id"].as_str().expect("string id").to_string();
+
+    let before = search_hits(
+        &pack,
+        json!({"kind": "entity", "query": "VersionFixtureEntity"}),
+    )
+    .await;
+    assert_eq!(
+        before.len(),
+        1,
+        "control: one fixture entity; got {before:?}"
+    );
+    let first_updated = before[0]["updated_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("entity hits must carry updated_at; got {}", before[0]))
+        .to_string();
+    assert!(
+        first_updated
+            >= before[0]["created_at"]
+                .as_str()
+                .expect("entity hits carry created_at"),
+        "an entity is never written before it is created; got {}",
+        before[0]
+    );
+    assert_eq!(
+        before[0]["version"],
+        Value::Null,
+        "entities carry no persisted revision; got {}",
+        before[0]
+    );
+
+    pack.dispatch(
+        "update",
+        json!({"kind": "entity", "id": &id, "description": "touched"}),
+    )
+    .await
+    .expect("update must succeed");
+
+    let after = search_hits(
+        &pack,
+        json!({"kind": "entity", "query": "VersionFixtureEntity"}),
+    )
+    .await;
+    assert_eq!(after.len(), 1, "control: still one entity; got {after:?}");
+    let second_updated = after[0]["updated_at"].as_str().expect("updated_at");
+    assert!(
+        second_updated > first_updated.as_str(),
+        "updated_at must advance with the write; got {second_updated} after {first_updated}"
+    );
+    assert_eq!(
+        after[0]["version"],
+        Value::Null,
+        "an updated entity still has no revision to report; got {}",
+        after[0]
+    );
+}

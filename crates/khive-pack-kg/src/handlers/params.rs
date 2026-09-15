@@ -211,6 +211,7 @@ pub(crate) struct SearchParams {
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) source: Option<String>,
     pub(crate) min_score: Option<f64>,
+    pub(crate) order_by: Option<String>,
 }
 
 #[derive(Deserialize)]

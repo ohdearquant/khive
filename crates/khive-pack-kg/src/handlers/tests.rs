@@ -345,6 +345,36 @@ fn search_params_min_score_absent_is_none() {
     );
 }
 
+// SearchParams must accept an `order_by` field at the wire boundary; the
+// handler owns which values are valid.
+#[test]
+fn search_params_accepts_order_by() {
+    use super::SearchParams;
+    let p: SearchParams = serde_json::from_value(json!({
+        "kind": "note",
+        "query": "transformer",
+        "order_by": "updated_at",
+    }))
+    .expect("SearchParams must accept order_by");
+    assert_eq!(p.order_by.as_deref(), Some("updated_at"));
+}
+
+// Absent order_by -> None, which the handler reads as the score order, so a
+// caller who never heard of the parameter keeps today's behaviour.
+#[test]
+fn search_params_order_by_absent_is_none() {
+    use super::SearchParams;
+    let p: SearchParams = serde_json::from_value(json!({
+        "kind": "note",
+        "query": "transformer",
+    }))
+    .unwrap();
+    assert!(
+        p.order_by.is_none(),
+        "absent order_by must be None; the relevance order is the default"
+    );
+}
+
 // ---- Recursive walk_timestamps unit tests ----
 
 #[test]
