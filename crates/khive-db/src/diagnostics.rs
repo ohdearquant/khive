@@ -53,7 +53,8 @@
 //!
 //! Checkpoint counters are process-global, while reader and writer acquisition
 //! counters belong to the supplied pool and can reset when it is reconstructed.
-//! Every payload carries [`BuildIdentity`] and [`ProcessIdentity`] for the
+//! Every payload carries [`BuildIdentity`](crate::diagnostics::BuildIdentity) and
+//! [`ProcessIdentity`](crate::diagnostics::ProcessIdentity) for the
 //! process producing the reading. The PID, OS start time, and main-pool generation
 //! identify the reader/writer counter window; checkpoint counters remain global.
 
