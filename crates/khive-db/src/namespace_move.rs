@@ -329,9 +329,16 @@ pub enum TableDisposition {
     /// A projection rebuilt from its subject, never routed on its own.
     ///
     /// Split two ways on purpose. `fts_knowledge` and `fts_sections` are
-    /// maintained by schema triggers that fire on `UPDATE OF ... namespace`
-    /// (`sql/schema.sql`, `sql/026-knowledge-fts-repair.sql`), so writing the base
-    /// row carries them. `fts_notes` and `fts_entities` have no triggers at all —
+    /// maintained by triggers that fire on `UPDATE OF ... namespace`
+    /// (`sql/026-knowledge-fts-repair.sql:49` and
+    /// `sql/002-narrow-fts-sections-update-trigger.sql:10`), so writing the base
+    /// row carries them. Both live declarations are column-scoped, and
+    /// `fts_sections_au` reached that shape by being narrowed: `sql/schema.sql`
+    /// declares it `AFTER UPDATE` unconditioned and V2 drops and recreates it
+    /// over a named column list, to stop reindex-only updates from paying an
+    /// fts5 delete-and-reinsert. So this disposition depends on `namespace`
+    /// staying in that list, which a later narrowing could shorten without
+    /// touching anything here. `fts_notes` and `fts_entities` have no triggers at all —
     /// their contents are written from Rust — so the move writes them itself, and
     /// because fts5 refuses an `UPDATE` of an indexed column that write is a
     /// delete followed by an insert.
@@ -590,6 +597,18 @@ pub fn validate(
 /// issues plain statements, they error, and the caller's transaction rolls back.
 /// So this function decides the QUALITY of a refusal, never whether one happens.
 /// A collision it cannot enumerate still aborts the move.
+///
+/// The reverse also happens, and it does not show up here at all: a constraint
+/// this function DOES enumerate can be unreachable because of one the census
+/// never reported. `graph_edges` is `PRIMARY KEY (namespace, id)`, which names
+/// `namespace` and so arrives here as a live key — but
+/// `sql/014-graph-edges-id-unique.sql:25` puts a UNIQUE index on `id` alone,
+/// globally, so no two rows in the database can share an `id` and the clash this
+/// arm looks for cannot exist in any store that reached V13. That index names no
+/// namespace, so a census keyed on the column cannot see it, and nothing in the
+/// enumerated set says the arm is dead. `idx_graph_edges_unique_triple`
+/// (`namespace, source_id, target_id, relation`) is the constraint that actually
+/// refuses a graph edge move, and it is enumerated here.
 fn collisions_for(
     conn: &Connection,
     constraint: &NamespaceConstraint,
@@ -1240,5 +1259,90 @@ mod tests {
             )
             .expect("count");
         assert_eq!(moved, 1);
+    }
+    /// The half of a vector move that is invisible from the side it leaves.
+    ///
+    /// An ANN consumer builds its index per `(namespace, embedding_model)` by
+    /// advancing a watermark over `ann_write_log`. Moving the row in the `vec_*`
+    /// table and appending only the target's `upsert` leaves the source's index
+    /// intact and still answering searches with a subject that is no longer in
+    /// its namespace, which is the same observable as never having touched the
+    /// vectors at all. This arm fails if nothing tells the source side to drop
+    /// what left.
+    ///
+    /// The consumer itself lives above this crate, so what is asserted here is
+    /// the instruction it reads, not the index it builds from it.
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn a_vector_move_tells_the_source_side_to_drop_what_left() {
+        // Registration is an auto-extension, so it only reaches connections
+        // opened after it. This has to come before `migrated`.
+        crate::extension::ensure_extensions_loaded();
+        let conn = migrated();
+        seed_note(&conn, "n1", "source", "observation");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_test_model USING vec0(\
+               subject_id TEXT PRIMARY KEY, \
+               namespace TEXT NOT NULL, \
+               kind TEXT NOT NULL, \
+               field TEXT NOT NULL, \
+               embedding_model TEXT NOT NULL, \
+               embedding float[4] distance_metric=cosine\
+             )",
+        )
+        .expect("the vector table an embedding model creates at runtime");
+        conn.execute(
+            "INSERT INTO vec_test_model \
+             (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES ('n1', 'source', 'observation', 'content', 'test-model', \
+                     '[0.1, 0.2, 0.3, 0.4]')",
+            [],
+        )
+        .expect("seed a vector");
+
+        let request = MoveRequest::new("source", vec![route("note:observation", "target")]);
+        let counts = move_namespace(&conn, &request).expect("a total move");
+
+        assert_eq!(
+            counts.rows.get("vec_test_model"),
+            Some(&1),
+            "the vector itself moved"
+        );
+        let left_in_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_test_model WHERE namespace = 'source'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left_in_source, 0);
+
+        // Two entries per moved vector, and the one that matters here is the
+        // first: without it the source's index is never told anything.
+        assert_eq!(counts.ann_log_appended, 2);
+        let dropped_from_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE namespace = 'source' AND op = 'delete' \
+                   AND subject_id = 'n1' AND embedding_model = 'test-model'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            dropped_from_source, 1,
+            "the source consumer is never told to drop the vector, so its index \
+             keeps answering with a subject that has left the namespace"
+        );
+        let taken_by_target: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE namespace = 'target' AND op = 'upsert' \
+                   AND subject_id = 'n1' AND embedding_model = 'test-model'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(taken_by_target, 1);
     }
 }
