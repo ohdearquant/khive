@@ -325,6 +325,10 @@ fusion_weight = 0.5
 #                                true = any non-empty value except "0" / "false".
 #   KHIVE_SOCKET=~/.khive/khived.sock            Daemon Unix socket path.
 #   KHIVE_PID=~/.khive/khived.pid                Daemon PID file path.
+#                                Set these two together or not at all: they are the two halves
+#                                of one rendezvous, and a daemon started with only one of them
+#                                would share the other half with an unrelated instance. Setting
+#                                exactly one refuses the boot, naming both variables.
 #   KHIVE_LOCK=~/.khive/khived.recovery.lock     Stale-daemon recovery lock file path.
 #   KHIVE_DRAIN_TIMEOUT_SECS=10  Seconds the daemon waits for in-flight requests before shutdown.
 #   KHIVE_REQUEST_READ_TIMEOUT_SECS=30
