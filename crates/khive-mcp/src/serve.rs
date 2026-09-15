@@ -10371,19 +10371,20 @@ region = "us-east-1"
         std::env::remove_var("KHIVE_PACKS");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
 
+        use clap::Parser;
         let db = seat_dir.path().join("read-only-schedule.db");
-        KhiveRuntime::new(RuntimeConfig {
-            db_path: Some(db.clone()),
-            ..RuntimeConfig::no_embeddings()
-        })
-        .expect("create migrated snapshot source");
+        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
+        // A readable snapshot includes pack upgrades from writable startup,
+        // not only the substrate migrations performed by KhiveRuntime::new.
+        {
+            let (_source_server, _source_schedule_rt) = build_server(&args)
+                .await
+                .expect("create snapshot with current default-pack schema");
+        }
         let mut permissions = std::fs::metadata(&db).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&db, permissions).unwrap();
         freeze_snapshot_sidecars(&db);
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
 
         let (_server, schedule_rt) = build_server(&args)
             .await
@@ -13886,6 +13887,234 @@ backend = "kg-backend"
             .await
             .expect("the loop must observe the token it was handed and return")
             .expect("the loop task must not panic");
+    }
+
+    const ISSUE2768_LEGACY_GRANTS: &str = "CREATE TABLE tool_grants (
+        id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL,
+        tool TEXT NOT NULL, scope TEXT, reason TEXT, status TEXT NOT NULL,
+        requested_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT,
+        expires_at INTEGER, decision_note TEXT)";
+
+    fn issue2768_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".into(), "tool".into()],
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn issue2768_tool_shape(
+        backend: &StorageBackend,
+    ) -> Vec<(String, String, i64, Option<String>, i64, i64)> {
+        let reader = backend.pool().reader().unwrap();
+        let rows: String = reader
+            .query_row(
+                "SELECT json_group_array(json_array(name, type, \"notnull\", dflt_value, pk, hidden)) FROM (SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo('tool_grants', 'main') ORDER BY cid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&rows).unwrap()
+    }
+
+    fn issue2768_seed_tool_database(path: &std::path::Path, upgraded: bool) {
+        let backend = StorageBackend::sqlite(path).unwrap();
+        backend.prepare_core_schema().unwrap();
+        backend
+            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS])
+            .unwrap();
+        if upgraded {
+            backend
+                .apply_pack_ddl_statements_with_columns(
+                    &khive_pack_tool::vocab::TOOL_SCHEMA_PLAN_STMTS,
+                    &khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS,
+                )
+                .unwrap();
+        }
+    }
+
+    fn issue2768_multi_config(
+        main_path: &std::path::Path,
+        tool_path: &std::path::Path,
+        tool_read_only: bool,
+    ) -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.to_path_buf()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "tool-store".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(tool_path.to_path_buf()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: tool_read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "tool".into(),
+                khive_runtime::PackConfig {
+                    backend: "tool-store".into(),
+                    no_embed: true,
+                },
+            )]),
+            ..KhiveConfig::default()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn issue2768_single_backend_refuses_failed_pack_plan_and_rolls_back() {
+        let runtime = KhiveRuntime::new(issue2768_runtime_config()).unwrap();
+        runtime
+            .backend()
+            .apply_pack_ddl_statements(&["CREATE TABLE tool_grants (id TEXT PRIMARY KEY)"])
+            .unwrap();
+        let before = issue2768_tool_shape(runtime.backend());
+        let error = match KhiveMcpServer::new(runtime) {
+            Ok(_) => panic!("must not expose grant verbs after their schema plan fails"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("pack schema boot failure"), "{message}");
+        assert!(message.contains("tool"), "{message}");
+        assert!(
+            message.contains("namespace"),
+            "fixture must fail after adding the pin columns: {message}"
+        );
+        assert!(matches!(
+            &error.failure,
+            crate::server::PackRegFailure::Schema(_)
+        ));
+        assert_eq!(issue2768_tool_shape(error.runtime.backend()), before);
+        let reader = error.runtime.backend().pool().reader().unwrap();
+        let policies: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='tool_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            policies, 0,
+            "the failed tool plan also rolls back its earlier CREATE"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue2768_successful_single_and_multi_boot_have_the_same_upgraded_shape() {
+        let fresh = KhiveRuntime::new(issue2768_runtime_config()).unwrap();
+        let fresh_observer = fresh.clone();
+        let _fresh_server = KhiveMcpServer::new(fresh).unwrap();
+        let expected = issue2768_tool_shape(fresh_observer.backend());
+
+        let single = KhiveRuntime::new(issue2768_runtime_config()).unwrap();
+        single
+            .backend()
+            .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS])
+            .unwrap();
+        let single_observer = single.clone();
+        let before = issue2768_tool_shape(single_observer.backend());
+        assert_eq!(expected.len(), before.len() + 4);
+        assert_eq!(&expected[..before.len()], before.as_slice());
+        let _single_server = KhiveMcpServer::new(single).unwrap();
+        assert_eq!(issue2768_tool_shape(single_observer.backend()), expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool_path = dir.path().join("tool.db");
+        issue2768_seed_tool_database(&tool_path, false);
+        {
+            let backend = StorageBackend::sqlite(&tool_path).unwrap();
+            assert_eq!(issue2768_tool_shape(&backend), before);
+        }
+        let multi = build_registry_for_multi_backend_inner(
+            issue2768_runtime_config(),
+            &issue2768_multi_config(&dir.path().join("main.db"), &tool_path, false),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            issue2768_tool_shape(multi.per_pack_runtimes["tool"].backend()),
+            expected
+        );
+        assert!(
+            issue2768_tool_shape(multi.default_runtime.backend()).is_empty(),
+            "tool DDL must stay on its assigned backend"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn issue2768_read_only_boot_refuses_missing_columns_and_accepts_current_schema() {
+        for upgraded in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tool_path = dir.path().join("tool-snapshot.db");
+            issue2768_seed_tool_database(&tool_path, upgraded);
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(&tool_path);
+            let backend =
+                std::sync::Arc::new(StorageBackend::sqlite_read_only(&tool_path).unwrap());
+            let before = issue2768_tool_shape(&backend);
+            let writes_before = backend.pool().writer_acquisition_snapshot();
+            let runtime = KhiveRuntime::from_backend(backend.clone(), issue2768_runtime_config());
+            let single = KhiveMcpServer::new(runtime);
+            let multi = build_registry_for_multi_backend_inner(
+                issue2768_runtime_config(),
+                &issue2768_multi_config(&dir.path().join("main.db"), &tool_path, true),
+                None,
+            )
+            .await;
+            if upgraded {
+                assert!(
+                    single.is_ok(),
+                    "compatible read-only single boot must succeed: {:?}",
+                    single.err()
+                );
+                let multi = multi.unwrap();
+                let tool = multi.per_pack_runtimes["tool"].backend();
+                assert_eq!(issue2768_tool_shape(tool), before);
+                assert_eq!(
+                    tool.pool().writer_acquisition_snapshot(),
+                    khive_db::pool::WriterAcquisitionSnapshot::default()
+                );
+            } else {
+                let single_message = match single {
+                    Ok(_) => panic!("old read-only schema must refuse single boot"),
+                    Err(error) => error.to_string(),
+                };
+                let multi_message = match multi {
+                    Ok(_) => panic!("old read-only schema must refuse multi boot"),
+                    Err(error) => error.to_string(),
+                };
+                for message in [single_message, multi_message] {
+                    assert!(message.contains("tool"), "{message}");
+                    assert!(
+                        message.contains("read-only schema validation failed"),
+                        "{message}"
+                    );
+                    for column in khive_pack_tool::vocab::TOOL_SCHEMA_COLUMN_ADDITIONS {
+                        assert!(
+                            message.contains(&format!("tool_grants.{}", column.column)),
+                            "{message}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(issue2768_tool_shape(&backend), before);
+            assert_eq!(backend.pool().writer_acquisition_snapshot(), writes_before);
+        }
     }
 }
 
