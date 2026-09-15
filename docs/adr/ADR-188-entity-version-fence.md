@@ -52,10 +52,38 @@ is why it is recorded rather than fixed in place.
    observe.
 4. `update`, `merge` and `delete` each accept a positive `expected_version` for entities, checked
    **inside the writer transaction**, refusing a stale value without mutation, with the same
-   `reason`, `expected_version` and `current_version` fields notes return. Omitting it preserves
-   today's unconditional semantics exactly, for all three. Every verb that writes an entity carries
+   `reason`, `expected_version` and `current_version` fields notes return. Omitting it requires no
+   caller revision assertion; identical unfenced updates follow the no-op rule below. Every verb that writes an entity carries
    the parameter, because a guarantee that depends on which verb a competing writer happened to call
    is not a guarantee: a fenced `update` racing an unfenced `merge` loses in silence.
+
+For `merge`, `expected_version` belongs to the surviving `into_id`, the record the caller
+continues using. It does **not** assert a version for `from_id`. Both rows are reread inside the
+merge transaction, and the existing both-side snapshot and safety checks still apply. The one
+parameter cannot name two revisions. `force=true` bypasses the existing safety floor only; it never
+bypasses the version fence. `dry_run=true` checks the same survivor fence without mutation. After a
+real merge, both the survivor update and source tombstone advance their own versions once.
+
+For `delete`, the fence also applies to hard deletion of an existing tombstone. A soft delete advances
+the version once; hard delete removes the row after checking its current version. Atomic `update`
+and `delete` use the same transaction guard; atomic merge remains outside the existing supported
+surface.
+
+Entity and note updates share the ADR-172 Amendment 5 no-op definition (#2718): after validation,
+normalization, hooks where applicable, and property merging, an identical patch with no
+`expected_version` and no explicit embedding request is a mutation-free assertion. Canonical and
+atomic results disclose `unchanged=true`; version, `updated_at`, stored representation, indexes,
+and mutation events stay untouched. The writer transaction rechecks the prepared snapshot, so an
+earlier operation in the atomic unit can invalidate a no-op and roll back the unit. An accepted
+identical patch with `expected_version` is always a write: it advances version by exactly one and
+`updated_at` strictly, and never returns `unchanged=true`. Stale identical fenced patches refuse.
+
+The implementation uses one eligibility predicate and shared comparison helpers, tested across
+both substrates. Object key order and tag order are insignificant; duplicate tag counts and other
+array ordering remain significant. Entity tags live in the tags column; note tags live in
+`properties.tags`. An entity's custom `properties.tags` remains an ordinary ordered property.
+Entity type aliases compare after vocabulary normalization. Explicit `embed` remains note-only
+and preserves existing note write behavior, including an explicit `embed=false` on identical data.
 
 The refusal shape is shared rather than parallel. Two refusal shapes that mean the same thing is how a
 client ends up special-casing a substrate, which is the state this record is removing.
@@ -63,10 +91,9 @@ client ends up special-casing a substrate, which is the state this record is rem
 ### What this does not do
 
 - It does not rewrite stored entities. Existing rows start at version 1.
-- It does not make the fence mandatory. A caller that never passes `expected_version` sees no change.
-- It does not decide what a no-op update should do. Whether an update that changes nothing bumps the
-  version is a separate open question that applies to both substrates, and whatever is decided there
-  applies here unchanged: the two substrates stay symmetric, which is the whole point of this record.
+- It does not make the fence mandatory. Unfenced changes still require no caller version.
+- It does not change note semantics or add `fence`/`embed` to entities. It extends the existing note
+  no-op rule to entities as part of this version implementation (#2718).
 
 ## Alternatives considered
 
@@ -88,6 +115,10 @@ client ends up special-casing a substrate, which is the state this record is rem
 
 - One more column and one more trigger on `entities`, the graph's primary table. The trigger fires on
   every entity update, which is a cost paid by every writer, including those that never fence.
+- Entity upserts use `INSERT ... ON CONFLICT(id) DO UPDATE`, because `INSERT OR REPLACE`
+  would delete/reinsert the row and reset the default revision. Input `Entity.version` is a read
+  projection: fresh inserts start at one and existing upserts advance the stored revision. Import
+  and sync therefore use local revisions rather than importing a counter from another store.
 - Entity read responses gain a field. Additive for a client that ignores unknown fields, and a change
   for anything asserting an exact shape.
 - The migration adds a column with a constant default, which SQLite records in the schema without
@@ -105,6 +136,11 @@ client ends up special-casing a substrate, which is the state this record is rem
   something is the failure this record exists to prevent, and asserting only the error misses it.
 - A current-version update succeeds and the version moves by exactly one. "Moves" is not enough: a
   trigger that double-bumps breaks every caller that read a version and wants to write once.
+- Identical fenced entity and note patches advance by exactly one and never disclose `unchanged`;
+  identical unfenced patches disclose `unchanged=true` and preserve the exact stored record,
+  including version and `updated_at`. Both canonical and atomic tests use one contract table.
+- A no-op prepared before a raw version-only writer or a prior atomic update/delete refuses its
+  stale snapshot. The atomic unit rolls back earlier mutations too.
 - A note arm as the control for the shared refusal shape: the same `reason` and the same field names,
   asserted against one definition rather than two string literals.
 - An arm proving the check happens inside the writer transaction rather than before it: two writers
@@ -118,6 +154,23 @@ client ends up special-casing a substrate, which is the state this record is rem
 - A stale `delete` is refused and the entity is still readable afterwards.
 - A `merge` and a `delete` with no `expected_version`, each asserting today's unconditional behaviour
   is unchanged.
+- A source mutation after the caller's merge preflight still triggers the existing transactional
+  safety refusal, even when `into_id` satisfies its version fence.
 - The migration's cost at the fleet's entity count, measured on a synthetic store and written into
   Consequences before merge, with the row count stated beside it so the shape of the cost is readable
   and not only its magnitude.
+
+### Migration measurement procedure
+
+The executable fixture is `khive-db`'s ignored `entity_version_migration_measurement` test. Set
+`KHIVE_ENTITY_VERSION_ROWS` to the chosen synthetic population and run it with
+`--ignored --nocapture`; it bounds seeding to 1,000,000 rows and reports both empty and populated
+V34 stores. The validation packet will run 9,285 rows (a caller-visible live lower bound observed
+2026-09-15T16:40:27Z, excluding tombstones and other namespaces) and 100,000 rows (synthetic stress).
+Neither is the complete fleet count. Record population provenance beside each result; a full-table
+count, if obtained, must explicitly include tombstones and all namespaces. Only `run_migrations` is timed. The fixture uses khive's
+bundled SQLite, WAL/NORMAL, and a warm cache after seeding; it checks that every existing row reads
+version one afterward. Output includes row count, elapsed microseconds, SQLite version, platform,
+page size, database size before migration, and WAL bytes after migration. Record the exact source
+revision, host/storage hardware, fleet-count query and time, build profile, and output here before
+merge. No measurement has been performed in the source-only implementation packet.
