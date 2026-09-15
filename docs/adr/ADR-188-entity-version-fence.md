@@ -121,6 +121,12 @@ client ends up special-casing a substrate, which is the state this record is rem
   and sync therefore use local revisions rather than importing a counter from another store.
 - Entity read responses gain a field. Additive for a client that ignores unknown fields, and a change
   for anything asserting an exact shape.
+- Canonical and atomic entity/note write results add `unchanged=true` for accepted identical
+  unfenced patches that qualify for the no-op rule above. This is additive for clients that ignore
+  unknown fields; clients asserting an exact response shape are affected.
+- An atomic no-op rechecks its prepared snapshot inside the writer transaction. An earlier operation
+  in the same unit can invalidate that assertion, causing the whole unit to roll back, including its
+  earlier mutations.
 - The migration adds a column with a constant default, which SQLite records in the schema without
   rewriting the table. The measured cost at the fleet's entity count is written here before this
   merges, the way the listing index's build cost was. If that cost turns out to scale with the row
