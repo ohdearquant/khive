@@ -73,6 +73,9 @@ primary keys:
 A census of every `CREATE UNIQUE INDEX` touching namespace in `khive-db` returns those four indexes
 and no fifth.
 
+The `note_streams` row is listed for completeness and is never reached: the section below refuses a
+stream member before any collision is computed.
+
 **Vectors.** The delete path is keyed on the pair:
 `DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2`, at `stores/vectors.rs:31`, `:506`
 and `:658`. Every vector write is an `INSERT` with replace semantics (`:548`); there is no `UPDATE`
@@ -116,7 +119,7 @@ Only kind-bearing records are routed. Everything else is carried:
 
 - the six fts5 tables and the two rowid maps, with their parent note or entity,
 - `knowledge_sections` with its atom,
-- `note_streams` and `proposals_open` with the namespace they belong to,
+- `proposals_open` with the namespace it belongs to,
 - every `vec_*` row, with its subject.
 
 None of these appears in the route map. A caller cannot route them independently, because they have
@@ -126,8 +129,8 @@ no independent existence.
 
 Consolidating two trees written by two clients is the case this primitive exists for, so two rows
 holding the same `(namespace, kind, key)` or the same `(namespace, slug)` after the move is the
-expected shape rather than an exotic one. `note_streams` makes it near-certain: `seq` is a
-per-namespace sequence, so two streams that both start at 1 collide on their first row.
+expected shape rather than an exotic one: two independently written trees each hold a note keyed
+`(kind, key)` and an atom keyed `slug`, and after the move both sit in one namespace.
 
 The primitive refuses the whole move on any collision against any of the nine constraints, and names
 the colliding `(table, namespace, key)` rows in the refusal.
@@ -137,10 +140,39 @@ caller's data, and does so while satisfying the counts-in-equals-counts-out asse
 worst available combination: the destructive outcome and the reassuring receipt arrive together.
 Resolution is a decision someone makes with the rows in front of them.
 
+This rules out one statement in particular. `note_insert_keyed_statement`
+(`stores/note.rs:113`) carries `ON CONFLICT(namespace, kind, key) WHERE key IS NOT NULL AND
+deleted_at IS NULL DO NOTHING`, which is correct for its own caller
+(`khive-runtime/src/atomic_message.rs:603`, where an occupied key means the message already exists)
+and wrong for a mover, where it would drop a row and return success. The mover issues a plain
+`INSERT` that errors on conflict. Reusing the keyed statement would leave the counts assertion as
+the only thing standing between a collision and silent loss, which inverts its purpose: the counts
+are a second line of defence, not the first.
+
 ### One transaction, through the writer task
 
 The whole move runs inside one `BEGIN IMMEDIATE` in the writer task, reads included, for the reason
 `text.rs:414` already records. Partial application is not a state this primitive can leave behind.
+
+The mover issues no `BEGIN IMMEDIATE` of its own. `WriterTaskHandle::send` hands its closure a
+connection already inside the transaction it opened and owns the commit or rollback
+(`writer_task.rs:73-76`, `:253-258`); a nested bare `BEGIN IMMEDIATE` is a SQLite error, so the
+primitive is one closure of statements, not a script.
+
+### A stream member cannot move at all
+
+`sql/029-note-streams.sql` pins stream membership to a namespace with four triggers, and the pin is
+absolute rather than conditional. `refuse_stream_entry_rewrite` aborts any `UPDATE` of a member
+note that names `namespace` in its `SET` list; `refuse_stream_entry_delete` aborts the delete;
+`refuse_stream_ledger_update` and `refuse_stream_ledger_delete` abort every write to the ledger
+rows themselves. `stream_schema_tests.rs:37` already asserts the first of these directly, with
+`UPDATE notes SET namespace='other'` in its list of forbidden statements.
+
+So a stream member has no move at all, by update or by delete and reinsert, and the primitive
+refuses any move whose routed kinds reach one. The refusal comes from a read of `note_streams` by
+`note_id` taken before any write, naming the notes and their `(stream, seq)`, so the caller gets an
+enumeration rather than a trigger's `stream_member` abort string from somewhere in the middle of
+the transaction.
 
 ### Vectors: rewrite the row, never re-embed
 
@@ -209,6 +241,12 @@ missed: the first skips rows, the second corrupts them.
 - Full-text search and vector recall return the moved records under the target namespace and nothing
   under the source, and a delete issued after the move removes the vector.
 - Soft-deleted records move with `deleted_at` intact.
+- A move reaching a stream member refuses before writing anything, names the notes and their
+  `(stream, seq)`, and the arm is distinguishable from a trigger abort: the mutation control removes
+  the pre-flight read and the same case then fails with `stream_member` from inside the transaction.
+- The fixture is parameterized rather than collision-only. A clean move asserting counts in equals
+  counts out, non-zero, is the arm that would go missing if every case collided, and it is the arm
+  that detects a conflict-swallowing insert.
 - An ANN consumer that was caught up before the move consumes the moved subjects afterwards, which
   is the arm that fails if the write log is rewritten instead of appended to.
 - The fixture is built through the store's own writers. A SQL seed produces no fts5 shadow rows, no
