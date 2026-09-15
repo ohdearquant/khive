@@ -168,15 +168,27 @@ client ends up special-casing a substrate, which is the state this record is rem
 
 ### Migration measurement procedure
 
-The executable fixture is `khive-db`'s ignored `entity_version_migration_measurement` test. Set
-`KHIVE_ENTITY_VERSION_ROWS` to the chosen synthetic population and run it with
-`--ignored --nocapture`; it bounds seeding to 1,000,000 rows and reports both empty and populated
-V34 stores. The validation packet will run 9,285 rows (a caller-visible live lower bound observed
+The implementation packet for #2673 and #2718 must deliver `khive-db`'s ignored
+`entity_version_migration_measurement` test and its `KHIVE_ENTITY_VERSION_ROWS` input. This
+ADR-only change does not publish that fixture. Run the procedure only from the implementation
+revision containing it, and record that exact revision beside the result.
+
+Before measuring, list the ignored tests under that name and require exactly one selected test;
+zero matches or multiple matches invalidate the run. Then set `KHIVE_ENTITY_VERSION_ROWS` to the
+chosen synthetic population and run with `--ignored --nocapture`. Require a successful exit,
+exactly one passed test with zero failures and zero ignored tests, and two measurement records
+labelled `synthetic_v34_to_v35`: one with zero rows and one with the requested population, both
+reporting schema version 35. A successful exit alone, missing records, or `running 0 tests` is not
+a measurement and must not be recorded as one.
+
+The fixture must bound seeding to 1,000,000 rows and report both empty and populated V34 stores.
+The validation packet will run 9,285 rows (a caller-visible live lower bound observed
 2026-09-15T16:40:27Z, excluding tombstones and other namespaces) and 100,000 rows (synthetic stress).
 Neither is the complete fleet count. Record population provenance beside each result; a full-table
-count, if obtained, must explicitly include tombstones and all namespaces. Only `run_migrations` is timed. The fixture uses khive's
-bundled SQLite, WAL/NORMAL, and a warm cache after seeding; it checks that every existing row reads
-version one afterward. Output includes row count, elapsed microseconds, SQLite version, platform,
-page size, database size before migration, and WAL bytes after migration. Record the exact source
-revision, host/storage hardware, fleet-count query and time, build profile, and output here before
-merge. No measurement has been performed in the source-only implementation packet.
+count, if obtained, must explicitly include tombstones and all namespaces. Only `run_migrations`
+is timed. The fixture must use khive's bundled SQLite, WAL/NORMAL, and a warm cache after seeding,
+and check that every existing row reads version one afterward. Required output includes row count,
+elapsed microseconds, SQLite version, platform, page size, database size before migration, and WAL
+bytes after migration. Record the exact source revision, host/storage hardware, fleet-count query
+and time, build profile, and output here before merge. No measurement has been performed in the
+source-only implementation packet.
