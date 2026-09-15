@@ -14,8 +14,9 @@ narrow trigger-context exceptions for file paths, VCS revisions, and recognizabl
 (defined below). The path and revision exceptions run only after the reconstruction checks and
 outside credential-value syntax; the LaTeX exception rejects credential-shaped inner runs and
 direct credential labels. Bare Git-length hex values use a separate line-local trigger rule,
-gated by the clause-label guard, which changes only which trigger context applies and never
-fragment reconstruction.** A UUID or a sha-prefixed content hash sitting directly beside
+gated by the clause-label guard. Valid JSON objects and arrays also bound surrounding trigger
+context to the candidate's scalar value and its owning credential labels (defined below). These
+rules change trigger attribution, not credential shape checks.** A UUID or a sha-prefixed content hash sitting directly beside
 "api_key"/"secret"/"auth" is exactly as ambiguous as any other high-entropy candidate and falls
 through to explicit detection instead of being silently allowed.
 
@@ -218,9 +219,9 @@ structured token, inline context stops at commas, semicolons, and ampersands. An
 governs the value after its delimiter and nested carriers within that member; it cannot label an
 earlier value or a sibling member. Thus `{"a_secret":"x","digest":"<hex>"}` leaves the digest
 unlabeled, while `secret=label=<hex>` remains credential-shaped. Underscore carriers such as
-`session_secret_<value>` remain recognized when nested or padded. The original ASCII tokenization
-and external 120-byte context window stay unchanged, so adding whitespace can still put a nearby
-credential word inside a value's external window. The same member context governs shape checks,
+`session_secret_<value>` remain recognized when nested or padded. The original ASCII tokenization and 120-byte radius stay unchanged. In non-JSON text, adding
+whitespace can still put a nearby credential word inside a value's external window. Valid JSON
+objects and arrays apply the scalar boundary below. The same member context governs shape checks,
 entropy checks, exemption guards, reconstruction, masking, and the trigger named in a refusal.
 
 A structured-identifier-shaped token sitting near a **genuinely standalone** trigger word (e.g.
@@ -239,6 +240,38 @@ credential-config compounds keep firing: `SECRET_KEY=...` (Django/Flask-style co
 `auth_token=...`, `session_secret_...`, `signing_key=...` all match on the `secret`/`key`/`auth`
 half. This is implemented by parameterizing the boundary rule (`contains_word`'s
 `underscore_is_word_char` argument) rather than sharing one rule between the two callers.
+
+## Structured scalar trigger context (2026-09-15, #2756)
+
+When the entire input validates as a JSON object or array, surrounding trigger text is confined
+to the candidate's scalar value. A trigger inside another value, including an artifact path or
+a quoted refusal, does not label this candidate. This is independent of field order and spacing:
+`{"path":"/tmp/pytest/auth/fixture", "principal":"instance:<32hex>"}` admits the principal,
+as does a record carrying the gate's refusal message in an `error` value beside unrelated
+identifier/path evidence. Ordinary file paths containing trigger words retain their existing
+own-token exclusion. A quoted refusal within the **same** scalar does not gain an exemption;
+existing sentence boundaries remain the way to separate quoted diagnostic prose from evidence.
+
+Owning object keys remain credential labels: `{"secret":"<32hex>"}` and
+`{"message":"secret <32hex>"}` refuse, as does bare prose `secret <32hex>`. Keys are decoded
+before label matching, so `"sec\u0072et"` labels its value as `secret`. A credential-shaped
+container key also governs nested scalar values within the existing 120-byte label radius;
+benign nested keys do not erase that authority. JSON validation and an iterative source-range
+walk run once per input and are reused by every masking continuation. Scalar ranges refer to
+original bytes, including escaped quotes/backslashes; no decoded value replaces the scanned or
+masked source. Invalid JSON, non-JSON prose and root JSON strings retain the original scanner.
+
+This is a context boundary, not a JSON admission bypass. Known-prefix detection still scans the
+whole input. Each scalar still receives the same hex/UUID/hash, entropy and fragment-reconstruction
+checks. A compact raw-token bridge anchor spanning sibling scalars does not borrow a shared
+label; its separate member views still scan their values, and bridges within a scalar remain
+active. Commas inside one JSON string do not turn its contents into unrelated values: a trigger
+and credential in that same scalar continue to share context. Escape decoding applies to owning
+keys only; this change does not add generalized decoding of credential-bearing string payloads.
+
+Executable must-admit and must-refuse cases are in `tests/secret_gate_issue_2756.rs`; their
+synthetic corpus rows are listed in `tests/data/secret_gate_corpus_manifest.md`. The historical
+production replay counts in that manifest are not a fresh measurement of this rule.
 
 ## Bare Git-length hex context and refusal diagnostics (2026-09-10)
 

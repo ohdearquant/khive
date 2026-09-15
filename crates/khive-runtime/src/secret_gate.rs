@@ -276,8 +276,8 @@ thread_local! {
 /// `ghp_` token). Both detector layers are folded through [`keep_leftmost`].
 #[cfg(test)]
 fn scan_match(text: &str) -> Option<(&str, &'static str)> {
-    let tokens = tokenize_entropy_tokens(text);
-    scan_from(text, 0, &tokens)
+    let context = EntropyScanContext::new(text);
+    scan_from(text, 0, &context)
 }
 
 /// Like [`scan_match`], but only returns secrets whose span starts at or after
@@ -291,19 +291,19 @@ fn scan_match(text: &str) -> Option<(&str, &'static str)> {
 fn scan_from<'a>(
     text: &'a str,
     from: usize,
-    tokens: &[(usize, &'a str)],
+    context: &EntropyScanContext<'a>,
 ) -> Option<(&'a str, &'static str)> {
-    scan_from_with_trigger(text, from, tokens).map(|(slice, detector, _)| (slice, detector))
+    scan_from_with_trigger(text, from, context).map(|(slice, detector, _)| (slice, detector))
 }
 
 fn scan_from_with_trigger<'a>(
     text: &'a str,
     from: usize,
-    tokens: &[(usize, &'a str)],
+    context: &EntropyScanContext<'a>,
 ) -> Option<(&'a str, &'static str, Option<&'static str>)> {
     let mut best =
         check_known_patterns(&text[from..]).map(|(slice, detector)| (slice, detector, None));
-    if let Some(candidate) = check_entropy_heuristic(text, from, tokens) {
+    if let Some(candidate) = check_entropy_heuristic(text, from, context) {
         if best
             .as_ref()
             .is_none_or(|current| candidate.0.as_ptr() < current.0.as_ptr())
@@ -338,8 +338,8 @@ fn keep_leftmost<'a>(
 
 /// Return the first `SecretMatch` found in `text`, or `None`.
 fn scan(text: &str) -> Option<SecretMatch> {
-    let tokens = tokenize_entropy_tokens(text);
-    scan_from_with_trigger(text, 0, &tokens).map(|(slice, detector, trigger)| {
+    let context = EntropyScanContext::new(text);
+    scan_from_with_trigger(text, 0, &context).map(|(slice, detector, trigger)| {
         let mut matched = build_match(detector, slice);
         matched.trigger = trigger;
         matched
@@ -589,7 +589,8 @@ pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
 /// Exhausting the work budget extends the last confirmed secret span through the input tail.
 fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
     let base = text.as_ptr() as usize;
-    let tokens = tokenize_entropy_tokens(text);
+    let context = EntropyScanContext::new(text);
+    let tokens = &context.tokens;
     // Collect every secret span (absolute byte offsets into `text`) before
     // writing any output, so trigger-context detection always sees the original
     // string rather than the suffix after the previous redaction.
@@ -613,7 +614,7 @@ fn collect_mask_spans(text: &str) -> (Vec<(usize, usize)>, usize) {
             break;
         }
         scan_work_bytes = next_scan_work;
-        match scan_from(text, from, &tokens) {
+        match scan_from(text, from, &context) {
             Some((sub, _detector)) => {
                 let start = sub.as_ptr() as usize - base;
                 // The prefix detectors return whitespace-delimited tokens, so a
@@ -1385,6 +1386,117 @@ fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct JsonScalarContext {
+    value_start: usize,
+    end: usize,
+    label: Option<(usize, &'static str)>,
+}
+
+struct EntropyScanContext<'a> {
+    tokens: Vec<(usize, &'a str)>,
+    scalars: Vec<JsonScalarContext>,
+}
+
+impl<'a> EntropyScanContext<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            tokens: tokenize_entropy_tokens(text),
+            scalars: json_scalar_contexts(text),
+        }
+    }
+
+    fn scalar_for(&self, text: &str, value: &str) -> Option<JsonScalarContext> {
+        let value = wrapper_strip_repeated(value);
+        if value.is_empty() {
+            return None;
+        }
+        let start = value.as_ptr() as usize - text.as_ptr() as usize;
+        let end = start + value.len();
+        let index = self.scalars.partition_point(|scalar| scalar.end <= start);
+        self.scalars
+            .get(index)
+            .copied()
+            .filter(|scalar| end > scalar.value_start && end <= scalar.end)
+    }
+}
+
+// Validate once before interpreting punctuation as field boundaries. The
+// iterative source walk retains offsets for masking; decoding keys prevents
+// JSON escapes from hiding an owning credential label.
+fn json_scalar_contexts(text: &str) -> Vec<JsonScalarContext> {
+    if !text.trim_start().starts_with(['{', '['])
+        || serde_json::from_str::<serde::de::IgnoredAny>(text).is_err()
+    {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut scalars = Vec::new();
+    let mut containers: Vec<Option<(usize, &'static str)>> = Vec::new();
+    let mut pending_label = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                let label = pending_label
+                    .take()
+                    .or_else(|| containers.last().copied().flatten());
+                containers.push(label);
+                index += 1;
+            }
+            b'}' | b']' => {
+                containers.pop();
+                pending_label = None;
+                index += 1;
+            }
+            b',' | b':' | b' ' | b'\t' | b'\r' | b'\n' => index += 1,
+            _ => {
+                let start = index;
+                let quoted = bytes[index] == b'"';
+                let value_start = start + usize::from(quoted);
+                let end = if quoted {
+                    index += 1;
+                    while index < bytes.len() && bytes[index] != b'"' {
+                        index += if bytes[index] == b'\\' { 2 } else { 1 };
+                    }
+                    let end = index;
+                    index += 1;
+                    end
+                } else {
+                    while index < bytes.len()
+                        && !bytes[index].is_ascii_whitespace()
+                        && !matches!(bytes[index], b',' | b'}' | b']')
+                    {
+                        index += 1;
+                    }
+                    index
+                };
+                if index > bytes.len() {
+                    return Vec::new();
+                }
+                if quoted && text[index..].trim_start().starts_with(':') {
+                    let Ok(key) = serde_json::from_str::<String>(&text[start..index]) else {
+                        return Vec::new();
+                    };
+                    let label =
+                        find_trigger(&format!("{key}:"), true).map(|trigger| (end, trigger));
+                    pending_label = label;
+                    continue;
+                }
+                let label = pending_label
+                    .take()
+                    .or_else(|| containers.last().copied().flatten());
+                scalars.push(JsonScalarContext {
+                    value_start,
+                    end,
+                    label,
+                });
+            }
+        }
+    }
+    scalars
+}
+
 // A bare Git-length value uses line-local context. The preceding label line
 // remains authoritative when it explicitly ends in an assignment delimiter.
 // Bridge anchors retain full-window context so masking cannot leave a fragment behind.
@@ -1393,11 +1505,23 @@ fn entropy_trigger(
     tokens: &[(usize, &str)],
     index: usize,
     credential_label_only: bool,
-    inline_trigger: Option<&'static str>,
+    candidate: EntropyCandidate<'_>,
 ) -> Option<&'static str> {
-    let (offset, raw) = tokens[index];
-    let window_start = floor_char_boundary(text, offset.saturating_sub(TRIGGER_WINDOW));
-    let window_end = floor_char_boundary(text, offset + raw.len() + TRIGGER_WINDOW);
+    let (mut offset, raw) = tokens[index];
+    let mut token_end = offset + raw.len();
+    if let Some(scalar) = candidate.scalar {
+        offset =
+            (candidate.value.as_ptr() as usize - text.as_ptr() as usize).max(scalar.value_start);
+        token_end = (candidate.value.as_ptr() as usize - text.as_ptr() as usize
+            + candidate.value.len())
+        .min(scalar.end);
+    }
+    let mut window_start = floor_char_boundary(text, offset.saturating_sub(TRIGGER_WINDOW));
+    let mut window_end = floor_char_boundary(text, token_end + TRIGGER_WINDOW);
+    if let Some(scalar) = candidate.scalar {
+        window_start = window_start.max(scalar.value_start);
+        window_end = window_end.min(scalar.end);
+    }
     let token = strip_delimiters(raw);
     let standalone_revision = token.len() == 40
         && token.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1406,9 +1530,9 @@ fn entropy_trigger(
         let line_start = text[window_start..offset]
             .rfind(['\r', '\n'])
             .map_or(window_start, |i| window_start + i + 1);
-        let line_end = text[offset + raw.len()..window_end]
+        let line_end = text[token_end..window_end]
             .find(['\r', '\n'])
-            .map_or(window_end, |i| offset + raw.len() + i);
+            .map_or(window_end, |i| token_end + i);
         let before_line = &text[window_start..line_start];
         let previous = before_line
             .strip_suffix("\r\n")
@@ -1439,11 +1563,11 @@ fn entropy_trigger(
     )
     .or_else(|| {
         find_trigger(
-            before_first_sentence_boundary(&text[offset + raw.len()..end]),
+            before_first_sentence_boundary(&text[token_end..end]),
             credential_label_only,
         )
     })
-    .or(inline_trigger)
+    .or(candidate.inline_trigger)
     .or(preceding_label)
 }
 
@@ -1454,6 +1578,7 @@ struct EntropyCandidate<'a> {
     member: &'a str,
     inline_trigger: Option<&'static str>,
     bridge_anchor: bool,
+    scalar: Option<JsonScalarContext>,
 }
 
 fn entropy_candidates(raw: &str) -> Vec<EntropyCandidate<'_>> {
@@ -1466,6 +1591,7 @@ fn entropy_candidates(raw: &str) -> Vec<EntropyCandidate<'_>> {
             member: raw,
             inline_trigger: None,
             bridge_anchor: true,
+            scalar: None,
         });
     }
     for member in raw
@@ -1480,6 +1606,7 @@ fn entropy_candidates(raw: &str) -> Vec<EntropyCandidate<'_>> {
                 .then(|| inline_credential_trigger(member))
                 .flatten(),
             bridge_anchor: member.len() == raw.len(),
+            scalar: None,
         });
         if !has_assignment {
             continue;
@@ -1495,6 +1622,7 @@ fn entropy_candidates(raw: &str) -> Vec<EntropyCandidate<'_>> {
                     member,
                     inline_trigger: Some(inline_trigger),
                     bridge_anchor: false,
+                    scalar: None,
                 });
             }
         }
@@ -1523,6 +1651,7 @@ fn entropy_candidates(raw: &str) -> Vec<EntropyCandidate<'_>> {
                 member,
                 inline_trigger,
                 bridge_anchor: member.len() == raw.len(),
+                scalar: None,
             });
             break;
         }
@@ -1571,8 +1700,9 @@ fn entropy_bridge_fragments<'a>(
 fn check_entropy_heuristic<'a>(
     text: &'a str,
     from: usize,
-    tokens: &[(usize, &'a str)],
+    context: &EntropyScanContext<'a>,
 ) -> Option<(&'a str, &'static str, Option<&'static str>)> {
+    let tokens = &context.tokens;
     let first_token = tokens.partition_point(|&(offset, raw)| offset + raw.len() <= from);
     for (idx, &(context_offset, raw)) in tokens.iter().enumerate().skip(first_token) {
         let token = strip_delimiters(raw);
@@ -1580,7 +1710,33 @@ fn check_entropy_heuristic<'a>(
             continue;
         }
         let mut best: Option<(&str, &'static str, Option<&'static str>)> = None;
-        for candidate in entropy_candidates(raw) {
+        for mut candidate in entropy_candidates(raw) {
+            candidate.scalar = context.scalar_for(text, candidate.value);
+            if candidate.scalar.is_none() && !context.scalars.is_empty() {
+                let core = wrapper_strip_repeated(candidate.value);
+                let start = core.as_ptr() as usize - text.as_ptr() as usize;
+                let end = start + core.len();
+                let first = context
+                    .scalars
+                    .partition_point(|scalar| scalar.end <= start);
+                if context
+                    .scalars
+                    .get(first)
+                    .is_some_and(|scalar| scalar.value_start < end && scalar.end < end)
+                {
+                    // The member views below still scan each value; a raw
+                    // bridge anchor spanning sibling scalars has no shared label.
+                    continue;
+                }
+            }
+            if let Some(scalar) = candidate.scalar {
+                let offset = candidate.value.as_ptr() as usize - text.as_ptr() as usize;
+                let label = scalar
+                    .label
+                    .filter(|(end, _)| offset.saturating_sub(*end) <= TRIGGER_WINDOW)
+                    .map(|(_, trigger)| trigger);
+                candidate.inline_trigger = candidate.inline_trigger.or(label);
+            }
             let offset = candidate.value.as_ptr() as usize - text.as_ptr() as usize;
             if offset + candidate.value.len() <= from {
                 continue;
@@ -1637,9 +1793,9 @@ fn check_entropy_candidate<'a>(
     // UUIDs require credential-label context rather than a generic mention
     // of `token`; base64 content-hash exemptions remain trigger-sensitive.
     // VCS revisions and file paths use narrower syntactic context below.
-    let trigger = entropy_trigger(text, tokens, idx, false, candidate.inline_trigger);
+    let trigger = entropy_trigger(text, tokens, idx, false, candidate);
     let near_trigger = trigger.is_some();
-    let uuid_trigger = entropy_trigger(text, tokens, idx, true, candidate.inline_trigger);
+    let uuid_trigger = entropy_trigger(text, tokens, idx, true, candidate);
     let uuid_near_credential_label = uuid_trigger.is_some();
 
     // Step 1 (see doc: per-token flagging sequence). UUIDs fall through only
