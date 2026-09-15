@@ -129,7 +129,10 @@
 - Pack verb names in `Visibility::Verb` participate in cross-pack collision detection at boot
 - `Visibility::Subhandler` entries are excluded from collision checks and not callable via MCP
 - Boot-time collision: two packs declaring the same public verb name produce `RuntimeError::VerbCollision`
-- Pack-auxiliary schema plans are collected from all registered packs and applied at startup
+- Pack-auxiliary schema plans are collected from all registered packs and applied at startup.
+  Serving hosts use `apply_schema_plans_with_map` (an empty map for one backend) and propagate
+  pack-named failures. Read-only backends validate declared columns without a writer; missing
+  or incompatible columns refuse boot.
 
 ### ADR-018: Authorization Gate
 

@@ -286,3 +286,67 @@ fn pack_column_upgrades_resolve_identifiers_with_sqlite_case_rules() {
         .unwrap();
     assert_eq!(revision, "pinned");
 }
+
+#[test]
+fn pack_column_read_only_validation_reports_all_missing_and_incompatible_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("incompatible-columns.db");
+    {
+        let backend = StorageBackend::sqlite(&path).unwrap();
+        backend
+            .apply_pack_ddl_statements(&["CREATE TABLE upgrade_records (id INTEGER PRIMARY KEY, \
+                 revision INTEGER NOT NULL, invalidated_at TEXT DEFAULT 'unknown')"])
+            .unwrap();
+    }
+    #[cfg(unix)]
+    khive_storage::test_support::freeze_snapshot_sidecars(&path);
+    let backend = StorageBackend::sqlite_read_only(&path).unwrap();
+    let before = backend.pool().writer_acquisition_snapshot();
+    assert_eq!(before, crate::pool::WriterAcquisitionSnapshot::default());
+    let additions = [
+        ADDITIONS[0],
+        ADDITIONS[1],
+        PackColumnAddition {
+            table: "upgrade_records",
+            column: "missing",
+            affinity: PackColumnAffinity::Text,
+        },
+    ];
+    let error = backend
+        .validate_pack_schema_columns(&additions)
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "incompatible pack schema column upgrade_records.revision: expected nullable TEXT",
+        "type=\"INTEGER\", notnull=1",
+        "incompatible pack schema column upgrade_records.invalidated_at: expected nullable INTEGER",
+        "type=\"TEXT\", notnull=0, default=Some(\"'unknown'\")",
+        "pack schema plan did not create declared columns: upgrade_records.missing",
+    ] {
+        assert!(error.contains(expected), "missing {expected:?} in {error}");
+    }
+    assert_eq!(backend.pool().writer_acquisition_snapshot(), before);
+    assert_eq!(column_count(&backend, "missing"), 0);
+}
+
+#[test]
+fn pack_column_validation_preserves_query_errors() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(PLAN[0]).unwrap();
+    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+        AuthAction::Read {
+            table_name: "pragma_table_xinfo",
+            ..
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }))
+    .unwrap();
+    assert!(table_exists(&conn, "upgrade_records").unwrap());
+    let control = column_exists_and_matches(&conn, &ADDITIONS[0]).unwrap_err();
+    assert!(matches!(&control, SqliteError::Rusqlite(_)), "{control}");
+    let error = validate_columns(&conn, ADDITIONS).unwrap_err();
+    assert!(matches!(&error, SqliteError::Rusqlite(_)), "{error}");
+    assert_eq!(error.to_string(), control.to_string());
+}
