@@ -38,7 +38,17 @@ def _counts(scratch):
             "SELECT COUNT(*) FROM notes",
             "SELECT COUNT(*) FROM note_streams",
             "SELECT COUNT(*) FROM fts_notes",
-            "SELECT COUNT(*) FROM events WHERE kind != 'audit'",
+            # Caller-produced events only. The daemon runs background loops that
+            # append non-audit events on their own schedule: the checkpoint task
+            # (crates/khive-db/src/checkpoint.rs), the channel poll loop
+            # (crates/khive-mcp/src/serve.rs) and the ANN warmer
+            # (crates/khive-pack-memory/src/ann.rs). Each hands its event to an
+            # unawaited queue, so one can land in any window between two samples.
+            # A database-wide count then says "nothing anywhere wrote an event",
+            # where the assertion means "the refused request wrote none". All
+            # three name themselves with a `daemon:` actor; a request carries the
+            # caller's, so this counts requests and nothing else.
+            "SELECT COUNT(*) FROM events WHERE kind != 'audit' AND actor NOT LIKE 'daemon:%'",
         ))
 
 
@@ -96,3 +106,8 @@ def test_observed_id_arm9_socket_second_process_recreation(scratch_daemon):
         assert [one("stream.stat", stream=s) for s in streams] == [{"count":1, "head_seq":1}] * 2
         written = one("get", kind="head", key=target)
         assert written["version"] == 2 and json.loads(written["content"]) == {"published":True}
+        # Control on the predicate itself: the batch that just committed wrote
+        # caller events, so an actor filter that excluded everything would make
+        # every equality above pass vacuously. This is the arm that fails if the
+        # scoping is wrong rather than merely narrow.
+        assert _counts(scratch_daemon)[3] > 0

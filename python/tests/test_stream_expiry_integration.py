@@ -53,7 +53,17 @@ def _counts(scratch):
         return tuple(db.execute(sql).fetchone()[0] for sql in (
             "SELECT COUNT(*) FROM notes",
             "SELECT COUNT(*) FROM note_streams",
-            "SELECT COUNT(*) FROM events WHERE kind != 'audit'",
+            # Caller-produced events only. The daemon runs background loops that
+            # append non-audit events on their own schedule: the checkpoint task
+            # (crates/khive-db/src/checkpoint.rs), the channel poll loop
+            # (crates/khive-mcp/src/serve.rs) and the ANN warmer
+            # (crates/khive-pack-memory/src/ann.rs). Each hands its event to an
+            # unawaited queue, so one can land in any window between two samples.
+            # A database-wide count then says "nothing anywhere wrote an event",
+            # where the assertion means "the refused request wrote none". All
+            # three name themselves with a `daemon:` actor; a request carries the
+            # caller's, so this counts requests and nothing else.
+            "SELECT COUNT(*) FROM events WHERE kind != 'audit' AND actor NOT LIKE 'daemon:%'",
         ))
 
 
@@ -104,6 +114,11 @@ def test_expiry_arm10_socket_expiry_and_intervening_writer(scratch_daemon):
         assert stale["error"]["domain_disposition"] == "not_committed"
         assert _counts(scratch_daemon) == before
         assert publish(2)["ok"]
+        # Control on the predicate itself: the batch that just committed wrote
+        # caller events, so an actor filter that excluded everything would make
+        # every equality above pass vacuously. This is the arm that fails if the
+        # scoping is wrong rather than merely narrow.
+        assert _counts(scratch_daemon)[2] > 0
         assert request("stream.stat", stream=stream)["result"] == {"count":2, "head_seq":2}
         proc.stdin.write("done\n")
         proc.stdin.flush()
