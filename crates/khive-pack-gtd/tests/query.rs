@@ -526,3 +526,456 @@ async fn assign_advertises_the_description_param_and_stores_it() {
         "task record must carry the body; got {record}"
     );
 }
+
+// Additive task-query filters must pass through the public registry and filter
+// the SQL candidate set before either pagination or the excluded-state probe.
+fn issue_2678_ids(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .expect("ordinary task results retain the existing array shape")
+        .iter()
+        .map(|task| task["full_id"].as_str().expect("full task UUID").to_owned())
+        .collect()
+}
+
+fn issue_2678_id_set(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    issue_2678_ids(value).into_iter().collect()
+}
+
+async fn issue_2678_context(fixture: &common::Fixture, name: &str, namespace: &str) -> String {
+    fixture
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": name, "namespace": namespace,
+                   "skip_dedup_check": true}),
+        )
+        .await
+        .expect("create a real context in assign's primary namespace")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn issue_2678_tags_any_all_nocase_and_unfiltered_controls() {
+    let fixture = pack(rt());
+    let mut tasks = Vec::new();
+    for (title, tags) in [
+        ("red", vec!["red"]),
+        ("blue", vec!["blue"]),
+        ("both", vec!["red", "blue"]),
+        ("untagged", vec![]),
+    ] {
+        tasks.push(assign(&fixture, json!({"title": title, "tags": tags})).await);
+    }
+    let legacy = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert_eq!(issue_2678_ids(&legacy).len(), 4);
+    for args in [
+        json!({"tags": null}),
+        json!({"tags": []}),
+        json!({"tag_mode": null}),
+        json!({"tag_mode": "all"}),
+        json!({"tags": [], "tag_mode": "all", "context_entity_id": null}),
+    ] {
+        assert_eq!(fixture.dispatch("gtd.tasks", args).await.unwrap(), legacy);
+    }
+    let union: std::collections::BTreeSet<String> = tasks[..3]
+        .iter()
+        .map(|task| task["full_id"].as_str().unwrap().to_owned())
+        .collect();
+    for args in [
+        json!({"tags": ["RED", "blue"]}),
+        json!({"tags": ["red", "BLUE"], "tag_mode": "any"}),
+        json!({"tags": ["RED", "red", "blue"], "tag_mode": null}),
+    ] {
+        let result = fixture.dispatch("gtd.tasks", args).await.unwrap();
+        assert_eq!(issue_2678_id_set(&result), union);
+        assert_eq!(
+            issue_2678_ids(&result).len(),
+            3,
+            "duplicate tags do not duplicate rows"
+        );
+    }
+    for tags in [json!(["RED", "blue"]), json!(["red", "RED", "BLUE"])] {
+        let result = fixture
+            .dispatch("gtd.tasks", json!({"tags": tags, "tag_mode": "all"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            issue_2678_ids(&result),
+            vec![tasks[2]["full_id"].as_str().unwrap()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_2678_context_compares_canonical_uuid_without_requiring_live_anchor() {
+    let fixture = pack(rt());
+    let alpha = issue_2678_context(&fixture, "context-alpha", "local").await;
+    let beta = issue_2678_context(&fixture, "context-beta", "local").await;
+    let anchored = assign(
+        &fixture,
+        json!({"title": "alpha task", "context_entity_id": alpha}),
+    )
+    .await;
+    assign(
+        &fixture,
+        json!({"title": "beta task", "context_entity_id": beta}),
+    )
+    .await;
+    assign(&fixture, json!({"title": "unanchored task"})).await;
+    let legacy = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert_eq!(issue_2678_ids(&legacy).len(), 3);
+    assert_eq!(
+        fixture
+            .dispatch("gtd.tasks", json!({"context_entity_id": null}))
+            .await
+            .unwrap(),
+        legacy
+    );
+    let parsed = uuid::Uuid::parse_str(&alpha).unwrap();
+    let noncanonical = parsed.simple().to_string();
+    assert_ne!(noncanonical, alpha);
+    assert_eq!(uuid::Uuid::parse_str(&noncanonical).unwrap(), parsed);
+    let legacy_stored = assign(&fixture, json!({"title": "noncanonical stored context"})).await;
+    fixture
+        .dispatch(
+            "update",
+            json!({"id": legacy_stored["full_id"],
+                   "properties": {"context_entity_id": noncanonical}}),
+        )
+        .await
+        .expect("store the literal context property through the public update path");
+    let stored = fixture
+        .dispatch("get", json!({"id": legacy_stored["full_id"]}))
+        .await
+        .unwrap();
+    assert_eq!(stored["properties"]["context_entity_id"], noncanonical);
+    let unfiltered = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert_eq!(issue_2678_ids(&unfiltered).len(), 4);
+    assert!(issue_2678_ids(&unfiltered)
+        .contains(&legacy_stored["full_id"].as_str().unwrap().to_owned()));
+    assert_eq!(
+        fixture
+            .dispatch("gtd.tasks", json!({"context_entity_id": null}))
+            .await
+            .unwrap(),
+        unfiltered
+    );
+    for spelling in [
+        alpha.clone(),
+        alpha.to_ascii_uppercase(),
+        parsed.simple().to_string(),
+        parsed.urn().to_string(),
+        parsed.braced().to_string(),
+    ] {
+        let result = fixture
+            .dispatch("gtd.tasks", json!({"context_entity_id": spelling}))
+            .await
+            .unwrap();
+        assert_eq!(
+            issue_2678_ids(&result),
+            vec![anchored["full_id"].as_str().unwrap()]
+        );
+        let row = &result[0];
+        assert_eq!(row["context_entity_id"], alpha);
+        assert_eq!(row["dependency_state"], "ready");
+        assert_eq!(row["blocked_by"], json!([]));
+        for field in ["created_at", "updated_at"] {
+            chrono::DateTime::parse_from_rfc3339(row[field].as_str().unwrap()).unwrap();
+        }
+    }
+    let absent = "00000000-0000-4000-8000-000000000678";
+    let before = fixture
+        .dispatch("list", json!({"kind": "entity"}))
+        .await
+        .unwrap();
+    assert!(fixture
+        .dispatch("get", json!({"id": absent}))
+        .await
+        .is_err());
+    assert_eq!(
+        fixture
+            .dispatch("gtd.tasks", json!({"context_entity_id": absent}))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        fixture
+            .dispatch("list", json!({"kind": "entity"}))
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(fixture
+        .dispatch("get", json!({"id": absent}))
+        .await
+        .is_err());
+    fixture
+        .dispatch("delete", json!({"id": alpha}))
+        .await
+        .expect("soft-delete anchor");
+    assert!(fixture.dispatch("get", json!({"id": alpha})).await.is_err());
+    let result = fixture
+        .dispatch("gtd.tasks", json!({"context_entity_id": alpha}))
+        .await
+        .unwrap();
+    assert_eq!(
+        issue_2678_ids(&result),
+        vec![anchored["full_id"].as_str().unwrap()]
+    );
+    assert_eq!(
+        fixture
+            .dispatch("get", json!({"id": legacy_stored["full_id"]}))
+            .await
+            .unwrap()["properties"]["context_entity_id"],
+        noncanonical,
+        "filtering must not rewrite the noncanonical stored reference"
+    );
+}
+
+#[tokio::test]
+async fn issue_2678_filters_combine_with_status_owner_priority_and_namespace_visibility() {
+    let runtime = rt();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![
+        khive_runtime::Namespace::parse("filter-alpha").expect("valid fixture namespace")
+    ]);
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    runtime.install_edge_rules(registry.all_edge_rules());
+    let fixture = common::Fixture { registry };
+    let alpha = issue_2678_context(&fixture, "visible context", "filter-alpha").await;
+    let other = issue_2678_context(&fixture, "other context", "filter-alpha").await;
+    let base = json!({"title": "matching task", "namespace": "filter-alpha", "status": "next",
+                      "assignee": "alice", "priority": "p1", "tags": ["red"], "context_entity_id": alpha});
+    let matching = assign(&fixture, base.clone()).await;
+    for (field, value) in [
+        ("tags", json!(["blue"])),
+        ("context_entity_id", json!(other)),
+        ("status", json!("waiting")),
+        ("assignee", json!("bob")),
+        ("priority", json!("p2")),
+    ] {
+        let mut args = base.clone();
+        args["title"] = json!(format!("wrong {field}"));
+        args[field] = value;
+        assign(&fixture, args).await;
+    }
+    let local = assign(&fixture, json!({"title": "local red", "tags": ["red"]})).await;
+    let beta = assign(
+        &fixture,
+        json!({"title": "hidden red", "namespace": "filter-beta", "tags": ["red"]}),
+    )
+    .await;
+    let query = json!({"tags": ["RED"], "context_entity_id": alpha, "status": "next", "assignee": "alice", "priority": "p1"});
+    // The configured visible set exposes the task despite its context living
+    // outside the default primary namespace. Filtering must not resolve it there.
+    assert_eq!(
+        issue_2678_ids(&fixture.dispatch("gtd.tasks", query.clone()).await.unwrap()),
+        vec![matching["full_id"].as_str().unwrap()]
+    );
+    let mut precise = query;
+    precise["namespace"] = json!("filter-alpha");
+    assert_eq!(
+        issue_2678_ids(&fixture.dispatch("gtd.tasks", precise).await.unwrap()),
+        vec![matching["full_id"].as_str().unwrap()]
+    );
+    let visible = fixture
+        .dispatch("gtd.tasks", json!({"tags": ["red"]}))
+        .await
+        .unwrap();
+    let ids = issue_2678_id_set(&visible);
+    assert!(ids.contains(local["full_id"].as_str().unwrap()));
+    assert!(ids.contains(matching["full_id"].as_str().unwrap()));
+    assert!(!ids.contains(beta["full_id"].as_str().unwrap()));
+    assert_eq!(
+        issue_2678_ids(
+            &fixture
+                .dispatch(
+                    "gtd.tasks",
+                    json!({"namespace": "filter-beta", "tags": ["RED"]})
+                )
+                .await
+                .unwrap()
+        ),
+        vec![beta["full_id"].as_str().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn issue_2678_tags_and_context_filter_before_limit_and_offset() {
+    let fixture = pack(rt());
+    let alpha = issue_2678_context(&fixture, "page alpha", "local").await;
+    let beta = issue_2678_context(&fixture, "page beta", "local").await;
+    let mut wanted = std::collections::BTreeSet::new();
+    for index in 0..3 {
+        let task = assign(&fixture, json!({"title": format!("older match {index}"), "tags": ["red"], "context_entity_id": alpha})).await;
+        wanted.insert(task["full_id"].as_str().unwrap().to_owned());
+    }
+    for index in 0..6 {
+        let (tags, context) = if index % 2 == 0 {
+            (json!(["blue"]), &alpha)
+        } else {
+            (json!(["red"]), &beta)
+        };
+        assign(&fixture, json!({"title": format!("newer nonmatch {index}"), "tags": tags, "context_entity_id": context})).await;
+    }
+    let unfiltered = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    let all_ids = issue_2678_ids(&unfiltered);
+    assert_eq!(all_ids.len(), 9);
+    assert!(
+        all_ids[..2].iter().all(|id| !wanted.contains(id)),
+        "newer nonmatches must occupy the unfiltered first page"
+    );
+    let expected: Vec<String> = all_ids
+        .into_iter()
+        .filter(|id| wanted.contains(id))
+        .collect();
+    let query = json!({"tags": ["RED"], "context_entity_id": alpha, "limit": 2, "offset": 1});
+    let page = fixture.dispatch("gtd.tasks", query.clone()).await.unwrap();
+    assert_eq!(issue_2678_ids(&page), expected[1..]);
+    assert_eq!(
+        fixture.dispatch("gtd.tasks", query).await.unwrap(),
+        page,
+        "stable order and rendering on repeat"
+    );
+    assert_eq!(
+        issue_2678_ids(
+            &fixture
+                .dispatch(
+                    "gtd.tasks",
+                    json!({"tags": ["red"], "context_entity_id": alpha, "limit": 1})
+                )
+                .await
+                .unwrap()
+        ),
+        expected[..1]
+    );
+    assert_eq!(
+        fixture
+            .dispatch(
+                "gtd.tasks",
+                json!({"tags": ["red"], "context_entity_id": alpha, "offset": 3})
+            )
+            .await
+            .unwrap(),
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn issue_2678_exclusion_probe_keeps_both_filters_and_tag_mode() {
+    let fixture = pack(rt());
+    let alpha = issue_2678_context(&fixture, "terminal alpha", "local").await;
+    let beta = issue_2678_context(&fixture, "terminal beta", "local").await;
+    let task = assign(
+        &fixture,
+        json!({"title": "done red alpha", "tags": ["red"], "context_entity_id": alpha}),
+    )
+    .await;
+    fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task["full_id"], "status": "done"}),
+        )
+        .await
+        .unwrap();
+    for args in [
+        json!({"tags": ["blue"], "context_entity_id": alpha}),
+        json!({"tags": ["red"], "context_entity_id": beta}),
+        json!({"tags": ["red", "blue"], "tag_mode": "all", "context_entity_id": alpha}),
+    ] {
+        assert_eq!(
+            fixture.dispatch("gtd.tasks", args).await.unwrap(),
+            json!([]),
+            "unrelated terminal rows must not trigger an exclusion hint"
+        );
+    }
+    let legacy = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    assert_eq!(legacy["tasks"], json!([]));
+    assert_eq!(
+        legacy["filter_excluded"],
+        json!(["done", "cancelled", "unrecognized_status"])
+    );
+    for args in [
+        json!({"tags": ["RED"], "context_entity_id": alpha}),
+        json!({"tags": ["red", "blue"], "tag_mode": "any", "context_entity_id": alpha}),
+        json!({"tags": [], "context_entity_id": null}),
+    ] {
+        assert_eq!(fixture.dispatch("gtd.tasks", args).await.unwrap(), legacy);
+    }
+    let done = fixture
+        .dispatch(
+            "gtd.tasks",
+            json!({"status": "done", "tags": ["red"], "context_entity_id": alpha}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        issue_2678_ids(&done),
+        vec![task["full_id"].as_str().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn issue_2678_rejects_malformed_filters_without_domain_mutation() {
+    let fixture = pack(rt());
+    let context = issue_2678_context(&fixture, "refusal context", "local").await;
+    assign(
+        &fixture,
+        json!({"title": "preserved task", "tags": ["red"], "context_entity_id": context}),
+    )
+    .await;
+    let tasks = fixture.dispatch("gtd.tasks", json!({})).await.unwrap();
+    let entities = fixture
+        .dispatch("list", json!({"kind": "entity"}))
+        .await
+        .unwrap();
+    for args in [
+        json!({"tags": "red"}),
+        json!({"tags": ["red", 1]}),
+        json!({"tags": {"red": true}}),
+        json!({"tag_mode": "ALL"}),
+        json!({"tag_mode": "some"}),
+        json!({"tag_mode": true}),
+        json!({"context_entity_id": 7}),
+        json!({"context_entity_id": {"id": context}}),
+    ] {
+        let error = fixture
+            .dispatch("gtd.tasks", args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bad params"), "{error}");
+    }
+    for invalid in [
+        "not-a-uuid",
+        "",
+        &context[..8],
+        "0000000000004000800000000000067",
+    ] {
+        let error = fixture
+            .dispatch("gtd.tasks", json!({"context_entity_id": invalid}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("context_entity_id") && error.contains("full UUID"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        fixture.dispatch("gtd.tasks", json!({})).await.unwrap(),
+        tasks
+    );
+    assert_eq!(
+        fixture
+            .dispatch("list", json!({"kind": "entity"}))
+            .await
+            .unwrap(),
+        entities
+    );
+}

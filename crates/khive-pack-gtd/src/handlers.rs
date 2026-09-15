@@ -22,7 +22,7 @@ use uuid::Uuid;
 use khive_runtime::note_write::NoteWriteOptions;
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
-use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, NoteFilter, NoteTagMode, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_types::{Details, KhiveError};
 
@@ -274,6 +274,12 @@ struct TasksParams {
     assignee: Option<String>,
     #[serde(default)]
     priority: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    tag_mode: Option<NoteTagMode>,
+    #[serde(default)]
+    context_entity_id: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
@@ -1570,6 +1576,23 @@ impl GtdPack {
             }
         }
 
+        // This is a comparison with an already stored canonical reference,
+        // not assign's validation of a new reference to a live primary-namespace entity.
+        let context_filter = p
+            .context_entity_id
+            .as_deref()
+            .map(|raw| {
+                Uuid::parse_str(raw)
+                    .map(|id| id.as_hyphenated().to_string())
+                    .map_err(|_| {
+                        RuntimeError::InvalidInput(
+                            "tasks: context_entity_id must be a full UUID; short prefixes are not accepted"
+                                .to_string(),
+                        )
+                    })
+            })
+            .transpose()?;
+
         // #772: push status/assignee/priority predicates into SQL via
         // `query_notes_filtered` and use its real `PageRequest{limit, offset}`
         // for pagination. The previous `list_notes(..., window, 0)` always
@@ -1635,6 +1658,14 @@ impl GtdPack {
             });
         }
 
+        if let Some(want) = context_filter {
+            property_filters.push(PropertyFilter {
+                json_path: "$.context_entity_id".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(want),
+            });
+        }
+
         let namespaces = if token.visible_namespaces().len() > 1 {
             token
                 .visible_namespaces()
@@ -1646,8 +1677,10 @@ impl GtdPack {
         };
         let filter = NoteFilter {
             kind: Some("task".to_string()),
-            property_filters: property_filters.clone(),
-            namespaces: namespaces.clone(),
+            property_filters,
+            namespaces,
+            tags: p.tags.unwrap_or_default(),
+            tag_mode: p.tag_mode.unwrap_or_default(),
             ..Default::default()
         };
         let page = self
@@ -1676,26 +1709,21 @@ impl GtdPack {
         // #96: a bare `[]` is indistinguishable from "no such task" when the
         // *default* state exclusion is what emptied the result —
         // the common case a caller hits right after `gtd.complete`. Probe for
-        // an excluded task with the same namespace/assignee/priority filters
+        // an excluded task with the same namespace/assignee/priority/tag/context filters
         // before changing the response shape; other empty results keep the
         // established bare array.
         if result.is_empty() && status_filter.is_none() {
-            property_filters[0] = PropertyFilter {
+            let mut terminal_filter = filter.clone();
+            terminal_filter.property_filters[0] = PropertyFilter {
                 json_path: "$.status".to_string(),
                 op: FilterOp::NotInOrMissing(open_statuses),
                 value: SqlValue::Null,
             };
-            property_filters.push(PropertyFilter {
+            terminal_filter.property_filters.push(PropertyFilter {
                 json_path: "$.status".to_string(),
                 op: FilterOp::JsonTypeEq,
                 value: SqlValue::Text("text".to_string()),
             });
-            let terminal_filter = NoteFilter {
-                kind: Some("task".to_string()),
-                property_filters,
-                namespaces,
-                ..Default::default()
-            };
             let terminal_page = self
                 .runtime()
                 .notes(token)?
