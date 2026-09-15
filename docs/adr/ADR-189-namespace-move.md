@@ -73,8 +73,12 @@ primary keys:
 A census of every `CREATE UNIQUE INDEX` touching namespace in `khive-db` returns those four indexes
 and no fifth.
 
-The `note_streams` row is listed for completeness and is never reached: the section below refuses a
-stream member before any collision is computed.
+Three of the nine are unreachable through this primitive, and the reasons are decisions taken below
+rather than accidents: `note_streams` refuses before any collision is computed, and the two
+`ann_consumer_*` tables are never written by the move at all, because the write log is appended to
+and no watermark is edited. The refusal set the implementation actually enumerates is the other
+six. They are listed here because the census has to keep finding all nine: a later decision that
+moves a watermark makes that PK reachable again, and the table is where a reader would look.
 
 **Vectors.** The delete path is keyed on the pair:
 `DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2`, at `stores/vectors.rs:31`, `:506`
@@ -258,8 +262,11 @@ missed: the first skips rows, the second corrupts them.
 - A concurrent writer during the move cannot produce a resurrected or a lost row.
 - A route map missing a kind that has rows refuses without writing anything, and a routed kind with
   zero rows succeeds reporting zero.
-- A collision on any of the nine constraints refuses the whole move and names the rows. The fixture
-  carries at least the `(namespace, kind, key)` and `(namespace, slug)` shapes.
+- A collision on any of the six reachable constraints refuses the whole move and names the rows. The
+  fixture carries at least the `(namespace, kind, key)` and `(namespace, slug)` shapes.
+- The census finds all nine namespace-bearing uniqueness constraints, including the three this
+  primitive cannot reach, so a later decision that makes one reachable is a change to one predicate
+  rather than a rediscovery.
 - Full-text search and vector recall return the moved records under the target namespace and nothing
   under the source, and a delete issued after the move removes the vector.
 - Soft-deleted records move with `deleted_at` intact.
