@@ -127,8 +127,8 @@ fn default_pid_path() -> PathBuf {
 /// Unix socket path the daemon binds and clients connect to.
 ///
 /// Overridable via the `KHIVE_SOCKET` env var (for tests and ops), which must
-/// be set together with `KHIVE_PID` — see
-/// [`ensure_rendezvous_overrides_paired`].
+/// be set together with `KHIVE_PID`: the daemon refuses to boot when exactly
+/// one of the two is set.
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     path_override(SOCKET_PATH_ENV).unwrap_or_else(default_socket_path)
@@ -137,7 +137,8 @@ pub fn socket_path() -> PathBuf {
 /// PID file path written by the daemon.
 ///
 /// Overridable via the `KHIVE_PID` env var, which must be set together with
-/// `KHIVE_SOCKET` — see [`ensure_rendezvous_overrides_paired`].
+/// `KHIVE_SOCKET`: the daemon refuses to boot when exactly one of the two is
+/// set.
 #[cfg(unix)]
 pub fn pid_path() -> PathBuf {
     path_override(PID_PATH_ENV).unwrap_or_else(default_pid_path)
