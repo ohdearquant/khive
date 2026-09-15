@@ -4,15 +4,20 @@
 //! supplied at construction time from environment variables; they are never
 //! logged or embedded in source.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use khive_channel::ChannelError;
 use lettre::{
     message::{header::ContentType, Mailbox},
-    transport::smtp::authentication::{Credentials, Mechanism},
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    transport::smtp::{
+        authentication::{Credentials, Mechanism, DEFAULT_MECHANISMS},
+        client::{AsyncSmtpConnection, TlsParameters},
+        extension::ClientId,
+    },
+    Message,
 };
+use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::oauth::TokenProvider;
@@ -73,10 +78,19 @@ pub(crate) trait SmtpConnector: Send + Sync + 'static {
 }
 
 /// Production SMTP connector backed by `lettre`.
+///
+/// Retains one authenticated connection across sequential deliveries and passes
+/// until credentials change or an exchange fails.
 pub(crate) struct LettreSmtp {
     host: String,
     port: u16,
     auth: SmtpAuthConfig,
+    connection: Mutex<Option<AuthenticatedConnection>>,
+}
+
+struct AuthenticatedConnection {
+    credentials: Credentials,
+    connection: AsyncSmtpConnection,
 }
 
 impl LettreSmtp {
@@ -89,6 +103,7 @@ impl LettreSmtp {
                 username.to_string(),
                 password.to_string(),
             )),
+            connection: Mutex::new(None),
         }
     }
 
@@ -110,7 +125,75 @@ impl LettreSmtp {
                 mailbox: mailbox.into(),
                 token_provider,
             },
+            connection: Mutex::new(None),
         }
+    }
+
+    async fn connect(&self) -> Result<AsyncSmtpConnection, ChannelError> {
+        let tls = TlsParameters::new(self.host.clone())
+            .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?;
+        let hello_name = ClientId::default();
+        // Match lettre's transport defaults: implicit TLS on 465, mandatory
+        // STARTTLS elsewhere, and a 60-second network/command timeout.
+        let mut connection = AsyncSmtpConnection::connect_tokio1(
+            (self.host.as_str(), self.port),
+            Some(Duration::from_secs(60)),
+            &hello_name,
+            (self.port == 465).then(|| tls.clone()),
+            None,
+        )
+        .await
+        .map_err(smtp_connection_error)?;
+        if self.port != 465 {
+            connection
+                .starttls(tls, &hello_name)
+                .await
+                .map_err(smtp_connection_error)?;
+        }
+        Ok(connection)
+    }
+
+    async fn send_message_with_connect<F, Fut>(
+        &self,
+        message: Message,
+        credentials: Credentials,
+        mechanisms: &[Mechanism],
+        connect: F,
+    ) -> Result<(), ChannelError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
+    {
+        let mut cached = self.connection.lock().await;
+        // Own the connection during every exchange. Cancellation or an error
+        // must never return a partially completed SMTP transaction to the cache.
+        let mut session = match cached.take() {
+            Some(session) if session.credentials == credentials => session,
+            _ => {
+                let mut connection = connect().await?;
+                connection
+                    .auth(mechanisms, &credentials)
+                    .await
+                    .map_err(smtp_connection_error)?;
+                classify_smtp_preamble_status(connection.test_connected().await)?;
+                AuthenticatedConnection {
+                    credentials,
+                    connection,
+                }
+            }
+        };
+
+        // Calling the connection directly cannot reconnect inside MAIL/RCPT/DATA.
+        // A new handshake always passes through the connection/AUTH classifier.
+        session
+            .connection
+            .send(message.envelope(), &message.formatted())
+            .await
+            .map_err(|error| {
+                classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
+            })?;
+        *cached = Some(session);
+        Ok(())
     }
 }
 
@@ -152,8 +235,15 @@ fn classify_smtp_connection_error(is_permanent: bool, message: String) -> Channe
     }
 }
 
-/// Classify the boolean half of lettre's `test_connection` contract. The
-/// transport swallows the NOOP command's own error and reports `Ok(false)`, so
+fn smtp_connection_error(error: lettre::transport::smtp::Error) -> ChannelError {
+    classify_smtp_connection_error(
+        error.is_permanent(),
+        format!("SMTP connection/authentication failed: {error}"),
+    )
+}
+
+/// Classify lettre's `test_connected` contract. The connection
+/// swallows the NOOP command's own error and reports `false`, so
 /// a refused NOOP after a successful connect/AUTH carries no permanence
 /// information. AUTH rejections surface as `Err` from the connection setup and
 /// are classified by [`classify_smtp_connection_error`]; a refused NOOP is a
@@ -251,56 +341,21 @@ impl SmtpConnector for LettreSmtp {
             references,
         )?;
 
-        // Port 465 is implicit TLS (SMTPS, TLS-on-connect); 587 and everything
-        // else use STARTTLS (connect in plaintext, upgrade after EHLO). Exchange
-        // Online's SMTP AUTH submission endpoint is 587/STARTTLS. Using implicit
-        // TLS on a STARTTLS port makes rustls read the plaintext `220` greeting as
-        // a TLS record and fail with `InvalidContentType`.
-        let relay_builder = if self.port == 465 {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
-        } else {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host)
-        }
-        .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?
-        .port(self.port);
-
-        let transport = match &self.auth {
-            SmtpAuthConfig::Basic(creds) => relay_builder.credentials(creds.clone()).build(),
+        let (credentials, mechanisms) = match &self.auth {
+            SmtpAuthConfig::Basic(credentials) => (credentials.clone(), DEFAULT_MECHANISMS),
             SmtpAuthConfig::OAuth {
                 mailbox,
                 token_provider,
             } => {
-                // Fetch (or return cached) bearer token, then wire it into lettre.
-                // lettre's Mechanism::Xoauth2 builds the SASL string internally from
-                // Credentials::new(mailbox, access_token).
                 let token = token_provider.get_token().await?;
-                relay_builder
-                    .credentials(Credentials::new(mailbox.clone(), token))
-                    .authentication(vec![Mechanism::Xoauth2])
-                    .build()
+                (
+                    Credentials::new(mailbox.clone(), token),
+                    &[Mechanism::Xoauth2][..],
+                )
             }
         };
-
-        // Explicitly separate the connect/AUTH preamble from the per-message
-        // MAIL/RCPT/DATA exchange (ADR-122 §4): `test_connection` runs only
-        // the former (connect, EHLO, AUTH if configured, NOOP), so a
-        // definitive rejection here is an account-wide auth problem, not a
-        // rejection of this particular recipient. The transport pools the
-        // connection it just opened, so a successful test reuses it for the
-        // send below instead of paying for a second handshake.
-        let is_connected = transport.test_connection().await.map_err(|error| {
-            classify_smtp_connection_error(
-                error.is_permanent(),
-                format!("SMTP connection/authentication failed: {error}"),
-            )
-        })?;
-        classify_smtp_preamble_status(is_connected)?;
-
-        transport.send(msg).await.map_err(|error| {
-            classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
-        })?;
-
-        Ok(())
+        self.send_message_with_connect(msg, credentials, mechanisms, || self.connect())
+            .await
     }
 }
 
@@ -377,7 +432,470 @@ impl SmtpSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        io,
+        net::SocketAddr,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+
+    #[derive(Debug)]
+    struct ScriptedStream(tokio::io::DuplexStream);
+
+    impl lettre::transport::smtp::client::AsyncTokioStream for ScriptedStream {
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 25)))
+        }
+    }
+
+    impl AsyncRead for ScriptedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ScriptedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    type Script = Vec<(String, String)>;
+
+    #[derive(Default)]
+    struct SmtpCounts {
+        connections: usize,
+        auth: usize,
+        noop: usize,
+        messages: usize,
+    }
+
+    struct ScriptedSmtp {
+        scripts: Mutex<VecDeque<Script>>,
+        counts: Arc<Mutex<SmtpCounts>>,
+        servers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        stalled: Arc<tokio::sync::Notify>,
+    }
+
+    impl ScriptedSmtp {
+        fn new(scripts: Vec<Script>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts.into()),
+                counts: Arc::new(Mutex::new(SmtpCounts::default())),
+                servers: Mutex::new(Vec::new()),
+                stalled: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        async fn connect(&self) -> Result<AsyncSmtpConnection, ChannelError> {
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected reconnect");
+            self.counts.lock().unwrap().connections += 1;
+            let counts = self.counts.clone();
+            let stalled = self.stalled.clone();
+            let (client, server) = tokio::io::duplex(8192);
+            let task = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                server.write_all(b"220 scripted SMTP\r\n").await.unwrap();
+                for (expected, reply) in script {
+                    if expected == "CLOSE" {
+                        return;
+                    }
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        assert_ne!(
+                            server.read_line(&mut line).await.unwrap(),
+                            0,
+                            "missing {expected}"
+                        );
+                        if expected != "." || line == ".\r\n" {
+                            break;
+                        }
+                    }
+                    assert!(
+                        line.starts_with(&expected),
+                        "expected {expected}, got {line}"
+                    );
+                    {
+                        let mut counts = counts.lock().unwrap();
+                        if expected.starts_with("AUTH ") {
+                            counts.auth += 1;
+                        } else if expected == "NOOP" {
+                            counts.noop += 1;
+                        } else if expected == "." {
+                            counts.messages += 1;
+                        }
+                    }
+                    server.write_all(reply.as_bytes()).await.unwrap();
+                    if reply.is_empty() {
+                        stalled.notify_one();
+                    }
+                }
+                // Keep the session alive until its owner drops it. Unexpected
+                // extra traffic fails instead of silently satisfying a script.
+                let mut line = String::new();
+                assert_eq!(
+                    server.read_line(&mut line).await.unwrap(),
+                    0,
+                    "extra command: {line}"
+                );
+            });
+            self.servers.lock().unwrap().push(task);
+            AsyncSmtpConnection::connect_with_transport(
+                Box::new(ScriptedStream(client)),
+                &ClientId::default(),
+            )
+            .await
+            .map_err(smtp_connection_error)
+        }
+
+        async fn finish(self) -> SmtpCounts {
+            assert!(self.scripts.into_inner().unwrap().is_empty());
+            for server in self.servers.into_inner().unwrap() {
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .expect("scripted server did not finish")
+                    .expect("scripted server failed");
+            }
+            Arc::try_unwrap(self.counts)
+                .ok()
+                .unwrap()
+                .into_inner()
+                .unwrap()
+        }
+    }
+
+    fn step(command: &str, response: &str) -> (String, String) {
+        (command.to_string(), format!("{response}\r\n"))
+    }
+
+    fn handshake(mechanism: Mechanism, secret: &str, auth_reply: &str) -> Script {
+        use base64::Engine as _;
+        let credentials = Credentials::new("sender@example.com".to_string(), secret.to_string());
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(mechanism.response(&credentials, None).unwrap());
+        vec![
+            step("EHLO ", "250-scripted\r\n250 AUTH PLAIN XOAUTH2"),
+            step(&format!("AUTH {mechanism} {auth}\r\n"), auth_reply),
+        ]
+    }
+
+    fn successful_session(mechanism: Mechanism, secret: &str, messages: usize) -> Script {
+        let mut script = handshake(mechanism, secret, "235 authenticated");
+        script.push(step("NOOP", "250 ready"));
+        for _ in 0..messages {
+            script.extend([
+                step("MAIL FROM:", "250 sender accepted"),
+                step("RCPT TO:", "250 recipient accepted"),
+                step("DATA", "354 send message"),
+                step(".", "250 queued"),
+            ]);
+        }
+        script
+    }
+
+    async fn scripted_delivery(
+        connector: &LettreSmtp,
+        server: &ScriptedSmtp,
+        mechanism: Mechanism,
+        secret: &str,
+    ) -> Result<(), ChannelError> {
+        let message = build_message(
+            "sender@example.com",
+            "recipient@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.send_message_with_connect(
+                message,
+                Credentials::new("sender@example.com".to_string(), secret.to_string()),
+                &[mechanism],
+                || server.connect(),
+            ),
+        )
+        .await
+        .expect("SMTP exchange timed out")
+    }
+
+    #[tokio::test]
+    async fn smtp_reuses_one_authenticated_connection_for_sequential_deliveries() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let server = ScriptedSmtp::new(vec![successful_session(
+            Mechanism::Plain,
+            "test-password",
+            3,
+        )]);
+        for _ in 0..3 {
+            scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap();
+        }
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (1, 1, 1, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_oauth_token_change_reconnects_and_authenticates_with_new_credentials() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let server = ScriptedSmtp::new(vec![
+            successful_session(Mechanism::Xoauth2, "test-token-first", 2),
+            successful_session(Mechanism::Xoauth2, "test-token-second", 2),
+        ]);
+        for secret in [
+            "test-token-first",
+            "test-token-first",
+            "test-token-second",
+            "test-token-second",
+        ] {
+            scripted_delivery(&connector, &server, Mechanism::Xoauth2, secret)
+                .await
+                .unwrap();
+        }
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 2, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_auth_rejection_never_sends_and_failed_session_is_not_cached() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let server = ScriptedSmtp::new(vec![
+            handshake(
+                Mechanism::Plain,
+                "test-password",
+                "535 authentication refused",
+            ),
+            successful_session(Mechanism::Plain, "test-password", 1),
+        ]);
+        let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChannelError::Auth(_)));
+        assert_eq!(server.counts.lock().unwrap().messages, 0);
+        scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap();
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_noop_refusal_never_sends_and_next_attempt_reconnects() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let mut refused = handshake(Mechanism::Plain, "test-password", "235 authenticated");
+        refused.push(step("NOOP", "550 NOOP refused"));
+        let server = ScriptedSmtp::new(vec![
+            refused,
+            successful_session(Mechanism::Plain, "test-password", 1),
+        ]);
+        let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChannelError::Transport(_)));
+        assert_eq!(server.counts.lock().unwrap().messages, 0);
+        scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap();
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_post_auth_rejection_discards_session_and_reconnect_auth_keeps_its_stage() {
+        for (reply, permanent) in [
+            ("450 recipient busy", false),
+            ("550 recipient refused", true),
+        ] {
+            let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+            let mut refused = successful_session(Mechanism::Plain, "test-password", 1);
+            refused.extend([
+                step("MAIL FROM:", "250 sender accepted"),
+                step("RCPT TO:", reply),
+                step("QUIT", "221 goodbye"),
+            ]);
+            let server = ScriptedSmtp::new(vec![
+                refused,
+                handshake(
+                    Mechanism::Plain,
+                    "test-password",
+                    "535 authentication refused",
+                ),
+                successful_session(Mechanism::Plain, "test-password", 1),
+            ]);
+            scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap();
+            let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(err, ChannelError::PermanentTransport(_)),
+                permanent
+            );
+            if !permanent {
+                assert!(matches!(err, ChannelError::Transport(_)));
+            }
+            let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ChannelError::Auth(_)));
+            scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap();
+            drop(connector);
+            let counts = server.finish().await;
+            assert_eq!(
+                (
+                    counts.connections,
+                    counts.auth,
+                    counts.noop,
+                    counts.messages
+                ),
+                (3, 3, 2, 2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_closed_connection_retries_without_hiding_reconnect_auth_rejection() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let mut closed = successful_session(Mechanism::Plain, "test-password", 1);
+        closed.push(("CLOSE".to_string(), String::new()));
+        let server = ScriptedSmtp::new(vec![
+            closed,
+            handshake(
+                Mechanism::Plain,
+                "test-password",
+                "535 authentication refused",
+            ),
+        ]);
+        scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap();
+        let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChannelError::Transport(_)));
+        let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChannelError::Auth(_)));
+        drop(connector);
+        let counts = server.finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_cancelled_send_discards_the_in_flight_connection() {
+        let connector = Arc::new(LettreSmtp::new("unused.invalid", 587, "unused", "unused"));
+        let mut stalled = successful_session(Mechanism::Plain, "test-password", 2);
+        stalled.last_mut().unwrap().1.clear();
+        let server = Arc::new(ScriptedSmtp::new(vec![
+            stalled,
+            successful_session(Mechanism::Plain, "test-password", 1),
+        ]));
+        scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap();
+        let sender = connector.clone();
+        let script = server.clone();
+        let delivery = tokio::spawn(async move {
+            scripted_delivery(&sender, &script, Mechanism::Plain, "test-password").await
+        });
+        tokio::time::timeout(Duration::from_secs(2), server.stalled.notified())
+            .await
+            .unwrap();
+        delivery.abort();
+        assert!(delivery.await.unwrap_err().is_cancelled());
+        scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+            .await
+            .unwrap();
+        drop(connector);
+        let counts = Arc::try_unwrap(server).ok().unwrap().finish().await;
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 2, 3)
+        );
+    }
 
     struct MockSmtp {
         calls: Arc<Mutex<Vec<(String, String, String)>>>,
