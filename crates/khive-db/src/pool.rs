@@ -26,6 +26,7 @@ const DEFAULT_READER_CAP: usize = 8;
 
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Bounded WAL autocheckpoint applied to writer-capable connections while no
 /// dedicated checkpoint owner has claimed the pool (4,000 pages ≈ 16 MiB at
@@ -473,6 +474,7 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    main_pool_generation: OnceLock<u64>,
     /// Three-state gate for whether the ADR-091 scheduled task has claimed
     /// routine WAL reclamation for this pool. Until claimed, every
     /// writer-capable connection keeps a bounded SQLite autocheckpoint
@@ -1217,6 +1219,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            main_pool_generation: OnceLock::new(),
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
@@ -1601,6 +1604,19 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// Identify this pool's counter window when it is designated as main.
+    /// Repeated runtime handles and diagnostics reads reuse the same generation;
+    /// constructing secondary pools does not consume main-pool generations.
+    pub fn main_pool_generation(&self) -> u64 {
+        *self.main_pool_generation.get_or_init(|| {
+            NEXT_MAIN_POOL_GENERATION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                })
+                .expect("main pool generation exhausted")
+        })
     }
 
     /// The typed admission failure for a pooled reader checkout that

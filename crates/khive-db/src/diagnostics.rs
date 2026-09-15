@@ -51,11 +51,11 @@
 //!    scan a `%_idx` table, so observing segment health is bounded even when
 //!    the corpus itself is large.
 //!
-//! The counters are process-global statics inside this crate, so a report is
-//! only meaningful when built inside the process that owns the checkpoint
-//! task (the daemon). Every payload therefore carries
-//! [`BuildIdentity`](crate::diagnostics::BuildIdentity), so a reading is
-//! self-labeling about which build's counters it describes.
+//! Checkpoint counters are process-global, while reader and writer acquisition
+//! counters belong to the supplied pool and can reset when it is reconstructed.
+//! Every payload carries [`BuildIdentity`] and [`ProcessIdentity`] for the
+//! process producing the reading. The PID, OS start time, and main-pool generation
+//! identify the reader/writer counter window; checkpoint counters remain global.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -180,6 +180,44 @@ impl BuildIdentity {
         Self {
             version: version.to_string(),
             build_hash: build_hash.map(str::to_string),
+        }
+    }
+}
+
+/// The serving OS process and the main pool's reader/writer counter generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// OS-reported process creation time in whole Unix epoch seconds (UTC).
+    /// This is neither pool creation time nor the time of the first request.
+    pub started_at: Option<i64>,
+    /// Present when the OS lookup is unsupported or unavailable. An unknown
+    /// start time is never replaced by zero or the current wall clock.
+    pub started_at_unavailable_reason: Option<String>,
+    pub pool_generation: u64,
+}
+
+impl ProcessIdentity {
+    pub fn current(pool: &ConnectionPool) -> Self {
+        let pid = std::process::id();
+        Self::from_start_time(
+            pid,
+            crate::walpin::process_start_time_secs(pid),
+            pool.main_pool_generation(),
+        )
+    }
+
+    fn from_start_time(pid: u32, started_at: Option<i64>, pool_generation: u64) -> Self {
+        Self {
+            pid,
+            started_at,
+            started_at_unavailable_reason: started_at.is_none().then(|| {
+                format!(
+                    "OS process start time is unsupported or unavailable on {}",
+                    std::env::consts::OS
+                )
+            }),
+            pool_generation,
         }
     }
 }
@@ -1147,6 +1185,7 @@ fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSize
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
+    pub process: ProcessIdentity,
     /// `None` for an in-memory backend — the file-backed sections then carry
     /// their own unavailability reasons.
     pub db_path: Option<String>,
@@ -1182,7 +1221,7 @@ pub struct DbDiagnostics {
 /// and the checkpoint sidecar writers key off of; a symlinked or otherwise
 /// aliased configured path would otherwise send those probes looking beside
 /// the alias while the evidence sits beside the canonical file. An in-memory
-/// pool has no path: the counters are still real (they are process-global),
+/// pool has no path: its process- and pool-scoped counters are still real,
 /// but every file-backed section degrades to an explicit "unavailable" with
 /// a reason rather than being silently omitted.
 ///
@@ -1256,6 +1295,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
+    let process = ProcessIdentity::current(&pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
@@ -1268,6 +1308,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         crate::ensure_request_read_active("db_diagnostics")?;
         return Ok(DbDiagnostics {
             build,
+            process,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1310,6 +1351,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
 
     Ok(DbDiagnostics {
         build,
+        process,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
@@ -1352,6 +1394,7 @@ fn collect_inner(
     audit_append_failures: Option<u64>,
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> DbDiagnostics {
+    let process = ProcessIdentity::current(pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let writer_contention = WriterContentionDiagnostics::snapshot(
@@ -1363,6 +1406,7 @@ fn collect_inner(
     let Some(path) = pool.config().path.clone() else {
         return DbDiagnostics {
             build,
+            process,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1396,6 +1440,7 @@ fn collect_inner(
 
     DbDiagnostics {
         build,
+        process,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file_state(&canonical)),
         checkpoint_counters: counters,
@@ -1690,6 +1735,98 @@ mod tests {
 
     use super::*;
     use crate::pool::{ConnectionPool, PoolConfig};
+
+    #[test]
+    fn process_identity_serializes_os_start_time_or_explicit_unavailability() {
+        let known = ProcessIdentity::from_start_time(42, Some(1_000_000_000), 3);
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            serde_json::json!({
+                "pid": 42,
+                "started_at": 1_000_000_000,
+                "started_at_unavailable_reason": null,
+                "pool_generation": 3
+            }),
+            "preserve the OS timestamp, not request time or a derived uptime"
+        );
+
+        let unknown = ProcessIdentity::from_start_time(42, None, 3);
+        let json = serde_json::to_value(unknown).unwrap();
+        assert_eq!(json["pid"], 42);
+        assert!(json["started_at"].is_null(), "never invent a start time");
+        let reason = json["started_at_unavailable_reason"].as_str().unwrap();
+        assert!(!reason.is_empty());
+        assert!(reason.contains(std::env::consts::OS));
+        assert_eq!(json["pool_generation"], 3);
+    }
+
+    #[tokio::test]
+    async fn process_identity_is_present_in_every_collector_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (file_pool, _) = seeded_pool(&dir);
+        let memory_pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
+        for pool in [file_pool, memory_pool] {
+            let pool = Arc::new(pool);
+            let expected = ProcessIdentity::current(&pool);
+            let writer_before = pool.writer_acquisition_snapshot();
+            let sync = collect(
+                &pool,
+                BuildIdentity::from_env("test", None),
+                Duration::from_secs(30),
+            );
+            let asynchronous = collect_with_runtime_audit_metrics_interruptibly(
+                Arc::clone(&pool),
+                BuildIdentity::from_env("test", None),
+                Duration::from_secs(30),
+                0,
+                None,
+            )
+            .await
+            .expect("diagnostics");
+            for report in [sync, asynchronous] {
+                assert_eq!(report.process, expected);
+                let json = serde_json::to_value(report).unwrap();
+                assert_eq!(json["process"], serde_json::to_value(&expected).unwrap());
+                assert_eq!(json["build"]["version"], "test");
+            }
+            assert_eq!(
+                pool.writer_acquisition_snapshot(),
+                writer_before,
+                "diagnostics must not count its probes as write traffic"
+            );
+        }
+    }
+
+    #[test]
+    fn process_identity_survives_pool_reconstruction_with_reset_counters() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("first pool");
+        drop(pool.try_writer().expect("writer acquisition"));
+        drop(pool.reader().expect("reader acquisition"));
+        let before = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert!(before.writer_contention.writer_acquisitions > 0);
+        assert!(before.reader_contention.reader_acquisitions > 0);
+        drop(pool);
+
+        let replacement = ConnectionPool::new(PoolConfig::default()).expect("replacement pool");
+        let after = collect(
+            &replacement,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        assert_eq!(after.process.pid, before.process.pid);
+        assert_eq!(after.process.started_at, before.process.started_at);
+        assert_eq!(
+            after.process.started_at_unavailable_reason,
+            before.process.started_at_unavailable_reason
+        );
+        assert!(after.process.pool_generation > before.process.pool_generation);
+        assert_eq!(after.writer_contention.writer_acquisitions, 0);
+        assert_eq!(after.reader_contention.reader_acquisitions, 0);
+    }
 
     fn seeded_pool(dir: &tempfile::TempDir) -> (ConnectionPool, PathBuf) {
         let path = dir.path().join("diag.db");

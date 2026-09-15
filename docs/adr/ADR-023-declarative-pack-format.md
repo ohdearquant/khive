@@ -188,9 +188,13 @@ Its 2026-08-08 integrity extension adds `graph_edge_integrity` (duplicate edge-I
 raw `graph_edges`/`graph_edges_seq` row counts) and a paired error field. A non-zero duplicate
 group count is the exact pre-V14 cross-namespace state that makes ID-deduplicated cursor walks
 lossy. The raw ledger counts are not collapsed into a parity boolean because sequence rows
-intentionally survive hard deletion. WAL-pin cleanup counters are emitted only when that request
-actually ran the cleanup enumeration; a skipped measurement is omitted, never serialized as
-`0`/`false`.
+intentionally survive hard deletion. Under ADR-091 Amendment 15, the request's read-only WAL-pin
+sidecar inspection emits `sidecar_listing_truncated` and
+`sidecar_entries_cleanup_would_reap` when the pass completes. `false`/`0` are measured results
+for an untruncated pass with no trusted stale producer temps eligible for ordinary housekeeping;
+the request never deletes sidecar evidence. The forecast uses housekeeping's compiled 5000 ms
+session-sweep fallback, not the checkpoint interval or a local sweep override. A skipped or failed
+sidecar pass omits these measurements rather than fabricating `0`/`false`.
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers

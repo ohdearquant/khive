@@ -901,6 +901,88 @@ async fn close_and_fail_queued_requests(rx: &mut mpsc::Receiver<Box<dyn AnyWrite
     }
 }
 
+/// Acquire the request transaction without multiplying its busy-timeout budget.
+/// The setter is supplied so tests can fail SQLite's timeout update while still
+/// executing real BEGIN statements; production uses `Connection::busy_timeout`.
+fn begin_immediate_with_retry(
+    conn: &Connection,
+    acquisition_counters: &WriterAcquisitionCounters,
+    busy_timeout: Duration,
+    mut set_busy_timeout: impl FnMut(&Connection, Duration) -> rusqlite::Result<()>,
+) -> (rusqlite::Result<()>, Duration, u32) {
+    let transaction_acquire_started = Instant::now();
+    let mut begin_attempt = 1_u32;
+    let mut retry_delays = WRITER_BEGIN_RETRY_DELAYS.into_iter();
+    let mut busy_timeout_lowered = false;
+    let begin_outcome = loop {
+        match conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => break Ok(()),
+            Err(error) if crate::timeout_sink::is_busy_or_locked(&error) => {
+                // Every busy/locked refusal is counted here,
+                // whether or not it goes on to be retried: this
+                // is the pre-PR meaning of the counter, and the
+                // outer match below no longer counts the final
+                // refusal a second time.
+                acquisition_counters.record_writer_task_begin_busy();
+                let Some(delay) = retry_delays.next() else {
+                    break Err(error);
+                };
+                // The whole retry sequence shares one
+                // `busy_timeout` budget: each SQLite attempt is
+                // itself bounded by `busy_timeout`, so without a
+                // shrinking budget three attempts could each
+                // wait out a full window and multiply the
+                // serialized writer's contention window instead
+                // of bounding it.
+                let remaining_budget =
+                    busy_timeout.saturating_sub(transaction_acquire_started.elapsed());
+                if remaining_budget.is_zero() {
+                    break Err(error);
+                }
+                if let Err(set_err) = set_busy_timeout(conn, remaining_budget) {
+                    tracing::warn!(
+                        error = %set_err,
+                        "writer task: failed to lower busy_timeout for BEGIN \
+                         retry; surfacing the original busy refusal"
+                    );
+                    // A retry with the old timeout could exceed the shared budget.
+                    break Err(error);
+                }
+                busy_timeout_lowered = true;
+                // Count only refusals that will actually be retried. A failed
+                // timeout reduction leaves this refusal visible to the caller.
+                acquisition_counters.record_writer_task_begin_busy_absorbed();
+                tracing::debug!(
+                    attempt = begin_attempt,
+                    backoff_ms = delay.as_millis() as u64,
+                    budget_remaining_ms = remaining_budget.as_millis() as u64,
+                    "writer task: BEGIN IMMEDIATE refused busy; retrying before \
+                     request execution"
+                );
+                std::thread::sleep(delay);
+                begin_attempt = begin_attempt.saturating_add(1);
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    let transaction_acquire = transaction_acquire_started.elapsed();
+    // Restore the pool-configured busy_timeout only if a retry
+    // actually lowered it, so the common uncontended request
+    // never pays for an extra pragma write; the next request
+    // dequeued on this same connection must still start from
+    // the full configured budget.
+    if busy_timeout_lowered {
+        if let Err(restore_err) = set_busy_timeout(conn, busy_timeout) {
+            tracing::warn!(
+                error = %restore_err,
+                "writer task: failed to restore busy_timeout after a BEGIN retry \
+                 sequence"
+            );
+        }
+    }
+    (begin_outcome, transaction_acquire, begin_attempt)
+}
+
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
 /// through the channel. Busy/locked `BEGIN IMMEDIATE` refusals receive the
 /// bounded retry above before a final failure replies the request's error via
@@ -962,77 +1044,13 @@ async fn run_writer_task(
                     Some("writer_task_tx".to_string()),
                     origin,
                 );
-                let transaction_acquire_started = Instant::now();
-                let mut begin_attempt = 1_u32;
-                let mut retry_delays = WRITER_BEGIN_RETRY_DELAYS.into_iter();
-                let mut busy_timeout_lowered = false;
-                let begin_outcome = loop {
-                    match conn.execute_batch("BEGIN IMMEDIATE") {
-                        Ok(()) => break Ok(()),
-                        Err(error) if crate::timeout_sink::is_busy_or_locked(&error) => {
-                            // Every busy/locked refusal is counted here,
-                            // whether or not it goes on to be retried: this
-                            // is the pre-PR meaning of the counter, and the
-                            // outer match below no longer counts the final
-                            // refusal a second time.
-                            acquisition_counters.record_writer_task_begin_busy();
-                            let Some(delay) = retry_delays.next() else {
-                                break Err(error);
-                            };
-                            // The whole retry sequence shares one
-                            // `busy_timeout` budget: each SQLite attempt is
-                            // itself bounded by `busy_timeout`, so without a
-                            // shrinking budget three attempts could each
-                            // wait out a full window and multiply the
-                            // serialized writer's contention window instead
-                            // of bounding it.
-                            let remaining_budget =
-                                busy_timeout.saturating_sub(transaction_acquire_started.elapsed());
-                            if remaining_budget.is_zero() {
-                                break Err(error);
-                            }
-                            // This refusal remains pre-execution: the request
-                            // still owns its FnOnce closure and no DML has run.
-                            // Count it before sleeping so diagnostics expose
-                            // contention even while the retry is pending.
-                            acquisition_counters.record_writer_task_begin_busy_absorbed();
-                            tracing::debug!(
-                                attempt = begin_attempt,
-                                backoff_ms = delay.as_millis() as u64,
-                                budget_remaining_ms = remaining_budget.as_millis() as u64,
-                                "writer task: BEGIN IMMEDIATE refused busy; retrying before \
-                                 request execution"
-                            );
-                            if let Err(set_err) = conn.busy_timeout(remaining_budget) {
-                                tracing::warn!(
-                                    error = %set_err,
-                                    "writer task: failed to lower busy_timeout for BEGIN \
-                                     retry; retrying with the previous timeout"
-                                );
-                            } else {
-                                busy_timeout_lowered = true;
-                            }
-                            std::thread::sleep(delay);
-                            begin_attempt = begin_attempt.saturating_add(1);
-                        }
-                        Err(error) => break Err(error),
-                    }
-                };
-                let transaction_acquire = transaction_acquire_started.elapsed();
-                // Restore the pool-configured busy_timeout only if a retry
-                // actually lowered it, so the common uncontended request
-                // never pays for an extra pragma write; the next request
-                // dequeued on this same connection must still start from
-                // the full configured budget.
-                if busy_timeout_lowered {
-                    if let Err(restore_err) = conn.busy_timeout(busy_timeout) {
-                        tracing::warn!(
-                            error = %restore_err,
-                            "writer task: failed to restore busy_timeout after a BEGIN retry \
-                             sequence"
-                        );
-                    }
-                }
+                let (begin_outcome, transaction_acquire, begin_attempt) =
+                    begin_immediate_with_retry(
+                        &conn,
+                        &acquisition_counters,
+                        busy_timeout,
+                        Connection::busy_timeout,
+                    );
                 match begin_outcome {
                     Ok(()) => {
                         acquisition_counters.record_writer_task_acquisition();
@@ -1537,6 +1555,208 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1, "exactly one closure execution commits one row");
+    }
+
+    // `#[serial(tx_registry)]`: same rationale as
+    // `begin_immediate_failure_replies_error_without_running_op`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
+    async fn transient_begin_refusal_retries_once_and_restores_timeout() {
+        // Force the first contended BEGIN to return immediately, leaving
+        // budget for the Rust retry. The holder is released only after that
+        // refusal is counted, so an uncontended first attempt cannot pass.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_transient_contention.db");
+        let busy_timeout = Duration::from_secs(5);
+        let configured_timeout_ms = i64::try_from(busy_timeout.as_millis()).unwrap();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            busy_timeout,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let begin_attempts = Arc::new(AtomicUsize::new(0));
+        let begin_attempts_in_setup = Arc::clone(&begin_attempts);
+        handle
+            .send_top_level(move |conn| {
+                // A successful timeout reduction installs SQLite's normal busy
+                // handler for attempt two; only the first refusal is immediate.
+                conn.busy_handler(None)
+                    .map_err(|error| StorageError::Internal(error.to_string()))?;
+                count_begin_attempts(conn, begin_attempts_in_setup)
+                    .map_err(|error| StorageError::Internal(error.to_string()))
+            })
+            .await
+            .expect("install connection-local contention observers");
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let op_runs = Arc::new(AtomicUsize::new(0));
+        let op_runs_in_request = Arc::clone(&op_runs);
+        let send_future = handle.send(move |conn| {
+            op_runs_in_request.fetch_add(1, Ordering::SeqCst);
+            conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                .map_err(|error| StorageError::Pool {
+                    operation: "test_insert_after_transient_contention".into(),
+                    message: error.to_string(),
+                })?;
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .map_err(|error| StorageError::Internal(error.to_string()))
+        });
+        let release_future = async {
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                while pool.writer_acquisition_snapshot().writer_task_begin_busy == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            // Release even when the handshake times out, so a failing test
+            // cannot strand the writer behind its own fixture lock.
+            lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+            observed.expect("first BEGIN refusal must be observed before releasing the lock");
+        };
+        let (result, ()) = tokio::join!(send_future, release_future);
+
+        assert_eq!(
+            result.expect("BEGIN IMMEDIATE succeeds once the transient lock clears"),
+            configured_timeout_ms,
+            "the configured timeout must be restored before the operation runs"
+        );
+        assert_eq!(
+            begin_attempts.load(Ordering::SeqCst),
+            2,
+            "the request must actually retry BEGIN"
+        );
+        assert_eq!(
+            op_runs.load(Ordering::SeqCst),
+            1,
+            "the FnOnce request closure must execute exactly once"
+        );
+
+        let settled = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            settled.writer_task_begin_busy, 1,
+            "the first real BEGIN refusal must be observed"
+        );
+        assert_eq!(settled.writer_task_begin_busy_absorbed, 1);
+        let next_timeout = handle
+            .send_top_level(|conn| {
+                conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                    .map_err(|error| StorageError::Internal(error.to_string()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_timeout, configured_timeout_ms,
+            "the next request must retain the configured timeout"
+        );
+        assert_eq!(
+            begin_attempts.load(Ordering::SeqCst),
+            2,
+            "timeout probes and top-level setup must not count as BEGIN attempts"
+        );
+        let reader = pool.reader().unwrap();
+        let rows: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "exactly one closure execution commits one row");
+    }
+
+    fn count_begin_attempts(conn: &Connection, attempts: Arc<AtomicUsize>) -> rusqlite::Result<()> {
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Begin
+                }
+            ) {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }))
+    }
+
+    #[test]
+    fn failed_busy_timeout_reduction_stops_before_a_second_begin() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("writer_task_timeout_update_failure.db"));
+        let conn = pool.open_standalone_writer_untracked().unwrap();
+        let busy_timeout = Duration::from_secs(5);
+        // Return BUSY before the budget expires, without manufacturing the
+        // BEGIN result. Only the timeout setter below injects a failure.
+        conn.busy_handler(None).unwrap();
+        let original_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        count_begin_attempts(&conn, Arc::clone(&attempts)).unwrap();
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let counters = pool.writer_acquisition_counters();
+        let mut timeout_updates = Vec::new();
+
+        let (result, _, reported_attempts) =
+            begin_immediate_with_retry(&conn, &counters, busy_timeout, |_, timeout| {
+                timeout_updates.push(timeout);
+                Err(rusqlite::Error::InvalidQuery)
+            });
+
+        let error = result.expect_err("failed timeout reduction must surface the busy refusal");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "preserve the original BEGIN error, not the injected setter error"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "failed reduction must not issue a second BEGIN"
+        );
+        assert_eq!(reported_attempts as usize, attempts.load(Ordering::SeqCst));
+        assert_eq!(timeout_updates.len(), 1, "a failed first update must not trigger retries or a spurious restoration call through the injected setter");
+        assert!(timeout_updates[0] < busy_timeout);
+        assert!(!timeout_updates[0].is_zero());
+        let unchanged_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            unchanged_timeout, original_timeout,
+            "the failed setter did not change the connection timeout"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "the refused acquisition must not open a transaction"
+        );
+        let snapshot = pool.writer_acquisition_snapshot();
+        assert_eq!(snapshot.writer_task_begin_busy, 1);
+        assert_eq!(
+            snapshot.writer_task_begin_busy_absorbed, 0,
+            "an unretried refusal must not be counted as absorbed"
+        );
+
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        drop(lock_holder);
+        conn.busy_timeout(busy_timeout).unwrap();
+        let (positive, _, reported_attempts) =
+            begin_immediate_with_retry(&conn, &counters, busy_timeout, Connection::busy_timeout);
+        positive.expect(
+            "the same connection and observer must see a valid BEGIN once contention clears",
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            reported_attempts, 1,
+            "attempt count is local to this request"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
     }
 
     // `#[serial(tx_registry)]`: same rationale as
