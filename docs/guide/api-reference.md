@@ -2312,6 +2312,18 @@ request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uu
 
 List concepts filtered by domain or free-text query.
 
+With a non-null `query` (including an empty string), the response contains
+`results` and `candidate_window_count`, with no `total`. The count is the number
+of candidates remaining after hydration and optional domain filtering, before
+truncating output to `limit`. Search requests at most four times the effective
+output limit; the count is neither a full matching corpus count nor a pagination
+promise. Candidates excluded by the domain filter are not replaced.
+
+Without `query`, or with `query=null`, the response retains `results` and `total`:
+`total` counts all matching caller-visible concepts before the output limit.
+This branch does not include `candidate_window_count`. Any limit-report fields
+retain their own meanings and are independent of both counts.
+
 | Param    | Type    | Required | Notes                                       |
 | -------- | ------- | -------- | ------------------------------------------- |
 | `domain` | string  | no       | Filter to concepts tagged with this domain. |

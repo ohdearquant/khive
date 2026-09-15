@@ -583,55 +583,189 @@ async fn topic_domain_filter_is_case_insensitive_listing_path() {
     );
 }
 
-// ── H2 regression: search-path `total` semantics ─────────────────────────────
+// ── #2732: distinguish corpus size, candidate window and returned rows ────────
 
 #[tokio::test]
-async fn topic_search_path_total_is_bounded_by_candidate_window() {
-    let f = pack(rt());
-
-    // Learn 10 concepts — more than a small limit, so we can observe truncation.
-    for i in 0..10 {
-        f.dispatch(
-            "knowledge.learn",
-            json!({ "name": format!("Attention{i}"), "domain": "attention" }),
+async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..17 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["count-domain".into()],
         )
         .await
-        .expect("learn");
+        .unwrap();
     }
-    f.dispatch(
-        "knowledge.learn",
-        json!({ "name": "LoRA", "domain": "fine-tuning" }),
-    )
-    .await
-    .expect("learn unrelated");
-
-    // Search path with limit=3.  total must be <= limit*4 (12) and >= returned items.
-    let resp = f
+    // An independent, fixed-bound core search supplies exact candidate IDs and scores.
+    let hits = core
+        .hybrid_search(&token, QUERY, None, 12, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        12,
+        "real indexed fixture fills the twelve-candidate window"
+    );
+    let queried = f
+        .dispatch("knowledge.topic", json!({"query": QUERY, "limit": 3}))
+        .await
+        .unwrap();
+    assert_eq!(queried["candidate_window_count"], 12);
+    assert!(
+        queried.get("total").is_none(),
+        "query count must not masquerade as corpus total"
+    );
+    let rows = queried["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for (row, hit) in rows.iter().zip(&hits) {
+        assert_eq!(row["full_id"], hit.entity_id.to_string());
+        assert_eq!(row["score"], json!(hit.score.to_f64()));
+    }
+    let listing = f
         .dispatch(
             "knowledge.topic",
-            json!({ "query": "attention", "limit": 3 }),
+            json!({"domain":"count-domain", "limit":3}),
         )
         .await
-        .expect("topic search ok");
+        .unwrap();
+    assert_eq!(listing["total"], 17);
+    assert_eq!(listing["results"].as_array().unwrap().len(), 3);
+    assert!(listing.get("candidate_window_count").is_none());
+    let null_query = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"domain":"count-domain", "query":null, "limit":3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        null_query, listing,
+        "null query retains unqueried full-count semantics"
+    );
+    assert!(
+        listing["total"].as_u64().unwrap() > queried["candidate_window_count"].as_u64().unwrap()
+    );
+    assert!(queried["candidate_window_count"].as_u64().unwrap() > rows.len() as u64);
+    for (args, count_key, expected, absent) in [
+        (
+            json!({"query":QUERY, "limit":0}),
+            "candidate_window_count",
+            0,
+            "total",
+        ),
+        (
+            json!({"domain":"count-domain", "limit":0}),
+            "total",
+            17,
+            "candidate_window_count",
+        ),
+    ] {
+        let response = f.dispatch("knowledge.topic", args).await.unwrap();
+        assert_eq!(response[count_key], expected);
+        assert_eq!(response["results"], json!([]));
+        assert!(response.get(absent).is_none());
+    }
+}
 
-    let items = resp["results"].as_array().expect("results array");
-    let total = resp["total"].as_u64().expect("total field present");
-
-    assert!(
-        items.len() <= 3,
-        "items must respect limit: got {}",
-        items.len()
+#[tokio::test]
+async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..13 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["other".into()],
+        )
+        .await
+        .unwrap();
+    }
+    let ranked = core
+        .hybrid_search(&token, QUERY, None, 13, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(ranked.len(), 13);
+    let ids: Vec<_> = ranked.iter().map(|hit| hit.entity_id).collect();
+    // Two domain matches inside the four-hit window and two outside it.
+    // Only tags change; verify below that this fixture leaves search order intact.
+    let access = core.sql();
+    let mut writer = access.writer().await.unwrap();
+    for position in [0, 2, 5, 8] {
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE entities SET tags = '[\"wanted\"]' WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(ids[position].to_string())],
+                label: None,
+            })
+            .await
+            .unwrap();
+    }
+    drop(writer);
+    let window = core
+        .hybrid_search(&token, QUERY, None, 4, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        window.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
+        ids[..4]
     );
-    // total is the candidate-window count, bounded by limit*4 = 12.
-    assert!(
-        total <= 12,
-        "search-path total must be bounded by limit*4 (12), got {total}"
+    let filtered = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"query":QUERY, "domain":" WANTED ", "limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered["candidate_window_count"], 2);
+    assert!(filtered.get("total").is_none());
+    assert_eq!(filtered["results"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["results"][0]["full_id"], ids[0].to_string());
+    let listing = f
+        .dispatch("knowledge.topic", json!({"domain":"wanted", "limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listing["total"], 4,
+        "the corpus has two more matches outside the candidate window"
     );
-    assert!(
-        total >= items.len() as u64,
-        "total must be >= returned items: total={total}, items={}",
-        items.len()
-    );
+    assert!(listing.get("candidate_window_count").is_none());
+    for (args, key, absent) in [
+        (
+            json!({"query":QUERY, "domain":"absent", "limit":1}),
+            "candidate_window_count",
+            "total",
+        ),
+        (
+            json!({"domain":"absent", "limit":1}),
+            "total",
+            "candidate_window_count",
+        ),
+    ] {
+        let response = f.dispatch("knowledge.topic", args).await.unwrap();
+        assert_eq!(response[key], 0);
+        assert_eq!(response["results"], json!([]));
+        assert!(response.get(absent).is_none());
+    }
 }
 
 // ── upsert_atoms ──────────────────────────────────────────────────────────────
