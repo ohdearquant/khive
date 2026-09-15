@@ -8,8 +8,9 @@
 //! return leaves supervisors holding a live token in an embedded process.
 //!
 //! Isolation: this test lives in its own integration-test binary on purpose.
-//! It mutates `KHIVE_SOCKET` (process-global env) and fires the process-wide
-//! single-shot shutdown token; neither may leak into other tests.
+//! It mutates `KHIVE_SOCKET` and `KHIVE_PID` (process-global env) and fires
+//! the process-wide single-shot shutdown token; neither may leak into other
+//! tests.
 
 #![cfg(unix)]
 
@@ -58,7 +59,12 @@ async fn setup_failure_before_bind_cancels_component_token() {
 
     // The socket's parent is a regular file, so create_dir_all fails before
     // the stale-daemon cleanup, bind, or pid-write are ever reached.
+    //
+    // Both rendezvous overrides are set because setting exactly one of them
+    // is refused before any of that setup work runs (#2656), and this test
+    // would then pass on a refusal it does not target.
     std::env::set_var("KHIVE_SOCKET", blocker.join("khived.sock"));
+    std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
 
     let result = run_daemon_with_boot_guard(NeverDispatch, None).await;
 
