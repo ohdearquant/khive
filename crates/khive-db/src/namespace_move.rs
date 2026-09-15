@@ -612,6 +612,12 @@ pub fn validate(
 /// So this function decides the QUALITY of a refusal, never whether one happens.
 /// A collision it cannot enumerate still aborts the move.
 ///
+/// That refusal is thinner than it sounds, and it is worth writing down because
+/// it is the reason the exclusion above costs something. SQLite names the
+/// COLUMNS, not the index: a caller whose note-key move is refused receives
+/// `UNIQUE constraint failed: notes.namespace, notes.kind, notes.key` and gets
+/// no index name to look up and no rows. Measured.
+///
 /// The reverse also happens, and it does not show up here at all: a constraint
 /// this function DOES enumerate can be unreachable because of one the census
 /// never reported. `graph_edges` is `PRIMARY KEY (namespace, id)`, which names
