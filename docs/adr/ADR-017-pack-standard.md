@@ -1039,3 +1039,15 @@ packs became a real need it would get its own ADR. Taking them in order:
   lacks, and no exemption from a check a linked pack passes.
 
 Nothing in this amendment authorizes implementation.
+
+## Proposed amendment (2026-09-15): pack schema readiness at startup
+
+**Status:** Proposed.
+
+Related issue: [#2768](https://github.com/ohdearquant/khive/issues/2768).
+Implementation: [#2782](https://github.com/ohdearquant/khive/pull/2782).
+
+Both single- and multi-backend hosts refuse boot with the owning pack's name when its
+plan fails. Read-only startup remains writer-free: it validates declared columns through
+a reader and refuses missing or incompatible columns before exposing handlers, naming
+the missing table/column pairs.
