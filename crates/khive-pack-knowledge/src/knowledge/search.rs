@@ -473,6 +473,21 @@ fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
     }
 }
 
+fn term_frequency_statement(term: &str) -> SqlStatement {
+    SqlStatement {
+        sql: "SELECT count(*) AS frequency FROM ( \
+                  SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
+                  ORDER BY rowid LIMIT ?2 \
+              )"
+        .into(),
+        params: vec![
+            SqlValue::Text(term.into()),
+            SqlValue::Integer((FTS_TERM_LIMIT + 1) as i64),
+        ],
+        label: Some("knowledge.fts_term_frequency".into()),
+    }
+}
+
 async fn rarest_fts_terms_first(
     reader: &mut dyn khive_storage::SqlReader,
     terms: Vec<String>,
@@ -482,14 +497,23 @@ async fn rarest_fts_terms_first(
     for term in terms {
         // Count only a bounded index prefix. Rare counts are exact; terms
         // above the cap tie by spelling, without scanning their whole lists.
+        // Aggregating inside SQLite avoids materializing up to 501 owned
+        // SqlRows just to discard their rowids and count them in Rust.
         let rows = stage
             .read(
                 LexicalPhase::TermFrequency,
-                reader.query_all(phase_a_rowids_statement(&term, FTS_TERM_LIMIT + 1)),
+                reader.query_all(term_frequency_statement(&term)),
             )
             .await?;
-        if !rows.is_empty() {
-            frequencies.push((term, rows.len()));
+        let frequency = rows
+            .first()
+            .and_then(|row| row_i64(row, "frequency"))
+            .ok_or_else(|| khive_storage::StorageError::Serialization {
+                capability: khive_storage::StorageCapability::Sql,
+                message: "term frequency probe returned no integer count".into(),
+            })?;
+        if frequency > 0 {
+            frequencies.push((term, frequency));
         }
     }
     frequencies
@@ -4063,7 +4087,14 @@ mod tests {
                 .iter()
                 .filter(|statement| statement.sql.starts_with("SELECT rowid"))
                 .count(),
-            2 * FTS_TERM_COUNT_LIMIT
+            FTS_TERM_COUNT_LIMIT
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT count(*) AS frequency"))
+                .count(),
+            FTS_TERM_COUNT_LIMIT
         );
         assert_eq!(
             probes
@@ -4229,7 +4260,7 @@ mod tests {
 
     struct ProbeRecordingReader {
         inner: Box<dyn khive_storage::SqlReader>,
-        probes: Vec<(SqlStatement, usize)>,
+        probes: Vec<(SqlStatement, Vec<SqlRow>)>,
     }
 
     #[async_trait::async_trait]
@@ -4240,7 +4271,7 @@ mod tests {
 
         async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
             let rows = self.inner.query_all(statement.clone()).await?;
-            self.probes.push((statement, rows.len()));
+            self.probes.push((statement, rows.clone()));
             Ok(rows)
         }
 
@@ -4306,7 +4337,13 @@ mod tests {
             inner: runtime.sql().reader().await.expect("reader"),
             probes: Vec::new(),
         };
-        let terms = ["\"term1\"", "\"term18\"", "\"missing\"", "\"term11\""];
+        let terms = [
+            "\"term1\"",
+            "\"term18\"",
+            "\"missing\"",
+            "\"term11\"",
+            "\"synthetic\"",
+        ];
         let ordered = rarest_fts_terms_first(
             &mut reader,
             terms.iter().map(|term| (*term).to_string()).collect(),
@@ -4318,19 +4355,32 @@ mod tests {
         )
         .await
         .expect("frequency probes");
-        assert_eq!(ordered, ["\"term11\"", "\"term18\"", "\"term1\""]);
+        assert_eq!(
+            ordered,
+            ["\"term11\"", "\"term18\"", "\"synthetic\"", "\"term1\""]
+        );
         assert_eq!(reader.probes.len(), terms.len());
         assert_eq!(
             reader
                 .probes
                 .iter()
-                .map(|(_, count)| *count)
+                .map(|(_, rows)| rows.len())
                 .collect::<Vec<_>>(),
-            [501, 55, 0, 55]
+            [1; 5],
+            "each probe must materialize one aggregate row, including zero matches"
         );
-        for (statement, count) in &reader.probes {
+        assert_eq!(
+            reader
+                .probes
+                .iter()
+                .map(|(_, rows)| row_i64(&rows[0], "frequency").expect("frequency"))
+                .collect::<Vec<_>>(),
+            [501, 55, 0, 55, 501],
+            "rare counts stay exact and both common terms tie at the cap"
+        );
+        for (statement, rows) in &reader.probes {
             assert!(matches!(statement.params[1], SqlValue::Integer(501)));
-            assert!(*count <= FTS_TERM_LIMIT + 1);
+            assert_eq!(rows[0].columns.len(), 1);
         }
     }
 
@@ -4428,28 +4478,34 @@ mod tests {
         let access = runtime.sql();
         let mut reader = access.reader().await.expect("reader");
         let statement = phase_a_rowids_statement("\"term1\"", 3);
-        for (query, should_sort) in [
-            (statement.sql.clone(), false),
-            (
-                statement
-                    .sql
-                    .replace("ORDER BY rowid", "ORDER BY bm25(fts_knowledge), rowid"),
-                true,
-            ),
-        ] {
-            let plan = reader
-                .query_all(SqlStatement {
-                    sql: format!("EXPLAIN QUERY PLAN {query}"),
-                    params: statement.params.clone(),
-                    label: None,
-                })
-                .await
-                .expect("query plan");
-            assert!(!plan.is_empty());
-            let sorts = plan.iter().any(|row| {
-                row_str(row, "detail").is_some_and(|detail| detail.contains("TEMP B-TREE"))
-            });
-            assert_eq!(sorts, should_sort, "plan: {plan:?}");
+        for bounded in [statement.clone(), term_frequency_statement("\"term1\"")] {
+            for (query, should_sort) in [
+                (bounded.sql.clone(), false),
+                (
+                    bounded
+                        .sql
+                        .replace("ORDER BY rowid", "ORDER BY bm25(fts_knowledge), rowid"),
+                    true,
+                ),
+            ] {
+                let plan = reader
+                    .query_all(SqlStatement {
+                        sql: format!("EXPLAIN QUERY PLAN {query}"),
+                        params: bounded.params.clone(),
+                        label: None,
+                    })
+                    .await
+                    .expect("query plan");
+                assert!(!plan.is_empty());
+                assert!(plan.iter().any(|row| {
+                    row_str(row, "detail")
+                        .is_some_and(|detail| detail.contains("fts_knowledge VIRTUAL TABLE INDEX"))
+                }));
+                let sorts = plan.iter().any(|row| {
+                    row_str(row, "detail").is_some_and(|detail| detail.contains("TEMP B-TREE"))
+                });
+                assert_eq!(sorts, should_sort, "plan: {plan:?}");
+            }
         }
         let rows = reader.query_all(statement).await.expect("bounded rowids");
         let ids: Vec<_> = rows
