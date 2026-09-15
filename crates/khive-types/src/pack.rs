@@ -231,6 +231,11 @@ pub enum VerbPresentationPolicy {
     /// `git.ingest_cursor` preserves raw checkpoint strings, full project UUIDs,
     /// and stored microsecond timestamps for persisted-position inspection.
     AlwaysVerbose,
+    /// Preserve only the root append receipt's `created_at` string in Agent mode.
+    StreamAppendReceipt,
+    /// Preserve `created_at` and `updated_at` strings on immediate `results`
+    /// array members in Agent mode.
+    StreamBatchReceipts,
 }
 
 impl HandlerDef {
@@ -240,8 +245,8 @@ impl HandlerDef {
     /// semantics demand full output (full UUIDs, complete timestamps) regardless
     /// of the caller's requested presentation mode.
     ///
-    /// New verbs that need this override must be added here; omission from the
-    /// list means `Standard` applies.
+    /// Stream writers retain exact receipt timestamps while keeping other
+    /// Agent transforms. Unlisted verbs use `Standard`.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
         match self.name {
             "get"
@@ -255,6 +260,8 @@ impl HandlerDef {
             | "comm.delivered"
             | "git.digest"
             | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
+            "stream.append" => VerbPresentationPolicy::StreamAppendReceipt,
+            "stream.batch" => VerbPresentationPolicy::StreamBatchReceipts,
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -716,6 +723,26 @@ mod tests {
                 VerbPresentationPolicy::AlwaysVerbose,
                 "{name:?} must be AlwaysVerbose"
             );
+        }
+    }
+
+    #[test]
+    fn stream_receipt_policies_are_closed_to_the_registered_writers() {
+        for (name, policy) in [
+            ("stream.append", VerbPresentationPolicy::StreamAppendReceipt),
+            ("stream.batch", VerbPresentationPolicy::StreamBatchReceipts),
+            ("stream.read", VerbPresentationPolicy::Standard),
+            ("stream.batch.other", VerbPresentationPolicy::Standard),
+            ("list", VerbPresentationPolicy::Standard),
+        ] {
+            let handler = HandlerDef {
+                name,
+                description: "",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            };
+            assert_eq!(handler.presentation_policy(), policy, "{name}");
         }
     }
 

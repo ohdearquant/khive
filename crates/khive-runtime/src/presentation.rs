@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 
+use khive_types::VerbPresentationPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -666,6 +667,25 @@ fn should_shorten_uuid_field(key: &str) -> bool {
 /// `now_unix_seconds` is sampled once per response and passed through so all
 /// relative datetime renderings within a response use the same instant.
 pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> Value {
+    present_with_policy(
+        value,
+        mode,
+        now_unix_seconds,
+        VerbPresentationPolicy::Standard,
+    )
+}
+
+/// Present a successful result using its trusted registered verb policy.
+/// Receipt policies preserve only their closed string paths, not descendants.
+pub fn present_with_policy(
+    value: Value,
+    mode: PresentationMode,
+    now_unix_seconds: i64,
+    policy: VerbPresentationPolicy,
+) -> Value {
+    if policy == VerbPresentationPolicy::AlwaysVerbose {
+        return value;
+    }
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
@@ -680,9 +700,23 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
                 &payload_timestamps,
                 now_unix_seconds,
                 false,
+                match policy {
+                    VerbPresentationPolicy::StreamAppendReceipt => ReceiptContext::AppendRoot,
+                    VerbPresentationPolicy::StreamBatchReceipts => ReceiptContext::BatchRoot,
+                    _ => ReceiptContext::None,
+                },
             )
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiptContext {
+    None,
+    AppendRoot,
+    BatchRoot,
+    BatchResults,
+    BatchMember,
 }
 
 /// Apply the Agent-mode transform to an arbitrary JSON value.
@@ -697,6 +731,7 @@ fn transform_agent(
     payload_timestamps: &HashSet<&str>,
     now: i64,
     inside_properties: bool,
+    receipt_context: ReceiptContext,
 ) -> Value {
     match value {
         Value::Object(map) => {
@@ -709,6 +744,22 @@ fn transform_agent(
                     out.insert(k, v);
                     continue;
                 }
+                if v.is_string()
+                    && ((receipt_context == ReceiptContext::AppendRoot && k == "created_at")
+                        || (receipt_context == ReceiptContext::BatchMember
+                            && matches!(k.as_str(), "created_at" | "updated_at")))
+                {
+                    out.insert(k, v);
+                    continue;
+                }
+                let child_receipt_context = if receipt_context == ReceiptContext::BatchRoot
+                    && k == "results"
+                    && v.is_array()
+                {
+                    ReceiptContext::BatchResults
+                } else {
+                    ReceiptContext::None
+                };
                 // ADR-045 Amendment 3 scopes the empty-string carve-out to
                 // strings nested under an object-valued `properties`; a
                 // scalar or array `properties` value gets no carve-out.
@@ -724,6 +775,7 @@ fn transform_agent(
                     AgentFieldContext {
                         inside_properties: child_inside_properties,
                         preserve_list_envelope,
+                        receipt_context: child_receipt_context,
                     },
                 );
                 match transformed {
@@ -746,6 +798,11 @@ fn transform_agent(
                         payload_timestamps,
                         now,
                         inside_properties,
+                        if receipt_context == ReceiptContext::BatchResults {
+                            ReceiptContext::BatchMember
+                        } else {
+                            ReceiptContext::None
+                        },
                     )
                 })
                 .collect();
@@ -770,6 +827,7 @@ fn transform_agent(
 struct AgentFieldContext {
     inside_properties: bool,
     preserve_list_envelope: bool,
+    receipt_context: ReceiptContext,
 }
 
 fn transform_field_agent(
@@ -839,6 +897,7 @@ fn transform_field_agent(
             payload_timestamps,
             now,
             context.inside_properties,
+            context.receipt_context,
         )),
         // Everything else passes through.
         _ => Some(value),
@@ -2135,5 +2194,205 @@ mod stream_presentation_tests {
         }
         let empty = json!({"entries": [], "head_seq": 0, "next_after": null});
         assert_eq!(present(empty.clone(), PresentationMode::Agent, 0), empty);
+    }
+}
+
+#[cfg(test)]
+mod issue_2537_standard_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue_2537_standard_context_baseline_controls() {
+        let timestamp = "2026-01-01T00:00:00.123456Z";
+        let now = 1_767_225_780; // 2026-01-01T00:03:00Z, independently literal clock.
+        let uuid = "aabbccdd-1234-4321-1234-abcdefabcdef";
+        let payload = json!({"id":uuid,"created_at":timestamp,"empty":[],"null":null});
+        let value = json!({"tool":"stream.batch","policy":"StreamBatchReceipts","id":uuid,
+            "updated_at":timestamp,"score":0.123456,"empty":[],"null":null,
+            "results":[{"id":uuid,"version":1,"updated_at":timestamp,"details":{"updated_at":timestamp}}],
+            "properties":{"created_at":timestamp,"id":uuid,"empty":""},"trigger_at":timestamp,"due":timestamp,
+            "entry":{"seq":1,"id":uuid,"created_at":timestamp,"record":payload},
+            "cursor":{"head_seq":0,"entries":[],"next_after":null}});
+        let shown = present(value.clone(), PresentationMode::Agent, now);
+        assert_eq!(shown["updated_at"], "3m ago");
+        assert_eq!(shown["results"][0]["updated_at"], "3m ago");
+        assert_eq!(shown["results"][0]["details"]["updated_at"], "3m ago");
+        assert_eq!(shown["id"], "aabbccdd");
+        assert_eq!(shown["score"], json!(0.123));
+        assert!(shown.get("empty").is_none());
+        assert!(shown.get("null").is_none());
+        assert_eq!(
+            shown["properties"],
+            json!({"created_at":timestamp,"id":"aabbccdd","empty":""})
+        );
+        assert_eq!(shown["trigger_at"], timestamp);
+        assert_eq!(shown["due"], timestamp);
+        assert_eq!(shown["entry"]["record"], payload);
+        assert_eq!(shown["entry"]["created_at"], "3m ago");
+        assert_eq!(shown["cursor"], value["cursor"]);
+        for mode in [PresentationMode::Verbose, PresentationMode::Human] {
+            assert_eq!(present(value.clone(), mode, now), value);
+        }
+        assert_eq!(
+            present(
+                json!({"properties":timestamp}),
+                PresentationMode::Agent,
+                now
+            )["properties"],
+            "3m ago"
+        );
+        assert_eq!(
+            present(
+                json!({"properties":[timestamp,{"created_at":timestamp}]}),
+                PresentationMode::Agent,
+                now
+            )["properties"],
+            json!([timestamp,{"created_at":"3m ago"}])
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_2537_receipt_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    const TIMESTAMP: &str = "2026-01-01T00:00:00.123456Z";
+    const NOW: i64 = 1_767_225_780;
+    const UUID: &str = "aabbccdd-1234-4321-1234-abcdefabcdef";
+
+    #[test]
+    fn issue_2537_receipt_policies_preserve_only_the_named_fields() {
+        let append = json!({
+            "id": UUID, "created_at": TIMESTAMP, "updated_at": TIMESTAMP,
+            "score": 0.123456, "empty": [], "null": null,
+            "details": {"created_at": TIMESTAMP},
+            "ticker": {"last_tick_at": TIMESTAMP},
+        });
+        let batch = json!({
+            "id": UUID, "created_at": TIMESTAMP, "updated_at": TIMESTAMP,
+            "results": [{
+                "id": UUID, "created_at": TIMESTAMP, "updated_at": TIMESTAMP,
+                "details": {"created_at": TIMESTAMP, "updated_at": TIMESTAMP},
+                "record": {"updated_at": TIMESTAMP},
+                "score": 0.123456, "empty": [], "null": null,
+            }],
+            "properties": {"created_at": TIMESTAMP, "id": UUID, "empty": ""},
+            "entry": {"seq": 1, "id": UUID, "created_at": TIMESTAMP,
+                "record": {"id": UUID, "updated_at": TIMESTAMP, "empty": [], "null": null}},
+            "trigger_at": TIMESTAMP, "due": TIMESTAMP,
+            "ticker": {"last_tick_at": TIMESTAMP},
+        });
+        for (value, policy) in [
+            (append, VerbPresentationPolicy::StreamAppendReceipt),
+            (batch, VerbPresentationPolicy::StreamBatchReceipts),
+        ] {
+            let mut expected = present(value.clone(), PresentationMode::Agent, NOW);
+            assert_eq!(expected["created_at"], "3m ago");
+            assert_eq!(expected["updated_at"], "3m ago");
+            assert_eq!(expected["id"], "aabbccdd");
+            assert_eq!(expected["ticker"]["last_tick_at"], "3m ago");
+            if policy == VerbPresentationPolicy::StreamAppendReceipt {
+                expected["created_at"] = json!(TIMESTAMP);
+            } else {
+                expected["results"][0]["created_at"] = json!(TIMESTAMP);
+                expected["results"][0]["updated_at"] = json!(TIMESTAMP);
+            }
+            assert_eq!(
+                present_with_policy(value.clone(), PresentationMode::Agent, NOW, policy),
+                expected
+            );
+            for mode in [PresentationMode::Verbose, PresentationMode::Human] {
+                assert_eq!(present_with_policy(value.clone(), mode, NOW, policy), value);
+            }
+            assert_eq!(
+                present_with_policy(
+                    value.clone(),
+                    PresentationMode::Agent,
+                    NOW,
+                    VerbPresentationPolicy::AlwaysVerbose
+                ),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2537_receipt_paths_do_not_match_other_containers_or_descendants() {
+        let row = json!({"created_at": TIMESTAMP, "updated_at": TIMESTAMP});
+        for (policy, cases) in [
+            (
+                VerbPresentationPolicy::StreamAppendReceipt,
+                vec![
+                    json!([row.clone()]),
+                    json!({"details": row.clone()}),
+                    json!({"results": [row.clone()]}),
+                    json!({"created_at": {"created_at": TIMESTAMP}}),
+                ],
+            ),
+            (
+                VerbPresentationPolicy::StreamBatchReceipts,
+                vec![
+                    json!([{"results": [row.clone()]}]),
+                    json!({"results": row.clone()}),
+                    json!({"results": [[row.clone()]]}),
+                    json!({"details": {"results": [row.clone()]}}),
+                    json!({"results": [{"details": row.clone(), "record": row.clone(), "results": [row.clone()]}]}),
+                    json!({"results": [{"created_at": {"updated_at": TIMESTAMP}, "updated_at": null}]}),
+                ],
+            ),
+        ] {
+            for value in cases {
+                assert_eq!(
+                    present_with_policy(value.clone(), PresentationMode::Agent, NOW, policy),
+                    present(value.clone(), PresentationMode::Agent, NOW),
+                    "container must not acquire receipt protection: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_2537_receipt_strings_are_preserved_without_parsing() {
+        for text in ["", "not a timestamp", "2026-01-01T05:30:00.123456+05:30"] {
+            let append = json!({"created_at": text});
+            assert_eq!(
+                present_with_policy(
+                    append.clone(),
+                    PresentationMode::Agent,
+                    NOW,
+                    VerbPresentationPolicy::StreamAppendReceipt
+                ),
+                append
+            );
+            let batch = json!({"results": [{"created_at": text, "updated_at": text}]});
+            assert_eq!(
+                present_with_policy(
+                    batch.clone(),
+                    PresentationMode::Agent,
+                    NOW,
+                    VerbPresentationPolicy::StreamBatchReceipts
+                ),
+                batch
+            );
+        }
+        for non_string in [Value::Null, json!([]), json!({}), json!(42), json!(true)] {
+            for (value, policy) in [
+                (
+                    json!({"created_at": non_string}),
+                    VerbPresentationPolicy::StreamAppendReceipt,
+                ),
+                (
+                    json!({"results": [{"created_at": non_string, "updated_at": non_string}]}),
+                    VerbPresentationPolicy::StreamBatchReceipts,
+                ),
+            ] {
+                assert_eq!(
+                    present_with_policy(value.clone(), PresentationMode::Agent, NOW, policy),
+                    present(value, PresentationMode::Agent, NOW)
+                );
+            }
+        }
     }
 }
