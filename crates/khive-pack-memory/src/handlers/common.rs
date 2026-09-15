@@ -585,51 +585,72 @@ pub(super) const ANN_DEGRADED_REASON: &str = "ann_unavailable";
 /// recall. FTS and the vector arm run concurrently, so these fields are not
 /// additive. Sequential outer widening rounds are accumulated; concurrent
 /// embedding models contribute the maximum ANN/fresh-tail duration rather
-/// than summing work that happened in parallel.
+/// than summing work that happened in parallel. `None` means the stage was
+/// not entered; `Some(Duration::ZERO)` is a recorded, sub-millisecond stage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RecallStageTimings {
-    embed: Duration,
-    fts: Duration,
-    ann: Duration,
-    fresh_tail: Duration,
-    hydrate: Duration,
+    embed: Option<Duration>,
+    fts: Option<Duration>,
+    ann: Option<Duration>,
+    fresh_tail: Option<Duration>,
+    hydrate: Option<Duration>,
 }
 
 impl RecallStageTimings {
     pub(super) fn add_retrieval_round(&mut self, round: Self) {
-        self.embed = self.embed.saturating_add(round.embed);
-        self.fts = self.fts.saturating_add(round.fts);
-        self.ann = self.ann.saturating_add(round.ann);
-        self.fresh_tail = self.fresh_tail.saturating_add(round.fresh_tail);
+        add_stage_duration(&mut self.embed, round.embed);
+        add_stage_duration(&mut self.fts, round.fts);
+        add_stage_duration(&mut self.ann, round.ann);
+        add_stage_duration(&mut self.fresh_tail, round.fresh_tail);
     }
 
     pub(super) fn add_hydration(&mut self, elapsed: Duration) {
-        self.hydrate = self.hydrate.saturating_add(elapsed);
+        add_stage_duration(&mut self.hydrate, Some(elapsed));
     }
 
-    fn record_parallel_model(&mut self, ann: Duration, fresh_tail: Duration) {
-        self.ann = self.ann.max(ann);
+    fn record_parallel_model(&mut self, ann: Duration, fresh_tail: Option<Duration>) {
+        self.ann = self.ann.max(Some(ann));
         self.fresh_tail = self.fresh_tail.max(fresh_tail);
     }
 
     pub(super) fn embed_ms(self) -> u64 {
-        duration_millis(self.embed)
+        duration_millis(self.embed.unwrap_or_default())
+    }
+
+    pub(super) fn embed_attempted(self) -> bool {
+        self.embed.is_some()
     }
 
     pub(super) fn fts_ms(self) -> u64 {
-        duration_millis(self.fts)
+        duration_millis(self.fts.unwrap_or_default())
+    }
+
+    pub(super) fn fts_attempted(self) -> bool {
+        self.fts.is_some()
     }
 
     pub(super) fn ann_ms(self) -> u64 {
-        duration_millis(self.ann)
+        duration_millis(self.ann.unwrap_or_default())
+    }
+
+    pub(super) fn ann_attempted(self) -> bool {
+        self.ann.is_some()
     }
 
     pub(super) fn fresh_tail_ms(self) -> u64 {
-        duration_millis(self.fresh_tail)
+        duration_millis(self.fresh_tail.unwrap_or_default())
+    }
+
+    pub(super) fn fresh_tail_attempted(self) -> bool {
+        self.fresh_tail.is_some()
     }
 
     pub(super) fn hydrate_ms(self) -> u64 {
-        duration_millis(self.hydrate)
+        duration_millis(self.hydrate.unwrap_or_default())
+    }
+
+    pub(super) fn hydrate_attempted(self) -> bool {
+        self.hydrate.is_some()
     }
 
     #[cfg(test)]
@@ -641,12 +662,18 @@ impl RecallStageTimings {
         hydrate: u64,
     ) -> Self {
         Self {
-            embed: Duration::from_millis(embed),
-            fts: Duration::from_millis(fts),
-            ann: Duration::from_millis(ann),
-            fresh_tail: Duration::from_millis(fresh_tail),
-            hydrate: Duration::from_millis(hydrate),
+            embed: Some(Duration::from_millis(embed)),
+            fts: Some(Duration::from_millis(fts)),
+            ann: Some(Duration::from_millis(ann)),
+            fresh_tail: Some(Duration::from_millis(fresh_tail)),
+            hydrate: Some(Duration::from_millis(hydrate)),
         }
+    }
+}
+
+fn add_stage_duration(total: &mut Option<Duration>, elapsed: Option<Duration>) {
+    if let Some(elapsed) = elapsed {
+        *total = Some(total.unwrap_or_default().saturating_add(elapsed));
     }
 }
 
@@ -1079,7 +1106,7 @@ impl MemoryPack {
         );
         let ((text_hits, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
         let mut timings = vector_result.timings;
-        timings.fts = fts_elapsed;
+        timings.fts = Some(fts_elapsed);
         khive_storage::ensure_request_read_active("memory.recall")?;
         Ok(RecallCandidateSet {
             namespace: primary_ns,
@@ -1223,7 +1250,7 @@ impl MemoryPack {
                     collect_embed_results(named_results)?
                 }
             };
-            timings.embed = embed_started.elapsed();
+            timings.embed = Some(embed_started.elapsed());
 
             if prof {
                 if let Some(t) = t_embed {
@@ -1465,7 +1492,7 @@ pub(super) struct PerModelAnnHits {
     /// Time spent in ANN readiness/search/widening or exact sqlite-vec work,
     /// excluding the separately measured fresh-tail leg.
     ann_elapsed: Duration,
-    fresh_tail_elapsed: Duration,
+    fresh_tail_elapsed: Option<Duration>,
 }
 
 /// Resolve one embedding model's vector candidates via warm ANN or the exact sqlite-vec
@@ -1527,7 +1554,7 @@ pub(super) async fn collect_model_ann_hits(
                 )),
                 used_sqlite_vec_fallback: false,
                 ann_elapsed: started.elapsed(),
-                fresh_tail_elapsed: Duration::ZERO,
+                fresh_tail_elapsed: None,
             })
         }
     }
@@ -1731,7 +1758,7 @@ async fn collect_model_ann_hits_inner(
             degraded_reason: Some(degrade_reason),
             used_sqlite_vec_fallback: false,
             ann_elapsed,
-            fresh_tail_elapsed,
+            fresh_tail_elapsed: Some(fresh_tail_elapsed),
         });
     }
 
@@ -1876,7 +1903,7 @@ async fn collect_model_ann_hits_inner(
             degraded_reason: fresh_tail_skip_reason,
             used_sqlite_vec_fallback: false,
             ann_elapsed,
-            fresh_tail_elapsed,
+            fresh_tail_elapsed: Some(fresh_tail_elapsed),
         });
     }
 
@@ -1926,7 +1953,7 @@ async fn collect_model_ann_hits_inner(
         degraded_reason: None,
         used_sqlite_vec_fallback: true,
         ann_elapsed: ann_started.elapsed(),
-        fresh_tail_elapsed: Duration::ZERO,
+        fresh_tail_elapsed: None,
     })
 }
 
@@ -1935,10 +1962,142 @@ mod request_cancellation_tests {
     use super::*;
 
     #[test]
+    fn stage_timings_distinguish_skips_from_sub_millisecond_work() {
+        let skipped = RecallStageTimings::default();
+        let mut measured = RecallStageTimings::default();
+        measured.record_parallel_model(Duration::from_micros(500), Some(Duration::ZERO));
+        measured.add_hydration(Duration::from_micros(500));
+        assert_eq!(skipped.ann_ms(), measured.ann_ms());
+        assert!(!skipped.ann_attempted());
+        assert!(measured.ann_attempted());
+        assert!(measured.fresh_tail_attempted());
+        assert_eq!(measured.fresh_tail_ms(), 0);
+        assert!(measured.hydrate_attempted());
+        assert_eq!(measured.hydrate_ms(), 0);
+
+        let mut total = RecallStageTimings::default();
+        total.add_retrieval_round(skipped);
+        assert!(!total.ann_attempted());
+        total.add_retrieval_round(measured);
+        total.add_retrieval_round(skipped);
+        total.record_parallel_model(Duration::ZERO, None);
+        assert!(total.ann_attempted());
+        assert!(
+            total.fresh_tail_attempted(),
+            "later skipped work cannot erase a measurement"
+        );
+        assert!(!total.embed_attempted());
+        assert!(!total.fts_attempted());
+        assert!(
+            !total.hydrate_attempted(),
+            "hydration is accumulated separately"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_recall_records_fts_without_inventing_vector_stage_work() {
+        let rt = khive_runtime::KhiveRuntime::memory().unwrap();
+        assert!(rt.registered_embedding_model_names().is_empty());
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+        let pack = MemoryPack::new(rt);
+        let result = pack
+            .collect_recall_candidates(
+                "stage telemetry",
+                &token,
+                RecallCandidateParams {
+                    candidate_limit: 10,
+                    embedding_model: None,
+                    cjk_fts_bypass: false,
+                    snippet_policy: TextSnippetPolicy::Omit,
+                    fts_gather: &crate::config::RecallFtsGatherConfig::default(),
+                    ann_overfetch_max_rounds: 1,
+                    ann_ready_timeout_ms: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.vector_hits_per_model.is_empty());
+        assert!(result.timings.fts_attempted());
+        assert!(!result.timings.embed_attempted());
+        assert!(!result.timings.ann_attempted());
+        assert!(!result.timings.fresh_tail_attempted());
+        assert!(!result.timings.hydrate_attempted());
+    }
+
+    #[tokio::test]
+    async fn exact_sqlite_vec_recall_records_ann_but_skips_fresh_tail() {
+        use crate::test_support::HashVecProvider;
+        use khive_runtime::{KhiveRuntime, RuntimeConfig};
+
+        const MODEL: &str = "stage-timing-exact-model";
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RuntimeConfig {
+            db_path: Some(dir.path().join("recall-stage.db")),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let writable = KhiveRuntime::new(cfg.clone()).unwrap();
+        writable.register_embedder(HashVecProvider {
+            model_name: MODEL.into(),
+            dims: 8,
+        });
+        let token = writable
+            .authorize(khive_runtime::Namespace::local())
+            .unwrap();
+        writable.vectors_for_model(&token, MODEL).unwrap();
+        let writer_join = writable.backend().pool().take_writer_task_join();
+        drop(token);
+        drop(writable);
+        if let Some(join) = writer_join {
+            tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .expect("fixture writer must drain before readonly reopen")
+                .expect("fixture writer must not panic");
+        }
+        let rt = KhiveRuntime::new_readonly(cfg).unwrap();
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.into(),
+            dims: 8,
+        });
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+        let shared = ann::new_shared();
+        let result = collect_model_ann_hits(
+            &rt,
+            &shared,
+            &token,
+            "local",
+            &["local".into()],
+            MODEL.into(),
+            vec![1.0; 8],
+            10,
+            40,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.used_sqlite_vec_fallback,
+            "must exercise the exact route"
+        );
+        assert!(
+            !result.degraded,
+            "a failed exact query is not a successful control"
+        );
+        assert!(result.fresh_tail_elapsed.is_none());
+        let mut timings = RecallStageTimings::default();
+        timings.record_parallel_model(result.ann_elapsed, result.fresh_tail_elapsed);
+        assert!(timings.ann_attempted());
+        assert!(!timings.fresh_tail_attempted());
+        assert_eq!(timings.fresh_tail_ms(), 0);
+    }
+
+    #[test]
     fn stage_timings_max_parallel_models_and_sum_sequential_rounds() {
         let mut first_round = RecallStageTimings::default();
-        first_round.record_parallel_model(Duration::from_millis(13), Duration::from_millis(2));
-        first_round.record_parallel_model(Duration::from_millis(5), Duration::from_millis(11));
+        first_round
+            .record_parallel_model(Duration::from_millis(13), Some(Duration::from_millis(2)));
+        first_round
+            .record_parallel_model(Duration::from_millis(5), Some(Duration::from_millis(11)));
         assert_eq!(first_round.ann_ms(), 13);
         assert_eq!(first_round.fresh_tail_ms(), 11);
 
