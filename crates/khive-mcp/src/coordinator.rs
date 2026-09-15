@@ -833,7 +833,11 @@ pub(crate) mod tests {
         assert_eq!(
             search["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 0},
+                "text": {
+                    "status": "ran",
+                    "candidate_count": 0,
+                    "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+                },
                 "vector": {"status": "ran", "candidate_count": 0}
             })
         );
@@ -1206,12 +1210,17 @@ pub(crate) mod tests {
                 "{kind} hit must expose its retrieval source; got: {hit}"
             );
             let expected_text_candidates = usize::from(kind == "entity");
+            let mut expected_participation = json!({
+                "text": {"status": "ran", "candidate_count": expected_text_candidates},
+                "vector": {"status": "ran", "candidate_count": 1}
+            });
+            if kind == "note" {
+                expected_participation["text"]["reason"] = json!(
+                    "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+                );
+            }
             assert_eq!(
-                entry["arm_participation"],
-                json!({
-                    "text": {"status": "ran", "candidate_count": expected_text_candidates},
-                    "vector": {"status": "ran", "candidate_count": 1}
-                }),
+                entry["arm_participation"], expected_participation,
                 "{kind} search must count final candidates by source membership"
             );
             assert!(entry.get("partial").is_none());
