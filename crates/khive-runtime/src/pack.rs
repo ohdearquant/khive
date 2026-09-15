@@ -1708,7 +1708,11 @@ impl VerbRegistry {
                 degraded_rows: m.degraded_rows,
                 degraded: m.degraded,
                 admission_refused_obligations: audit_admission_refused_obligation_count(),
+                admission_refused_obligations_last_at_ms:
+                    audit_admission_refused_obligation_last_at_ms(),
                 admission_unresolved_obligations: audit_admission_unresolved_obligation_count(),
+                admission_unresolved_obligations_last_at_ms:
+                    audit_admission_unresolved_obligation_last_at_ms(),
             }
         })
     }
@@ -4372,11 +4376,34 @@ pub(crate) fn audit_obligation_append_failure_count() -> u64 {
 /// which (like `khive-runtime/src/audit_batch.rs`'s own `test_internals`
 /// module) need it as `pub`, not `pub(crate)`, since they compile as a
 /// separate external binary outside this crate.
+///
+/// This counter is CUMULATIVE for the life of the process. Nothing decrements
+/// it and nothing resolves it: the only writes in the tree are this
+/// declaration and one `fetch_add`. A value that does not move therefore means
+/// no refusal happened in that window, which is the healthy reading, not a
+/// stalled subsystem (#2791). Because a total cannot say when it was last
+/// earned, it is paired with
+/// [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS_LAST_MS`].
 static AUDIT_ADMISSION_REFUSED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Wall-clock milliseconds at which [`AUDIT_ADMISSION_REFUSED_OBLIGATIONS`]
+/// last moved; `0` means it has never moved in this process. This is the field
+/// that makes a static count readable: an old mark beside a non-zero count is
+/// history, a recent mark beside the same count is an active condition (#2791).
+static AUDIT_ADMISSION_REFUSED_OBLIGATIONS_LAST_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub fn audit_admission_refused_obligation_count() -> u64 {
     AUDIT_ADMISSION_REFUSED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `None` until the counter first moves in this process.
+pub fn audit_admission_refused_obligation_last_at_ms() -> Option<u64> {
+    match AUDIT_ADMISSION_REFUSED_OBLIGATIONS_LAST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        at => Some(at),
+    }
 }
 
 /// Process-wide count of `DispatchObligation` rows that were **already
@@ -4395,11 +4422,46 @@ pub fn audit_admission_refused_obligation_count() -> u64 {
 /// and from there into the `db_diagnostics` verb's
 /// `writer_contention.audit_admission_unresolved_obligations` field (ADR-103
 /// Amendment 3).
+///
+/// This counter is CUMULATIVE for the life of the process, and its name is the
+/// one that misleads: "unresolved obligations" reads as the size of a live set
+/// that something drains. There is no such set and no resolver. The only
+/// writes in the tree are this declaration and one `fetch_add`, so a value that
+/// does not move means no admission deadline expired in that window — the
+/// healthy reading (#2791). Each increment records one past event whose row,
+/// per `AuditTerminalReason::AdmissionDeadlineExpired`, most likely committed
+/// afterwards. Paired with [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS_LAST_MS`]
+/// so a reader can tell history from an active condition.
 static AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Wall-clock milliseconds at which [`AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS`]
+/// last moved; `0` means it has never moved in this process (#2791).
+static AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS_LAST_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub fn audit_admission_unresolved_obligation_count() -> u64 {
     AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `None` until the counter first moves in this process.
+pub fn audit_admission_unresolved_obligation_last_at_ms() -> Option<u64> {
+    match AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS_LAST_MS.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        0 => None,
+        at => Some(at),
+    }
+}
+
+/// Stamp an admission-obligation counter's "last moved" mark.
+///
+/// A clock that reads before 1970, or a host clock stepped backwards, must not
+/// be able to write `0` and make a counter that HAS moved report that it never
+/// did, so a non-positive reading is clamped to 1ms.
+fn mark_admission_obligation_counter(mark: &std::sync::atomic::AtomicU64) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let now = u64::try_from(now).unwrap_or(1).max(1);
+    mark.store(now, std::sync::atomic::Ordering::Relaxed);
 }
 
 const GIT_DIGEST_RECEIPT_FAILURE: &str =
@@ -4705,6 +4767,9 @@ async fn append_audit_event_best_effort(
                 {
                     AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mark_admission_obligation_counter(
+                        &AUDIT_ADMISSION_UNRESOLVED_OBLIGATIONS_LAST_MS,
+                    );
                     tracing::warn!(
                         verb,
                         reason = ?reason,
@@ -4721,6 +4786,7 @@ async fn append_audit_event_best_effort(
                 {
                     AUDIT_ADMISSION_REFUSED_OBLIGATIONS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mark_admission_obligation_counter(&AUDIT_ADMISSION_REFUSED_OBLIGATIONS_LAST_MS);
                     tracing::warn!(
                         verb,
                         reason = ?reason,

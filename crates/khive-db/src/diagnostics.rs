@@ -834,7 +834,19 @@ pub struct WriterContentionDiagnostics {
     /// pressure) and from `audit_admission_unresolved_obligations` (a row that
     /// was enqueued and may still commit). `None` under the same conditions as
     /// `audit_batch_flush_failures`.
+    ///
+    /// CUMULATIVE since process start. Nothing decrements it, so a value that
+    /// holds steady under traffic means no refusal occurred in that window
+    /// rather than a stalled subsystem (#2791); read
+    /// `audit_admission_refused_obligations_last_at_ms` beside it to tell the
+    /// two apart.
     pub audit_admission_refused_obligations: Option<u64>,
+    /// Wall-clock milliseconds at which `audit_admission_refused_obligations`
+    /// last moved in the serving process, or `None` if it has never moved.
+    /// `None` alongside a count of zero is the ordinary quiet case; `None`
+    /// alongside a non-zero count cannot occur and would indicate the two are
+    /// being produced from different processes.
+    pub audit_admission_refused_obligations_last_at_ms: Option<u64>,
     /// Why `audit_admission_refused_obligations` is unavailable to this caller.
     pub audit_admission_refused_obligations_unavailable_reason: Option<String>,
     /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
@@ -848,7 +860,20 @@ pub struct WriterContentionDiagnostics {
     /// independently of the caller's timeout — so this field is an upper
     /// bound on the eventual undercount, not the undercount itself. `None`
     /// under the same conditions as `audit_batch_flush_failures`.
+    ///
+    /// CUMULATIVE since process start, despite the set-shaped name. There is no
+    /// live set of unresolved obligations and nothing resolves this counter:
+    /// each increment records one past deadline expiry, and the row it counted
+    /// most likely committed afterwards. A steady value under traffic means no
+    /// deadline expired in that window, which is the healthy reading (#2791).
+    /// Read `audit_admission_unresolved_obligations_last_at_ms` beside it: a
+    /// non-zero count whose mark is old is history, the same count with a
+    /// recent mark is an active condition.
     pub audit_admission_unresolved_obligations: Option<u64>,
+    /// Wall-clock milliseconds at which
+    /// `audit_admission_unresolved_obligations` last moved in the serving
+    /// process, or `None` if it has never moved.
+    pub audit_admission_unresolved_obligations_last_at_ms: Option<u64>,
     /// Why `audit_admission_unresolved_obligations` is unavailable to this
     /// caller.
     pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
@@ -872,6 +897,9 @@ pub struct RuntimeAuditBatchMetrics {
     /// ADR-133 Amendment 1) — a confirmed, terminal accounting loss. Disjoint
     /// from `degraded_rows` and from `admission_unresolved_obligations`.
     pub admission_refused_obligations: u64,
+    /// Wall-clock ms at which `admission_refused_obligations` last moved;
+    /// `None` until it moves. A total cannot say when it was last earned.
+    pub admission_refused_obligations_last_at_ms: Option<u64>,
     /// Admission-degrade-safe read verbs' audit rows that were already
     /// enqueued but had not resolved when the caller's admission wait
     /// deadline elapsed (ADR-103 Amendment 3, ADR-133 Amendment 1). Not a
@@ -879,6 +907,9 @@ pub struct RuntimeAuditBatchMetrics {
     /// on the eventual undercount. Disjoint from `degraded_rows` and from
     /// `admission_refused_obligations`.
     pub admission_unresolved_obligations: u64,
+    /// Wall-clock ms at which `admission_unresolved_obligations` last moved;
+    /// `None` until it moves.
+    pub admission_unresolved_obligations_last_at_ms: Option<u64>,
 }
 
 impl WriterContentionDiagnostics {
@@ -922,12 +953,16 @@ impl WriterContentionDiagnostics {
                 .flatten(),
             audit_admission_refused_obligations: runtime_audit_batch_metrics
                 .map(|m| m.admission_refused_obligations),
+            audit_admission_refused_obligations_last_at_ms: runtime_audit_batch_metrics
+                .and_then(|m| m.admission_refused_obligations_last_at_ms),
             audit_admission_refused_obligations_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
                 .then(unavailable_reason)
                 .flatten(),
             audit_admission_unresolved_obligations: runtime_audit_batch_metrics
                 .map(|m| m.admission_unresolved_obligations),
+            audit_admission_unresolved_obligations_last_at_ms: runtime_audit_batch_metrics
+                .and_then(|m| m.admission_unresolved_obligations_last_at_ms),
             audit_admission_unresolved_obligations_unavailable_reason: runtime_audit_batch_metrics
                 .is_none()
                 .then(unavailable_reason)
@@ -1929,7 +1964,9 @@ mod tests {
                 degraded_rows: 7,
                 degraded: true,
                 admission_refused_obligations: 5,
+                admission_refused_obligations_last_at_ms: Some(1_700_000_000_123),
                 admission_unresolved_obligations: 2,
+                admission_unresolved_obligations_last_at_ms: Some(1_700_000_000_456),
             }),
         )
         .await
