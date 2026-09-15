@@ -55,30 +55,47 @@ for exactly one of the 24. It reads, deletes and re-inserts inside the writer ta
 `SELECT` outside that transaction leaves a window in which a concurrent writer can resurrect a stale
 row or lose one.
 
-**Uniqueness.** Namespace participates in nine constraints, four unique indexes and five composite
-primary keys:
+**Uniqueness.** Namespace participates in fourteen constraints, six unique indexes and eight
+composite primary keys. The first count taken here was nine, and the five it missed are the
+instructive ones - see the note under the table:
 
-| Constraint                      | Columns                                                          |
-| ------------------------------- | ---------------------------------------------------------------- |
-| `idx_notes_namespace_kind_key`  | `(namespace, kind, key)` where `key` is not null and not deleted |
-| `idx_graph_edges_unique_triple` | `(namespace, source_id, target_id, relation)`                    |
-| `idx_knowledge_atoms_ns_slug`   | `(namespace, slug)`                                              |
-| `idx_knowledge_domains_ns_slug` | `(namespace, slug)`                                              |
-| `brain_implicit_mass` PK        | `(profile_id, namespace, target_id)`                             |
-| `brain_profile_snapshots` PK    | `(profile_id, namespace)`                                        |
-| `ann_consumer_watermark` PK     | `(consumer, namespace, embedding_model)`                         |
-| `ann_consumer_pending` PK       | `(consumer, namespace, embedding_model)`                         |
-| `note_streams` PK               | `(namespace, stream, seq)`                                       |
+| Constraint                      | Columns                                                                  | Reachable |
+| ------------------------------- | ------------------------------------------------------------------------ | --------- |
+| `idx_notes_namespace_kind_key`  | `(namespace, kind, key)` where `key` is not null and not deleted         | yes       |
+| `idx_comm_message_external_id`  | `(namespace, kind, json_extract(properties, '$.external_id'))`, filtered | yes       |
+| `graph_edges` PK                | `(namespace, id)`                                                        | yes       |
+| `idx_graph_edges_unique_triple` | `(namespace, source_id, target_id, relation)`                            | yes       |
+| `idx_knowledge_atoms_ns_slug`   | `(namespace, slug)`                                                      | yes       |
+| `idx_knowledge_domains_ns_slug` | `(namespace, slug)`                                                      | yes       |
+| `idx_brain_serve_ledger_unique` | `(namespace, target_id, query_class, served_at)`                         | yes       |
+| `brain_implicit_mass` PK        | `(profile_id, namespace, target_id)`                                     | yes       |
+| `brain_profile_snapshots` PK    | `(profile_id, namespace)`                                                | yes       |
+| `fts_notes_rowids` PK           | `(namespace, subject_id)`                                                | yes       |
+| `fts_entities_rowids` PK        | `(namespace, subject_id)`                                                | yes       |
+| `note_streams` PK               | `(namespace, stream, seq)`                                               | no        |
+| `ann_consumer_watermark` PK     | `(consumer, namespace, embedding_model)`                                 | no        |
+| `ann_consumer_pending` PK       | `(consumer, namespace, embedding_model)`                                 | no        |
 
-A census of every `CREATE UNIQUE INDEX` touching namespace in `khive-db` returns those four indexes
-and no fifth.
+Three are unreachable through this primitive, by decisions taken below rather than by accident:
+`note_streams` refuses before any collision is computed, and neither `ann_consumer_*` table is
+written at all, because the write log is appended to and no watermark is edited. They stay in the
+table because a later decision that moves a watermark makes that primary key reachable again, and
+this table is where a reader looks.
 
-Three of the nine are unreachable through this primitive, and the reasons are decisions taken below
-rather than accidents: `note_streams` refuses before any collision is computed, and the two
-`ann_consumer_*` tables are never written by the move at all, because the write log is appended to
-and no watermark is edited. The refusal set the implementation actually enumerates is the other
-six. They are listed here because the census has to keep finding all nine: a later decision that
-moves a watermark makes that PK reachable again, and the table is where a reader would look.
+**How the first count came to be nine, because it decides how the set is maintained.** The two
+enumerations behind it were `CREATE UNIQUE INDEX ... namespace` and composite `PRIMARY KEY`
+declarations. Neither is wrong; both stop at the shapes their author had in mind. What they missed:
+an index whose third column is an EXPRESSION (`json_extract(properties, '$.external_id')`) rather
+than a column name; a `PRIMARY KEY (namespace, id)` on `graph_edges`, read past as "edges are keyed
+by id"; a unique index on `brain_serve_ledger`, a table this ADR separately decides to move; and the
+two rowid maps, whose `(namespace, subject_id)` keys are the reason a stale fts row can block a
+move.
+
+So the refusal set is not maintained by hand. It is derived at move time from
+`PRAGMA index_list`/`PRAGMA index_xinfo` over the tables the census finds carrying a namespace
+column, which reports primary keys and uniqueness constraints alongside `CREATE INDEX` ones and
+names the namespace column inside an expression index like any other. A constraint added by a
+future migration is in the set on the next run, without an edit here.
 
 **Vectors.** The delete path is keyed on the pair:
 `DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2`, at `stores/vectors.rs:31`, `:506`
@@ -152,8 +169,15 @@ holding the same `(namespace, kind, key)` or the same `(namespace, slug)` after 
 expected shape rather than an exotic one: two independently written trees each hold a note keyed
 `(kind, key)` and an atom keyed `slug`, and after the move both sit in one namespace.
 
-The primitive refuses the whole move on any collision against any of the nine constraints, and names
-the colliding `(table, namespace, key)` rows in the refusal.
+The primitive refuses the whole move on any collision against any reachable constraint, and names
+the colliding `(table, constraint, namespace, key)` rows in the refusal.
+
+The enumeration comes from a pre-flight query per constraint, built from `PRAGMA index_xinfo`, so a
+refusal lists every collision rather than the first one. An expression index has no column name to
+build that query from, so for those the refusal carries the constraint's name and the row the
+failing statement was applying, not a full list. That is a stated limit of the enumeration and not
+of the refusal: the statements themselves are plain and error, so a collision the pre-flight cannot
+enumerate still aborts the move.
 
 It does not offer a conflict policy. An `ON CONFLICT` that drops or replaces picks a winner over a
 caller's data, and does so while satisfying the counts-in-equals-counts-out assertion, which is the
@@ -262,11 +286,13 @@ missed: the first skips rows, the second corrupts them.
 - A concurrent writer during the move cannot produce a resurrected or a lost row.
 - A route map missing a kind that has rows refuses without writing anything, and a routed kind with
   zero rows succeeds reporting zero.
-- A collision on any of the six reachable constraints refuses the whole move and names the rows. The
-  fixture carries at least the `(namespace, kind, key)` and `(namespace, slug)` shapes.
-- The census finds all nine namespace-bearing uniqueness constraints, including the three this
-  primitive cannot reach, so a later decision that makes one reachable is a change to one predicate
-  rather than a rediscovery.
+- A collision on any reachable constraint refuses the whole move and names the rows. The fixture
+  carries at least the `(namespace, kind, key)` and `(namespace, slug)` shapes.
+- The runtime census reproduces the fourteen constraints in the table above on a freshly migrated
+  store, including the three this primitive cannot reach and the expression index. The arm that
+  matters adds a namespace-bearing unique index to the store and asserts the census finds it with no
+  code change, because the failure this guards against is a migration landing while nobody edits
+  this ADR.
 - Full-text search and vector recall return the moved records under the target namespace and nothing
   under the source, and a delete issued after the move removes the vector.
 - Soft-deleted records move with `deleted_at` intact.
