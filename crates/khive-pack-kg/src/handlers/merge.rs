@@ -1,6 +1,7 @@
 //! `merge` verb handler.
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use khive_runtime::{
     entity_merge_guard_error, validate_entity_merge_floor, NamespaceToken, RuntimeError,
@@ -13,6 +14,29 @@ use super::common::{
     MergeParams,
 };
 use crate::KgPack;
+
+async fn diagnose_private_merge<T>(
+    result: Result<T, RuntimeError>,
+    id: Uuid,
+    registry: &VerbRegistry,
+) -> Result<T, RuntimeError> {
+    match result {
+        Err(original @ RuntimeError::NotFound(_)) => {
+            for (_pack_name, resolver) in registry.resolvers() {
+                if resolver.resolve_by_id(id).await?.is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "merge of pack-private records is not supported; \
+                         use the pack's own verbs (e.g. knowledge.upsert_atoms, \
+                         knowledge.upsert_domains, knowledge.edit)"
+                            .into(),
+                    ));
+                }
+            }
+            Err(original)
+        }
+        other => other,
+    }
+}
 
 impl KgPack {
     pub(crate) async fn handle_merge(
@@ -37,10 +61,30 @@ impl KgPack {
 
         let summary = match spec {
             KindSpec::Entity { specific } => {
-                ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
-                ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
-                let into_entity = self.runtime.get_entity(token, into_id).await?;
-                let from_entity = self.runtime.get_entity(token, from_id).await?;
+                diagnose_private_merge(
+                    ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await,
+                    into_id,
+                    registry,
+                )
+                .await?;
+                diagnose_private_merge(
+                    ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await,
+                    from_id,
+                    registry,
+                )
+                .await?;
+                let into_entity = diagnose_private_merge(
+                    self.runtime.get_entity(token, into_id).await,
+                    into_id,
+                    registry,
+                )
+                .await?;
+                let from_entity = diagnose_private_merge(
+                    self.runtime.get_entity(token, from_id).await,
+                    from_id,
+                    registry,
+                )
+                .await?;
                 if !force {
                     validate_entity_merge_floor(&into_entity, &from_entity)
                         .map_err(entity_merge_guard_error)?;
@@ -59,8 +103,18 @@ impl KgPack {
                     .await?
             }
             KindSpec::Note { specific } => {
-                ensure_note_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
-                ensure_note_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
+                diagnose_private_merge(
+                    ensure_note_kind(&self.runtime, token, into_id, specific.as_deref()).await,
+                    into_id,
+                    registry,
+                )
+                .await?;
+                diagnose_private_merge(
+                    ensure_note_kind(&self.runtime, token, from_id, specific.as_deref()).await,
+                    from_id,
+                    registry,
+                )
+                .await?;
                 self.runtime
                     .merge_note_with_reason(
                         token,
