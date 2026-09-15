@@ -174,11 +174,9 @@ pub fn render_format_with_note_content(
         OutputFormat::Auto if content_scope != NoteContentScope::None => {
             serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
         }
-        OutputFormat::Auto | OutputFormat::Table => render_auto_with_note_content(
-            value,
-            presentation != PresentationMode::Verbose,
-            content_scope,
-        ),
+        OutputFormat::Auto | OutputFormat::Table => {
+            render_auto(value, presentation != PresentationMode::Verbose)
+        }
     }
 }
 
@@ -372,12 +370,8 @@ struct RecordArray {
 /// Every other shape → compact JSON, lossless by construction. The former
 /// kv-block renderer for single records is removed: its truncation destroyed
 /// single-record payloads (e.g. a compose briefing's `markdown` field).
-fn render_auto_with_note_content(
-    value: Value,
-    truncate: bool,
-    content_scope: NoteContentScope,
-) -> String {
-    match locate_record_array_with_note_content(&value, content_scope) {
+fn render_auto(value: Value, truncate: bool) -> String {
+    match locate_record_array(&value) {
         Some(found) => render_table_with_siblings(&value, &found, truncate),
         None => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
     }
@@ -388,10 +382,7 @@ fn render_auto_with_note_content(
 /// Checks:
 /// 1. `value` itself is an array of 2+ objects.
 /// 2. `value` is an object with a key whose value is an array of 2+ objects.
-fn locate_record_array_with_note_content(
-    value: &Value,
-    content_scope: NoteContentScope,
-) -> Option<RecordArray> {
+fn locate_record_array(value: &Value) -> Option<RecordArray> {
     let build = |key: Option<String>, arr: &[Value]| {
         let records: Vec<Value> = arr.iter().cloned().map(hoist_table_scalars).collect();
         let columns = collect_keys(&records);
@@ -404,7 +395,6 @@ fn locate_record_array_with_note_content(
     match value {
         Value::Array(arr) if is_record_array(arr) => Some(build(None, arr)),
         Value::Object(map) => map.iter().find_map(|(k, v)| match v {
-            _ if content_scope == NoteContentScope::Record && k == "content" => None,
             Value::Array(arr) if is_record_array(arr) => Some(build(Some(k.clone()), arr)),
             _ => None,
         }),

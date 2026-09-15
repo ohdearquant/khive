@@ -922,7 +922,7 @@ invalid fixtures, missing cases and zero selected tests are neither a baseline
 proof nor mutation kills. This Proposed amendment records no executed outcome;
 native verification and dependent implementation remain held until signature.
 
-## Amendment: opt-in parsed note content (#2757)
+## Amendment 7 (2026-09-15): opt-in parsed note content
 
 **Status: Accepted.** [Ratified by the owner on 2026-09-15](https://github.com/ohdearquant/khive/issues/2757#issuecomment-5684308086).
 This contract supersedes the earlier raw-string fallback and nested-cell placeholder proposal.
