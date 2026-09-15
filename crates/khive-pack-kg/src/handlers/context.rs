@@ -247,15 +247,27 @@ impl KgPack {
         }
 
         let hops = p.hops.unwrap_or(DEFAULT_HOPS).clamp(MIN_HOPS, MAX_HOPS);
-        let budget = p
+        let budget_effective = p
             .budget
             .unwrap_or(DEFAULT_BUDGET)
-            .clamp(MIN_BUDGET, MAX_BUDGET) as usize;
-        let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(MIN_LIMIT, MAX_LIMIT);
+            .clamp(MIN_BUDGET, MAX_BUDGET);
+        let budget = budget_effective as usize;
+        let requested_limit = p.limit;
+        let limit = requested_limit
+            .unwrap_or(DEFAULT_LIMIT)
+            .clamp(MIN_LIMIT, MAX_LIMIT);
         let fanout = p
             .fanout
             .unwrap_or(DEFAULT_FANOUT)
             .clamp(MIN_FANOUT, MAX_FANOUT);
+        // Every clamped number reports back under its own name, and only when
+        // the caller supplied it: a default is not a clamp.
+        let clamp_reports: [(&str, Option<i64>, i64); 4] = [
+            ("hops", p.hops, hops),
+            ("budget", p.budget, budget_effective),
+            ("limit", requested_limit.map(i64::from), i64::from(limit)),
+            ("fanout", p.fanout.map(i64::from), i64::from(fanout)),
+        ];
         let direction = parse_direction(p.direction.as_deref())?;
         let relations: Option<Vec<EdgeRelation>> = p
             .relations
@@ -583,7 +595,7 @@ impl KgPack {
             plog(call_id, "assembly", t.elapsed().as_micros());
         }
 
-        Ok(json!({
+        let mut response = json!({
             "anchors": out_anchors,
             "truncated": truncated,
             // `stage` is additive: every drop this handler produces originates in the
@@ -594,7 +606,19 @@ impl KgPack {
                 "neighbors": dropped_neighbors,
                 "stage": "budget",
             },
-        }))
+        });
+        let fields = response
+            .as_object_mut()
+            .expect("context response is an object");
+        for (name, requested, effective) in clamp_reports {
+            let Some(requested) = requested else {
+                continue;
+            };
+            fields.insert(format!("requested_{name}"), json!(requested));
+            fields.insert(format!("effective_{name}"), json!(effective));
+            fields.insert(format!("{name}_clamped"), json!(requested != effective));
+        }
+        Ok(response)
     }
 }
 

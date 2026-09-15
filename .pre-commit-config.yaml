@@ -39,13 +39,13 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: bash -c 'cd crates && cargo fmt --all -- --check'
+        entry: bash scripts/hook-cargo.sh fmt
         language: system
         files: ^crates/.*\.rs$
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: bash -c 'cd crates && cargo clippy --workspace --all-targets -- -D warnings'
+        entry: bash scripts/hook-cargo.sh clippy
         language: system
         files: ^crates/.*\.rs$
         pass_filenames: false

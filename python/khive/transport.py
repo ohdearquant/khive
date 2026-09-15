@@ -57,7 +57,7 @@ from .models import OpResult
 from .models import OpError, RecallOutcome
 from .ops import encode, op
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 

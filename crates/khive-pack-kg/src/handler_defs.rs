@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (24 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (26 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -24,7 +24,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "record", param_type: "JSON value", required: true, description: "Required JSON value, including scalar or null; stored as note content.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "expected_seq", param_type: "integer", required: false, description: "Append only if this entry would receive this sequence; conflict details include next_seq.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "A fence object {key, kind, expected_version} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based).", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "A fence object {key, kind, expected_version, live_until?, id?} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based). Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_kind", param_type: "string", required: false, description: "Registered note kind; defaults to observation.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "boolean", required: false, description: "Defaults false: no embedding rows or vector-index work, while lexical indexing and stream reads remain available. True embeds under every registered model unless embedding_model selects one.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embedding_model", param_type: "string", required: false, description: "Select one registered embedding model. Requires embed=true; otherwise invalid_input before any write.", resolution_mode: IdResolutionMode::NotApplicable },
@@ -60,8 +60,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef { name: "ops", param_type: "array of object", required: true, description: "Members in order. {op: \"append\", stream, record, expected_seq?, fence?, embed?, embedding_model?}: record is any JSON value, including null. Append embed defaults false; true embeds under all registered models or the one embedding_model selects. embedding_model requires embed=true or the entire list is invalid_input before any write; atomic errors name details.member. Each append fence is an object or non-empty ordered list of at most 100 {key, kind, expected_version} entries; oversized lists return invalid_input naming the cap and count sent before fence entry interpretation or any writer admission, in both modes. Each fence entry requires expected_version: an integer >=1 asserts the live note's version in the write namespace; null asserts no live (kind, key) holder, including when the old holder is soft-deleted. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid. All append-member fences are checked in order before any member writes in their transaction. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals report a string index; atomic refusal also names the string member position. Outer fence:null, empty lists and duplicate (kind,key) entries are invalid before any member writes. {op: \"write\", key, kind, doc, tags?, embed?, expected_version?}: doc is any JSON value; omitted/null expected_version creates only if absent, while a positive version updates only an existing key at that version. Duplicate write (kind, key) pairs refuse the whole batch. An unknown op is that member's unknown_op refusal, placed by the mode.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object", required: false, description: "{key, kind, expected_version}, checked once inside the atomic transaction before the first write. expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live (kind, key) holder, so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid. A mismatch refuses the whole batch with fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. An object selects atomic mode; atomic=false beside it is refused. List-valued fences are not supported. Top-level fence:null is treated as omitted and does not select atomic mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "ops", param_type: "array of object", required: true, description: "Members in order. {op: \"append\", stream, record, expected_seq?, fence?, embed?, embedding_model?}: record is any JSON value, including null. Append embed defaults false; true embeds under all registered models or the one embedding_model selects. embedding_model requires embed=true or the entire list is invalid_input before any write; atomic errors name details.member. Each append fence is an object or non-empty ordered list of at most 100 {key, kind, expected_version} entries; oversized lists return invalid_input naming the cap and count sent before fence entry interpretation or any writer admission, in both modes. Each fence entry requires expected_version: an integer >=1 asserts the live note's version in the write namespace; null asserts no live (kind, key) holder, including when the old holder is soft-deleted. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid. All append-member fences are checked in order before any member writes in their transaction. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals report a string index; atomic refusal also names the string member position. Outer fence:null, empty lists and duplicate (kind,key) entries are invalid before any member writes. {op: \"write\", key, kind, doc, tags?, embed?, expected_version?}: doc is any JSON value; omitted/null expected_version creates only if absent, while a positive version updates only an existing key at that version. An accepted write member always advances the version by exactly one, an identical document included; a batch write is never a no-op. Duplicate write (kind, key) pairs refuse the whole batch. An unknown op is that member's unknown_op refusal, placed by the mode.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object", required: false, description: "{key, kind, expected_version, live_until?, id?}, checked once inside the atomic transaction before the first write. expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live (kind, key) holder, so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid. A mismatch refuses the whole batch with fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. An object selects atomic mode; atomic=false beside it is refused. List-valued fences are not supported. Top-level fence:null is treated as omitted and does not select atomic mode. Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "observed", param_type: "array of object", required: false, description: "Requires atomic mode; supplying observed alone does not select it. Set atomic=true or supply fence. [{key, kind, version, id?, live_until?}], checked inside the transaction before the first write. A positive version asserts the live key's exact version; explicit null asserts no live holder. A mismatch refuses the batch with version_conflict naming the key and the entry index. The version field is required. Optional live_until is a dotted document path (for example lease.expires_at), requires a positive version, and must hold an RFC 3339 timestamp strictly later than one writer-transaction clock reading. Expired or unreadable fields refuse with expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID and requires a positive version; a replacement refuses with identity_conflict before the version check. The refusal includes current_id only when the caller may learn the holder, under the same disclosure rule as key_conflict. Without id, the entry asserts version equality on the note holding the key at commit time. Refused with invalid_input in per-member mode.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "atomic", param_type: "boolean", required: false, description: "true: one transaction, all or nothing. false: one transaction per member, refusals as member values. Defaults to whether fence is present. observed alone does not select atomic mode; observed without fence requires atomic=true, otherwise invalid_input.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
@@ -81,7 +81,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         params: &[
             ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "boolean", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based).", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version, live_until?, id?} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based). Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
@@ -220,9 +220,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "boolean",
                 required: false,
                 description:
-                    "If true, return soft-deleted entities (with deleted_at populated). Default false. \
+                    "If true, return a caller-owned soft-deleted entity, note, or edge (with deleted_at populated). Default false. \
                      Accepts a full UUID or a unique short hex prefix — prefix resolution falls back \
-                     to soft-deleted entities when no live record matches.",
+                     to soft-deleted records when no live record matches.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -230,7 +230,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering. Offset-mode results always use \
+        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool}; clients advance offset by items.length, while M \
                       discloses the server cap and is not a guaranteed row count. \
@@ -448,7 +448,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes). Counts cover \
+        description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
                       live rows across caller-visible namespaces; count_scope repeats this scope \
                       in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
@@ -466,8 +466,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
-            ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based).", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Notes only: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics. A fenced update that changes nothing is still a write and advances the version by one; only an unfenced identical patch is answered as a no-op with unchanged=true.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version, live_until?, id?} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based). Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "boolean", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
@@ -587,6 +587,29 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
             },
         ],
     },
+    // Declaration: declares a caller-owned tombstone live again
+    HandlerDef {
+        name: "restore",
+        description: "Restore a caller-owned soft-deleted entity, note, or edge; live records are returned unchanged and key conflicts refuse without modifying either record.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "Complete UUID or globally unique 8+ hex prefix of the tombstone to restore. Entity-name fallback uses the primary namespace.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
@@ -658,7 +681,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over knowledge-graph entities and notes. Corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -877,10 +900,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors, returned as a bare array of hits rather than the \
-                      {\"items\": [...]} envelope `list` uses. Each hit carries origin_id for the \
-                      queried node, edge_id, relation, weight, and the neighbor's id, kind and \
-                      name; include_entity_type=true adds entity_type when the neighbor has one.",
+        description: "Immediate graph neighbors. With no explicit `limit`, the response remains a \
+                      bare array of hits. An explicit limit returns a `neighbors` page with \
+                      `requested_limit`, `effective_limit`, `limit_clamped`, and `next_after`. \
+                      Each record hit carries origin_id for the queried node, edge_id, relation, \
+                      weight, and the neighbor's id, kind and name; include_entity_type=true adds \
+                      entity_type when the neighbor has one. This verb does not accept \
+                      `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -914,17 +940,46 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 description: "Minimum edge weight for returned neighbors (0.0–1.0). Edges below this threshold are excluded.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum neighbors to return (default: all for compatibility). Explicit values are capped at 1000 and report requested_limit, effective_limit, and limit_clamped.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after",
+                param_type: "string",
+                required: false,
+                description: "Opaque cursor from a prior limited response. Pass an empty string to start a cursor walk; requires an explicit limit. Results continue in weight-descending, neighbor-id-ascending, edge-id-ascending order.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "neighbor_kinds",
+                param_type: "array of string",
+                required: false,
+                description: "Filter neighbors to these entity or note kinds before the limit is applied.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "projection",
+                param_type: "string",
+                required: false,
+                description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Bounded multi-hop BFS traversal returning one path per distinct root. \
+        description: "Bounded multi-hop BFS traversal over live nodes and edges, returning one path per distinct root. \
                       At most 100 roots, depth 10, 1,000 non-root results per root, 100,000 \
                       adjacency rows, and five seconds of storage expansion per request; \
                       over-budget calls fail without partial paths. Entity and note nodes \
                       both include name/kind; note names use the same fallback as \
-                      `neighbors` when no explicit name is stored.",
+                      `neighbors` when no explicit name is stored. This verb does not accept \
+                      `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -992,12 +1047,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // Assertive: entity-anchored graph context in one call (ADR-089)
     HandlerDef {
         name: "context",
-        description: "Entity-anchored graph context: resolve anchors from `query` and/or \
+        description: "Entity-anchored live graph context: resolve anchors from `query` and/or \
                       `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
                       a budgeted, deterministically-ordered response. `direction` defaults to \
                       \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
                       least one of `query`/`entity_ids` is required. One embedding inference \
-                      when `query` is used; zero for a pure `entity_ids` call.",
+                      when `query` is used; zero for a pure `entity_ids` call. This verb does not \
+                      accept `include_deleted`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -1057,7 +1113,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 param_type: "integer",
                 required: false,
                 description: "Max anchors taken from the `query` search leg, clamped 1..=20 \
-                              (default 5). Does not clamp explicit entity_ids.",
+                              (default 5). Does not clamp explicit entity_ids. An explicit \
+                              value reports requested_limit, effective_limit, and limit_clamped.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1081,7 +1138,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "GQL or SPARQL pattern query string (read-only). GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+                description: "GQL or SPARQL pattern query string over the live graph (read-only); this verb does not accept `include_deleted`. GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1230,7 +1287,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
     // executes a plan; `ask` (a later slice) is the write-planning entrance.
     HandlerDef {
         name: "resolve",
-        description: "Resolve natural-language references to ids. Each ref in \
+        description: "Resolve natural-language references to live ids. This verb does not accept `include_deleted`. Each ref in \
                        `refs` is resolved through, in order: (1) id-string \
                        passthrough (UUID / 8+ hex prefix) via the by-ID path; \
                        Entity ids only: note, edge, and event ids return \
@@ -1297,6 +1354,41 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
         category: VerbCategory::Assertive,
         params: &[],
     },
+    // Assertive: the secret gate's verdict for a note body, without a write
+    HandlerDef {
+        name: "scan",
+        description: "Report whether the secret gate would refuse a note body, without writing \
+                      anything: would_refuse, the detector that fired, its trigger word, the \
+                      masked candidate (first6...N), the field it sat in (note.content, \
+                      note.name, note.properties), the exact refusal message a write would \
+                      return, and a masked preview of content and name. Runs the same checks \
+                      in the same order as a note write. Stores nothing and emits no event.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: true,
+                description: "Note body to scan, exactly as it would be written.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: false,
+                description: "Note name to scan alongside the body.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Properties object to scan; every string leaf is checked.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     // Assertive: reader/writer contention, edge-integrity, and WAL diagnostics.
     HandlerDef {
         name: "db_diagnostics",
@@ -1318,6 +1410,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 24] = [
                       expected non-negative ledger delta explicit; a negative delta is unexpected \
                       unless the report also flags the pre-V14 duplicate-edge state, which is \
                       classified as ledger_behind_pre_v14_duplicate_edge_state. \
+                      live_entities_carrying_merged_into counts live entity rows that still carry \
+                      merge provenance, the state an earlier restore left behind; restore names \
+                      such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
                       row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
                       WAL checkpoint counters, a PASSIVE \
@@ -1753,6 +1848,33 @@ mod tests {
                 "missing tag contract: {detail}"
             );
         }
+    }
+
+    /// ADR-172 Amendment 5, acceptance arm 6: both routes state which rule
+    /// an identical write gets.
+    #[test]
+    fn help_states_that_a_fenced_identical_write_still_mints_a_version() {
+        let update = find_handler("update");
+        let expected = update
+            .params
+            .iter()
+            .find(|p| p.name == "expected_version")
+            .expect("update documents expected_version");
+        assert!(
+            expected
+                .description
+                .contains("changes nothing is still a write")
+                && expected.description.contains("unchanged=true"),
+            "update.expected_version must state the fenced-write and no-op rules"
+        );
+        let batch = find_handler("stream.batch");
+        let ops = batch.params.iter().find(|p| p.name == "ops").unwrap();
+        assert!(
+            ops.description
+                .contains("always advances the version by exactly one")
+                && ops.description.contains("never a no-op"),
+            "stream.batch.ops must state that an accepted write member always mints"
+        );
     }
 
     /// update.help must document `content` for notes.

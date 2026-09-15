@@ -9,6 +9,9 @@ id by default, semantic memory writes stamp the shared pool, and an explicit `na
 overrides both.
 **Amended**: 2026-08-30, schema V23 makes the `memory` candidate filter an
 indexed FTS classifier rather than a post-MATCH row filter (#1907).
+**Proposed amendment**: 2026-09-14, [new-memory creation admission](#amendment-new-memory-creation-admission-proposed)
+replaces the generic-create equivalence in §4 and qualifies §10 and the neutral
+consequences. Existing accepted decisions remain in force until this amendment is accepted.
 
 ## Context
 
@@ -102,6 +105,9 @@ actor-identity ADR for the string format, and would not participate in graph tra
 Edges are the right substrate for "this came from X" relationships.
 
 ### 4. `memory.remember` — sugar over `create` + optional `link`
+
+The generic-create equivalence in this section is superseded only on acceptance of
+the [creation-admission amendment](#amendment-new-memory-creation-admission-proposed).
 
 ```
 memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, tags?, namespace?)
@@ -304,6 +310,9 @@ Resolution rules:
   escape: `memory.remember(content="...", memory_type="episodic", namespace="local")` writes the
   episodic memory into the shared pool, and `memory.remember(content="...",
   memory_type="semantic", namespace="ns-x")` writes the semantic memory into `ns-x`.
+  The proposed [creation-admission amendment](#amendment-new-memory-creation-admission-proposed)
+  removes the generic-create equivalence on acceptance; the `memory.remember`
+  routing rules themselves remain unchanged.
 - The episodic default uses `token.actor().id`, the actor identity threaded onto the request token
   (ADR-053). An anonymous caller has actor id `'local'` (`ActorRef::anonymous`), so when no
   `[actor]` is configured the episodic default resolves to `'local'`, identical to the semantic
@@ -469,10 +478,103 @@ handler logic.
   `annotates` already accepts note → any-substrate per [ADR-002](ADR-002-edge-ontology.md).
 - `khive-pack-kg` is unaffected. Its `search`/`create` paths continue to work as
   specified; the memory pack uses them via the runtime's pack-extensible verb dispatch.
+  The proposed [creation-admission amendment](#amendment-new-memory-creation-admission-proposed)
+  qualifies this statement for generic creation and new `stream.batch` memory writes.
 - The pack composes with [ADR-020](ADR-020-git-native-kg-implementation.md) git-native
   KG: memory notes are part of the notes substrate, which is excluded from v1 KG
   snapshots ([ADR-010](ADR-010-kg-versioning.md) §SnapshotCoverage). Memory persists in
   `working.db` and the main database; cross-instance memory portability is v2 work.
+
+## Amendment: new-memory creation admission (proposed)
+
+**Status**: proposed scope clarification, 2026-09-14. This revision corrects the
+earlier amendment's description of public stream append and explicitly preserves
+proposal-based note creation. The clarified contract requires acceptance before
+its implementation merges. It partially supersedes §4's
+generic-create equivalence, the equivalent-create clause in §10, and the
+corresponding neutral consequence. Other decisions remain accepted and unchanged.
+
+### Problem and decision
+
+Generic memory creation currently permits rows with absent `memory_type`,
+`salience`, or `decay_factor`. Recall may report effective defaults that were never
+stored, so recall and raw or generic reads can describe different values for the
+same record. Generic creation also does not implement the specialized
+writer's complete decay and actor-routing contract. Treating these entry points
+as interchangeable promises behavior shared create does not provide.
+
+When the memory pack is loaded, `memory.remember` is the supported replacement for
+generic create and new `stream.batch` memory writes. Shared generic creation of
+the memory kind refuses before creating a note or provenance edge, with an error
+naming `memory.remember` as the supported writer. This includes
+`create(kind="memory", ...)` and
+`create(kind="note", note_kind="memory", ...)`, including keyed requests,
+explicit namespaces and requests supplying defaults themselves. Existing
+validation may reject malformed arguments before reaching this refusal.
+
+The memory pack owns admission through the existing
+[ADR-017](ADR-017-pack-standard.md) `KindHook::prepare_create` interface. KG does
+not hard-code memory, redirect requests, or enforce a general prohibition on kinds
+with specialized verbs. Generic task creation retains its existing behavior.
+
+### Stream consequence and preserved operations
+
+The shared creation hook also governs a new `stream.batch` write whose kind is
+memory. That operation refuses with the same directing error in both atomic and
+per-member modes. It is a preparation failure: no preceding sibling write in that
+batch commits. This consequence is part of the decision, not a new per-member
+conflict result. Public `stream.batch` append members continue to create
+observations.
+
+Standalone `stream.append` continues to accept a registered `note_kind`, including
+memory; observation is its default, not its only admitted kind. Approved
+`propose`/`review` changesets containing `AddNote` likewise retain their existing
+registered-kind admission. These two public creation routes do not invoke the
+shared create hook and remain governed by their existing stream and proposal
+contracts. This amendment neither redirects them to `memory.remember` nor gives
+them its stored-default, namespace-routing or keyed-replay contract.
+
+`memory.remember` uses the memory writer directly and remains admitted, including
+existing keyed replay. It retains type-specific stored defaults, explicit zero
+values, source annotations, embedding selection and the namespace rules in §10.
+This amendment does not change its key equality, replay result or conflict
+contract.
+
+The create-only hook does not deny generic reads, searches, updates, deletion,
+restoration or other already-supported operations on existing memories. An
+expected-version stream write to an existing keyed memory remains governed by
+existing update rules. Internal note constructors and historical raw rows remain
+available to their existing callers; this is not a universal storage invariant.
+Existing missing fields are neither backfilled nor repaired on read, and recall's
+legacy effective defaults remain unchanged. No supported memory snapshot-import
+roundtrip is introduced or claimed.
+
+### Compatibility, alternative and validation
+
+Callers of generic create and new `stream.batch` memory writes must move to the
+actual `memory.remember` parameter and result contract. There is no silent
+redirect or compatibility alias with different namespace or key semantics.
+[ADR-007](ADR-007-namespace.md#proposed-qualification-memory-creation-admission)
+reciprocally qualifies its generic-create equivalence; specialized memory routing
+and namespace-as-attribution decisions remain unchanged.
+
+The alternative is full shared normalization, including stored type, salience,
+decay and authenticated actor/explicit-namespace routing. Inserting only default
+properties into generic create does not satisfy that alternative. The directing
+refusal reuses the complete specialized writer without extending shared creation
+arguments or the hook interface.
+
+Acceptance tests exercise real KG and memory packs: both generic spellings refuse
+without changing notes, key holders or provenance edges; new `stream.batch`
+memory writes refuse before sibling mutations; specialized default/explicit writes
+are visible in raw storage, generic get and a nonempty matching recall; identical
+keyed replay preserves the original record; existing-memory updates and other kinds remain
+usable. Error audit records are outside the no-domain-mutation assertion. Tests
+retain legacy-row read behavior and show that reads do not fill absent fields.
+No native execution or performance result is asserted by this proposal.
+
+No schema migration, dependency, new verb or graph relation is required. Reverting
+the hook restores prior input admission; it does not migrate existing data.
 
 ## Implementation
 

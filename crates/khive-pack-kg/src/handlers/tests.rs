@@ -1,5 +1,5 @@
 use super::{parse_relation, UpdateParams};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
@@ -179,16 +179,16 @@ fn propose_params_no_actor_field() {
     assert_eq!(p.title, "Fix RoPE");
 }
 
-// KG pack must expose exactly 24 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/db_diagnostics
+// KG pack must expose exactly 26 handlers including propose/review/withdraw/verbs/stats/context/resolve/whoami/scan/db_diagnostics/restore
 #[test]
-fn kg_pack_exposes_24_handlers() {
+fn kg_pack_exposes_26_handlers() {
     use crate::KgPack;
     use khive_types::Pack;
     let handlers = KgPack::HANDLERS;
     assert_eq!(
         handlers.len(),
-        24,
-        "kg pack must expose 24 handlers including ordered streams and stream.batch"
+        26,
+        "kg pack must expose 26 handlers including ordered streams, stream.batch, restore, and scan"
     );
     let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
     assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -3003,6 +3003,88 @@ async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity()
     );
 }
 
+#[tokio::test]
+async fn update_note_noop_keeps_version_and_reports_unchanged() {
+    let (rt, token, _pack, registry) = configured_kg_pack().await;
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            Some("no-op update"),
+            &"long content ".repeat(32),
+            Some(0.4),
+            Some(json!({
+                "first": 1,
+                "nullable": "keep",
+                "tags": ["alpha", "beta"]
+            })),
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let response = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "properties": {"tags": ["beta", "alpha"], "first": 1},
+                "salience": 0.4,
+            }),
+        )
+        .await
+        .expect("equal normalized patch");
+
+    assert_eq!(response["unchanged"], json!(true));
+    assert_eq!(response["version"], json!(note.version));
+    // #2697: the no-op answers with the stored row, not the patched snapshot;
+    // the request's tag order must not leak into the response.
+    assert_eq!(response["properties"]["tags"], json!(["alpha", "beta"]));
+    let read_back = registry
+        .dispatch("get", json!({"id": note.id.to_string()}))
+        .await
+        .expect("read back the stored row");
+    assert_eq!(read_back["properties"]["tags"], json!(["alpha", "beta"]));
+    assert_eq!(response["properties"], read_back["properties"]);
+
+    let omitted = registry
+        .dispatch("update", json!({"id": note.id.to_string(), "kind": "note"}))
+        .await
+        .expect("omitting a field must leave it unchanged");
+    assert_eq!(omitted["unchanged"], json!(true));
+    assert_eq!(omitted["version"], json!(note.version));
+
+    let explicitly_null = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "properties": {"nullable": null}
+            }),
+        )
+        .await
+        .expect("an explicit null must be applied, not treated as omission");
+    assert_ne!(explicitly_null["unchanged"], json!(true));
+    assert_eq!(explicitly_null["version"], json!(note.version + 1));
+    assert_eq!(explicitly_null["properties"]["nullable"], Value::Null);
+
+    let changed = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": note.id.to_string(),
+                "kind": "note",
+                "content": format!("{}x", "long content ".repeat(32)),
+            }),
+        )
+        .await
+        .expect("one-byte content change");
+    assert_ne!(changed["unchanged"], json!(true));
+    assert_eq!(changed["version"], json!(note.version + 2));
+}
+
 // #1669: `get(include_deleted=true)` must also reach soft-deleted notes and edges.
 
 #[tokio::test]
@@ -3217,6 +3299,344 @@ async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
     assert!(
         !msg.contains("merged into"),
         "a never-existed id must not gain a merge hint, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_note_refuses_a_live_key_holder_and_restores_when_free() {
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let first = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "first tombstone",
+                "key": "restore-key"
+            }),
+        )
+        .await
+        .expect("create keyed note");
+    let first_id = first["id"].as_str().expect("first id").to_owned();
+    assert!(rt
+        .delete_note(&token, first_id.parse().unwrap(), false)
+        .await
+        .expect("delete first note"));
+
+    let second = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "replacement holder",
+                "key": "restore-key"
+            }),
+        )
+        .await
+        .expect("create replacement keyed note");
+    let second_id = second["id"].as_str().expect("second id");
+    let conflict = pack
+        .handle_restore(&token, json!({"id": first_id}), &registry)
+        .await
+        .expect_err("restore must refuse a live key holder");
+    let conflict_text = format!("{conflict}");
+    assert!(conflict_text.contains("restore_key_conflict"));
+    assert!(conflict_text.contains("restore-key"));
+    assert!(conflict_text.contains(second_id));
+
+    let tombstone = registry
+        .dispatch("get", json!({"id": first_id, "include_deleted": true}))
+        .await
+        .expect("conflicting restore leaves tombstone intact");
+    assert!(tombstone["deleted_at"].is_string());
+    let live = registry
+        .dispatch("get", json!({"id": second_id}))
+        .await
+        .expect("replacement holder remains live");
+    assert_eq!(live["content"], "replacement holder");
+
+    assert!(rt
+        .delete_note(&token, second_id.parse().unwrap(), false)
+        .await
+        .expect("delete replacement"));
+    let restored = pack
+        .handle_restore(&token, json!({"id": first_id}), &registry)
+        .await
+        .expect("restore after freeing key");
+    assert_eq!(restored["restored"], true);
+    assert_eq!(restored["content"], "first tombstone");
+    assert_eq!(restored["deleted_at"], Value::Null);
+    // The restore response reports the version the store now holds: a
+    // re-read returns the same number, one past the tombstone's version.
+    let reread = registry
+        .dispatch("get", json!({"id": first_id}))
+        .await
+        .expect("restored note reads back live");
+    assert_eq!(reread["version"], restored["version"]);
+    assert_eq!(
+        reread["version"].as_i64().expect("version is an integer"),
+        tombstone["version"]
+            .as_i64()
+            .expect("tombstone version is an integer")
+            + 1
+    );
+}
+
+#[tokio::test]
+async fn include_deleted_and_restore_are_scoped_to_the_callers_namespace() {
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let token_a = rt
+        .authorize(khive_runtime::Namespace::parse("restore-a").unwrap())
+        .expect("authorize first namespace");
+    let token_b = rt
+        .authorize(khive_runtime::Namespace::parse("restore-b").unwrap())
+        .expect("authorize second namespace");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    let pack = crate::KgPack::new(rt.clone());
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(
+            &token_a,
+            "concept",
+            None,
+            "private tombstone",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
+
+    let owned = pack
+        .handle_get(
+            &token_a,
+            &token_a,
+            json!({"id": entity.id.to_string(), "include_deleted": true}),
+            &registry,
+        )
+        .await
+        .expect("owner can read tombstone");
+    assert!(owned["deleted_at"].is_string());
+    let foreign = pack
+        .handle_get(
+            &token_b,
+            &token_b,
+            json!({"id": entity.id.to_string(), "include_deleted": true}),
+            &registry,
+        )
+        .await
+        .expect_err("foreign caller cannot read tombstone");
+    assert!(matches!(foreign, khive_runtime::RuntimeError::NotFound(_)));
+
+    let restored = pack
+        .handle_restore(&token_a, json!({"id": entity.id.to_string()}), &registry)
+        .await
+        .expect("owner can restore tombstone");
+    assert_eq!(restored["restored"], true);
+    let foreign_restore = pack
+        .handle_restore(&token_b, json!({"id": entity.id.to_string()}), &registry)
+        .await
+        .expect_err("foreign caller cannot restore tombstone");
+    assert!(matches!(
+        foreign_restore,
+        khive_runtime::RuntimeError::NotFound(_)
+    ));
+}
+
+#[tokio::test]
+async fn restore_kind_hint_does_not_disclose_a_foreign_tombstone() {
+    // #2701: the restore preflight reads the row by id alone, so a kind hint
+    // compared before ownership told a foreign caller the tombstone's kind.
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let token_a = rt
+        .authorize(khive_runtime::Namespace::parse("hint-a").unwrap())
+        .expect("authorize first namespace");
+    let token_b = rt
+        .authorize(khive_runtime::Namespace::parse("hint-b").unwrap())
+        .expect("authorize second namespace");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    let pack = crate::KgPack::new(rt.clone());
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let entity = rt
+        .create_entity(
+            &token_a,
+            "concept",
+            None,
+            "foreign tombstone",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
+    let note = rt
+        .create_note(
+            &token_a,
+            "observation",
+            None,
+            "foreign note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    assert!(rt.delete_note(&token_a, note.id, false).await.unwrap());
+
+    // Every hint shape a foreign caller can send reads the same: NotFound,
+    // never a kind mismatch that names the stored kind.
+    let arms: [(uuid::Uuid, Option<&str>); 6] = [
+        (entity.id, Some("person")),
+        (entity.id, Some("concept")),
+        (entity.id, None),
+        (note.id, Some("decision")),
+        (note.id, Some("observation")),
+        (note.id, None),
+    ];
+    let mut foreign_messages = Vec::new();
+    for (id, hint) in arms {
+        let mut params = json!({"id": id.to_string()});
+        if let Some(hint) = hint {
+            params["kind"] = json!(hint);
+        }
+        let err = pack
+            .handle_restore(&token_b, params, &registry)
+            .await
+            .expect_err("foreign caller must not restore or learn the kind");
+        assert!(
+            matches!(err, khive_runtime::RuntimeError::NotFound(_)),
+            "hint {hint:?} on {id}: expected NotFound, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("kind mismatch") && !message.contains("exists with kind"),
+            "hint {hint:?} on {id} disclosed the kind: {message}"
+        );
+        foreign_messages.push(message.replace(&id.to_string(), "<id>"));
+    }
+    foreign_messages.dedup();
+    assert_eq!(
+        foreign_messages.len(),
+        1,
+        "hinted and hint-less foreign restores must be indistinguishable: {foreign_messages:?}"
+    );
+
+    // Control: the owner still gets the kind mismatch for a wrong hint, and
+    // restores with the right one.
+    let owner_mismatch = pack
+        .handle_restore(
+            &token_a,
+            json!({"id": entity.id.to_string(), "kind": "person"}),
+            &registry,
+        )
+        .await
+        .expect_err("owner with a wrong hint gets the mismatch");
+    assert!(
+        matches!(owner_mismatch, khive_runtime::RuntimeError::InvalidInput(ref m) if m.contains("kind mismatch")),
+        "owner control: {owner_mismatch:?}"
+    );
+    let restored = pack
+        .handle_restore(
+            &token_a,
+            json!({"id": entity.id.to_string(), "kind": "concept"}),
+            &registry,
+        )
+        .await
+        .expect("owner restores with the right hint");
+    assert_eq!(restored["restored"], true);
+}
+
+#[tokio::test]
+async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge() {
+    use khive_types::EdgeRelation;
+
+    let (rt, token, pack, registry) = configured_kg_pack().await;
+    let source = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "traverse source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "traverse target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    let edge = rt
+        .link(
+            &token,
+            source.id,
+            target.id,
+            EdgeRelation::Extends,
+            0.8,
+            None,
+        )
+        .await
+        .expect("create edge");
+
+    let before = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("initial traversal");
+    assert_eq!(before.as_array().map(Vec::len), Some(1));
+    assert!(before[0]["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.len() >= 2));
+
+    assert!(rt.delete_entity(&token, target.id, false).await.unwrap());
+    let edge_read = registry
+        .dispatch("get", json!({"id": edge.id.to_string()}))
+        .await
+        .expect("edge remains directly readable");
+    assert_eq!(edge_read["id"], edge.id.to_string());
+    let suppressed = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("traversal after endpoint deletion");
+    assert_eq!(suppressed.as_array().map(Vec::len), Some(1));
+    assert_eq!(suppressed[0]["nodes"].as_array().map(Vec::len), Some(1));
+
+    let restored = pack
+        .handle_restore(&token, json!({"id": target.id.to_string()}), &registry)
+        .await
+        .expect("restore endpoint");
+    assert_eq!(restored["restored"], true);
+    let after = registry
+        .dispatch(
+            "traverse",
+            json!({"roots": [source.id.to_string()], "max_depth": 1}),
+        )
+        .await
+        .expect("traversal after endpoint restore");
+    assert_eq!(
+        after[0]["nodes"].as_array().map(Vec::len),
+        before[0]["nodes"].as_array().map(Vec::len)
     );
 }
 
@@ -3643,4 +4063,97 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
         format!("{err}").contains("kind mismatch"),
         "expected a kind mismatch refusal, got: {err}"
     );
+}
+
+// ---- scan: the secret gate's verdict without a write ----
+
+/// The probe and the write path must agree on both signs, and the probe's
+/// `message` must be byte-identical to the refusal the write returns, because
+/// consumers use the probe to decide whether to spend the write at all.
+#[tokio::test]
+async fn scan_agrees_with_the_note_write_on_a_refused_and_an_accepted_body() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let secret = format!("sk-proj-{}", "A".repeat(80));
+    let refused = format!("rotate this credential before the release: {secret}");
+
+    let probe = registry
+        .dispatch("scan", json!({"content": refused}))
+        .await
+        .expect("scan reports a refusal, it does not fail on one");
+    assert_eq!(probe["would_refuse"], json!(true), "{probe}");
+    assert_eq!(probe["location"], json!("note.content"), "{probe}");
+    assert!(probe["detector"].is_string(), "{probe}");
+    assert!(
+        !probe.to_string().contains(&secret),
+        "the probe response must never echo the candidate: {probe}"
+    );
+
+    let write_err = registry
+        .dispatch("create", json!({"kind": "observation", "content": refused}))
+        .await
+        .expect_err("the write must refuse the same body");
+    assert_eq!(
+        Some(write_err.to_string().as_str()),
+        probe["message"].as_str(),
+        "probe message must equal the write's refusal text"
+    );
+
+    let clean = "a plain observation about the build cache".to_string();
+    let probe = registry
+        .dispatch("scan", json!({"content": clean}))
+        .await
+        .expect("scan succeeds on a clean body");
+    assert_eq!(probe["would_refuse"], json!(false), "{probe}");
+    assert!(probe["message"].is_null(), "{probe}");
+    assert!(probe["detector"].is_null(), "{probe}");
+    assert_eq!(probe["masked_preview"]["content"], json!(clean), "{probe}");
+    registry
+        .dispatch("create", json!({"kind": "observation", "content": clean}))
+        .await
+        .expect("the write must accept the same body");
+}
+
+/// A credential inside `properties` is refused by the write path with the
+/// location `note.properties`; the probe reports the same field.
+#[tokio::test]
+async fn scan_locates_a_secret_in_properties_where_the_write_refuses_it() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let secret = format!("sk-proj-{}", "B".repeat(80));
+    let params = json!({
+        "content": "clean body",
+        "name": "clean name",
+        "properties": {"neighbor": "550e8400-e29b-41d4-a716-446655440000", "token": secret},
+    });
+
+    let probe = registry
+        .dispatch("scan", params.clone())
+        .await
+        .expect("scan succeeds");
+    assert_eq!(probe["would_refuse"], json!(true), "{probe}");
+    assert_eq!(probe["location"], json!("note.properties"), "{probe}");
+    assert!(!probe.to_string().contains(&secret), "{probe}");
+
+    let mut write = params;
+    write["kind"] = json!("observation");
+    let write_err = registry
+        .dispatch("create", write)
+        .await
+        .expect_err("the write must refuse");
+    assert_eq!(
+        Some(write_err.to_string().as_str()),
+        probe["message"].as_str(),
+        "{write_err}"
+    );
+}
+
+/// `scan` takes only what a note write scans; an unknown field is refused so
+/// a caller cannot believe a field was checked that never was.
+#[tokio::test]
+async fn scan_refuses_unknown_fields() {
+    let (_rt, _token, _pack, registry) = configured_kg_pack().await;
+    let err = registry
+        .dispatch("scan", json!({"content": "x", "tags": ["a"]}))
+        .await
+        .expect_err("unknown field must be refused");
+    assert!(err.to_string().contains("tags"), "{err}");
 }

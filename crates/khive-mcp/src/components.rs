@@ -453,12 +453,10 @@ fn start_component_registrations(
     }
     let count = regs.len();
     for reg in regs {
-        khive_runtime::track_background_task(supervise(
-            reg,
-            server.clone(),
-            parent.child_token(),
-            health.clone(),
-        ));
+        khive_runtime::track_named_background_task(
+            "component_supervision",
+            supervise(reg, server.clone(), parent.child_token(), health.clone()),
+        );
     }
     count
 }

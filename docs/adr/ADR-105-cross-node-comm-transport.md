@@ -207,3 +207,114 @@ three-node star, verified by the end-to-end flow above.
    one specified here; this ADR is that shape written down.
 4. **KG-versioning snapshot push/pull as the comm transport.** Rejected: built for
    version-controlled graph state, wrong latency and granularity shape for messaging.
+
+## Amendment 2026-09-14 -- Hosted messaging profile: directory, consent, client custody
+
+**Instruction.** Product ruling, 2026-09-14: khive ships an agent-to-agent messaging
+product: any khive agent can contact any other once both are in each
+other's contacts; what a client sends stays on that client, the service keeps only server logs;
+the product is built in the hosted service, and any runtime interface it needs is made here
+under this document's own process. This amendment records what that ruling changes in ADR-105
+and what it leaves standing. The product contract itself is C-ADR-033 in the hosted service's
+decision record; this amendment is the runtime half.
+
+### The fifth fence is overridden for the opt-in hosted profile
+
+ADR-105's fifth implementation fence reads, verbatim:
+
+> MAY NOT route this traffic through any separately-hosted service deployment: node
+> transport and any hosted service stay decoupled — coupling them makes the hosted
+> service a hard runtime dependency of the operator's own communications and
+> entangles node-transport changes with an unrelated release cadence.
+
+The 2026-09-14 product ruling overrides this fence for one profile only: a spoke that opts in
+to the hosted messaging profile dials the hosted service as its hub. The fence's two reasons
+were true and remain true, so the profile carries their costs explicitly: the hosted service
+becomes a runtime dependency of that spoke's cross-deployment messaging (never of its local
+comm, which is unchanged), and the node protocol is versioned so that the two release cadences
+meet at a version number rather than a shared build. A spoke that does not opt in is exactly
+the ADR-105 spoke and the fence stands for it.
+
+### What changes
+
+1. **Directory instead of `[node_routes]`.** In the hosted profile the static routing table is
+   replaced by the service's directory: a stable, service-assigned agent identifier per
+   participant, separate from the node name, the local actor id and the device credential.
+   Routing is by canonical address, resolved by the hub against consent state on every send
+   and retry. A spoke keeps `[node_routes]` for the self-hosted hub of the original design.
+2. **Consent instead of a roster.** ADR-105's trust is transitive across one organisation's
+   nodes. The hosted profile has many organisations that do not trust each other, so a hop is
+   authorized only by an active, bilateral, revocable contact grant between the exact pair of
+   agents, at a generation the hub checks at ingress and again before forwarding. Revocation is
+   observed at the next send; it does not retract a forward already authorized.
+3. **Ingress-derived attribution.** `from` is never read from the wire. The hub derives the
+   sender from the authenticated device credential and its live device-to-agent binding, and
+   the spoke's trusted ingest fixes the recipient from local transport authority. An asserted
+   `from`, tenant, namespace, actor or project field in an envelope is refused, not corrected.
+4. **Client custody.** The hub forwards ciphertext from a bounded memory buffer while both
+   clients are connected and writes no body, subject or plaintext-derived digest anywhere. The
+   sender's outbox and the recipient's store are the only durable copies. "Offline delivery"
+   in the ADR-105 sense (hub queues while a spoke is down) does not exist in this profile; the
+   sender stays `pending` until the recipient signs for the message.
+5. **Receipts.** At-least-once over idempotent ingest stands, and gains a durable, signed
+   recipient receipt so that "delivered" means the recipient committed the note. The `Channel`
+   trait (ADR-056) gains three defaulted methods and their companion types, so every existing
+   adapter keeps its behaviour with no source change:
+   - `send_with_receipt(envelope) -> SendOutcome`; default calls `send` and answers
+     `LegacyAccepted`. The node adapter answers `Pending`, `RecipientStored(receipt)` or
+     `RecipientQuarantined(receipt)`. The node outbox refuses `LegacyAccepted` as proof.
+   - `poll_deliveries(since, checkpoint) -> DeliveryPage`; default wraps `poll_page` with no
+     receipt tickets. A node page pairs each envelope with a typed, non-transferable
+     `InboundReceiptTicket` (authenticated routing identity, key and contact generations,
+     logical message identifier, delivery-attempt identifier); the runtime rejects a
+     mismatched or duplicated ticket.
+   - `acknowledge_receipt(receipt) -> Result<(), ChannelError>`; default unsupported,
+     mandatory for the node adapter, driven by a durable acknowledgement journal that the
+     node loop retries after restart. Polling never acknowledges or deletes on its own.
+     The receipt is a signed tuple: protocol version, logical message identifier, sender and
+     recipient agent identifiers, recipient device and key epoch, contact generation,
+     delivery-attempt identifier, disposition `stored` or `quarantined`. It carries no subject,
+     body, local note identifier or free text.
+6. **Trusted node ingest.** `comm.ingest` gains a verified-recipient mode that can only be
+   entered from the daemon's own node loop holding a valid ticket, never from wire
+   parameters. It fixes the recipient, confines correlation to the authenticated
+   conversation, and commits the message note and the transport receipt record in one
+   transaction, so a duplicate delivery lands zero rows and a failed write yields no receipt.
+   The transport record survives explicit history deletion. Email recipient selection outside
+   this mode is unchanged.
+7. **Runtime-owned transport state.** Node outbox rows, the acknowledgement journal, replay
+   identity and the receipt record are runtime-owned; no adapter writes raw SQL. A
+   narrowly scoped transport-status operation reports `pending`, `recipient_stored`,
+   `recipient_quarantined`, `failed` or `unknown`. `comm.delivered` keeps its existing
+   meaning (the internal dual-write question) and is not the transport status.
+8. **Node loop lifecycle.** The node receive, outbox and receipt-retry tasks are independently
+   cancellable, with per-credential health and bounded backoff. An authentication failure
+   pauses the affected channel for credential repair rather than discarding pending messages,
+   as the email loop already does. The email tasks are untouched.
+9. **Vocabulary.** The `khive:` channel kind stands. Added: the versioned product address
+   form, `logical message identifier`, `device grant`, `contact generation`,
+   `recipient key epoch`, `pending`, `recipient_stored`, `recipient_quarantined`, `unknown`,
+   `LegacyAccepted`.
+
+### What stands
+
+Every other fence, verbatim in force: `comm.send`, `comm.reply` and the dual-write path are
+not modified, remote routing lives in the transport and outbox layer only, and existing email
+channel behaviour is a regression surface that stays byte-identical; no inbound listener or
+port on a spoke; no bearer tokens or mailbox credentials in any khive store; nothing beyond
+`message` notes is transported. Riders R1 and R2 stand and extend to the hosted profile: the
+end-to-end success criterion is executable (two independently owned spokes, one message each
+way, exactly one recipient note per logical identifier, local history readable with the hub
+stopped), and the hub authenticates before it parses.
+
+The MAY list is extended, not reinterpreted: MAY add the three defaulted `Channel` methods and
+their companion types, the verified-recipient ingest mode, the runtime-owned transport state
+and the transport-status operation, the node loop tasks, and the vocabulary above.
+
+### Compatibility obligation
+
+Every existing channel adapter is in the compatibility matrix even where the defaulted methods
+mean its source does not change: serialized messages, routing, retry classification, cursor
+behaviour and send effects are asserted byte-identical before and after this amendment. The
+registry selects an adapter by exact `(kind, slug)`; a kind-only lookup that returns an
+unspecified member where several exist is not used on any node path.

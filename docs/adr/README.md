@@ -201,6 +201,10 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-182](ADR-182-git-dev-loop-verbs.md)                                | Git Verbs for the Dev Loop: Trees In and Out, Commit as Actor, Policy-Gated Push, Pull Requests            |
 | [ADR-183](ADR-183-batched-write-disposition.md)                         | Batched Write Disposition: Commit What Passes, Name What Refuses                                           |
 | [ADR-184](ADR-184-telemetry-pack.md)                                    | Telemetry Pack — Channel Table, Emit Outcome, and Read-Time Rollup                                         |
+| [ADR-185](ADR-185-daemon-rendezvous-ownership.md)                       | Daemon Rendezvous Ownership — a client must not take the socket a supervisor is for                        |
+| [ADR-186](ADR-186-note-listing-order-index.md)                          | One partial index for the note listing order                                                               |
+| [ADR-187](ADR-187-comm-seek-plan-pinning.md)                            | Pin the comm seeks' index instead of hoping the planner picks it                                           |
+| [ADR-188](ADR-188-entity-version-fence.md)                              | Entities get a version, and then a fence                                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -228,4 +232,4 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 
 ## Proposed amendments
 
-- [ADR-179 Amendment 1: Message-pair identity](ADR-179-operation-identity-memory-remember.md#amendment-1-message-pair-identity-proposed-2026-09-09).
+None at present. ADR-179 Amendment 1 (message-pair identity) was accepted on 2026-09-09.

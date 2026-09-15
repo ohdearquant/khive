@@ -4,6 +4,10 @@
 **Date**: 2026-05-23 (amended 2026-08-07)\
 **Authors**: khive maintainers
 
+**Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
+adds three fields to successful read payloads upon acceptance. Existing decisions
+remain accepted; this proposed addition requires acceptance before implementation merges.
+
 ## Context
 
 The pack standard (ADR-017) specifies how vocabulary, verb handlers, kind specialization, and
@@ -120,6 +124,9 @@ and current-surface rationale enumerate the complete ten-verb catalog.
 
 #### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
 
+The proposed [limit-disclosure amendment](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
+adds response fields to this pagination contract without changing page selection.
+
 `comm.inbox` accepts a zero-based `offset` (default 0) in addition to the existing `limit`
 (default 20, maximum 200). The offset is applied to the fully-filtered sequence ordered by
 `(created_at DESC, id ASC)`, including filters that must be evaluated after the indexed store
@@ -164,6 +171,10 @@ stable property aliases such as `from_actor`, `to_actor`, and `sent_at`.
 Unknown fields are errors. Omission preserves the full response. Projection is
 the final presentation step: actor visibility, filters, pagination counts,
 thread deduplication, and ordering continue to use the complete record.
+
+Upon acceptance of the proposed [limit-disclosure amendment](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14),
+`fields` continues to project message records only; it does not remove the three
+new response-level fields from either `comm.inbox` or `comm.thread`.
 
 #### Message-filter scan cap
 
@@ -714,6 +725,11 @@ original pre-amendment description.
 
 ## Amendment (2026-08-01): bounded `comm.inbox` long poll (#1499)
 
+The proposed [limit-disclosure amendment](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
+qualifies only the unchanged-response-schema statement below, adding the same
+three fields to every successful return. The deadline, requery and zero-limit
+no-wait semantics remain unchanged.
+
 `comm.inbox` accepts optional `wait_ms` in the inclusive range 0 through
 30,000. Omission and zero preserve the original immediate snapshot. A positive
 value establishes one deadline before the initial query; if that fully scoped
@@ -799,3 +815,71 @@ legacy cron rows fail closed before dispatch. This supersedes the earlier limite
 five-field grammar in this ADR. Durable occurrence/invocation receipts, renewable
 dispatch leases, crash reconciliation, and failed one-shot recovery are governed by
 [ADR-106 Amendment F](ADR-106-schedule-pack-executor.md#amendment-f-durable-dispatch-receipts-and-renewable-leases-2026-08-07).
+
+## Amendment (proposed): inbox and thread limit disclosure (2026-09-14)
+
+**Status**: proposed. Acceptance is required before dependent implementation merges.
+This amendment adds normalization evidence to `comm.inbox` and `comm.thread`
+success payloads. It partially qualifies the payload descriptions in Part 1's
+pagination/projection clauses and the long-poll amendment's statement that the
+response schema is unchanged. All existing message fields, actor rules,
+selection, ordering, pagination, cursor, deduplication and wait behavior remain
+unchanged; schedule verbs are outside this amendment.
+
+Each successful canonical payload MUST include these flat fields beside its
+existing fields, never inside a message record:
+
+- `requested_limit`: the accepted unsigned integer supplied as `limit`, or the
+  verb's numeric default when `limit` is omitted or null.
+- `effective_limit`: the normalized limit actually used by the handler.
+- `limit_clamped`: the boolean `requested_limit != effective_limit`.
+
+| Verb          | Numeric default | Effective limit                  | Explicit zero report                                    |
+| ------------- | --------------: | -------------------------------- | ------------------------------------------------------- |
+| `comm.inbox`  |              20 | `min(requested_limit, 200)`      | `0 / 0 / false`; immediate count-only response, no wait |
+| `comm.thread` |             100 | `clamp(requested_limit, 1, 500)` | `0 / 1 / true`; existing lower clamp                    |
+
+Both inputs retain their strict `Option<u32>` contract. Negative or fractional
+numbers, strings, booleans, arrays, objects and integers above `4294967295` are
+errors; this amendment introduces no aliases or coercions. Errors and help
+responses MUST NOT carry a successful normalization report. Existing validation
+and authorization order is unchanged.
+
+The report describes settings, not the number of returned messages, scan work,
+truncation or completeness. A request for 201 inbox messages that finds one row
+reports `201 / 200 / true`. Existing `count`, unread counts, `has_more` and
+`next_offset` retain their meanings and calculations. In particular, zero inbox
+limit still computes the actual unread-count metadata in inbox mode and the
+existing zero unread metadata in sent mode. The effective page cap does not bound
+how many stored rows post-filtering or thread traversal scans.
+
+All three fields MUST appear on empty as well as populated successful canonical
+payloads, including inbox zero, immediate match, wakeup, deadline/final requery,
+and a thread exhausted by `after` or actor filtering. Inbox filtering must occur
+before logical pagination, and thread visibility/deduplication and requested
+ordering must occur before truncation. The report MUST NOT change those steps or
+substitute for the lookahead used to calculate continuation fields.
+
+Message `fields` projection remains confined to each record; the report is outside
+that projection. Presentation MUST retain the numeric/boolean report, including
+zero and false, while preserving existing empty-array/null elision. Auto/table
+rendering may express payload scalars in the existing rendered form; it need not
+convert an existing string response back to JSON. This amendment adds no stored
+message fields and performs no read-state mutation.
+
+Validation MUST compare canonical pre/post payloads after removing only the
+three new fields, using defaults/null, zero, cap boundaries and `u32::MAX` in both
+inbox boxes and both thread orders. Populated over-cap fixtures must prove the
+executed cap as well as the report. Projection, actor/dedup/cursor ties,
+SQL-only/post-filter paging, zero-with-positive-wait, immediate/wakeup/deadline
+returns, and Agent/Human/Verbose with JSON/Auto/Table remain regression controls.
+The existing forced final-requery library tests remain intact; public handler
+controls verify report propagation through the final successful return.
+Mutations that omit a success branch's fields, report requested as effective,
+execute the raw limit, use `>` instead of `!=`, or project away response metadata
+MUST be detected. These are pending acceptance requirements, not test results.
+
+This proposal preserves the actor and legacy-row contracts in
+[ADR-057](ADR-057-comm-actor-addressed-delivery.md) and
+[ADR-063](ADR-063-comm-principal-model.md); it creates no new authorization seam.
+Other verbs' limits and response contracts are unchanged.

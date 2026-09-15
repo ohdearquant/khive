@@ -7,9 +7,11 @@ section: By-ID namespace-agnostic access (Rule 2); Multi-record namespace scopin
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
-from khive_contract.client import KhiveMcpSession
+from khive_contract.client import KhiveMcpSession, OwnedContractStore, error_text
 
 VERBS_UNDER_TEST = {"create", "get", "list", "search", "link"}
 
@@ -48,10 +50,17 @@ def test_read_isolation_between_namespaces(
         "kind": "entity",
         "entity_kind": "concept",
         "name": "AlphaEntity",
-        "description": "Only visible in alpha",
+        "description": "contractnamespaceprobe only visible in alpha",
         "namespace": ns_alpha,
     })
     full_id = entity["id"]
+    beta = khive_session.verb("create", {
+        "kind": "concept", "name": "BetaEntity", "namespace": ns_beta,
+        "description": "contractnamespaceprobe only visible in beta",
+    })
+    beta_id = beta["id"]
+    assert khive_session.verb("get", {"id": full_id})["namespace"] == ns_alpha
+    assert khive_session.verb("get", {"id": beta_id})["namespace"] == ns_beta
 
     # By-ID get from beta: must SUCCEED (ADR-007 Rev 6 Rule 2 — namespace-agnostic)
     envelope_get = khive_session.request_batch([{
@@ -125,6 +134,20 @@ def test_read_isolation_between_namespaces(
     assert prefix_result.get("name") == "AlphaEntity", (
         f"prefix get from beta must return AlphaEntity, got: {first_prefix}"
     )
+
+    assert beta_id in ids_beta, "beta list must contain its own positive fixture"
+    _assert_population(khive_session, ns_alpha, full_id, beta_id)
+    _assert_population(khive_session, ns_beta, beta_id, full_id)
+    for verb, args in [("list", {"kind": "entity"}), ("search", {"kind": "entity", "query": "contractnamespaceprobe"})]:
+        result = khive_session.verb(verb, args)
+        rows = result["items"] if verb == "list" else result
+        assert not {full_id, beta_id} & {row["id"] for row in rows}
+    note = khive_session.verb("create", {
+        "kind": "observation", "content": "Alpha observation fixture", "namespace": ns_alpha,
+    })
+    fetched_note = khive_session.verb("get", {"id": note["id"], "namespace": ns_beta})
+    assert fetched_note["kind"] == "observation"
+    assert fetched_note["namespace"] == ns_alpha
 
 
 @pytest.mark.adr_007
@@ -200,3 +223,80 @@ def test_write_cross_namespace_link_succeeds(
         "Cross-namespace link (alpha→beta, beta caller) must succeed: link endpoint "
         f"resolution is by-ID and namespace-agnostic, got: {first_rev.get('error')!r}"
     )
+
+    assert first_fwd["result"]["namespace"] == ns_beta
+    assert first_rev["result"]["namespace"] == ns_beta
+
+
+def _assert_population(session, namespace, present, absent):
+    for verb, args in [("list", {"kind": "entity"}), ("search", {"kind": "entity", "query": "contractnamespaceprobe"})]:
+        if namespace is not None:
+            args["namespace"] = namespace
+        result = session.verb(verb, args)
+        rows = result["items"] if verb == "list" else result
+        ids = {row["id"] for row in rows}
+        assert present in ids, (verb, namespace, rows)
+        assert absent not in ids, (verb, namespace, rows)
+
+
+@pytest.mark.adr_007
+@pytest.mark.slow
+def test_configured_visible_set_keeps_foreign_by_id_access():
+    with OwnedContractStore(visible_namespaces=["ns-alpha"]) as store:
+        with KhiveMcpSession(store=store) as session:
+            alpha = session.verb("create", {
+                "kind": "concept", "name": "AlphaEntity", "namespace": "ns-alpha",
+                "description": "contractnamespaceprobe alpha",
+            })
+            beta = session.verb("create", {
+                "kind": "concept", "name": "BetaEntity", "namespace": "ns-beta",
+                "description": "contractnamespaceprobe beta",
+            })
+            _assert_population(session, None, alpha["id"], beta["id"])
+            assert session.verb("get", {"id": beta["id"]})["namespace"] == "ns-beta"
+            created = session.verb("create", {"kind": "concept", "name": "VisibleSetLocalWrite"})
+            assert session.verb("get", {"id": created["id"]})["namespace"] == "local"
+
+
+@pytest.mark.adr_007
+@pytest.mark.slow
+def test_create_routes_explicit_namespace_and_defaults_to_local(khive_session):
+    local = khive_session.verb("create", {"kind": "concept", "name": "LocalWrite"})
+    explicit = khive_session.verb("create", {
+        "kind": "concept", "name": "ExplicitNamespaceWrite", "namespace": "ns-alpha",
+    })
+    assert khive_session.verb("get", {"id": local["id"]})["namespace"] == "local"
+    assert khive_session.verb("get", {"id": explicit["id"]})["namespace"] == "ns-alpha"
+    assert {row["id"] for row in khive_session.verb("list", {"kind": "entity"})["items"]} == {local["id"]}
+    assert {row["id"] for row in khive_session.verb("list", {"kind": "entity", "namespace": "ns-alpha"})["items"]} == {explicit["id"]}
+
+
+def _domain_rows(db):
+    if not db.exists():
+        return {table: [] for table in ("entities", "notes", "graph_edges")}
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return {table: connection.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() if table in tables else []
+                for table in ("entities", "notes", "graph_edges")}
+
+
+@pytest.mark.adr_007
+@pytest.mark.slow
+@pytest.mark.parametrize("actor,reason", [
+    ("lambda:unenrolled-contract-test", "actor is not enrolled"),
+    (None, "unattributed caller is not enrolled"),
+])
+def test_unenrolled_callers_cannot_mutate_domain_records(actor, reason):
+    with OwnedContractStore(actor=actor) as store:
+        before = _domain_rows(store.db)
+        with KhiveMcpSession(store=store) as session:
+            for verb, args in [
+                ("create", {"kind": "concept", "name": "UnenrolledEntity"}),
+                ("create", {"kind": "observation", "content": "Unenrolled note"}),
+                ("link", {"source_id": "11111111-1111-4111-8111-111111111111", "target_id": "22222222-2222-4222-8222-222222222222", "relation": "extends"}),
+            ]:
+                response = session.request_batch([{"tool": verb, "args": args}])["results"][0]
+                assert response["ok"] is False
+                assert reason in error_text(response), response
+        # Gate-denial/configuration audit events are intentionally permitted.
+        assert _domain_rows(store.db) == before

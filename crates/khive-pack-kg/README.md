@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-24 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+26 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb             | What it does                                                                                                                                                                                                                                                                                                                                                                                          |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -16,6 +16,7 @@ workspace declares it as a dependency.
 | `list`           | List records with optional filtering                                                                                                                                                                                                                                                                                                                                                                  |
 | `update`         | Patch an entity or edge                                                                                                                                                                                                                                                                                                                                                                               |
 | `delete`         | Soft- or hard-delete a record                                                                                                                                                                                                                                                                                                                                                                         |
+| `restore`        | Restore a caller-owned soft-deleted entity, note, or edge                                                                                                                                                                                                                                                                                                                                            |
 | `merge`          | Merge two entities                                                                                                                                                                                                                                                                                                                                                                                    |
 | `search`         | Hybrid FTS + vector search over entities or notes                                                                                                                                                                                                                                                                                                                                                     |
 | `link`           | Create a typed directed edge between two entities                                                                                                                                                                                                                                                                                                                                                     |
@@ -30,6 +31,7 @@ workspace declares it as a dependency.
 | `context`        | Entity-anchored graph context in one call (ADR-089)                                                                                                                                                                                                                                                                                                                                                   |
 | `resolve`        | Resolve natural-language references to record ids                                                                                                                                                                                                                                                                                                                                                     |
 | `whoami`         | Report the caller identity this request resolved to                                                                                                                                                                                                                                                                                                                                                   |
+| `scan`           | The secret gate's verdict on a note body without a write: detector, field, refusal text                                                                                                                                                                                                                                                                                                               |
 | `db_diagnostics` | Reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics: reader admission capacity/availability, pooled checkouts, separately attributed standalone opens, timeouts and hold lifecycle; aggregate plus pooled/standalone/writer-task writer acquisitions, writer-task failures, swallowed audit failures, duplicate edge-ID/list-ledger counts, checkpoint counters, PASSIVE probe, WAL size, and qualified holder census (probe may backfill WAL frames; never TRUNCATE or create/delete files) |
 
 | `stream.append` | Append immutable JSON with a dense sequence and optional expected_seq precondition |
@@ -139,11 +141,13 @@ chain (`|`) preserves caller order; a request array gives dense numbers in write
 admission order, which need not be array order.
 
 `stream.append`, singleton note `create`/`update`, and `stream.batch` append
-members accept a `fence` object `{key, kind, expected_version}` or a non-empty
-ordered list of at most 100 distinct `(kind, key)` objects. Each entry requires
-`expected_version`: an integer at least 1 asserts the live holder's exact version
-in the write namespace; explicit null asserts that no live note holds that
-`(kind, key)`. Missing and soft-deleted notes satisfy an absence assertion.
+members accept a `fence` object
+`{key, kind, expected_version, live_until?, id?}` or a non-empty ordered list of
+at most 100 distinct `(kind, key)` objects. Each entry requires
+`expected_version`: an integer at least 1 asserts the live holder's exact
+version in the write namespace; explicit null asserts that no live note holds
+that `(kind, key)`. Missing and soft-deleted notes satisfy an absence
+assertion.
 `version` is accepted as an input alias instead of `expected_version`; supplying
 both names, omitting both, or supplying unknown fields is invalid. Serialization
 always emits `expected_version`, including an explicit null for absence.
@@ -151,10 +155,19 @@ always emits `expected_version`, including an explicit null for absence.
 Fences are checked in order in the same writer transaction as the write. A
 mismatch returns `fence_conflict`; an absence conflict carries string-valued
 `expected_version="absent"` and the live `current_version`. List refusals also
-carry a zero-based string `index`. Oversized lists are rejected with
-`invalid_input` naming the cap and count sent before entry interpretation or
-writer admission. Empty lists, duplicate `(kind, key)` entries and outer
-`fence:null` are invalid on these surfaces.
+carry a zero-based string `index`. An entry that pins `id` is compared before
+anything else: a key held by a different live note refuses `identity_conflict`,
+naming the asserted id and the `current_id` holding the key, while an absent
+holder has no identity to name and is reported by the version comparison
+instead. A `live_until` deadline that has passed is a separate refusal,
+`expired`, carrying the deadline read and the writer clock; a path resolving to
+nothing or to a value that is not an RFC 3339 timestamp refuses
+`live_until_unreadable` naming the value's type and never the value. The order
+is identity, then version, then deadline, so a stale version reports
+`fence_conflict` even when the deadline has also passed. Oversized lists are
+rejected with `invalid_input` naming the cap and count sent before entry
+interpretation or writer admission. Empty lists, duplicate `(kind, key)` entries
+and outer `fence:null` are invalid on these surfaces.
 
 The batch-wide `stream.batch(fence=...)` accepts one object with the same entry
 contract, not a list. An object selects atomic mode and is checked before the
@@ -165,8 +178,13 @@ member writes in their transaction; an atomic member refusal also carries its
 string `member` position.
 
 `stream.batch(observed=...)` is unchanged: each observation still requires its
-`version` field, with no `expected_version` alias. Its optional `id` and
-`live_until` contracts do not apply to fence objects; fences add no expiry check.
+`version` field, with no `expected_version` alias. Both of its optional
+contracts now apply to a fence entry as well: `live_until` takes the same dotted
+document path into the fenced head, resolved inside the writing transaction
+against one clock reading shared by every entry in that write, and `id` names
+the note that must still hold `(kind, key)`. Each requires a positive
+`expected_version`, because an absence assertion has no document to read a
+deadline out of and no identity to compare.
 
 ```text
 request(ops='stream.append(stream="run", record={"step":1}, expected_seq=1)', presentation="verbose")

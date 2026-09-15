@@ -316,6 +316,56 @@ async fn stream_batch_write_tags_and_embedding_transitions_use_canonical_plans()
     );
 }
 
+/// ADR-172 Amendment 5, acceptance arm 1: a batch write member at a matching
+/// version is a fenced write and mints a version even when the document is
+/// byte-equal to the stored head, so the caller's next expectation stays live.
+#[tokio::test]
+async fn stream_batch_identical_write_at_matching_version_still_mints_a_version() {
+    let (runtime, token, registry) = fixture();
+    let same = |version: Option<i64>| {
+        let mut spec = write("lease", version);
+        spec.doc = json!({"holder": "worker-1", "n": 1});
+        spec
+    };
+    let first = batch_write(&runtime, &token, &registry, same(None)).await;
+    assert_eq!(first["version"], 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let second = batch_write(&runtime, &token, &registry, same(Some(1))).await;
+    assert_eq!(
+        second["version"], 2,
+        "identical fenced write mints: {second}"
+    );
+    assert_ne!(
+        second["updated_at"], first["updated_at"],
+        "an accepted fenced write moves updated_at"
+    );
+
+    let third = batch_write(&runtime, &token, &registry, same(Some(2))).await;
+    assert_eq!(third["version"], 3, "{third}");
+
+    // The stale expectation a no-op would have left behind is refused.
+    let result = runtime
+        .stream_batch_atomic(
+            &token,
+            vec![StreamBatchMember::Write(same(Some(2)))],
+            None,
+            vec![],
+            &registry,
+        )
+        .await
+        .unwrap();
+    let refusal = result.unwrap_err();
+    let error = serde_json::to_value(refusal.error).unwrap();
+    assert_eq!(error["details"]["reason"], "version_conflict", "{error}");
+    assert_eq!(error["details"]["current_version"], "3", "{error}");
+    let note = runtime
+        .get_note_by_key(&token, "lease", Some("head"), false)
+        .await
+        .unwrap();
+    assert_eq!(note.version, 3);
+}
+
 #[tokio::test]
 async fn stream_batch_write_missing_and_late_key_conflicts_keep_member_index() {
     let (runtime, token, registry) = fixture();
@@ -802,6 +852,8 @@ async fn stream_batch_fence_rechecks_after_writer_admission() {
             key: "fence".into(),
             kind: "head".into(),
             expected_version: Some(1),
+            live_until: None,
+            id: None,
         }),
         vec![],
     )
@@ -881,11 +933,15 @@ async fn stream_batch_append_member_fence_rechecks_cross_connection_at_admission
                             key: "stable".into(),
                             kind: "head".into(),
                             expected_version: Some(1),
+                            live_until: None,
+                            id: None,
                         },
                         NoteFence {
                             key: "renewed".into(),
                             kind: "head".into(),
                             expected_version: Some(1),
+                            live_until: None,
+                            id: None,
                         },
                     ],
                 ),
@@ -945,12 +1001,13 @@ struct TraceAccess(Arc<Mutex<Vec<SqlStatement>>>);
 #[async_trait]
 impl SqlReader for TraceAccess {
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
-        // Both trace arms share this reader: the observed check reads the holder row, and the
-        // write member reads its own write time. Either label is expected; anything else is not.
+        // Three trace arms share this reader: the observed check reads the holder row, a member
+        // fence reads the same row through the note-write guard, and the write member reads its
+        // own write time. Those labels are expected; anything else is not.
         assert!(
             matches!(
                 statement.label.as_deref(),
-                Some("stream-batch-observed" | "stream-batch-write-time")
+                Some("stream-batch-observed" | "stream-batch-write-time" | "note-write-guard")
             ),
             "unexpected labelled row read: {:?}",
             statement.label
@@ -1222,11 +1279,15 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
                                 key: "first".into(),
                                 kind: "head".into(),
                                 expected_version: Some(1),
+                                live_until: None,
+                                id: None,
                             },
                             NoteFence {
                                 key: "second".into(),
                                 kind: "head".into(),
                                 expected_version: Some(if stale { 2 } else { 1 }),
+                                live_until: None,
+                                id: None,
                             },
                         ],
                     ),
@@ -1252,7 +1313,7 @@ async fn stream_batch_append_member_fences_precede_every_member_insert() {
             .enumerate()
             .filter(|(_, s)| {
                 s.label.as_deref() == Some("note-write-guard")
-                    && s.sql.starts_with("SELECT version")
+                    && s.sql.starts_with("SELECT id, version")
             })
             .collect();
         assert_eq!(checks.len(), 2, "each append-member fence checked once");

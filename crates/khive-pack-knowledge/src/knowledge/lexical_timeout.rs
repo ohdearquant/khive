@@ -34,6 +34,7 @@ pub(super) enum LexicalPhase {
     EligibilityFallback,
     NamespaceMembership,
     NamespaceExistence,
+    ExactNameProbe,
 }
 
 impl LexicalPhase {
@@ -46,6 +47,7 @@ impl LexicalPhase {
             Self::EligibilityFallback => "eligibility_fallback",
             Self::NamespaceMembership => "namespace_membership",
             Self::NamespaceExistence => "namespace_existence",
+            Self::ExactNameProbe => "exact_name_probe",
         }
     }
 

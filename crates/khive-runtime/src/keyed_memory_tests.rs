@@ -142,7 +142,7 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
     );
 }
 
-fn assert_key_conflict(error: RuntimeError, key: &str, holder: Uuid) {
+fn assert_idempotency_conflict(error: RuntimeError, key: &str, holder: Uuid) {
     let RuntimeError::Khive(error) = error else {
         panic!("expected typed key conflict, got {error:?}");
     };
@@ -150,7 +150,7 @@ fn assert_key_conflict(error: RuntimeError, key: &str, holder: Uuid) {
     assert_eq!(
         error.details(),
         Some(&Details::new_owned([
-            ("reason", "key_conflict".into()),
+            ("reason", "idempotency_key_conflict".into()),
             ("key", key.to_owned()),
             ("existing_id", holder.to_string()),
         ]))
@@ -160,7 +160,7 @@ fn assert_key_conflict(error: RuntimeError, key: &str, holder: Uuid) {
 #[tokio::test]
 async fn keyed_memory_replay_keeps_holder_and_rolls_back_losing_indexes_and_edges() {
     let (runtime, token, source) = fixture("keyed-memory-replay").await;
-    let (first, edge_id) = create_keyed_memory(
+    let (first, edge_id, _) = create_keyed_memory(
         &runtime,
         &token,
         spec("operation-one", "first memory content", Some(source)),
@@ -193,17 +193,19 @@ async fn keyed_memory_replay_keeps_holder_and_rolls_back_losing_indexes_and_edge
     );
     assert_rows(&runtime, &token, 1, 1).await;
 
-    let error = create_keyed_memory(
+    let (replayed, replay_edge, was_replay) = create_keyed_memory(
         &runtime,
         &token,
         spec("operation-one", "first memory content", Some(source)),
     )
     .await
-    .expect_err("identical replay must name the holder");
-    assert_key_conflict(error, "operation-one", first.id);
+    .expect("identical replay must return the holder");
+    assert_eq!(replayed.id, first.id);
+    assert!(replay_edge.is_none());
+    assert!(was_replay);
     assert_rows(&runtime, &token, 1, 1).await;
 
-    let (decoy, _) = create_keyed_memory(
+    let (decoy, _, _) = create_keyed_memory(
         &runtime,
         &token,
         spec(
@@ -227,7 +229,7 @@ async fn keyed_memory_replay_keeps_holder_and_rolls_back_losing_indexes_and_edge
     )
     .await
     .expect_err("replay must be refused");
-    assert_key_conflict(error, "operation-one", first.id);
+    assert_idempotency_conflict(error, "operation-one", first.id);
     assert_rows(&runtime, &token, 2, 2).await;
     assert_eq!(
         runtime
@@ -279,7 +281,7 @@ async fn keyed_memory_fts_and_vector_failures_roll_back_and_leave_key_available(
         );
         drop(arm);
         assert_rows(&runtime, &token, 0, 0).await;
-        let (_, edge) = create_keyed_memory(
+        let (_, edge, _) = create_keyed_memory(
             &runtime,
             &token,
             spec("fault-operation", "rollback target", Some(source)),
@@ -386,15 +388,18 @@ async fn keyed_memory_validates_key_bytes_before_writing_and_accepts_empty_key()
     }
     for key in ["", utf8_boundary.as_str()] {
         validate_memory_key(key).expect("valid byte-bounded key");
-        let (note, edge) = create_keyed_memory(&runtime, &token, spec(key, "valid key", None))
+        let (note, edge, _) = create_keyed_memory(&runtime, &token, spec(key, "valid key", None))
             .await
             .expect("valid key must write");
         assert_eq!(note.key.as_deref(), Some(key));
         assert!(edge.is_none());
-        let error = create_keyed_memory(&runtime, &token, spec(key, "valid key", None))
-            .await
-            .expect_err("valid key replay must conflict");
-        assert_key_conflict(error, key, note.id);
+        let (replayed, replay_edge, was_replay) =
+            create_keyed_memory(&runtime, &token, spec(key, "valid key", None))
+                .await
+                .expect("valid key replay must return the holder");
+        assert_eq!(replayed.id, note.id);
+        assert!(replay_edge.is_none());
+        assert!(was_replay);
     }
     assert_rows(&runtime, &token, 2, 0).await;
 }
@@ -403,10 +408,10 @@ async fn keyed_memory_validates_key_bytes_before_writing_and_accepts_empty_key()
 async fn keyed_memory_same_key_coexists_in_distinct_namespace_tokens() {
     let (runtime, first_token, _) = fixture("keyed-memory-namespace-one").await;
     let second_token = token(&runtime, "keyed-memory-namespace-two");
-    let (first, _) = create_keyed_memory(&runtime, &first_token, spec("shared", "one", None))
+    let (first, _, _) = create_keyed_memory(&runtime, &first_token, spec("shared", "one", None))
         .await
         .expect("first namespace write");
-    let (second, _) = create_keyed_memory(&runtime, &second_token, spec("shared", "two", None))
+    let (second, _, _) = create_keyed_memory(&runtime, &second_token, spec("shared", "two", None))
         .await
         .expect("second namespace write");
     assert_ne!(first.id, second.id);
@@ -416,7 +421,7 @@ async fn keyed_memory_same_key_coexists_in_distinct_namespace_tokens() {
         let error = create_keyed_memory(&runtime, token, spec("shared", "replay", None))
             .await
             .expect_err("each namespace must resolve its own holder");
-        assert_key_conflict(error, "shared", holder);
+        assert_idempotency_conflict(error, "shared", holder);
         assert_rows(&runtime, token, 1, 0).await;
     }
 }
@@ -556,11 +561,12 @@ async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate
         .await
         .send(())
         .expect("resume second attempt");
-    let (note, edge) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
+    let (note, edge, replayed) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
         .await
         .expect("worker must finish")
         .expect("worker must not panic")
         .expect("retry after holder disappearance must succeed");
+    assert!(!replayed);
     assert_ne!(note.id, holder);
     assert_eq!(note.key.as_deref(), Some(key));
     assert_eq!(note.content, "retry candidate");

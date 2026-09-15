@@ -15,8 +15,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_db::SqliteError;
-use khive_storage::note::Note;
-use khive_storage::types::{EdgeFilter, TextDocument};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::types::{EdgeFilter, PageRequest, SqlValue, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 use khive_types::{Details, EdgeEndpointRule, EventKind, KhiveError};
 use rusqlite::OptionalExtension;
@@ -1648,7 +1648,17 @@ impl KhiveRuntime {
         _token: &NamespaceToken,
         mut note: khive_storage::note::Note,
         patch: NotePatch,
-    ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
+    ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        // The stored row as read. A no-op answers with this, not with the
+        // patched snapshot: the patch may differ from the row in ways the
+        // no-op decision ignores (tag order), and nothing was written.
+        let stored = note.clone();
+        let original_name = note.name.clone();
+        let original_content = note.content.clone();
+        let original_salience = note.salience;
+        let original_decay_factor = note.decay_factor;
+        let original_properties = note.properties.clone();
+        let original_status = note.status.clone();
         if patch.content.is_some() || patch.properties.is_some() {
             if let Some(error) = self.stream_member_error(&note).await? {
                 return Err(error);
@@ -1775,6 +1785,20 @@ impl KhiveRuntime {
             note.status = status;
         }
 
+        // JSON object key order is not meaningful to callers. Tags are also
+        // set-like in every existing note reader, so their order is ignored
+        // for the no-op decision while duplicate entries remain meaningful.
+        // All other arrays retain ordinary JSON ordering semantics.
+        let changed = original_name != note.name
+            || original_content != note.content
+            || original_salience != note.salience
+            || original_decay_factor != note.decay_factor
+            || !note_update_values_equal(&original_properties, &note.properties)
+            || original_status != note.status;
+        if !changed {
+            return Ok((stored, text_changed, false));
+        }
+
         // `updated_at` is also the optimistic-concurrency revision for
         // full-note replacement. Make it strictly advance even when two
         // operations land inside one clock microsecond. Saturation is not a
@@ -1789,7 +1813,7 @@ impl KhiveRuntime {
         note.updated_at = chrono::Utc::now()
             .timestamp_micros()
             .max(minimum_updated_at);
-        Ok((note, text_changed))
+        Ok((note, text_changed, true))
     }
 
     /// Patch-style note update.
@@ -1939,10 +1963,12 @@ impl KhiveRuntime {
 
     /// Non-wire outbox scan for the channel delivery loops.
     ///
-    /// Pages newest-first through live `message` notes (the same order and
-    /// 10k scan cap as the generic `list` verb's filtered offset path) and
-    /// returns those with `properties.direction == "outbound"` that are still
-    /// pending delivery, capped at `limit`. Pending means `delivered_at` is
+    /// Fetches live `message` notes matching the SQL-side pending predicate,
+    /// sorts that bounded candidate set newest-first, and returns those that
+    /// are still pending delivery, capped at `limit`.
+    /// Direction, `delivered_at`, and terminal `delivery` state are filtered
+    /// by SQLite; a valid `next_attempt_at` and the optional `to_actor`
+    /// channel prefix remain Rust checks. Pending means `delivered_at` is
     /// absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
@@ -1962,78 +1988,79 @@ impl KhiveRuntime {
         to_prefix: Option<&str>,
         limit: u32,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
-        const PAGE_SIZE: u32 = 200;
         const MAX_SCAN_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        let filter = NoteFilter {
+            kind: Some("message".to_string()),
+            unordered: true,
+            property_filters: vec![
+                PropertyFilter {
+                    json_path: "$.direction".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text("outbound".to_string()),
+                },
+                PropertyFilter {
+                    json_path: "$.delivered_at".to_string(),
+                    op: FilterOp::JsonTypeMissingOrNullIndexed,
+                    value: SqlValue::Null,
+                },
+                PropertyFilter {
+                    json_path: "$.delivery".to_string(),
+                    op: FilterOp::NotInOrMissing(vec![
+                        SqlValue::Text("delivered".to_string()),
+                        SqlValue::Text("failed".to_string()),
+                    ]),
+                    value: SqlValue::Null,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut candidates = self
+            .notes(token)?
+            .query_notes_filtered_count_free(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: MAX_SCAN_TOTAL,
+                    offset: 0,
+                },
+            )
+            .await?
+            .items;
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
-        let mut db_offset: u32 = 0;
-        loop {
-            let remaining_scan = MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
-            if remaining_scan == 0 {
-                break;
-            }
-            let page = self
-                .list_notes(token, Some("message"), remaining_scan, db_offset)
-                .await?;
-            let fetched = page.len() as u32;
-            for note in page {
-                if note.deleted_at.is_some() {
-                    continue;
-                }
-                let props = note.properties.as_ref().and_then(|v| v.as_object());
-                let outbound = props
-                    .and_then(|p| p.get("direction"))
+        for note in candidates {
+            let props = note.properties.as_ref().and_then(|v| v.as_object());
+            if let Some(prefix) = to_prefix {
+                let to_matches = props
+                    .and_then(|p| p.get("to_actor"))
                     .and_then(|v| v.as_str())
-                    == Some("outbound");
-                if !outbound {
+                    .is_some_and(|actor| actor.starts_with(prefix));
+                if !to_matches {
                     continue;
-                }
-                if let Some(prefix) = to_prefix {
-                    let to_matches = props
-                        .and_then(|p| p.get("to_actor"))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|actor| actor.starts_with(prefix));
-                    if !to_matches {
-                        continue;
-                    }
-                }
-                // Must match the delivery loop's terminal-state guard: a
-                // present-but-null `delivered_at` is undelivered, and a
-                // terminal `delivery` state ("delivered"/"failed") is not
-                // pending even without `delivered_at` (ADR-122 §1).
-                let delivered = props
-                    .and_then(|p| p.get("delivered_at"))
-                    .is_some_and(|v| !v.is_null());
-                if delivered {
-                    continue;
-                }
-                let terminal = props
-                    .and_then(|p| p.get("delivery"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|state| state == "delivered" || state == "failed");
-                if terminal {
-                    continue;
-                }
-                let retry_deferred = props
-                    .and_then(|p| p.get("next_attempt_at"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                    .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
-                if retry_deferred {
-                    continue;
-                }
-                collected.push(note);
-                if collected.len() >= limit as usize {
-                    return Ok(collected);
                 }
             }
-            if fetched < PAGE_SIZE {
-                break;
+            let retry_deferred = props
+                .and_then(|p| p.get("next_attempt_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
+            if retry_deferred {
+                continue;
             }
-            db_offset += fetched;
+            collected.push(note);
+            if collected.len() >= limit as usize {
+                return Ok(collected);
+            }
         }
         Ok(collected)
     }
@@ -4205,6 +4232,49 @@ pub(crate) fn merge_properties(
     }
 }
 
+/// Compare note-update values using the semantics exposed by note readers.
+/// `serde_json::Value` already compares objects without depending on insertion
+/// order; the top-level `properties.tags` array is compared as an
+/// order-independent multiset because readers treat it as a set while
+/// preserving duplicate entries as a meaningful representation change.
+fn note_update_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
+    fn equal(left: &Value, right: &Value, is_tags_field: bool, is_properties_object: bool) -> bool {
+        match (left, right) {
+            (Value::Object(a), Value::Object(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(key, value)| {
+                        b.get(key).is_some_and(|other| {
+                            equal(value, other, is_properties_object && key == "tags", false)
+                        })
+                    })
+            }
+            (Value::Array(a), Value::Array(b)) if is_tags_field => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut left = a.iter().map(Value::to_string).collect::<Vec<_>>();
+                let mut right = b.iter().map(Value::to_string).collect::<Vec<_>>();
+                left.sort_unstable();
+                right.sort_unstable();
+                left == right
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(left, right)| equal(left, right, false, false))
+            }
+            _ => left == right,
+        }
+    }
+
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => equal(left, right, false, true),
+        _ => false,
+    }
+}
+
 /// Deep-merge two JSON values per strategy. Returns (merged, keys_contributed_by_from).
 fn merge_json(into: &Value, from: &Value, strategy: EntityDedupMergePolicy) -> (Value, usize) {
     match (into, from, strategy) {
@@ -4386,6 +4456,183 @@ mod tests {
             .await
             .expect("zero-limit scan succeeds");
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    fn legacy_outbox_pending(note: &Note, to_prefix: Option<&str>, now_micros: i64) -> bool {
+        if note.deleted_at.is_some() {
+            return false;
+        }
+        let props = note.properties.as_ref().and_then(|value| value.as_object());
+        if props
+            .and_then(|properties| properties.get("direction"))
+            .and_then(Value::as_str)
+            != Some("outbound")
+        {
+            return false;
+        }
+        if let Some(prefix) = to_prefix {
+            let matches = props
+                .and_then(|properties| properties.get("to_actor"))
+                .and_then(Value::as_str)
+                .is_some_and(|actor| actor.starts_with(prefix));
+            if !matches {
+                return false;
+            }
+        }
+        if props
+            .and_then(|properties| properties.get("delivered_at"))
+            .is_some_and(|value| !value.is_null())
+        {
+            return false;
+        }
+        if props
+            .and_then(|properties| properties.get("delivery"))
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "delivered" || state == "failed")
+        {
+            return false;
+        }
+        let retry_deferred = props
+            .and_then(|properties| properties.get("next_attempt_at"))
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|deadline| deadline.timestamp_micros() > now_micros);
+        !retry_deferred
+    }
+
+    /// The SQL-prefiltered scan must return exactly what the former full-note
+    /// scan selected, including every legacy and channel-partition edge case.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_matches_legacy_predicate() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let make_note = |created_at, properties, deleted_at| {
+            let mut note = Note::new("local", "message", "outbox fixture");
+            note.created_at = created_at;
+            note.updated_at = created_at;
+            note.properties = Some(properties);
+            note.deleted_at = deleted_at;
+            note
+        };
+        let notes = vec![
+            make_note(
+                110,
+                serde_json::json!({"direction": "outbound", "to_actor": "email:absent"}),
+                None,
+            ),
+            make_note(
+                109,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:null",
+                    "delivered_at": null
+                }),
+                None,
+            ),
+            make_note(
+                108,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:terminal-failed",
+                    "delivery": "failed"
+                }),
+                None,
+            ),
+            make_note(
+                107,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:terminal-delivered",
+                    "delivery": "delivered"
+                }),
+                None,
+            ),
+            make_note(
+                106,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:malformed",
+                    "next_attempt_at": "not-a-timestamp"
+                }),
+                None,
+            ),
+            make_note(
+                105,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:future",
+                    "next_attempt_at": "2999-01-01T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                104,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:due",
+                    "next_attempt_at": "2000-01-01T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                103,
+                serde_json::json!({"direction": "inbound", "to_actor": "email:inbound"}),
+                None,
+            ),
+            make_note(
+                102,
+                serde_json::json!({"direction": "outbound", "to_actor": "telegram:other"}),
+                None,
+            ),
+            make_note(
+                101,
+                serde_json::json!({
+                    "direction": "outbound",
+                    "to_actor": "email:already-delivered",
+                    "delivered_at": "2026-08-28T00:00:00Z"
+                }),
+                None,
+            ),
+            make_note(
+                100,
+                serde_json::json!({"direction": "outbound", "to_actor": "email:deleted"}),
+                Some(100),
+            ),
+        ];
+        for note in &notes {
+            store.upsert_note(note.clone()).await.expect("seed note");
+        }
+
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let all_rows = rt
+            .list_notes(&tok, Some("message"), 200, 0)
+            .await
+            .expect("legacy scan fixture loads");
+        let expected_ids: Vec<_> = all_rows
+            .iter()
+            .filter(|note| legacy_outbox_pending(note, Some("email:"), now_micros))
+            .map(|note| note.id)
+            .collect();
+        let actual_ids: Vec<_> = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 200)
+            .await
+            .expect("filtered scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+
+        assert_eq!(
+            expected_ids.len(),
+            4,
+            "fixture must exercise all exclusions"
+        );
+        assert_eq!(
+            actual_ids, expected_ids,
+            "filtered scan changed answer or order"
+        );
     }
 
     #[tokio::test]
@@ -8123,6 +8370,113 @@ mod tests {
         );
     }
 
+    /// A row an earlier restore left live over its merge (deleted_at cleared,
+    /// merged_into kept) is an invariant violation, not a state restore may
+    /// report as "already live". Restore names it and writes nothing.
+    #[tokio::test]
+    async fn restore_names_a_live_row_that_still_carries_merged_into() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+        // Reproduce what the pre-guard restore wrote: the tombstone cleared,
+        // the merge provenance left in place.
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        let cleared = writer
+            .execute(khive_storage::SqlStatement {
+                sql: "UPDATE entities SET deleted_at = NULL \
+                      WHERE id = ?1 AND merged_into IS NOT NULL"
+                    .to_string(),
+                params: vec![SqlValue::Text(from.id.to_string())],
+                label: None,
+            })
+            .await
+            .expect("seed the pre-guard state");
+        assert_eq!(
+            cleared, 1,
+            "control: the seed must have found the merge tombstone"
+        );
+        drop(writer);
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("live_merged_entity") && msg.contains(&into.id.to_string()),
+            "restore of a live merged row must be named, not reported already live, got {msg:?}"
+        );
+
+        // Nothing was written: the row is still live and still carries the merge.
+        let row = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(row.merged_into, Some(into.id));
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_merge_tombstone_and_keeps_the_disclosure() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = rt.restore_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge_tombstone") && msg.contains(&into.id.to_string()),
+            "restore of a merge tombstone must be refused naming the kept id, got {msg:?}"
+        );
+
+        // The refusal wrote nothing: the source is still a merge tombstone.
+        let err = rt.get_entity(&tok, from.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was merged into") && msg.contains(&into.id.to_string()),
+            "after a refused restore the merged_into disclosure must survive, got {msg:?}"
+        );
+        let tombstone = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("tombstone row still present");
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(tombstone.merged_into, Some(into.id));
+    }
+
     #[tokio::test]
     async fn get_entity_on_plain_soft_delete_stays_bare_not_found() {
         let rt = rt();
@@ -8524,7 +8878,7 @@ mod tests {
 
         let rt = rt();
         let tok = NamespaceToken::local();
-        let (into, _) = create_keyed_memory(
+        let (into, _, _) = create_keyed_memory(
             &rt,
             &tok,
             KeyedMemorySpec {

@@ -117,7 +117,7 @@ impl MemoryPack {
 
         let annotates_target = annotates.first().copied();
 
-        let (note, keyed_edge_id) = if let Some(key) = p.key.as_deref() {
+        let (note, keyed_edge_id, replayed) = if let Some(key) = p.key.as_deref() {
             create_keyed_memory(
                 &self.runtime,
                 write_token,
@@ -147,10 +147,10 @@ impl MemoryPack {
                     p.embedding_model.as_deref(),
                 )
                 .await?;
-            (note, None)
+            (note, None, false)
         };
 
-        {
+        if !replayed {
             // Preserve the stale graph as a fast fallback; generation is the invalidation signal.
             let affected_models: Vec<String> = match p.embedding_model.as_deref() {
                 Some(model) => vec![model.to_owned()],
@@ -164,12 +164,17 @@ impl MemoryPack {
             }
         }
 
-        let edge_id = if p.key.is_some() {
-            keyed_edge_id.map(|id| id.to_string())
-        } else if let Some(target_id) = annotates_target {
+        // A replay answers from the stored memory, not from the request: the
+        // annotation edge is the one the stored note still owns (whatever the
+        // replay named as `source_id`), and `memory_type` is the value it was
+        // written with, so a replay that sends a different type cannot echo it
+        // back as if stored.
+        let edge_id = if let Some(id) = keyed_edge_id {
+            Some(id.to_string())
+        } else if replayed || annotates_target.is_some() {
             self.runtime
                 .neighbors_with_query(
-                    token,
+                    write_token,
                     note.id,
                     NeighborQuery {
                         direction: Direction::Out,
@@ -180,10 +185,20 @@ impl MemoryPack {
                 )
                 .await?
                 .into_iter()
-                .find(|hit| hit.node_id == target_id)
+                .find(|hit| replayed || annotates_target == Some(hit.node_id))
                 .map(|hit| hit.edge_id.to_string())
         } else {
             None
+        };
+        let response_memory_type: String = if replayed {
+            note.properties
+                .as_ref()
+                .and_then(|pr| pr.get("memory_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("episodic")
+                .to_owned()
+        } else {
+            memory_type.to_owned()
         };
 
         let mut response = json!({
@@ -191,11 +206,14 @@ impl MemoryPack {
             "kind": note.kind,
             "salience": note.salience,
             "decay_factor": note.decay_factor,
-            "memory_type": memory_type,
+            "memory_type": response_memory_type,
             "created_at": micros_to_iso(note.created_at),
         });
         if let Some(eid) = edge_id {
             response["edge_id"] = json!(eid);
+        }
+        if replayed {
+            response["replayed"] = json!(true);
         }
         to_json(&response)
     }
@@ -275,5 +293,139 @@ mod tests {
         // in the event payload: the runtime emitter knows the note, not the verb
         // that asked for it. The response is the caller-facing surface for it.
         assert_eq!(result["memory_type"], serde_json::json!("semantic"));
+    }
+
+    #[tokio::test]
+    async fn remember_replay_returns_original_without_creating_a_duplicate() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let args = serde_json::json!({
+            "content": "idempotent memory content",
+            "memory_type": "semantic",
+            "idempotency_key": "remember-replay",
+        });
+        let first = registry
+            .dispatch("memory.remember", args.clone())
+            .await
+            .expect("first remember");
+        let second = registry
+            .dispatch("memory.remember", args)
+            .await
+            .expect("identical replay");
+
+        assert_eq!(second["id"], first["id"]);
+        assert_eq!(second["replayed"], serde_json::json!(true));
+        let notes = rt
+            .notes(&token)
+            .expect("note store")
+            .get_live_notes_by_key("local", "remember-replay", Some("memory"))
+            .await
+            .expect("key lookup");
+        assert_eq!(notes.len(), 1);
+
+        let conflict = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "different content",
+                    "memory_type": "semantic",
+                    "idempotency_key": "remember-replay",
+                }),
+            )
+            .await
+            .expect_err("different content under one key must refuse");
+        assert!(conflict.to_string().contains("idempotency_key_conflict"));
+        assert!(conflict.to_string().contains("remember-replay"));
+        let notes_after = rt
+            .notes(&token)
+            .expect("note store")
+            .get_live_notes_by_key("local", "remember-replay", Some("memory"))
+            .await
+            .expect("key lookup after refused replay");
+        assert_eq!(notes_after.len(), 1);
+        assert_eq!(notes_after[0].content, "idempotent memory content");
+    }
+
+    #[tokio::test]
+    async fn remember_replay_answers_from_the_stored_memory() {
+        // #2700: a replay must carry the stored note's annotation edge and the
+        // memory_type it was written with, never the replay request's values.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let source = rt
+            .create_entity(&token, "concept", None, "replay source", None, None, vec![])
+            .await
+            .expect("source entity");
+        let args = serde_json::json!({
+            "content": "replayed memory answers from the store",
+            "memory_type": "semantic",
+            "namespace": "local",
+            "source_id": source.id.to_string(),
+            "idempotency_key": "remember-replay-stored",
+        });
+        let first = registry
+            .dispatch("memory.remember", args.clone())
+            .await
+            .expect("first remember");
+        let first_edge = first["edge_id"]
+            .as_str()
+            .expect("original keyed create reports its annotation edge")
+            .to_owned();
+        assert_eq!(first["memory_type"], serde_json::json!("semantic"));
+
+        // Exact replay: same edge, same type, flagged as a replay.
+        let exact = registry
+            .dispatch("memory.remember", args)
+            .await
+            .expect("exact replay");
+        assert_eq!(exact["id"], first["id"]);
+        assert_eq!(exact["replayed"], serde_json::json!(true));
+        assert_eq!(exact["edge_id"], serde_json::json!(first_edge));
+        assert_eq!(exact["memory_type"], serde_json::json!("semantic"));
+
+        // Same key and content, different type and no source_id: the response
+        // still describes the stored memory.
+        let drifted = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "replayed memory answers from the store",
+                    "memory_type": "episodic",
+                    "namespace": "local",
+                    "idempotency_key": "remember-replay-stored",
+                }),
+            )
+            .await
+            .expect("replay with a drifted type");
+        assert_eq!(drifted["id"], first["id"]);
+        assert_eq!(drifted["replayed"], serde_json::json!(true));
+        assert_eq!(drifted["memory_type"], serde_json::json!("semantic"));
+        assert_eq!(drifted["edge_id"], serde_json::json!(first_edge));
+        let notes = rt
+            .notes(&token)
+            .expect("note store")
+            .get_live_notes_by_key("local", "remember-replay-stored", Some("memory"))
+            .await
+            .expect("key lookup");
+        assert_eq!(notes.len(), 1);
+        let stored_type = notes[0]
+            .properties
+            .as_ref()
+            .and_then(|pr| pr.get("memory_type"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        assert_eq!(stored_type.as_deref(), Some("semantic"));
     }
 }

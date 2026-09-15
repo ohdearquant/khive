@@ -17,12 +17,12 @@ pub use graph::{
     EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, GraphPath,
     GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
     GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, LinkId,
-    MissingEndpoints, NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange,
-    TraversalExecutionBudget, TraversalOptions, TraversalRequest, DEFAULT_TRAVERSAL_LIMIT,
-    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
-    MAX_TRAVERSAL_WORK,
+    MissingEndpoints, NeighborCursor, NeighborHit, NeighborQuery, PathNode, SortDirection,
+    SortOrder, TimeRange, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
-pub use pagination::{BoundedCount, Page, PageRequest, SeekCursor, SeekPage};
+pub use pagination::{BoundedCount, LimitReport, Page, PageRequest, SeekCursor, SeekPage};
 pub use sparse::{
     SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, MAX_SPARSE_SEARCH_TOP_K,
 };

@@ -1044,44 +1044,49 @@ async fn build_op_result(
                 })?;
             Ok(serde_json::to_value(&edge)?)
         }
-        ("update", AtomicOpPlan::Update(p)) => match runtime
-            .resolve_by_id(token, p.target_id())
-            .await?
-        {
-            Some(Resolved::Entity(entity)) => {
-                Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
-                    serde_json::to_value(&entity)?,
-                ))
+        ("update", AtomicOpPlan::Update(p)) => {
+            match runtime.resolve_by_id(token, p.target_id()).await? {
+                Some(Resolved::Entity(entity)) => {
+                    Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
+                        serde_json::to_value(&entity)?,
+                    ))
+                }
+                Some(Resolved::Note(note)) => {
+                    let mut value = serde_json::to_value(&note)?;
+                    if p.is_idempotent_noop() {
+                        value["unchanged"] = json!(true);
+                    }
+                    Ok(khive_pack_kg::handlers::normalize_entity_timestamps(value))
+                }
+                Some(Resolved::Event(_)) | Some(Resolved::PackRecord { .. }) => {
+                    Err(anyhow::anyhow!(
+                        "atomic update result: target {} resolved to an unsupported record",
+                        p.target_id()
+                    ))
+                }
+                // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so a
+                // non-symmetric edge update's `p.target_id` (unambiguous — see
+                // `prepare_update_edge`'s non-symmetric branch, which never
+                // changes the edge's own id) falls through here. Canonical
+                // shape: `to_json(&edge)` with no `normalize_entity_timestamps`
+                // wrapper (update.rs:220 — entity/note timestamps are ISO-8601
+                // strings needing normalization; `Edge`'s `created_at`/
+                // `updated_at` already serialize as RFC3339 via its own
+                // `Serialize` impl).
+                None => {
+                    let edge = runtime
+                        .get_edge(token, p.target_id())
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "atomic update result: target {} not found post-commit",
+                                p.target_id()
+                            )
+                        })?;
+                    Ok(serde_json::to_value(&edge)?)
+                }
             }
-            Some(Resolved::Note(note)) => Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
-                serde_json::to_value(&note)?,
-            )),
-            // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so a
-            // non-symmetric edge update's `p.target_id` (unambiguous — see
-            // `prepare_update_edge`'s non-symmetric branch, which never
-            // changes the edge's own id) falls through here. Canonical
-            // shape: `to_json(&edge)` with no `normalize_entity_timestamps`
-            // wrapper (update.rs:220 — entity/note timestamps are ISO-8601
-            // strings needing normalization; `Edge`'s `created_at`/
-            // `updated_at` already serialize as RFC3339 via its own
-            // `Serialize` impl).
-            None => {
-                let edge = runtime
-                    .get_edge(token, p.target_id())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "atomic update result: target {} not found post-commit",
-                            p.target_id()
-                        )
-                    })?;
-                Ok(serde_json::to_value(&edge)?)
-            }
-            _ => anyhow::bail!(
-                "atomic update result: target {} not found post-commit",
-                p.target_id()
-            ),
-        },
+        }
         // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
         // (update.rs:327/:356/:360) — `p.id`/`p.kind` are the CALLER's
         // original strings (pre id-resolution), not the resolved UUID.
@@ -1999,6 +2004,158 @@ mod tests {
         assert_eq!(after, before, "rejected atomic prepare must not write");
     }
 
+    async fn assert_issue_2675_atomic_derived_property_refused(field: &str, value: Value) {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task before refused preparation")
+            .expect("task exists");
+
+        let error = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "content": "body that must not be committed",
+                "properties": {field: value, "priority": "p0"},
+            }),
+        )
+        .await
+        .expect_err("atomic preparation must refuse a derived task property");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("properties.{field}")),
+            "refusal must name the supplied diagnostic field; got: {message}"
+        );
+        assert!(
+            message.contains("properties.depends_on"),
+            "refusal must direct callers to the writable dependency property; got: {message}"
+        );
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task after refused preparation")
+            .expect("task exists");
+        assert_eq!(
+            after, before,
+            "refused preparation must preserve the entire task, including body, properties, timestamps and version"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_blocked_by() {
+        assert_issue_2675_atomic_derived_property_refused(
+            "blocked_by",
+            json!(["11111111-1111-4111-8111-111111111111"]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_null_blocked_by() {
+        assert_issue_2675_atomic_derived_property_refused("blocked_by", Value::Null).await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_dependency_state() {
+        assert_issue_2675_atomic_derived_property_refused("dependency_state", json!("blocked"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_null_dependency_state() {
+        assert_issue_2675_atomic_derived_property_refused("dependency_state", Value::Null).await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_actionable() {
+        assert_issue_2675_atomic_derived_property_refused("actionable", json!(false)).await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_refuses_null_actionable() {
+        assert_issue_2675_atomic_derived_property_refused("actionable", Value::Null).await;
+    }
+
+    #[tokio::test]
+    async fn issue_2675_atomic_task_update_applies_supported_properties() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task before supported preparation")
+            .expect("task exists");
+
+        let (plan, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "content": "supported atomic task body",
+                "properties": {"planning_label": "reviewed", "priority": "p1"},
+            }),
+        )
+        .await
+        .expect("prepare legitimate task property update");
+        let prepared = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task after supported preparation")
+            .expect("task exists");
+        assert_eq!(
+            prepared, before,
+            "preparation alone must not persist the patch"
+        );
+
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit legitimate task property update");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read committed task")
+            .expect("task exists");
+        assert_eq!(after.content, "supported atomic task body");
+        assert_eq!(
+            task_properties(&after)["description"],
+            "supported atomic task body"
+        );
+        assert_eq!(task_properties(&after)["planning_label"], "reviewed");
+        assert_eq!(task_properties(&after)["priority"], "p1");
+        assert_eq!(task_properties(&after)["status"], "next");
+        assert_ne!(
+            after, before,
+            "the positive control must actually persist its patch"
+        );
+    }
+
     #[tokio::test]
     async fn atomic_task_update_checks_explicit_kind_before_running_task_hook() {
         let runtime = scratch_runtime();
@@ -2585,8 +2742,7 @@ mod tests {
     /// GAP-6 (ADR-099 B3): an idempotent atomic `gtd.transition` (current ==
     /// target after `normalize_status`) must perform no persisted mutation.
     /// Its guarded no-effect statement only revalidates the snapshot. This
-    /// matches canonical when no note was supplied; canonical note-bearing
-    /// no-ops have a separate note-event contract outside atomic v1. The
+    /// matches canonical for both note-omitting and note-bearing requests. The
     /// pre-fix atomic prepare only special-cased `current != target` inside
     /// its `can_transition` guard, so a current==target call fell through
     /// to an unconditional `UPDATE` that bumped `updated_at` for nothing.

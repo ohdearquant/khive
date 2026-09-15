@@ -116,6 +116,7 @@ impl KgPack {
                         .runtime
                         .get_entity_including_deleted(graph_token, id)
                         .await?
+                        .filter(|deleted| deleted.namespace == graph_token.namespace().as_str())
                     {
                         return flatten_get_result(
                             "entity",
@@ -130,6 +131,7 @@ impl KgPack {
                         .runtime
                         .get_entity_including_deleted(graph_token, id)
                         .await?
+                        .filter(|deleted| deleted.namespace == graph_token.namespace().as_str())
                     {
                         return flatten_get_result(
                             "entity",
@@ -155,7 +157,12 @@ impl KgPack {
             return flatten_get_result("note", remapped);
         }
         if include_deleted {
-            if let Some(deleted) = self.runtime.get_note_including_deleted(token, id).await? {
+            if let Some(deleted) = self
+                .runtime
+                .get_note_including_deleted(token, id)
+                .await?
+                .filter(|deleted| deleted.namespace == token.namespace().as_str())
+            {
                 let note_val = normalize_entity_timestamps(to_json(&deleted)?);
                 let remapped = remap_note_status(note_val);
                 return flatten_get_result("note", remapped);
@@ -172,7 +179,12 @@ impl KgPack {
             return flatten_get_result("edge", edge_val);
         }
         if include_deleted {
-            if let Some(deleted) = self.runtime.get_edge_including_deleted(token, id).await? {
+            if let Some(deleted) = self
+                .runtime
+                .get_edge_including_deleted(token, id)
+                .await?
+                .filter(|deleted| deleted.namespace == token.namespace().as_str())
+            {
                 let mut edge_val = to_json(&deleted)?;
                 let annotations = self.fetch_edge_annotations(token, id).await?;
                 if let Some(obj) = edge_val.as_object_mut() {

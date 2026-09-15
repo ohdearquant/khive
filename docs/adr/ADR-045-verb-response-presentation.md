@@ -402,6 +402,10 @@ empty field named `items`, `entities`, `notes`, or `edges` still drops it. The
 three limit-metadata fields identify a list envelope at the presentation
 boundary.
 
+[Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes)
+explicitly applies this rule to the new knowledge-list/topic `results` envelopes
+on acceptance, while retaining ordinary row transforms.
+
 On synthetic 10-item task listings with full timestamps and UUIDs, the Agent
 transform reduced response JSON byte length by ~55–60%. On smaller responses
 (single record, few fields), savings are proportionally lower (~20–30%).
@@ -660,6 +664,11 @@ completion signals and a caller that cannot see them cannot terminate. The
 exception is envelope-scoped in the same way: a `results` array without a
 sibling `next_after` key receives the ordinary transform.
 
+That last sentence is qualified by
+[Amendment 5 (2026-09-14)](#amendment-5-2026-09-14-structural-knowledge-limit-envelopes):
+the new knowledge-list/topic report siblings also identify a structural envelope
+without a cursor. Existing keyset completion behavior does not change.
+
 ## References
 
 - ADR-016 (Request DSL) §"UUID arguments" — short-prefix resolution on input
@@ -667,3 +676,248 @@ sibling `next_after` key receives the ordinary transform.
 - ADR-017 (Pack Standard) — verb declaration, handler return shape
 - ADR-016 (Request DSL) — single-tool `request` envelope shape
 - Design request 2026-05-23 — "verb should include a handler for verbose output…"
+
+## Amendment 5 (2026-09-14): structural knowledge limit envelopes
+
+**Status: Accepted (2026-09-14).**
+**Related issue:** #2679.
+
+This amendment accompanies
+[ADR-047's 2026-09-14 knowledge list and topic limit reports](ADR-047-knowledge-pack.md#amendment-2026-09-14-knowledge-list-and-topic-limit-reports).
+It proposes the observable empty-result consequence of those two verbs adding
+`requested_limit`, `effective_limit`, and `limit_clamped` beside `results`.
+Numeric-report approval alone does not accept this presentation change. Both
+proposals require owner/spec approval before dependent implementation merges;
+only the new amendments become Accepted with the later fix.
+
+### Scope of the structural envelope
+
+On acceptance, §7's **Amendment 1 (2026-08-08)** stable-envelope rule explicitly
+includes all four `knowledge.list` successes (atom/domain × offset/cursor) and
+both `knowledge.topic` successes (query/listing) carrying the three report
+siblings. Agent mode must retain the siblings and envelope `results` even when
+it is `[]`. This newly retains empty offset-list/topic results previously
+removed by ordinary empty-field dropping.
+
+This amendment also qualifies **Amendment 4 (2026-09-03)**'s final sentence:
+absence of `next_after` does not imply an ordinary transform when those three
+report siblings identify a knowledge limit envelope. A results array without
+either structural discriminator still follows the existing ordinary transform.
+Knowledge-list cursor pages already retain empty results and `next_after:null`;
+this proposal preserves that completion contract without adding cursor fields
+to offset pages or to topic.
+
+The exception is scoped to the envelope. Fields within records retain all
+existing UUID, timestamp, score and empty-field transformations. No new
+per-verb rendering exception, response wrapper or renderer change is required.
+Adding report siblings to an envelope does not make an ordinary record or its
+properties structural; each object keeps its existing classification.
+
+### Presentation and format behavior
+
+The rule applies before output-format rendering. For each presentation mode
+Agent, Verbose and Human, preserve the existing behavior of each format `json`,
+`auto` and `table`. Verbose/Human canonical payloads already include empty
+results; Agent now retains the scoped empty results in all three formats.
+Existing zero/one-row JSON fallback, multi-row tables, sibling scalar rendering,
+full_id redundancy policy, field order policy and ordinary record transforms
+continue to govern. `format` does not undo the presentation transform.
+
+For example, topic listing with two matching concepts and limit 0 yields the
+canonical `{results:[],total:2,requested_limit:0,effective_limit:0,
+limit_clamped:false}`. Agent preserves the empty array and report; `total` is
+still 2, not the output length. A topic query with effective 0 instead retains its
+existing total 0. For an empty list cursor with requested 501, results and
+`next_after:null` remain present as before, alongside legacy limit 500 and the
+new `501 / 500 / true` report.
+
+Removing the new siblings from a nonempty result must leave the same legacy
+payload under the same existing presentation/format rules. Empty offset-list
+and topic Agent results have exactly one further allowed structural difference:
+`results: []` is now present. Existing empty cursor completion is unchanged.
+This contract does not require rendered-byte identity after additive fields.
+
+### Acceptance and mutation witnesses
+
+- **KP-MATRIX:** Exercise all nine presentation × format pairs on zero-, one-
+  and multi-row responses, including false/zero report values, full_id, local
+  namespace, row order and null cursor. Check complete old row/payload behavior
+  as well as new siblings; distinguish empty offset/topic retention from
+  already-retained cursor completion.
+- **KP-WIRE:** A real MCP request must retain empty offset-list and topic
+  results and their three report siblings in Agent output. A populated route
+  control must precede each empty-route assertion. A separate ordinary result
+  fixture without either structural discriminator must still drop an empty
+  results array under the unchanged renderer.
+- **KP-MISSING-REPORT:** Independently omit one report sibling from an empty
+  atom-offset response and rename one from an empty topic-listing response.
+  The intended metadata/empty-array assertion must fail while baseline route
+  controls pass. These mutations affect handler output only; the renderer and
+  its row, identifier, namespace and cursor-completion controls stay unchanged.
+
+Witnesses and individual mutants are named and frozen before running them.
+Baseline controls establish existing transformations before an expected failure
+on missing new metadata or the proposed new empty-array retention. Fixed runs
+must satisfy the unchanged controls and the new assertions. Zero selected
+tests, compilation failures or invalid fixtures are not acceptance or mutant
+kills. This proposed text records no executed result.
+
+## Amendment 6 (2026-09-14): exact stream receipt timestamps
+
+**Status: Proposed.**
+**Related issue:** #2537.
+
+This amendment extends §6's declaration-based presentation policy and qualifies
+§3's Agent timestamp-compaction rule for the closed stream-receipt paths below.
+It does not change canonical handler output or the transaction that produces a
+receipt. The existing `Standard` and `AlwaysVerbose` policies remain intact.
+
+This is a presentation clarification of the write-receipt value described in
+[ADR-174 Amendment 5 §A5.2](ADR-174-ordered-streams-append.md#a52-updated_at-on-write-member-results).
+
+### Closed receipt policies
+
+The registered `HandlerDef::presentation_policy()` declaration supplies two
+finite policies: `StreamAppendReceipt` for `stream.append`, and
+`StreamBatchReceipts` for `stream.batch`. The response boundary must select the
+policy using the actual dispatched verb's registered definition. These policy
+variants are the explicit declaration that a result contains the named receipt
+values; they are not fields added to the result JSON.
+
+Under Agent presentation, preserve strings byte-for-byte at exactly these
+paths, relative to the canonical successful `result`:
+
+| Registered verb | Policy                | Protected string path                          |
+| --------------- | --------------------- | ---------------------------------------------- |
+| `stream.append` | `StreamAppendReceipt` | Root `/created_at`                             |
+| `stream.batch`  | `StreamBatchReceipts` | `/results/<immediate array member>/created_at` |
+| `stream.batch`  | `StreamBatchReceipts` | `/results/<immediate array member>/updated_at` |
+
+The append fields retain the appended record's canonical creation time. The
+write field retains that write's own stored update time for both create and
+update members, in atomic and per-member batches. In particular, the boundary
+must not obtain a replacement timestamp by reading the record after the write:
+a later writer cannot change the value already captured in the receipt.
+
+The path rule preserves the original string bytes, including fractional
+precision; it does not parse, validate, normalize or reconstruct timestamps.
+Non-string values continue through the existing presentation rules. The
+canonical producers retain responsibility for valid receipt values.
+
+Only an object at the result root can match the append path. The batch paths
+require a root object whose `results` value is an array, and apply only to the
+named fields directly on its immediate object members. A root array, an
+object-valued `results`, an array nested within a member, or fields inside
+`details`, `record` or another descendant do not acquire receipt protection.
+Existing independent payload guards still apply at their own paths.
+
+No field name, response shape, embedded `tool: "stream.batch"` value, or
+caller-supplied marker may select a receipt policy. An unrelated Standard verb
+returning a lookalike result remains Standard. No request parameter or result
+schema field is added. Any additional producer, protected path or policy
+requires a separate declared contract and its own acceptance witnesses; this
+amendment does not grant arbitrary handlers a general path-exemption facility.
+
+### Coexistence with ordinary presentation
+
+Receipt protection does not make either stream writer `AlwaysVerbose`. Agent
+UUID shortening, score handling, empty/null treatment and ordinary metadata
+timestamp compaction remain active outside the named string paths. A single
+MCP response can therefore contain an exact write-receipt timestamp and compact
+metadata from a subsequent `list` of the same record.
+
+The existing `trigger_at` and `due` timestamp exceptions, object-valued
+`properties` protection, opaque stream-entry `record` protection, strict UUID
+fields, AlwaysVerbose verbs and structural list/cursor envelopes are unchanged.
+In particular, the outer `created_at` on a `stream.read` entry remains ordinary
+read metadata; protecting the caller's `record` does not protect that sibling.
+The knowledge limit envelopes specified by the preceding amendment keep their
+own structural rules and ordinary row transformations.
+
+Verbose and Human remain canonical at the MCP/runtime presentation boundary.
+The public generic `present(value, mode, now)` behavior remains Standard;
+receipt-aware presentation receives the trusted declaration separately. Pack
+handlers and direct runtime/registry callers continue to return canonical JSON
+without inspecting the caller's mode or injecting presentation markers.
+
+Raw MCP `RequestParams.presentation=None` selects Agent. In ordinary
+`kkernel exec` dispatch, omitting the CLI flag is different: `ExecArgs` supplies
+`Some("verbose")` before forwarding to the local or daemon MCP path. Explicit
+Agent selects the receipt policies on those paths; explicit Verbose preserves
+canonical output. Existing envelope and per-operation override precedence is
+unchanged. A local MCP test representing the omitted CLI flag must therefore
+pass `Some("verbose")`; raw `None` is an Agent test, not a CLI-default test.
+
+### Response boundary, chaining and formats
+
+Apply the same policy on successful single, parallel and serial-chain response
+paths. `$prev` substitution continues to consume the canonical intermediate
+result, before any visible presentation transform. No policy marker or shortened
+value may enter that canonical chain state.
+
+Whole-operation error envelopes remain untransformed. An error nested inside a
+successful per-member batch retains its existing presentation behavior; receipt
+protection does not descend into its error details. Help and synthetic successes
+do not gain invented receipt fields. Gate, result-depth and response-frame
+limits remain in force, including their existing refusal and omission rules.
+The policy does not require a field to survive omission of its entire result.
+
+Presentation still precedes ADR-078 format rendering. Preserve the existing
+`json`, `auto` and `table` reductions, scalar rendering and structured fallback
+behavior in every presentation mode. When an in-scope timestamp is displayed,
+its complete string must survive; a second Standard Agent pass must not compact
+it again. This rule does not promise that a rendered table preserves every field
+of canonical JSON, or change the full_id, namespace or field-order policies.
+
+### Census-known follow-up policies
+
+The closed stream-receipt family and its declaration mechanism define this
+amendment's bounded #2537 scope. The following result-carried timestamps remain
+unchanged and subject to their existing Standard Agent handling:
+
+| Producer             | Result-carried timestamp paths left unchanged                           |
+| -------------------- | ----------------------------------------------------------------------- |
+| `gtd.complete`       | Root `/completed_at`                                                    |
+| `brain.event_counts` | Root `/since` and `/until`                                              |
+| `telemetry.counts`   | `/window/since` and `/window/until`, with existing grouped-key handling |
+
+These are result data, not reclassified metadata. The protected
+`properties.completed_at` copy on a GTD note does not protect the separate
+top-level completion receipt. Follow-up policies for these census-known
+surfaces are separate work to be tracked after this amendment merges; no exact
+Agent-output guarantee for them is introduced here. Other metadata, daemon
+cursor inspection, native serializers, and proposed/unimplemented timestamp
+surfaces likewise receive no new policy from this amendment.
+
+### Acceptance and mutation witnesses
+
+- **SR-RECEIPTS:** Real Agent MCP calls cover standalone append, batch append,
+  and batch write create/update in both atomic modes. Establish dispatch,
+  identity, sequence/version/count/order and commit controls before comparing
+  every receipt timestamp with its canonical own-write oracle. A mixed
+  write-then-list response must retain compact metadata and ordinary Agent UUIDs.
+- **SR-BOUNDARIES:** Exercise single, parallel and serial chaining, including
+  canonical `$prev`, mode overrides and all three formats. Raw omission selects
+  Agent; the CLI-defaulted local seam uses explicit Verbose. Whole errors,
+  per-member errors, help, depth refusal and frame omission retain their controls.
+- **SR-CONTEXT:** At a fixed clock, require ordinary metadata's literal compact
+  form beside exact receipt strings. Unrelated verb/marker/shape lookalikes,
+  malformed container paths and nested descendants receive no receipt policy.
+  Existing properties, trigger/due, opaque-record, AlwaysVerbose and structural
+  envelope controls remain unchanged. A protected string is retained without
+  reparsing; non-string handling is unchanged.
+- **SR-MUTATIONS:** Independently remove each of the three protected-path arms;
+  add a global `updated_at` exemption; select the batch policy by response shape;
+  inherit it into descendants; substitute AlwaysVerbose for the batch policy;
+  omit the serial-chain policy; assign presented output to `$prev`; and apply a
+  second Standard pass before rendering. Each wrong edit must fail its named
+  behavioral witness, including the unchanged controls that distinguish an
+  over-broad fix from correct receipt preservation.
+
+Freeze exact selectors, fixtures, source identities and individual mutants
+before execution. A valid tests-only baseline reaches the real handlers and
+passes its legacy controls before failing on lost receipt precision. Fixed
+runs must satisfy both controls and exactness assertions. Compilation failures,
+invalid fixtures, missing cases and zero selected tests are neither a baseline
+proof nor mutation kills. This Proposed amendment records no executed outcome;
+native verification and dependent implementation remain held until signature.

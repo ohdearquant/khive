@@ -108,7 +108,14 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "key",
                 param_type: "string",
                 required: false,
-                description: "Immutable operation key, at most 512 UTF-8 bytes and no NUL (empty is allowed). Unique among live memories in the write namespace. Replay returns key_conflict with existing_id; pin the original namespace when reconciling across actors.",
+                description: "Optional idempotency key (also accepted as the legacy `key` spelling), at most 512 UTF-8 bytes and no NUL. It is scoped to the write namespace. An identical replay returns the original memory with `replayed=true`; a different content under the same key is refused and names the conflict.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "idempotency_key",
+                param_type: "string",
+                required: false,
+                description: "Alias for `key`; namespace-scoped idempotency key. An identical replay returns the original memory with `replayed=true`, while different content under the same key is refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

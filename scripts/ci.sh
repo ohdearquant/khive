@@ -55,6 +55,9 @@ phase_lint() {
 
     echo "=== Binary Resolution Harness Tests ==="
     python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
+
+    echo "=== Contract Harness Tests ==="
+    uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
 }
 
 phase_no_stubs_scan() {

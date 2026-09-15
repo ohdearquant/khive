@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 24    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -211,7 +211,7 @@ That advisory appears on successful non-help operations only. Failed, aborted, a
 
 ---
 
-## `kg` pack — 24 verbs
+## `kg` pack — 26 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -249,10 +249,10 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                           |
-| `include_deleted` | bool | no       | Return soft-deleted records too (default false); requires a full UUID. |
+| Param             | Type | Required | Notes                                                                                                                  |
+| ----------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                           |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -264,9 +264,24 @@ notes annotate the edge), and each full note object includes `annotation_edge_id
 `annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
 annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
 
+### `restore` — Declaration
+
+Restore a caller-owned soft-deleted entity, note, or edge. Restoring a live record is an
+idempotent no-op. A note restore refuses with the conflict error `restore_key_conflict` when
+another live note already holds the same namespace/kind/key identity (details: `reason`, `key`,
+`existing_id`); neither record is changed. An entity that was merged into another
+entity is a merge tombstone, not a plain soft delete: restore refuses it with `merge_tombstone`
+and names the kept id. A tombstone the caller does not own is answered not found, with or
+without a `kind` hint; the hint is compared only after ownership is established.
+
+| Param  | Type   | Required | Notes                                                         |
+| ------ | ------ | -------- | ------------------------------------------------------------- |
+| `id`   | uuid   | yes      | Full UUID or unique short hex prefix of the tombstone.        |
+| `kind` | string | no       | `entity`\|`note`\|`edge`, or a registered granular kind hint. |
+
 ### `list` — Assertive
 
-List records with optional filtering.
+List live records with optional filtering. `list` does not accept `include_deleted` and always excludes soft-deleted rows.
 
 For entity `entity_type` filtering, the non-null column takes precedence. Only
 when it is null does `list` compare a string-valued `properties.type`, before
@@ -419,6 +434,12 @@ Note tags remain stored and returned in `properties.tags`. Updating that propert
 also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
 `tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
 as usual.
+
+An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
+comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
+names `expected_version` is always a write when it is accepted, identical patch included: the
+version advances by exactly one and `unchanged` is never set, because the version a fenced write
+mints is the only thing a rival writer can fail against.
 
 ```
 request(ops="update(id=\"<uuid>\", salience=0.7)")
@@ -635,17 +656,21 @@ the edge's mutation history.
 
 ### `neighbors` — Assertive
 
-Immediate graph neighbors, returned as a bare array of hits rather than the `{"items": [...]}` envelope that `list` uses. Each hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
+Immediate graph neighbors. Without an explicit `limit` the response is the bare array of hits it has always been. An explicit `limit` returns a page instead: `{"neighbors": [...], "next_after": <cursor or null>, "requested_limit": N, "effective_limit": M, "limit_clamped": bool}`, so a dense node can be walked in bounded steps. Each record hit carries `origin_id` for the queried node, `edge_id`, `relation`, `weight`, and the neighbor's `id`, `kind` and `name`; `include_entity_type=true` adds `entity_type` when the neighbor has one.
 
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
 
-| Param        | Type            | Required | Notes                                            |
-| ------------ | --------------- | -------- | ------------------------------------------------ |
-| `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
-| `direction`  | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`). |
-| `relations`  | array\<string\> | no       | Restrict to these relation types.                |
-| `min_weight` | number          | no       | Exclude edges below this weight.                 |
+| Param            | Type            | Required | Notes                                                                                                                                                                                        |
+| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `node_id`        | uuid            | yes      | Node whose neighbors to return.                                                                                                                                                              |
+| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
+| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
+| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
+| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
+| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
+| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
 
 ```
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
@@ -745,6 +770,12 @@ One embedding inference when `query` is used; zero for a pure `entity_ids` call.
 | `fanout`     | integer         | no       | Max neighbors per expanded node per hop, clamped 1..=50 (default 10).                 |
 
 \* at least one of `query`/`entity_ids` required.
+
+Every number the caller supplies that the verb clamps is reported back beside the body, under its
+own name: `requested_hops` / `effective_hops` / `hops_clamped`, and likewise for `budget`, `limit`
+and `fanout`. A raise to a minimum counts as a clamp (`budget=1` reports `effective_budget: 256`,
+`budget_clamped: true`). A number the caller did not supply is not reported; the default is not a
+clamp.
 
 ```
 request(ops="context(query=\"rotary position embedding\", hops=1, budget=4096)")
@@ -901,6 +932,22 @@ and immutable build metadata without invoking database diagnostics or a checkpoi
 request(ops="whoami()")
 ```
 
+### `scan` — Assertive
+
+Report whether the secret gate would refuse a note body, without writing anything. Takes
+`content` (required) plus optional `name` and `properties`, and runs the same checks in the same
+order a note write runs before it stores: content, then name, then every string leaf of
+properties. Returns `{would_refuse, detector, trigger, masked, location, message,
+masked_preview: {content, name}}`. On a refusal `message` is the exact text the write would
+have failed with, `location` names the field (`note.content`, `note.name`, `note.properties`)
+and `masked` is the candidate as `first6...N`; on acceptance those fields are null.
+`masked_preview` is the input through the canonical masker either way. Nothing is stored and
+no event is emitted, so the verb is safe to call on a body you do not intend to keep.
+
+```
+request(ops="scan(content=\"api_key=sk-...\")")
+```
+
 ### `db_diagnostics` — Assertive
 
 Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
@@ -1022,7 +1069,11 @@ object returned by `dbstat`. `size_composition_error` explains an unavailable re
 count is the legacy cross-namespace duplicate-ID state that can make a multi-namespace edge cursor
 walk lossy. The two row counts are raw evidence, not a parity verdict: list-sequence rows
 intentionally survive hard deletion, so the ledger can legitimately contain more rows than the
-live edge table. `graph_edge_integrity_error` explains a missing integrity section.
+live edge table. `live_entities_carrying_merged_into` counts entity rows across all namespaces
+that are live while still carrying `merged_into`, the state an earlier restore left behind before
+restore refused merge tombstones; `restore` names such a row as `live_merged_entity` instead of
+reporting it already live, and this count is where an operator finds the rest.
+`graph_edge_integrity_error` explains a missing integrity section.
 
 The handler additionally annotates `graph_edge_integrity` with four derived fields:
 `graph_edges_rows_scope` (`{"namespaces": "all", "rows": "live_and_soft_deleted"}`),
@@ -1080,6 +1131,12 @@ Create a GTD task (note with `kind=task`).
 | `depends_on`        | array\<uuid\>   | no       | Blocking task complete UUIDs or unique 8+ hex prefixes resolved in the caller's primary namespace.                                                                   |
 | `context_entity_id` | uuid            | no       | Full UUID of a related KG entity. Prefixes are rejected because the stored relationship is an explicit stable reference; Agent responses preserve it canonically.    |
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
+| `idempotency_key`   | string          | no       | Key scoped to the caller's namespace, at most 512 UTF-8 bytes, no NUL. See the replay rule below.                                                                    |
+
+With `idempotency_key`, a replay whose stored content matches the original returns the original
+task with `replayed=true` and records no new dependency edges. Different content under the same
+key is refused with the conflict error `idempotency_key_conflict`; its details carry `reason`,
+`key` and `existing_id` (the task that holds the key).
 
 ```
 request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
@@ -1147,6 +1204,11 @@ Explicit GTD status transition with lifecycle validation.
 | `status` | string | yes      | Target status (same set/aliases as above). |
 | `note`   | string | no       | Note attached to the transition.           |
 
+A task already in the target status is a read assertion, not a lifecycle event: the response
+carries `transitioned=false`, `from`, `to` and `note: "already in target status"`, no lifecycle
+audit row is written, and a `note` passed with the request is not persisted, reported as
+`note_recorded=false`.
+
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
 ```
@@ -1162,16 +1224,22 @@ Salience- and decay-weighted memory notes. Optional; load with
 
 Create a memory note with salience and decay.
 
-| Param             | Type   | Required | Notes                                                                                                                       |
-| ----------------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `content`         | string | yes      | Memory content.                                                                                                             |
-| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                           |
-| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay. |
-| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                      |
-| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                           |
-| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                             |
-| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                |
-| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                       |
+| Param             | Type   | Required | Notes                                                                                                                                 |
+| ----------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`         | string | yes      | Memory content.                                                                                                                       |
+| `salience`        | number | no       | 0.0–1.0. Type-differentiated default: episodic=0.3, semantic=0.5.                                                                     |
+| `decay_factor`    | number | no       | >= 0. Type-differentiated default: episodic=0.02 (~35d half-life), semantic=0.005 (~139d half-life). Higher = faster decay.           |
+| `memory_type`     | string | no       | `episodic`\|`semantic` (default `episodic`); no other values accepted.                                                                |
+| `source_id`       | string | no       | UUID or 8-char short ID of the entity/note this memory annotates.                                                                     |
+| `embedding_model` | string | no       | Registered model name; defaults to pack config.                                                                                       |
+| `tags`            | array  | no       | Stored in `properties.tags`.                                                                                                          |
+| `namespace`       | string | no       | Write namespace override. Default: episodic → caller's namespace, semantic → `local`.                                                 |
+| `idempotency_key` | string | no       | Key scoped to the write namespace, at most 512 UTF-8 bytes, no NUL; the legacy spelling `key` is accepted. See the replay rule below. |
+
+With `idempotency_key`, a replay whose content matches the stored memory returns the original
+memory with `replayed=true`. Different content under the same key is refused with the conflict
+error `idempotency_key_conflict`; its details carry `reason`, `key` and `existing_id` (the memory
+that holds the key).
 
 ```
 request(ops="memory.remember(content=\"ADR-016 fixes the DSL grammar\", salience=0.7, memory_type=\"semantic\")")
@@ -2044,6 +2112,8 @@ The response is `{results, total, candidate_provenance, ...}`. A genuine FTS mis
 not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` reports:
 
 - `matched`: eligible lexical candidates were found.
+- `exact_name`: FTS found no match, and a query with no scoreable terms recovered an eligible
+  atom by its exact normalized slug.
 - `no_match`: no lexical match was found in the caller's namespace.
 - `filtered`: lexical matches were removed by eligibility, such as kind or status filters.
 - `partial_timeout`: a timed-out fetch retains eligible candidates, or decomposed passes
@@ -2053,6 +2123,19 @@ not scan or rank unrelated recent corpus rows. `candidate_provenance.lexical` re
 
 These states supplement `degraded.lexical_timeout` and any public timeout details. A lexical
 stage timeout does not by itself mean the request's broader read deadline has expired.
+
+Short queries such as `AI` use the pack's import slug convention for this indexed recovery.
+A custom slug outside that convention is outside the guarantee. The probe shares the lexical
+pass's remaining deadline and namespace, status, and kind filters; a role hint does not change
+the raw query used for lookup.
+
+`candidate_provenance.terms_truncated` is `true` when a lexical pass exceeds the request's
+shared allowance of 32 distinct expanded terms. The full query and both decomposed passes
+draw from the same allowance; a repeated term in a later pass counts again. Admission uses
+deterministic spelling order before rarest-first scheduling. Frequency, rowid, eligibility,
+and namespace-existence probes all stay within those admitted terms, while retaining their
+own row and time limits. The lexical state describes only admitted terms: a match reachable
+only through an untested term does not make a truncated miss `filtered`.
 
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and
 no returned result has lexical evidence; otherwise it is `none`, including for an empty

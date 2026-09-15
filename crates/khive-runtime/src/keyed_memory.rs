@@ -1,8 +1,6 @@
 //! Memory identity is published only by the final DML of its atomic create.
 
 use khive_storage::note::Note;
-use khive_storage::types::SqlValue;
-use khive_storage::SqlStatement;
 use khive_types::{Details, KhiveError};
 use serde_json::Value;
 use uuid::Uuid;
@@ -31,12 +29,15 @@ pub fn validate_memory_key(key: &str) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn key_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
-    KhiveError::conflict("a live memory already holds this key")
+fn idempotency_conflict(key: &str, existing: &Note) -> RuntimeError {
+    KhiveError::conflict(format!(
+        "idempotency_key_conflict: key {key:?} already exists; stored content differs (existing memory {})",
+        existing.id
+    ))
         .with_details(Details::new_owned([
-            ("reason", "key_conflict".into()),
+            ("reason", "idempotency_key_conflict".into()),
             ("key", key.to_owned()),
-            ("existing_id", existing_id.to_string()),
+            ("existing_id", existing.id.to_string()),
         ]))
         .into()
 }
@@ -45,29 +46,16 @@ async fn resolve_holder(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     key: &str,
-) -> RuntimeResult<Option<Uuid>> {
-    let value = runtime
-        .sql()
-        .reader()
-        .await?
-        .query_scalar(SqlStatement {
-            sql: "SELECT id FROM notes WHERE namespace = ?1 AND kind = 'memory' \
-                  AND key = ?2 AND deleted_at IS NULL LIMIT 1"
-                .into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_owned()),
-                SqlValue::Text(key.to_owned()),
-            ],
-            label: Some("memory-key-holder".into()),
-        })
+) -> RuntimeResult<Option<Note>> {
+    let mut matches = runtime
+        .notes(token)?
+        .get_live_notes_by_key(token.namespace().as_str(), key, Some("memory"))
         .await?;
-    match value {
-        None => Ok(None),
-        Some(SqlValue::Text(id)) => Uuid::parse_str(&id)
-            .map(Some)
-            .map_err(|error| RuntimeError::Internal(format!("invalid memory holder id: {error}"))),
-        Some(_) => Err(RuntimeError::Internal(
-            "memory holder id is not text".into(),
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(RuntimeError::Internal(
+            "memory key lookup returned multiple live holders".into(),
         )),
     }
 }
@@ -76,7 +64,7 @@ pub async fn create_keyed_memory(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     spec: KeyedMemorySpec<'_>,
-) -> RuntimeResult<(Note, Option<Uuid>)> {
+) -> RuntimeResult<(Note, Option<Uuid>, bool)> {
     validate_memory_key(spec.key)?;
     if spec.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -114,7 +102,7 @@ pub async fn create_keyed_memory(
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 note.key = Some(spec.key.to_owned());
                 note.version = 2;
-                return Ok((note, edge_id));
+                return Ok((note, edge_id, false));
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure:
@@ -129,7 +117,10 @@ pub async fn create_keyed_memory(
                 crate::keyed_memory_tests::checkpoint(token.namespace().as_str(), _attempt, true)
                     .await;
                 if let Some(holder) = resolve_holder(runtime, token, spec.key).await? {
-                    return Err(key_conflict(spec.key, holder));
+                    if holder.content == spec.content {
+                        return Ok((holder, None, true));
+                    }
+                    return Err(idempotency_conflict(spec.key, &holder));
                 }
             }
             Ok(AtomicRunOutcome::RolledBack {

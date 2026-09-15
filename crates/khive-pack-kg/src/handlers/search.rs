@@ -506,7 +506,7 @@ impl KgPack {
         let runtime = self.runtime.clone();
         let token = token.clone();
 
-        khive_runtime::track_background_task(async move {
+        khive_runtime::track_named_background_task("kg_search_event_append", async move {
             emit_search_executed_event(
                 &runtime,
                 &token,

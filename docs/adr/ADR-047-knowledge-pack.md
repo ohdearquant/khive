@@ -1,11 +1,89 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
 operator-opt-in intent-rephrase retrieval path while preserving original-only behavior by default
 on acceptance.
+
+## Amendment (2026-09-14): existing atom properties-only updates
+
+**Status: Accepted (2026-09-14).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates.
+
+`knowledge.upsert_atoms` gains a second atom row form:
+`{id: <complete UUID>, properties: <JSON value or null>}`. Both keys are required.
+Every other row key, including `content`, `slug`, and `name`, is rejected rather
+than assigned precedence. Malformed IDs, slugs, and short prefixes are invalid
+input; complete UUID spellings accepted by the UUID parser are canonicalized.
+
+The target must be an existing live ordinary atom. An absent or soft-deleted UUID
+returns `NotFound`; this form never inserts a row. A domain or its mirror atom is
+invalid input and must be changed through the domain's own verbs. UUID lookup is
+namespace-agnostic under ADR-007, with authorization at registry dispatch. The
+record retains its stored namespace.
+
+The supplied properties replace the complete stored value, following the existing
+upsert implementation: keys are not merged, an empty object replaces the value
+with `{}`, and explicit null stores SQL NULL. Existing acceptance of arbitrary
+JSON values is retained. Caller-supplied properties undergo the same secret scan
+and reserved-property rejection as the ordinary row form. Only `properties` and
+`updated_at` change. All other fields, including stored content bytes, remain
+unchanged; stored short or empty content is neither trimmed nor revalidated.
+
+The original `(namespace, slug)` row form remains unchanged and requires content
+meeting the 20-word minimum whenever creating or replacing atom content, even
+when supplied content matches the stored value. Its source/finalization tri-state
+rules remain in force. Batches may mix the two forms, preserve input write order,
+and validate all inputs and resolve targets before writing any row. A refused
+row must not commit a valid prefix. The existing `{created, updated, total}`
+response remains, with successful id rows counted as updated.
+
+## Amendment (2026-08-30c): indexed exact-name recovery for short queries
+
+A query such as `AI` has no scoreable term, and the trigram FTS tokenizer cannot match
+a phrase below three characters. When a completed lexical pass finds no match and the raw
+query contains no scoreable non-stopword term, `knowledge.search` probes the unique
+`(namespace, slug)` index using the same slug normalization as the pack's import path.
+An eligible hit reports `candidate_provenance.lexical: "exact_name"` with lexical score
+provenance. This is an exact normalized-slug lookup, not a general name index or substring
+search: an atom with a caller-chosen slug outside the import convention remains outside
+this guarantee. A role prefix affects scoring but cannot suppress the raw-query probe.
+
+The probe runs after FTS retrieval, using the same reader and remaining lexical-stage
+deadline. It retains namespace, live-row, status, and atom/domain eligibility; an existing
+ineligible slug reports `filtered`. An expired probe reports `timed_out` and the existing
+lexical degradation flags, with an internal `exact_name_probe` timing phase. It does not reset
+the stage budget, rerun a timed-out pass, or change public timeout-detail redaction. Exact-name
+hits then follow the existing fusion, score normalization, status multiplier, and final
+`min_score` gates.
+
+The probe sits downstream of the term admission bound described in the 2026-08-30b
+amendment. It consumes no admission of its own, and a pass that was refused every
+admission opens no reader, so it never reaches the probe.
+
+## Amendment (2026-08-30b): request-wide bound on distinct FTS terms
+
+The lexical candidate stage admits at most 32 distinct expanded terms across one
+`knowledge.search` or `knowledge.suggest` request. Terms are deduplicated and expanded,
+then admitted in deterministic spelling order before any database read, including the
+rarest-first frequency probes. The full query and both optional decomposed passes share
+one allowance; repeating a term in a later pass consumes another admission because that
+pass repeats the retrieval work. A pass with no allowance left opens no reader.
+
+Within a pass, rarity ordering, phase-A rowid probes and widening, eligibility fallback,
+and namespace-only existence recovery all use the same admitted terms or their subsets.
+The bound limits combined distinct-term work, not the number of SQL statements: one term
+can require multiple bounded probes. Existing per-term row caps, widening ceilings, and
+lexical deadlines remain in force. Queries with no scoreable terms retain the raw-phrase
+fallback, which consumes one admission.
+
+`candidate_provenance.terms_truncated` is true when any lexical pass drops terms because
+the shared allowance is exhausted. It is independent of timeout reporting. `no_match`
+and `filtered` describe only admitted terms in the caller's namespace: a local match
+reachable only through an untested term must not turn a truncation-caused miss into
+`filtered`. ANN retrieval and scoring remain unchanged.
 
 ## Amendment (2026-08-29): tri-state atom upsert patches
 
@@ -246,6 +324,10 @@ list(
 Default type is `atom`. Limit is capped at 500. Legacy offset pages have a
 declared total order of `created_at DESC, id DESC`.
 
+The [2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
+extends this response shape and specifies the existing lower bound on acceptance;
+this section's pagination and projection rules otherwise remain in force.
+
 Completeness-sensitive consumers use keyset mode: pass `after=""` on the first
 request, then round-trip each non-null `next_after` full UUID. Cursor pages seek
 by `created_at ASC, id ASC`; `after` and `offset` are mutually exclusive. This is
@@ -369,12 +451,16 @@ Every `knowledge.search` result carries `score_provenance` with these fields:
 - `calibrated`: `false`.
 
 The response's `candidate_provenance.lexical` records the lexical candidate-stage outcome:
-`matched` for eligible candidates, `no_match` for no lexical match in the caller's namespace,
+`matched` for eligible FTS candidates, `exact_name` for indexed short-query recovery,
+`no_match` for no lexical match in the caller's namespace,
 `filtered` for matches removed by eligibility, `partial_timeout` when a timed-out fetch retains
 eligible candidates or decomposed passes mix completion and timeout, and `timed_out` when a
 fetch times out with no retained candidates (or every decomposed pass does so).
 Completed empty terms alone do not make a fetch partial. These states supplement the
 lexical timeout diagnostics.
+
+`candidate_provenance.terms_truncated` reports whether any pass exceeded the shared
+32-term allowance described above; the lexical state applies only to admitted terms.
 
 `candidate_provenance.fallback` is `ann` only when the returned set has ANN evidence and no
 returned hit has lexical evidence; otherwise it is `none`, including for an empty result.
@@ -439,6 +525,10 @@ topic(domain?, query?, limit?) → {results: [...], total: N}
   reflects the capped limit via `items` and `total`.
 - The domain filter is case-insensitive tag match (`eq_ignore_ascii_case`).
 
+The [2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
+replaces this section's silent-cap, `items`, and cap-through-`total` description
+on acceptance, with separate definitions for the two existing `total` values.
+
 ### 6. Pack dependency declaration
 
 The pack declares `REQUIRES: &["kg"]`. The runtime enforces this at boot: loading
@@ -498,3 +588,143 @@ discoverability.
 Rejected. Research concepts are entities (named, structured, graph-connected). Notes are
 for context and observations _about_ entities, not for the entities themselves. The
 existing `concept` entity kind in ADR-001 is the correct substrate; no new kind is needed.
+
+## Amendment (2026-09-14): knowledge list and topic limit reports
+
+**Status: Accepted (2026-09-14).**
+**Related issue:** #2679.
+
+This amendment adds numeric normalization reports to `knowledge.list` and
+`knowledge.topic` and proposes the associated structural empty-result behavior
+in [ADR-045 Amendment 5 (2026-09-14)](ADR-045-verb-response-presentation.md#amendment-5-2026-09-14-structural-knowledge-limit-envelopes).
+Both decisions were approved on 2026-09-14; the accepted parent ADRs retain
+their status. Acceptance of the text is not implementation acceptance: the
+dependent implementation lands on its own gates.
+
+On acceptance, this amendment extends §2's `knowledge.list` response signature
+and limit description. It replaces only §5's statement that the topic cap is
+silent and reflected through `items` and `total`, and clarifies that section's
+two totals. All other input, retrieval, pagination and storage decisions remain
+in force. It does not specify other verbs' numeric reports.
+
+### Defaulted request and effective setting
+
+Every successful payload carries three non-null scalar siblings:
+`requested_limit`, `effective_limit`, and `limit_clamped`. The first records the
+accepted typed argument after its existing default; the second records the
+existing handler output ceiling; the boolean is their inequality.
+
+| Verb              | Existing accepted type | Omitted or null request | Effective limit                 | Explicit zero   |
+| ----------------- | ---------------------- | ----------------------- | ------------------------------- | --------------- |
+| `knowledge.list`  | `Option<usize>`        | 20                      | `requested_limit.clamp(1, 500)` | `0 / 1 / true`  |
+| `knowledge.topic` | `Option<u32>`          | 20                      | `requested_limit.min(100)`      | `0 / 0 / false` |
+
+Exact bounds and unchanged requests report `limit_clamped: false`. A list
+request 501 reports `501 / 500 / true`; a topic request 101 reports
+`101 / 100 / true`. These values describe the setting, even when no rows match;
+they are not result counts, total counts, internal candidate-work budgets or
+promises that the page is full.
+
+Input types, defaults, decoding, validation order and error behavior do not
+change. Negative integers, incompatible JSON types and values outside each
+existing unsigned domain still fail. In particular, a 64-bit `usize` list input
+above `u32::MAX` remains valid and clamps before SQL conversion; topic continues
+to reject values above `u32::MAX`. No common `u32` conversion may narrow list's
+accepted domain. The report keys are output-only: they are neither input
+parameters nor allowed record projection fields. Failed requests do not acquire
+a fabricated success report.
+
+### Six successful response paths
+
+Each path below adds the same three siblings to its existing object; no wrapper
+is introduced. The legacy list `limit` remains present and equals
+`effective_limit` on every list success, including empty or exhausted pages.
+
+| Path                  | Existing payload fields retained               | Meaning preserved                                                                                           |
+| --------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Atom list, offset     | `results`, `total`, `limit`, `offset`, `order` | Exact-namespace matching live-atom count; descending created_at/id order and existing status/mirror filters |
+| Domain list, offset   | `results`, `total`, `limit`, `offset`, `order` | Exact-namespace live-domain count; descending created_at/id order                                           |
+| Atom list, cursor     | `results`, `limit`, `order`, `next_after`      | Ascending created_at/id walk, existing atom filters, no `total` or `offset`                                 |
+| Domain list, cursor   | `results`, `limit`, `order`, `next_after`      | Ascending created_at/id walk, no `total` or `offset`                                                        |
+| Topic with `query`    | `results`, `total`                             | Filtered candidate-window count before output truncation                                                    |
+| Topic without `query` | `results`, `total`                             | Full matching caller-visible concept count before output limit                                              |
+
+List retains the `type`/`kind` alias, omitted/null `after` offset mode, full-UUID
+cursor rules, mutually exclusive after/offset parameters, strict per-kind row
+projection, unchanged SQL predicates and ordering, effective-plus-one keyset
+fetch and existing continuation construction. Only rows are projected; report
+siblings remain present. No additional count, refill or retrieval query is
+introduced to produce the report.
+
+Topic continues to resolve shared graph reads through `core()`, including
+query, hydration, count and listing. A present empty or whitespace query still
+takes the search branch; omitted/null query takes listing. Domain normalization
+and post-filtering remain unchanged. Query requests retain the existing
+`effective_limit * 4` candidate bound, hydration, domain filtering and final
+take. Their `total` is the resulting candidate-window length before that take,
+not the whole matching corpus; excluded candidates are not replenished to fill
+the output. Listing retains its full visible matching count. Neither total is
+replaced with `effective_limit` or the number of returned rows.
+A corpus-true total for the query branch is tracked separately in #2732.
+
+Topic zero continues through the existing selected branch, including its reads
+and possible errors. A successful query zero has empty results and total 0; a
+successful listing zero has empty results while total may be positive. No new
+zero shortcut or namespace unification is authorized.
+
+### Presentation and compatibility
+
+[ADR-045 Amendment 5 (2026-09-14)](ADR-045-verb-response-presentation.md#amendment-5-2026-09-14-structural-knowledge-limit-envelopes)
+proposes retaining envelope `results: []` for Agent offset-list and topic
+successes once all three report fields are present. This is an explicit
+observable change, separate from the numeric metadata. Cursor empty results
+and null continuation already survive presentation and retain that behavior.
+Row transformations, other empty fields and existing format rules are unchanged.
+
+After removing only the three new siblings, canonical legacy fields and values
+must equal the prior payload for the same effective setting. For Agent empty
+offset-list/topic payloads, the sole additional allowed difference is the
+newly retained `results: []`. Additive reports need not preserve rendered bytes.
+
+### Falsifiable acceptance and mutation arms
+
+- **K-LIMIT:** All four list and both topic routes prove omitted/null/default,
+  lower/exact/upper bounds, zero and typed overflow behavior, with an
+  effective-value twin. A wide 64-bit list request must remain admitted while
+  the same out-of-u32 value fails topic. Isolated mutations to a default, cap,
+  zero rule, inequality flag or list-width conversion must fail these witnesses.
+- **K-ENVELOPE:** Empty, populated and exhausted successes retain every legacy
+  field and report the original request independently of result length. Strict
+  row projection retains the siblings but rejects them as projected fields or
+  inputs. Omitting a report at any return, reporting result length, replacing
+  legacy `limit`, or broadening a projection/input allowlist must be detected.
+- **K-PAGE:** Atom/domain offset and cursor controls establish exact IDs, order,
+  counts, continuation, live/status/namespace filtering and all existing cursor
+  errors before checking reports. Removing cursor lookahead, reversing the ID
+  tiebreak or relaxing an existing filter must fail the corresponding controls;
+  source review must also reject added reads.
+- **K-TOTAL:** A controlled query corpus larger than the candidate bound must
+  distinguish the candidate-window total from both output size and corpus size;
+  listing must retain its full matching total when output is limited. Zero and
+  empty/filter-empty arms need
+  populated positive controls. Substituting output length, corpus count or
+  effective limit for a branch total, or changing the 4× candidate request, must
+  fail the corresponding exact witness.
+- **K-ROUTE:** Query absent/null versus empty string, normalized domain,
+  secondary-pack/core routing and a matching domain candidate outside the
+  initial four-hit window establish existing behavior. Refill, premature domain
+  filtering, non-core reads or changed branch selection must be detected.
+- **K-PRESENT:** Satisfy ADR-045 Amendment 5's complete presentation/format
+  matrix and real MCP empty-result witness. Removing or renaming a report on an
+  empty offset-list/topic success must make that witness fail without modifying
+  the renderer.
+
+Freeze the named test and individual mutant mapping before execution. Establish
+all legacy fixture, count, ordering and error controls on baseline production
+before the first expected missing-report or newly structural-array failure;
+observe and retain that baseline before production edits. Exact-count/rank
+fixtures that cannot establish their positive control require correction and
+refreezing, not weakened inequalities. Fixed runs must pass the same controls.
+A mutant kill requires the intended semantic assertion with a nonzero selected
+test count; compilation, setup failure and unrelated errors do not qualify.
+No test or mutation result is claimed by this contract.

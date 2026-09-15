@@ -1,6 +1,7 @@
 //! BrainState — profile registry, resolution, and snapshot.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,18 @@ pub struct BrainState {
     pub section_states: HashMap<String, SectionPosteriorState>,
     pub router_state: HashMap<String, RouterStateBlob>,
     pub adapter_set: HashMap<String, Vec<AdapterRecord>>,
+    /// Dispatch-signal counters for this process. Diagnostics only: they are
+    /// not part of the persisted snapshot, they start at zero on every load,
+    /// and nothing reads them to make a decision. They exist so the cost of
+    /// the signal path has a denominator: a duty cycle with no signal count
+    /// beside it cannot say whether the work was too much or merely frequent.
+    pub signals_applied: AtomicU64,
+    /// Profile-record snapshot serializations performed in this process. This
+    /// counts every one, not only the dispatch path's, because the question it
+    /// answers is how much serialization the process is doing; the signal
+    /// count beside it is what makes the ratio readable. It is atomic because
+    /// serialization now happens on the read path, which holds `&self`.
+    pub snapshot_serializations: AtomicU64,
 }
 
 impl BrainState {
@@ -46,6 +59,8 @@ impl BrainState {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: AtomicU64::new(0),
+            snapshot_serializations: AtomicU64::new(0),
         }
     }
 
@@ -61,8 +76,13 @@ impl BrainState {
             .iter()
             .map(|(id, s)| (id.clone(), s.to_snapshot()))
             .collect();
+        let profiles = self
+            .profiles
+            .keys()
+            .filter_map(|id| self.materialized_profile(id).map(|r| (id.clone(), r)))
+            .collect();
         BrainStateSnapshot {
-            profiles: self.profiles.clone(),
+            profiles,
             balanced_recall: self.balanced_recall.to_snapshot(),
             profile_states: extra,
             bindings: self.bindings.clone(),
@@ -95,15 +115,54 @@ impl BrainState {
             section_states,
             router_state: snapshot.router_state,
             adapter_set: snapshot.adapter_set,
+            signals_applied: AtomicU64::new(0),
+            snapshot_serializations: AtomicU64::new(0),
         }
+    }
+
+    /// The live posterior state that owns `profile_id`, if this process holds
+    /// one. The default profile lives in its own field for historical reasons;
+    /// every other profile lives in the map.
+    fn live_profile_state(&self, profile_id: &str) -> Option<&BalancedRecallState> {
+        if profile_id == "balanced-recall-v1" {
+            Some(&self.balanced_recall)
+        } else {
+            self.profile_states.get(profile_id)
+        }
+    }
+
+    /// A profile record whose `state_snapshot` is serialized from live state
+    /// at the moment it is asked for.
+    ///
+    /// This is where the profile snapshot is serialized now. The signal path
+    /// used to do it on every signal, which made the cost of a read the cost
+    /// of every write that preceded it; the stored value was written far more
+    /// often than it was read. A profile the process holds no live state for
+    /// (archived, or belonging to another namespace) keeps whatever snapshot
+    /// it was loaded with, because there is nothing newer to serialize.
+    pub fn materialized_profile(&self, profile_id: &str) -> Option<ProfileRecord> {
+        let record = self.profiles.get(profile_id)?;
+        let Some(live) = self.live_profile_state(profile_id) else {
+            return Some(record.clone());
+        };
+        let mut record = record.clone();
+        record.total_events = live.total_events;
+        record.state_snapshot = serde_json::to_value(live.to_snapshot()).ok();
+        self.snapshot_serializations.fetch_add(1, Ordering::Relaxed);
+        Some(record)
     }
 
     /// Reset all posteriors to their prior values and bump the exploration epoch.
     pub fn reset_posteriors(&mut self) {
+        let mut serialized = false;
         self.balanced_recall.reset_posteriors();
         if let Some(record) = self.profiles.get_mut("balanced-recall-v1") {
             record.exploration_epoch = self.balanced_recall.exploration_epoch;
             record.state_snapshot = serde_json::to_value(self.balanced_recall.to_snapshot()).ok();
+            serialized = true;
+        }
+        if serialized {
+            self.snapshot_serializations.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(ss) = self.section_states.get_mut("balanced-recall-v1") {
             ss.reset_posteriors();
@@ -119,6 +178,7 @@ impl BrainState {
             if let Some(record) = self.profiles.get_mut(profile_id) {
                 record.exploration_epoch = epoch;
                 record.state_snapshot = snap;
+                self.snapshot_serializations.fetch_add(1, Ordering::Relaxed);
             }
         }
         if let Some(ss) = self.section_states.get_mut(profile_id) {
@@ -468,6 +528,8 @@ mod tests {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: AtomicU64::new(0),
+            snapshot_serializations: AtomicU64::new(0),
         };
         state_a.profiles.insert(p_early.id.clone(), p_early.clone());
         state_a.profiles.insert(p_later.id.clone(), p_later.clone());
@@ -480,6 +542,8 @@ mod tests {
             section_states: HashMap::new(),
             router_state: HashMap::new(),
             adapter_set: HashMap::new(),
+            signals_applied: AtomicU64::new(0),
+            snapshot_serializations: AtomicU64::new(0),
         };
         // Insert in the opposite order.
         state_b.profiles.insert(p_later.id.clone(), p_later.clone());

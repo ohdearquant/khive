@@ -1857,6 +1857,9 @@ impl VerbRegistry {
         ("kg", "query"),
         ("kg", "resolve"),
         ("kg", "whoami"),
+        // scan runs the secret gate over caller-supplied text in process: no
+        // store read, no store write, no event.
+        ("kg", "scan"),
         ("kg", "verbs"),
         ("kg", "stream.read"),
         ("kg", "stream.stat"),
@@ -14100,7 +14103,6 @@ mod help_tests {
             .pool()
             .reader()
             .unwrap()
-            .conn()
             .query_row(
                 "SELECT count(*) FROM pragma_table_xinfo(?1, 'main') WHERE name = ?2",
                 [table, column],

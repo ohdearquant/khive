@@ -300,15 +300,16 @@ def main():
         # with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 133, (
-            f"expected 133 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 135, (
+            f"expected 135 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
             f"(caller identity introspection); db_diagnostics is the 20th "
             f"kg-substrate bare verb (ADR-091 read-only-by-intent operator "
-            f"diagnostics); comm.health is #606; comm.probe is #644; "
+            f"diagnostics); scan is the kg-substrate bare verb answering the "
+            f"secret gate without a write; comm.health is #606; comm.probe is #644; "
             f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
             f"git.commit/git.branch/git.push (ADR-108); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "

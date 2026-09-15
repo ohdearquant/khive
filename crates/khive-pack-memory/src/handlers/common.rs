@@ -346,6 +346,7 @@ pub(super) fn balanced_recall_state_from_profile_response(
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
     pub(super) content: String,
+    #[serde(alias = "idempotency_key")]
     pub(super) key: Option<String>,
     pub(super) memory_type: Option<String>,
     pub(super) salience: Option<f64>,
@@ -1592,7 +1593,7 @@ async fn collect_model_ann_hits_inner(
             let token_detached = token.clone();
             let ann_detached = ann.clone();
             let model_detached = model_name.clone();
-            khive_runtime::track_background_task(async move {
+            khive_runtime::track_named_background_task("memory_ann_build", async move {
                 #[cfg(test)]
                 retrieval_failpoints::before_ann_build(&model_detached).await;
                 let result = ann::ensure_ann_for_model(

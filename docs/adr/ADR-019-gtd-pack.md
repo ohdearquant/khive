@@ -353,9 +353,10 @@ effects.
 ### Lifecycle verbs stay pack-owned
 
 `complete` and `transition` enforce the GTD state machine. They are not equivalent to
-kg `update` — `update` patches arbitrary fields without lifecycle awareness, while
-`transition` validates against the allowed-set table. A `done → inbox` `update` would
-silently succeed; `gtd.transition(id, "inbox")` from `done` returns `InvalidInput`.
+kg `update` — the task hook rejects incoming `properties.status`,
+`properties.completed_at`, and `properties.transition_history`, while `transition`
+validates against the allowed-set table. Both a generic attempt to patch a done task's
+status to inbox and `gtd.transition(id, "inbox")` from done return `InvalidInput`.
 The dependency-integrity amendment is deliberately narrower: the task hook validates
 `properties.depends_on` updates because graph cycles are a cross-record invariant,
 without moving the lifecycle state machine into shared CRUD.
@@ -366,6 +367,27 @@ items priority-sorted.
 
 These verbs do not have shared-CRUD equivalents. Lifecycle semantics belong in the
 pack that defines them.
+
+### Amendment (2026-09-14): dependency diagnostic ownership (#2675)
+
+**Status**: Accepted (2026-09-14).
+
+The task hook rejects incoming `properties.blocked_by`,
+`properties.dependency_state`, and `properties.actionable` on generic task updates,
+including null values. These are query-derived diagnostics. The refusal names the
+field and directs callers to `properties.depends_on`; canonical dispatch and atomic
+preparation reject the entire patch before writing. This does not reject unrelated
+updates to a legacy task with those stored properties or scrub its historical data.
+Other note kinds and generic task creation retain their existing property semantics.
+
+Scheduling dependencies come from the task's `properties.depends_on`, a validated
+array of canonical full task UUIDs. Setting it to an empty array clears scheduling
+blockers. A generic task-to-task `link(source_id=dependent, target_id=blocker,
+relation="depends_on")` creates a traversable graph relationship when KG and GTD are
+loaded; it does not update that property or change scheduling state. Generic property
+updates likewise do not synchronize the graph edges. Task creation stores the
+dependency property and attempts a best-effort edge projection. Completing a blocker
+changes derived readiness without rewriting the dependent's lifecycle or its edges.
 
 ### Hybrid search composition
 
@@ -771,3 +793,38 @@ reads or lifecycle validation. Any manual repair requires independently verified
 source timestamps/units, an operator-reviewed correction, and preserved original
 values; this amendment supplies neither an automatic repair nor speculative
 timestamp diagnostics.
+
+## Amendment 3 (proposed, 2026-09-14): additive task-query filters (#2678)
+
+**Status: proposed; awaiting contract approval.** This amendment extends the
+`gtd.tasks` input contract. It does not change the accepted response shapes,
+status defaults, ordering, limit handling, dependency diagnostics, or timestamps.
+
+`gtd.tasks` accepts three additional optional parameters:
+
+| Parameter           | Contract                                                                                                                                                                                                                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tags`              | Array of strings. Omission, JSON null, or an empty array adds no restriction. Tag membership uses the existing note-query SQLite `NOCASE` comparator (ASCII case-insensitive, not general Unicode case folding). Duplicate query tags do not duplicate rows or change membership.                  |
+| `tag_mode`          | `any` or `all`; omission or JSON null defaults to `any`. `any` matches at least one requested tag; `all` requires each requested tag. With no tags, either mode adds no restriction. Other spellings and types are invalid.                                                                        |
+| `context_entity_id` | A complete UUID spelling accepted by the existing UUID parser, normalized to canonical lowercase dashed form for equality against the stored `properties.context_entity_id` string. Omission or JSON null adds no restriction. Short prefixes, malformed UUIDs, and non-string values are invalid. |
+
+The context parameter compares a stored reference; it neither creates one nor
+resolves an entity in the caller's primary namespace. A task can therefore match
+its retained context UUID after the context entity is deleted. A supplied UUID
+absent from all visible tasks' stored references yields no matches, without
+requiring or creating an entity. Tasks with no stored context do not match a
+supplied context filter. This query does not rewrite historical property values;
+a noncanonical stored string is not silently normalized by the comparison.
+
+All supplied filters combine with AND, including the existing namespace, status,
+assignee, and priority filters. Explicit namespace routing remains precise;
+omitted routing uses the caller's existing visible task namespaces. The context
+parameter itself does not widen or narrow that task-row visibility policy.
+
+Both tag membership and the constant-path context predicate are applied by the
+storage query before limit/offset pagination. The bounded one-row query that
+explains an empty default-status result applies the same filters, changing only
+the status predicate. Unrelated terminal tasks must not cause `filter_excluded`
+to appear. Ordinary results remain arrays; the existing special empty-result
+object remains limited to a matching excluded task. No response-envelope
+migration or storage migration is part of this amendment.

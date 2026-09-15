@@ -600,6 +600,10 @@ pub struct NoteFilter {
     pub property_filters: Vec<PropertyFilter>,
     /// `(json_path, direction)` — `None` defaults to `created_at DESC`.
     pub order_by: Option<(String, SortDir)>,
+    /// When true, omit the SQL ordering clause from count-free pages. The
+    /// caller is responsible for ordering the bounded result set.
+    #[serde(default)]
+    pub unordered: bool,
     /// When non-empty, restricts results to any of these namespaces using
     /// `namespace IN (...)`. Takes precedence over the `namespace` string
     /// parameter passed to `query_notes_filtered`. When empty the

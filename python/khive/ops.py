@@ -20,7 +20,19 @@ import json
 from typing import Any
 
 
-def op(tool: str, **args: Any) -> dict[str, Any]:
+def op(verb: str | None = None, /, **args: Any) -> dict[str, Any]:
+    """Build an operation.
+
+    The verb is normally the first positional argument, which leaves the
+    keyword ``tool`` free for verbs whose arguments include one
+    (``exec.run``, ``tool.describe``, ...). ``op(tool="stats")`` keeps working:
+    with no positional verb, the ``tool`` keyword names the verb.
+    """
+    if verb is None:
+        verb = args.pop("tool", None)
+        if verb is None:
+            raise TypeError("op() missing the verb: pass it positionally or as tool=")
+    tool = verb
     # A stream record may be JSON null. A supplied fence (even null) must
     # reach the server so input validation cannot be bypassed.
     preserve_null = {"record", "fence"} if tool == "stream.append" else set()

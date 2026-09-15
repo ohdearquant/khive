@@ -209,6 +209,7 @@ impl EdgeNaturalKey {
 ///     statements: Vec::new(),
 ///     post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
 ///     edge_natural_key: None,
+///     idempotent_noop: false,
 /// };
 /// ```
 ///
@@ -242,6 +243,10 @@ pub struct UpdatePlan {
     /// (entity, note, non-symmetric edge), where `target_id` alone is
     /// already an exact, non-advisory identifier.
     pub(crate) edge_natural_key: Option<EdgeNaturalKey>,
+    /// True for a note patch whose normalized values already equal the
+    /// snapshot. Such plans carry a guarded SELECT assertion and must not
+    /// execute DML that would advance the note revision.
+    pub(crate) idempotent_noop: bool,
     pub(crate) note_guard: Option<crate::note_write::NoteWriteGuard>,
     pub(crate) note_vector_purge: Option<crate::note_write::NoteVectors>,
     pub(crate) note_embedding_inheritance: Option<crate::note_write::NoteEmbeddingInheritance>,
@@ -262,6 +267,11 @@ impl UpdatePlan {
     /// membership before issuing the committed-effects token.
     pub fn post_commit(&self) -> &PostCommitEffect {
         &self.post_commit
+    }
+
+    /// Whether this plan is a mutation-free note update assertion.
+    pub fn is_idempotent_noop(&self) -> bool {
+        self.idempotent_noop
     }
 }
 
@@ -439,17 +449,16 @@ pub struct GtdTransitionPlan {
     /// current status and requested transition were legal). For an idempotent
     /// no-op (`current == target` after `normalize_status`) this contains one
     /// guarded SELECT assertion that revalidates the prepare snapshot
-    /// under the commit transaction. Atomic v1 still persists no caller note;
-    /// canonical dispatch has a separately documented note-event path.
+    /// under the commit transaction. Atomic v1 and canonical dispatch both
+    /// persist no caller note.
     pub(crate) statements: Vec<PlanStatement>,
     /// Explicit result-shape and execution discriminator: true executes the
     /// snapshot assertion through the writer's read API and guards its result
     /// count; false executes DML and guards affected rows.
     pub(crate) idempotent_noop: bool,
     /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
-    /// `PostCommitEffect::None` for the idempotent no-op case. This matches a
-    /// canonical no-op without a note; canonical note-bearing no-ops instead
-    /// attempt a same-status audit append outside atomic v1.
+    /// `PostCommitEffect::None` for the idempotent no-op case. This matches
+    /// canonical dispatch, which emits no audit row for a same-status request.
     pub(crate) post_commit: PostCommitEffect,
 }
 
@@ -632,6 +641,7 @@ mod tests {
             ],
             post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
             edge_natural_key: None,
+            idempotent_noop: false,
         };
         assert_eq!(plan.target_id, id);
         assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));

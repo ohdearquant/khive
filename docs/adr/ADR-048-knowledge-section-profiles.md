@@ -4,6 +4,19 @@
 **Date**: 2026-05-27
 **Authors**: khive maintainers
 
+## Amendment (2026-09-14): properties-only atom updates
+
+**Status: Accepted (2026-09-14).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates.
+
+The 20-word atom content minimum applies whenever content is supplied for
+creation or replacement. The existing-id properties-only row form in
+[ADR-047](ADR-047-knowledge-pack.md) supplies no content and changes none: it
+preserves stored content byte for byte, including legacy short or empty content,
+without applying the content minimum to that unchanged value. Supplying content
+continues to require the ordinary row form and its full content validation.
+Section content constraints are unchanged.
+
 ## Current Implementation Status
 
 This ADR is accepted as the governing record for shipped knowledge sections and section

@@ -369,7 +369,7 @@ fn search_arm_candidate_counts(result: &Value) -> (usize, usize) {
 }
 
 fn search_arm_participation_value(participation: SearchArmParticipation) -> Value {
-    json!({
+    let mut value = json!({
         "text": {
             "status": participation.text.status.as_str(),
             "candidate_count": participation.text.candidate_count,
@@ -378,7 +378,14 @@ fn search_arm_participation_value(participation: SearchArmParticipation) -> Valu
             "status": participation.vector.status.as_str(),
             "candidate_count": participation.vector.candidate_count,
         },
-    })
+    });
+    if participation.text.status == SearchArmStatus::Ran && participation.text.candidate_count == 0
+    {
+        value["text"]["reason"] = json!(
+            "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+        );
+    }
+    value
 }
 
 fn bounded_backend_error_message(message: &str) -> String {
@@ -4942,6 +4949,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::{collections::BTreeMap, future::Future, sync::Arc};
     include!("server/plan_tests.rs");
+    include!("server/search_text_reason_tests.rs");
     use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
@@ -10550,7 +10558,11 @@ mod tests {
         assert_eq!(
             search["arm_participation"],
             json!({
-                "text": {"status": "ran", "candidate_count": 0},
+                "text": {
+                    "status": "ran",
+                    "candidate_count": 0,
+                    "reason": "No text candidate survived matching, filtering, fusion, and the result limit. Plain text search combines normalized term groups conjunctively; try fewer terms."
+                },
                 "vector": {"status": "skipped", "candidate_count": 0}
             }),
             "a dense zero-hit query must prove that text ran without a match"

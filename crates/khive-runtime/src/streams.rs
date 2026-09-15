@@ -372,56 +372,38 @@ async fn check_observed(
     now: Option<i64>,
 ) -> Result<Option<KhiveError>, StorageError> {
     for (index, entry) in observed.iter().enumerate() {
-        let current = writer.query_row(SqlStatement {
-            sql: "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
-            params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
-            label: Some("stream-batch-observed".into()),
-        }).await?;
-        let current = current
-            .map(|row| {
-                let id = match row.get("id") {
-                    Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|_| {
-                        StorageError::Internal("invalid observed note identity".into())
-                    })?,
-                    _ => {
-                        return Err(StorageError::Internal(
-                            "invalid observed note identity".into(),
-                        ))
-                    }
-                };
-                let version = match row.get("version") {
-                    Some(SqlValue::Integer(version)) => *version,
-                    _ => {
-                        return Err(StorageError::Internal(
-                            "invalid observed note version".into(),
-                        ))
-                    }
-                };
-                Ok::<_, StorageError>((id, version))
-            })
-            .transpose()?;
+        let current = crate::fence_identity::read_holder(
+            writer,
+            namespace,
+            &entry.kind,
+            &entry.key,
+            "stream-batch-observed",
+        )
+        .await?;
         // No live holder is the existing version conflict. Identity conflict
         // specifically names a replacement, so current_id is always present.
-        if let (Some(asserted), Some((current_id, _))) = (entry.id, current) {
-            if asserted != current_id {
+        if let (Some(asserted), Some(holder)) = (entry.id, current.as_ref()) {
+            if asserted != holder.id {
                 let version = entry.version.ok_or_else(|| {
                     StorageError::Internal("identity observation missing version".into())
                 })?;
+                let mut details = vec![
+                    ("reason", "identity_conflict".into()),
+                    ("key", entry.key.clone()),
+                    ("kind", entry.kind.clone()),
+                    ("version", version.to_string()),
+                ];
+                details.extend(crate::fence_identity::identity_evidence(
+                    asserted, holder.id,
+                ));
+                details.push(("index", index.to_string()));
                 return Ok(Some(
                     KhiveError::conflict("stream observation identity precondition failed")
-                        .with_details(Details::new_owned(vec![
-                            ("reason", "identity_conflict".into()),
-                            ("key", entry.key.clone()),
-                            ("kind", entry.kind.clone()),
-                            ("version", version.to_string()),
-                            ("id", asserted.to_string()),
-                            ("current_id", current_id.to_string()),
-                            ("index", index.to_string()),
-                        ])),
+                        .with_details(Details::new_owned(details)),
                 ));
             }
         }
-        let current = current.map(|(_, version)| version);
+        let current = current.map(|holder| holder.version);
         if current != entry.version {
             let mut details = vec![
                 ("reason", "version_conflict".into()),
@@ -440,51 +422,28 @@ async fn check_observed(
             ));
         }
         if let Some(field) = &entry.live_until {
-            let content = writer.query_scalar(SqlStatement {
-                sql: "SELECT content FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
-                params: vec![SqlValue::Text(namespace.into()), SqlValue::Text(entry.kind.clone()), SqlValue::Text(entry.key.clone())],
-                label: Some("stream-batch-live-until".into()),
-            }).await?;
-            let doc: Value = match content {
-                Some(SqlValue::Text(content)) => {
-                    serde_json::from_str(&content).unwrap_or(Value::Null)
-                }
-                _ => Value::Null,
-            };
-            let found = field
-                .split('.')
-                .try_fold(&doc, |value, part| value.get(part));
-            let value = found.unwrap_or(&Value::Null);
-            let deadline = value
-                .as_str()
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
             let now = now
                 .ok_or_else(|| StorageError::Internal("missing stream observation clock".into()))?;
-            let clock = chrono::DateTime::from_timestamp_micros(now)
-                .ok_or_else(|| StorageError::Internal("invalid stream observation clock".into()))?;
-            let reason = match deadline {
-                None => Some("live_until_unreadable"),
-                Some(deadline) if deadline <= clock => Some("expired"),
-                Some(_) => None,
-            };
-            if let Some(reason) = reason {
+            if let Some(refusal) = crate::live_until::evaluate(
+                writer,
+                namespace,
+                &entry.kind,
+                &entry.key,
+                field,
+                now,
+                "stream-batch-live-until",
+            )
+            .await?
+            {
                 let mut details = vec![
-                    ("reason", reason.into()),
+                    ("reason", refusal.reason().into()),
                     ("key", entry.key.clone()),
                     ("kind", entry.kind.clone()),
                     ("version", entry.version.unwrap().to_string()),
                     ("field", field.clone()),
                     ("index", index.to_string()),
                 ];
-                if reason == "expired" {
-                    // Only a value that parsed as RFC 3339 is echoed, because that value is
-                    // the deadline the caller pinned. The path is caller-chosen, so echoing
-                    // whatever it lands on would read any field of the document back out.
-                    details.push(("value", value.to_string()));
-                    details.push(("now", micros_to_iso(now)));
-                } else {
-                    details.push(("value_type", found.map_or("absent", json_type_name).into()));
-                }
+                details.extend(refusal.details());
                 return Ok(Some(
                     KhiveError::conflict("stream observation time precondition failed")
                         .with_details(Details::new_owned(details)),
@@ -495,33 +454,8 @@ async fn check_observed(
     Ok(None)
 }
 
-/// The JSON type of a `live_until` field, which an unreadable refusal reports in
-/// place of the value itself.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 async fn observation_clock(writer: &mut dyn SqlWriter) -> Result<i64, StorageError> {
-    match writer
-        .query_scalar(SqlStatement {
-            sql: "SELECT khive_now_micros()".into(),
-            params: vec![],
-            label: Some("stream-batch-clock".into()),
-        })
-        .await?
-    {
-        Some(SqlValue::Integer(now)) => Ok(now),
-        _ => Err(StorageError::Internal(
-            "invalid stream observation clock".into(),
-        )),
-    }
+    crate::live_until::writer_clock(writer, "stream-batch-clock").await
 }
 
 struct BatchFailure {

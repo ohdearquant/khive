@@ -23,9 +23,9 @@ use crate::vocab::NoteKind;
 pub(crate) use super::params::DbDiagnosticsParams;
 pub(crate) use super::params::{
     ContextParams, CreateParams, DeleteParams, GetParams, LinkParams, ListParams,
-    ListProposalsParams, MergeParams, NeighborsParams, ProposeParams, QueryParams, ReviewParams,
-    SearchParams, StatsParams, TraverseParams, UpdateParams, WhoamiParams, WithdrawParams,
-    HARD_CAP,
+    ListProposalsParams, MergeParams, NeighborProjection, NeighborsParams, ProposeParams,
+    QueryParams, RestoreParams, ReviewParams, SearchParams, StatsParams, TraverseParams,
+    UpdateParams, WhoamiParams, WithdrawParams, HARD_CAP,
 };
 
 // ---- Kind canonicalization ----

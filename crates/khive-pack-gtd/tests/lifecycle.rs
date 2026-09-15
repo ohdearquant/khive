@@ -591,7 +591,7 @@ async fn noop_transition_without_note_omits_note_recorded_field() {
 }
 
 #[tokio::test]
-async fn noop_transition_with_note_persists_transition_note_in_properties() {
+async fn noop_transition_with_note_does_not_change_properties() {
     use khive_storage::{SqlStatement, SqlValue};
 
     let rt = rt();
@@ -603,8 +603,7 @@ async fn noop_transition_with_note_persists_transition_note_in_properties() {
     .await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    // issue #15: current == target, but the note must still land in the
-    // task's stored properties, not be silently dropped.
+    // A same-status request has no lifecycle event to annotate.
     let r = pack
         .dispatch(
             "gtd.transition",
@@ -613,7 +612,8 @@ async fn noop_transition_with_note_persists_transition_note_in_properties() {
         .await
         .expect("noop transition with note should succeed");
     assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note_recorded"], true);
+    assert_eq!(r["note_recorded"], false);
+    assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -637,13 +637,13 @@ async fn noop_transition_with_note_persists_transition_note_in_properties() {
                 None
             }
         }),
-        Some("blocked on review"),
-        "properties.transition_note must be persisted on a noop transition (issue #15)"
+        None,
+        "properties.transition_note must not be persisted on a noop transition"
     );
 }
 
 #[tokio::test]
-async fn repeated_noop_notes_are_last_write_wins() {
+async fn repeated_noop_notes_leave_properties_unchanged() {
     use khive_storage::{SqlStatement, SqlValue};
 
     let rt = rt();
@@ -664,7 +664,8 @@ async fn repeated_noop_notes_are_last_write_wins() {
             .await
             .expect("noop transition with note should succeed");
         assert_eq!(r["transitioned"], false);
-        assert_eq!(r["note_recorded"], true);
+        assert_eq!(r["note_recorded"], false);
+        assert!(r.get("audit_persisted").is_none());
     }
 
     let sql = rt.sql();
@@ -687,13 +688,13 @@ async fn repeated_noop_notes_are_last_write_wins() {
                 None
             }
         }),
-        Some("second update"),
-        "a later noop note must overwrite the stored transition_note (last write wins)"
+        None,
+        "noop notes must not create or overwrite transition_note"
     );
 }
 
 #[tokio::test]
-async fn empty_string_noop_note_is_persisted() {
+async fn empty_string_noop_note_is_ignored() {
     use khive_storage::{SqlStatement, SqlValue};
 
     let rt = rt();
@@ -713,7 +714,8 @@ async fn empty_string_noop_note_is_persisted() {
         .await
         .expect("noop transition with empty note should succeed");
     assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note_recorded"], true);
+    assert_eq!(r["note_recorded"], false);
+    assert!(r.get("audit_persisted").is_none());
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -735,7 +737,7 @@ async fn empty_string_noop_note_is_persisted() {
                 None
             }
         }),
-        Some(""),
-        "an explicitly supplied empty note is stored as the empty string, not dropped"
+        None,
+        "an explicitly supplied empty note is not persisted on a no-op"
     );
 }

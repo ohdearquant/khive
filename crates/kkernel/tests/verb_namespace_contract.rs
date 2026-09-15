@@ -7,8 +7,9 @@
 //! `memory.recall_embed`, not `memory.recall.embed`.
 //!
 //! One documented exception: the kg pack also carries the `stream`
-//! sub-namespace (`stream.append`, `stream.read`, `stream.stat`). ADR-174
-//! section 2 registers those three verbs under kg because the entries are kg
+//! sub-namespace (`stream.append`, `stream.read`, `stream.stat`,
+//! `stream.batch`). ADR-174 section 2 registers those four verbs under kg
+//! because the entries are kg
 //! notes and the append writes the note and the ledger row in one writer
 //! transaction, which a separate pack could only do by reaching into kg's
 //! write path. The exception is pack-scoped and closed: kg may carry exactly
@@ -51,12 +52,14 @@ use khive_pack_schedule::SchedulePack as _;
 /// Bare verb names owned by the kg substrate pack. These are the only names
 /// permitted to omit the `<pack>.` prefix.
 ///
-/// The 20 entries cover CRUD + graph + curation + proposal primitives, plus
+/// The 22 entries cover CRUD + graph + curation + proposal primitives, plus
 /// `stats` for aggregate namespace metrics, `verbs` for verb-registry
 /// introspection (J-help PR #464), `context` for entity-anchored graph
 /// context in one call (ADR-089), `resolve` for reference resolution (S1),
 /// `whoami` for caller identity introspection, and `db_diagnostics` for the
-/// WAL/checkpoint operator diagnostics surface (ADR-091).
+/// WAL/checkpoint operator diagnostics surface (ADR-091), plus `restore` for
+/// caller-scoped tombstone restoration and `scan` for the secret gate's
+/// write-free verdict on a note body.
 const KG_SUBSTRATE_VERBS: &[&str] = &[
     "create",
     "get",
@@ -64,6 +67,7 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
     "stats",
     "update",
     "delete",
+    "restore",
     "search",
     "link",
     "neighbors",
@@ -77,6 +81,7 @@ const KG_SUBSTRATE_VERBS: &[&str] = &[
     "context",
     "resolve",
     "whoami",
+    "scan",
     "db_diagnostics",
 ];
 

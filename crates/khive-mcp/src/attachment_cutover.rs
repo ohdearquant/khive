@@ -240,7 +240,7 @@ async fn coordinate_attachment_cutover_inner(
         return Ok(());
     }
 
-    let handle = khive_runtime::daemon::spawn_tracked_task(async move {
+    let handle = khive_runtime::spawn_named_tracked_task("attachment_cutover", async move {
         let sql = backend.sql();
         #[cfg(test)]
         test_sync::before_gc_owner(sql.as_ref()).await;

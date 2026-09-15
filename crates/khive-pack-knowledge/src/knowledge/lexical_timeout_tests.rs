@@ -60,6 +60,7 @@ async fn fetch(runtime: &KhiveRuntime, query: &str) -> FtsFetchOutcome {
             &[],
             &[],
             5,
+            &FtsTermBudget::new(),
             LexicalStage::new(LexicalPass::Full, started, configured),
         )
         .await
@@ -138,6 +139,7 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "namespace_existence",
             "zzoraclezz",
         ),
+        (LexicalPhase::ExactNameProbe, "exact_name_probe", "AI"),
     ] {
         let events = TimeoutEvents::default();
         let outcome = with_timeout(
@@ -168,6 +170,60 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "elapsed must be frozen at capture"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn short_exact_name_timeout_degrades_within_original_lexical_budget() {
+    let runtime = fixture(false).await;
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let configured = Duration::from_millis(2000);
+    khive_storage::scope_request_read_deadline(Duration::from_millis(1000), async {
+        let started = tokio::time::Instant::now();
+        let mut stage = LexicalStage::new(LexicalPass::Full, started, configured);
+        stage
+            .read(LexicalPhase::ReaderOpen, async {
+                tokio::time::advance(Duration::from_millis(30)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let sql = runtime.sql();
+        let mut reader = sql.reader().await.unwrap();
+        let outcome = with_timeout(
+            vec![LexicalPhase::ExactNameProbe],
+            Duration::from_millis(7),
+            fetch_exact_name_candidate(reader.as_mut(), "local", "AI", None, &[], &[], &mut stage),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ExactNameProbe::TimedOut));
+        let timeout = stage.timeout.unwrap();
+        assert_eq!(timeout.configured_budget_ms, 2000);
+        assert_eq!(timeout.effective_budget_ms, 1000);
+        assert_eq!(timeout.stage_elapsed_ms, 37);
+        assert_eq!(timeout.operation_elapsed_ms, 7);
+    })
+    .await;
+
+    let response = with_timeout(
+        vec![LexicalPhase::ExactNameProbe],
+        Duration::from_millis(7),
+        KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "AI", "rerank": false}),
+            &vamana::new_shared(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["total"], 0);
+    assert_eq!(response["candidate_provenance"]["lexical"], "timed_out");
+    assert_eq!(response["degraded"]["lexical_timeout"], true);
+    assert_eq!(response["degraded"]["lexical_timeout_instrumented"], true);
+    assert!(response["degraded"]
+        .get("lexical_timeout_details")
+        .is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -223,7 +279,7 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
         let expected = if verb == "knowledge.search" {
             json!({
                 "results": [], "total": 0,
-                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
                 "degraded": {"lexical_timeout": true}
             })
         } else {
@@ -264,7 +320,7 @@ async fn healthy_dispatch_omits_timeout_details() {
         if verb == "knowledge.search" {
             assert_eq!(
                 response["candidate_provenance"],
-                json!({"lexical": "matched", "fallback": "none"})
+                json!({"lexical": "matched", "fallback": "none", "terms_truncated": false})
             );
             assert_eq!(
                 response["results"][0]["score_provenance"],
@@ -301,7 +357,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             healthy,
             json!({
                 "results": [], "total": 0,
-                "candidate_provenance": {"lexical": "no_match", "fallback": "none"},
+                "candidate_provenance": {"lexical": "no_match", "fallback": "none", "terms_truncated": false},
             }),
             "a healthy miss must not reveal a foreign match: {foreign}"
         );
@@ -338,7 +394,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             assert_eq!(
                 response,
                 json!({"results": [], "total": 0,
-                "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+                "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
                 "degraded": {
                     "lexical_timeout": true, "lexical_timeout_instrumented": true,
                     "lexical_timeout_details": [{
@@ -364,7 +420,7 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
         assert_eq!(
             *response,
             json!({"results": [], "total": 0,
-            "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+            "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
             "degraded": {
                 "lexical_timeout": true, "lexical_timeout_instrumented": true
             }})
@@ -439,7 +495,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
         assert_eq!(
             response,
             json!({"results": [], "total": 0,
-            "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none"},
+            "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none", "terms_truncated": false},
             "degraded": {
                 "lexical_timeout": true, "lexical_timeout_instrumented": true,
                 "lexical_timeout_details": [{
@@ -461,7 +517,7 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
 #[test]
 fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases() {
     let base = json!({"results": [],
-    "candidate_provenance": {"lexical": "timed_out", "fallback": "none"},
+    "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
     "degraded": {
         "lexical_timeout": true, "reason": "ann_unavailable", "mode": "no_match", "cache_safe": false,
         "body_lines_timeout": true, "hydration_failures": 2, "member_sizing_timeout": ["domain"]
@@ -602,6 +658,7 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
     let runtime = KhiveRuntime::memory().expect("runtime");
     seed_low_overlap_corpus(&runtime, 1_000, 20).await;
     let weights = Weights::default();
+    let term_budget = FtsTermBudget::new();
     let ctx = SearchCtx {
         runtime: &runtime,
         ns: "local",
@@ -612,6 +669,7 @@ async fn partial_scored_candidates_match_the_base_rare_term_fixture() {
         fetch_limit: 100,
         statuses: &[],
         exclude_statuses: &[],
+        term_budget: &term_budget,
     };
     for query in ["term1 term18", "term18 term1"] {
         let outcome = with_fts_deadline_advance_after_term(
@@ -675,7 +733,7 @@ async fn configured_budget_uses_the_stage_override() {
     .expect("public dispatch");
     assert_eq!(
         response["candidate_provenance"],
-        json!({"lexical": "timed_out", "fallback": "none"})
+        json!({"lexical": "timed_out", "fallback": "none", "terms_truncated": false})
     );
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["configured_budget_ms"],

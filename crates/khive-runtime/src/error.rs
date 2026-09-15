@@ -499,6 +499,21 @@ impl DenialReceipt {
     }
 }
 
+/// Payload of [`RuntimeError::RefusedWithReceipt`].
+#[derive(Debug, Clone)]
+pub struct ReceiptRefusal {
+    /// Wire `code`, naming which refusal surface produced this.
+    pub code: &'static str,
+    /// The refusal's own sentence, unchanged.
+    pub message: String,
+    /// Id of the durable row the refusal wrote.
+    pub receipt_id: String,
+    /// Why the call was refused, as the receipt records it.
+    pub reason: String,
+    /// Surface-specific structured evidence, an object or `Value::Null`.
+    pub detail: serde_json::Value,
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
@@ -605,6 +620,26 @@ pub enum RuntimeError {
         verb: String,
         param: String,
     },
+
+    /// A handler refused the call and wrote a durable receipt naming the refusal.
+    ///
+    /// The durable id rides as its own field. Without it a consumer has to find
+    /// the id inside the refusal sentence with a regular expression, which makes
+    /// the wording of a message part of the contract and breaks silently the
+    /// first time someone rewords it. `message` keeps whatever text the refusal
+    /// already produced, so a reader that does parse it today keeps working.
+    ///
+    /// `reason` is the refusal's own explanation, the same value the receipt
+    /// stores, so a consumer keeping its own command record does not parse the
+    /// sentence for it either. `detail` carries the surface's other structured
+    /// evidence (for exec, the resolved output cap); it must be a JSON object or
+    /// null, and its members are projected beside the fields above without
+    /// overriding them.
+    ///
+    /// Boxed so the refusal's evidence does not widen every `Result` in the
+    /// runtime: the error enum is copied on each `?`, the refusal is rare.
+    #[error("{}", .0.message)]
+    RefusedWithReceipt(Box<ReceiptRefusal>),
 
     /// Gate denied this verb invocation.
     ///
@@ -825,6 +860,7 @@ impl RuntimeError {
             Self::SecretDetected(_) => "SecretDetected",
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
+            Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
         }
     }
 

@@ -368,6 +368,25 @@ pub struct NeighborQuery {
     pub min_weight: Option<f64>,
 }
 
+/// Exclusive continuation boundary for the deterministic neighbor order.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NeighborCursor {
+    pub weight: f64,
+    pub node_id: Uuid,
+    pub edge_id: Uuid,
+}
+
+impl NeighborCursor {
+    /// Return true when `hit` sorts strictly after this cursor in the public
+    /// neighbor order (`weight DESC, node_id ASC, edge_id ASC`).
+    pub fn is_after(&self, hit: &NeighborHit) -> bool {
+        hit.weight < self.weight
+            || (hit.weight == self.weight
+                && (hit.node_id > self.node_id
+                    || (hit.node_id == self.node_id && hit.edge_id > self.edge_id)))
+    }
+}
+
 /// One neighbor returned by a graph query.
 ///
 /// Field naming (#148): on the JSON wire, the node identifier is serialized as

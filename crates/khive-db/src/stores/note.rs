@@ -746,6 +746,9 @@ fn json_type_expr(path: &str) -> String {
 /// pages. Keeping the clause in one helper prevents the cheaper projection
 /// from drifting into a different offset sequence.
 fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
+    if filter.unordered {
+        return String::new();
+    }
     match &filter.order_by {
         Some((path, dir)) => {
             let dir_str = match dir {
@@ -1699,6 +1702,15 @@ impl NoteStore for SqlNoteStore {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> Result<Page<Note>, StorageError> {
+        if filter.unordered {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered".into(),
+                message: "NoteFilter.unordered is supported only by \
+                          query_notes_filtered_count_free"
+                    .into(),
+            });
+        }
         // Validate paths before entering spawn_blocking (closures return rusqlite::Error).
         for pf in &filter.property_filters {
             validate_json_path(&pf.json_path)?;
@@ -2019,6 +2031,15 @@ impl NoteStore for SqlNoteStore {
         filter: &NoteFilter,
         max_rows: u32,
     ) -> Result<Vec<Note>, StorageError> {
+        if filter.unordered {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_bounded".into(),
+                message: "NoteFilter.unordered is supported only by \
+                          query_notes_filtered_count_free"
+                    .into(),
+            });
+        }
         for pf in &filter.property_filters {
             validate_json_path(&pf.json_path)?;
         }
@@ -2149,3 +2170,7 @@ mod tests;
 #[cfg(test)]
 #[path = "comm_filter_plan_tests.rs"]
 mod comm_filter_plan_tests;
+
+#[cfg(test)]
+#[path = "note_list_plan_tests.rs"]
+mod note_list_plan_tests;

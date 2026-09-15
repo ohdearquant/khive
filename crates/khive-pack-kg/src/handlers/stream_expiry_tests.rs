@@ -103,7 +103,11 @@ async fn expiry_arm2_live_and_pinned_version() {
             .unwrap()["committed"],
         true
     );
-    document(&registry, "lease", doc, Some(1)).await;
+    let changed_doc = json!({
+        "expires_at": doc["expires_at"].clone(),
+        "changed": true
+    });
+    document(&registry, "lease", changed_doc, Some(1)).await;
     let error = refused_unchanged(&rt, &registry, args, "version_conflict", "lease").await;
     assert_eq!(error["details"]["current_version"], "2");
 }
