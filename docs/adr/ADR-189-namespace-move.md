@@ -157,7 +157,9 @@ Only subject classes are routed. Everything else is carried:
 - `knowledge_sections` with its atom,
 - `proposals_open` with the namespace it belongs to,
 - every `vec_*` row, with its subject,
-- the `brain_*` rows and the `ann_*` bookkeeping, with the subject whose state they hold.
+- the `brain_*` rows, with the subject whose state they hold,
+- `ann_write_log`, appended under the target namespace at a fresh `seq`; `ann_consumer_watermark`
+  and `ann_consumer_pending` are not written at all.
 
 None of these appears in the route map. A caller cannot route them independently, because they have
 no independent existence.
@@ -202,6 +204,33 @@ The mover issues no `BEGIN IMMEDIATE` of its own. `WriterTaskHandle::send` hands
 connection already inside the transaction it opened and owns the commit or rollback
 (`writer_task.rs:73-76`, `:253-258`); a nested bare `BEGIN IMMEDIATE` is a SQLite error, so the
 primitive is one closure of statements, not a script.
+
+### One transaction per backend, and a store can have several
+
+A pack can be assigned its own backend, and then its records live in a different SQLite file. That
+is not a hypothetical configuration: a `[packs.comm] backend = "comm"` and
+`[packs.knowledge] backend = "knowledge"` assignment puts comm's notes and the knowledge atoms in
+two files beside the main one, and a route map that sends `note:message` to one namespace and
+`note:observation` to another spans two of them. SQLite has no transaction across unattached
+databases, so "the whole move is one `BEGIN IMMEDIATE`" is true of one backend and false of a store
+that has three.
+
+The primitive is therefore scoped to one backend. It takes the connection it is given, censuses
+that backend's schema, and moves that backend's rows in that backend's transaction. A move over a
+split store is the same route map applied to each backend in turn, which composes correctly because
+a class routed with no rows in this backend succeeds reporting zero: the same rule that makes the
+map verifiable by its caller is what makes it re-runnable per file.
+
+What does not compose is atomicity, and the honest statement is that it cannot. A split store gets
+N transactions, and a failure in the third leaves the first two applied. The primitive reports
+counts per backend so a caller can see where it stopped; it does not offer a distributed commit it
+has no mechanism for.
+
+One carry rule depends on this. `brain_*` and `ann_*` rows are carried with the subject whose state
+they hold, and that only works while they sit in the same backend as the subject. No pack assignment
+splits them today. A deployment that gave the brain pack its own backend would leave those rows with
+no subject to be carried by, and the move would silently skip them - so that assignment needs this
+paragraph revisited before it is made, rather than after.
 
 ### A stream member cannot move at all
 
@@ -284,6 +313,8 @@ missed: the first skips rows, the second corrupts them.
   than by a spot check, with the vector tables enumerated from `sqlite_master` rather than from a
   list written into the test.
 - A concurrent writer during the move cannot produce a resurrected or a lost row.
+- A route map naming classes whose rows live in another backend succeeds here reporting zero for
+  them, so the same map is re-runnable against each backend of a split store.
 - A route map missing a kind that has rows refuses without writing anything, and a routed kind with
   zero rows succeeds reporting zero.
 - A collision on any reachable constraint refuses the whole move and names the rows. The fixture
