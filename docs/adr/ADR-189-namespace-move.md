@@ -210,9 +210,15 @@ target namespace. They move with the records. `brain_serve_ledger` moves with th
 by id, and the namespace column on the row is carried rather than reinterpreted.
 
 `events` stays where it is. The event log is the record of what happened under the namespace it
-happened under, and rewriting it makes the history claim something that did not occur. The
-consequence is real and is stated here so that it is a documented cost rather than a surprise: a
-caller reading an audit trail that spans a move reads both namespaces.
+happened under, and rewriting it makes the history claim something that did not occur. That is the
+whole reason, and it does not need a cost to justify it.
+
+The cost it does carry is narrow and worth stating precisely, because the wider version invites a
+workaround nobody needs. Only a read that FILTERS BY NAMESPACE pays it: `stores/event.rs:1264` and
+the list at `:1314` scope by namespace, so after a move those return the moved records' history
+under the source namespace and a reader wanting the whole trail asks for both. A read keyed on
+anything else - by id at `:387`, or by any caller-side identifier that is not the namespace - is
+unaffected, and there is no verb today that publishes a namespace-scoped event read to a consumer.
 
 ## Consequences
 
