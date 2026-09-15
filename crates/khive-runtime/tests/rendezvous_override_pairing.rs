@@ -145,7 +145,13 @@ async fn only_socket_override_refuses_and_names_the_set_and_missing_variables() 
          operator can see whose file it is, got: {message}"
     );
     assert!(
-        message.contains(&home.join(".khive").join("khived.sock").display().to_string()),
+        message.contains(
+            &home
+                .join(".khive")
+                .join("khived.sock")
+                .display()
+                .to_string()
+        ),
         "the refusal must name the socket the incumbent daemon is serving, not only the \
          socket being started, got: {message}"
     );
@@ -184,7 +190,13 @@ async fn only_pid_override_refuses_and_names_the_set_and_missing_variables() {
         "the refusal must quote the private PID file this boot was given, got: {message}"
     );
     assert!(
-        message.contains(&home.join(".khive").join("khived.sock").display().to_string()),
+        message.contains(
+            &home
+                .join(".khive")
+                .join("khived.sock")
+                .display()
+                .to_string()
+        ),
         "the refusal must name the shared socket this boot would have bound, which is the \
          one the incumbent daemon is serving, got: {message}"
     );
