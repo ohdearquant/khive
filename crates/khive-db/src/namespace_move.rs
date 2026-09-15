@@ -589,9 +589,23 @@ pub fn validate(
 ///   name, so there is nothing to join on;
 /// - a partial index carries a `WHERE` clause that `index_xinfo` does not
 ///   report, so a join ignoring it reports clashes the constraint would not have
-///   raised — and `idx_comm_message_external_id` is exactly that shape, filtered
-///   on `deleted_at IS NULL`, so two soft-deleted rows sharing an external id
-///   would refuse a move SQLite would have allowed.
+///   raised.
+///
+/// The second rule covers two cases that are not alike, and saying so here keeps
+/// the comment from presenting one reason for both.
+/// `idx_comm_message_external_id` (`sql/005-unique-comm-external-id.sql:33`) is
+/// unreachable either way: its third key column is `json_extract(properties,
+/// '$.external_id')` and its predicate calls the same function twice, so neither
+/// the key nor the filter can be expressed without evaluating it on both sides.
+/// `idx_notes_namespace_kind_key` (`sql/028-notes-key.sql:4`) is not like that at
+/// all: three plain column names and `WHERE key IS NOT NULL AND deleted_at IS
+/// NULL`, which a source/target join CAN express exactly. It is excluded only
+/// because `index_xinfo` does not hand over the `WHERE`, and it is the collision
+/// a consolidation of two namespaces is most likely to hit, since two notes
+/// sharing a key under one kind is the ordinary case rather than the exotic one.
+/// Admitting it means deciding which predicate shapes a parse may accept, and a
+/// predicate read permissively would refuse moves SQLite allows, so it is left
+/// out until that rule exists rather than guessed at here.
 ///
 /// What the excluded constraints get instead is the constraint itself: the move
 /// issues plain statements, they error, and the caller's transaction rolls back.
@@ -915,15 +929,21 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     let census = namespace_census::census(conn)?;
     validate(conn, &census, request)?;
 
+    // Over DISTINCT targets, not over routes. `collisions_for` is a function of
+    // the constraint and the two namespaces and does not read the route's class,
+    // so two routes sharing a target ask the same question twice and the answers
+    // are byte-identical. A `Collision` carries no route, so the repeats are not
+    // a second fact about a second class, they are the same row printed again.
+    // Found by the fixture, which planted three note kinds bound for one target
+    // and read back the same collision three times.
+    let mut targets: BTreeSet<&str> = BTreeSet::new();
+    for route in &request.routes {
+        targets.insert(route.target.as_str());
+    }
     let mut collisions = Vec::new();
     for constraint in namespace_census::reachable_constraints(&census) {
-        for route in &request.routes {
-            collisions.extend(collisions_for(
-                conn,
-                constraint,
-                &request.source,
-                &route.target,
-            )?);
+        for target in &targets {
+            collisions.extend(collisions_for(conn, constraint, &request.source, target)?);
         }
     }
     if !collisions.is_empty() {
@@ -991,11 +1011,8 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     }
 
     // Learned state follows the subject it is about. Run per distinct target, so
-    // a partitioning move sends each row after the subject it names.
-    let mut targets: BTreeSet<&str> = BTreeSet::new();
-    for route in &request.routes {
-        targets.insert(route.target.as_str());
-    }
+    // a partitioning move sends each row after the subject it names. The set is
+    // the one the pre-flight above already built, for the same reason.
     for table in SUBJECT_KEYED_TABLES {
         for target in &targets {
             let moved = conn.execute(
@@ -1344,5 +1361,58 @@ mod tests {
             )
             .expect("count");
         assert_eq!(taken_by_target, 1);
+    }
+    /// Two routes bound for one target report a shared collision once, not twice.
+    ///
+    /// The pre-flight reads a constraint and two namespaces and never reads the
+    /// route's class, so iterating routes asked the same question once per route
+    /// and pushed byte-identical rows. A `Collision` carries no route, so a
+    /// repeat says nothing a reader can act on: it inflates the list in
+    /// proportion to how finely the caller partitioned its request, which is the
+    /// one thing the refusal should be independent of.
+    ///
+    /// The arm fails on the unfixed code by reporting the same collision three
+    /// times, once per route. Restoring the route-keyed loop is the control.
+    #[test]
+    fn two_routes_to_one_target_report_a_shared_collision_once() {
+        let conn = migrated();
+        // The clash is on the atom slug, which is a plain two-column unique
+        // index and the one collision a SQL seed can plant honestly. Every class
+        // present in the source must be routed or `validate` refuses first, so
+        // the source holds exactly what these three routes name.
+        seed_note(&conn, "n1", "source", "observation");
+        seed_note(&conn, "n2", "source", "insight");
+        for (id, namespace) in [("a1", "source"), ("a2", "target")] {
+            conn.execute(
+                "INSERT INTO knowledge_atoms \
+                 (id, namespace, slug, name, created_at, updated_at) \
+                 VALUES (?1, ?2, 'shared-slug', 'an atom', 1, 1)",
+                rusqlite::params![id, namespace],
+            )
+            .expect("seed an atom on each side of the move");
+        }
+
+        let request = MoveRequest::new(
+            "source",
+            vec![
+                route("note:observation", "target"),
+                route("note:insight", "target"),
+                route("atom", "target"),
+            ],
+        );
+        let error = move_namespace(&conn, &request).expect_err("the pre-flight refuses");
+        let MoveError::Collisions { collisions } = error else {
+            panic!("expected a named collision list, got {error:?}");
+        };
+
+        assert_eq!(
+            collisions.len(),
+            1,
+            "three routes share one target, so the one blocking row is reported \
+             once: {collisions:?}"
+        );
+        assert_eq!(collisions[0].table, "knowledge_atoms");
+        assert_eq!(collisions[0].constraint, "idx_knowledge_atoms_ns_slug");
+        assert_eq!(collisions[0].key, "shared-slug");
     }
 }
