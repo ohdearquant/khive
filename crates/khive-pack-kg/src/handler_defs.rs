@@ -71,11 +71,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     HandlerDef {
         name: "create",
         description: "Create an entity or note (singleton) or a batch of entities (bulk via \
-                      `items`). When a new entity's name resembles one that already exists, the \
-                      response carries `similar_existing`. Read it before creating another: in \
-                      most cases the right next step is to link to what is already there rather \
-                      than add a near-duplicate. The field is absent when nothing similar was \
-                      found, and suppressed entirely by `skip_dedup_check`.",
+                      `items`). Every singleton `kind=entity` create carries `similar_existing`, \
+                      an array of up to 3 existing entities of the same kind whose hybrid-search \
+                      score against the new name is at least 0.1, each with `id`, `name` and \
+                      `score`, ordered by score. Read it before creating another: in most cases \
+                      the right next step is to link to what is already there rather than add a \
+                      near-duplicate. An empty array means the comparison ran and nothing \
+                      qualified. It is never used to report a comparison that could not run: \
+                      `similar_existing_unavailable_reason` is null when the array is an answer \
+                      and names the failure when it is not, so the two are never confused. Both \
+                      fields are absent for notes, for the bulk `items` path, and when \
+                      `skip_dedup_check` is true.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

@@ -8507,7 +8507,11 @@ async fn create_entity_with_mixed_edges_partial_success() {
 
 // ---- Issue #487: dedup guard tests ----
 
-// Creating a uniquely-named entity produces no `similar_existing` field.
+// Creating a uniquely-named entity reports an EMPTY comparison, not an absent
+// one. This test asserted absence until #2750: absence could not be told apart
+// from a similarity search that failed, and the caller reads this field to
+// decide whether to link instead of create. The two sibling cases below, where
+// no comparison happens at all, still assert absence — that is the distinction.
 #[tokio::test]
 async fn create_entity_dedup_no_similar_when_unique() {
     let pack = pack();
@@ -8522,9 +8526,15 @@ async fn create_entity_dedup_no_similar_when_unique() {
         .await
         .expect("create must succeed");
 
-    assert!(
-        result.get("similar_existing").is_none(),
-        "#487: no similar_existing when no duplicates exist; got: {result}"
+    assert_eq!(
+        result.get("similar_existing"),
+        Some(&json!([])),
+        "#2750: an entity create reports the comparison's result, empty included; got: {result}"
+    );
+    assert_eq!(
+        result.get("similar_existing_unavailable_reason"),
+        Some(&serde_json::Value::Null),
+        "#2750: the comparison ran, so nothing is unavailable; got: {result}"
     );
 }
 
