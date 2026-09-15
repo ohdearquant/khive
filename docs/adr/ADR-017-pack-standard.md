@@ -1040,14 +1040,20 @@ packs became a real need it would get its own ADR. Taking them in order:
 
 Nothing in this amendment authorizes implementation.
 
-## Proposed amendment (2026-09-15): pack schema readiness at startup
+## Amendment (2026-09-15): pack schema readiness at startup
 
-**Status:** Proposed.
+**Status:** Accepted.
 
 Related issue: [#2768](https://github.com/ohdearquant/khive/issues/2768).
 Implementation: [#2782](https://github.com/ohdearquant/khive/pull/2782).
 
 Both single- and multi-backend hosts refuse boot with the owning pack's name when its
 plan fails. Read-only startup remains writer-free: it validates declared columns through
-a reader and refuses missing or incompatible columns before exposing handlers, naming
-the missing table/column pairs.
+a reader and refuses boot on missing or incompatible columns, naming the owning pack
+and the missing or incompatible `table.column` pairs.
+
+Missing means that the declared table or column is absent. A present column is compatible
+only when its declared SQL type matches the declaration's affinity type (`TEXT` or
+`INTEGER`, ignoring case and surrounding whitespace), it is nullable, it has no default,
+and it is neither a primary key nor hidden/generated. A present column that violates any
+of those requirements is incompatible.
