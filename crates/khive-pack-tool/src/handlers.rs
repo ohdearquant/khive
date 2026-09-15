@@ -153,9 +153,7 @@ async fn find_by_name(
     token: &NamespaceToken,
     name: &str,
 ) -> Result<Option<Entity>, RuntimeError> {
-    let Some(snapshot) =
-        crate::pin::current_registration(rt, token.namespace().as_str(), name).await?
-    else {
+    let Some(snapshot) = crate::pin::current_registration(rt, token, name).await? else {
         return Ok(None);
     };
     Ok(Some(rt.get_entity(token, snapshot.id).await?))
@@ -803,7 +801,7 @@ pub(crate) async fn decide_request(
     };
     let row = policy::set_grant_status(
         rt,
-        &ns,
+        token,
         &current,
         status,
         &decider,

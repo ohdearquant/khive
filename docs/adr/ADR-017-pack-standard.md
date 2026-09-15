@@ -917,9 +917,11 @@ rolls back the additions and the rest of the plan together. Repeated installatio
 preserves existing values and does not rely on swallowing duplicate-column errors.
 
 Column-addition targets participate in pack table-ownership collision checks. The
-registry carries declarations to the pack's assigned backend and preserves read-only
-startup's writer-free behavior. A pack that is not loaded supplies neither DDL nor
-additions. Tool grant pins use this mechanism; the core migration chain does not create
+registry carries declarations to the pack's assigned backend. Both single- and multi-backend
+hosts refuse boot with the owning pack's name when its plan fails. Read-only startup remains
+writer-free: it validates declared columns through a reader and refuses missing or incompatible
+columns before exposing handlers, naming the missing table/column pairs. Opening the database
+writable applies the upgrade. A pack that is not loaded supplies neither DDL nor additions. Tool grant pins use this mechanism; the core migration chain does not create
 or upgrade `tool_grants`. The tool pack installs its invalidation trigger and marker-only
 backfill in the same transaction as its auxiliary schema.
 

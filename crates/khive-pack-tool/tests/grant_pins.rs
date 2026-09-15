@@ -2,7 +2,10 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_tool::{RegistryPin, ToolPack};
-use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::pack::PackRuntime;
+use khive_runtime::{
+    KhiveRuntime, Namespace, NamespaceToken, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
 use khive_storage::{Entity, SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
@@ -26,6 +29,13 @@ impl Fixture {
     async fn call(&self, verb: &str, args: Value) -> Value {
         self.registry
             .dispatch(verb, args)
+            .await
+            .unwrap_or_else(|error| panic!("{verb}: {error}"))
+    }
+
+    async fn call_for(&self, token: &NamespaceToken, verb: &str, args: Value) -> Value {
+        ToolPack::new(self.rt.clone())
+            .dispatch(verb, args, &self.registry, token)
             .await
             .unwrap_or_else(|error| panic!("{verb}: {error}"))
     }
@@ -466,5 +476,150 @@ fn schema_key_order_preserves_digest_but_changed_values_do_not() {
             .unwrap()
             .definition_digest(),
         original.definition_digest()
+    );
+}
+
+#[tokio::test]
+async fn visible_registration_list_and_describe_agree_across_namespaces() {
+    let f = Fixture::new();
+    let owner = f.rt.authorize(Namespace::parse("b").unwrap()).unwrap();
+    let registered = f
+        .call_for(
+            &owner,
+            "tool.register",
+            json!({
+                "name":"shared-tool", "source":"mcp:fixture", "side_effect":"write"
+            }),
+        )
+        .await;
+    for (namespace, visible, expected) in [
+        ("a", vec![Namespace::parse("b").unwrap()], true),
+        ("a", vec![], false),
+        ("b", vec![], true),
+    ] {
+        let caller =
+            f.rt.authorize_with_visibility(Namespace::parse(namespace).unwrap(), visible)
+                .unwrap();
+        let listed = f.call_for(&caller, "tool.list", json!({})).await;
+        assert_eq!(
+            listed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["full_id"] == registered["tool"]["full_id"]),
+            expected
+        );
+        let described = ToolPack::new(f.rt.clone())
+            .dispatch(
+                "tool.describe",
+                json!({"tool":"shared-tool"}),
+                &f.registry,
+                &caller,
+            )
+            .await;
+        if expected {
+            assert_eq!(
+                described.unwrap()["tool"]["full_id"],
+                registered["tool"]["full_id"]
+            );
+        } else {
+            assert!(
+                matches!(described, Err(RuntimeError::NotFound(_))),
+                "{described:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn visible_registration_invalidates_legacy_grants_on_every_decision_surface() {
+    let f = Fixture::new();
+    let owner = f.rt.authorize(Namespace::parse("b").unwrap()).unwrap();
+    let caller =
+        f.rt.authorize_with_visibility(
+            Namespace::parse("a").unwrap(),
+            vec![Namespace::parse("b").unwrap()],
+        )
+        .unwrap();
+    let args = json!({"tool":"shared-tool", "actor":"agent:requester"});
+    let requested = f.call_for(&caller, "tool.request", args.clone()).await;
+    let legacy_id = requested["request_id"].clone();
+    let legacy = f
+        .call_for(&caller, "tool.grant", json!({"id":legacy_id}))
+        .await;
+    assert!(legacy["grant"]["registry_id"].is_null());
+    assert!(legacy["grant"]["definition_digest"].is_null());
+    assert_eq!(
+        f.call_for(&caller, "tool.check", args.clone()).await["source"],
+        "grant"
+    );
+
+    let registered = f
+        .call_for(
+            &owner,
+            "tool.register",
+            json!({
+                "name":"shared-tool", "source":"mcp:fixture", "side_effect":"write"
+            }),
+        )
+        .await["tool"]
+        .clone();
+    let check = f.call_for(&caller, "tool.check", args.clone()).await;
+    assert_eq!(check["registered"], true);
+    assert_eq!(check["decision"], "ask");
+    assert_eq!(check["source"], "default");
+    let described = f.call_for(&caller, "tool.describe", args.clone()).await;
+    assert_eq!(described["tool"]["decision"]["decision"], "ask");
+    assert_eq!(described["tool"]["decision"]["source"], "default");
+    let retry = f.call_for(&caller, "tool.request", args.clone()).await;
+    assert_eq!(retry["registered"], true);
+    assert_eq!(retry["decision"], "ask");
+    assert_eq!(retry["source"], "default");
+    assert!(retry["request_id"].is_string());
+    assert_ne!(retry["request_id"], legacy_id);
+    let rows = f
+        .call_for(&caller, "tool.requests", json!({"status":"granted"}))
+        .await;
+    let legacy = rows["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == legacy_id)
+        .unwrap();
+    assert_eq!(legacy["status"], "granted");
+    assert!(legacy["registry_id"].is_null());
+    assert!(legacy["definition_digest"].is_null());
+    assert!(legacy["invalidated_by_registry_id"].is_null());
+
+    let approved = f
+        .call_for(&caller, "tool.grant", json!({"id":retry["request_id"]}))
+        .await;
+    assert_eq!(approved["grant"]["registry_id"], registered["full_id"]);
+    let entity =
+        f.rt.get_entity(
+            &owner,
+            registered["full_id"].as_str().unwrap().parse().unwrap(),
+        )
+        .await
+        .unwrap();
+    let pin = RegistryPin::from_entity(&entity).unwrap();
+    assert_eq!(
+        approved["grant"]["definition_digest"],
+        pin.definition_digest()
+    );
+    assert_eq!(
+        f.call_for(&caller, "tool.check", args.clone()).await["source"],
+        "grant"
+    );
+    let mut properties = entity.properties.unwrap();
+    properties["source"] = json!("mcp:changed-definition");
+    f.properties(&registered, properties).await;
+    assert_eq!(
+        f.call_for(&caller, "tool.check", args.clone()).await["source"],
+        "default"
+    );
+    assert_eq!(
+        f.call_for(&caller, "tool.request", args).await["source"],
+        "default"
     );
 }

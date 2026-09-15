@@ -100,13 +100,19 @@ pub(super) fn validate_columns(
     conn: &Connection,
     additions: &[PackColumnAddition],
 ) -> Result<(), SqliteError> {
+    let mut missing = Vec::new();
     for addition in additions {
+        validate_identifier(addition.table)?;
+        validate_identifier(addition.column)?;
         if !table_exists(conn, addition.table)? || !column_exists_and_matches(conn, addition)? {
-            return Err(SqliteError::InvalidData(format!(
-                "pack schema plan did not create declared column {}.{}",
-                addition.table, addition.column,
-            )));
+            missing.push(format!("{}.{}", addition.table, addition.column));
         }
+    }
+    if !missing.is_empty() {
+        return Err(SqliteError::InvalidData(format!(
+            "pack schema plan did not create declared columns: {}",
+            missing.join(", "),
+        )));
     }
     Ok(())
 }

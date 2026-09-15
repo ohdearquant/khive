@@ -1,6 +1,6 @@
 //! The registry definition approved by a grant or checked by an executor.
 
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{Entity, SqlReader, SqlStatement, SqlValue, StorageError};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -87,13 +87,14 @@ impl RegistrationSnapshot {
 
 pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
     reader: &mut R,
-    namespace: &str,
+    namespaces: &[String],
     name: &str,
 ) -> Result<Option<RegistrationSnapshot>, StorageError> {
     let row = reader
         .query_row(SqlStatement {
             sql: "SELECT id, name, properties FROM entities \
-                  WHERE namespace = ?1 AND kind = 'project' AND deleted_at IS NULL \
+                  WHERE namespace IN (SELECT value FROM json_each(?1)) \
+                    AND kind = 'project' AND deleted_at IS NULL \
                     AND CAST(lower(name) AS BLOB) = ?2 \
                     AND EXISTS (SELECT 1 FROM json_each(entities.tags) \
                                 WHERE lower(json_each.value) = 'tool-registry') \
@@ -101,7 +102,7 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
                            created_at DESC, id ASC LIMIT 1"
                 .into(),
             params: vec![
-                SqlValue::Text(namespace.into()),
+                SqlValue::Json(json!(namespaces)),
                 SqlValue::Blob(name.to_ascii_lowercase().into_bytes()),
                 SqlValue::Text(name.into()),
             ],
@@ -137,11 +138,16 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
 
 pub(crate) async fn current_registration(
     rt: &KhiveRuntime,
-    namespace: &str,
+    token: &NamespaceToken,
     name: &str,
 ) -> Result<Option<RegistrationSnapshot>, RuntimeError> {
+    let namespaces: Vec<String> = token
+        .visible_namespace_strs()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let mut reader = rt.sql().reader().await?;
-    Ok(registration_snapshot(reader.as_mut(), namespace, name).await?)
+    Ok(registration_snapshot(reader.as_mut(), &namespaces, name).await?)
 }
 
 pub(crate) async fn invalidating_registration<R: SqlReader + ?Sized>(

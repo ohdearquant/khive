@@ -12,7 +12,7 @@
 // dispatch and is intentionally co-located.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -1265,6 +1265,7 @@ pub enum PackRegFailure {
     MissingDependency { pack: String, dep: String },
     NoPublicVerbs { pack: String },
     Registry(khive_runtime::RuntimeError),
+    Schema(khive_runtime::PackSchemaCollisionError),
 }
 
 /// Returned by [`KhiveMcpServer::with_packs`] when pack registration fails.
@@ -1284,6 +1285,7 @@ impl std::fmt::Debug for PackRegError {
             }
             PackRegFailure::NoPublicVerbs { pack } => dbg.field("pack", pack),
             PackRegFailure::Registry(source) => dbg.field("source", source),
+            PackRegFailure::Schema(source) => dbg.field("schema", source),
         }
         .finish_non_exhaustive()
     }
@@ -1309,6 +1311,7 @@ impl std::fmt::Display for PackRegError {
                  intentionally vocabulary- or ontology-only"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
+            PackRegFailure::Schema(source) => write!(f, "{source}"),
         }
     }
 }
@@ -1614,10 +1617,14 @@ impl KhiveMcpServer {
                 .collect(),
         );
         registry.call_register_note_write_validators(&runtime);
-        // Apply pack-auxiliary schema plans at startup so pack tables are
-        // present before any handler runs. Errors are logged but not propagated
-        // so a single pack's schema failure cannot abort startup.
-        registry.apply_schema_plans(runtime.backend());
+        // A required pack schema failure must refuse boot before any handler
+        // can run. Use the same validation and error path as multi-backend boot.
+        registry
+            .apply_schema_plans_with_map(&HashMap::new(), runtime.backend())
+            .map_err(|source| PackRegError {
+                failure: PackRegFailure::Schema(source),
+                runtime: runtime.clone(),
+            })?;
         // Capture the pool arc for the WAL checkpoint task. Only available for
         // file-backed databases; in-memory backends return None here.
         let pool = if runtime.backend().is_file_backed() && !runtime.is_read_only() {
