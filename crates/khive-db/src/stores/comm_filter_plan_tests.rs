@@ -1,6 +1,9 @@
 //! Measure mailbox query index candidates using the production SQL builder.
 
-use super::{build_note_filter_where, note_filter_page_order_clause, NOTE_COLUMNS};
+use super::{
+    build_note_filter_read_clause, build_note_filter_where, comm_filter_index_clause,
+    note_filter_page_order_clause, NOTE_COLUMNS,
+};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
 use khive_storage::types::SqlValue;
 use rusqlite::{Connection, StatementStatus};
@@ -204,7 +207,19 @@ fn outbox_filter() -> NoteFilter {
 }
 
 fn measure(conn: &Connection, filter: &NoteFilter) -> Value {
-    let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+    measure_with_pin(conn, filter, true)
+}
+
+fn measure_unpinned(conn: &Connection, filter: &NoteFilter) -> Value {
+    measure_with_pin(conn, filter, false)
+}
+
+fn measure_with_pin(conn: &Connection, filter: &NoteFilter, pinned: bool) -> Value {
+    let (where_sql, mut params) = if pinned {
+        build_note_filter_read_clause("default", filter).unwrap()
+    } else {
+        build_note_filter_where("default", filter).unwrap()
+    };
     params.push(Box::new(21_i64));
     params.push(Box::new(0_i64));
     let sql = format!(
@@ -273,7 +288,7 @@ fn comm_filter_query_plan_candidates_preserve_rows_and_record_unread_risk() {
     let conn = fixture(6000, 10_000);
     let baseline: Vec<_> = ["unread", "read", "all"]
         .iter()
-        .map(|status| measure(&conn, &inbox_filter(status, false)))
+        .map(|status| measure_unpinned(&conn, &inbox_filter(status, false)))
         .collect();
     for (candidate, ddl) in [
         ("base", None),
@@ -286,14 +301,14 @@ fn comm_filter_query_plan_candidates_preserve_rows_and_record_unread_risk() {
         }
         for (index, status) in ["unread", "read", "all"].iter().enumerate() {
             for raw in [false, true] {
-                let result = measure(&candidate_conn, &inbox_filter(status, raw));
+                let result = measure_unpinned(&candidate_conn, &inbox_filter(status, raw));
                 assert_eq!(result["ids"], baseline[index]["ids"]);
                 all.push(json!({"candidate":candidate, "status":status,
                                 "raw_recipient":raw, "result":result}));
             }
         }
         all.push(json!({"candidate":candidate, "box":"sent",
-                        "result":measure(&candidate_conn, &sent_filter())}));
+                        "result":measure_unpinned(&candidate_conn, &sent_filter())}));
     }
     println!(
         "{}",
@@ -321,7 +336,7 @@ fn comm_filter_query_plan_candidates_record_foreign_mailbox_growth() {
                 } else {
                     inbox_filter(status, false)
                 };
-                let result = measure(&conn, &filter);
+                let result = measure_unpinned(&conn, &filter);
                 if foreign_count == 0 {
                     previous_ids.push(result["ids"].clone());
                 } else {
@@ -342,7 +357,7 @@ fn full_then_unread_ddl() -> String {
     include_str!("../../sql/033-notes-message-recipient-direction.sql").to_owned()
 }
 
-fn assert_actor_seek(result: &Value, status: &str) {
+fn assert_inbox_actor_seek(result: &Value, status: &str) {
     let plan = result["plan"]
         .as_array()
         .unwrap()
@@ -352,8 +367,8 @@ fn assert_actor_seek(result: &Value, status: &str) {
         .join("\n");
     let expected_index = match status {
         "unread" => "idx_notes_unread_probe_recipient_direction",
-        "sent" => "idx_comm_message_outbound_ref",
-        _ => "idx_notes_message_recipient_direction",
+        "read" | "all" => "idx_notes_message_recipient_direction",
+        _ => panic!("recipient seek assertion requires an inbox status: {status}"),
     };
     assert!(plan.contains(expected_index), "{status}: {plan}");
     assert!(
@@ -367,13 +382,14 @@ fn comm_filter_fresh_bootstrap_preserves_recipient_plans_without_rebuilds() {
     let conn = Connection::open_in_memory().unwrap();
     let ddl = include_str!("../../sql/notes-ddl.sql");
     conn.execute_batch(ddl).unwrap();
+    assert_listing_index_present(&conn);
     register_comm_indexes(&conn);
     let version: i64 = conn
         .query_row("PRAGMA schema_version", [], |row| row.get(0))
         .unwrap();
     for _ in 0..2 {
         for status in ["unread", "read", "all"] {
-            assert_actor_seek(&measure(&conn, &inbox_filter(status, false)), status);
+            assert_inbox_actor_seek(&measure(&conn, &inbox_filter(status, false)), status);
         }
         conn.execute_batch(ddl).unwrap();
         assert_eq!(
@@ -391,7 +407,7 @@ fn comm_filter_recreated_unread_index_preserves_fresh_reopen_and_analyzed_plans(
     let baseline: Vec<_> = ["unread", "read", "all", "sent"]
         .iter()
         .map(|status| {
-            measure(
+            measure_unpinned(
                 &baseline_conn,
                 &if *status == "sent" {
                     sent_filter()
@@ -436,7 +452,12 @@ fn comm_filter_recreated_unread_index_preserves_fresh_reopen_and_analyzed_plans(
                     inbox_filter(status, false)
                 };
                 let result = measure(&conn, &filter);
-                assert_actor_seek(&result, status);
+                if *status == "sent" {
+                    // ADR-187 pins recipient seeks; sender-only plans remain cost-selected.
+                    assert!(!result["sql"].as_str().unwrap().contains("INDEXED BY"));
+                } else {
+                    assert_inbox_actor_seek(&result, status);
+                }
                 assert_eq!(result["ids"], baseline[index]["ids"]);
                 if *status == "unread" {
                     let steps = result["vm_steps"].as_u64().unwrap();
@@ -485,6 +506,8 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("preanalyzed-mailbox.sqlite");
     let mut conn = fixture_with_connection(Connection::open(&path).unwrap(), 6000, 10_000, None);
+    conn.execute_batch("DROP INDEX idx_notes_namespace_created")
+        .unwrap();
     conn.execute_batch("ANALYZE").unwrap();
     let catalog_before = comm_catalog(&conn);
     let stats_before = comm_stats(&conn);
@@ -502,12 +525,15 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
         .collect();
     let baseline: Vec<_> = filters
         .iter()
-        .map(|filter| measure(&conn, filter))
+        .map(|filter| measure_unpinned(&conn, filter))
         .collect();
 
     // Existing pack indexes survive CREATE IF NOT EXISTS registration during
     // a real upgrade, including their catalog positions and ANALYZE statistics.
     conn.execute_batch(&full_then_unread_ddl()).unwrap();
+    conn.execute_batch(include_str!("../../sql/034-notes-namespace-created.sql"))
+        .unwrap();
+    assert_listing_index_present(&conn);
     let mut measurements = Vec::new();
     for stage in ["upgraded", "reopened"] {
         if stage == "reopened" {
@@ -518,7 +544,11 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
         assert_eq!(comm_stats(&conn), stats_before, "{stage}");
         for (index, status) in ["unread", "read", "all", "sent"].iter().enumerate() {
             let result = measure(&conn, &filters[index]);
-            assert_actor_seek(&result, status);
+            if *status == "sent" {
+                assert!(!result["sql"].as_str().unwrap().contains("INDEXED BY"));
+            } else {
+                assert_inbox_actor_seek(&result, status);
+            }
             assert_eq!(result["ids"], baseline[index]["ids"]);
             if *status == "unread" {
                 let before = baseline[index]["vm_steps"].as_u64().unwrap();
@@ -601,7 +631,7 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                     };
                     let result = measure(&conn, &filter);
                     let sent_baseline =
-                        (*status == "sent").then(|| measure(&baseline_conn, &filter));
+                        (*status == "sent").then(|| measure_unpinned(&baseline_conn, &filter));
                     if let Some(before) = &sent_baseline {
                         assert_eq!(result["sql"], before["sql"]);
                         assert_eq!(result["ids"], before["ids"]);
@@ -610,7 +640,7 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
                         assert!(after_steps <= before_steps,
                             "{fresh_schema}/{foreign_count}/{stage}: sent work regressed ({before} -> {result})");
                     } else {
-                        assert_actor_seek(&result, status);
+                        assert_inbox_actor_seek(&result, status);
                     }
                     if foreign_count == 0 {
                         small_results.push(result.clone());
@@ -633,4 +663,103 @@ fn comm_filter_recreated_unread_index_bounds_work_as_other_mailboxes_grow() {
         "{}",
         json!({"sqlite_version":rusqlite::version(),"bounded_growth":measurements})
     );
+}
+
+fn assert_listing_index_present(conn: &Connection) {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'idx_notes_namespace_created')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        exists,
+        "comm plans must be checked with the shipped listing index present"
+    );
+}
+
+#[test]
+fn comm_seek_pins_match_emitted_predicates_and_preserve_pages() {
+    let conn = fixture(300, 200);
+    conn.execute_batch(&full_then_unread_ddl()).unwrap();
+    assert_listing_index_present(&conn);
+    for (i, properties) in [
+        json!({"direction":"inbound", "read":false}),
+        json!({"direction":"inbound", "to_actor":null, "read":true}),
+        json!({"direction":"inbound", "to_actor":"", "read":false}),
+        json!({"direction":"outbound", "read":false}),
+        json!({"direction":"inbound", "to_actor":null, "read":false}),
+    ]
+    .iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at) VALUES (?1, 'default', 'message', ?2, 90000, 90000)",
+            rusqlite::params![format!("legacy-{i}"), properties.to_string()],
+        ).unwrap();
+    }
+
+    for status in ["unread", "read", "all"] {
+        for op in [
+            FilterOp::EqOrMissingIndexed,
+            FilterOp::EqOrLegacyIndexed,
+            FilterOp::JsonTypeMissingOrNullIndexed,
+        ] {
+            let mut filter = inbox_filter(status, false);
+            filter.property_filters.last_mut().unwrap().op = op;
+            for namespaces in [vec![], vec!["default".to_owned(), "other".to_owned()]] {
+                filter.namespaces = namespaces;
+                let (predicate, _) = build_note_filter_where("default", &filter).unwrap();
+                let expected = if status == "unread" {
+                    " INDEXED BY idx_notes_unread_probe_recipient_direction"
+                } else {
+                    " INDEXED BY idx_notes_message_recipient_direction"
+                };
+                assert_eq!(comm_filter_index_clause(&filter, &predicate), expected);
+                let pinned = measure(&conn, &filter);
+                let unpinned = measure_unpinned(&conn, &filter);
+                assert_inbox_actor_seek(&pinned, status);
+                assert_eq!(pinned["ids"], unpinned["ids"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn unmatched_comm_filters_remain_unpinned() {
+    let conn = fixture(30, 20);
+    let mut filters = vec![
+        inbox_filter("unread", true),
+        sent_filter(),
+        NoteFilter::default(),
+    ];
+    let mut no_direction = inbox_filter("unread", false);
+    no_direction.property_filters.remove(0);
+    filters.push(no_direction);
+    let mut other_kind = inbox_filter("unread", false);
+    other_kind.kind = Some("task".into());
+    filters.push(other_kind);
+    for filter in filters {
+        let (predicate, _) = build_note_filter_where("default", &filter).unwrap();
+        assert_eq!(comm_filter_index_clause(&filter, &predicate), "");
+        let result = measure(&conn, &filter);
+        assert!(!result["sql"].as_str().unwrap().contains("INDEXED BY"));
+        assert_eq!(result["ids"], measure_unpinned(&conn, &filter)["ids"]);
+    }
+}
+
+#[test]
+fn missing_pinned_comm_indexes_are_errors_without_fallback() {
+    for (status, index) in [
+        ("all", "idx_notes_message_recipient_direction"),
+        ("unread", "idx_notes_unread_probe_recipient_direction"),
+    ] {
+        let conn = fixture(30, 20);
+        conn.execute_batch(&full_then_unread_ddl()).unwrap();
+        let result = measure(&conn, &inbox_filter(status, false));
+        conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        let error = conn.prepare(result["sql"].as_str().unwrap()).err().unwrap();
+        assert!(error.to_string().contains(index), "{error}");
+    }
 }

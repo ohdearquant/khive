@@ -1010,6 +1010,66 @@ fn build_note_filter_where(
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 
+// ADR-187: match only compiler-emitted equality/IN terms that constrain every
+// comm seek key. The unread pin additionally requires its exact partial predicate.
+// Inspect whole AND terms, never substrings that might occur inside an OR branch.
+fn comm_filter_index_clause(filter: &NoteFilter, where_sql: &str) -> &'static str {
+    if filter.kind.as_deref() != Some("message") {
+        return "";
+    }
+    let Some(predicate) = where_sql.strip_prefix(" WHERE ") else {
+        return "";
+    };
+    let terms: Vec<_> = predicate.split(" AND ").collect();
+    let numbered_param = |value: &str| {
+        value.strip_prefix('?').is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    };
+    let equality = |prefix: &str| {
+        terms
+            .iter()
+            .any(|term| term.strip_prefix(prefix).is_some_and(numbered_param))
+    };
+    let namespace = equality("namespace = ")
+        || terms.iter().any(|term| {
+            term.strip_prefix("namespace IN (")
+                .and_then(|term| term.strip_suffix(')'))
+                .is_some_and(|values| values.split(", ").all(numbered_param))
+        });
+    let recipient = equality("ifnull(json_extract(properties, '$.to_actor'), '') = ")
+        || terms.contains(&"ifnull(json_extract(properties, '$.to_actor'), '') = ''")
+        || terms.iter().any(|term| {
+            term.strip_prefix("ifnull(json_extract(properties, '$.to_actor'), '') IN (")
+                .and_then(|term| term.strip_suffix(", '')"))
+                .is_some_and(numbered_param)
+        });
+    if !namespace
+        || !terms.contains(&"deleted_at IS NULL")
+        || !equality("kind = ")
+        || !equality("json_extract(properties, '$.direction') = ")
+        || !recipient
+    {
+        return "";
+    }
+    if terms.contains(
+        &"(json_type(properties, '$.read') IS NULL OR json_type(properties, '$.read') != 'true')",
+    ) {
+        " INDEXED BY idx_notes_unread_probe_recipient_direction"
+    } else {
+        " INDEXED BY idx_notes_message_recipient_direction"
+    }
+}
+
+fn build_note_filter_read_clause(
+    namespace: &str,
+    filter: &NoteFilter,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
+    let (where_sql, params) = build_note_filter_where(namespace, filter)?;
+    let index_clause = comm_filter_index_clause(filter, &where_sql);
+    Ok((format!("{index_clause}{where_sql}"), params))
+}
+
 /// `SELECT` column list for a plain note-row projection. Used by
 /// [`fetch_notes_after`] and `query_notes_filtered_count_free`; the other
 /// note-row projection queries in this file (`query_notes`,
@@ -1050,7 +1110,7 @@ fn fetch_notes_after(
     }
 
     {
-        let (where_sql, mut params) = build_note_filter_where(namespace, base_filter)?;
+        let (where_sql, mut params) = build_note_filter_read_clause(namespace, base_filter)?;
         params.push(Box::new(after.created_at));
         let ts_idx = params.len();
         params.push(Box::new(after.id.to_string()));
@@ -1072,7 +1132,7 @@ fn fetch_notes_after(
 
     let remaining = limit - items.len() as i64;
     if remaining > 0 {
-        let (where_sql, mut params) = build_note_filter_where(namespace, base_filter)?;
+        let (where_sql, mut params) = build_note_filter_read_clause(namespace, base_filter)?;
         params.push(Box::new(after.created_at));
         let ts_idx = params.len();
         params.push(Box::new(remaining));
@@ -1744,10 +1804,10 @@ impl NoteStore for SqlNoteStore {
         })?;
 
         self.with_reader("query_notes_filtered", move |conn| {
-            let (count_sql, count_params) = build_note_filter_where(&namespace, &filter)?;
+            let (count_sql, count_params) = build_note_filter_read_clause(&namespace, &filter)?;
             let count_sql = format!("SELECT COUNT(*) FROM notes{count_sql}");
 
-            let (where_sql, mut data_params) = build_note_filter_where(&namespace, &filter)?;
+            let (where_sql, mut data_params) = build_note_filter_read_clause(&namespace, &filter)?;
             data_params.push(Box::new(limit_i64));
             data_params.push(Box::new(offset_i64));
 
@@ -1829,7 +1889,7 @@ impl NoteStore for SqlNoteStore {
                 return Ok(Page { items, total: None });
             }
 
-            let (where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
+            let (where_sql, mut params) = build_note_filter_read_clause(&namespace, &filter)?;
             params.push(Box::new(limit_i64));
             params.push(Box::new(offset_i64));
             let limit_idx = params.len() - 1;
@@ -1886,7 +1946,7 @@ impl NoteStore for SqlNoteStore {
                     tests::page_snapshot_seam::hook("count_notes_filtered_in_snapshot", &namespace);
                 }
 
-                let (where_sql, params) = build_note_filter_where(&namespace, filter)?;
+                let (where_sql, params) = build_note_filter_read_clause(&namespace, filter)?;
                 let sql = format!("SELECT COUNT(*) FROM notes{where_sql}");
                 let mut stmt = tx.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1931,7 +1991,7 @@ impl NoteStore for SqlNoteStore {
                     );
                 }
 
-                let (where_sql, mut params) = build_note_filter_where(&namespace, filter)?;
+                let (where_sql, mut params) = build_note_filter_read_clause(&namespace, filter)?;
                 params.push(Box::new(probe_limit_i64));
                 let limit_idx = params.len();
                 // The inner LIMIT is the work bound. Selecting a constant
@@ -2052,7 +2112,7 @@ impl NoteStore for SqlNoteStore {
         let limit_i64 = i64::from(max_rows) + 1;
 
         self.with_reader("query_notes_filtered_bounded", move |conn| {
-            let (where_sql, mut data_params) = build_note_filter_where(&namespace, &filter)?;
+            let (where_sql, mut data_params) = build_note_filter_read_clause(&namespace, &filter)?;
             data_params.push(Box::new(limit_i64));
             let limit_idx = data_params.len();
 

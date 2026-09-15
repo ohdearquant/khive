@@ -33,6 +33,11 @@ CREATE INDEX IF NOT EXISTS idx_notes_namespace ON notes(namespace);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(namespace, kind);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 
+-- ADR-186: serve live note pages in their stable creation order.
+CREATE INDEX IF NOT EXISTS idx_notes_namespace_created
+    ON notes(namespace, created_at DESC, id ASC)
+    WHERE deleted_at IS NULL;
+
 -- Fresh/direct-store counterpart of migration 028 (ADR-179).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_namespace_kind_key
     ON notes(namespace, kind, key)

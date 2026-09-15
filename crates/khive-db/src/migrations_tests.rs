@@ -1343,6 +1343,73 @@ fn v33_recipient_indexes_match_fresh_schema_and_preserve_notes() {
 }
 
 #[test]
+fn v34_note_order_index_matches_fresh_schema_and_preserves_notes() {
+    const NOTES_DDL: &str = include_str!("../sql/notes-ddl.sql");
+    let fresh = open_memory();
+    fresh.execute_batch(NOTES_DDL).unwrap();
+    let upgraded = open_memory();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    upgraded
+        .execute_batch("DROP INDEX idx_notes_namespace_created")
+        .unwrap();
+    for (id, deleted_at) in [("live", None), ("deleted", Some(2_i64))] {
+        upgraded.execute(
+            "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at, deleted_at)
+             VALUES (?1, 'default', 'message', 'kept', '{\"read\":true}', 1, 1, ?2)",
+            rusqlite::params![id, deleted_at],
+        ).unwrap();
+    }
+    let snapshot = |conn: &Connection| -> Vec<(String, String, String, i64, Option<i64>)> {
+        conn.prepare("SELECT id, content, properties, version, deleted_at FROM notes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = snapshot(&upgraded);
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 34)
+        .unwrap();
+    assert_eq!(migration.name, "notes_namespace_created");
+    upgraded.execute_batch(migration.up).unwrap();
+    let schema_version: i64 = upgraded
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    upgraded.execute_batch(migration.up).unwrap();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    assert_eq!(
+        upgraded
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        schema_version
+    );
+    assert_eq!(snapshot(&upgraded), before);
+    let definition = |conn: &Connection| -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'idx_notes_namespace_created'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(definition(&upgraded), definition(&fresh));
+    let live_ids: Vec<String> = upgraded.prepare(
+        "SELECT id FROM notes INDEXED BY idx_notes_namespace_created WHERE namespace = 'default' AND deleted_at IS NULL ORDER BY created_at DESC, id ASC",
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(live_ids, ["live"]);
+}
+
+#[test]
 fn migration_versions_advance_by_exactly_one() {
     for pair in MIGRATIONS.windows(2) {
         assert_eq!(

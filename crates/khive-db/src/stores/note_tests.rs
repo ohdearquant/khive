@@ -3009,7 +3009,7 @@ async fn unread_probe_query_uses_partial_index() {
 
     // Plan: the same WHERE the store generates is served by the partial
     // index.
-    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let (where_sql, params) = build_note_filter_read_clause("default", &filter).unwrap();
     let sql =
         format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
 
@@ -3026,7 +3026,7 @@ async fn unread_probe_query_uses_partial_index() {
         .property_filters
         .retain(|property| !matches!(property.op, FilterOp::JsonTypeNeMissing));
     let (_, params_without_json_type) =
-        build_note_filter_where("default", &filter_without_json_type).unwrap();
+        build_note_filter_read_clause("default", &filter_without_json_type).unwrap();
     assert_eq!(
         params.len(),
         params_without_json_type.len(),
@@ -3054,21 +3054,16 @@ async fn unread_probe_query_uses_partial_index() {
         "unread probe must be served by the partial index, got plan:\n{indexed_plan}"
     );
 
-    // Control proving the assertion above is falsifiable: with the partial
-    // index dropped, the same query cannot name it. (A bound-parameter
-    // variant is NOT a usable control here: the bundled SQLite replans after
-    // binding and can then prove the implication from the bound value, so
-    // the parameterized form is also index-served in this build. The literal
-    // inlining stays because that replan behavior is build-dependent, while
-    // a literal is provable at prepare time everywhere.)
     reader
         .conn()
         .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_direction")
         .unwrap();
-    let control_plan = plan(&sql, &params);
+    let error = reader.conn().prepare(&sql).err().unwrap();
     assert!(
-        !control_plan.contains("idx_notes_unread_probe_recipient_direction"),
-        "control: dropped index must vanish from the plan, got:\n{control_plan}"
+        error
+            .to_string()
+            .contains("idx_notes_unread_probe_recipient_direction"),
+        "a missing pinned index must fail loudly: {error}"
     );
 }
 
@@ -3132,7 +3127,7 @@ async fn unread_probe_legacy_partition_includes_null_and_uses_partial_index() {
         .unwrap();
     assert_eq!(rows.len(), 2, "only missing and JSON-null recipients match");
 
-    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let (where_sql, params) = build_note_filter_read_clause("default", &filter).unwrap();
     let sql =
         format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 1001");
     let reader = pool.reader().unwrap();
@@ -3236,7 +3231,7 @@ async fn unread_probe_work_is_bounded_by_callers_own_unread_rows() {
         order_by: None,
         ..Default::default()
     };
-    let (where_sql, params) = build_note_filter_where("default", &filter).unwrap();
+    let (where_sql, params) = build_note_filter_read_clause("default", &filter).unwrap();
     let sql = format!("SELECT id FROM notes{where_sql} ORDER BY created_at DESC, id ASC LIMIT 2");
     let measure = || -> (usize, i32) {
         let reader = pool.reader().unwrap();
@@ -3322,7 +3317,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     // (note.rs ~1618-1627): the LIMIT bounds rows that MATCH the full WHERE
     // clause, not index entries visited before direction rejects them.
     fn count_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        let (where_sql, mut params) = build_note_filter_read_clause("default", filter).unwrap();
         params.push(Box::new(CAP + 1));
         let limit_idx = params.len();
         (
@@ -3334,7 +3329,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     // Mirrors the ordered unread-listing shape (query_notes_filtered_bounded /
     // the comm.inbox unread listing, note.rs ~1748-1752).
     fn list_sql_and_params(filter: &NoteFilter) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        let (where_sql, mut params) = build_note_filter_read_clause("default", filter).unwrap();
         params.push(Box::new(CAP + 1));
         let limit_idx = params.len();
         (
@@ -3522,6 +3517,8 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     // show the same assertion fails, proving the bound above is real and not
     // an artifact of small numbers or an unrelated planner choice. V33's
     // full index also supplies direction, so remove it only in this control. --
+    let control_count_sql =
+        count_sql.replace(" INDEXED BY idx_notes_unread_probe_recipient_direction", "");
     let control_pool = setup_pool();
     {
         let writer = control_pool.writer().unwrap();
@@ -3543,7 +3540,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     }
     let (control_count_small, control_count_steps_small) = {
         let reader = control_pool.reader().unwrap();
-        measure(reader.conn(), &count_sql, &count_params)
+        measure(reader.conn(), &control_count_sql, &count_params)
     };
     {
         let writer = control_pool.writer().unwrap();
@@ -3552,7 +3549,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
     }
     let (control_count_large, control_count_steps_large) = {
         let reader = control_pool.reader().unwrap();
-        measure(reader.conn(), &count_sql, &count_params)
+        measure(reader.conn(), &control_count_sql, &count_params)
     };
     assert_eq!(
         control_count_small, 5,
@@ -3628,7 +3625,7 @@ async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
     fn listing_sql_and_params(
         filter: &NoteFilter,
     ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-        let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+        let (where_sql, mut params) = build_note_filter_read_clause("default", filter).unwrap();
         params.push(Box::new(1001_i64));
         let limit_idx = params.len();
         (
@@ -3916,7 +3913,7 @@ fn plan_details(
 fn listing_sql_and_params(
     filter: &khive_storage::note::NoteFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let (where_sql, mut params) = build_note_filter_where("default", filter).unwrap();
+    let (where_sql, mut params) = build_note_filter_read_clause("default", filter).unwrap();
     params.push(Box::new(1_i64));
     let limit_idx = params.len();
     (
@@ -4375,7 +4372,8 @@ async fn seek_after_does_not_scale_with_rows_already_seen_unlike_offset() {
     let reader = pool.reader().unwrap();
 
     // Offset-based: skip the first 4,900 rows, fetch the last 100.
-    let (offset_where, mut offset_params) = build_note_filter_where("default", &filter).unwrap();
+    let (offset_where, mut offset_params) =
+        build_note_filter_read_clause("default", &filter).unwrap();
     offset_params.push(Box::new(100_i64));
     let offset_limit_idx = offset_params.len();
     offset_params.push(Box::new(4_900_i64));
@@ -4390,7 +4388,7 @@ async fn seek_after_does_not_scale_with_rows_already_seen_unlike_offset() {
     // Cursor-based: seek to the boundary a real 4,900-row page ends at, then
     // fetch the next 100 via the production `fetch_notes_after` path -- the
     // same rows the offset query above returned.
-    let (peek_where, mut peek_params) = build_note_filter_where("default", &filter).unwrap();
+    let (peek_where, mut peek_params) = build_note_filter_read_clause("default", &filter).unwrap();
     peek_params.push(Box::new(4_900_i64));
     let peek_limit_idx = peek_params.len();
     let peek_sql =
@@ -4414,7 +4412,7 @@ async fn seek_after_does_not_scale_with_rows_already_seen_unlike_offset() {
 
     // `fetch_notes_after`'s two branches, instrumented individually and
     // summed, since it prepares its own statements internally.
-    let (tie_where, mut tie_params) = build_note_filter_where("default", &filter).unwrap();
+    let (tie_where, mut tie_params) = build_note_filter_read_clause("default", &filter).unwrap();
     tie_params.push(Box::new(after.created_at));
     let tie_ts_idx = tie_params.len();
     tie_params.push(Box::new(after.id.to_string()));
@@ -4428,7 +4426,7 @@ async fn seek_after_does_not_scale_with_rows_already_seen_unlike_offset() {
     let (tie_rows, tie_steps) = measure(reader.conn(), &tie_sql, &tie_params);
 
     let remaining = 100 - tie_rows as i64;
-    let (lt_where, mut lt_params) = build_note_filter_where("default", &filter).unwrap();
+    let (lt_where, mut lt_params) = build_note_filter_read_clause("default", &filter).unwrap();
     lt_params.push(Box::new(after.created_at));
     let lt_ts_idx = lt_params.len();
     lt_params.push(Box::new(remaining));
@@ -4557,7 +4555,7 @@ async fn comm_inbox_status_all_lt_branch_seeks_recipient_index() {
     };
 
     let reader = pool.reader().unwrap();
-    let (lt_where, mut lt_params) = build_note_filter_where("default", &filter).unwrap();
+    let (lt_where, mut lt_params) = build_note_filter_read_clause("default", &filter).unwrap();
     lt_params.push(Box::new(3000_i64));
     let lt_ts_idx = lt_params.len();
     lt_params.push(Box::new(100_i64));
@@ -4578,24 +4576,9 @@ async fn comm_inbox_status_all_lt_branch_seeks_recipient_index() {
     );
 }
 
-/// khive#2392: the natural seekable fix for the gap pinned by
-/// the pre-V33 inbox schema — a general
-/// `(namespace, kind, created_at DESC, id ASC) WHERE deleted_at IS NULL`
-/// index — was measured, not just assumed, before deciding not to ship it.
-/// Standalone it cuts the lt-branch scan from 57,473 to 7,223 VM steps for a
-/// 6,000-row fixture (~8x), but because it carries no `to_actor`/`read`
-/// predicate it is *also* a legal plan for `comm.inbox`'s default
-/// `status="unread"` listing, and SQLite prefers it (no `ANALYZE`
-/// statistics) over the purpose-built partial
-/// `idx_notes_unread_probe_recipient_direction` — the identical failure mode
-/// V27's header already recorded for the dropped `(to_actor, direction)`
-/// index. Measured on the same fixture: 84 VM steps via the partial index
-/// vs. 125 via this candidate, so it is not even a narrow win there. This
-/// test builds the two indexes together and pins that the unread-probe plan
-/// flips away from the tuned partial index, which is the reason this index
-/// is not part of the migration.
+/// ADR-187 keeps the unread seek selective when another ordering index competes.
 #[tokio::test]
-async fn candidate_created_at_id_seek_index_flips_unread_probe_plan() {
+async fn candidate_created_at_id_seek_index_cannot_steal_pinned_unread_plan() {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter as NotePropFilter};
     use khive_storage::types::SqlValue;
 
@@ -4653,14 +4636,10 @@ async fn candidate_created_at_id_seek_index_flips_unread_probe_plan() {
     let (sql, params) = listing_sql_and_params(&filter);
     let plan = plan_details(store.pool.reader().unwrap().conn(), &sql, &params);
     assert!(
-        plan.contains("idx_notes_kind_created_seek"),
-        "expected arm: with both indexes present, the planner prefers the general \
-         created_at/id index over the tuned partial unread-probe index, got:\n{plan}"
+        plan.contains("idx_notes_unread_probe_recipient_direction"),
+        "the unread pin must survive a competing ordering index: {plan}"
     );
-    assert!(
-        !plan.contains("idx_notes_unread_probe_recipient_direction"),
-        "got:\n{plan}"
-    );
+    assert!(!plan.contains("idx_notes_kind_created_seek"), "{plan}");
 }
 
 /// khive#2392: narrowing `idx_notes_task_status`/`idx_notes_task_assignee`'s
