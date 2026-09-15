@@ -1275,7 +1275,7 @@ async fn suggest_member_sizing_counts_each_distinct_live_atom_once() {
                     "slug": "sizing-distinct-domain",
                     "name": "Sizing Distinct Domain",
                     "description": "Lexical domain member sizing search uses the live content of member atoms to calculate the estimated token cost before a fold selection admits the domain into its budget.",
-                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-b"]
+                    "members": ["sizing-distinct-member-a", "sizing-distinct-member-b", "sizing-distinct-member-a"]
                 }
             ]}),
         )

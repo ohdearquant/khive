@@ -2279,6 +2279,8 @@ async fn load_domain_member_token_sizes(
     };
     let rows = match reader
         .query_all(SqlStatement {
+            // Keep atom identity in DISTINCT: repeated members count once, while
+            // different atoms with identical names and content still count separately.
             sql: format!(
                 "SELECT DISTINCT d.id AS domain_id, a.id AS atom_id, a.name, a.content \
                  FROM knowledge_domains AS d \

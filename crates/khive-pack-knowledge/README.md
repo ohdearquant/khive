@@ -63,6 +63,22 @@ or, to build a fresh corpus and immediately reference it:
 request(ops="[knowledge.upsert_atoms(atoms=[{\"slug\":\"bm25-wand\",\"name\":\"BM25 WAND\",\"content\":\"...\"}]), knowledge.compose(atom_ids=[\"bm25-wand\"], query=\"keyword search pruning strategies\")]")
 ```
 
+To replace only an existing atom's properties, supply its complete UUID and the
+new JSON value:
+
+```text
+request(ops='knowledge.upsert_atoms(atoms=[{"id":"4bed83db-6e6e-4db0-844f-00f6273035bf","properties":{"reviewed":true}}])')
+```
+
+This row form accepts exactly `id` and `properties`. It preserves stored content,
+including short or empty legacy content, and every other field except `updated_at`.
+Properties are replaced completely; `{}` replaces with an empty object and `null`
+clears the value. The UUID must identify a live ordinary atom; missing or deleted
+IDs return `NotFound`, and domains or their mirrors are refused. By-ID lookup is
+namespace-agnostic and retains the atom's namespace. Ordinary slug rows still
+require at least 20 words of content. The two forms can share an atomic batch:
+all inputs and targets are checked before any write, and writes retain input order.
+
 Programmatic embedding is exposed via a small Rust API for the `kkernel reindex`
 binary, independent of the MCP surface:
 

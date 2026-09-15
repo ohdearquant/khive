@@ -27,7 +27,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
-        description: "Bulk insert or update knowledge atoms by slug",
+        description: "Bulk insert or update knowledge atoms by slug, or replace existing atom properties by UUID",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -35,7 +35,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "atoms",
                 param_type: "array of object",
                 required: true,
-                description: "List of atoms: {slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}. On update, omitted source/finalized fields are preserved; null clears a source or resets finalized to false without demoting lifecycle status.",
+                description: "List of atom writes. Content form: {slug, name, content, tags?, properties?, source_uri?, source_type?, finalized?}; content requires at least 20 words, omitted source/finalized fields are preserved, and null clears a source or resets finalized without demoting lifecycle status. Properties-only form: exactly {id: complete UUID, properties: JSON value or null}; replaces properties on an existing live ordinary atom across namespaces while preserving all other fields except updated_at. Missing/deleted IDs are NotFound; domains and mirrors are refused. Forms may mix in one atomic batch and apply in input order.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

@@ -5608,3 +5608,510 @@ mod kg_blend {
         );
     }
 }
+
+async fn properties_only_atom_fixture(
+    runtime: &KhiveRuntime,
+    f: &Fixture,
+    slug: &str,
+    content: &str,
+    namespace: &str,
+) -> Value {
+    let created = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{
+                "slug": slug,
+                "name": "Preserved atom name",
+                "content": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty",
+                "tags": ["preserved-tag"],
+                "properties": {"old": "remove on replacement"},
+                "source_uri": "https://example.com/source",
+                "source_type": "article",
+                "finalized": true
+            }] }),
+        )
+        .await
+        .expect("create ordinary atom before legacy fixture");
+    assert_eq!(created, json!({"created": 1, "updated": 0, "total": 1}));
+    let atom = f
+        .dispatch("knowledge.get", json!({"id": slug}))
+        .await
+        .expect("read created atom");
+    let id = atom["id"].as_str().expect("full atom UUID");
+    {
+        let mut writer = runtime.sql().writer().await.expect("fixture writer");
+        let changed = writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET content=?1, namespace=?2, created_at=5, updated_at=7 WHERE id=?3".into(),
+                params: vec![
+                    SqlValue::Text(content.into()),
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(id.into()),
+                ],
+                label: Some("test.atom_properties_only.legacy_fixture".into()),
+            })
+            .await
+            .expect("seed legacy atom content");
+        assert_eq!(changed, 1);
+    }
+    let before = f
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("generic get resolves the legacy atom");
+    assert_eq!(before["content"], content);
+    assert_eq!(before["namespace"], namespace);
+    assert_eq!(
+        before["properties"],
+        json!({"old": "remove on replacement"})
+    );
+    before
+}
+
+fn assert_properties_only_payload(before: &Value, after: &Value, properties: Value) {
+    assert_eq!(after["properties"], properties);
+    let mut expected = before.clone();
+    expected["properties"] = properties;
+    expected["updated_at"] = after["updated_at"].clone();
+    assert_eq!(after, &expected, "all other atom fields must be preserved");
+}
+
+#[tokio::test]
+async fn upsert_atoms_properties_only_preserves_short_content() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let content = " \tone two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen\n ";
+    assert_eq!(content.split_whitespace().count(), 15);
+    let before =
+        properties_only_atom_fixture(&runtime, &f, "short-properties", content, "other").await;
+    let response = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{"id": before["id"], "properties": {"marker": true}}]}),
+        )
+        .await
+        .expect("properties-only update accepts stored short content");
+    let after = f
+        .dispatch("get", json!({"id": before["id"]}))
+        .await
+        .expect("generic get after property replacement");
+    assert_eq!(response, json!({"created": 0, "updated": 1, "total": 1}));
+    assert_properties_only_payload(&before, &after, json!({"marker": true}));
+    assert_ne!(before["updated_at"], after["updated_at"]);
+
+    let credential = ["ghp_", "FakeGitHubToken0000000000000000000"].concat();
+    let missing = "a82d4e7f-f16c-469d-9c27-3cd7fb2a6ad1";
+    assert!(matches!(
+        f.dispatch("get", json!({"id": missing})).await,
+        Err(RuntimeError::NotFound(_))
+    ));
+    for (atoms, location) in [
+        (
+            json!([{"id": before["id"], "properties": {"nested": [credential]}}]),
+            "atoms[0].properties",
+        ),
+        (
+            json!([
+                {"id": before["id"], "properties": {"safe_prefix": true}},
+                {"id": missing, "properties": {"nested": [credential]}}
+            ]),
+            "atoms[1].properties",
+        ),
+    ] {
+        let error = f
+            .dispatch("knowledge.upsert_atoms", json!({"atoms": atoms}))
+            .await
+            .expect_err("ID properties must receive the recursive secret scan");
+        match &error {
+            RuntimeError::SecretDetected(found) => {
+                assert_eq!(found.location.as_deref(), Some(location));
+            }
+            other => panic!("expected secret refusal before target lookup, got {other:?}"),
+        }
+        assert!(!error.to_string().contains(&credential));
+        let after_refusal = f
+            .dispatch("get", json!({"id": before["id"]}))
+            .await
+            .expect("safe update survives secret refusal unchanged");
+        assert_eq!(after_refusal, after);
+        assert!(matches!(
+            f.dispatch("get", json!({"id": missing})).await,
+            Err(RuntimeError::NotFound(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn upsert_atoms_properties_only_preserves_empty_content() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let before = properties_only_atom_fixture(&runtime, &f, "empty-properties", "", "local").await;
+    let canonical = before["id"].as_str().expect("canonical UUID");
+    let compact = canonical.replace('-', "");
+    assert_eq!(
+        uuid::Uuid::parse_str(&compact).expect("complete compact UUID is accepted"),
+        uuid::Uuid::parse_str(canonical).expect("canonical UUID")
+    );
+    for (id, properties) in [
+        (canonical, json!({"marker": true})),
+        (compact.as_str(), json!(["array", {"nested": true}, 3])),
+        (canonical, json!("scalar string")),
+        (canonical, json!(42)),
+        (canonical, json!(true)),
+        (canonical, json!({})),
+        (canonical, Value::Null),
+    ] {
+        let response = f
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({"atoms": [{"id": id, "properties": properties}]}),
+            )
+            .await
+            .expect("properties-only update accepts stored empty content");
+        let after = f
+            .dispatch("get", json!({"id": before["id"]}))
+            .await
+            .expect("generic get after empty-content property replacement");
+        assert_eq!(response, json!({"created": 0, "updated": 1, "total": 1}));
+        assert_properties_only_payload(&before, &after, properties);
+    }
+    let mut reader = runtime.sql().reader().await.expect("property reader");
+    let properties = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT properties FROM knowledge_atoms WHERE id=?1".into(),
+            params: vec![SqlValue::Text(before["id"].as_str().unwrap().into())],
+            label: None,
+        })
+        .await
+        .expect("read stored null property");
+    assert!(matches!(properties, Some(SqlValue::Null)));
+}
+
+#[tokio::test]
+async fn upsert_atoms_properties_only_keeps_content_and_shape_validation() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let before = properties_only_atom_fixture(
+        &runtime,
+        &f,
+        "content-validation",
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+        "local",
+    )
+    .await;
+    let mut floor_results = Vec::new();
+    for slug in ["content-validation", "missing-content-create"] {
+        for content in [
+            Some(json!("too short")),
+            Some(json!("")),
+            Some(Value::Null),
+            None,
+        ] {
+            let mut atom =
+                json!({"slug": slug, "name": "Replacement name", "properties": {"marker": true}});
+            if let Some(content) = content {
+                atom["content"] = content;
+            }
+            floor_results.push(
+                f.dispatch("knowledge.upsert_atoms", json!({"atoms": [atom]}))
+                    .await,
+            );
+        }
+    }
+    let mut invalid_rows = vec![
+        json!({"id": "not-a-uuid", "properties": {}}),
+        json!({"id": &before["id"].as_str().unwrap()[..8], "properties": {}}),
+        json!({"id": before["id"]}),
+        json!({"id": before["id"], "properties": {"khive:secret_gate": "forbidden"}}),
+    ];
+    for (field, value) in [
+        ("content", json!("too short")),
+        ("content", Value::Null),
+        ("content", json!("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty")),
+        ("slug", json!("content-validation")),
+        ("name", json!("Replacement name")),
+        ("tags", json!([])),
+        ("source_uri", Value::Null),
+        ("source_type", Value::Null),
+        ("finalized", json!(false)),
+        ("unknown", json!(true)),
+    ] {
+        let mut row = json!({"id": before["id"], "properties": {"marker": true}});
+        row[field] = value;
+        invalid_rows.push(row);
+    }
+    let mut shape_results = Vec::new();
+    for row in invalid_rows {
+        shape_results.push(
+            f.dispatch("knowledge.upsert_atoms", json!({"atoms": [row]}))
+                .await,
+        );
+    }
+    let after_refusals = f
+        .dispatch("get", json!({"id": before["id"]}))
+        .await
+        .expect("original atom remains readable");
+    let missing_create = f
+        .dispatch("knowledge.get", json!({"id": "missing-content-create"}))
+        .await;
+    let ordinary = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{
+                "slug": "content-validation",
+                "name": "Valid replacement",
+                "content": " one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty ",
+                "properties": {"ordinary": true}
+            }]}),
+        )
+        .await
+        .expect("ordinary valid content update remains accepted");
+    let after_ordinary = f
+        .dispatch("get", json!({"id": before["id"]}))
+        .await
+        .expect("generic get after ordinary update");
+    for result in floor_results {
+        assert!(
+            matches!(&result, Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
+            "{result:?}"
+        );
+    }
+    for result in shape_results {
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "{result:?}"
+        );
+    }
+    assert_eq!(after_refusals, before);
+    assert!(matches!(missing_create, Err(RuntimeError::NotFound(_))));
+    assert_eq!(ordinary, json!({"created": 0, "updated": 1, "total": 1}));
+    assert_eq!(after_ordinary["name"], "Valid replacement");
+    assert_eq!(after_ordinary["properties"], json!({"ordinary": true}));
+    assert_eq!(after_ordinary["content"], "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty");
+    assert_eq!(after_ordinary["tags"], json!([]));
+    assert_eq!(after_ordinary["source_uri"], before["source_uri"]);
+    assert_eq!(after_ordinary["source_type"], before["source_type"]);
+    assert_eq!(after_ordinary["finalized"], before["finalized"]);
+}
+
+#[tokio::test]
+async fn upsert_atoms_properties_only_missing_id_is_not_found() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let before = properties_only_atom_fixture(&runtime, &f, "missing-id-prefix", "", "local").await;
+    let missing = "0d442bda-6d6a-4f47-b2b6-ea3f5da3a43b";
+    let missing_before = f.dispatch("get", json!({"id": missing})).await;
+    let singleton = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{"id": missing, "properties": {"marker": true}}]}),
+        )
+        .await;
+    let batch = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [
+                {"id": before["id"], "properties": {"marker": true}},
+                {"id": missing, "properties": {"marker": true}}
+            ]}),
+        )
+        .await;
+    let after = f
+        .dispatch("get", json!({"id": before["id"]}))
+        .await
+        .expect("generic get after refused batch");
+    let missing_after = f.dispatch("get", json!({"id": missing})).await;
+    f.dispatch(
+        "knowledge.delete_atoms",
+        json!({"ids": ["missing-id-prefix"]}),
+    )
+    .await
+    .expect("soft delete existing atom");
+    let deleted = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{"id": before["id"], "properties": {"marker": true}}]}),
+        )
+        .await;
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({"domains": [{
+            "slug": "properties-domain",
+            "name": "Properties domain",
+            "description": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+        }]}),
+    )
+    .await
+    .expect("seed protected domain mirror");
+    let domain_before = f
+        .dispatch("knowledge.get", json!({"id": "properties-domain"}))
+        .await
+        .expect("read protected domain");
+    let domain = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [{"id": domain_before["id"], "properties": {"marker": true}}]}),
+        )
+        .await;
+    let domain_after = f
+        .dispatch("get", json!({"id": domain_before["id"]}))
+        .await
+        .expect("generic get protected domain");
+    for result in [missing_before, singleton, batch, missing_after, deleted] {
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "{result:?}"
+        );
+    }
+    assert_eq!(
+        after, before,
+        "missing target must not commit a valid prefix"
+    );
+    assert!(
+        matches!(domain, Err(RuntimeError::InvalidInput(_))),
+        "{domain:?}"
+    );
+    assert_eq!(domain_after, domain_before);
+}
+
+#[tokio::test]
+async fn upsert_atoms_properties_only_mixed_batches_preserve_order_and_atomicity() {
+    let valid_content = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+    for id_first in [false, true] {
+        let runtime = rt();
+        let f = pack_via_registry(runtime.clone());
+        let before = properties_only_atom_fixture(&runtime, &f, "mixed-order", "", "local").await;
+        let ordinary = json!({
+            "slug": "mixed-order",
+            "name": "Ordered replacement",
+            "content": valid_content,
+            "properties": {"winner": "ordinary"}
+        });
+        let id_row = json!({"id": before["id"], "properties": {"winner": "id"}});
+        let mut atoms = if id_first {
+            vec![id_row, ordinary]
+        } else {
+            vec![ordinary, id_row]
+        };
+        atoms.push(json!({
+            "slug": "mixed-created",
+            "name": "Created sibling",
+            "content": valid_content,
+            "properties": {"created_sibling": true}
+        }));
+        let response = f
+            .dispatch("knowledge.upsert_atoms", json!({"atoms": atoms}))
+            .await
+            .expect("ordinary and ID forms compose in one successful batch");
+        assert_eq!(response, json!({"created": 1, "updated": 2, "total": 3}));
+        let after = f
+            .dispatch("get", json!({"id": before["id"]}))
+            .await
+            .expect("read ordered mixed update");
+        let mut expected = before.clone();
+        expected["name"] = json!("Ordered replacement");
+        expected["content"] = json!(valid_content);
+        expected["tags"] = json!([]);
+        expected["properties"] = if id_first {
+            json!({"winner": "ordinary"})
+        } else {
+            json!({"winner": "id"})
+        };
+        expected["updated_at"] = after["updated_at"].clone();
+        assert_eq!(
+            after, expected,
+            "last input must win for id_first={id_first}"
+        );
+        assert_ne!(after["updated_at"], before["updated_at"]);
+        let created = f
+            .dispatch("knowledge.get", json!({"id": "mixed-created"}))
+            .await
+            .expect("ordinary sibling must actually be created");
+        assert_eq!(created["name"], "Created sibling");
+        assert_eq!(created["content"], valid_content);
+        assert_eq!(created["properties"], json!({"created_sibling": true}));
+        assert_ne!(created["id"], before["id"]);
+    }
+
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let before = properties_only_atom_fixture(&runtime, &f, "mixed-refusal", "", "local").await;
+    let missing = "c8da3216-d789-497b-8e61-25574828cb3b";
+    assert!(matches!(
+        f.dispatch("get", json!({"id": missing})).await,
+        Err(RuntimeError::NotFound(_))
+    ));
+    for (index, invalid_row) in [
+        json!({"id": missing, "properties": {}}),
+        json!({"id": before["id"], "properties": {"khive:secret_gate": "forbidden"}}),
+        json!({"id": before["id"], "properties": {}, "content": valid_content}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let prefix_slug = format!("mixed-refused-create-{index}");
+        let result = f
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({"atoms": [
+                    {
+                        "slug": "mixed-refusal", "name": "Must not replace",
+                        "content": valid_content, "properties": {"prefix": true}
+                    },
+                    {
+                        "slug": prefix_slug, "name": "Must not create",
+                        "content": valid_content
+                    },
+                    invalid_row
+                ]}),
+            )
+            .await;
+        if index == 0 {
+            assert!(
+                matches!(result, Err(RuntimeError::NotFound(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(RuntimeError::InvalidInput(_))),
+                "{result:?}"
+            );
+        }
+        let after = f
+            .dispatch("get", json!({"id": before["id"]}))
+            .await
+            .expect("ordinary prefix must remain unchanged");
+        assert_eq!(after, before);
+        assert!(matches!(
+            f.dispatch("knowledge.get", json!({"id": prefix_slug}))
+                .await,
+            Err(RuntimeError::NotFound(_))
+        ));
+        assert!(matches!(
+            f.dispatch("get", json!({"id": missing})).await,
+            Err(RuntimeError::NotFound(_))
+        ));
+    }
+    let result = f
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({"atoms": [
+                {"id": before["id"], "properties": {"prefix": true}},
+                {"slug": "mixed-short-refusal", "name": "Must not create", "content": "too short"}
+            ]}),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(RuntimeError::InvalidInput(message)) if message.contains("20 words")),
+        "{result:?}"
+    );
+    let after = f
+        .dispatch("get", json!({"id": before["id"]}))
+        .await
+        .expect("ID prefix must remain unchanged after ordinary content refusal");
+    assert_eq!(after, before);
+    assert!(matches!(
+        f.dispatch("knowledge.get", json!({"id": "mixed-short-refusal"}))
+            .await,
+        Err(RuntimeError::NotFound(_))
+    ));
+}
