@@ -137,7 +137,7 @@ impl NamespaceCensus {
 /// `PRAGMA`. Pragmas take no bound parameters for their argument, so the name
 /// has to be inlined; every name here comes from `sqlite_master`, and quoting it
 /// anyway keeps that a property of this function rather than of its callers.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
