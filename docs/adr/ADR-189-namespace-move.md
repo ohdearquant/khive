@@ -279,9 +279,32 @@ no `ann_consumer_pending` row is rewritten.
 
 `brain_implicit_mass`, `brain_event_log` and `brain_profile_snapshots` are read namespace-scoped, so
 leaving them behind makes retune history, implicit mass and profile snapshots read empty under the
-target namespace. They move with the records. `brain_serve_ledger` moves with them; its row read is
-by id, and the namespace column on the row is carried rather than reinterpreted.
+target namespace. They move with the records where that is a defined operation, and for two of them
+it is not.
 
+Two of the four brain tables are keyed by subject and two are not:
+
+| Table                     | Key                                  | Carried by  |
+| ------------------------- | ------------------------------------ | ----------- |
+| `brain_implicit_mass`     | `(profile_id, namespace, target_id)` | its subject |
+| `brain_serve_ledger`      | `id`, with `target_id`               | its subject |
+| `brain_profile_snapshots` | `(profile_id, namespace)`            | nothing     |
+| `brain_event_log`         | `(profile_id, namespace, ...)`       | nothing     |
+
+The first two carry with the record they describe, which is what "moves with the records" means. The
+last two are per-namespace aggregates with no subject at all, and under a move that routes different
+classes to different namespaces there is no target to carry them to: a snapshot of a profile's state
+in one namespace cannot be split across five.
+
+So they move only when the move is TOTAL and SINGLE-TARGET - every subject class present in the
+source is routed, and every route names the same target. Otherwise they stay where they are, and the
+counts report them as left behind rather than omitting them.
+
+Left behind rather than refused, because the choice is between two recoverable outcomes and one
+unrecoverable one. Refusing would block the primitive on exactly its main case, a partitioning move,
+over state that re-accumulates from use. Splitting the aggregate would invent numbers. Leaving it
+costs a profile its retune history under the new namespaces and says so in the result, which is the
+only one of the three a caller can act on.
 `events` stays where it is. The event log is the record of what happened under the namespace it
 happened under, and rewriting it makes the history claim something that did not occur. That is the
 whole reason, and it does not need a cost to justify it.
@@ -327,6 +350,10 @@ missed: the first skips rows, the second corrupts them.
 - Full-text search and vector recall return the moved records under the target namespace and nothing
   under the source, and a delete issued after the move removes the vector.
 - Soft-deleted records move with `deleted_at` intact.
+- A partitioning move over a namespace holding `brain_profile_snapshots` or `brain_event_log` rows
+  succeeds, leaves them in place, and reports them as left behind. A total single-target move over
+  the same fixture moves them. The two arms differ only in the route map, so an implementation that
+  ignores totality fails one of them.
 - A move reaching a stream member refuses before writing anything, names the notes and their
   `(stream, seq)`, and the arm is distinguishable from a trigger abort: the mutation control removes
   the pre-flight read and the same case then fails with `stream_member` from inside the transaction.
