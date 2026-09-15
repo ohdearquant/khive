@@ -205,6 +205,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-186](ADR-186-note-listing-order-index.md)                          | One partial index for the note listing order                                                               |
 | [ADR-187](ADR-187-comm-seek-plan-pinning.md)                            | Pin the comm seeks' index instead of hoping the planner picks it                                           |
 | [ADR-188](ADR-188-entity-version-fence.md)                              | Entities get a version, and then a fence                                                                   |
+| [ADR-189](ADR-189-namespace-move.md)                                    | Moving records between namespaces                                                                          |
 
 <!-- END GENERATED ADR CATALOG -->
 
