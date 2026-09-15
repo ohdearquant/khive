@@ -34,6 +34,49 @@ pub enum SearchSubstrate {
     Note,
 }
 
+/// Order the handler applies to search hits before imposing the caller limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchOrder {
+    /// Relevance score, highest first. The default.
+    Score,
+    /// Record `updated_at`, most recently updated first.
+    UpdatedAt,
+    /// Record `created_at`, most recently created first.
+    CreatedAt,
+}
+
+impl SearchOrder {
+    /// The record timestamp this order sorts on, or `None` for the relevance
+    /// order, which does not read the record at all.
+    fn timestamp_of(self, created_at: i64, updated_at: i64) -> Option<i64> {
+        match self {
+            Self::Score => None,
+            Self::UpdatedAt => Some(updated_at),
+            Self::CreatedAt => Some(created_at),
+        }
+    }
+}
+
+/// Reorder hits by a record timestamp, most recent first, then impose `limit`.
+///
+/// A hit whose record was absent from the fetched batch has no timestamp and
+/// sorts last. The sort is stable, so hits sharing a timestamp keep the
+/// relevance order they arrived in, which makes the result deterministic.
+fn apply_time_order<T>(hits: &mut Vec<T>, limit: usize, timestamp: impl Fn(&T) -> Option<i64>) {
+    hits.sort_by_key(|hit| std::cmp::Reverse(timestamp(hit)));
+    hits.truncate(limit);
+}
+
+/// Entity fields the hit render and the time orders read, fetched once per
+/// candidate batch.
+struct EntityMeta {
+    kind: String,
+    properties: Option<Value>,
+    tags: Vec<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
 /// Strict, canonical search request shared by the KG handler and the
 /// multi-backend coordinator boundary.
 ///
@@ -53,6 +96,7 @@ pub struct ValidatedSearchRequest {
     tags: Vec<String>,
     source: Option<SearchSource>,
     min_score: f64,
+    order_by: SearchOrder,
 }
 
 impl ValidatedSearchRequest {
@@ -100,6 +144,21 @@ impl ValidatedSearchRequest {
                 ));
             }
         };
+        // Both time orders are descending: the question they exist to answer is
+        // "what is the most recent state", so there is no ascending spelling to
+        // choose between. An unrecognised value is refused rather than falling
+        // back to the score order, which would answer a different question and
+        // read as success.
+        let order_by = match p.order_by.as_deref() {
+            None | Some("score") => SearchOrder::Score,
+            Some("updated_at") => SearchOrder::UpdatedAt,
+            Some("created_at") => SearchOrder::CreatedAt,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "order_by must be one of: score, updated_at, created_at".to_string(),
+                ));
+            }
+        };
 
         match resolve_kind_spec(kind_raw, registry)? {
             KindSpec::Entity { specific } => {
@@ -139,6 +198,7 @@ impl ValidatedSearchRequest {
                     tags,
                     source,
                     min_score,
+                    order_by,
                 })
             }
             KindSpec::Note { specific } => {
@@ -169,6 +229,7 @@ impl ValidatedSearchRequest {
                     tags,
                     source,
                     min_score,
+                    order_by,
                 })
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
@@ -236,9 +297,22 @@ impl ValidatedSearchRequest {
         self.min_score
     }
 
+    /// Order applied to hits before the caller limit is imposed.
+    pub fn order_by(&self) -> SearchOrder {
+        self.order_by
+    }
+
     /// Bounded backend candidate window used to preserve filtered-result recall.
     pub fn candidate_limit(&self) -> u32 {
-        if self.properties.is_some() || !self.tags.is_empty() || self.source.is_some() {
+        // A time order widens the window for the same reason a filter does: it
+        // selects a different subset than the score order, so re-ranking only
+        // the top `limit` scored hits would answer "the most recent of the most
+        // relevant few" instead of the question asked.
+        if self.properties.is_some()
+            || !self.tags.is_empty()
+            || self.source.is_some()
+            || self.order_by != SearchOrder::Score
+        {
             self.limit.saturating_mul(50).min(FILTERED_SCAN_CAP)
         } else {
             self.limit
@@ -292,67 +366,92 @@ impl KgPack {
                     .await?;
 
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
-                let entity_meta: HashMap<Uuid, (String, Option<Value>, Vec<String>, i64)> =
-                    if candidate_ids.is_empty() {
-                        HashMap::new()
-                    } else {
-                        let entities_page = self
-                            .runtime
-                            .entities(token)?
-                            .query_entities(
-                                token.namespace().as_str(),
-                                EntityFilter {
-                                    ids: candidate_ids,
-                                    namespaces: token
-                                        .visible_namespace_strs()
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect(),
-                                    ..EntityFilter::default()
-                                },
-                                PageRequest {
-                                    offset: 0u64,
-                                    limit: hits.len() as u32,
+                let entity_meta: HashMap<Uuid, EntityMeta> = if candidate_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    let entities_page = self
+                        .runtime
+                        .entities(token)?
+                        .query_entities(
+                            token.namespace().as_str(),
+                            EntityFilter {
+                                ids: candidate_ids,
+                                namespaces: token
+                                    .visible_namespace_strs()
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect(),
+                                ..EntityFilter::default()
+                            },
+                            PageRequest {
+                                offset: 0u64,
+                                limit: hits.len() as u32,
+                            },
+                        )
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+                    entities_page
+                        .items
+                        .into_iter()
+                        .map(|e| {
+                            (
+                                e.id,
+                                EntityMeta {
+                                    kind: e.kind,
+                                    properties: e.properties,
+                                    tags: e.tags,
+                                    created_at: e.created_at,
+                                    updated_at: e.updated_at,
                                 },
                             )
-                            .await
-                            .map_err(RuntimeError::Storage)?;
-                        entities_page
-                            .items
-                            .into_iter()
-                            .map(|e| (e.id, (e.kind, e.properties, e.tags, e.created_at)))
-                            .collect()
-                    };
+                        })
+                        .collect()
+                };
 
-                let filtered_hits =
+                let mut filtered_hits =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        hits.into_iter()
-                            .filter(|h| {
-                                if source_filter.is_some_and(|source| h.source != source) {
-                                    return false;
-                                }
-                                let Some((_, props, tags, _)) = entity_meta.get(&h.entity_id)
-                                else {
-                                    return false;
-                                };
-                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf))
-                                    && tag_filter.is_none_or(|wanted| tags_match_any(tags, wanted))
-                            })
-                            .take(request.limit() as usize)
-                            .collect::<Vec<_>>()
+                        let kept = hits.into_iter().filter(|h| {
+                            if source_filter.is_some_and(|source| h.source != source) {
+                                return false;
+                            }
+                            let Some(meta) = entity_meta.get(&h.entity_id) else {
+                                return false;
+                            };
+                            props_filter.is_none_or(|pf| props_match(meta.properties.as_ref(), pf))
+                                && tag_filter
+                                    .is_none_or(|wanted| tags_match_any(&meta.tags, wanted))
+                        });
+                        if request.order_by() == SearchOrder::Score {
+                            // Score order imposes the caller limit as candidates
+                            // stream past the filters, as it always has.
+                            kept.take(request.limit() as usize).collect::<Vec<_>>()
+                        } else {
+                            // A time order has to see every candidate that passed
+                            // the filters before it can pick the most recent ones.
+                            kept.collect::<Vec<_>>()
+                        }
                     } else {
                         hits
                     };
+
+                if request.order_by() != SearchOrder::Score {
+                    apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {
+                        entity_meta.get(&h.entity_id).and_then(|meta| {
+                            request
+                                .order_by()
+                                .timestamp_of(meta.created_at, meta.updated_at)
+                        })
+                    });
+                }
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
                     .filter(|h| h.score.to_f64() >= request.min_score())
                     .map(|h| {
-                        let entity_kind =
-                            entity_meta.get(&h.entity_id).map(|(k, _, _, _)| k.as_str());
-                        let created_at = entity_meta
-                            .get(&h.entity_id)
-                            .map(|(_, _, _, c)| micros_to_iso(*c));
+                        let meta = entity_meta.get(&h.entity_id);
+                        let entity_kind = meta.map(|m| m.kind.as_str());
+                        let created_at = meta.map(|m| micros_to_iso(m.created_at));
+                        let updated_at = meta.map(|m| micros_to_iso(m.updated_at));
                         serde_json::json!({
                             "id": h.entity_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
@@ -365,6 +464,11 @@ impl KgPack {
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
+                            "updated_at": updated_at,
+                            // Entities carry no persisted revision — the column
+                            // exists on notes only — so the field is present for
+                            // row-shape parity across substrates and always null.
+                            "version": Value::Null,
                         })
                     })
                     .collect();
@@ -413,40 +517,56 @@ impl KgPack {
                         .collect()
                 };
 
-                let filtered_hits: Vec<_> =
+                let mut filtered_hits: Vec<_> =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        hits.into_iter()
-                            .filter(|h| {
-                                if source_filter.is_some_and(|source| h.source != source) {
-                                    return false;
-                                }
-                                let Some(note) = note_meta.get(&h.note_id) else {
-                                    return false;
-                                };
-                                let props = &note.properties;
-                                let props_ok =
-                                    props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
-                                let tags_ok = tag_filter.is_none_or(|wanted| {
-                                    let note_tags: Vec<String> = props
-                                        .as_ref()
-                                        .and_then(|p| p.get("tags"))
-                                        .and_then(Value::as_array)
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .filter_map(Value::as_str)
-                                                .map(str::to_owned)
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    tags_match_any(&note_tags, wanted)
-                                });
-                                props_ok && tags_ok
-                            })
-                            .take(request.limit() as usize)
-                            .collect()
+                        let kept = hits.into_iter().filter(|h| {
+                            if source_filter.is_some_and(|source| h.source != source) {
+                                return false;
+                            }
+                            let Some(note) = note_meta.get(&h.note_id) else {
+                                return false;
+                            };
+                            let props = &note.properties;
+                            let props_ok =
+                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
+                            let tags_ok = tag_filter.is_none_or(|wanted| {
+                                let note_tags: Vec<String> = props
+                                    .as_ref()
+                                    .and_then(|p| p.get("tags"))
+                                    .and_then(Value::as_array)
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_owned)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                tags_match_any(&note_tags, wanted)
+                            });
+                            props_ok && tags_ok
+                        });
+                        if request.order_by() == SearchOrder::Score {
+                            // Score order imposes the caller limit as candidates
+                            // stream past the filters, as it always has.
+                            kept.take(request.limit() as usize).collect()
+                        } else {
+                            // A time order has to see every candidate that passed
+                            // the filters before it can pick the most recent ones.
+                            kept.collect()
+                        }
                     } else {
                         hits
                     };
+
+                if request.order_by() != SearchOrder::Score {
+                    apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {
+                        note_meta.get(&h.note_id).and_then(|note| {
+                            request
+                                .order_by()
+                                .timestamp_of(note.created_at, note.updated_at)
+                        })
+                    });
+                }
 
                 let result: Vec<Value> = filtered_hits
                     .iter()
@@ -456,6 +576,7 @@ impl KgPack {
                         let note_kind = note.kind.as_str();
                         let name = &note.name;
                         let created_at = micros_to_iso(note.created_at);
+                        let updated_at = micros_to_iso(note.updated_at);
                         Some(serde_json::json!({
                             "id": h.note_id.to_string(),
                             // `kind`/`name` match the list()/get() row shape (#1174);
@@ -468,6 +589,7 @@ impl KgPack {
                             "title": h.title,
                             "snippet": h.snippet,
                             "created_at": created_at,
+                            "updated_at": updated_at,
                             "version": note.version,
                         }))
                     })

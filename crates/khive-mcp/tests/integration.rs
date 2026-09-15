@@ -6796,3 +6796,537 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
 
 #[path = "streams/contract.rs"]
 mod stream_contract;
+
+// #2537: transport witnesses collect all legacy controls before precision assertions.
+fn sr2537_write(key: &str, atomic: bool, version: Option<i64>) -> String {
+    let member = json!({"op":"write", "kind":"head", "key":key,
+        "doc":{"revision":version.unwrap_or(0)+1}, "expected_version":version, "embed":false});
+    format!("stream.batch(atomic={atomic},ops={})", json!([member]))
+}
+
+async fn sr2537_request(
+    client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
+    args: Value,
+) -> anyhow::Result<Value> {
+    let response = call(client, "request", args).await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    assert!(
+        body["results"].is_array(),
+        "real MCP result envelope: {body}"
+    );
+    Ok(body)
+}
+
+fn sr2537_success(body: &Value, index: usize, tool: &str) -> Value {
+    let entry = &body["results"][index];
+    assert_eq!(entry["tool"], tool);
+    assert_eq!(entry["ok"], true, "dispatch control: {entry}");
+    entry["result"].clone()
+}
+
+fn sr2537_iso(value: &Value) -> &str {
+    let text = value.as_str().expect("canonical timestamp string");
+    chrono::DateTime::parse_from_rfc3339(text).expect("canonical timestamp parses");
+    assert_eq!(
+        text.split('.').nth(1).unwrap().trim_end_matches('Z').len(),
+        6
+    );
+    text
+}
+
+async fn sr2537_stored(
+    client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
+    receipt: &Value,
+    short: bool,
+) -> anyhow::Result<Value> {
+    let visible = receipt["id"].as_str().expect("receipt id");
+    let stored = ok_one(client, &format!("get(id={})", json!(visible))).await?;
+    let full = stored["id"].as_str().unwrap();
+    uuid::Uuid::parse_str(full).expect("stored full UUID");
+    assert_eq!(visible, if short { &full[..8] } else { full });
+    if receipt.get("version").is_some() {
+        assert_eq!(receipt["version"], stored["version"]);
+    }
+    Ok(stored)
+}
+
+fn sr2537_precision(pairs: Vec<(String, Value, Value)>, expected: usize) {
+    assert_eq!(
+        pairs.len(),
+        expected,
+        "complete predeclared receipt case inventory"
+    );
+    println!("SR2537 controls complete: {expected} timestamp cases");
+    for (case, shown, canonical) in pairs {
+        sr2537_iso(&canonical);
+        assert_eq!(shown, canonical, "SR2537 precision: {case}");
+    }
+}
+
+#[tokio::test]
+async fn issue_2537_agent_write_receipts_with_compact_metadata() -> anyhow::Result<()> {
+    let mut pairs = Vec::new();
+    for atomic in [true, false] {
+        let client = connect().await?;
+        for expected in [None, Some(1)] {
+            let body = sr2537_request(&client, json!({"ops":format!("{} | list(kind=\"head\",limit=10)",sr2537_write("receipt",atomic,expected))})).await?;
+            assert_eq!(body["results"].as_array().unwrap().len(), 2);
+            assert_eq!(body["summary"]["succeeded"], 2);
+            let batch = sr2537_success(&body, 0, "stream.batch");
+            assert_eq!(batch["committed"], true);
+            assert_eq!(batch["results"].as_array().unwrap().len(), 1);
+            let receipt = &batch["results"][0];
+            assert_eq!(receipt["version"], expected.unwrap_or(0) + 1);
+            let stored = sr2537_stored(&client, receipt, true).await?;
+            assert_eq!(
+                serde_json::from_str::<Value>(stored["content"].as_str().unwrap())?,
+                json!({"revision":expected.unwrap_or(0)+1})
+            );
+            let listed = sr2537_success(&body, 1, "list");
+            assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+            let row = &listed["items"][0];
+            assert_eq!(row["id"], receipt["id"]);
+            assert_eq!(row["version"], stored["version"]);
+            assert_ne!(
+                row["updated_at"], stored["updated_at"],
+                "read metadata must stay compact"
+            );
+            assert!(!row["updated_at"].as_str().unwrap().contains('.'));
+            pairs.push((
+                format!("write atomic={atomic} expected={expected:?}"),
+                receipt["updated_at"].clone(),
+                stored["updated_at"].clone(),
+            ));
+        }
+    }
+    sr2537_precision(pairs, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_agent_append_receipts_all_producers() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let mut pairs = Vec::new();
+    let one = agent_one(
+        &client,
+        r#"stream.append(stream="standalone",record={"n":1},embed=false)"#,
+    )
+    .await?;
+    assert_eq!(one["seq"], 1);
+    let stored = sr2537_stored(&client, &one, true).await?;
+    let page = ok_one(&client, r#"stream.read(stream="standalone",limit=10)"#).await?;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(page["entries"][0]["record"], json!({"n":1}));
+    assert_eq!(page["entries"][0]["id"], stored["id"]);
+    pairs.push((
+        "standalone append".into(),
+        one["created_at"].clone(),
+        stored["created_at"].clone(),
+    ));
+    for atomic in [true, false] {
+        let stream = format!("mixed-{atomic}");
+        let ops = json!([{"op":"append","stream":stream,"record":{"n":2},"embed":false},
+            {"op":"write","key":format!("head-{atomic}"),"kind":"head","doc":{"n":3},"embed":false}]);
+        let batch = agent_one(&client, &format!("stream.batch(atomic={atomic},ops={ops})")).await?;
+        assert_eq!(batch["committed"], true);
+        assert_eq!(batch["results"].as_array().unwrap().len(), 2);
+        assert_eq!(batch["results"][0]["seq"], 1);
+        assert_eq!(batch["results"][1]["version"], 1);
+        for (index, field) in [(0, "created_at"), (1, "updated_at")] {
+            let receipt = &batch["results"][index];
+            let stored = sr2537_stored(&client, receipt, true).await?;
+            pairs.push((
+                format!("mixed atomic={atomic} member={index}"),
+                receipt[field].clone(),
+                stored[field].clone(),
+            ));
+        }
+        let page = ok_one(&client, &format!("stream.read(stream={})", json!(stream))).await?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["record"], json!({"n":2}));
+    }
+    sr2537_precision(pairs, 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_receipts_single_parallel_chain() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let routes = [
+        ("single", sr2537_write("single", true, None), 1),
+        (
+            "parallel",
+            format!(
+                "[{},{}]",
+                sr2537_write("left", false, None),
+                sr2537_write("right", false, None)
+            ),
+            2,
+        ),
+    ];
+    let mut pairs = Vec::new();
+    for (route, ops, count) in routes {
+        let body = sr2537_request(&client, json!({"ops":ops})).await?;
+        assert_eq!(body["results"].as_array().unwrap().len(), count);
+        for index in 0..count {
+            let batch = sr2537_success(&body, index, "stream.batch");
+            assert_eq!(batch["committed"], true);
+            assert_eq!(batch["results"].as_array().unwrap().len(), 1);
+            let receipt = &batch["results"][0];
+            assert_eq!(receipt["version"], 1);
+            let stored = sr2537_stored(&client, receipt, true).await?;
+            pairs.push((
+                format!("{route}-{index}"),
+                receipt["updated_at"].clone(),
+                stored["updated_at"].clone(),
+            ));
+        }
+    }
+    // Nest the whole result: the MCP boundary refuses a bare map-valued $prev argument.
+    // Persist the first receipt before a later write supersedes that row.
+    let ops = format!(
+        "{} | stream.append(stream=\"chain-capture\",record={{\"previous\":$prev}},embed=false) | {}",
+        sr2537_write("chain", true, None),
+        sr2537_write("chain", true, Some(1))
+    );
+    let body = sr2537_request(&client, json!({"ops":ops})).await?;
+    assert_eq!(
+        body["summary"],
+        json!({"total":3,"succeeded":3,"failed":0,"aborted":0}),
+        "complete chain response: {body}"
+    );
+    let first = sr2537_success(&body, 0, "stream.batch");
+    let middle = sr2537_success(&body, 1, "stream.append");
+    let last = sr2537_success(&body, 2, "stream.batch");
+    assert_eq!(first["committed"], true);
+    assert_eq!(last["committed"], true);
+    assert_eq!(first["results"].as_array().unwrap().len(), 1);
+    assert_eq!(last["results"].as_array().unwrap().len(), 1);
+    assert_eq!(first["results"][0]["version"], 1);
+    assert_eq!(last["results"][0]["version"], 2);
+    assert_eq!(first["results"][0]["id"], last["results"][0]["id"]);
+    assert_eq!(middle["seq"], 1);
+    let latest = sr2537_stored(&client, &last["results"][0], true).await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(latest["content"].as_str().unwrap())?,
+        json!({"revision":2})
+    );
+    let page = ok_one(&client, r#"stream.read(stream="chain-capture")"#).await?;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    let captured = &page["entries"][0]["record"];
+    let first_time = captured["previous"]["results"][0]["updated_at"].clone();
+    sr2537_iso(&first_time);
+    assert_eq!(
+        captured,
+        &json!({"previous":{"committed":true,"results":[{"id":latest["id"],"version":1,"updated_at":first_time}]}})
+    );
+    let append_stored = sr2537_stored(&client, &middle, true).await?;
+    pairs.push((
+        "chain superseded create".into(),
+        first["results"][0]["updated_at"].clone(),
+        first_time,
+    ));
+    pairs.push((
+        "chain capture append".into(),
+        middle["created_at"].clone(),
+        append_stored["created_at"].clone(),
+    ));
+    pairs.push((
+        "chain update".into(),
+        last["results"][0]["updated_at"].clone(),
+        latest["updated_at"].clone(),
+    ));
+    sr2537_precision(pairs, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_receipt_mode_overrides() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let mut pairs = Vec::new();
+    for (index, mode) in [None, Some("agent"), Some("verbose"), Some("human")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut args = json!({"ops":sr2537_write(&format!("mode-{index}"),true,None)});
+        if let Some(mode) = mode {
+            args["presentation"] = json!(mode);
+        }
+        let body = sr2537_request(&client, args).await?;
+        let batch = sr2537_success(&body, 0, "stream.batch");
+        assert_eq!(batch["committed"], true);
+        let receipt = &batch["results"][0];
+        let stored =
+            sr2537_stored(&client, receipt, mode.is_none() || mode == Some("agent")).await?;
+        if mode == Some("verbose") || mode == Some("human") {
+            assert_eq!(receipt["updated_at"], stored["updated_at"]);
+        }
+        pairs.push((
+            format!("mode-{mode:?}"),
+            receipt["updated_at"].clone(),
+            stored["updated_at"].clone(),
+        ));
+    }
+    for envelope in ["agent", "verbose"] {
+        let ops = format!(
+            "[{},{}]",
+            sr2537_write(&format!("{envelope}-a"), false, None),
+            sr2537_write(&format!("{envelope}-v"), false, None)
+        );
+        let body = sr2537_request(
+            &client,
+            json!({"ops":ops,"presentation":envelope,"presentation_per_op":["agent","verbose"]}),
+        )
+        .await?;
+        for index in 0..2 {
+            let batch = sr2537_success(&body, index, "stream.batch");
+            let receipt = &batch["results"][0];
+            let stored = sr2537_stored(&client, receipt, index == 0).await?;
+            if index == 1 {
+                assert_eq!(receipt["updated_at"], stored["updated_at"]);
+            }
+            pairs.push((
+                format!("override-{envelope}-{index}"),
+                receipt["updated_at"].clone(),
+                stored["updated_at"].clone(),
+            ));
+        }
+    }
+    sr2537_precision(pairs, 8);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_receipt_formats() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let mut pairs = Vec::new();
+    for mode in ["agent", "verbose", "human"] {
+        for format in ["json", "auto", "table"] {
+            let stream = format!("format-{mode}-{format}");
+            let body=sr2537_request(&client,json!({"ops":format!("stream.append(stream={},record={{\"format\":true}},embed=false)",json!(stream)),"presentation":mode,"format":format})).await?;
+            let shown = sr2537_success(&body, 0, "stream.append");
+            let scalar = if format == "json" {
+                assert!(shown.is_object());
+                shown.clone()
+            } else {
+                assert!(shown.is_string());
+                serde_json::from_str::<Value>(shown.as_str().unwrap())?
+            };
+            assert_eq!(scalar["seq"], 1);
+            let stored = sr2537_stored(&client, &scalar, mode == "agent").await?;
+            pairs.push((
+                format!("{mode}/{format}"),
+                scalar["created_at"].clone(),
+                stored["created_at"].clone(),
+            ));
+        }
+    }
+    let body=sr2537_request(&client,json!({"ops":r#"[stream.append(stream="override-json",record=1,embed=false),stream.append(stream="override-table",record=2,embed=false)]"#,"format":"auto","format_per_op":["json","table"]})).await?;
+    for index in 0..2 {
+        let shown = sr2537_success(&body, index, "stream.append");
+        let scalar = if index == 0 {
+            assert!(shown.is_object());
+            shown
+        } else {
+            assert!(shown.is_string());
+            serde_json::from_str::<Value>(shown.as_str().unwrap())?
+        };
+        assert_eq!(scalar["seq"], 1);
+        let stored = sr2537_stored(&client, &scalar, true).await?;
+        pairs.push((
+            format!("format override {index}"),
+            scalar["created_at"].clone(),
+            stored["created_at"].clone(),
+        ));
+    }
+    for mode in ["agent", "verbose", "human"] {
+        for format in ["json", "auto", "table"] {
+            let stream = format!("rows-{mode}-{format}");
+            let ops = json!([{"op":"append","stream":stream,"record":1,"embed":false},
+                {"op":"append","stream":stream,"record":2,"embed":false}]);
+            let body=sr2537_request(&client,json!({"ops":format!("stream.batch(atomic=true,ops={ops})"),"presentation":mode,"format":format})).await?;
+            let shown = sr2537_success(&body, 0, "stream.batch");
+            let page = ok_one(&client, &format!("stream.read(stream={})", json!(stream))).await?;
+            let entries = page["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["record"], 1);
+            assert_eq!(entries[1]["record"], 2);
+            let receipts = if format == "json" {
+                assert_eq!(shown["committed"], true);
+                shown["results"].as_array().unwrap().clone()
+            } else {
+                let text = shown.as_str().expect("real table result");
+                assert!(text.ends_with("committed: true\n"));
+                let lines: Vec<_> = text.lines().filter(|line| line.starts_with('|')).collect();
+                assert_eq!(lines.len(), 4, "header, separator, two rows: {text}");
+                let cells = |line: &str| {
+                    line.split('|')
+                        .skip(1)
+                        .take(3)
+                        .map(|cell| cell.trim().to_owned())
+                        .collect::<Vec<_>>()
+                };
+                let headers = cells(lines[0]);
+                assert_eq!(headers.len(), 3);
+                for key in ["id", "seq", "created_at"] {
+                    assert!(headers.iter().any(|header| header == key));
+                }
+                lines[2..]
+                    .iter()
+                    .map(|line| {
+                        let row = cells(line);
+                        let mut obj = serde_json::Map::new();
+                        for (key, cell) in headers.iter().zip(row) {
+                            obj.insert(
+                                key.clone(),
+                                if key == "seq" {
+                                    json!(cell.parse::<i64>().unwrap())
+                                } else {
+                                    json!(cell)
+                                },
+                            );
+                        }
+                        Value::Object(obj)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(receipts.len(), 2);
+            for index in 0..2 {
+                assert_eq!(receipts[index]["seq"], index + 1);
+                let full = entries[index]["id"].as_str().unwrap();
+                uuid::Uuid::parse_str(full).unwrap();
+                assert_eq!(
+                    receipts[index]["id"].as_str().unwrap(),
+                    if mode == "agent" { &full[..8] } else { full }
+                );
+                pairs.push((
+                    format!("row {mode}/{format}/{index}"),
+                    receipts[index]["created_at"].clone(),
+                    entries[index]["created_at"].clone(),
+                ));
+            }
+        }
+    }
+    sr2537_precision(pairs, 29);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_receipt_errors_partial_members() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let bad = json!([{"op":"append","stream":"refused","record":0,"expected_seq":9,"embed":false},
+        {"op":"append","stream":"survivor","record":1,"embed":false},
+        {"op":"write","kind":"head","key":"survivor-head","doc":{"ok":true},"embed":false}]);
+    let rejected = sr2537_request(
+        &client,
+        json!({"ops":format!("stream.batch(atomic=true,ops={bad})")}),
+    )
+    .await?;
+    assert_eq!(rejected["results"][0]["ok"], false);
+    assert!(rejected["results"][0]["error"].is_object());
+    for stream in ["refused", "survivor"] {
+        let page = ok_one(&client, &format!("stream.read(stream={})", json!(stream))).await?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 0);
+    }
+    let empty = ok_one(&client, r#"list(kind="head")"#).await?;
+    assert_eq!(empty["items"].as_array().unwrap().len(), 0);
+    let body = sr2537_request(
+        &client,
+        json!({"ops":format!("stream.batch(atomic=false,ops={bad})")}),
+    )
+    .await?;
+    let batch = sr2537_success(&body, 0, "stream.batch");
+    assert_eq!(batch["committed"], true);
+    assert_eq!(batch["results"].as_array().unwrap().len(), 3);
+    assert_eq!(batch["results"][0]["details"]["reason"], "seq_conflict");
+    assert_eq!(batch["results"][1]["seq"], 1);
+    assert_eq!(batch["results"][2]["version"], 1);
+    let canonical_client = connect().await?;
+    let canonical_rejected = sr2537_request(
+        &canonical_client,
+        json!({"ops":format!("stream.batch(atomic=true,ops={bad})"),"presentation":"verbose"}),
+    )
+    .await?;
+    assert_eq!(
+        rejected["results"][0]["error"],
+        canonical_rejected["results"][0]["error"]
+    );
+    let canonical_partial = ok_one(
+        &canonical_client,
+        &format!("stream.batch(atomic=false,ops={bad})"),
+    )
+    .await?;
+    let mut expected_refusal = canonical_partial["results"][0].clone();
+    assert_eq!(
+        expected_refusal.as_object_mut().unwrap().remove("code"),
+        Some(Value::Null),
+        "Agent omits the existing non-lifecycle null code field"
+    );
+    assert_eq!(
+        batch["results"][0], expected_refusal,
+        "whole nested refusal retains every other canonical field"
+    );
+    let help = agent_one(&client, r#"stream.batch(help=true)"#).await?;
+    assert!(help.to_string().contains("atomic"));
+    assert!(help.get("updated_at").is_none());
+    let mut pairs = Vec::new();
+    for (index, field) in [(1, "created_at"), (2, "updated_at")] {
+        let receipt = &batch["results"][index];
+        let stored = sr2537_stored(&client, receipt, true).await?;
+        pairs.push((
+            format!("partial member {index}"),
+            receipt[field].clone(),
+            stored[field].clone(),
+        ));
+    }
+    sr2537_precision(pairs, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_2537_prev_canonical_receipt() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let mut pairs = Vec::new();
+    for whole in [true, false] {
+        let key = format!("prev-{whole}");
+        let record = if whole {
+            "{\"previous\":$prev}"
+        } else {
+            "{\"time\":$prev.results[0].updated_at}"
+        };
+        let ops = format!(
+            "{} | stream.append(stream={},record={record},embed=false)",
+            sr2537_write(&key, true, None),
+            json!(key)
+        );
+        let body = sr2537_request(&client, json!({"ops":ops})).await?;
+        assert_eq!(
+            body["summary"],
+            json!({"total":2,"succeeded":2,"failed":0,"aborted":0}),
+            "complete chain response: {body}"
+        );
+        let batch = sr2537_success(&body, 0, "stream.batch");
+        let appended = sr2537_success(&body, 1, "stream.append");
+        assert_eq!(appended["seq"], 1);
+        let receipt = &batch["results"][0];
+        let stored = sr2537_stored(&client, receipt, true).await?;
+        let page = ok_one(&client, &format!("stream.read(stream={})", json!(key))).await?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let captured = &page["entries"][0]["record"];
+        if whole {
+            assert_eq!(
+                captured,
+                &json!({"previous":{"committed":true,"results":[{"id":stored["id"],"version":1,"updated_at":stored["updated_at"]}]}})
+            );
+        } else {
+            assert_eq!(captured, &json!({"time":stored["updated_at"]}));
+        }
+        pairs.push((
+            format!("canonical prev whole={whole}"),
+            receipt["updated_at"].clone(),
+            stored["updated_at"].clone(),
+        ));
+    }
+    sr2537_precision(pairs, 2);
+    Ok(())
+}

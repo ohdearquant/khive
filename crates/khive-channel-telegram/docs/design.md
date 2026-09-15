@@ -46,3 +46,7 @@ The adapter requires `KHIVE_TELEGRAM_BOT_TOKEN` and a numeric
   the durable external-id deduplication boundary.
 - Production uses a 25-second Bot API long poll with a longer client timeout. Tests inject a
   connector or test-only base URL and do not make live Telegram calls.
+- The daemon selects an in-flight poll against its shutdown token. Cancellation drops the
+  request without acknowledging an offset, so the next poll requests the same uncommitted
+  updates. Once a fetched batch enters ingestion, the daemon finishes that batch's existing
+  ingest/offset discipline before observing shutdown on the next cycle.

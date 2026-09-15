@@ -847,10 +847,10 @@ async fn handle_channel_ingest_failure(
 /// token fires first. Returns `false` when shutdown is observed, which is the
 /// caller's signal to leave its loop.
 ///
-/// The wait is the only cancellation point on purpose: a channel cycle issues
-/// verbs against the store, so dropping one mid-flight would abandon a cursor
-/// read or an ingest partway. Between cycles there is nothing in flight, so
-/// the loop ends where a restart costs at most one re-poll.
+/// Poll loops also select their transport read against this token. Store
+/// dispatches and progress commits finish their existing sequence instead of
+/// being dropped mid-flight. A cancelled read or cycle wait leaves the last
+/// committed progress available for the next poll.
 ///
 /// The token is a parameter, never read from
 /// `khive_runtime::daemon_shutdown_token()` inside a loop. That singleton is
@@ -985,7 +985,19 @@ async fn channel_poll_loop(
                 }
             };
 
-            match channel.poll_page(since, checkpoint.as_ref()).await {
+            #[cfg(test)]
+            poll_timing_tests::at(poll_timing_tests::Boundary::EmailBeforePoll).await;
+            // A transport poll may outlast the daemon drain budget. No
+            // cursor or bootstrap floor advances until its page is ingested.
+            let polled = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::info!("email channel polling loop: cancelled in-flight poll");
+                    return;
+                }
+                result = channel.poll_page(since, checkpoint.as_ref()) => result,
+            };
+            match polled {
                 Ok(page) => {
                     let prior_attempt =
                         backoffs.get(&backoff_key).map(|b| b.attempt()).unwrap_or(0);
@@ -1083,6 +1095,11 @@ async fn channel_poll_loop(
                     if page_fully_ingested {
                         match page.next_checkpoint {
                             Some(next_checkpoint) => {
+                                #[cfg(test)]
+                                poll_timing_tests::at(
+                                    poll_timing_tests::Boundary::EmailBeforeCommit,
+                                )
+                                .await;
                                 match commit_channel_cursor(&registry, kind, slug, &next_checkpoint)
                                     .await
                                 {
@@ -1912,6 +1929,20 @@ fn telegram_ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+// Keep the offset acknowledgement coupled to the polled channel. This
+// private seam lets the daemon loop be tested with a parked transport.
+#[cfg(feature = "channel-telegram")]
+trait TelegramPollChannel: khive_channel::Channel {
+    fn commit_offset(&self);
+}
+
+#[cfg(feature = "channel-telegram")]
+impl TelegramPollChannel for khive_channel_telegram::TelegramChannel {
+    fn commit_offset(&self) {
+        khive_channel_telegram::TelegramChannel::commit_offset(self);
+    }
+}
+
 /// Background task that polls the Telegram channel via `getUpdates` long
 /// polling and ingests new inbound messages via `comm.ingest`. No
 /// backoff/heartbeat/lifecycle-event surface — see
@@ -1930,13 +1961,12 @@ fn telegram_ingest_namespace_from_env() -> String {
 /// without importing its IMAP-specific machinery (issue #113).
 #[cfg(feature = "channel-telegram")]
 async fn telegram_poll_loop(
-    telegram_channel: std::sync::Arc<khive_channel_telegram::TelegramChannel>,
+    telegram_channel: std::sync::Arc<impl TelegramPollChannel>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     use chrono::Utc;
-    use khive_channel::Channel;
     use serde_json::json;
 
     const ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1949,7 +1979,19 @@ async fn telegram_poll_loop(
             tracing::info!("telegram channel polling loop: daemon shutdown observed, stopping");
             return;
         }
-        match telegram_channel.poll(Utc::now()).await {
+        #[cfg(all(test, feature = "test-channel-timing"))]
+        poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforePoll).await;
+        // Dropping getUpdates leaves the confirmed offset unchanged; an
+        // abandoned batch is requested again when polling resumes.
+        let polled = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!("telegram channel polling loop: cancelled in-flight poll");
+                return;
+            }
+            result = telegram_channel.poll(Utc::now()) => result,
+        };
+        match polled {
             Ok(envelopes) => {
                 let kind = telegram_channel.kind();
                 let slug = telegram_channel.slug();
@@ -1987,6 +2029,8 @@ async fn telegram_poll_loop(
                 }
 
                 if all_ingested {
+                    #[cfg(all(test, feature = "test-channel-timing"))]
+                    poll_timing_tests::at(poll_timing_tests::Boundary::TelegramBeforeCommit).await;
                     telegram_channel.commit_offset();
                     for key in batch_attempt_keys {
                         unknown_ingest_attempts.remove(&key);
@@ -14073,3 +14117,11 @@ backend = "kg-backend"
         }
     }
 }
+
+#[cfg(all(test, any(feature = "channel-email", feature = "channel-telegram")))]
+#[path = "serve_poll_cancel_tests.rs"]
+mod poll_cancellation_tests;
+
+#[cfg(all(test, any(feature = "channel-email", feature = "test-channel-timing")))]
+#[path = "serve_poll_timing_tests.rs"]
+mod poll_timing_tests;

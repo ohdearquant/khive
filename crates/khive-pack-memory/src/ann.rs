@@ -2202,6 +2202,88 @@ pub(crate) fn outcome_into_candidates(
     }
 }
 
+/// Cap on the error text a [`SkipReason`] carries beside its label, counted
+/// in characters and inclusive of [`SKIP_DETAIL_TRUNCATION_MARKER`]. A
+/// degraded recall stamps the rendered reason onto every hit it serves, so an
+/// error that quotes a whole statement must not be able to bloat the response.
+const SKIP_DETAIL_MAX_CHARS: usize = 200;
+
+/// Written in place of the characters a cut removed, so a reader can tell a
+/// bounded rendering from a complete one.
+const SKIP_DETAIL_TRUNCATION_MARKER: &str = "...";
+
+/// Bound `detail` to [`SKIP_DETAIL_MAX_CHARS`] characters, marking a cut with
+/// [`SKIP_DETAIL_TRUNCATION_MARKER`]. The bound is character-wise, not
+/// byte-wise, so a multi-byte error message cannot be split mid-character.
+fn bound_skip_detail(detail: &str) -> String {
+    if detail.char_indices().nth(SKIP_DETAIL_MAX_CHARS).is_none() {
+        return detail.to_owned();
+    }
+    let keep = SKIP_DETAIL_MAX_CHARS - SKIP_DETAIL_TRUNCATION_MARKER.chars().count();
+    let cut = match detail.char_indices().nth(keep) {
+        Some((byte_index, _)) => byte_index,
+        None => detail.len(),
+    };
+    let mut bounded = String::with_capacity(cut + SKIP_DETAIL_TRUNCATION_MARKER.len());
+    bounded.push_str(&detail[..cut]);
+    bounded.push_str(SKIP_DETAIL_TRUNCATION_MARKER);
+    bounded
+}
+
+/// Why the fresh-tail leg sat out a query: the failure-site label, plus the
+/// error that caused the skip whenever the site was holding one.
+///
+/// One label covers causes that differ in what the caller should do next — a
+/// segment directory rewritten underneath the read self-heals on the next
+/// query, a truncated segment does not, and both arrive as "re-resolved
+/// segment load failed" — so the error travels out with the label instead of
+/// stopping at a log line the caller cannot read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkipReason {
+    label: &'static str,
+    detail: Option<String>,
+}
+
+impl SkipReason {
+    /// A skip whose site holds no error: the bare label, unchanged.
+    fn bare(label: &'static str) -> Self {
+        Self {
+            label,
+            detail: None,
+        }
+    }
+
+    /// A skip whose site holds the error that caused it. The error's own
+    /// message is bounded by [`bound_skip_detail`] before it is carried.
+    fn with_error(label: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            label,
+            detail: Some(bound_skip_detail(&error.to_string())),
+        }
+    }
+
+    /// The failure-site label on its own, without any error text.
+    #[cfg(test)]
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// The bounded error text, or `None` when the site held no error.
+    #[cfg(test)]
+    fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(f, "{}: {detail}", self.label),
+            None => f.write_str(self.label),
+        }
+    }
+}
+
 /// Outcome of [`fresh_tail_leg`]. Full semantics and the disclosure contract
 /// for each variant: `docs/ann.md`.
 pub(crate) enum FreshTailOutcome {
@@ -2215,9 +2297,11 @@ pub(crate) enum FreshTailOutcome {
     /// re-resolution; `None` means the full pair was assembled.
     Replace(Vec<(Uuid, f32)>, Option<&'static str>),
     /// The leg sat out this query entirely; the caller's candidates are
-    /// unaffected. The payload is a non-empty failure-site diagnostic —
-    /// callers may depend on its presence, not its exact wording.
-    Skipped(&'static str),
+    /// unaffected. The payload renders to a non-empty failure-site
+    /// diagnostic: the label, followed by the error that caused the skip
+    /// whenever the site was holding one. Callers may depend on its
+    /// presence, not on its exact wording.
+    Skipped(SkipReason),
 }
 
 /// The ADR-118 fresh-tail exact leg, giving read-your-writes visibility.
@@ -2288,9 +2372,9 @@ pub(crate) async fn fresh_tail_leg(
     }
 
     if !rt.ann_fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped(
+        return FreshTailOutcome::Skipped(SkipReason::bare(
             "fresh-tail leg disabled by runtime policy (KHIVE_ANN_FRESH_TAIL is sampled at construction)",
-        );
+        ));
     }
 
     match s {
@@ -2315,12 +2399,18 @@ async fn fresh_tail_serving(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: reader open failed; skipping exact leg");
-            return FreshTailOutcome::Skipped("fresh-tail: reader open failed");
+            return FreshTailOutcome::Skipped(SkipReason::with_error(
+                "fresh-tail: reader open failed",
+                e,
+            ));
         }
     };
     if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
         tracing::warn!(error = %e, model, "fresh-tail: snapshot begin failed; skipping exact leg");
-        return FreshTailOutcome::Skipped("fresh-tail: snapshot begin failed");
+        return FreshTailOutcome::Skipped(SkipReason::with_error(
+            "fresh-tail: snapshot begin failed",
+            e,
+        ));
     }
 
     let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
@@ -2328,7 +2418,10 @@ async fn fresh_tail_serving(
         Err(e) => {
             end_read_snapshot(reader.as_mut()).await;
             tracing::warn!(error = %e, model, "fresh-tail: registry-min read failed; skipping exact leg");
-            return FreshTailOutcome::Skipped("fresh-tail: registry-min read failed");
+            return FreshTailOutcome::Skipped(SkipReason::with_error(
+                "fresh-tail: registry-min read failed",
+                e,
+            ));
         }
     };
 
@@ -2410,7 +2503,10 @@ async fn fresh_tail_serving(
                         Ok((ops, _)) => FreshTailOutcome::Ops(ops),
                         Err(e) => {
                             tracing::warn!(error = %e, model, "fresh-tail: floored tail fetch failed; skipping exact leg");
-                            FreshTailOutcome::Skipped("fresh-tail: floored tail fetch failed")
+                            FreshTailOutcome::Skipped(SkipReason::with_error(
+                                "fresh-tail: floored tail fetch failed",
+                                e,
+                            ))
                         }
                     }
                 }
@@ -2424,7 +2520,7 @@ async fn fresh_tail_serving(
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped("fresh-tail: tail fetch failed")
+            FreshTailOutcome::Skipped(SkipReason::with_error("fresh-tail: tail fetch failed", e))
         }
     }
 }
@@ -2454,16 +2550,19 @@ async fn fresh_tail_reresolve(
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
         let Some(dir) = ann_segment_dir(rt, model) else {
             bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped(
+            return FreshTailOutcome::Skipped(SkipReason::bare(
                 "fresh-tail: re-resolved segment directory unavailable",
-            );
+            ));
         };
         let bridge = match AnnBridge::load(&dir) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment load failed");
+                return FreshTailOutcome::Skipped(SkipReason::with_error(
+                    "fresh-tail: re-resolved segment load failed",
+                    e,
+                ));
             }
         };
         let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
@@ -2472,7 +2571,10 @@ async fn fresh_tail_reresolve(
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment search failed");
+                return FreshTailOutcome::Skipped(SkipReason::with_error(
+                    "fresh-tail: re-resolved segment search failed",
+                    e,
+                ));
             }
         };
         // This load served only the current query; force re-adoption so the
@@ -2602,14 +2704,20 @@ async fn fresh_tail_capped_at_threshold(
         Ok(true) => {}
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail-existence read failed; skipping capped exact leg");
-            return FreshTailOutcome::Skipped("fresh-tail: tail-existence read failed");
+            return FreshTailOutcome::Skipped(SkipReason::with_error(
+                "fresh-tail: tail-existence read failed",
+                e,
+            ));
         }
     }
     match fetch_final_tail(rt, model, 0, Some(live_threshold)).await {
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped("fresh-tail: capped tail fetch failed")
+            FreshTailOutcome::Skipped(SkipReason::with_error(
+                "fresh-tail: capped tail fetch failed",
+                e,
+            ))
         }
     }
 }
@@ -3144,14 +3252,131 @@ mod tests {
     fn outcome_into_candidates_skipped_keeps_prior_and_discloses() {
         let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
         let (candidates, disclosure) = outcome_into_candidates(
-            FreshTailOutcome::Skipped("fresh-tail: reader open failed"),
+            FreshTailOutcome::Skipped(SkipReason::with_error(
+                "fresh-tail: reader open failed",
+                "pool exhausted after 5s",
+            )),
             prior.clone(),
             &[1.0, 0.0],
         );
         assert_eq!(candidates, prior, "Skipped must leave candidates untouched");
         assert_eq!(
             disclosure.as_deref(),
-            Some("fresh-tail: reader open failed")
+            Some("fresh-tail: reader open failed: pool exhausted after 5s"),
+            "the disclosure must carry the error that caused the skip, not \
+             only the label shared by every failure at that site"
+        );
+    }
+
+    /// A site holding no error keeps emitting the bare label: the enriched
+    /// rendering must not smuggle a separator or a placeholder onto a skip
+    /// that genuinely has nothing further to say.
+    #[test]
+    fn skip_reason_without_an_error_renders_the_bare_label() {
+        const LABEL: &str = "fresh-tail: re-resolved segment directory unavailable";
+        let reason = SkipReason::bare(LABEL);
+        assert_eq!(reason.detail(), None);
+        assert_eq!(reason.label(), LABEL);
+        assert_eq!(reason.to_string(), LABEL);
+
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Skipped(SkipReason::bare(LABEL)),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, prior);
+        assert_eq!(
+            disclosure.as_deref(),
+            Some(LABEL),
+            "an error-free skip must disclose exactly the label it always did"
+        );
+    }
+
+    /// Two skips that share a label are told apart by the error each carries:
+    /// a directory rewritten underneath the read is retryable, a corrupt
+    /// segment is not, and the label alone cannot separate them.
+    #[test]
+    fn skip_reason_separates_two_causes_that_share_a_label() {
+        const LABEL: &str = "fresh-tail: re-resolved segment load failed";
+        let rewritten = SkipReason::with_error(LABEL, "No such file or directory (os error 2)");
+        let corrupt = SkipReason::with_error(LABEL, "vamana graph: unexpected end of file");
+
+        assert_eq!(rewritten.label(), corrupt.label());
+        assert_ne!(
+            rewritten.to_string(),
+            corrupt.to_string(),
+            "the two causes must be distinguishable in the served reason"
+        );
+        for (reason, expected_error) in [
+            (&rewritten, "No such file or directory (os error 2)"),
+            (&corrupt, "vamana graph: unexpected end of file"),
+        ] {
+            let rendered = reason.to_string();
+            assert!(
+                rendered.starts_with(LABEL),
+                "the label must stay at the front of the reason, got: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(expected_error),
+                "the reason must carry the error text, got: {rendered:?}"
+            );
+        }
+    }
+
+    /// An unbounded error (a driver message quoting a whole statement) is cut
+    /// to the documented character bound and marked as cut, so one degraded
+    /// response cannot be bloated by the error it discloses.
+    #[test]
+    fn skip_reason_detail_is_bounded_and_marks_the_cut() {
+        let long_error = "x".repeat(SKIP_DETAIL_MAX_CHARS * 10);
+        let reason = SkipReason::with_error("fresh-tail: tail fetch failed", &long_error);
+
+        let detail = reason
+            .detail()
+            .expect("an error-bearing skip carries detail");
+        assert_eq!(
+            detail.chars().count(),
+            SKIP_DETAIL_MAX_CHARS,
+            "a cut detail must land exactly on the bound, marker included"
+        );
+        assert!(
+            detail.ends_with(SKIP_DETAIL_TRUNCATION_MARKER),
+            "a cut must be marked so the reader knows the error continues, got: {detail:?}"
+        );
+        assert!(
+            reason
+                .to_string()
+                .starts_with("fresh-tail: tail fetch failed"),
+            "truncating the error must not disturb the label"
+        );
+
+        // The control arm: an error that fits is carried whole, with no
+        // marker — otherwise the assertion above passes on a function that
+        // simply truncates everything.
+        let short_error = "y".repeat(SKIP_DETAIL_MAX_CHARS);
+        let short = SkipReason::with_error("fresh-tail: tail fetch failed", &short_error);
+        assert_eq!(
+            short.detail(),
+            Some(short_error.as_str()),
+            "an error within the bound must be carried unchanged"
+        );
+    }
+
+    /// The bound counts characters, not bytes: a multi-byte error message
+    /// must never be cut mid-character (which would not even be a `String`).
+    #[test]
+    fn skip_reason_detail_bound_never_splits_a_character() {
+        let multibyte = "\u{00e9}".repeat(SKIP_DETAIL_MAX_CHARS * 2);
+        let bounded = bound_skip_detail(&multibyte);
+        assert_eq!(bounded.chars().count(), SKIP_DETAIL_MAX_CHARS);
+        assert!(bounded.ends_with(SKIP_DETAIL_TRUNCATION_MARKER));
+        assert!(
+            bounded
+                .trim_end_matches(SKIP_DETAIL_TRUNCATION_MARKER)
+                .chars()
+                .all(|c| c == '\u{00e9}'),
+            "the kept prefix must be whole characters, got: {bounded:?}"
         );
     }
 
@@ -5358,6 +5583,153 @@ mod tests {
             ids[4..].to_vec(),
             "ceil(0.20 × 6) must select the two newest raw log rows"
         );
+    }
+
+    /// A skip that discards an error must carry it out to the caller: the
+    /// label alone cannot say whether the store lost its write log or was
+    /// merely busy, and retry-vs-rebuild turns on that difference. The
+    /// control arm is the same call before the fault, which must not skip —
+    /// otherwise this passes on a leg that sits out unconditionally.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_capped_leg_carries_its_read_error_into_the_skip_reason() {
+        const MODEL: &str = "adr118-skip-reason-carries-error-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("skip reason fixture note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        match fresh_tail_capped_at_threshold(&rt, MODEL, 1.0).await {
+            FreshTailOutcome::Ops(ops) => assert!(
+                !ops.is_empty(),
+                "control: a healthy store must replay the seeded tail"
+            ),
+            FreshTailOutcome::Replace(..) => {
+                panic!("the no-index capped leg never replaces candidates")
+            }
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("control: a healthy store must not skip, got: {reason}")
+            }
+        }
+
+        // Fault injection: remove the write-log table the leg's existence
+        // probe reads, so its next call fails for a nameable reason. (Test
+        // fixture database, mirroring the DROP TABLE fault pattern already
+        // used in this module and in handlers/recall.rs.)
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("fault injection writer");
+            w.execute(SqlStatement {
+                sql: "DROP TABLE ann_write_log".into(),
+                params: vec![],
+                label: Some("test_drop_write_log_for_skip_reason".into()),
+            })
+            .await
+            .expect("drop the write-log table");
+        }
+
+        match fresh_tail_capped_at_threshold(&rt, MODEL, 1.0).await {
+            FreshTailOutcome::Skipped(reason) => {
+                assert_eq!(
+                    reason.label(),
+                    "fresh-tail: tail-existence read failed",
+                    "the failure-site label must be unchanged by the enrichment"
+                );
+                let detail = reason
+                    .detail()
+                    .expect("a skip constructed while holding an error must carry it");
+                assert!(
+                    detail.contains("ann_write_log"),
+                    "the carried error must name what actually failed, got: {detail:?}"
+                );
+                let rendered = reason.to_string();
+                assert!(
+                    rendered.starts_with(reason.label()) && rendered.contains(detail),
+                    "the served reason must carry the label and the error, got: {rendered:?}"
+                );
+            }
+            FreshTailOutcome::Ops(_) | FreshTailOutcome::Replace(..) => {
+                panic!("a missing write-log table must make the capped leg sit out")
+            }
+        }
+    }
+
+    /// The policy-disabled arm holds no error, and must keep emitting exactly
+    /// the bare label it always did — through the real leg, not only through
+    /// a hand-built value. The control arm is the same fixture with the leg
+    /// enabled, which must not skip at all.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_disabled_by_policy_skips_with_a_bare_label() {
+        const MODEL: &str = "adr118-disabled-policy-bare-label-test-model";
+        const DIMS: usize = 8;
+
+        async fn run_leg(fresh_tail_enabled: bool) -> FreshTailOutcome {
+            let rt = KhiveRuntime::memory()
+                .expect("in-memory runtime")
+                .with_ann_fresh_tail_enabled(fresh_tail_enabled);
+            provision_test_vector_store(&rt, MODEL, DIMS);
+            register_consumer(&rt, MODEL)
+                .await
+                .expect("register this consumer");
+            raise_watermark_with_authority(&rt, MODEL, 0, WatermarkAuthority::PendingOrActive)
+                .await
+                .expect("activate this consumer");
+            let ann = new_shared();
+            let key = AnnKey::new(MODEL);
+            fresh_tail_leg(&rt, &ann, &key, MODEL, &[0.0_f32; DIMS], 10, Some(0)).await
+        }
+
+        match run_leg(false).await {
+            FreshTailOutcome::Skipped(reason) => {
+                assert!(
+                    reason
+                        .label()
+                        .starts_with("fresh-tail leg disabled by runtime policy"),
+                    "got: {}",
+                    reason.label()
+                );
+                assert_eq!(
+                    reason.detail(),
+                    None,
+                    "this site holds no error, so it must carry none"
+                );
+                assert_eq!(
+                    reason.to_string(),
+                    reason.label(),
+                    "an error-free skip must render as the bare label, with no \
+                     separator and no placeholder"
+                );
+            }
+            FreshTailOutcome::Ops(_) | FreshTailOutcome::Replace(..) => {
+                panic!("a leg disabled by runtime policy must sit the query out")
+            }
+        }
+
+        match run_leg(true).await {
+            FreshTailOutcome::Ops(_) => {}
+            FreshTailOutcome::Replace(..) => {
+                panic!("control: an enabled leg over an empty log must not replace")
+            }
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("control: an enabled leg must not skip, got: {reason}")
+            }
+        }
     }
 
     /// A subject in the stale warm index whose final tail op is delete must be dropped from the merged list (#1828).

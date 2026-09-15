@@ -23,7 +23,7 @@ use khive_runtime::note_write::NoteWriteOptions;
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, NoteTagMode, PropertyFilter};
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{LimitReport, PageRequest, SqlStatement, SqlValue};
 use khive_types::{Details, KhiveError};
 
 use crate::schema::{
@@ -302,6 +302,25 @@ pub struct TransitionParams {
 fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
+}
+
+/// #2679: merge the shared `khive_storage::types::LimitReport`
+/// (`requested_limit`, `effective_limit`, `limit_clamped = requested >
+/// effective`) into an already-built object response — the exact idiom
+/// `khive-pack-kg`'s `graph.rs::handle_neighbors` and `proposal.rs` already
+/// use to merge the same struct, reused here instead of a second spelling of
+/// the same three fields. `response` must already be a JSON object;
+/// `handle_next`/`handle_tasks` only call this after deciding to wrap their
+/// normally-bare-array result because a clamp fired, so the object is
+/// freshly built here and the `expect` documents that invariant rather than
+/// guarding a real caller error.
+fn insert_limit_report(response: &mut Value, requested: u32, effective: u32) {
+    if let Some(fields) = LimitReport::new(requested, effective).value().as_object() {
+        response
+            .as_object_mut()
+            .expect("insert_limit_report requires an object response")
+            .extend(fields.clone());
+    }
 }
 
 fn short_id(uuid: Uuid) -> String {
@@ -1405,13 +1424,25 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: NextParams = deser(params)?;
-        // #744: this clamp is silent by design here — the response shape is a bare
-        // JSON array (`Value::Array`), consumed directly via `.as_array()` by every
-        // caller in this crate and beyond (kkernel, li surfaces). Adding a sibling
-        // `truncated` field would require wrapping the response in an object, which
-        // is a breaking shape change, not an additive one. The cap is documented on
-        // the `limit` ParamDef instead (issue #744 fallback ask 1).
-        let limit = p.limit.unwrap_or(10).clamp(1, 200);
+        // #744 → #2679: the response shape is a bare JSON array (`Value::Array`),
+        // consumed directly via `.as_array()` by every caller in this crate and
+        // beyond (kkernel, li surfaces) since long before `limit` existed as a
+        // param, so unconditionally wrapping it in an object to carry clamp
+        // metadata would break every existing unclamped call — the concern
+        // #744 raised. #2679 resolves it the other way: wrap ONLY when a clamp
+        // actually fires (`requested_limit > effective_limit`, computed
+        // below), so an unclamped caller (including one that passes an
+        // under-cap `limit` explicitly) still sees today's bare array
+        // byte-for-byte. This differs deliberately from `khive-pack-kg`'s
+        // `graph.rs::handle_neighbors`, which wraps whenever the caller
+        // supplies `limit` at all, clamped or not — safe there only because
+        // `neighbors` gained `limit` in the same change that added the report,
+        // so no prior unclamped caller of a bare `limit` exists to break.
+        // `insert_limit_report` merges the shared `LimitReport` struct
+        // (`khive_storage::types`), the same one `handle_neighbors` and
+        // `proposal.rs` already merge into their responses.
+        let requested_limit = p.limit.unwrap_or(10);
+        let limit = requested_limit.clamp(1, 200);
 
         // #772: push the actionable-status (+ optional assignee) predicate into
         // SQL via `query_notes_filtered` and scan every matching page, instead
@@ -1464,7 +1495,13 @@ impl GtdPack {
             .iter()
             .map(|(note, diagnostic)| diagnostic.render(note))
             .collect();
-        Ok(Value::Array(result))
+        if requested_limit > limit {
+            let mut response = json!({ "tasks": result });
+            insert_limit_report(&mut response, requested_limit, limit);
+            Ok(response)
+        } else {
+            Ok(Value::Array(result))
+        }
     }
 
     pub(crate) async fn handle_complete(
@@ -1548,10 +1585,14 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
-        // #744: silent clamp, documented rather than signaled — see the identical
-        // note in `handle_next` above (bare-array response shape rules out an
-        // additive `truncated` field).
-        let limit = p.limit.unwrap_or(50).clamp(1, 200);
+        // #744 → #2679: see the identical rationale in `handle_next` above — the
+        // bare-array shape stays byte-identical when unclamped; wrapping happens
+        // only when `requested_limit > limit` fires below (checked at every
+        // return site, including the `filter_excluded` object wrap further
+        // down, which already switches shape for an unrelated reason).
+        let requested_limit = p.limit.unwrap_or(50);
+        let limit = requested_limit.clamp(1, 200);
+        let limit_clamped = requested_limit > limit;
         let offset = p.offset.unwrap_or(0);
 
         // Normalize status filter once.
@@ -1739,17 +1780,27 @@ impl GtdPack {
                 .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
             if !terminal_page.items.is_empty() {
-                return Ok(json!({
+                let mut response = json!({
                     "tasks": result,
                     "filter_excluded": ["done", "cancelled", "unrecognized_status"],
                     "hint": "no tasks matched, but the default filter excludes terminal and \
                               unrecognized stored statuses; pass status=\"done\" or \
                               status=\"cancelled\" for terminal tasks, or use list(kind=\"task\") \
                               to inspect legacy records before a reviewed repair",
-                }));
+                });
+                if limit_clamped {
+                    insert_limit_report(&mut response, requested_limit, limit);
+                }
+                return Ok(response);
             }
         }
-        Ok(Value::Array(result))
+        if limit_clamped {
+            let mut response = json!({ "tasks": result });
+            insert_limit_report(&mut response, requested_limit, limit);
+            Ok(response)
+        } else {
+            Ok(Value::Array(result))
+        }
     }
 
     pub(crate) async fn handle_transition(

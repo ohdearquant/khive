@@ -10,7 +10,7 @@ use uuid::Uuid;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
-use crate::pin::{current_registration, invalidating_registration, registration_snapshot};
+use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
 use crate::RegistryPin;
 
 pub fn now_micros() -> i64 {
@@ -455,7 +455,7 @@ pub(crate) async fn set_grant_status(
 ) -> Result<GrantRow, RuntimeError> {
     let now = now_micros();
     let registration = if status == "granted" {
-        current_registration(rt, token, &prepared.tool).await?
+        visible_registration(rt, token, &prepared.tool).await?
     } else {
         None
     };
@@ -485,7 +485,7 @@ pub(crate) async fn set_grant_status(
                 Err(RuntimeError::InvalidInput(format!("grant {} changed while preparing the decision; retry", &current.id[..8])))
             } else if let Err(error) = validate_transition(&current, &status, &decided_by) {
                 Err(error)
-            } else if status == "granted" && registration_snapshot(writer, &visible_namespaces, &current.tool).await? != registration {
+            } else if status == "granted" && registration_snapshot(writer, &ns, &visible_namespaces, &current.tool).await? != registration {
                 Err(RuntimeError::InvalidInput(format!("tool {:?} registration changed while preparing the grant; retry", current.tool)))
             } else {
                 let (registry_id, definition_digest) = if status == "granted" {

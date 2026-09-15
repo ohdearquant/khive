@@ -87,6 +87,7 @@ impl RegistrationSnapshot {
 
 pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
     reader: &mut R,
+    own_namespace: &str,
     namespaces: &[String],
     name: &str,
 ) -> Result<Option<RegistrationSnapshot>, StorageError> {
@@ -98,13 +99,15 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
                     AND CAST(lower(name) AS BLOB) = ?2 \
                     AND EXISTS (SELECT 1 FROM json_each(entities.tags) \
                                 WHERE lower(json_each.value) = 'tool-registry') \
-                  ORDER BY CASE WHEN name = ?3 COLLATE BINARY THEN 0 ELSE 1 END, \
+                  ORDER BY CASE WHEN namespace = ?4 THEN 0 ELSE 1 END, \
+                           CASE WHEN name = ?3 COLLATE BINARY THEN 0 ELSE 1 END, \
                            created_at DESC, id ASC LIMIT 1"
                 .into(),
             params: vec![
                 SqlValue::Json(json!(namespaces)),
                 SqlValue::Blob(name.to_ascii_lowercase().into_bytes()),
                 SqlValue::Text(name.into()),
+                SqlValue::Text(own_namespace.into()),
             ],
             label: Some("tool_registry_snapshot".into()),
         })
@@ -136,7 +139,9 @@ pub(crate) async fn registration_snapshot<R: SqlReader + ?Sized>(
     .transpose()
 }
 
-pub(crate) async fn current_registration(
+// A visible name first denotes the caller's own registration; foreign rows
+// only supply the existing exact-case, newest, UUID-ordered fallback.
+pub(crate) async fn visible_registration(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     name: &str,
@@ -147,7 +152,13 @@ pub(crate) async fn current_registration(
         .map(str::to_owned)
         .collect();
     let mut reader = rt.sql().reader().await?;
-    Ok(registration_snapshot(reader.as_mut(), &namespaces, name).await?)
+    Ok(registration_snapshot(
+        reader.as_mut(),
+        token.namespace().as_str(),
+        &namespaces,
+        name,
+    )
+    .await?)
 }
 
 pub(crate) async fn invalidating_registration<R: SqlReader + ?Sized>(
