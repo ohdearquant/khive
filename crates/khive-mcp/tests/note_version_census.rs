@@ -119,6 +119,9 @@ fn assignment_list(sql: &str) -> Option<&str> {
     // closed by `]` rather than by itself. `None` means not inside one.
     let mut closes: Option<u8> = None;
     let mut start: Option<usize> = None;
+    // Where the list ends, recorded rather than returned, so the scan carries on
+    // to the end of the literal looking for a statement separator.
+    let mut end: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
@@ -160,6 +163,25 @@ fn assignment_list(sql: &str) -> Option<&str> {
             b'[' => closes = Some(b']'),
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
+            // A `;` outside every quoted span and comment separates STATEMENTS, and
+            // this predicate reasons about one. A second statement assigns
+            // whatever it likes while the first supplies a `WHERE` that ends the
+            // list before it: measured on this scanner,
+            // `UPDATE {} SET a = 1; SELECT 1 WHERE 1=1; UPDATE {} SET version = 2
+            // WHERE id = 1` yielded the list `a = 1; SELECT 1`, which carries no
+            // `VERSION`, and was admitted. Refusing the whole literal is the
+            // direction that costs nothing: a reader of one statement has no
+            // business ruling on two.
+            //
+            // A `;` closing a single statement is not that, so it ends the scan
+            // rather than refusing; otherwise the ordinary trailing semicolon
+            // would refuse every statement that carries one.
+            b';' => {
+                if bytes[i + 1..].iter().all(u8::is_ascii_whitespace) {
+                    break;
+                }
+                return None;
+            }
             _ => {
                 if depth == 0 {
                     if start.is_none() && starts_with_ci(bytes, i, b" SET ") {
@@ -167,17 +189,15 @@ fn assignment_list(sql: &str) -> Option<&str> {
                         i += 5;
                         continue;
                     }
-                    if let Some(from) = start {
-                        if starts_with_ci(bytes, i, b" WHERE ") {
-                            return Some(&sql[from..i]);
-                        }
+                    if start.is_some() && end.is_none() && starts_with_ci(bytes, i, b" WHERE ") {
+                        end = Some(i);
                     }
                 }
             }
         }
         i += 1;
     }
-    start.map(|from| &sql[from..])
+    start.map(|from| &sql[from..end.unwrap_or(sql.len())])
 }
 
 /// Whether a statement whose table name is interpolated can still be ruled out as
@@ -829,6 +849,43 @@ fn a_where_inside_a_comment_does_not_end_the_assignment_list() {
     assert!(!assignments_rule_out_version(
         "UPDATE {} SET namespace = ?2 /* not a version write */ WHERE id = ?1"
     ));
+}
+
+/// Two statements in one literal are two statements, and this reads one.
+///
+/// Third of the same class as the quoted identifier and the comment, and the one
+/// that does not fit their shape: here the text ending the list early is a real
+/// `WHERE`, belonging to a real predicate, of a different statement. Whatever the
+/// second statement assigns is outside everything the predicate looks at, so the
+/// refusal is on the LITERAL rather than on the list.
+///
+/// Both placements get a case because they fail differently: a separator inside
+/// the list leaves a `;` in the text a list-scoped rule could still see, and one
+/// after the list leaves nothing there at all.
+#[test]
+fn a_second_statement_in_one_literal_is_not_read_and_so_is_refused() {
+    for hidden in [
+        "UPDATE {} SET a = 1; SELECT 1 WHERE 1=1; UPDATE {} SET version = 2 WHERE id = 1",
+        "UPDATE {} SET a = 1 WHERE id = 1; UPDATE notes SET version = 2 WHERE id = 1",
+    ] {
+        assert!(
+            !assignments_rule_out_version(hidden),
+            "a second statement is never read, so a literal holding one is refused: {hidden}"
+        );
+    }
+
+    // The controls, and a rule keyed on the character alone would refuse both: a
+    // single statement written with its terminator, and a semicolon inside a
+    // quoted value, where it is data rather than a separator.
+    for benign in [
+        "UPDATE {} SET namespace = ?2 WHERE id = ?1;",
+        "UPDATE {} SET namespace = ?2 WHERE note = ';'",
+    ] {
+        assert!(
+            assignments_rule_out_version(benign),
+            "one statement is still one statement: {benign}"
+        );
+    }
 }
 
 /// What would have to be true for the predicate to be wrong, executed rather
