@@ -3,7 +3,8 @@
 use serde_json::{json, Value};
 
 use khive_runtime::secret_gate::{
-    check_at, check_json_at, mask_for_redaction_surface, RedactionSurface,
+    check_at, check_json_at, mask_for_redaction_surface, reject_reserved_secret_gate_property,
+    RedactionSurface,
 };
 use khive_runtime::{NamespaceToken, RuntimeError};
 
@@ -15,11 +16,10 @@ impl KgPack {
     /// Report whether the secret gate would refuse a note body, which detector
     /// fires, and where. Nothing is stored and no event is written.
     ///
-    /// The verdict comes from the same `check_at` / `check_json_at` calls, in
-    /// the same field order, that a note write runs before it stores anything,
-    /// so the probe cannot disagree with the write path by construction: there
-    /// is no second predicate to drift. The masked preview goes through the
-    /// same masker every mask-only surface uses.
+    /// Reserved properties are validated before content, name and properties
+    /// reach the same credential detectors used by a note write. Reservation
+    /// failures retain the shared validator's error; detector matches become
+    /// verdicts. The masked preview uses the shared mask-only surface masker.
     pub(crate) async fn handle_scan(
         &self,
         _token: &NamespaceToken,
@@ -61,14 +61,15 @@ impl KgPack {
     }
 }
 
-/// The note-write gate sequence: content, then name, then properties. Keep in
-/// step with the note create path in `khive_runtime`; the agreement test in
-/// `handlers/tests.rs` fails if the two diverge on a refused body.
+/// The reservation and credential checks shared with the note-write path:
+/// reserved properties, then content, name and properties. Agreement tests
+/// cover this sequence; create-only kind and shape validation is outside scan.
 fn scan_note_fields(
     content: &str,
     name: Option<&str>,
     properties: Option<&Value>,
 ) -> Result<(), RuntimeError> {
+    reject_reserved_secret_gate_property(properties)?;
     check_at(content, "note", "content")?;
     if let Some(n) = name {
         check_at(n, "note", "name")?;
