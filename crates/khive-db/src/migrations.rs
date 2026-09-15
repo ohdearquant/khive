@@ -162,6 +162,7 @@ const V30_UP: &str = include_str!("../sql/030-tool-source-mounts.sql");
 const V31_UP: &str = include_str!("../sql/031-note-versions.sql");
 const V32_UP: &str = include_str!("../sql/032-knowledge-count-indexes.sql");
 const V33_UP: &str = include_str!("../sql/033-notes-message-recipient-direction.sql");
+const V34_UP: &str = include_str!("../sql/034-notes-namespace-created.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -382,6 +383,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 33,
         name: "notes_message_recipient_direction",
         up: V33_UP,
+    },
+    VersionedMigration {
+        version: 34,
+        name: "notes_namespace_created",
+        up: V34_UP,
     },
 ];
 
