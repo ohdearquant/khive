@@ -68,8 +68,8 @@ impl KgPack {
     /// Reader/writer-contention, graph-edge integrity, and WAL/checkpoint
     /// diagnostics (ADR-091/ADR-135/ADR-165 operator surface): reader
     /// admission/route/timeout/hold evidence; aggregate and class-specific
-    /// writer acquisition, pooled-timeout, and audit-failure counters; build
-    /// identity; duplicate edge-ID and list-ledger counts; checkpoint counters;
+    /// writer acquisition, pooled-timeout, and audit-failure counters; build and
+    /// OS process identity; duplicate edge-ID and list-ledger counts; checkpoint counters;
     /// a PASSIVE probe; WAL file size; and a qualified WAL-pin census.
     /// Zero-arg, always targets the main backend regardless of the caller's
     /// namespace. Not write-free: the PASSIVE probe may backfill WAL frames

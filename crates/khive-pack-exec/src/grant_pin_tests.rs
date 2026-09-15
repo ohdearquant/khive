@@ -2,6 +2,7 @@ use super::*;
 use khive_pack_blob::BlobPack;
 use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
+use khive_runtime::pack::PackRuntime;
 use khive_runtime::{RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::Namespace;
@@ -201,4 +202,84 @@ async fn exec_preflight_validates_the_snapshot_that_selected_its_binary() {
         .unwrap();
     assert_eq!(tool_binary(&replacement).unwrap(), "/bin/echo");
     assert_eq!(decision.source, "grant");
+}
+
+#[tokio::test]
+async fn visible_registration_legacy_grant_still_refuses_at_execution_preflight() {
+    let f = Fixture::new();
+    let owner = f.runtime.authorize(Namespace::parse("b").unwrap()).unwrap();
+    let caller = f
+        .runtime
+        .authorize_with_visibility(
+            Namespace::parse("a").unwrap(),
+            vec![Namespace::parse("b").unwrap()],
+        )
+        .unwrap();
+    let registered = ToolPack::new(f.runtime.clone())
+        .dispatch(
+            "tool.register",
+            json!({"name":"shared-shell", "source":"exec:/bin/sh", "side_effect":"write"}),
+            &f.registry,
+            &owner,
+        )
+        .await
+        .unwrap();
+    let id = registered["tool"]["full_id"].as_str().unwrap();
+    f.runtime.sql().writer().await.unwrap().execute(SqlStatement {
+        sql: "INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at) VALUES (?1, 'a', 'agent:pin', 'shared-shell', 'granted', 1)".into(),
+        params: vec![SqlValue::Text(Uuid::new_v4().to_string())],
+        label: Some("test_legacy_visible_grant".into()),
+    }).await.unwrap();
+
+    // The entity-based execution decision was already closed before name
+    // resolution was fixed. Keep that independent enforcement control.
+    let entity = f
+        .runtime
+        .get_entity(&owner, id.parse().unwrap())
+        .await
+        .unwrap();
+    let control = preflight_policy(&f.runtime, &caller, "agent:pin", &entity)
+        .await
+        .unwrap();
+    assert_eq!(control.decision, "ask");
+    assert_eq!(control.source, "default");
+    let pack = crate::ExecPack::new(f.runtime.clone());
+    for reference in ["shared-shell", id] {
+        let error = pack
+            .dispatch(
+                "exec.run",
+                json!({"tool":reference, "actor":"agent:pin", "tree":"intentionally-invalid-tree"}),
+                &f.registry,
+                &caller,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("= ask from default"), "{error}");
+        assert!(
+            !error.contains("tree:"),
+            "must refuse before tree loading: {error}"
+        );
+        let runs = pack
+            .dispatch(
+                "exec.runs",
+                json!({"actor":"agent:pin"}),
+                &f.registry,
+                &caller,
+            )
+            .await
+            .unwrap();
+        let receipt = pack
+            .dispatch(
+                "exec.receipt",
+                json!({"id":runs["runs"][0]["id"]}),
+                &f.registry,
+                &caller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["decision"]["decision"], "ask");
+        assert_eq!(receipt["decision"]["source"], "default");
+        assert!(!f.root.exists(), "preflight must not materialize a run");
+    }
 }
