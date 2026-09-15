@@ -106,21 +106,37 @@ tested against a fixture, and a closure can do none of those.
 
 Validation before any write, with two outcomes that must not look alike:
 
-- A record kind present in the source namespace with **no route** refuses the entire move.
-- A record kind **routed with zero rows** succeeds and reports a count of zero.
+- A subject class present in the source namespace with **no route** refuses the entire move.
+- A subject class **routed with zero rows** succeeds and reports a count of zero.
 
 The second is the reason the counts exist. A host that binds a pack which writes nothing needs
 "routed, nothing there" to be distinguishable from "you forgot this one", and an implementation that
 collapses them makes the map unverifiable by its own caller.
 
+### The route key names a subject class
+
+Four of the namespace-carrying tables hold rows that exist in their own right and have no `kind`
+column: `knowledge_atoms`, `knowledge_domains`, `graph_edges` and the stream ledger. A route map
+keyed on a bare kind string cannot name them, and cannot be validated against a store that holds
+them. So the key names a subject class, qualified by kind for the two classes that carry one:
+
+```
+note:<kind>   entity:<kind>   edge   atom   domain
+```
+
+The qualification is not decoration. Nothing in the schema stops a note kind and an entity kind
+sharing a spelling, and an unqualified key would route both on a store where they do. It also makes
+the refusal exact: the message names `note:observation` rather than `observation`.
+
 ### Derived rows move with their parent
 
-Only kind-bearing records are routed. Everything else is carried:
+Only subject classes are routed. Everything else is carried:
 
 - the six fts5 tables and the two rowid maps, with their parent note or entity,
 - `knowledge_sections` with its atom,
 - `proposals_open` with the namespace it belongs to,
-- every `vec_*` row, with its subject.
+- every `vec_*` row, with its subject,
+- the `brain_*` rows and the `ann_*` bookkeeping, with the subject whose state they hold.
 
 None of these appears in the route map. A caller cannot route them independently, because they have
 no independent existence.
