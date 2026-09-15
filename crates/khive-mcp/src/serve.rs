@@ -10327,19 +10327,20 @@ region = "us-east-1"
         std::env::remove_var("KHIVE_PACKS");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
 
+        use clap::Parser;
         let db = seat_dir.path().join("read-only-schedule.db");
-        KhiveRuntime::new(RuntimeConfig {
-            db_path: Some(db.clone()),
-            ..RuntimeConfig::no_embeddings()
-        })
-        .expect("create migrated snapshot source");
+        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
+        // A readable snapshot includes pack upgrades from writable startup,
+        // not only the substrate migrations performed by KhiveRuntime::new.
+        {
+            let (_source_server, _source_schedule_rt) = build_server(&args)
+                .await
+                .expect("create snapshot with current default-pack schema");
+        }
         let mut permissions = std::fs::metadata(&db).unwrap().permissions();
         permissions.set_mode(0o444);
         std::fs::set_permissions(&db, permissions).unwrap();
         freeze_snapshot_sidecars(&db);
-
-        use clap::Parser;
-        let args = Args::parse_from(["mcp", "--db", db.to_str().expect("utf8 path"), "--no-embed"]);
 
         let (_server, schedule_rt) = build_server(&args)
             .await
