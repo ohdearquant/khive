@@ -732,11 +732,11 @@ No test or mutation result is claimed by this contract.
 ## Proposed amendment (2026-09-15): topic query candidate-window counts
 
 **Status: Proposed.** Related issue: #2732. This follow-on requires acceptance and
-lands after the knowledge list/topic implementation of the accepted 2026-09-14
-#2679 amendment. It does not change that amendment's existing acceptance or claim
-that its implementation has landed.
+extends the accepted 2026-09-14 knowledge list/topic limit-report contract. Its
+implementation can proceed independently of the limit-report implementation;
+this proposal does not claim that those reports are already implemented.
 
-The #2679 amendment deliberately retains `total` for two different quantities.
+The accepted limit-report amendment deliberately retains `total` for two different quantities.
 This amendment would supersede only the queried topic count name: a successful
 `knowledge.topic` with a non-null `query` returns `candidate_window_count` instead
 of `total`. The count is the hydrated, domain-filtered candidate-window length
@@ -751,9 +751,11 @@ caller-visible concept `total` and omits `candidate_window_count`. A zero output
 limit may still report a positive listing total. The names are mutually exclusive;
 retaining the query `total` as an alias would retain the original ambiguity.
 
-The three #2679 limit-report fields, result shape and order, scores/snippets,
-branch selection, core-backend routing, namespace visibility, hydration, domain
-normalization/post-filtering, candidate bound and final take are unchanged.
+Result shape and order, scores/snippets, branch selection, core-backend routing,
+namespace visibility, hydration, domain normalization/post-filtering, candidate
+bound and final take are unchanged. Wherever the three accepted limit-report
+fields are implemented, preserve them and their contract semantics; this
+amendment does not add those reports.
 No additional count, search, refill or storage operation is introduced. This is
 an explicit response-key migration: callers using query `total` must move to
 `candidate_window_count`; the new field remains output-only under the existing
@@ -764,7 +766,7 @@ candidate window, itself greater than returned rows; exact queried count and
 key-absence assertions must distinguish all three. A domain-filtered control
 must measure only the surviving initial window and show no refill from matching
 concepts outside it. Unqueried/null-query, zero and empty controls preserve the
-full-count semantics and #2679 reports. Existing #2679 queried-count witnesses
-must be migrated to the new key after that implementation lands; their numeric
-expectations and other controls remain unchanged. No native result or sign-off
-is recorded by this Proposed amendment.
+full-count semantics. Wherever limit reports and their queried-count witnesses
+are implemented, retain the reports and migrate only the queried-count key;
+the witnesses' numeric expectations and other controls remain unchanged. No
+native result or sign-off is recorded by this Proposed amendment.
