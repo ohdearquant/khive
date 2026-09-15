@@ -79,17 +79,90 @@ fn read_sink_ndjson() -> String {
 /// whichever point it stopped polling, so a timed-out caller's assertion
 /// failure message still shows the actual contents.
 fn wait_for_ndjson_line(predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
+    let path = ensure_sink_dir().join(format!("writer_timeouts.{}.ndjson", std::process::id()));
+    wait_for_ndjson_line_with_reader(&path, || std::fs::read_to_string(&path), predicate, timeout)
+}
+
+fn wait_for_ndjson_line_with_reader(
+    path: &Path,
+    mut read: impl FnMut() -> std::io::Result<String>,
+    predicate: impl Fn(&str) -> bool,
+    timeout: Duration,
+) -> String {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let contents = read_sink_ndjson();
+        let contents = match read() {
+            Ok(contents) => contents,
+            // Sink startup creates the file on its background thread. A
+            // missing file is another not-yet-written observation, not a
+            // reason to bypass the polling deadline with an immediate panic.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("failed to read sink NDJSON file at {path:?}: {error}"),
+        };
         if contents.lines().any(&predicate) {
             return contents;
         }
-        if std::time::Instant::now() > deadline {
+        if std::time::Instant::now() >= deadline {
             return contents;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn ndjson_wait_retries_missing_file_and_unrelated_rows() {
+    let mut observations = [
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok("unrelated row\n".to_string()),
+        Ok("unrelated row\nexpected row\n".to_string()),
+    ]
+    .into_iter();
+    let mut reads = 0;
+    let contents = wait_for_ndjson_line_with_reader(
+        Path::new("scripted-sink.ndjson"),
+        || {
+            reads += 1;
+            observations
+                .next()
+                .expect("reader polled after matching row")
+        },
+        |line| line == "expected row",
+        Duration::from_secs(5),
+    );
+    assert_eq!(reads, 3, "both incomplete observations must be retried");
+    assert_eq!(contents, "unrelated row\nexpected row\n");
+}
+
+#[test]
+fn ndjson_wait_missing_file_respects_timeout() {
+    let mut reads = 0;
+    let contents = wait_for_ndjson_line_with_reader(
+        Path::new("scripted-sink.ndjson"),
+        || {
+            reads += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        },
+        |line| line == "expected row",
+        Duration::ZERO,
+    );
+    assert_eq!(reads, 1, "an expired wait must not poll again");
+    assert!(contents.is_empty(), "timeout must not fabricate a sink row");
+}
+
+#[test]
+#[should_panic(expected = "scripted permission failure")]
+fn ndjson_wait_does_not_hide_other_read_errors() {
+    wait_for_ndjson_line_with_reader(
+        Path::new("scripted-sink.ndjson"),
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "scripted permission failure",
+            ))
+        },
+        |_| true,
+        Duration::ZERO,
+    );
 }
 
 /// Read-only inspection must neither start the process-global writer-timeout
