@@ -683,7 +683,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.topic",
-        description: "List concepts filtered by domain or free-text query",
+        description: "List concepts filtered by domain or free-text query. With query, candidate_window_count counts hydrated, domain-filtered candidates before the final output limit, not corpus matches. Without query, total is the full matching visible concept count.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
