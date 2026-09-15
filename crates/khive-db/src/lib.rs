@@ -18,6 +18,8 @@ mod fts_maintenance;
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).
 pub mod namespace_census;
+/// Moving records between namespaces (ADR-189).
+pub mod namespace_move;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
