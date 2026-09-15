@@ -1051,6 +1051,20 @@ in the structured value. Known-prefix detections need no trigger; typed permanen
 classification does not depend on the display string. This amendment changes neither storage
 schema nor exemption-manifest identity.
 
+## Amendment: structured scalar trigger attribution (2026-09-15, #2756)
+
+For an input that validates as a JSON object or array, an entropy candidate's surrounding
+trigger context is bounded to its scalar value. Credential-shaped owning keys, including
+escaped key spellings and enclosing container labels within the existing byte radius, remain
+active. A trigger in a sibling artifact path or quoted refusal no longer labels an unrelated
+principal identifier. A label and hex credential in one scalar, a credential field, and bare
+prose credential labels remain refused. This changes trigger attribution only: provider-prefix
+checks, scalar candidate checks, and in-scalar fragment reconstruction retain their contracts.
+Invalid JSON and ordinary prose use the existing sentence/window rules. The precise bounds and
+source-range/masking rules are in the
+[algorithm specification](../../crates/khive-runtime/docs/api/secret_gate.md#structured-scalar-trigger-context-2026-09-15-2756).
+This amendment changes neither storage schema nor exemption-manifest authorization.
+
 ## Proposed amendment: prose-shaped names and stored UUID references (2026-09-14)
 
 **Status**: Items 1, 3 and 4 signed; item 2 ruled (a); item 5 signed; UUID admission remains
