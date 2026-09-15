@@ -16,6 +16,8 @@ pub mod extension;
 mod fts_maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
+/// What a live store's schema says about `namespace` (ADR-189).
+pub mod namespace_census;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
