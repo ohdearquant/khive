@@ -199,6 +199,7 @@ mod search_text_reason_tests {
                 OpSuccess { result: json!([]), degradation: SearchDegradation::complete(&json!([]), false) },
                 mode,
                 0,
+                khive_types::VerbPresentationPolicy::Standard,
                 khive_runtime::presentation::NoteContentScope::None,
             );
             assert_eq!(entry["ok"], true);

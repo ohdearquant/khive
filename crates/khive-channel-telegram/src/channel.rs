@@ -288,6 +288,84 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dropping_inflight_poll_preserves_confirmed_and_pending_offsets() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ParkFirst {
+            inner: MockConnector,
+            entered: tokio::sync::Notify,
+            first: AtomicBool,
+            drops: AtomicUsize,
+            offsets: StdMutex<Vec<Option<i64>>>,
+        }
+        #[async_trait]
+        impl TelegramConnector for ParkFirst {
+            async fn send_message(&self, _: i64, _: &str) -> Result<(), ChannelError> {
+                panic!("poll fixture never sends");
+            }
+            async fn get_updates(
+                &self,
+                offset: Option<i64>,
+            ) -> Result<Vec<TelegramUpdate>, ChannelError> {
+                self.offsets.lock().unwrap().push(offset);
+                if self.first.swap(false, Ordering::SeqCst) {
+                    struct OnDrop<'a>(&'a AtomicUsize);
+                    impl Drop for OnDrop<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    let _drop = OnDrop(&self.drops);
+                    self.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                self.inner.get_updates(offset).await
+            }
+        }
+        let connector = Arc::new(ParkFirst {
+            inner: MockConnector::new(vec![
+                vec![text_update(10, 555, "cancelled poll replay", 1_700_000_000)],
+                vec![],
+            ]),
+            entered: tokio::sync::Notify::new(),
+            first: AtomicBool::new(true),
+            drops: AtomicUsize::new(0),
+            offsets: StdMutex::new(Vec::new()),
+        });
+        let channel = TelegramChannel::with_connector(make_config(), Box::new(connector.clone()));
+        channel.advance_offset(7);
+        // A previous fetched page can remain uncommitted after ingestion fails.
+        *channel.pending_offset.lock().unwrap() = Some(9);
+        {
+            let poll = channel.poll(Utc::now());
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = connector.entered.notified() => {},
+                _ = &mut poll => panic!("the first request must remain pending"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("connector never entered its pending request")
+                }
+            }
+        }
+        assert_eq!(connector.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(channel.current_offset(), Some(7));
+        assert_eq!(*channel.pending_offset.lock().unwrap(), Some(9));
+        let replay = channel.poll(Utc::now()).await.unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].external_id.as_deref(), Some("tg:555:10"));
+        assert_eq!(channel.current_offset(), Some(7));
+        channel.commit_offset();
+        assert_eq!(channel.current_offset(), Some(11));
+        assert!(channel.poll(Utc::now()).await.unwrap().is_empty());
+        assert_eq!(
+            *connector.offsets.lock().unwrap(),
+            vec![Some(7), Some(7), Some(11)]
+        );
+    }
+
     #[test]
     fn kind_is_telegram() {
         let ch =
@@ -519,3 +597,7 @@ mod tests {
         assert_eq!(ch.maintainer_slug(), "maintainer");
     }
 }
+
+#[cfg(feature = "test-support")]
+#[path = "test_support.rs"]
+pub mod test_support;

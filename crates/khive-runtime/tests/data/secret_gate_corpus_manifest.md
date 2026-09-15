@@ -194,3 +194,32 @@ adversarial-only content that does not occur in the real corpus):
 - `blocks_separator_split_base64_like_unicode_credential`
 - `allows_unrelated_short_fragments_cited_near_a_trigger_word`
 - `allows_unrelated_short_base64_like_fragments_cited_near_a_trigger_word`
+
+
+## #2756 structured trigger context — executable synthetic corpus
+
+These rows are synthetic regression inputs, not additional production replay measurements.
+`H32` below means `0123456789abcdef0123456789abcdef`. The executable rows and masking assertions
+live in `crates/khive-runtime/tests/secret_gate_issue_2756.rs`; run them from `crates/` with
+`cargo test -p khive-runtime --test secret_gate_issue_2756`. Existing production replay counts
+above remain historical; only rerunning `generate_corpus_manifest` against the same read-only
+corpus can measure their before/after change.
+
+| Row | Expected | Input shape | Executable test suffix |
+| --- | --- | --- | --- |
+| pytest path then principal | must admit | JSON `path=/tmp/pytest/auth/workspace/fixture/output`, then `principal=instance:H32`, 80–119 bytes from `auth` | `separate_path_and_principal_scalars_admit` |
+| worktree path then principal | must admit | JSON `path=/repo/.worktrees/auth/workspace/fixture/output`, then unrelated principal | `separate_path_and_principal_scalars_admit` |
+| sibling ordering/spacing | must admit | Source path or `a_secret=x` in a sibling value; comma/space/LF/CRLF forms | `sibling_context_is_independent_of_order_and_spacing` |
+| own path trigger | must admit | `/tmp/pytest/auth/H32` and `/repo/.worktrees/secret-context/H32`, bare or JSON path field | `own_path_triggers_admit_without_credential_label` |
+| quoted refusal evidence | must admit | JSON error value quotes pattern name and `near 'auth'`; sibling path or principal contains H32 | `quoted_refusal_does_not_label_sibling_evidence` |
+| complete refusal write-up | must admit | Actual formatted gate refusal followed by evidence in a separate sentence | `quoted_refusal_does_not_label_sibling_evidence` |
+| scalar label and hex | must refuse | JSON message contains `secret H32`, `secret,H32`, or `H32 is the auth value` | `same_scalar_and_bare_prose_labels_refuse` |
+| bare prose label and hex | must refuse | `secret H32` and `H32 is the auth value` | `same_scalar_and_bare_prose_labels_refuse` |
+| credential fields | must refuse | `secret`, `api_key`, `token`, escaped keys and nested credential containers own H32 or UUID | `owning_credential_fields_refuse` |
+| credential-bearing paths | must refuse | `secret /tmp/pytest/auth/H32` and JSON `api_key` owning that path | `own_path_triggers_admit_without_credential_label` |
+| escaped structural punctuation | must refuse | Escaped quote/comma/key-like text remains in a scalar beside `secret H32` | `escaped_quotes_do_not_manufacture_field_boundaries` |
+| malformed/non-JSON | must refuse | An unclosed JSON record or prose assignment retains the existing external trigger window | `non_json_and_malformed_json_keep_prose_context` |
+| known prefixes and fragments | must refuse | Known provider value under benign key; same-scalar hex split by U+200B | `json_keeps_known_prefix_and_bridge_detection` |
+| UUID/hash ownership | admit/refuse pair | Path-trigger sibling admits UUID/SRI hash; credential owner refuses and masks | `json_siblings_keep_uuid_and_hash_rules` |
+
+Every executable test suffix above is prefixed with `issue_2756_`.

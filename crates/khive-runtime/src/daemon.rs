@@ -91,30 +91,102 @@ fn last_resort_root() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Env var overriding the socket half of the daemon rendezvous.
+#[cfg(unix)]
+const SOCKET_PATH_ENV: &str = "KHIVE_SOCKET";
+
+/// Env var overriding the PID-file half of the daemon rendezvous.
+#[cfg(unix)]
+const PID_PATH_ENV: &str = "KHIVE_PID";
+
+/// Read a path override, treating an empty value as unset.
+///
+/// One predicate for "the operator set this variable", shared by the path
+/// resolvers and [`ensure_rendezvous_overrides_paired`]. A pairing check that
+/// disagreed with the resolvers about what counts as set would either refuse
+/// boots that resolve consistently, or admit the split rendezvous it exists
+/// to stop.
+#[cfg(unix)]
+fn path_override(key: &str) -> Option<PathBuf> {
+    match std::env::var(key) {
+        Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn default_socket_path() -> PathBuf {
+    khive_dir().join("khived.sock")
+}
+
+#[cfg(unix)]
+fn default_pid_path() -> PathBuf {
+    khive_dir().join("khived.pid")
+}
+
 /// Unix socket path the daemon binds and clients connect to.
 ///
-/// Overridable via the `KHIVE_SOCKET` env var (for tests and ops).
+/// Overridable via the `KHIVE_SOCKET` env var (for tests and ops), which must
+/// be set together with `KHIVE_PID`: the daemon refuses to boot when exactly
+/// one of the two is set.
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KHIVE_SOCKET") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    khive_dir().join("khived.sock")
+    path_override(SOCKET_PATH_ENV).unwrap_or_else(default_socket_path)
 }
 
 /// PID file path written by the daemon.
 ///
-/// Overridable via the `KHIVE_PID` env var.
+/// Overridable via the `KHIVE_PID` env var, which must be set together with
+/// `KHIVE_SOCKET`: the daemon refuses to boot when exactly one of the two is
+/// set.
 #[cfg(unix)]
 pub fn pid_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KHIVE_PID") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    path_override(PID_PATH_ENV).unwrap_or_else(default_pid_path)
+}
+
+/// Refuse to boot when exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set
+/// (#2656).
+///
+/// The socket and the PID file are the two halves of one rendezvous, but they
+/// resolve independently: with only `KHIVE_SOCKET` set a daemon binds a
+/// private socket while still claiming the shared PID file, and with only
+/// `KHIVE_PID` set it writes a private PID file while binding the shared
+/// socket. Either way [`cleanup_stale_daemon`] reads an incumbent's pid out of
+/// one instance's file and judges it by probing the other instance's socket,
+/// so both of its branches are wrong: a live incumbent produces a refusal
+/// naming a pid that has nothing to do with the socket being started, and a
+/// pid that is no longer running makes this process delete a rendezvous file
+/// another daemon's `shutdown_cleanup_if_owned` still expects to own.
+///
+/// Setting both variables (a fully private rendezvous) and setting neither
+/// (the default rendezvous) are both unchanged.
+#[cfg(unix)]
+fn ensure_rendezvous_overrides_paired() -> anyhow::Result<()> {
+    match (path_override(SOCKET_PATH_ENV), path_override(PID_PATH_ENV)) {
+        (Some(socket), None) => anyhow::bail!(
+            "refusing to start: {SOCKET_PATH_ENV} is set to {} but {PID_PATH_ENV} is not set. \
+             The socket and the PID file are two halves of one daemon rendezvous and must move \
+             together: with only {SOCKET_PATH_ENV} set, this daemon would bind a private socket \
+             while claiming the shared PID file at {}, which belongs to the default rendezvous \
+             served on {}. Set {PID_PATH_ENV} to a private path beside the socket, or unset \
+             {SOCKET_PATH_ENV} to share the default rendezvous.",
+            socket.display(),
+            default_pid_path().display(),
+            default_socket_path().display(),
+        ),
+        (None, Some(pid)) => anyhow::bail!(
+            "refusing to start: {PID_PATH_ENV} is set to {} but {SOCKET_PATH_ENV} is not set. \
+             The socket and the PID file are two halves of one daemon rendezvous and must move \
+             together: with only {PID_PATH_ENV} set, this daemon would write a private PID file \
+             while binding the shared socket at {}, the default rendezvous whose owner is \
+             recorded in {}. Set {SOCKET_PATH_ENV} to a private path beside the PID file, or \
+             unset {PID_PATH_ENV} to share the default rendezvous.",
+            pid.display(),
+            default_socket_path().display(),
+            default_pid_path().display(),
+        ),
+        _ => Ok(()),
     }
-    khive_dir().join("khived.pid")
 }
 
 /// Advisory lock file used to serialize stale-daemon recovery across concurrent
@@ -1972,6 +2044,11 @@ async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
         }
     }
     let _component_teardown = ComponentTeardown;
+
+    // Placed after the teardown guard so this refusal keeps the ADR-119
+    // contract every other pre-bind error path has, and before the paths are
+    // resolved so a split rendezvous never reaches cleanup/bind/pid-write.
+    ensure_rendezvous_overrides_paired()?;
 
     let sock = socket_path();
     let pid_file = pid_path();

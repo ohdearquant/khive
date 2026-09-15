@@ -9,3 +9,6 @@ mod connector;
 
 pub use channel::TelegramChannel;
 pub use config::TelegramChannelConfig;
+
+#[cfg(feature = "test-support")]
+pub use channel::test_support;

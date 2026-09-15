@@ -43,6 +43,18 @@ decisions and rationale.
   sibling stable `reason` classification. The closed vocabulary is documented
   once in `crates/kkernel/docs/usage.md`.
 
+### Channel polling during shutdown
+
+Email and Telegram poll loops select the in-flight transport read against the daemon's
+shutdown token. Cancellation drops a pending poll immediately instead of waiting for the
+network timeout. An abandoned email page cannot advance its durable checkpoint or bootstrap
+floor; an abandoned Telegram request cannot acknowledge an offset. Polling after restart
+retries from the last committed progress, with stable external IDs preserving deduplication.
+
+This cancellation boundary surrounds polling only. A batch already being ingested retains
+its existing durable-ingest and progress-commit sequence. Outbound sends retain their own
+delivery and acknowledgement rules.
+
 ### Pack Standard — Vocabulary, Visibility, and Schema Plans (ADR-017)
 
 - Subhandler verbs are operator-only and are blocked at the MCP wire boundary.

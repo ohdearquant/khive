@@ -776,6 +776,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 description: "Optional caller-supplied score floor (0.0–1.0). Results below this threshold are discarded. No server default is applied; RRF rank-1 scores are typically 0.013–0.033 on small corpora. Pass e.g. 0.02 to suppress near-zero noise hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "order_by",
+                param_type: "string",
+                required: false,
+                description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     // Commissive: commits a typed edge to the graph

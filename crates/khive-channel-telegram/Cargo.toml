@@ -11,6 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "Telegram Bot API channel adapter for khive (ADR-056)"
 
+[features]
+# Opt-in adapter fixtures for downstream coordinator tests; disabled by default.
+test-support = []
+
 [dependencies]
 khive-channel = { version = "0.8.0", path = "../khive-channel" }
 async-trait = { workspace = true }

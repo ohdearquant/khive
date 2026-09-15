@@ -39,9 +39,10 @@ use khive_runtime::presentation::{
     prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
 };
 use khive_runtime::{
-    present, render_format, DispatchError, DomainDisposition, InterceptedDispatchResult,
-    KhiveRuntime, OutputFormat, PackLoadError, PackRegistry, PresentationMode, RuntimeConfig,
-    RuntimeError, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    present_with_policy, render_format, DispatchError, DomainDisposition,
+    InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
+    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
@@ -2341,9 +2342,9 @@ impl KhiveMcpServer {
                             return failure_entry(tool, json!(msg), DomainDisposition::NotCommitted);
                         }
                         // AlwaysVerbose verbs override the caller's presentation mode.
+                        let presentation_policy = registry.presentation_policy_for(&tool);
                         let effective_mode =
-                            if registry.presentation_policy_for(&tool)
-                                == VerbPresentationPolicy::AlwaysVerbose
+                            if presentation_policy == VerbPresentationPolicy::AlwaysVerbose
                             {
                                 PresentationMode::Verbose
                             } else {
@@ -2407,6 +2408,7 @@ impl KhiveMcpServer {
                                             result,
                                             effective_mode,
                                             now_unix,
+                                            presentation_policy,
                                             NoteContentScope::None,
                                         ),
                                         Err(failure) => failure.into_entry(),
@@ -2441,6 +2443,7 @@ impl KhiveMcpServer {
                                     success,
                                     effective_mode,
                                     now_unix,
+                                    presentation_policy,
                                     content_scope,
                                 )
                             }
@@ -2491,13 +2494,13 @@ impl KhiveMcpServer {
                     parse_content[i] = parse_content_requested(&op, prev_result.as_ref());
                     let op_mode = mode_for_op(i);
                     // AlwaysVerbose verbs override the caller's presentation mode.
-                    let effective_mode = if self.registry.presentation_policy_for(&op.tool)
-                        == VerbPresentationPolicy::AlwaysVerbose
-                    {
-                        PresentationMode::Verbose
-                    } else {
-                        op_mode
-                    };
+                    let presentation_policy = self.registry.presentation_policy_for(&op.tool);
+                    let effective_mode =
+                        if presentation_policy == VerbPresentationPolicy::AlwaysVerbose {
+                            PresentationMode::Verbose
+                        } else {
+                            op_mode
+                        };
                     let usage_ctx = khive_runtime::usage::UsageContext::new();
                     match khive_runtime::usage::scope(
                         usage_ctx.clone(),
@@ -2536,6 +2539,7 @@ impl KhiveMcpServer {
                                         result_obj,
                                         effective_mode,
                                         now_unix,
+                                        presentation_policy,
                                         content_scope,
                                     );
                                     results.push(presented_obj);
@@ -2764,6 +2768,10 @@ async fn dispatch_via_coordinator_inner(
                                         .note_created_at
                                         .get(&h.note_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let updated_at = coord_result
+                                        .note_updated_at
+                                        .get(&h.note_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     Some(json!({
                                         "id": h.note_id.to_string(),
                                         "kind": note_kind,
@@ -2774,6 +2782,7 @@ async fn dispatch_via_coordinator_inner(
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
+                                        "updated_at": updated_at,
                                         "version": version,
                                     }))
                                 })
@@ -2790,6 +2799,10 @@ async fn dispatch_via_coordinator_inner(
                                         .entity_created_at
                                         .get(&h.entity_id)
                                         .map(|micros| khive_runtime::micros_to_iso(*micros));
+                                    let updated_at = coord_result
+                                        .entity_updated_at
+                                        .get(&h.entity_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     json!({
                                         "id": h.entity_id.to_string(),
                                         "kind": entity_kind,
@@ -2800,6 +2813,7 @@ async fn dispatch_via_coordinator_inner(
                                         "title": h.title,
                                         "snippet": h.snippet,
                                         "created_at": created_at,
+                                        "updated_at": updated_at,
                                     })
                                 })
                                 .collect();
@@ -3119,13 +3133,16 @@ fn present_ok_envelope_or_depth_error(
     mut success: OpSuccess,
     mode: PresentationMode,
     now_unix: i64,
+    policy: VerbPresentationPolicy,
     content_scope: NoteContentScope,
 ) -> Value {
     if !result_within_depth_limit(&success.result) {
         drop_value_iteratively(success.result);
         return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
-    success.result = content_scope.protect(success.result, |value| present(value, mode, now_unix));
+    success.result = content_scope.protect(success.result, |value| {
+        present_with_policy(value, mode, now_unix, policy)
+    });
     ok_envelope(tool, success)
 }
 
@@ -3176,12 +3193,14 @@ fn apply_presentation_to_result(
     mut result_obj: Value,
     mode: PresentationMode,
     now_unix: i64,
+    policy: VerbPresentationPolicy,
     content_scope: NoteContentScope,
 ) -> Value {
     if result_obj.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(result_field) = result_obj.get("result").cloned() {
-            let presented =
-                content_scope.protect(result_field, |value| present(value, mode, now_unix));
+            let presented = content_scope.protect(result_field, |value| {
+                present_with_policy(value, mode, now_unix, policy)
+            });
             if let Some(obj) = result_obj.as_object_mut() {
                 obj.insert("result".to_string(), presented);
             }
@@ -8066,7 +8085,9 @@ mod tests {
                 entity_kinds: std::collections::HashMap::new(),
                 note_kinds: std::collections::HashMap::new(),
                 entity_created_at: std::collections::HashMap::new(),
+                entity_updated_at: std::collections::HashMap::new(),
                 note_created_at: std::collections::HashMap::new(),
+                note_updated_at: std::collections::HashMap::new(),
                 note_versions: std::collections::HashMap::new(),
                 note_names: std::collections::HashMap::new(),
             }
@@ -8140,7 +8161,9 @@ mod tests {
             entity_kinds: std::collections::HashMap::new(),
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
+            entity_updated_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
@@ -8177,7 +8200,9 @@ mod tests {
             entity_kinds: std::collections::HashMap::new(),
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
+            entity_updated_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         };
@@ -8230,7 +8255,9 @@ mod tests {
             entity_kinds: std::collections::HashMap::new(),
             note_kinds: std::collections::HashMap::new(),
             entity_created_at: std::collections::HashMap::new(),
+            entity_updated_at: std::collections::HashMap::new(),
             note_created_at: std::collections::HashMap::new(),
+            note_updated_at: std::collections::HashMap::new(),
             note_versions: std::collections::HashMap::new(),
             note_names: std::collections::HashMap::new(),
         }
@@ -9805,6 +9832,7 @@ mod tests {
             OpSuccess::complete(pathological),
             PresentationMode::Agent,
             0,
+            khive_types::VerbPresentationPolicy::Standard,
             NoteContentScope::None,
         );
         assert_eq!(envelope["ok"], json!(false));
@@ -9821,6 +9849,7 @@ mod tests {
             OpSuccess::complete(shallow),
             PresentationMode::Verbose,
             0,
+            khive_types::VerbPresentationPolicy::Standard,
             NoteContentScope::None,
         );
         assert_eq!(envelope["ok"], json!(true));
@@ -9867,6 +9896,7 @@ mod tests {
             success,
             PresentationMode::Agent,
             0,
+            khive_types::VerbPresentationPolicy::Standard,
             NoteContentScope::None,
         );
 
@@ -12239,3 +12269,231 @@ mod request_read_cancellation_tests {
 
 #[cfg(test)]
 mod disposition_tests;
+
+#[cfg(test)]
+mod issue_2537_tests {
+    use super::*;
+    use crate::tools::request::RequestParams;
+    use khive_runtime::{Namespace, RuntimeConfig};
+
+    fn server() -> KhiveMcpServer {
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".into(), "gtd".into()],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        KhiveMcpServer::new(rt).unwrap()
+    }
+
+    async fn dispatch(server: &KhiveMcpServer, ops: &str, mode: Option<&str>) -> Value {
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                plan: None,
+                ops: ops.into(),
+                presentation: mode.map(str::to_owned),
+                presentation_per_op: None,
+                save_to: None,
+                format: Some("json".into()),
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    async fn oracle(server: &KhiveMcpServer, receipt: &Value, agent: bool) -> Value {
+        let body = dispatch(
+            server,
+            &format!("get(id={})", json!(receipt["id"])),
+            Some("verbose"),
+        )
+        .await;
+        assert_eq!(body["results"][0]["ok"], true);
+        let stored = body["results"][0]["result"].clone();
+        let full = stored["id"].as_str().unwrap();
+        uuid::Uuid::parse_str(full).unwrap();
+        assert_eq!(
+            receipt["id"].as_str().unwrap(),
+            if agent { &full[..8] } else { full }
+        );
+        let timestamp = stored["created_at"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        assert_eq!(
+            timestamp
+                .split('.')
+                .nth(1)
+                .unwrap()
+                .trim_end_matches('Z')
+                .len(),
+            6
+        );
+        stored
+    }
+
+    #[test]
+    fn issue_2537_registered_policy_ignores_result_markers() {
+        let server = server();
+        let timestamp = "2026-01-01T00:00:00.123456Z";
+        let payload = json!({
+            "tool": "stream.batch", "policy": "StreamBatchReceipts",
+            "results": [{"id": "aabbccdd-1234-4321-1234-abcdefabcdef", "updated_at": timestamp}],
+        });
+        for tool in ["list", "stream.batch"] {
+            let policy = server.registry.presentation_policy_for(tool);
+            let expected = if tool == "list" { "3m ago" } else { timestamp };
+            let parallel = present_ok_envelope_or_depth_error(
+                tool.into(),
+                OpSuccess::complete(payload.clone()),
+                PresentationMode::Agent,
+                1_767_225_780,
+                policy,
+                NoteContentScope::None,
+            );
+            let canonical = ok_envelope(tool.into(), OpSuccess::complete(payload.clone()));
+            let chained = apply_presentation_to_result(
+                canonical,
+                PresentationMode::Agent,
+                1_767_225_780,
+                policy,
+                NoteContentScope::None,
+            );
+            for result in [parallel, chained] {
+                assert_eq!(result["result"]["results"][0]["updated_at"], expected);
+                assert_eq!(result["result"]["results"][0]["id"], "aabbccdd");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_2537_local_cli_defaulted_vs_raw_modes() {
+        let server = server();
+        let mut pairs = Vec::new();
+        for (index, mode) in [None, Some("agent"), Some("verbose"), Some("human")]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                parse_presentation_mode(mode).unwrap(),
+                match mode {
+                    Some("verbose") => PresentationMode::Verbose,
+                    Some("human") => PresentationMode::Human,
+                    _ => PresentationMode::Agent,
+                }
+            );
+            let body = dispatch(
+                &server,
+                &format!(
+                    "stream.append(stream=\"local-{index}\",record={{\"i\":{index}}},embed=false)"
+                ),
+                mode,
+            )
+            .await;
+            assert_eq!(body["results"][0]["ok"], true);
+            assert_eq!(body["results"][0]["tool"], "stream.append");
+            let receipt = body["results"][0]["result"].clone();
+            assert_eq!(receipt["seq"], 1);
+            let stored = oracle(&server, &receipt, mode.is_none() || mode == Some("agent")).await;
+            if mode == Some("verbose") || mode == Some("human") {
+                assert_eq!(receipt["created_at"], stored["created_at"]);
+            }
+            pairs.push((
+                mode,
+                receipt["created_at"].clone(),
+                stored["created_at"].clone(),
+            ));
+        }
+        assert_eq!(pairs.len(), 4);
+        println!("SR2537 local controls complete: raw None Agent and CLI-defaulted Some(verbose)");
+        for (mode, actual, expected) in pairs {
+            assert_eq!(actual, expected, "SR2537 local precision {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_2537_receipt_depth_frame_errors() {
+        let server = server();
+        let whole = json!({"tool":"stream.batch","ok":false,"error":{"details":{"updated_at":"2026-01-01T00:00:00.123456Z"}}});
+        assert_eq!(
+            apply_presentation_to_result(
+                whole.clone(),
+                PresentationMode::Agent,
+                0,
+                VerbPresentationPolicy::StreamBatchReceipts,
+                NoteContentScope::None,
+            ),
+            whole
+        );
+        let nested = json!({"tool":"stream.batch","ok":true,"result":{"results":[{"error":{"details":{"updated_at":"2026-01-01T00:00:00.123456Z"}}}]}});
+        assert_eq!(
+            apply_presentation_to_result(
+                nested,
+                PresentationMode::Agent,
+                0,
+                VerbPresentationPolicy::StreamBatchReceipts,
+                NoteContentScope::None,
+            )["result"]["results"][0]["error"]["details"]["updated_at"],
+            "2026-01-01T00:00"
+        );
+        fn nest(n: usize) -> Value {
+            let mut v = json!(1);
+            for _ in 0..n {
+                v = Value::Array(vec![v]);
+            }
+            v
+        }
+        let limit = khive_request::NESTING_DEPTH_LIMIT;
+        let at = chain_ok_envelope_or_depth_error(
+            "stream.batch".into(),
+            OpSuccess::complete(nest(limit)),
+        )
+        .unwrap();
+        assert_eq!(at["ok"], true);
+        let chain = chain_ok_envelope_or_depth_error(
+            "stream.batch".into(),
+            OpSuccess::complete(nest(limit + 1)),
+        )
+        .unwrap_err();
+        assert_eq!(chain.error["kind"], "result_too_deep");
+        let parallel = present_ok_envelope_or_depth_error(
+            "stream.append".into(),
+            OpSuccess::complete(nest(limit + 1)),
+            PresentationMode::Agent,
+            0,
+            VerbPresentationPolicy::StreamAppendReceipt,
+            NoteContentScope::None,
+        );
+        assert_eq!(parallel["ok"], false);
+        assert_eq!(parallel["error"]["kind"], "result_too_deep");
+        assert!(parallel.get("result").is_none());
+        let help = dispatch(&server, "stream.append(help=true)", None).await;
+        assert_eq!(help["results"][0]["ok"], true);
+        assert!(help["results"][0]["result"].get("created_at").is_none());
+        let body = dispatch(
+            &server,
+            r#"stream.append(stream="frame",record={"ok":true},embed=false)"#,
+            None,
+        )
+        .await;
+        let entry = &body["results"][0];
+        assert_eq!(entry["ok"], true);
+        assert_eq!(entry["result"]["seq"], 1);
+        let stored = oracle(&server, &entry["result"], true).await;
+        let omitted = frame_budget_omission(entry, &server.registry);
+        assert_eq!(omitted["ok"], false);
+        assert_eq!(omitted["executed"], true);
+        assert_eq!(omitted["error"]["kind"], "response_frame_budget_exceeded");
+        assert!(omitted.get("result").is_none());
+        println!(
+            "SR2537 boundary controls complete: error/help/depth/frame; real retained receipt last"
+        );
+        assert_eq!(
+            entry["result"]["created_at"], stored["created_at"],
+            "SR2537 retained result precision"
+        );
+    }
+}
