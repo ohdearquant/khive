@@ -603,23 +603,44 @@ fn coordinator_backend_registry(
     per_pack_runtimes: &std::collections::HashMap<String, Arc<KhiveRuntime>>,
     khive_cfg: &KhiveConfig,
 ) -> Result<BackendRegistry> {
+    let mut registrations: Vec<_> = per_pack_runtimes
+        .iter()
+        .map(|(pack_name, rt)| {
+            let backend_name = khive_cfg
+                .packs
+                .get(pack_name.as_str())
+                .map(|pc| pc.backend.as_str())
+                .unwrap_or(BackendId::MAIN);
+            (backend_name, pack_name.as_str(), rt)
+        })
+        .collect();
+    // Packs share the base embedding configuration except for `no_embed`.
+    // Keep its write opt-out local to the pack; backend search needs the
+    // embedding-capable handle whenever another pack on that backend has one.
+    registrations.sort_by_key(|(backend_name, pack_name, rt)| {
+        let config = rt.config();
+        let has_embeddings =
+            config.embedding_model.is_some() || !config.additional_embedding_models.is_empty();
+        (
+            *backend_name != BackendId::MAIN,
+            *backend_name,
+            !has_embeddings,
+            *pack_name,
+        )
+    });
+    registrations.dedup_by_key(|(backend_name, _, _)| *backend_name);
+
     let mut backend_reg = BackendRegistry::new();
-    for (pack_name, rt) in per_pack_runtimes {
-        let backend_name = khive_cfg
-            .packs
-            .get(pack_name.as_str())
-            .map(|pc| pc.backend.as_str())
-            .unwrap_or(BackendId::MAIN);
+    for (backend_name, _, rt) in registrations {
         let backend_id = BackendId::parse(backend_name)?;
         let served_kinds = khive_cfg
             .backends
             .iter()
             .find(|backend| backend.name == backend_name)
             .and_then(|backend| backend.served_kinds.clone());
-        // `BackendRegistry::register` is idempotent by backend_id —
-        // the second registration for the same id is a no-op.
         backend_reg.register_with_served_kinds(backend_id, Arc::clone(rt), served_kinds)?;
     }
+    backend_reg.validate_search_coverage()?;
     Ok(backend_reg)
 }
 
@@ -1829,6 +1850,7 @@ mod tests {
         let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
         khive_cfg.backends[0].served_kinds = Some(std::collections::BTreeSet::from([
             khive_types::SubstrateKind::Note,
+            khive_types::SubstrateKind::Entity,
         ]));
         let runtimes = std::collections::HashMap::from([(
             "kg".to_string(),
@@ -1841,7 +1863,223 @@ mod tests {
             .get(&BackendId::main())
             .expect("main backend registered");
         assert!(main.serves(khive_types::SubstrateKind::Note));
-        assert!(!main.serves(khive_types::SubstrateKind::Entity));
+        assert!(main.serves(khive_types::SubstrateKind::Entity));
+        assert!(!main.serves(khive_types::SubstrateKind::Event));
+    }
+
+    #[test]
+    fn coordinator_registry_rejects_coverage_from_an_unused_backend() {
+        let khive_cfg: KhiveConfig = toml::from_str(
+            r#"
+[[backends]]
+name = "main"
+kind = "memory"
+served_kinds = ["event"]
+
+[[backends]]
+name = "unused"
+kind = "memory"
+served_kinds = ["note", "entity"]
+"#,
+        )
+        .expect("parse config");
+        khive_cfg.validate().expect("declared coverage is complete");
+        let runtimes = std::collections::HashMap::from([(
+            "comm".to_string(),
+            Arc::new(KhiveRuntime::memory().expect("memory runtime")),
+        )]);
+        let error = coordinator_backend_registry(&runtimes, &khive_cfg)
+            .err()
+            .expect("an unused declaration cannot supply runtime search coverage");
+        assert!(matches!(
+            error.downcast_ref::<crate::coordinator::BackendRegistrationError>(),
+            Some(crate::coordinator::BackendRegistrationError::MissingSearchKinds { kinds, backend_ids })
+                if kinds == &vec![khive_types::SubstrateKind::Note, khive_types::SubstrateKind::Entity]
+                    && backend_ids == &vec![BackendId::main()]
+        ));
+    }
+
+    #[test]
+    fn coordinator_registry_uses_stable_pack_order_and_main_primary() {
+        let khive_cfg: KhiveConfig = toml::from_str(
+            r#"
+[[backends]]
+name = "archive"
+kind = "memory"
+served_kinds = ["event"]
+
+[[backends]]
+name = "main"
+kind = "memory"
+
+[packs.comm]
+backend = "archive"
+no_embed = true
+"#,
+        )
+        .expect("parse config");
+        khive_cfg.validate().expect("valid event-only secondary");
+        let first = Arc::new(KhiveRuntime::memory().expect("first runtime"));
+        let second = Arc::new(KhiveRuntime::memory().expect("second runtime"));
+        let entries = [
+            ("memory".to_string(), Arc::clone(&second)),
+            ("kg".to_string(), Arc::clone(&first)),
+            ("comm".to_string(), Arc::clone(&second)),
+        ];
+        for attempt in 0..32 {
+            let mut entries = entries.to_vec();
+            if attempt % 2 == 1 {
+                entries.reverse();
+            }
+            let runtimes = entries.into_iter().collect();
+            let registry = coordinator_backend_registry(&runtimes, &khive_cfg).unwrap();
+            assert_eq!(registry.len(), 2);
+            let main = registry.primary().expect("primary backend");
+            assert_eq!(main.id, BackendId::main());
+            assert!(
+                Arc::ptr_eq(&main.runtime, &first),
+                "stable pack-name tie-break"
+            );
+            assert!(!registry
+                .get(&BackendId::parse("archive").unwrap())
+                .unwrap()
+                .serves(khive_types::SubstrateKind::Note));
+        }
+    }
+
+    struct RegistryTestEmbedder;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for RegistryTestEmbedder {
+        async fn embed(
+            &self,
+            texts: &[String],
+            model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0; model.dimensions()])
+                .collect())
+        }
+
+        fn supports_model(&self, model: lattice_embed::EmbeddingModel) -> bool {
+            model == lattice_embed::EmbeddingModel::AllMiniLmL6V2
+        }
+
+        fn name(&self) -> &'static str {
+            "coordinator-registry-test-embedder"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for RegistryTestEmbedder {
+        fn name(&self) -> &str {
+            "all-minilm-l6-v2"
+        }
+
+        fn dimensions(&self) -> usize {
+            lattice_embed::EmbeddingModel::AllMiniLmL6V2.dimensions()
+        }
+
+        async fn build(
+            &self,
+        ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+            Ok(Arc::new(Self))
+        }
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn coordinator_registry_preserves_vector_search_on_a_shared_no_embed_backend() {
+        let mut khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
+        khive_cfg.packs.insert(
+            "comm".to_string(),
+            khive_runtime::PackConfig {
+                backend: "main".to_string(),
+                no_embed: true,
+            },
+        );
+        let multi = khive_mcp::serve::build_registry_for_multi_backend(
+            RuntimeConfig {
+                db_path: None,
+                embedding_model: Some(lattice_embed::EmbeddingModel::AllMiniLmL6V2),
+                packs: vec!["comm".to_string(), "kg".to_string()],
+                actor_id: Some("backend-config-test".to_string()),
+                ..RuntimeConfig::no_embeddings()
+            },
+            &khive_cfg,
+            Some(":memory:"),
+        )
+        .await
+        .expect("build shared backend with mixed embedding settings");
+        let embedded = &multi.per_pack_runtimes["kg"];
+        let no_embed = &multi.per_pack_runtimes["comm"];
+        embedded.register_embedder(RegistryTestEmbedder);
+        let namespace = khive_runtime::Namespace::local();
+        let token = embedded.authorize(namespace.clone()).unwrap();
+        let note = embedded
+            .create_note(
+                &token,
+                "observation",
+                Some("vector candidate"),
+                "stored content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("write embedded note");
+        let token = no_embed.authorize(namespace.clone()).unwrap();
+        no_embed
+            .create_note(
+                &token,
+                "observation",
+                Some("text candidate"),
+                "other content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("write without embedding");
+        let request = khive_pack_kg::handlers::ValidatedSearchRequest::from_value(
+            serde_json::json!({ "kind": "note", "query": "unmatchedneedle", "limit": 10 }),
+            &multi.registry,
+        )
+        .expect("valid search");
+
+        let (_, control_hits, _) = SubstrateCoordinator::single(Arc::clone(no_embed))
+            .fan_out_search(&request, &namespace)
+            .await;
+        assert!(
+            control_hits.is_empty(),
+            "text-only handle cannot find a vector-only match"
+        );
+
+        for _ in 0..32 {
+            let runtimes = multi
+                .per_pack_runtimes
+                .iter()
+                .map(|(name, runtime)| (name.clone(), Arc::clone(runtime)))
+                .collect();
+            let registry = coordinator_backend_registry(&runtimes, &khive_cfg).unwrap();
+            assert_eq!(registry.len(), 1);
+            assert!(Arc::ptr_eq(&registry.primary().unwrap().runtime, embedded));
+        }
+        let registry = coordinator_backend_registry(&multi.per_pack_runtimes, &khive_cfg).unwrap();
+        let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
+            .fan_out_search(&request, &namespace)
+            .await;
+        assert!(outcomes
+            .iter()
+            .all(|outcome| outcome.error.is_none() && outcome.vector_error.is_none()));
+        assert_eq!(hits.len(), 1, "the no_embed write must have no vector row");
+        assert_eq!(hits[0].note_id, note.id);
+        assert_eq!(hits[0].source, khive_runtime::SearchSource::Vector);
+        assert!(
+            !no_embed.vector_arm_selected(),
+            "registration preserves pack write settings"
+        );
     }
 
     /// File-backed main: both boot paths must agree on every `WiringSurface`
@@ -2250,4 +2488,5 @@ mod tests {
              annotate_resp={annotate_resp} got_edge={got_edge}"
         );
     }
+    include!("cli_backend_batch_tests.rs");
 }

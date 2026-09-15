@@ -12,6 +12,11 @@ use khive_types::SubstrateKind;
 pub enum BackendRegistrationError {
     /// An explicit declaration must name at least one served substrate kind.
     EmptyServedKinds { backend_id: BackendId },
+    /// The completed registry must cover both searchable substrates.
+    MissingSearchKinds {
+        kinds: Vec<SubstrateKind>,
+        backend_ids: Vec<BackendId>,
+    },
 }
 
 impl fmt::Display for BackendRegistrationError {
@@ -20,6 +25,10 @@ impl fmt::Display for BackendRegistrationError {
             Self::EmptyServedKinds { backend_id } => write!(
                 formatter,
                 "backend {backend_id:?}: served kinds must not be empty when declared"
+            ),
+            Self::MissingSearchKinds { kinds, backend_ids } => write!(
+                formatter,
+                "registered backends {backend_ids:?} leave searchable substrate kinds {kinds:?} unserved"
             ),
         }
     }
@@ -107,6 +116,22 @@ impl BackendRegistry {
     /// Look up a backend by id.
     pub fn get(&self, id: &BackendId) -> Option<&BackendEntry> {
         self.backends.get(id.as_str())
+    }
+
+    /// Validate search coverage after all serving backends have been registered.
+    pub fn validate_search_coverage(&self) -> Result<(), BackendRegistrationError> {
+        let kinds: Vec<_> = [SubstrateKind::Note, SubstrateKind::Entity]
+            .into_iter()
+            .filter(|kind| !self.iter().any(|entry| entry.serves(*kind)))
+            .collect();
+        if kinds.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendRegistrationError::MissingSearchKinds {
+                kinds,
+                backend_ids: self.ids(),
+            })
+        }
     }
 
     /// The primary backend (first registered). `None` only if the registry is empty.

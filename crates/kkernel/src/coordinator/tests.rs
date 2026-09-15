@@ -394,6 +394,47 @@ fn registry_primary_is_first_registered() {
 }
 
 #[test]
+fn registry_search_coverage_validates_the_completed_backend_set() {
+    use super::BackendRegistrationError;
+
+    let mut registry = BackendRegistry::new();
+    assert!(matches!(
+        registry.validate_search_coverage(),
+        Err(BackendRegistrationError::MissingSearchKinds { kinds, backend_ids })
+            if kinds == vec![SubstrateKind::Note, SubstrateKind::Entity] && backend_ids.is_empty()
+    ));
+    let runtime = memory_runtime();
+    for (name, kind) in [
+        ("events", SubstrateKind::Event),
+        ("notes", SubstrateKind::Note),
+    ] {
+        registry
+            .register_with_served_kinds(
+                backend_id(name),
+                Arc::clone(&runtime),
+                Some(BTreeSet::from([kind])),
+            )
+            .expect("valid individual registration");
+    }
+    assert!(matches!(
+        registry.validate_search_coverage(),
+        Err(BackendRegistrationError::MissingSearchKinds { kinds, backend_ids })
+            if kinds == vec![SubstrateKind::Entity]
+                && backend_ids == vec![backend_id("events"), backend_id("notes")]
+    ));
+    registry
+        .register_with_served_kinds(
+            backend_id("entities"),
+            runtime,
+            Some(BTreeSet::from([SubstrateKind::Entity])),
+        )
+        .expect("valid entity registration");
+    registry
+        .validate_search_coverage()
+        .expect("complete split coverage");
+}
+
+#[test]
 fn multi_backend_coordinator_not_single() {
     let mut registry = BackendRegistry::new();
     registry.register(backend_id("main"), memory_runtime());
