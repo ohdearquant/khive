@@ -12,9 +12,9 @@ use khive_runtime::EdgeListFilter;
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, event_filter_from_params,
     normalize_entity_timestamps, normalize_entity_timestamps_array,
-    normalize_event_timestamps_array, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json, validate_entity_type, KindSpec,
-    ListParams,
+    normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_specific,
+    remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json,
+    validate_entity_type, KindSpec, ListParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -580,12 +580,15 @@ impl KgPack {
                     let remapped: Vec<Value> = notes
                         .drain(..)
                         .map(|note| {
-                            to_json(&note)
-                                .map(normalize_entity_timestamps)
-                                .map(remap_note_status)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            parse_note_content(
+                                to_json(&note)
+                                    .map(normalize_entity_timestamps)
+                                    .map(remap_note_status)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                                p.parse_content,
+                            )
                         })
-                        .collect();
+                        .collect::<Result<_, _>>()?;
                     let mut response = serde_json::json!({
                         "notes": remapped,
                         "next_after": next_after,
@@ -644,23 +647,29 @@ impl KgPack {
                         .skip(offset as usize)
                         .take(limit as usize)
                         .map(|n| {
-                            to_json(&n)
-                                .map(normalize_entity_timestamps)
-                                .map(remap_note_status)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            parse_note_content(
+                                to_json(&n)
+                                    .map(normalize_entity_timestamps)
+                                    .map(remap_note_status)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                                p.parse_content,
+                            )
                         })
-                        .collect()
+                        .collect::<Result<_, _>>()?
                 } else {
                     notes
                         .iter()
                         .filter(|n| n.deleted_at.is_none())
                         .map(|n| {
-                            to_json(n)
-                                .map(normalize_entity_timestamps)
-                                .map(remap_note_status)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            parse_note_content(
+                                to_json(n)
+                                    .map(normalize_entity_timestamps)
+                                    .map(remap_note_status)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                                p.parse_content,
+                            )
                         })
-                        .collect()
+                        .collect::<Result<_, _>>()?
                 };
                 let mut response = render_list_response(to_json(&remapped)?, requested, limit);
                 if scan_incomplete {

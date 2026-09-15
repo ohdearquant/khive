@@ -58,7 +58,6 @@ fn seed_atoms(registry: &VerbRegistry, rt: &tokio::runtime::Runtime, n: usize) {
             json!({
                 "slug": format!("bench-atom-{i:04}"),
                 "name": format!("Bench Atom {i}"),
-                "description": format!("knowledge retrieval benchmark atom {i} semantic neural transformer embedding"),
                 // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by the knowledge pack.
                 "content": format!("dense sparse vector embedding search benchmark corpus atom {i} gradient neural transformer retrieval semantic index query score rank precision recall"),
             })
