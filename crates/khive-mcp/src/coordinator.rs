@@ -145,9 +145,15 @@ pub struct CoordSearchResult {
     /// (`crates/khive-pack-kg/src/handlers/search.rs`). Populated alongside
     /// `entity_kinds`; missing entries follow the same resolution rule.
     pub entity_created_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// `updated_at` (micros) for each entity hit, keyed by entity UUID. Same
+    /// parity purpose and resolution rule as `entity_created_at`.
+    pub entity_updated_at: std::collections::HashMap<uuid::Uuid, i64>,
     /// `created_at` (micros) for each note hit, keyed by note UUID. Same
     /// parity purpose and resolution rule as `entity_created_at`.
     pub note_created_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// `updated_at` (micros) for each note hit, keyed by note UUID. Same
+    /// parity purpose and resolution rule as `entity_created_at`.
+    pub note_updated_at: std::collections::HashMap<uuid::Uuid, i64>,
     /// Persisted note revisions; a hit without hydrated metadata is not returned.
     pub note_versions: std::collections::HashMap<uuid::Uuid, i64>,
     /// Stored `name` for each note hit, keyed by note UUID — distinct from
@@ -455,7 +461,9 @@ pub(crate) mod tests {
                 entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
                 entity_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                entity_updated_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 note_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                note_updated_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
                 note_versions: std::collections::HashMap::from([(id, 1)]),
                 note_names: std::collections::HashMap::from([(
                     id,
