@@ -370,6 +370,19 @@ impl StorageBackend {
         })
     }
 
+    /// Validate a pack's declared columns without applying SQL or acquiring a writer.
+    /// Read-only hosts use this before exposing verbs that require these columns.
+    pub fn validate_pack_schema_columns(
+        &self,
+        additions: &[khive_types::PackColumnAddition],
+    ) -> Result<(), SqliteError> {
+        if additions.is_empty() {
+            return Ok(());
+        }
+        let reader = self.pool.reader()?;
+        pack_schema::validate_columns(reader.conn(), additions)
+    }
+
     /// Prepare the core schema for runtime boot.
     ///
     /// Writable backends acquire the canonical database-GC owner before the

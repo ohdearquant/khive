@@ -967,9 +967,37 @@ request(ops="scan(content=\"api_key=sk-...\")")
 ### `db_diagnostics` — Assertive
 
 Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
-main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+main database: build and process identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
 `-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
 Takes no parameters.
+
+Every report includes `process` alongside `build`:
+
+```json
+{
+  "process": {
+    "pid": 12345,
+    "started_at": 1789272000,
+    "started_at_unavailable_reason": null,
+    "pool_generation": 1
+  }
+}
+```
+
+`pid` identifies the OS process serving this request. `started_at` is its OS-reported creation
+time in whole Unix epoch seconds (UTC), including when the pool or the first diagnostics request
+was created later. If that lookup is unsupported or unavailable, `started_at` is `null` and
+`started_at_unavailable_reason` is nonempty and names the platform limitation; a missing or empty
+reason with a null start time is a producer defect. Request time and zero are never used as
+fallback timestamps. Compare PID and available start time together when distinguishing process
+restarts: PIDs can be reused, and two processes can start within the same second.
+
+`pool_generation` starts at 1 in each process and increments whenever the main pool is
+reconstructed. Additional handles to the same pool and secondary-pool construction do not
+advance it. Reader counters and writer acquisition/task counters belong to that main pool;
+compare `(pid, started_at, pool_generation)` and start a fresh counter window whenever the
+triple changes. Checkpoint counters remain process-global. Point-in-time gauges and
+consecutive-failure counts can also decrease during normal operation.
 
 `reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
 reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
@@ -991,7 +1019,7 @@ The timeout setting applies to each admission attempt. A verb that issues severa
 reads can spend more than one configured timeout in total wall time, but each attempt is bounded
 and saturation never falls back to opening a standalone connection.
 
-`writer_contention` contains monotonic counters captured once per request:
+`writer_contention` contains counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
 `standalone_writer_acquisitions`, and `writer_task_acquisitions`. The first counts successful
 finite-wait main-pool mutex checkouts, the second counts successful per-operation file-backed

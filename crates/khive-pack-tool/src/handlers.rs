@@ -153,9 +153,16 @@ async fn find_by_name(
     token: &NamespaceToken,
     name: &str,
 ) -> Result<Option<Entity>, RuntimeError> {
-    let Some(snapshot) =
-        crate::pin::current_registration(rt, token.namespace().as_str(), name).await?
-    else {
+    let own_namespace = token.with_namespace(token.namespace().clone());
+    find_visible_by_name(rt, &own_namespace, name).await
+}
+
+async fn find_visible_by_name(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+) -> Result<Option<Entity>, RuntimeError> {
+    let Some(snapshot) = crate::pin::visible_registration(rt, token, name).await? else {
         return Ok(None);
     };
     Ok(Some(rt.get_entity(token, snapshot.id).await?))
@@ -178,7 +185,7 @@ async fn resolve_tool(
             }
         }
     }
-    find_by_name(rt, token, reference)
+    find_visible_by_name(rt, token, reference)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("tool {reference:?} is not registered")))
 }
@@ -803,7 +810,7 @@ pub(crate) async fn decide_request(
     };
     let row = policy::set_grant_status(
         rt,
-        &ns,
+        token,
         &current,
         status,
         &decider,

@@ -100,13 +100,35 @@ pub(super) fn validate_columns(
     conn: &Connection,
     additions: &[PackColumnAddition],
 ) -> Result<(), SqliteError> {
+    let mut missing = Vec::new();
+    let mut incompatible = Vec::new();
     for addition in additions {
-        if !table_exists(conn, addition.table)? || !column_exists_and_matches(conn, addition)? {
-            return Err(SqliteError::InvalidData(format!(
-                "pack schema plan did not create declared column {}.{}",
-                addition.table, addition.column,
-            )));
+        validate_identifier(addition.table)?;
+        validate_identifier(addition.column)?;
+        if !table_exists(conn, addition.table)? {
+            missing.push(format!("{}.{}", addition.table, addition.column));
+            continue;
         }
+        match column_exists_and_matches(conn, addition) {
+            Ok(true) => {}
+            Ok(false) => missing.push(format!("{}.{}", addition.table, addition.column)),
+            // Only the helper's compatibility refusal is an aggregate finding;
+            // database errors must retain their original failure classification.
+            Err(SqliteError::InvalidData(message)) => incompatible.push(message),
+            Err(error) => return Err(error),
+        }
+    }
+    if !missing.is_empty() {
+        incompatible.insert(
+            0,
+            format!(
+                "pack schema plan did not create declared columns: {}",
+                missing.join(", "),
+            ),
+        );
+    }
+    if !incompatible.is_empty() {
+        return Err(SqliteError::InvalidData(incompatible.join("; ")));
     }
     Ok(())
 }

@@ -32,7 +32,8 @@ use khive_runtime::audit_batch::{
     AuditProducer, AuditTerminalReason, PreparedAuditRow,
 };
 use khive_runtime::pack::{
-    audit_admission_refused_obligation_count, audit_admission_unresolved_obligation_count,
+    audit_admission_refused_obligation_count, audit_admission_refused_obligation_last_at_ms,
+    audit_admission_unresolved_obligation_count, audit_admission_unresolved_obligation_last_at_ms,
     HandlerDef, PackRuntime, VerbRegistryBuilder,
 };
 use khive_runtime::runtime::NamespaceToken;
@@ -1442,6 +1443,11 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry_dispos
     // this must count on the "unresolved" counter, not "refused".
     let before_refused = audit_admission_refused_obligation_count();
     let before_unresolved = audit_admission_unresolved_obligation_count();
+    // #2791: a cumulative total cannot say when it was last earned, so each
+    // counter carries the wall-clock mark of its own last increment. Captured
+    // before the dispatch so the assertions below compare against this run.
+    let before_refused_mark = audit_admission_refused_obligation_last_at_ms();
+    let before_unresolved_mark = audit_admission_unresolved_obligation_last_at_ms();
     let result = registry
         .dispatch_with_disposition("list", Value::Null, None)
         .await
@@ -1457,6 +1463,23 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry_dispos
         audit_admission_refused_obligation_count(),
         before_refused,
         "a deadline expiry must never be counted on the queue-refusal counter"
+    );
+    // #2791, the direction that makes a static count readable: the counter that
+    // moved has a mark from this run, and the counter that did NOT move has the
+    // mark it arrived with. Without the second half, a `mark = now()` written
+    // unconditionally on every dispatch would pass the first half and tell an
+    // operator that refusals are ongoing when none happened.
+    let expiry_mark = audit_admission_unresolved_obligation_last_at_ms()
+        .expect("an expiry that incremented the counter must stamp its mark");
+    assert!(
+        before_unresolved_mark.is_none_or(|before| expiry_mark >= before),
+        "the mark must not travel backwards: {before_unresolved_mark:?} -> {expiry_mark}"
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_last_at_ms(),
+        before_refused_mark,
+        "a deadline expiry must leave the queue-refusal counter's mark alone, exactly as it \
+         leaves that counter's value alone"
     );
 
     // Drive the same production forwarding path as the queue-refusal test
@@ -1476,6 +1499,15 @@ async fn read_verb_dispatch_survives_audit_lane_admission_deadline_expiry_dispos
             .audit_admission_unresolved_obligations,
         Some(audit_admission_unresolved_obligation_count()),
         "the real db_diagnostics handler path must surface the unresolved-obligation count"
+    );
+    // The mark is only useful if it reaches the surface an operator reads, so
+    // assert the forwarding, not just the process-wide accessor (#2791).
+    assert_eq!(
+        report
+            .writer_contention
+            .audit_admission_unresolved_obligations_last_at_ms,
+        Some(expiry_mark),
+        "db_diagnostics must surface WHEN the unresolved counter last moved, not only its total"
     );
 
     drop(occupant);

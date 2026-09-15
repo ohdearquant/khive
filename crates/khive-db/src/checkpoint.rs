@@ -3615,6 +3615,68 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(khive_walpin_sidecar_env)]
+    async fn diagnostic_legacy_forecast_matches_housekeeping_with_distinct_cadences() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        let root = tempfile::tempdir().unwrap();
+        let pool = file_pool(&root.path().join("forecast.db"));
+        let path = pool.canonical_path().unwrap();
+        let checkpoint_interval = Duration::from_millis(500);
+        let session_interval = SessionSweepConfig::default().interval;
+        assert_eq!(session_interval, Duration::from_secs(5));
+        let state = TruncateState::default();
+        assert_eq!(state.legacy_walpin_fallback_interval, session_interval);
+        let sidecar = WalpinSidecarState::new(Some(path), true, "daemon", checkpoint_interval)
+            .expect("enabled fixture sidecar");
+        crate::walpin::ensure_sidecar_dir(&sidecar.dir).unwrap();
+        let mut paths = Vec::new();
+        for (pid, age) in [(2_000_000_001, 5), (2_000_000_002, 40)] {
+            assert!(!crate::walpin::is_process_alive(pid));
+            let temp = sidecar.dir.join(format!(".{pid}.beacon.tmp"));
+            std::fs::write(
+                &temp,
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": pid, "process_role": "session", "started_at": 1
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&temp)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
+            paths.push(temp);
+        }
+        let fast = crate::walpin::inspect_live(&sidecar.dir, checkpoint_interval).unwrap();
+        assert_eq!(
+            fast.cleanup_would_reap, 2,
+            "control must distinguish the cadences"
+        );
+        let forecast = crate::diagnostics::wal_pin_attribution(path, session_interval);
+        assert_eq!(forecast.sidecar_listing_truncated, Some(false));
+        assert_eq!(forecast.sidecar_entries_cleanup_would_reap, Some(1));
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "inspection retains evidence"
+        );
+
+        let cleanup = sidecar
+            .reap_dead_entries_bounded(state.legacy_walpin_fallback_interval)
+            .await
+            .expect("housekeeping report");
+        assert_eq!(
+            Some(cleanup.orphan_temps_reaped),
+            forecast.sidecar_entries_cleanup_would_reap
+        );
+        assert!(paths[0].exists(), "the temp inside the 15s window remains");
+        assert!(!paths[1].exists(), "the trusted older temp is reaped");
+    }
+
     #[test]
     #[cfg(unix)]
     fn walpin_full_scan_cadence_refreshes_first_then_reuses_until_boundary() {
