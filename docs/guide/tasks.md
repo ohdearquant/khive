@@ -45,9 +45,12 @@ dependencies.
 
 Use `gtd.next` to read the actionable queue. It considers only `next` and
 `active` tasks, sorts them by priority (`p0` first), and can filter by exact
-assignee. It defaults to `limit=10` and silently clamps `limit` to 1–200. If
-more than 20,000 actionable tasks match, it returns an error; narrow the query
-(for example with the exact `assignee` filter) and retry.
+assignee. It defaults to `limit=10` and clamps `limit` to 1–200; a request
+above 200 switches the response from the usual bare task array to an object
+carrying `requested_limit`, `effective_limit`, and `limit_clamped: true`
+alongside the (capped) results. If more than 20,000 actionable tasks match,
+it returns an error; narrow the query (for example with the exact `assignee`
+filter) and retry.
 
 By default it omits tasks with unfinished or structurally broken dependencies.
 Pass `include_blocked=true` to include those candidates after ready work for
@@ -62,7 +65,9 @@ Use `gtd.tasks` when reviewing work by status, assignee, or priority. Both
 `gtd.tasks` and `gtd.next` accept an assignee filter. Without a status filter,
 `gtd.tasks` shows non-terminal work; pass a terminal status when reviewing
 completed or cancelled tasks. It defaults to `limit=50, offset=0`, and
-silently clamps `limit` to 1–200.
+clamps `limit` to 1–200 the same way `gtd.next` does — a request above 200
+gets the `requested_limit`/`effective_limit`/`limit_clamped` object wrap
+(alongside `filter_excluded`/`hint` when that also applies).
 
 ## Start and finish work
 

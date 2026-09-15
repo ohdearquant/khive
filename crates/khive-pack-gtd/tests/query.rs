@@ -359,9 +359,11 @@ async fn next_ordering_is_deterministic_on_equal_priority_and_timestamp() {
     );
 }
 
-// ── #744: gtd.tasks / gtd.next silent 200-row clamp ──────────────────────────
+// ── #744/#2679: gtd.tasks / gtd.next 200-row clamp + its disclosure ──────────
 
-/// Under-limit: `limit` below the 200 cap is unaffected — no change from before #744.
+/// Under-limit control arm: `limit` below the 200 cap is unaffected — the response
+/// stays the bare `Value::Array` it was before #2679 (`.as_array()` panics if the
+/// handler switched shape, so this doubles as the shape-unchanged assertion).
 #[tokio::test]
 async fn next_limit_under_cap_returns_requested_count_unaffected() {
     let pack = pack(rt());
@@ -385,14 +387,36 @@ async fn next_limit_under_cap_returns_requested_count_unaffected() {
     );
 }
 
-/// Over-limit: `gtd.next(limit=500)` is silently clamped to 200 (issue #744 — the cap
-/// itself is intentional and unchanged; #744 is about the *silence*, addressed here by
-/// documenting the cap on the `limit` ParamDef rather than a response-shape change,
-/// since the response is a bare JSON array consumed via `.as_array()` throughout the
-/// codebase and a sibling `truncated` field would require a breaking wrap-in-object
-/// change).
+/// Boundary: `limit=200` is exactly the cap — `requested == effective`, so this must
+/// NOT be reported as clamped and must NOT switch response shape. Off-by-one here
+/// (e.g. a `>=` where the handler means `>`) is the failure this shape invites.
 #[tokio::test]
-async fn next_limit_over_cap_clamps_to_200() {
+async fn next_limit_at_cap_boundary_is_not_clamped() {
+    let pack = pack(rt());
+    for i in 0..3 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.next", json!({"limit": 200}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().expect(
+        "limit == the 200 cap must not be reported as clamped, so the response stays a bare array",
+    );
+    assert_eq!(arr.len(), 3);
+}
+
+/// Over-limit: `gtd.next(limit=500)` clamps to 200 and #2679 now discloses it — the
+/// response switches from a bare array to an object carrying the same
+/// requested/effective/clamped field spelling as `khive-pack-kg`'s `list.rs` and
+/// `context.rs`.
+#[tokio::test]
+async fn next_limit_over_cap_clamps_to_200_and_reports_it() {
     let pack = pack(rt());
     for i in 0..205 {
         assign(
@@ -406,15 +430,24 @@ async fn next_limit_over_cap_clamps_to_200() {
         .dispatch("gtd.next", json!({"limit": 500}))
         .await
         .unwrap();
-    let arr = resp.as_array().unwrap();
+    assert!(
+        resp.as_array().is_none(),
+        "a fired clamp must switch the response to an object, not stay a bare array"
+    );
+    let tasks = resp["tasks"]
+        .as_array()
+        .expect("clamped gtd.next response must carry the results under `tasks`");
     assert_eq!(
-        arr.len(),
+        tasks.len(),
         200,
         "limit=500 over 205 actionable tasks must clamp to exactly 200"
     );
+    assert_eq!(resp["requested_limit"], 500);
+    assert_eq!(resp["effective_limit"], 200);
+    assert_eq!(resp["limit_clamped"], true);
 }
 
-/// Under-limit: `gtd.tasks(limit=...)` below the cap is unaffected.
+/// Under-limit control arm: `gtd.tasks(limit=...)` below the cap is unaffected.
 #[tokio::test]
 async fn tasks_limit_under_cap_returns_requested_count_unaffected() {
     let pack = pack(rt());
@@ -434,9 +467,31 @@ async fn tasks_limit_under_cap_returns_requested_count_unaffected() {
     assert_eq!(arr.len(), 5, "limit=10 with only 5 tasks must return all 5");
 }
 
-/// Over-limit: `gtd.tasks(limit=500)` is silently clamped to 200, mirroring `gtd.next`.
+/// Boundary: `limit=200` is exactly the cap for `gtd.tasks` too — must not clamp.
 #[tokio::test]
-async fn tasks_limit_over_cap_clamps_to_200() {
+async fn tasks_limit_at_cap_boundary_is_not_clamped() {
+    let pack = pack(rt());
+    for i in 0..3 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"limit": 200}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().expect(
+        "limit == the 200 cap must not be reported as clamped, so the response stays a bare array",
+    );
+    assert_eq!(arr.len(), 3);
+}
+
+/// Over-limit: `gtd.tasks(limit=500)` clamps to 200 and reports it, mirroring `gtd.next`.
+#[tokio::test]
+async fn tasks_limit_over_cap_clamps_to_200_and_reports_it() {
     let pack = pack(rt());
     for i in 0..205 {
         assign(
@@ -450,17 +505,56 @@ async fn tasks_limit_over_cap_clamps_to_200() {
         .dispatch("gtd.tasks", json!({"limit": 500}))
         .await
         .unwrap();
-    let arr = resp.as_array().unwrap();
+    assert!(
+        resp.as_array().is_none(),
+        "a fired clamp must switch the response to an object, not stay a bare array"
+    );
+    let tasks = resp["tasks"]
+        .as_array()
+        .expect("clamped gtd.tasks response must carry the results under `tasks`");
     assert_eq!(
-        arr.len(),
+        tasks.len(),
         200,
         "limit=500 over 205 tasks must clamp to exactly 200"
     );
+    assert_eq!(resp["requested_limit"], 500);
+    assert_eq!(resp["effective_limit"], 200);
+    assert_eq!(resp["limit_clamped"], true);
+}
+
+/// The `filter_excluded`/`hint` object wrap (#96) already switches `gtd.tasks` to an
+/// object for an unrelated reason (default filter hid a terminal-only match); when a
+/// clamp *also* fires on that same call, the three clamp fields must land on that
+/// object too, not be dropped because the object already existed for another reason.
+#[tokio::test]
+async fn tasks_filter_excluded_object_also_carries_a_fired_clamp_report() {
+    let pack = pack(rt());
+    let t = assign(&pack, json!({"title": "closed", "status": "inbox"})).await;
+    let t_id = t["full_id"].as_str().unwrap().to_string();
+    pack.dispatch("gtd.transition", json!({"id": t_id, "status": "done"}))
+        .await
+        .expect("inbox -> done");
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"limit": 500}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp["tasks"].as_array().map(Vec::len),
+        Some(0),
+        "the only task is terminal, so the default (open-only) filter excludes it"
+    );
+    assert!(
+        resp["filter_excluded"].is_array(),
+        "the #96 wrap must still fire"
+    );
+    assert_eq!(resp["requested_limit"], 500);
+    assert_eq!(resp["effective_limit"], 200);
+    assert_eq!(resp["limit_clamped"], true);
 }
 
 /// The 200 cap is documented on both verbs' `limit` ParamDef (issue #744 fallback
-/// ask 1), so `help=true`/verb introspection surfaces it even though the response
-/// itself carries no truncation signal.
+/// ask 1); #2679 additionally makes the response itself disclose a fired clamp.
 #[tokio::test]
 async fn next_and_tasks_limit_param_documents_the_200_cap() {
     use khive_pack_gtd::GtdPack;
