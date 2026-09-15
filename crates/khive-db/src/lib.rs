@@ -20,6 +20,9 @@ pub mod migrations;
 pub mod namespace_census;
 /// Moving records between namespaces (ADR-189).
 pub mod namespace_move;
+/// A store fixture reproducing the namespace split, for the move's own arms.
+#[cfg(any(test, feature = "test-support"))]
+pub mod namespace_move_fixture;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
@@ -68,5 +71,7 @@ pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTE
 pub use sql_bridge::SqlBridge;
 pub use writer_task::WriterTaskHandle;
 
+#[cfg(test)]
+mod namespace_move_fixture_tests;
 #[cfg(test)]
 mod stream_schema_tests;
