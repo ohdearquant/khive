@@ -338,7 +338,8 @@ jobs:
       # one step puts them at roughly 26 each.
       #
       # It runs 25x per OS on push/nightly/manual full lanes; the macos-pr lane
-      # already covers the khive-mcp suite once via macos-pr-tests, so the
+      # already covers this pair once via macos-pr-tests, which runs khive-mcp's
+      # unit tests on macOS for that reason, so the
       # focused portability lane keeps one serial run of the pair (ADR-049
       # Amendment 3). The introducing commit (cad6479dc) left no rationale for
       # the lone ungated condition it originally carried.
