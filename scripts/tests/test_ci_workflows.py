@@ -123,6 +123,73 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
         self.assertEqual(permissions, {"contents: write", "pull-requests: write"})
 
 
+class AggregateGateWorkflowTests(unittest.TestCase):
+    CONDITIONAL_JOBS = {
+        "automerge-push-guard", "dependency-review", "coverage-ratchet",
+    }
+
+    def setUp(self):
+        self.workflow = workflow_text("ci.yml")
+        self.gate = indented_block(self.workflow, "ci-gate", 2)
+        self.needs = {
+            line.strip().removeprefix("- ")
+            for line in indented_block(self.gate, "needs", 4).splitlines()
+        }
+        step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
+        self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+    def run_gate(self, results):
+        return subprocess.run(
+            ["bash", "-e", "-c", self.script],
+            env={**os.environ, "NEEDS": json.dumps({
+                job: {"result": result} for job, result in results.items()
+            })},
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+
+    def test_gate_rejects_skips_outside_conditional_jobs(self):
+        conditional = {
+            job for job in self.needs
+            if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
+        }
+        self.assertEqual(conditional, self.CONDITIONAL_JOBS)
+        self.assertTrue(self.needs - conditional)
+        for job in sorted(self.needs):
+            for outcome in ("success", "skipped", "failure", "cancelled"):
+                with self.subTest(job=job, outcome=outcome):
+                    results = dict.fromkeys(self.needs, "success")
+                    results[job] = outcome
+                    result = self.run_gate(results)
+                    accepted = outcome == "success" or (
+                        outcome == "skipped" and job in conditional
+                    )
+                    self.assertEqual(result.returncode, 0 if accepted else 1,
+                                     result.stdout + result.stderr)
+                    if not accepted:
+                        self.assertIn(f"Gate failure — jobs not green: {job}", result.stdout)
+
+    def test_gate_new_dependency_does_not_inherit_skip_exemption(self):
+        for outcome in ("success", "skipped", "failure", "cancelled"):
+            with self.subTest(outcome=outcome):
+                results = dict.fromkeys(self.needs, "success")
+                results["new-required-check"] = outcome
+                result = self.run_gate(results)
+                self.assertEqual(result.returncode, 0 if outcome == "success" else 1,
+                                 result.stdout + result.stderr)
+
+    def test_gate_mixed_results_report_only_rejected_jobs(self):
+        results = {
+            "ci": "skipped", "docs": "failure", "secret-scan": "cancelled",
+            **dict.fromkeys(self.CONDITIONAL_JOBS, "skipped"),
+        }
+        result = self.run_gate(results)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines(),
+            ["ci", "docs", "secret-scan"],
+        )
+
+
 class WasmtimeParityWorkflowTests(unittest.TestCase):
     def test_pinned_runtime_is_cached_retried_and_verified(self):
         workflow = workflow_text("ci.yml")
