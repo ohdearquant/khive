@@ -19,9 +19,20 @@ pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
             }
         }
         "merge" => {
-            for name in &["into_id", "from_id"] {
-                if let Some(ArgValue::Value(Value::String(s))) = op.args.get(*name) {
-                    keys.push(format!("entity:{s}"));
+            // A dry-run merge reads the pair and returns a prediction, so it targets
+            // no stored record and declares no key. Only a literal `true` reads as a
+            // preview: absent, `false` and a non-boolean value keep the keys, on the
+            // same static-knowability rule the rest of this builder follows, so an
+            // argument this cannot read as a preview stays conservative.
+            let previews_without_writing = matches!(
+                op.args.get("dry_run"),
+                Some(ArgValue::Value(Value::Bool(true)))
+            );
+            if !previews_without_writing {
+                for name in &["into_id", "from_id"] {
+                    if let Some(ArgValue::Value(Value::String(s))) = op.args.get(*name) {
+                        keys.push(format!("entity:{s}"));
+                    }
                 }
             }
         }
@@ -169,6 +180,56 @@ mod tests {
         assert!(
             matches!(&err, DslError::WriteKeyConflict { id, .. } if id == "entity:old-id"),
             "expected WriteKeyConflict with entity-prefixed key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_dry_run_merges_in_one_batch_do_not_conflict() {
+        // The refusal this closes: two previews over the same pair were rejected as
+        // overlapping writes and had to be issued as sequential singleton calls.
+        let r = parse_request(
+            r#"[merge(into_id="a-id", from_id="b-id", dry_run=true), merge(into_id="a-id", from_id="b-id", dry_run=true)]"#,
+        )
+        .unwrap();
+        check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_merge_does_not_conflict_with_a_delete_of_its_from_id() {
+        // The same pair as merge_from_id_conflicts_with_delete above, which is the
+        // control: the only difference between the two cases is the preview flag.
+        let r = parse_request(
+            r#"[merge(into_id="new-id", from_id="old-id", dry_run=true), delete(id="old-id")]"#,
+        )
+        .unwrap();
+        check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn dry_run_false_keeps_the_merge_keys() {
+        let r = parse_request(
+            r#"[merge(into_id="new-id", from_id="old-id", dry_run=false), delete(id="old-id")]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(
+            matches!(&err, DslError::WriteKeyConflict { id, .. } if id == "entity:old-id"),
+            "a merge that writes must keep its keys, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_dry_run_keeps_the_merge_keys() {
+        // A string is not the preview the handler acts on, so reading it as one here
+        // would drop the keys of an op that goes on to write.
+        let r = parse_request(
+            r#"[merge(into_id="new-id", from_id="old-id", dry_run="true"), delete(id="old-id")]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(
+            matches!(&err, DslError::WriteKeyConflict { id, .. } if id == "entity:old-id"),
+            "a non-boolean dry_run must stay conservative, got {err:?}"
         );
     }
 
