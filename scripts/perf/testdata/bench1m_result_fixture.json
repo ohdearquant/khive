@@ -35,7 +35,7 @@
     "exit_code": 0,
     "overall": "PASS",
     "target_key": "khive-vamana/ci-synthetic/clustered-128",
-    "targets_file": "/Users/lion/khive-work/worktrees/fix830-r2/perf/targets.toml"
+    "targets_file": "perf/targets.toml"
   },
   "caveats": [
     "2-point fit",
@@ -56,13 +56,13 @@
     "target_recall": 0.95
   },
   "dataset": {
-    "base_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.NTXmw939WK/sift_base.fvecs",
+    "base_file": "<temporary directory>/sift_base.fvecs",
     "base_n": 50000,
     "dim": 128,
     "intrinsic_dim_approx": null,
     "name": "SIFT-CI-synthetic",
     "normalization": "l2",
-    "query_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.NTXmw939WK/sift_query.fvecs",
+    "query_file": "<temporary directory>/sift_query.fvecs",
     "query_n": 1000,
     "seed": null,
     "source_url": null
@@ -104,6 +104,14 @@
     "iso_recall_query_exponent_warm": 1.0804068714411033,
     "iso_recall_query_r2_warm": null,
     "note": "2-point fit"
+  },
+  "fixture_redactions": {
+    "fields": [
+      "assertions.targets_file",
+      "dataset.base_file",
+      "dataset.query_file"
+    ],
+    "note": "This result was recorded with absolute paths from the machine that ran it. Those values are replaced here: targets_file with its repository-relative path, the dataset files with a placeholder directory. No reader of this fixture uses these fields. A fixture refreshed from a new run gets the same replacement."
   },
   "git_sha": "1bdb19a9aa75250416065bcb543e5393e2d6ffa9",
   "gt_policy": {
