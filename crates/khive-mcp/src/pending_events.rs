@@ -724,13 +724,9 @@ async fn run_pending_events_on_with_lease(
                 // display metadata and never an authority source; the generic
                 // KG mutation fence separately prevents a valid provenance
                 // record from authorizing rewritten executable intent.
-                // Generic actions require provenance even on the missed path
-                // (legacy rows fail closed before any lifecycle transition).
-                // Reminders also resolve provenance when missed: although no
-                // delivery occurs, the durable receipt must still identify
-                // the creator rather than whichever daemon happened to run
-                // the grace-policy transition. Only genuinely legacy rows
-                // without a provenance event use the scheduler fallback.
+                // Both event kinds require provenance before the missed path:
+                // a grace-policy receipt still identifies the creator, and a
+                // legacy repeat must not rearm without a verified recipient.
                 let creator = match verified_creator_for_event(rt, ns_str, id, event_type).await {
                     Ok(actor) => actor,
                     Err(e) => {
@@ -745,27 +741,7 @@ async fn run_pending_events_on_with_lease(
                     }
                 };
                 let reminder_actor = if event_type == "remind" && !is_missed {
-                    match creator.as_ref() {
-                        Some(actor) => Some(actor.recipient_id.clone()),
-                        None => {
-                            // Compatibility for reminders written before
-                            // immutable provenance existed: deliver only to
-                            // the configured daemon owner. Never honor the
-                            // row's forgeable `created_by_actor` claim.
-                            let fallback = server
-                                .actor_id()
-                                .filter(|actor| !actor.trim().is_empty())
-                                .unwrap_or("local")
-                                .to_string();
-                            tracing::warn!(
-                                scheduled_event_id = %id,
-                                fallback_actor = %fallback,
-                                "pending-events: reminder lacks immutable creator provenance; \
-                                 ignoring note actor metadata and using the scheduler actor"
-                            );
-                            Some(fallback)
-                        }
-                    }
+                    creator.as_ref().map(|actor| actor.recipient_id.clone())
                 } else {
                     None
                 };
@@ -808,17 +784,7 @@ async fn run_pending_events_on_with_lease(
                 let receipt_actor = creator
                     .as_ref()
                     .map(|creator| creator.audit_actor.clone())
-                    .unwrap_or_else(|| {
-                        if event_type == "remind" {
-                            server
-                                .actor_id()
-                                .filter(|actor| !actor.trim().is_empty())
-                                .map(|actor| format!("actor:{actor}"))
-                                .unwrap_or_else(|| "anonymous:local".to_string())
-                        } else {
-                            "anonymous:local".to_string()
-                        }
-                    });
+                    .unwrap_or_else(|| "anonymous:local".to_string());
                 #[cfg(test)]
                 race_seam::pause_before_claim().await;
                 let claim = match claim_pending_event(
@@ -898,15 +864,15 @@ async fn run_pending_events_on_with_lease(
                     continue;
                 }
 
-                // Generic scheduled actions must replay as the creator from
-                // immutable pack provenance, never as the daemon and never
-                // from caller-editable note properties. Legacy/hand-written
-                // rows cannot satisfy that identity fence, so fail closed.
-                if event_type == "schedule" && creator.is_none() {
-                    let error = "scheduled action is missing immutable creator provenance; row cannot be replayed safely";
+                if creator.is_none() {
+                    let error = if event_type == "remind" {
+                        "reminder is missing immutable creator provenance; no recipient selected and delivery refused; create a new reminder with schedule.remind"
+                    } else {
+                        "scheduled action is missing immutable creator provenance; row cannot be replayed safely"
+                    };
                     tracing::error!(
                         scheduled_event_id = %id,
-                        "pending-events: refusing unattributed scheduled action replay"
+                        "pending-events: refusing unattributed scheduled event"
                     );
                     if verbose {
                         eprintln!("[pending-events] dispatch refused for note {id}: {error}");
@@ -922,8 +888,9 @@ async fn run_pending_events_on_with_lease(
                         continue;
                     };
                     props["status"] = json!("failed");
-                    props["dispatch_error"] = json!(error);
-                    props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
+                    let (error_key, error_at_key) = dispatch_error_property_keys(&props);
+                    props[error_key] = json!(error);
+                    props[error_at_key] = json!(Utc::now().to_rfc3339());
                     let updated_at = Utc::now().timestamp_micros();
                     props["dispatch_receipt"] = claim.completed_without_invocation_receipt(
                         DispatchReceiptState::NotInvoked,
@@ -1038,19 +1005,11 @@ async fn run_pending_events_on_with_lease(
                 }
 
                 // ── Dispatch the action ──────────────────────────────────
-                let dispatch_actor = if event_type == "schedule" {
-                    creator.clone().expect("checked above").request_actor
-                } else {
-                    match creator.clone() {
-                        Some(creator) => creator.request_actor,
-                        None => server.actor_id().and_then(|actor| {
-                            (!actor.trim().is_empty()).then(|| {
-                                VerifiedActor::new(actor.to_string())
-                                    .expect("non-blank scheduler actor was prevalidated")
-                            })
-                        }),
-                    }
-                };
+                let dispatch_actor = creator
+                    .as_ref()
+                    .expect("checked above")
+                    .request_actor
+                    .clone();
                 let Some(dsl) = action_dsl.as_deref() else {
                     let error = "scheduled event has no executable payload";
                     tracing::error!(
@@ -1220,6 +1179,7 @@ async fn run_pending_events_on_with_lease(
                             server,
                             ns_str,
                             id,
+                            &receipt_actor,
                             reminder_actor.as_deref().unwrap_or("local"),
                             error,
                         )
@@ -2655,6 +2615,7 @@ async fn append_reminder_delivery_failure_event(
     server: &KhiveMcpServer,
     namespace: &str,
     scheduled_event_id: uuid::Uuid,
+    audit_actor: &str,
     recipient_actor: &str,
     error: &str,
 ) {
@@ -2666,7 +2627,7 @@ async fn append_reminder_delivery_failure_event(
         "schedule.remind.fire",
         EventKind::Audit,
         SubstrateKind::Note,
-        recipient_actor,
+        audit_actor,
     )
     .with_outcome(EventOutcome::Error)
     .with_target(scheduled_event_id)
@@ -4045,13 +4006,14 @@ mod tests {
         assert!(props["fired_at"].as_str().is_some());
     }
 
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn unprovenanced_reminder_ignores_forged_actor_property() {
+    async fn assert_unprovenanced_reminder_refused(
+        daemon_actor: Option<&str>,
+        repeat: Option<&str>,
+        trigger_at: &str,
+    ) {
         let (_tmp, db_path) = tmp_db();
-        let daemon_actor = "lambda:daemon-owner";
         let forged_victim = "lambda:forged-victim";
-        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
+        let rt = make_rt_with_actor(&db_path, daemon_actor).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
         let token = rt
             .authorize(Namespace::local())
@@ -4064,8 +4026,8 @@ mod tests {
                 "unprovenanced reminder",
                 None,
                 Some(json!({
-                    "trigger_at": due_rfc3339(),
-                    "repeat": null,
+                    "trigger_at": trigger_at,
+                    "repeat": repeat,
                     "status": "pending",
                     "event_type": "remind",
                     "created_by_actor": forged_victim,
@@ -4077,26 +4039,112 @@ mod tests {
             )
             .await
             .expect("create hand-written reminder");
+        let action_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
 
         let summary = run_pending_events_on(&rt, &server, false)
             .await
-            .expect("drain");
+            .expect("drain continues after refusing the reminder");
+        assert_eq!(summary.scanned, 2);
         assert_eq!(summary.fired, 1);
-        assert_eq!(summary.failed, 0);
-        assert!(
-            inbound_reminder_messages(&rt, forged_victim)
-                .await
-                .is_empty(),
-            "mutable created_by_actor metadata must not select a recipient"
-        );
-        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
-        assert_eq!(daemon_messages.len(), 1);
-        assert_eq!(daemon_messages[0].0, "unprovenanced reminder");
-        assert_eq!(
-            get_note_props(&rt, note.id).await["dispatch_receipt"]["actor"],
-            format!("actor:{daemon_actor}"),
-            "the scheduler fallback remains available only for a genuinely legacy reminder"
-        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.invoked, 1);
+        assert_eq!(summary.advanced, 0);
+        assert_eq!(summary.retry_pending, 0);
+        assert!(summary.missed.is_empty());
+        assert_eq!(get_note_props(&rt, action_id).await["status"], "fired");
+        for recipient in [forged_victim, daemon_actor.unwrap_or("local"), "local"] {
+            assert!(inbound_reminder_messages(&rt, recipient).await.is_empty());
+        }
+
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: format!("get(id=\"{}\")", note.id),
+                presentation: Some("verbose".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("inspect refused reminder through get");
+        let response: Value = serde_json::from_str(&response).expect("get response JSON");
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+        let props = &response["results"][0]["result"]["properties"];
+        assert_eq!(props["status"], "failed", "{response}");
+        assert_eq!(props["trigger_at"], trigger_at);
+        assert_eq!(props["repeat"], json!(repeat));
+        assert!(props["fired_at"].is_null());
+        assert!(props["delivery_failed_at"].as_str().is_some());
+        let error = props["delivery_error"].as_str().expect("visible refusal");
+        assert!(error.contains("missing immutable creator provenance"));
+        assert!(error.contains("no recipient selected"));
+        assert!(error.contains("schedule.remind"));
+        let receipt = &props["dispatch_receipt"];
+        assert_eq!(receipt["state"], "not_invoked");
+        assert_eq!(receipt["actor"], "anonymous:local");
+        assert_eq!(receipt["error"], error);
+        assert!(receipt["completed_at"].as_i64().is_some());
+
+        let events = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    verbs: vec!["schedule.remind.fire".to_string()],
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query delivery failure events");
+        assert!(events.items.is_empty(), "no delivery was attempted");
+        let before = get_raw_note_properties(&rt, note.id).await;
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+        assert_eq!(second.scanned, 0);
+        assert_eq!(second.invoked, 0);
+        assert_eq!(get_raw_note_properties(&rt, note.id).await, before);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn unprovenanced_reminder_ignores_forged_actor_property() {
+        for daemon_actor in [Some("lambda:daemon-owner"), None] {
+            assert_unprovenanced_reminder_refused(daemon_actor, None, &due_rfc3339()).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn unprovenanced_repeating_reminder_is_terminal_and_visible_without_delivery() {
+        for daemon_actor in [Some("lambda:daemon-owner"), None] {
+            for repeat in ["daily", "weekly"] {
+                assert_unprovenanced_reminder_refused(daemon_actor, Some(repeat), &due_rfc3339())
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn unprovenanced_missed_reminder_is_refused_before_rearming() {
+        for daemon_actor in [Some("lambda:daemon-owner"), None] {
+            assert_unprovenanced_reminder_refused(
+                daemon_actor,
+                Some("daily"),
+                "2000-01-01T00:00:00Z",
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -4130,28 +4178,34 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
+    async fn assert_reminder_delivery_failure_attribution(creator_actor: Option<&str>) {
         let (_tmp, db_path) = tmp_db();
-        let actor = "lambda:failure-owner";
+        let namespace = "reminder-failure-tenant";
+        let daemon_actor = "lambda:failure-daemon";
+        let creator_rt = make_rt_with_actor(&db_path, creator_actor).await;
+        let id =
+            create_scheduled_event(&creator_rt, namespace, &due_rfc3339(), None, None, "remind")
+                .await;
+        let expected_actor = creator_actor
+            .map(|actor| format!("actor:{actor}"))
+            .unwrap_or_else(|| "anonymous:local".to_string());
+        let recipient = creator_actor.unwrap_or("local");
         let cfg = RuntimeConfig {
             db_path: Some(std::path::PathBuf::from(&db_path)),
             default_namespace: Namespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
             gate: std::sync::Arc::new(DenyCommSendGate),
-            actor_id: Some(actor.to_string()),
+            actor_id: Some(daemon_actor.to_string()),
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime");
         let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
         let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
             .expect("server with required reminder delivery pack");
-        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
         let action_id = create_scheduled_event(
             &rt,
-            "local",
+            namespace,
             &due_rfc3339(),
             Some("stats()"),
             None,
@@ -4183,7 +4237,10 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.fired, 1);
         assert_eq!(summary.retry_pending, 1);
-        assert!(inbound_reminder_messages(&rt, actor).await.is_empty());
+        assert!(inbound_reminder_messages(&rt, recipient).await.is_empty());
+        assert!(inbound_reminder_messages(&rt, daemon_actor)
+            .await
+            .is_empty());
         let props = get_note_props(&rt, id).await;
         assert_eq!(
             props["status"], "pending",
@@ -4196,11 +4253,15 @@ mod tests {
             "delivery error must be visible on the reminder row: {props:?}"
         );
         assert!(props["delivery_failed_at"].as_str().is_some());
+        assert_eq!(props["dispatch_receipt"]["actor"], expected_actor);
+        assert_eq!(props["dispatch_receipt"]["state"], "failed");
         let action_props = get_note_props(&rt, action_id).await;
         assert_eq!(action_props["status"], "fired");
         assert!(action_props["fired_at"].as_str().is_some());
 
-        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let token = rt
+            .authorize(Namespace::parse(namespace).expect("namespace"))
+            .expect("authorize");
         let events = rt
             .events(&token)
             .expect("event store")
@@ -4216,10 +4277,29 @@ mod tests {
             )
             .await
             .expect("query reminder failure events");
-        assert!(events
-            .items
-            .iter()
-            .any(|event| { event.outcome == EventOutcome::Error && event.target_id == Some(id) }));
+        assert_eq!(events.items.len(), 1, "one reminder delivery failure event");
+        let event = &events.items[0];
+        assert_eq!(event.outcome, EventOutcome::Error);
+        assert_eq!(event.target_id, Some(id));
+        assert_eq!(event.actor, expected_actor);
+        assert_eq!(event.namespace, namespace);
+        assert_eq!(event.payload["recipient_actor"], recipient);
+        assert_eq!(event.payload["scheduled_event_id"], id.to_string());
+        assert!(event.payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("denied by delivery-failure test")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
+        assert_reminder_delivery_failure_attribution(Some("lambda:failure-owner")).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn reminder_delivery_failure_preserves_verified_anonymous_creator_attribution() {
+        assert_reminder_delivery_failure_attribution(None).await;
     }
 
     #[tokio::test]

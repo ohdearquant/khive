@@ -124,5 +124,12 @@ part of the current by-ID contract described above.
 
 - Add a new pack: implement `Pack + PackRuntime`, call `VerbRegistryBuilder::pack()`.
 - Add a gate: implement `Gate`, call `VerbRegistryBuilder::with_gate()`.
-- Add an audit sink: implement `EventStore`, call `VerbRegistryBuilder::with_event_store()`.
+- Wire production runtime audit persistence with
+  `VerbRegistryBuilder::with_runtime_event_store(&runtime)`. The raw sink is resolved
+  at `build()` using the final default namespace; each audit event retains the actor
+  and namespace of its resolved request. Reserve `with_event_store()` for explicitly
+  trusted custom sinks that preserve those stamps. Do not pass the token-scoped
+  `runtime.events(&token)` decorator as the registry sink: it would replace request
+  attribution with the construction token. See
+  [ADR-162](../../../docs/adr/ADR-162-unified-event-plane-ownership.md).
 - Add a post-dispatch hook: implement `DispatchHook`, call `VerbRegistryBuilder::with_dispatch_hook()`.
