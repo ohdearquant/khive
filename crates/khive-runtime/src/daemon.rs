@@ -225,6 +225,28 @@ pub fn recoverer_lock_path() -> PathBuf {
     khive_dir().join("khived.recoverer.lock")
 }
 
+/// Marker file a process supervisor (launchd, systemd, or any equivalent)
+/// writes beside the socket path before it starts a supervised `khived`, and
+/// removes on a clean stop. Its presence tells a client that this rendezvous
+/// is not the "any client may spawn on demand" case: a supervisor already
+/// owns the daemon's lifecycle for this socket, and a client racing it to
+/// bind the socket would only produce a second, unsupervised daemon that the
+/// supervisor's own instance then refuses to replace. Reading and acting on
+/// this file is entirely the client's decision (`khive-mcp`); this module
+/// only resolves where it lives, matching the [`lock_path`] /
+/// [`recoverer_lock_path`] pattern.
+///
+/// Overridable via the `KHIVE_SUPERVISOR_MARKER` env var (for tests).
+#[cfg(unix)]
+pub fn supervisor_marker_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KHIVE_SUPERVISOR_MARKER") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    khive_dir().join("khived.supervisor")
+}
+
 #[cfg(unix)]
 fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {

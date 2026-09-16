@@ -45,6 +45,7 @@ pub(super) fn clear_daemon_env() {
     std::env::remove_var("KHIVE_LOCK");
     std::env::remove_var("KHIVE_RECOVERER_LOCK");
     std::env::remove_var("KHIVE_PROCESS_REF");
+    std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
 }
 
 pub(super) struct RecoveryTestGuard {
