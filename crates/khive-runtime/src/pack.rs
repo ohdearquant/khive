@@ -594,6 +594,15 @@ pub trait PackByIdResolver: Send + Sync {
         id: uuid::Uuid,
         hard: bool,
     ) -> Result<serde_json::Value, crate::RuntimeError>;
+
+    /// Verbs that change this pack's private records, named as examples when
+    /// a generic verb refuses one of them (ADR-061 Amendment 1).
+    ///
+    /// The refusal names the owning pack either way. A pack that returns
+    /// nothing is named without examples rather than borrowing another pack's.
+    fn private_record_verbs(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Builder for constructing a `VerbRegistry`.

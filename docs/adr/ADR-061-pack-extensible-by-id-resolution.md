@@ -232,6 +232,14 @@ Callers use the owning pack's mutation verbs, such as `knowledge.upsert_atoms`,
 ways to edit records, not a promise of an equivalent pack-specific merge operation. This
 amendment adds neither mutation methods to `PackByIdResolver` nor a `KindSpec` variant.
 
+The direction names the pack whose resolver claimed the record, never a fixed pack, because
+resolvers are registered generically and a second implementor is picked up without any change
+to the generic verbs. `PackByIdResolver` gains one non-mutating method,
+`private_record_verbs`, returning the verbs the pack offers for its own records; it defaults
+to an empty list. The refusal lists those verbs as examples when the pack declares any and
+names the pack alone when it declares none, so a caller is never pointed at another pack's
+verbs.
+
 During generic merge's existing pre-mutation operand checks, a `NotFound` for a resolved
 UUID triggers the registered live by-ID resolver probes for that same operand. A resolver
 claim produces `InvalidInput` stating that generic merge of pack-private records is
@@ -249,7 +257,8 @@ its errors after a possible commit.
 
 Resolver use is diagnostic-only and performs no generic private-record mutation. Existing
 `get`/`delete` support remains unchanged. Generic update's existing inferred-kind diagnostic
-also remains unchanged; this amendment does not extend it to explicit-kind update routes.
+keeps its route and error class and names the owning pack the same way; this amendment does
+not extend it to explicit-kind update routes.
 Full UUID parsing and existing prefix/name resolution retain their current reachability;
 no private-record short-ID lookup is added. Gate authorization remains at dispatch, and
 by-ID resolver lookup remains namespace-blind.

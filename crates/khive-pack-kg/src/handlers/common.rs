@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use khive_runtime::{
     micros_to_iso, ContentMergeStrategy, EntityDedupMergePolicy, KhiveRuntime, NamespaceToken,
-    QueryResult, RuntimeError, VerbRegistry,
+    PackByIdResolver, QueryResult, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{Direction, SqlValue};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
@@ -681,6 +681,28 @@ pub(crate) const IMMUTABLE_EVENT_MSG: &str =
 
 pub(crate) fn immutable_event_error() -> RuntimeError {
     RuntimeError::InvalidInput(IMMUTABLE_EVENT_MSG.into())
+}
+
+/// The refusal for a generic verb aimed at a record a pack's resolver claimed.
+///
+/// `refusal` is the verb's own first clause. The direction names the pack that
+/// claimed the record, and its examples are the verbs that pack declares for its
+/// own records: a fixed list would send a caller to one pack's verbs for a record
+/// another pack owns.
+pub(crate) fn pack_private_record_error(
+    refusal: &str,
+    pack_name: &str,
+    resolver: &dyn PackByIdResolver,
+) -> RuntimeError {
+    let verbs = resolver.private_record_verbs();
+    let examples = if verbs.is_empty() {
+        String::new()
+    } else {
+        format!(" (e.g. {})", verbs.join(", "))
+    };
+    RuntimeError::InvalidInput(format!(
+        "{refusal}; use the {pack_name} pack's own verbs{examples}"
+    ))
 }
 
 pub(crate) fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeError> {
