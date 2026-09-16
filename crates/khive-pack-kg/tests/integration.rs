@@ -777,6 +777,43 @@ async fn get_nonexistent_id_returns_not_found() {
     );
 }
 
+// ---- a refusal for an id that resolves to nothing renders its prefix once (#2864) ----
+
+/// `RuntimeError::NotFound` renders as `not found: {payload}`, so a payload that
+/// begins with `not found: ` itself reaches the caller as "not found: not found:
+/// <id>". The tests beside this one match the variant, which both forms satisfy;
+/// only the rendered string can see a defect that lives in how the payload is
+/// rendered. One arm per construction site a caller can reach.
+#[tokio::test]
+async fn a_refusal_for_an_unresolvable_id_renders_not_found_once() {
+    let pack = pack();
+    let missing = "00000000-0000-4000-8000-000000002864";
+    for (verb, args) in [
+        ("get", json!({"id": missing})),
+        ("update", json!({"id": missing, "properties": {"a": 1}})),
+        ("delete", json!({"id": missing})),
+        ("restore", json!({"id": missing})),
+        ("restore", json!({"id": missing, "kind": "entity"})),
+        ("restore", json!({"id": missing, "kind": "note"})),
+        ("restore", json!({"id": missing, "kind": "edge"})),
+    ] {
+        let arm = format!("{verb} {args}");
+        let err = match pack.dispatch(verb, args).await {
+            Ok(value) => panic!("{arm}: an unresolvable id must be refused; got: {value}"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, RuntimeError::NotFound(_)),
+            "{arm}: expected NotFound, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("not found: {missing}"),
+            "{arm}: the rendered refusal must carry the prefix exactly once"
+        );
+    }
+}
+
 // ---- `get` must distinguish a resolver storage failure from a genuine miss ----
 
 #[tokio::test]

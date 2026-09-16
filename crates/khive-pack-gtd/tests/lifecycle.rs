@@ -806,3 +806,17 @@ async fn empty_string_noop_note_is_ignored() {
         "an explicitly supplied empty note is not persisted on a no-op"
     );
 }
+
+/// A task id that resolves to no note renders its refusal prefix once (#2864).
+/// `NotFound` renders as `not found: {payload}`, so an assertion on the variant
+/// alone passes whether or not the payload repeats the prefix.
+#[tokio::test]
+async fn completing_a_missing_task_renders_not_found_once() {
+    let pack = pack(rt());
+    let missing = "00000000-0000-4000-8000-000000002864";
+    let err = pack
+        .dispatch("gtd.complete", json!({"id": missing, "result": "shipped"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("not found: {missing}"));
+}
