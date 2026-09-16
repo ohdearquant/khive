@@ -874,3 +874,50 @@ each logical create/link write goes through `VerbRegistry` dispatch, so its
 canonical gate request and audit lifecycle are inherited per write. A generic
 `authorize` consultation only governs namespace-token minting and is never treated
 as a replacement for either the batch-level or per-write operation check.
+
+---
+
+## Amendment 5 (2026-09-16) — `force` is a gate-visible privileged argument
+
+An argument that suspends a safety check is an authorization question, not a
+parameter default. `merge(kind="entity", ..., force=true)` skips the entity merge
+safety floor — the kind, name and projects comparison that otherwise refuses to
+merge two records that do not agree — and the verb itself asks nobody whether the
+caller may do that.
+
+The enforcement point is the gate, not the handler. A verb dispatch builds its
+`GateRequest` from the call's own parameters
+(`crates/khive-runtime/src/pack.rs`, `gate_request_with_identity`, which passes
+`params.clone()`), and `GateRequest` carries those arguments beside actor,
+namespace and verb (`crates/khive-gate/src/request.rs`). A policy-backed gate can
+therefore refuse `force=true` for a class of principals today, as an ordinary rule
+over the request's arguments, with no change to the request shape, the handler, or
+callers that do not force. Refusing in the handler instead was considered and
+rejected: it would break every plain request-path caller that forces, for a
+property whose enforcement point is deployment policy anyway.
+
+**This binds gated deployments only, and the amendment says so rather than implying
+more.** The runtime default is still `AllowAllGate`
+(`impl Default for RuntimeConfig`, `crates/khive-runtime/src/config.rs`; ADR-129's
+own implementation-state note records the same). A deployment on that default has
+no force protection at all. A deployment carrying a static `[gate]` roster gets a
+fail-closed `CallerEnrollmentGate`, which decides on the acting actor and not on
+the arguments, so a caller who is enrolled at all can still force. On both shipped
+postures, refusing `force` requires an argument-aware policy, and neither posture
+gets the property for free.
+
+Because the refusal is conditional, the trail is not. The `EntityMerged` audit
+event carries `force` as a boolean when the merge ran under the forced validation,
+and it is emitted only for a merge that actually writes: a dry run is a read-only
+preview and appends no event. An ungated deployment therefore still records which
+merges suspended the floor, under which actor and namespace, without depending on
+any policy being installed.
+
+The field is a marker: it is present only when the merge was forced, and an
+ordinary merge carries no `force` key at all. Consumers read presence, not value.
+That shape is stated here so a reader does not have to recover it from the
+emission site, and a change to it is a change to this contract.
+
+`dry_run` is deliberately not covered. A preview writes nothing and suspends
+nothing; it evaluates the floor and reports what the merge would do, which is the
+opposite of bypassing it.

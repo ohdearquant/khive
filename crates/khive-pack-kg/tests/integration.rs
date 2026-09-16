@@ -7098,6 +7098,450 @@ async fn merge_disjoint_projects_is_refused_by_properties_guard() {
         Some("project_compatibility")
     );
 }
+// ---- merge resolves an omitted kind from into_id, as the parameter documents ----
+
+/// `kind` has always documented "omit to resolve the substrate from into_id".
+/// The code defaulted to `"entity"`, so merging two notes without the hint was
+/// refused as a missing entity: a refusal naming a substrate the caller never
+/// chose, about records that exist.
+#[tokio::test]
+async fn merge_with_kind_omitted_resolves_the_substrate_from_into_id() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader pool saturates at eight slots", "salience": 0.4}),
+        )
+        .await
+        .expect("create into note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create from note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect("two notes must merge with no kind hint");
+    assert_eq!(result["kept_id"], json!(&into_id), "result: {result}");
+    assert_eq!(result["removed_id"], json!(&from_id), "result: {result}");
+}
+
+/// Inference makes a substrate disagreement reachable without the caller having
+/// typed a kind, so the refusal names both sides instead of reporting the second
+/// record as missing under the first record's substrate.
+#[tokio::test]
+async fn merge_across_substrates_with_kind_omitted_names_both_sides() {
+    let pack = pack();
+    let entity_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Reader Admission"}),
+        )
+        .await
+        .expect("create entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let note_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let error = match pack
+        .dispatch("merge", json!({"into_id": &entity_id, "from_id": &note_id}))
+        .await
+    {
+        Ok(value) => panic!("a cross-substrate merge must be refused; got: {value}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("cannot merge across substrates")
+            && error.contains("resolves as entity")
+            && error.contains("resolves as note"),
+        "the refusal must name both sides; got: {error}"
+    );
+    assert!(
+        !error.contains("not found"),
+        "both records exist, so the refusal must not read as a lookup failure; got: {error}"
+    );
+
+    // Control: the same pair with the substrates the other way round refuses the
+    // same way, so the message is not reporting whichever side happens to be
+    // second.
+    let reversed = match pack
+        .dispatch("merge", json!({"into_id": &note_id, "from_id": &entity_id}))
+        .await
+    {
+        Ok(value) => panic!("the reversed pair must also be refused; got: {value}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        reversed.contains("resolves as note") && reversed.contains("resolves as entity"),
+        "reversed refusal must name both sides; got: {reversed}"
+    );
+}
+
+/// An id that resolves to nothing has no substrate to infer, so the omitted-kind
+/// path keeps the historical entity refusal rather than reporting the inference's
+/// own miss. `khive-pack-knowledge`'s issue-558 arms pin this exact message and
+/// this exact ordering across the pack boundary, and a change to it belongs to
+/// whoever decides that contract, not to this one.
+#[tokio::test]
+async fn merge_with_kind_omitted_keeps_the_historical_refusal_for_an_id_that_resolves_to_nothing() {
+    let pack = pack();
+    let present = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create the present record")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let missing = "00000000-0000-4000-8000-000000000558";
+
+    // The present record is a NOTE on both arms. Inference would have resolved it
+    // as one, so a fallback that read the surviving side would answer "note" here;
+    // only the historical entity default produces the refusals below.
+    //
+    // The two arms name different ids on purpose. Under the entity default the
+    // `into_id` is checked first, so a missing `into_id` is reported by its own id
+    // and a missing `from_id` is never reached: the present note fails the entity
+    // check before it. That ordering is the historical behaviour this arm exists
+    // to keep, and a fix that "improved" it would move which id a caller sees.
+    for (into, from, arm, named) in [
+        (missing, present.as_str(), "missing into_id", missing),
+        (
+            present.as_str(),
+            missing,
+            "missing from_id",
+            present.as_str(),
+        ),
+    ] {
+        let error = match pack
+            .dispatch("merge", json!({"into_id": into, "from_id": from}))
+            .await
+        {
+            Ok(value) => panic!("{arm}: a merge naming a missing id must be refused; got: {value}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("entity"),
+            "{arm}: the refusal must come from the historical entity default; got: {error}"
+        );
+        assert!(
+            error.contains(named),
+            "{arm}: the refusal must name {named}; got: {error}"
+        );
+        assert!(
+            !error.contains("cannot merge across substrates"),
+            "{arm}: an unresolvable id is a lookup failure, never a substrate disagreement; \
+             got: {error}"
+        );
+    }
+}
+
+// ---- merge dry_run predicts the safety floor instead of failing on it ----
+
+/// `dry_run=true` asks for the plan, and a merge the floor would refuse still
+/// has a plan: it is the refusal. The guard used to run ahead of the dry-run
+/// branch, so the merges a caller had most reason to preview were exactly the
+/// ones a preview could not be obtained for. One arm per guard, because the
+/// value pair it reports has a different shape in each (kind and name are
+/// strings, the project lists are arrays).
+#[tokio::test]
+async fn merge_dry_run_previews_the_floor_refusal_for_every_guard() {
+    for (guard, into_body, from_body, into_value, from_value) in [
+        (
+            "entity_kind",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+            json!({"kind": "project", "name": "Quantum Annealing"}),
+            json!("concept"),
+            json!("project"),
+        ),
+        (
+            "name_similarity",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+            json!({"kind": "concept", "name": "Renaissance Painting"}),
+            json!("Quantum Annealing"),
+            json!("Renaissance Painting"),
+        ),
+        (
+            "project_compatibility",
+            json!({
+                "kind": "concept",
+                "name": "Vector Search",
+                "properties": {"projects": ["search-service"]},
+            }),
+            json!({
+                "kind": "concept",
+                "name": "vector-search",
+                "properties": {"projects": ["recommendation-service"]},
+            }),
+            json!(["search-service"]),
+            json!(["recommendation-service"]),
+        ),
+    ] {
+        let pack = pack();
+        let into_id = pack
+            .dispatch("create", into_body)
+            .await
+            .expect("create into entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let from_id = pack
+            .dispatch("create", from_body)
+            .await
+            .expect("create from entity")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let preview = pack
+            .dispatch(
+                "merge",
+                json!({"into_id": &into_id, "from_id": &from_id, "dry_run": true}),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{guard}: a dry run must predict the refusal, not fail on it: {error:?}")
+            });
+
+        assert_eq!(
+            preview["dry_run"],
+            json!(true),
+            "{guard}: preview: {preview}"
+        );
+        assert_eq!(
+            preview["would_merge"],
+            json!(false),
+            "{guard}: a predicted refusal is would_merge false; preview: {preview}"
+        );
+        assert_eq!(preview["refused_by"], json!(guard), "preview: {preview}");
+        assert_eq!(preview["into_value"], into_value, "preview: {preview}");
+        assert_eq!(preview["from_value"], from_value, "preview: {preview}");
+        assert!(
+            preview["compared"]
+                .as_str()
+                .is_some_and(|compared| !compared.is_empty()),
+            "{guard}: the preview must say what was compared; preview: {preview}"
+        );
+        assert!(
+            preview.get("kept_id").is_none() && preview.get("removed_id").is_none(),
+            "{guard}: nothing is kept or removed by a refused merge, so the plan must not \
+             name a survivor; preview: {preview}"
+        );
+
+        // Same pair without dry_run: the floor still refuses, and it refuses as
+        // an error. The preview is a second shape for the prediction, not a
+        // relaxation of the guard.
+        let error = match pack
+            .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+            .await
+        {
+            Ok(value) => panic!("{guard}: the real merge must still be refused; got: {value}"),
+            Err(error) => error,
+        };
+        let RuntimeError::Khive(error) = error else {
+            panic!("{guard}: expected the structured merge-guard error");
+        };
+        assert_eq!(
+            error.details().and_then(|details| details.get("guard")),
+            Some(guard)
+        );
+
+        // Nothing was written by the prediction.
+        for id in [&into_id, &from_id] {
+            let record = pack
+                .dispatch("get", json!({"id": id}))
+                .await
+                .unwrap_or_else(|error| panic!("{guard}: {id} must still be live: {error:?}"));
+            assert_eq!(record["id"], json!(id));
+        }
+    }
+}
+
+/// The other side of the same field: a dry run whose floor passes reports
+/// `would_merge` true. A caller reading a missing key as a verdict is reading
+/// an absence, so the field is present on every dry-run response.
+#[tokio::test]
+async fn merge_dry_run_reports_would_merge_true_when_the_floor_passes() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Attention Flash",
+                "properties": {"projects": ["transformers", "inference"]},
+            }),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Flash Attention",
+                "properties": {"projects": ["inference", "kernels"]},
+            }),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let preview = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": &into_id, "from_id": &from_id, "dry_run": true}),
+        )
+        .await
+        .expect("a mergeable pair must plan cleanly");
+    assert_eq!(preview["would_merge"], json!(true), "preview: {preview}");
+    assert_eq!(preview["dry_run"], json!(true), "preview: {preview}");
+    assert_eq!(preview["kept_id"], json!(&into_id), "preview: {preview}");
+
+    let record = pack
+        .dispatch("get", json!({"id": &from_id}))
+        .await
+        .expect("the from record must survive a dry run");
+    assert_eq!(record["id"], json!(&from_id));
+}
+
+/// `force` skips the floor, so a forced dry run plans the merge the floor would
+/// have refused. The preview fork is reached by the refusal, not by `dry_run`.
+#[tokio::test]
+async fn merge_forced_dry_run_plans_the_merge_the_floor_would_refuse() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let preview = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": &into_id, "from_id": &from_id, "dry_run": true, "force": true}),
+        )
+        .await
+        .expect("a forced dry run must plan the merge");
+    assert_eq!(preview["would_merge"], json!(true), "preview: {preview}");
+    assert_eq!(preview["kept_id"], json!(&into_id), "preview: {preview}");
+    assert!(
+        preview.get("refused_by").is_none(),
+        "a forced plan hit no guard; preview: {preview}"
+    );
+
+    let record = pack
+        .dispatch("get", json!({"id": &from_id}))
+        .await
+        .expect("the from record must survive a forced dry run");
+    assert_eq!(record["id"], json!(&from_id));
+}
+
+/// The refusal a consumer reads names the check and what it compared, and does
+/// not hand back the override parameter. The parameter belongs to a developer
+/// integrating this runtime; a consumer principal handed its name spends the
+/// next turn retrying with it rather than looking at the two records.
+#[tokio::test]
+async fn merge_guard_refusal_states_what_was_compared_without_naming_the_override() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Quantum Annealing"}),
+        )
+        .await
+        .expect("create into entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Renaissance Painting"}),
+        )
+        .await
+        .expect("create from entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let error = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect_err("dissimilar entity names must be refused");
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected the structured merge-guard error");
+    };
+    let message = error.message();
+    assert!(
+        message.contains("name_similarity") && message.contains("the records' names"),
+        "the refusal must name the check and what it compared; got: {message}"
+    );
+    assert!(
+        !message.contains("force"),
+        "the remedy must not name the developer override; got: {message}"
+    );
+    assert_eq!(
+        error.details().and_then(|details| details.get("compared")),
+        Some("the records' names")
+    );
+    assert!(
+        error
+            .details()
+            .and_then(|details| details.get("override"))
+            .is_none(),
+        "the override key named the parameter and is gone with it"
+    );
+
+    // Control: the same assertion run against a message that does name it would
+    // fail, so the arm above is not passing on an empty string.
+    assert!(
+        "use force=true only when the caller accepts responsibility".contains("force"),
+        "control: the predicate must be able to see the parameter name"
+    );
+}
 
 /// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
 /// If A already has a `competes_with` edge to C, the rewire is a conflict:
@@ -15103,6 +15547,19 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
             "reader_contention.{field} must be a non-negative integer, got {value:?}"
         );
     }
+
+    // The hold attribution is the one field here that is not a counter: it
+    // names the operation behind `max_completed_reader_hold_micros`, or null
+    // when that hold came through a route carrying no operation name (#2793).
+    // Asserted separately because the loop above requires an integer, and a
+    // field left out of both checks is a field that can disappear unnoticed.
+    let attribution = reader_contention
+        .get("max_completed_reader_hold_operation")
+        .expect("reader_contention.max_completed_reader_hold_operation must be in the payload");
+    assert!(
+        attribution.is_null() || attribution.is_string(),
+        "the hold attribution must be an operation name or null, got {attribution:?}"
+    );
 
     let writer_contention = report
         .get("writer_contention")

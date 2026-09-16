@@ -297,6 +297,11 @@ cannot run inside `BEGIN IMMEDIATE`. The shipped code does not persist an outbox
 `pending_reindex` retry record; callers may retry idempotent reindex operations when
 exposed, and durable retry is deferred.
 
+`force=true` suspends the entity merge safety floor. It is a privileged argument: the
+authorization decision belongs to the gate, which receives the call's arguments, and ADR-018
+Amendment 5 states the rule, what it binds, and the audit marker the merge event carries when
+a caller uses it.
+
 ### `merge_note` semantics
 
 Note merge follows the same structure with substrate-specific rules. Notes are

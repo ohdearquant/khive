@@ -87,7 +87,8 @@ pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
 pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
-    entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,
+    entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
+    entity_merge_guard_error, entity_merge_guard_refusal_message, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeEdgeConflictPreimage,
     MergeEdgePreimage, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NotePatch,

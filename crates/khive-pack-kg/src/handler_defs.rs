@@ -633,7 +633,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Natural-key edge collisions return and audit complete edge_conflict_preimages, including annotations cascaded with the dropped edge. Returns {kept_id, removed_id, edges_rewired, edges_contract_skipped, edge_conflict_preimages, properties_merged, tags_unioned, content_appended, dry_run}; \
+        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard and what it compared in details.compared; under dry_run=true the same refusal comes back as a prediction instead, {would_merge: false, refused_by, compared, into_value, from_value, detail}, so a dry run never fails on the floor it exists to predict. Every dry_run response carries would_merge. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Natural-key edge collisions return and audit complete edge_conflict_preimages, including annotations cascaded with the dropped edge. Returns {kept_id, removed_id, edges_rewired, edges_contract_skipped, edge_conflict_preimages, properties_merged, tags_unioned, content_appended, dry_run}; \
                        chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -679,7 +679,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "dry_run",
                 param_type: "boolean",
                 required: false,
-                description: "If true, return the planned summary without mutating records or emitting an event.",
+                description: "If true, return the plan without mutating records or emitting an event: the planned summary with would_merge true, or the safety floor's refusal with would_merge false.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -2127,8 +2127,14 @@ mod tests {
             );
         }
         assert!(
-            h.description.contains("details.guard") && h.description.contains("force=true"),
-            "merge must document structured guard refusal and the responsibility override"
+            h.description.contains("details.guard") && h.description.contains("details.compared"),
+            "merge must document the structured guard refusal and what the guard compared"
+        );
+        // The refusal a dry run predicts is part of the verb's contract, and the
+        // field a caller reads it from has to be named where the caller looks.
+        assert!(
+            h.description.contains("would_merge"),
+            "merge must document that a dry run reports the floor it would hit"
         );
     }
 }
