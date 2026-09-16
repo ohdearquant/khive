@@ -156,25 +156,6 @@ impl GrantRow {
         })
     }
 
-    pub(crate) fn is_active(&self, now: i64, registration: Option<&RegistryPin>) -> bool {
-        let matches_registration = match (
-            self.registry_id.as_deref(),
-            self.definition_digest.as_deref(),
-            registration,
-        ) {
-            (None, None, None) => true,
-            (Some(id), Some(digest), Some(pin)) => {
-                id == pin.registry_id().to_string() && digest == pin.definition_digest()
-            }
-            _ => false,
-        };
-        self.status == "granted"
-            && self.expires_at.is_none_or(|e| e > now)
-            && self.invalidated_by_registry_id.is_none()
-            && self.invalidated_at.is_none()
-            && matches_registration
-    }
-
     pub(crate) fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -226,6 +207,27 @@ pub(crate) async fn list_policies(
         .collect())
 }
 
+/// SQL for `pattern_matches(<col>, ?<param>)`: the pattern stored in `col`
+/// against the bound value.
+///
+/// It compares bytes, because `pattern_matches` does and SQLite's text
+/// functions do not: `LIKE` and `length()` read a TEXT value only up to its
+/// first NUL. A stored `a\0b*` then does not end in `*` and never matches
+/// `a\0bcd`, and tool names are not NUL-free. For a `deny` policy that miss is
+/// fail-open. Every comparison therefore runs on `CAST(.. AS BLOB)`, where
+/// `length()` counts bytes and `substr(x, -1)` is the last byte, and `X'2A'` is
+/// `*`. A lone `*` gets its own arm: `substr` of a zero-length blob is NULL,
+/// not an empty blob, so the prefix arm cannot match an empty value, and
+/// `pattern_matches("*", "")` is true. No LIKE escaping is involved.
+fn pattern_match_sql(col: &str, param: usize) -> String {
+    let pattern = format!("CAST({col} AS BLOB)");
+    let value = format!("CAST(?{param} AS BLOB)");
+    format!(
+        "({pattern} = X'2A' OR {pattern} = {value} OR (substr({pattern}, -1) = X'2A' \
+         AND substr({value}, 1, length({pattern}) - 1) = substr({pattern}, 1, length({pattern}) - 1)))"
+    )
+}
+
 /// Resolve the single deciding policy row for `(actor, tool)` in SQL.
 ///
 /// The match predicate and the ranking both live in the statement, so the
@@ -236,10 +238,10 @@ pub(crate) async fn list_policies(
 /// marker. On an authorization surface that direction is fail-open (#2596).
 ///
 /// `pattern_matches` admits exactly three shapes -- `*`, `prefix*`, and an
-/// exact string -- so the SQL predicate is the same three cases. For a pattern
-/// ending in `*`, `substr(value, 1, length(pattern) - 1)` compared against the
-/// pattern's own prefix is the prefix test without any LIKE escaping; `*`
-/// itself has length 1 and both sides reduce to the empty string.
+/// exact string -- so the SQL predicate is the same three cases, written in
+/// [`pattern_match_sql`]. The specificity rank reads the same bytes: ranked on
+/// text, a NUL-bearing prefix pattern would count as exact and tie with a real
+/// exact row.
 ///
 /// The trailing `created_at ASC, id ASC` is not decoration. Two different
 /// patterns can sum to the same specificity (`lambda:*` with `t.x` against
@@ -256,12 +258,14 @@ pub(crate) async fn select_deciding_policy(
     actor: &str,
     tool: &str,
 ) -> Result<Option<PolicyRow>, RuntimeError> {
-    const MATCHES: &str = "(%COL% = ?%N% OR (%COL% LIKE '%*' \
-         AND substr(?%N%, 1, length(%COL%) - 1) = substr(%COL%, 1, length(%COL%) - 1)))";
-    let actor_match = MATCHES.replace("%COL%", "actor").replace("%N%", "2");
-    let tool_match = MATCHES.replace("%COL%", "tool").replace("%N%", "3");
-    let rank =
-        |col: &str| format!("CASE WHEN {col} = '*' THEN 0 WHEN {col} LIKE '%*' THEN 1 ELSE 2 END");
+    let actor_match = pattern_match_sql("actor", 2);
+    let tool_match = pattern_match_sql("tool", 3);
+    let rank = |col: &str| {
+        format!(
+            "CASE WHEN CAST({col} AS BLOB) = X'2A' THEN 0 \
+             WHEN substr(CAST({col} AS BLOB), -1) = X'2A' THEN 1 ELSE 2 END"
+        )
+    };
     let mut reader = rt.sql().reader().await?;
     let rows = reader
         .query_all(SqlStatement {
@@ -284,6 +288,69 @@ pub(crate) async fn select_deciding_policy(
         })
         .await?;
     Ok(rows.first().and_then(PolicyRow::from_row))
+}
+
+/// Resolve the grant that allows `(actor, tool)`, if any, in SQL.
+///
+/// `decide()` used to read the newest 500 `granted` rows and test each one in
+/// Rust, so an active grant with 500 newer grants in front of it stopped being
+/// honoured and the decision fell through to policy or the default (#2596).
+/// That direction fails closed, and it is still a wrong answer: the caller holds
+/// an approval the decision cannot see. The whole activity test and both
+/// pattern matches are in the statement now, so it returns at most one row and
+/// no cap bounds the rows it considers.
+///
+/// The activity clauses are the former in-memory test, one for one: status
+/// `granted`, unexpired at `now`, not invalidated by a registration, and a pin
+/// that is absent on both the row and the tool or names the tool's current
+/// registry id and definition digest. A row carrying half a pin matches
+/// neither arm.
+///
+/// Newest `requested_at` first is the order the capped read had. `id ASC` is
+/// the final key here and in [`list_grants`], so a timestamp tie resolves the
+/// same way every time and a check cites the grant `tool.requests` lists first.
+pub(crate) async fn select_active_grant(
+    rt: &KhiveRuntime,
+    ns: &str,
+    actor: &str,
+    tool: &str,
+    now: i64,
+    registration: Option<&RegistryPin>,
+) -> Result<Option<GrantRow>, RuntimeError> {
+    let actor_match = pattern_match_sql("actor", 2);
+    let tool_match = pattern_match_sql("tool", 3);
+    let mut params = vec![
+        SqlValue::Text(ns.to_string()),
+        SqlValue::Text(actor.to_string()),
+        SqlValue::Text(tool.to_string()),
+        SqlValue::Integer(now),
+    ];
+    let pinned = match registration {
+        None => "registry_id IS NULL AND definition_digest IS NULL",
+        Some(pin) => {
+            params.push(SqlValue::Text(pin.registry_id().to_string()));
+            params.push(SqlValue::Text(pin.definition_digest().to_string()));
+            "registry_id = ?5 AND definition_digest = ?6"
+        }
+    };
+    let mut reader = rt.sql().reader().await?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT {GRANT_COLUMNS} FROM tool_grants \
+                 WHERE namespace = ?1 AND status = 'granted' \
+                 AND {actor_match} AND {tool_match} \
+                 AND (expires_at IS NULL OR expires_at > ?4) \
+                 AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL \
+                 AND {pinned} \
+                 ORDER BY requested_at DESC, id ASC \
+                 LIMIT 1"
+            ),
+            params,
+            label: Some("tool_grant_decide".into()),
+        })
+        .await?;
+    Ok(rows.first().and_then(GrantRow::from_row))
 }
 
 pub(crate) async fn insert_policy(
@@ -347,7 +414,7 @@ pub(crate) async fn list_grants(
     }
     params.push(SqlValue::Integer(i64::from(limit)));
     sql.push_str(&format!(
-        " ORDER BY requested_at DESC LIMIT ?{}",
+        " ORDER BY requested_at DESC, id ASC LIMIT ?{}",
         params.len()
     ));
     let mut reader = rt.sql().reader().await?;
@@ -597,16 +664,11 @@ pub async fn decide(
     registration: Option<&RegistryPin>,
 ) -> Result<Decision, RuntimeError> {
     let now = now_micros();
-    let grants = list_grants(rt, ns, Some("granted"), None, None, 500).await?;
-    if let Some(g) = grants.iter().find(|g| {
-        g.is_active(now, registration)
-            && pattern_matches(&g.actor, actor)
-            && pattern_matches(&g.tool, tool)
-    }) {
+    if let Some(g) = select_active_grant(rt, ns, actor, tool, now, registration).await? {
         return Ok(Decision {
             decision: "allow".into(),
             source: "grant".into(),
-            grant_id: Some(g.id.clone()),
+            grant_id: Some(g.id),
             policy_id: None,
             expires_at: g.expires_at,
             side_effect: side_effect.map(str::to_string),

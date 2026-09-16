@@ -585,3 +585,164 @@ async fn an_exact_specificity_tie_resolves_to_the_older_row() {
         );
     }
 }
+
+/// #2596, grant side: `decide()` read only the newest 500 `granted` rows, so an
+/// active grant with more than 500 later grants in front of it stopped being
+/// honoured and the check fell through to the default. The grant is resolved
+/// in SQL now, so the row count does not bound what it can see.
+#[tokio::test]
+async fn an_active_grant_still_allows_after_five_hundred_later_grants() {
+    let f = fixture();
+    f.call(
+        "tool.register",
+        json!({"name": "send_mail", "side_effect": "egress"}),
+    )
+    .await;
+    let req = f
+        .call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    let id = s(&req, "request_id");
+    f.call("tool.grant", json!({"id": id})).await;
+    let before = f
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(before["source"], json!("grant"), "{before}");
+    assert_eq!(before["grant_id"], json!(id));
+
+    for i in 0..520 {
+        let filler = f
+            .call(
+                "tool.request",
+                json!({"tool": "other_tool", "actor": format!("agent:filler{i}")}),
+            )
+            .await;
+        f.call("tool.grant", json!({"id": s(&filler, "request_id")}))
+            .await;
+    }
+
+    let after = f
+        .call(
+            "tool.check",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await;
+    assert_eq!(
+        after["decision"],
+        json!("allow"),
+        "the grant must still allow with 520 newer grants in the table: {after}"
+    );
+    assert_eq!(after["source"], json!("grant"));
+    assert_eq!(after["grant_id"], json!(id));
+}
+
+/// Two active grants can allow the same pair. The capped read handed back the
+/// newest request first, and the statement keeps that order, so the check
+/// cites the newer grant on every call.
+#[tokio::test]
+async fn of_two_active_grants_the_newer_request_is_cited() {
+    let f = fixture();
+    f.call(
+        "tool.register",
+        json!({"name": "send_mail", "side_effect": "egress"}),
+    )
+    .await;
+    // Both requests go in before either grant: once one grant is active, a
+    // request for a pair it covers takes the fast path and inserts no row.
+    let older = s(
+        &f.call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:*"}),
+        )
+        .await,
+        "request_id",
+    );
+    let newer = s(
+        &f.call(
+            "tool.request",
+            json!({"tool": "send_mail", "actor": "agent:a"}),
+        )
+        .await,
+        "request_id",
+    );
+    f.call("tool.grant", json!({"id": newer})).await;
+    f.call("tool.grant", json!({"id": older})).await;
+
+    for _ in 0..5 {
+        let checked = f
+            .call(
+                "tool.check",
+                json!({"tool": "send_mail", "actor": "agent:a"}),
+            )
+            .await;
+        assert_eq!(checked["source"], json!("grant"), "{checked}");
+        assert_eq!(
+            checked["grant_id"],
+            json!(newer),
+            "the newer of two active grants must be cited every time: {checked}"
+        );
+    }
+}
+
+/// Patterns match by bytes. SQLite's `LIKE` and `length()` stop reading a TEXT
+/// value at its first NUL, so a predicate written with them read `a\0b*` as
+/// `a`: not a prefix pattern, and no match for `a\0bcd`. A `deny` written that
+/// way stopped applying, and a grant would have stopped allowing.
+#[tokio::test]
+async fn a_nul_bearing_prefix_pattern_matches_by_bytes_for_policies_and_grants() {
+    let f = fixture();
+    let deny = f
+        .call(
+            "tool.policy",
+            json!({"actor": "agent:a", "tool": "a\0b*", "decision": "deny"}),
+        )
+        .await;
+    let denied = f
+        .call("tool.check", json!({"tool": "a\0bcd", "actor": "agent:a"}))
+        .await;
+    assert_eq!(denied["decision"], json!("deny"), "{denied}");
+    assert_eq!(denied["policy_id"], deny["policy"]["id"]);
+    let unmatched = f
+        .call("tool.check", json!({"tool": "a\0xcd", "actor": "agent:a"}))
+        .await;
+    assert_eq!(
+        unmatched["source"],
+        json!("default"),
+        "a different byte after the NUL is outside the prefix: {unmatched}"
+    );
+
+    // The rank reads bytes too: the exact row is more specific than the
+    // prefix row, so it decides even though a deny outranks an allow on a tie.
+    let exact = f
+        .call(
+            "tool.policy",
+            json!({"actor": "agent:a", "tool": "a\0bcd", "decision": "allow"}),
+        )
+        .await;
+    let ranked = f
+        .call("tool.check", json!({"tool": "a\0bcd", "actor": "agent:a"}))
+        .await;
+    assert_eq!(ranked["decision"], json!("allow"), "{ranked}");
+    assert_eq!(ranked["policy_id"], exact["policy"]["id"]);
+
+    let id = s(
+        &f.call("tool.request", json!({"tool": "a\0b*", "actor": "agent:b"}))
+            .await,
+        "request_id",
+    );
+    f.call("tool.grant", json!({"id": id})).await;
+    let allowed = f
+        .call("tool.check", json!({"tool": "a\0bcd", "actor": "agent:b"}))
+        .await;
+    assert_eq!(allowed["source"], json!("grant"), "{allowed}");
+    assert_eq!(allowed["grant_id"], json!(id));
+    let not_allowed = f
+        .call("tool.check", json!({"tool": "a\0xcd", "actor": "agent:b"}))
+        .await;
+    assert_eq!(not_allowed["source"], json!("default"), "{not_allowed}");
+}
