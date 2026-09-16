@@ -97,7 +97,14 @@ Superseded candidates are suppressed by inbound `supersedes` graph edges, with t
 Every completed recall taking at least ten seconds emits the unconditional
 `memory.recall exceeded slow-request threshold` warning. Alongside total and
 result-shape metadata it always names `embed_ms`, `fts_ms`, `ann_ms`,
-`fresh_tail_ms`, and `hydrate_ms`; no profiling environment flag is required.
+`fresh_tail_ms`, and `hydrate_ms`, each paired with a boolean `*_attempted`;
+no profiling environment flag is required. A false flag means the stage was not
+entered, and its milliseconds field remains zero for compatibility. A true flag
+with zero milliseconds means the stage ran in under one millisecond (including
+an immediate return); it does not imply that the stage found candidates or
+succeeded without degradation. No-model recall skips embedding and ANN; the exact
+sqlite-vec route is included in ANN time and skips fresh-tail. If any concurrent
+model or sequential widening round enters a stage, its attempted flag is true.
 The fields are wall-time attribution, not an additive critical path: FTS and
 the vector arm run concurrently, and concurrent embedding models contribute
 the maximum ANN and fresh-tail duration. Sequential handler-level widening
