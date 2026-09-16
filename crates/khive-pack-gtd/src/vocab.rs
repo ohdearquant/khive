@@ -224,7 +224,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
     // Declaration: declares a task done or cancelled
     HandlerDef {
         name: "gtd.complete",
-        description: "Mark a task done (or cancelled) with an optional result note",
+        description: "Mark a task done (or cancelled) with an optional result note. Done requires \
+                      ready dependencies unless ignore_dependencies=true is explicit; cancellation \
+                      remains available while dependencies are unresolved.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -249,6 +251,16 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "string",
                 required: false,
                 description: "Terminal status: \"done\" (default) or \"cancelled\".",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "ignore_dependencies",
+                param_type: "boolean",
+                required: false,
+                description: "Default false. Explicit true permits completion to done despite \
+                              blocked or broken dependencies, including cancelled, deleted, missing \
+                              or invalid blockers. Other lifecycle validation still applies. \
+                              Cancellation and nonterminal moves do not require this argument.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -340,7 +352,9 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
     // Declaration: changes task lifecycle status
     HandlerDef {
         name: "gtd.transition",
-        description: "Explicit GTD status transition with lifecycle validation",
+        description: "Explicit GTD status transition with lifecycle validation. Moving to done \
+                      requires ready dependencies unless ignore_dependencies=true is explicit; \
+                      cancellation remains available while dependencies are unresolved.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -367,6 +381,16 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "string",
                 required: false,
                 description: "Optional note to attach to the transition.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "ignore_dependencies",
+                param_type: "boolean",
+                required: false,
+                description: "Default false. Explicit true permits completion to done despite \
+                              blocked or broken dependencies, including cancelled, deleted, missing \
+                              or invalid blockers. Other lifecycle validation still applies. \
+                              Cancellation and nonterminal moves do not require this argument.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

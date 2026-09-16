@@ -43,6 +43,55 @@ impl TaskDependencyDiagnostic {
     }
 }
 
+pub(crate) async fn ensure_completion_dependencies_ready(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    task: &Note,
+    target: &str,
+    ignore_dependencies: bool,
+) -> Result<(), RuntimeError> {
+    if target != "done" || ignore_dependencies {
+        return Ok(());
+    }
+    let diagnostic = diagnose_tasks(runtime, token, std::slice::from_ref(task))
+        .await?
+        .pop()
+        .expect("one diagnostic for one task");
+    if diagnostic.is_ready() {
+        return Ok(());
+    }
+    let mut ids: Vec<String> = diagnostic
+        .blocked_by
+        .iter()
+        .filter_map(|blocker| blocker.get("id"))
+        .map(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| id.to_string())
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let blocked_by = json!(diagnostic.blocked_by).to_string();
+    Err(khive_types::KhiveError::conflict(format!(
+        "dependency_blocked: task {} cannot become done: dependencies are {} ({blocked_by}). \
+         Dependencies must be live tasks in the same namespace with status done; cancelled or \
+         invalid dependencies do not establish completed work. Resolve the blockers, edit \
+         properties.depends_on, or explicitly pass ignore_dependencies=true",
+        task.id, diagnostic.state,
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "dependency_blocked".into()),
+        ("task_id", task.id.to_string()),
+        ("target_status", target.to_owned()),
+        ("dependency_state", diagnostic.state.to_owned()),
+        ("dependency_ids", ids.join(",")),
+        ("dependency_count", ids.len().to_string()),
+        ("blocked_by", blocked_by),
+    ]))
+    .into())
+}
+
 pub(crate) async fn diagnose_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,

@@ -38,22 +38,20 @@ without silently claiming a complete audit trail.
 
 ## Same-status rows: canonical and atomic behavior
 
-A `gtd.transition` call where `current == target` normally writes no audit
-row — an idempotent no-op is not a lifecycle event. On canonical dispatch, a
-no-op that carries a caller-supplied `note` is the exception: the note is
-persisted to `properties.transition_note` (last-write-wins), and a same-status
-audit row (`from_state == to_state`) is attempted so each overwritten note can
-keep a durable trail. Its response carries `note_recorded` and, when the note
-write wins, `audit_persisted`. Consumers counting or replaying *real*
-transitions must therefore filter `from_state != to_state`; same-status rows
-are note events, not lifecycle changes.
+A `gtd.transition` call where `current == target` writes neither a task change nor
+an audit row, including when a caller supplies `note`. Canonical dispatch returns
+`note_recorded=false` for a supplied note. Atomic v1 also carries a guarded
+no-effect assertion that revalidates the prepare snapshot during commit.
 
-ADR-099 atomic v1 encodes every same-status transition as a guarded no-effect
-assertion, including calls that supplied `note`. The assertion revalidates the
-prepare snapshot inside the commit transaction, while the call still returns
-the base no-op shape, persists neither the note nor an audit row, and omits
-both status fields. Call canonical `gtd.transition` when a same-status note
-must be recorded.
+## Dependency refusals and explicit override
+
+Shared `prepare_complete` and `prepare_transition` check dependency readiness only
+for transitions to `done`, before preparing any lifecycle mutation or audit effect.
+Both canonical and atomic adapters forward the published `ignore_dependencies`
+boolean, default false. Refusals preserve the task and create no audit row;
+successful overrides retain the normal lifecycle audit behavior. Cancellation is
+permitted with unresolved dependencies. See [the dependency contract](../design.md#completion-dependencies)
+for the preparation-time scope and error details.
 
 ## `CompleteParams` / `TransitionParams` — `pub` structs, private fields
 

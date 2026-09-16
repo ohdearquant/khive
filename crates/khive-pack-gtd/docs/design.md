@@ -102,6 +102,33 @@
   `active`, `waiting`, and `someday` may all move directly to `done` or `cancelled`.
   `done` and `cancelled` remain permanently terminal.
 
+### Completion dependencies
+
+`gtd.complete` and `gtd.transition` to `done` (including the `finished` alias)
+require the existing `properties.depends_on` diagnostic to be `ready`. An open
+blocker is `blocked`; a cancelled, missing, deleted, wrong-kind, foreign-namespace
+or invalid dependency is `broken`. Both states refuse completion before changing
+the task or appending a lifecycle audit record. Cancellation remains legal while
+dependencies are unresolved, as do nonterminal moves and same-status assertions.
+
+Both verbs publish `ignore_dependencies` (boolean, default false). Explicit `true`
+skips this dependency check while preserving status, secret, and task snapshot
+validation. A task whose blocker was cancelled cannot be completed until
+`properties.depends_on` is edited or the override is passed.
+
+The conflict error has `reason=dependency_blocked`, `task_id`, `target_status`,
+`dependency_state`, `dependency_ids` (comma-joined unresolved identifiers),
+`dependency_count`, and `blocked_by` (JSON-encoded diagnostics). Details values are
+strings. The message includes the blocker identifiers, diagnostic state and the
+`ignore_dependencies=true` escape.
+
+Canonical and atomic execution share the guard in `prepare_complete` and
+`prepare_transition`. This is a preparation-time check: dependencies are not
+revalidated by the conditional write, and atomic preparation does not project
+prior operations in the unit. Complete an open blocker in an earlier request
+before preparing its dependent. The task's own revision/deletion/status guard
+continues to protect the resulting write.
+
 ### Atomic transition
 
 - Both `complete()` and `transition()` use a conditional SQL UPDATE with a

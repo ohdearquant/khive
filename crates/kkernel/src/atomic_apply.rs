@@ -1294,10 +1294,22 @@ async fn prepare_gtd_transition(
         .and_then(|o| o.get("note"))
         .and_then(|v| v.as_str());
 
-    let decision =
-        khive_pack_gtd::handlers::prepare_transition(runtime, token, raw_id, raw_status, note_arg)
-            .await
-            .map_err(anyhow::Error::new)?;
+    let ignore_dependencies = args
+        .get("ignore_dependencies")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let decision = khive_pack_gtd::handlers::prepare_transition(
+        runtime,
+        token,
+        raw_id,
+        raw_status,
+        note_arg,
+        khive_pack_gtd::handlers::DependencyOptions {
+            ignore_dependencies,
+        },
+    )
+    .await
+    .map_err(anyhow::Error::new)?;
 
     match decision {
         khive_pack_gtd::handlers::TransitionDecision::NoOp { note, current, .. } => {
@@ -1364,10 +1376,22 @@ async fn prepare_gtd_complete(
         .and_then(|o| o.get("result"))
         .and_then(|v| v.as_str());
 
-    let decision =
-        khive_pack_gtd::handlers::prepare_complete(runtime, token, raw_id, status_arg, result_arg)
-            .await
-            .map_err(anyhow::Error::new)?;
+    let ignore_dependencies = args
+        .get("ignore_dependencies")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let decision = khive_pack_gtd::handlers::prepare_complete(
+        runtime,
+        token,
+        raw_id,
+        status_arg,
+        result_arg,
+        khive_pack_gtd::handlers::DependencyOptions {
+            ignore_dependencies,
+        },
+    )
+    .await
+    .map_err(anyhow::Error::new)?;
 
     let statement = khive_pack_gtd::handlers::gtd_transition_statement(
         &decision.note,
@@ -2737,6 +2761,202 @@ mod tests {
             Some("done"),
             "the \"finished\" alias must normalize to \"done\", parity with canonical"
         );
+    }
+
+    async fn seed_dependency_pair(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        blocker_status: &str,
+    ) -> (Uuid, Uuid) {
+        let store = runtime.notes(token).unwrap();
+        let blocker_id = seed_task(runtime, token, blocker_status).await;
+        let task_id = seed_task(runtime, token, "next").await;
+        let mut task = store.get_note(task_id).await.unwrap().unwrap();
+        task.properties.as_mut().unwrap()["depends_on"] = json!([blocker_id.to_string()]);
+        store.upsert_note(task).await.unwrap();
+        (blocker_id, task_id)
+    }
+
+    async fn dependency_audit_count(runtime: &KhiveRuntime, task_id: Uuid) -> i64 {
+        ensure_audit_schema(runtime).await;
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT COUNT(*) AS count FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+                params: vec![SqlValue::Text(task_id.to_string())],
+                label: None,
+            })
+            .await
+            .unwrap();
+        let Some(SqlValue::Integer(count)) = rows[0].get("count") else {
+            panic!("audit count must be an integer");
+        };
+        *count
+    }
+
+    #[tokio::test]
+    async fn dependency_completion_atomic_prepare_refuses_before_writes() {
+        for verb in ["gtd.complete", "gtd.transition"] {
+            let runtime = scratch_runtime();
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            let registry = full_registry(&runtime);
+            let store = runtime.notes(&token).unwrap();
+            let (blocker_id, task_id) = seed_dependency_pair(&runtime, &token, "next").await;
+            let before = store.get_note(task_id).await.unwrap().unwrap();
+            assert_eq!(dependency_audit_count(&runtime, task_id).await, 0);
+            let error = prepare_one(
+                &runtime,
+                &token,
+                &registry,
+                verb,
+                &json!({"id": task_id.to_string(), "status": "done"}),
+            )
+            .await
+            .expect_err("blocked preparation");
+            let message = error.to_string();
+            assert!(message.contains(&blocker_id.to_string()));
+            assert!(message.contains("ignore_dependencies=true"));
+            let Some(khive_runtime::RuntimeError::Khive(error)) =
+                error.downcast_ref::<khive_runtime::RuntimeError>()
+            else {
+                panic!("structured dependency error must survive atomic prepare: {error:?}");
+            };
+            assert_eq!(error.kind(), khive_types::ErrorKind::Conflict);
+            let details = error.details().unwrap();
+            assert_eq!(details.get("reason"), Some("dependency_blocked"));
+            assert_eq!(
+                details.get("dependency_ids"),
+                Some(blocker_id.to_string().as_str())
+            );
+            assert_eq!(store.get_note(task_id).await.unwrap().unwrap(), before);
+            assert_eq!(dependency_audit_count(&runtime, task_id).await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_completion_atomic_override_is_audited() {
+        for verb in ["gtd.complete", "gtd.transition"] {
+            let runtime = scratch_runtime();
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            let registry = full_registry(&runtime);
+            let store = runtime.notes(&token).unwrap();
+            let (_, task_id) = seed_dependency_pair(&runtime, &token, "next").await;
+            let mut args =
+                json!({"id": task_id.to_string(), "status": "done", "ignore_dependencies": "true"});
+            assert!(prepare_one(&runtime, &token, &registry, verb, &args)
+                .await
+                .is_err());
+            args["ignore_dependencies"] = json!(true);
+            let (plan, _) = prepare_one(&runtime, &token, &registry, verb, &args)
+                .await
+                .unwrap();
+            let outcome =
+                khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                    .await
+                    .unwrap();
+            let AtomicRunOutcome::Committed { post_commit } = outcome else {
+                panic!("expected committed override, got {outcome:?}");
+            };
+            let audit = apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
+            assert_eq!(audit.get(&task_id), Some(&true));
+            assert_eq!(dependency_audit_count(&runtime, task_id).await, 1);
+            let mut reader = runtime.sql().reader().await.unwrap();
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit WHERE note_id = ?1"
+                        .into(),
+                    params: vec![SqlValue::Text(task_id.to_string())],
+                    label: None,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                rows[0].get("from_state"),
+                Some(SqlValue::Text(value)) if value == "next"
+            ));
+            assert!(matches!(
+                rows[0].get("to_state"),
+                Some(SqlValue::Text(value)) if value == "done"
+            ));
+            drop(reader);
+            let after = store.get_note(task_id).await.unwrap().unwrap();
+            assert_eq!(task_properties(&after)["status"], "done");
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_completion_atomic_cancellation_and_ready_controls() {
+        for verb in ["gtd.complete", "gtd.transition"] {
+            for (blocker_status, target) in [("next", "cancelled"), ("done", "done")] {
+                let runtime = scratch_runtime();
+                let token = runtime.authorize(Namespace::local()).unwrap();
+                let registry = full_registry(&runtime);
+                let (_, task_id) = seed_dependency_pair(&runtime, &token, blocker_status).await;
+                let (plan, _) = prepare_one(
+                    &runtime,
+                    &token,
+                    &registry,
+                    verb,
+                    &json!({"id": task_id.to_string(), "status": target}),
+                )
+                .await
+                .unwrap();
+                let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+                    runtime.sql().as_ref(),
+                    vec![plan],
+                )
+                .await
+                .unwrap();
+                assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+                let after = runtime
+                    .notes(&token)
+                    .unwrap()
+                    .get_note(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task_properties(&after)["status"], target);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_completion_atomic_guard_uses_preparation_time_readiness() {
+        let runtime = scratch_runtime();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let registry = full_registry(&runtime);
+        let (blocker_id, task_id) = seed_dependency_pair(&runtime, &token, "done").await;
+        let (delete, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "delete",
+            &json!({"id": blocker_id.to_string(), "hard": true}),
+        )
+        .await
+        .unwrap();
+        let (complete, _) = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "gtd.complete",
+            &json!({"id": task_id.to_string()}),
+        )
+        .await
+        .unwrap();
+
+        // Readiness is an admission check; commit revalidates only the task snapshot.
+        let outcome = khive_runtime::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![delete, complete],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+        let store = runtime.notes(&token).unwrap();
+        assert!(store.get_note(blocker_id).await.unwrap().is_none());
+        let after = store.get_note(task_id).await.unwrap().unwrap();
+        assert_eq!(task_properties(&after)["status"], "done");
     }
 
     /// GAP-6 (ADR-099 B3): an idempotent atomic `gtd.transition` (current ==

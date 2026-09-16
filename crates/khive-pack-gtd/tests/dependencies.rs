@@ -2365,3 +2365,370 @@ async fn create_task_with_visible_only_dependency_is_rejected_and_persists_no_lo
             .collect::<Vec<_>>()
     );
 }
+
+fn assert_dependency_refusal(error: khive_runtime::RuntimeError, blocker_id: &str, state: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains(blocker_id),
+        "blocker ID missing: {message}"
+    );
+    assert!(
+        message.contains(state),
+        "dependency state missing: {message}"
+    );
+    assert!(
+        message.contains("ignore_dependencies=true"),
+        "override missing: {message}"
+    );
+    let khive_runtime::RuntimeError::Khive(error) = error else {
+        panic!("expected structured dependency refusal, got {error:?}");
+    };
+    assert_eq!(error.kind(), khive_types::ErrorKind::Conflict);
+    let details = error.details().expect("dependency details");
+    assert_eq!(details.get("reason"), Some("dependency_blocked"));
+    assert_eq!(details.get("dependency_state"), Some(state));
+    assert_eq!(details.get("dependency_ids"), Some(blocker_id));
+    assert_eq!(details.get("dependency_count"), Some("1"));
+}
+
+async fn dependency_audit_count(runtime: &khive_runtime::KhiveRuntime, task_id: &str) -> i64 {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    khive_pack_gtd::handlers::ensure_audit_schema(runtime).await;
+    let mut reader = runtime.sql().reader().await.unwrap();
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COUNT(*) AS count FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            params: vec![SqlValue::Text(task_id.to_owned())],
+            label: None,
+        })
+        .await
+        .unwrap();
+    let Some(SqlValue::Integer(count)) = rows[0].get("count") else {
+        panic!("audit count must be an integer");
+    };
+    *count
+}
+
+#[tokio::test]
+async fn dependency_completion_refusal_preserves_task_and_keeps_dependents_blocked() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let store = runtime.notes(&token).unwrap();
+    let blocker = assign(
+        &pack,
+        json!({"title": "open prerequisite", "status": "next"}),
+    )
+    .await;
+    let task = assign(
+        &pack,
+        json!({"title": "blocked task", "status": "active",
+        "depends_on": [blocker["full_id"]]}),
+    )
+    .await;
+    let child = assign(
+        &pack,
+        json!({"title": "downstream task", "status": "next",
+        "depends_on": [task["full_id"]]}),
+    )
+    .await;
+    let id = task["full_id"].as_str().unwrap();
+    let task_id = uuid::Uuid::parse_str(id).unwrap();
+    let before = store.get_note(task_id).await.unwrap().unwrap();
+    assert_eq!(dependency_audit_count(&runtime, id).await, 0);
+    let error = pack
+        .dispatch("gtd.complete", json!({"id": id, "result": "finished work"}))
+        .await
+        .unwrap_err();
+    assert_dependency_refusal(error, blocker["full_id"].as_str().unwrap(), "blocked");
+    assert_eq!(
+        store.get_note(task_id).await.unwrap().unwrap(),
+        before,
+        "refusal must preserve status, version, revision and properties"
+    );
+    assert_eq!(dependency_audit_count(&runtime, id).await, 0);
+    let diagnostics = pack
+        .dispatch("gtd.next", json!({"include_blocked": true}))
+        .await
+        .unwrap();
+    let downstream = diagnostics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["full_id"] == child["full_id"])
+        .unwrap();
+    assert_eq!(downstream["dependency_state"], "blocked");
+    assert_eq!(downstream["blocked_by"][0]["id"], task["full_id"]);
+}
+
+#[tokio::test]
+async fn dependency_completion_blocked_cancellation_stays_legal() {
+    for verb in ["gtd.complete", "gtd.transition"] {
+        let runtime = rt();
+        let pack = pack(runtime.clone());
+        let blocker = assign(
+            &pack,
+            json!({"title": "open prerequisite", "status": "next"}),
+        )
+        .await;
+        let task = assign(
+            &pack,
+            json!({"title": "abandoned task", "status": "next",
+            "depends_on": [blocker["full_id"]]}),
+        )
+        .await;
+        let response = pack
+            .dispatch(verb, json!({"id": task["full_id"], "status": "cancelled"}))
+            .await
+            .unwrap();
+        assert_eq!(response["to"], "cancelled");
+        assert_eq!(response["audit_persisted"], true);
+        assert_eq!(
+            dependency_audit_count(&runtime, task["full_id"].as_str().unwrap()).await,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn dependency_completion_done_blocker_and_nonterminal_moves_stay_legal() {
+    let pack = pack(rt());
+    let blocker = assign(&pack, json!({"title": "prerequisite", "status": "next"})).await;
+    let task = assign(
+        &pack,
+        json!({"title": "work", "depends_on": [blocker["full_id"]]}),
+    )
+    .await;
+    pack.dispatch(
+        "gtd.transition",
+        json!({"id": task["full_id"], "status": "next"}),
+    )
+    .await
+    .unwrap();
+    let noop = pack
+        .dispatch(
+            "gtd.transition",
+            json!({"id": task["full_id"], "status": "next"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(noop["transitioned"], false);
+    pack.dispatch("gtd.complete", json!({"id": blocker["full_id"]}))
+        .await
+        .unwrap();
+    let complete = pack
+        .dispatch("gtd.complete", json!({"id": task["full_id"]}))
+        .await
+        .unwrap();
+    assert_eq!(complete["to"], "done");
+}
+
+async fn assert_broken_completion_refused(broken: &str) {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let blocker = assign(&pack, json!({"title": "prerequisite", "status": "next"})).await;
+    let task = assign(
+        &pack,
+        json!({"title": "blocked", "depends_on": [blocker["full_id"]]}),
+    )
+    .await;
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let store = runtime.notes(&token).unwrap();
+    let blocker_id = uuid::Uuid::parse_str(blocker["full_id"].as_str().unwrap()).unwrap();
+    let task_id = uuid::Uuid::parse_str(task["full_id"].as_str().unwrap()).unwrap();
+    match broken {
+        "cancelled" => {
+            pack.dispatch(
+                "gtd.complete",
+                json!({"id": blocker["full_id"], "status": "cancelled"}),
+            )
+            .await
+            .unwrap();
+        }
+        "soft_deleted" | "missing" => {
+            store
+                .delete_note(
+                    blocker_id,
+                    if broken == "missing" {
+                        khive_storage::DeleteMode::Hard
+                    } else {
+                        khive_storage::DeleteMode::Soft
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        "wrong_kind" | "different_namespace" => {
+            let mut blocker = store.get_note(blocker_id).await.unwrap().unwrap();
+            if broken == "wrong_kind" {
+                blocker.kind = "observation".into();
+            } else {
+                blocker.namespace = "other".into();
+            }
+            store.upsert_note(blocker).await.unwrap();
+        }
+        "invalid" => {
+            let mut task = store.get_note(task_id).await.unwrap().unwrap();
+            task.properties.as_mut().unwrap()["depends_on"] = json!(["invalid-dependency"]);
+            store.upsert_note(task).await.unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let before = store.get_note(task_id).await.unwrap().unwrap();
+    let id = task["full_id"].as_str().unwrap();
+    assert_eq!(dependency_audit_count(&runtime, id).await, 0);
+    let error = pack
+        .dispatch("gtd.complete", json!({"id": id}))
+        .await
+        .unwrap_err();
+    assert_dependency_refusal(
+        error,
+        if broken == "invalid" {
+            "invalid-dependency"
+        } else {
+            blocker["full_id"].as_str().unwrap()
+        },
+        "broken",
+    );
+    assert_eq!(store.get_note(task_id).await.unwrap().unwrap(), before);
+    assert_eq!(dependency_audit_count(&runtime, id).await, 0);
+}
+
+#[tokio::test]
+async fn dependency_completion_cancelled_blocker_is_refused_without_mutation() {
+    assert_broken_completion_refused("cancelled").await;
+}
+
+#[tokio::test]
+async fn dependency_completion_missing_blocker_is_refused_without_mutation() {
+    assert_broken_completion_refused("missing").await;
+}
+
+#[tokio::test]
+async fn dependency_completion_other_broken_blockers_are_refused_without_mutation() {
+    for broken in [
+        "soft_deleted",
+        "wrong_kind",
+        "different_namespace",
+        "invalid",
+    ] {
+        assert_broken_completion_refused(broken).await;
+    }
+}
+
+#[tokio::test]
+async fn dependency_completion_override_is_explicit_and_audited() {
+    for (verb, target) in [("gtd.complete", "done"), ("gtd.transition", "finished")] {
+        let runtime = rt();
+        let pack = pack(runtime.clone());
+        let blocker = assign(&pack, json!({"title": "open blocker", "status": "next"})).await;
+        let task = assign(
+            &pack,
+            json!({"title": "override target", "depends_on": [blocker["full_id"]]}),
+        )
+        .await;
+        let args = json!({"id": task["full_id"], "status": target, "ignore_dependencies": false});
+        let error = pack.dispatch(verb, args.clone()).await.unwrap_err();
+        assert_dependency_refusal(error, blocker["full_id"].as_str().unwrap(), "blocked");
+        let mut malformed = args.clone();
+        malformed["ignore_dependencies"] = json!("true");
+        assert!(
+            pack.dispatch(verb, malformed).await.is_err(),
+            "override must be a boolean"
+        );
+        let mut explicit = args;
+        explicit["ignore_dependencies"] = json!(true);
+        let response = pack.dispatch(verb, explicit).await.unwrap();
+        assert_eq!(response["to"], "done");
+        assert_eq!(response["audit_persisted"], true);
+        assert_eq!(
+            dependency_audit_count(&runtime, task["full_id"].as_str().unwrap()).await,
+            1
+        );
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let rows = reader
+            .query_all(khive_storage::SqlStatement {
+                sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit WHERE note_id = ?1"
+                    .into(),
+                params: vec![khive_storage::SqlValue::Text(
+                    task["full_id"].as_str().unwrap().to_owned(),
+                )],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rows[0].get("from_state"),
+            Some(khive_storage::SqlValue::Text(value)) if value == "inbox"
+        ));
+        assert!(matches!(
+            rows[0].get("to_state"),
+            Some(khive_storage::SqlValue::Text(value)) if value == "done"
+        ));
+        drop(reader);
+        assert!(
+            pack.dispatch(
+                "gtd.transition",
+                json!({"id": task["full_id"], "status": "inbox", "ignore_dependencies": true})
+            )
+            .await
+            .is_err(),
+            "override cannot reopen terminal work"
+        );
+        let untouched = pack
+            .dispatch("get", json!({"id": blocker["full_id"]}))
+            .await
+            .unwrap();
+        assert_eq!(untouched["properties"]["status"], "next");
+    }
+}
+
+#[tokio::test]
+async fn dependency_completion_transition_done_refuses_but_cancelled_succeeds() {
+    for target in ["done", "finished"] {
+        let runtime = rt();
+        let pack = pack(runtime.clone());
+        let blocker = assign(&pack, json!({"title": "open blocker", "status": "next"})).await;
+        let task = assign(
+            &pack,
+            json!({"title": "blocked", "depends_on": [blocker["full_id"]]}),
+        )
+        .await;
+        let token = runtime
+            .authorize(khive_runtime::Namespace::local())
+            .unwrap();
+        let store = runtime.notes(&token).unwrap();
+        let task_id = uuid::Uuid::parse_str(task["full_id"].as_str().unwrap()).unwrap();
+        let before = store.get_note(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            dependency_audit_count(&runtime, task["full_id"].as_str().unwrap()).await,
+            0
+        );
+        let error = pack
+            .dispatch(
+                "gtd.transition",
+                json!({"id": task["full_id"], "status": target, "note": "finished work"}),
+            )
+            .await
+            .unwrap_err();
+        assert_dependency_refusal(error, blocker["full_id"].as_str().unwrap(), "blocked");
+        assert_eq!(store.get_note(task_id).await.unwrap().unwrap(), before);
+        assert_eq!(
+            dependency_audit_count(&runtime, task["full_id"].as_str().unwrap()).await,
+            0
+        );
+        let response = pack
+            .dispatch(
+                "gtd.transition",
+                json!({"id": task["full_id"], "status": "cancelled"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["to"], "cancelled");
+    }
+}
