@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use khive_runtime::{
     entity_merge_guard_compared_values, entity_merge_guard_error,
-    entity_merge_guard_refusal_message, validate_entity_merge_floor, NamespaceToken, RuntimeError,
-    VerbRegistry,
+    entity_merge_guard_refusal_message, validate_entity_merge_floor, KhiveRuntime, NamespaceToken,
+    RuntimeError, VerbRegistry,
 };
 
 use super::common::{
@@ -47,6 +47,30 @@ async fn diagnose_private_merge<T>(
             Err(original)
         }
         other => other,
+    }
+}
+
+/// The refusal for an omitted-kind operand that resolves to nothing.
+///
+/// There is no substrate to name, so the refusal is the id alone, with one
+/// exception that is a fact about a record rather than a default: an entity an
+/// earlier merge consumed. The runtime's entity lookup names the id it was merged
+/// into, which is the caller's next step, and omitting `kind` must not cost the
+/// caller a pointer that naming `kind="entity"` would have kept.
+async fn unresolvable_merge_operand(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+) -> RuntimeError {
+    match runtime.get_entity_including_deleted(token, id).await {
+        Ok(Some(tombstone)) if tombstone.merged_into.is_some() => {
+            match runtime.get_entity(token, id).await {
+                Err(redirect) => redirect,
+                Ok(_) => RuntimeError::NotFound(id.to_string()),
+            }
+        }
+        Ok(_) => RuntimeError::NotFound(id.to_string()),
+        Err(error) => error,
     }
 }
 
@@ -114,17 +138,23 @@ impl KgPack {
                         }
                         into_spec
                     }
-                    // Inference answers only when an id resolves to a record. When
-                    // one does not, the historical "entity" default stands and the
-                    // ordinary lookup below produces the refusal it always
-                    // produced, in the order it always produced it: a missing
-                    // `into_id` is reported before `from_id` is considered at all,
-                    // which `khive-pack-knowledge`'s issue-558 arms pin. A refusal
-                    // about an id that resolves to nothing names no substrate the
-                    // caller can act on, so changing its wording is a separate
-                    // decision from this one.
-                    (Err(RuntimeError::NotFound(_)), _) | (_, Err(RuntimeError::NotFound(_))) => {
-                        resolve_kind_spec("entity", registry)?
+                    // An id that resolves to nothing has no substrate, so the
+                    // refusal names none (an entity a merge consumed still names
+                    // the id it was merged into; see `unresolvable_merge_operand`).
+                    // The historical default answered "entity <id>" here, which is the default's fingerprint rather than a
+                    // fact about a record, and it sent a caller merging two notes
+                    // looking for entities that never existed.
+                    //
+                    // `into_id` is still reported before `from_id` is considered,
+                    // which `khive-pack-knowledge`'s issue-558 arms pin: a caller
+                    // whose first id is wrong hears about that one. The ids are the
+                    // resolved uuids because the parameter accepts a hex prefix,
+                    // and the id the lookup used is the fact worth naming.
+                    (Err(RuntimeError::NotFound(_)), _) => {
+                        return Err(unresolvable_merge_operand(&self.runtime, token, into_id).await)
+                    }
+                    (_, Err(RuntimeError::NotFound(_))) => {
+                        return Err(unresolvable_merge_operand(&self.runtime, token, from_id).await)
                     }
                     (Err(error), _) | (_, Err(error)) => return Err(error),
                 }
