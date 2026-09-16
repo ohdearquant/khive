@@ -114,17 +114,22 @@ impl KgPack {
                         }
                         into_spec
                     }
-                    // Inference answers only when an id resolves to a record. When
-                    // one does not, the historical "entity" default stands and the
-                    // ordinary lookup below produces the refusal it always
-                    // produced, in the order it always produced it: a missing
-                    // `into_id` is reported before `from_id` is considered at all,
-                    // which `khive-pack-knowledge`'s issue-558 arms pin. A refusal
-                    // about an id that resolves to nothing names no substrate the
-                    // caller can act on, so changing its wording is a separate
-                    // decision from this one.
-                    (Err(RuntimeError::NotFound(_)), _) | (_, Err(RuntimeError::NotFound(_))) => {
-                        resolve_kind_spec("entity", registry)?
+                    // An id that resolves to nothing has no substrate, so the
+                    // refusal names none. The historical default answered "entity
+                    // <id>" here, which is the default's fingerprint rather than a
+                    // fact about a record, and it sent a caller merging two notes
+                    // looking for entities that never existed.
+                    //
+                    // `into_id` is still reported before `from_id` is considered,
+                    // which `khive-pack-knowledge`'s issue-558 arms pin: a caller
+                    // whose first id is wrong hears about that one. The ids are the
+                    // resolved uuids because the parameter accepts a hex prefix,
+                    // and the id the lookup used is the fact worth naming.
+                    (Err(RuntimeError::NotFound(_)), _) => {
+                        return Err(RuntimeError::NotFound(into_id.to_string()))
+                    }
+                    (_, Err(RuntimeError::NotFound(_))) => {
+                        return Err(RuntimeError::NotFound(from_id.to_string()))
                     }
                     (Err(error), _) | (_, Err(error)) => return Err(error),
                 }

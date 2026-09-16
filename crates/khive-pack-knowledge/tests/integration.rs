@@ -6111,7 +6111,13 @@ async fn issue_558_merge_missing_and_validation_errors_unchanged() {
     ] {
         let is_note = matches!(kind, Some("note" | "observation"));
         let ordinary = if is_note { &note } else { &entity };
-        let expected = if is_note {
+        // With `kind` omitted there is no substrate to name: the id resolved to
+        // nothing, so the refusal is the id (#2858). The explicit-kind arms are
+        // unchanged, and they are what keeps this a message decision rather than
+        // a change to which side is reported.
+        let expected = if kind.is_none() {
+            missing.to_string()
+        } else if is_note {
             "not found in this namespace".into()
         } else {
             format!("entity {missing}")

@@ -7197,13 +7197,13 @@ async fn merge_across_substrates_with_kind_omitted_names_both_sides() {
     );
 }
 
-/// An id that resolves to nothing has no substrate to infer, so the omitted-kind
-/// path keeps the historical entity refusal rather than reporting the inference's
-/// own miss. `khive-pack-knowledge`'s issue-558 arms pin this exact message and
-/// this exact ordering across the pack boundary, and a change to it belongs to
-/// whoever decides that contract, not to this one.
+/// An id that resolves to nothing has no substrate, so the refusal names none.
+/// The old answer, "entity <id>", was the omitted-kind default's fingerprint
+/// rather than a fact about a record: it sent a caller merging two notes looking
+/// for entities that had never existed. `khive-pack-knowledge`'s issue-558 arms
+/// pin the ordering this keeps, and that suite moves with this change.
 #[tokio::test]
-async fn merge_with_kind_omitted_keeps_the_historical_refusal_for_an_id_that_resolves_to_nothing() {
+async fn merge_with_kind_omitted_refuses_an_unresolvable_id_without_naming_a_substrate() {
     let pack = pack();
     let present = pack
         .dispatch(
@@ -7216,46 +7216,74 @@ async fn merge_with_kind_omitted_keeps_the_historical_refusal_for_an_id_that_res
         .unwrap()
         .to_string();
     let missing = "00000000-0000-4000-8000-000000000558";
+    let second_missing = "00000000-0000-4000-8000-000000000559";
 
-    // The present record is a NOTE on both arms. Inference would have resolved it
-    // as one, so a fallback that read the surviving side would answer "note" here;
-    // only the historical entity default produces the refusals below.
-    //
-    // The two arms name different ids on purpose. Under the entity default the
-    // `into_id` is checked first, so a missing `into_id` is reported by its own id
-    // and a missing `from_id` is never reached: the present note fails the entity
-    // check before it. That ordering is the historical behaviour this arm exists
-    // to keep, and a fix that "improved" it would move which id a caller sees.
+    // The present record is a NOTE. The second arm is the one that moves: under
+    // the entity default a missing `from_id` was never reached, because the
+    // present note failed the entity check first and the caller was told about
+    // the id they had got RIGHT. Now each arm names the id that is actually
+    // missing. The third arm holds the ordering the knowledge pack pins: with
+    // both ids missing, `into_id` is the one reported.
     for (into, from, arm, named) in [
         (missing, present.as_str(), "missing into_id", missing),
-        (
-            present.as_str(),
-            missing,
-            "missing from_id",
-            present.as_str(),
-        ),
+        (present.as_str(), missing, "missing from_id", missing),
+        (missing, second_missing, "both missing", missing),
     ] {
         let error = match pack
             .dispatch("merge", json!({"into_id": into, "from_id": from}))
             .await
         {
             Ok(value) => panic!("{arm}: a merge naming a missing id must be refused; got: {value}"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
         assert!(
-            error.contains("entity"),
-            "{arm}: the refusal must come from the historical entity default; got: {error}"
+            matches!(error, RuntimeError::NotFound(_)),
+            "{arm}: an unresolvable id is a lookup failure; got: {error:?}"
+        );
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            format!("not found: {named}"),
+            "{arm}: the refusal names the missing id and nothing else"
+        );
+        // The equality above already forbids these, but they are the two wrong
+        // answers this change is about, and an arm that names them survives a
+        // later edit to the message that keeps the shape and loses the point.
+        assert!(
+            !rendered.contains("entity") && !rendered.contains("note"),
+            "{arm}: an id that resolves to nothing has no substrate to name; got: {rendered}"
         );
         assert!(
-            error.contains(named),
-            "{arm}: the refusal must name {named}; got: {error}"
-        );
-        assert!(
-            !error.contains("cannot merge across substrates"),
-            "{arm}: an unresolvable id is a lookup failure, never a substrate disagreement; \
-             got: {error}"
+            !rendered.contains("cannot merge across substrates"),
+            "{arm}: an unresolvable id is never a substrate disagreement; got: {rendered}"
         );
     }
+
+    // The control for the second arm: with BOTH ids present and of one
+    // substrate, nothing above fires and the merge runs. Without this, an
+    // implementation that refused every omitted-kind merge would pass.
+    let other = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "pool holds a slot for a minute", "salience": 0.4}),
+        )
+        .await
+        .expect("create the second present record")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let merged = pack
+        .dispatch(
+            "merge",
+            json!({"into_id": present, "from_id": other, "dry_run": true}),
+        )
+        .await
+        .expect("two present notes with kind omitted still merge");
+    assert_eq!(
+        merged.get("dry_run").and_then(|v| v.as_bool()),
+        Some(true),
+        "the control must reach the merge itself; got: {merged}"
+    );
 }
 
 // ---- merge dry_run predicts the safety floor instead of failing on it ----
