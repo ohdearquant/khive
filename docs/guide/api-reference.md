@@ -496,11 +496,11 @@ that fails it is refused with a conflict error naming the check in
 from_value, detail}` — so a dry run predicts the floor rather than failing on
 it. Every `dry_run` response carries `would_merge`.
 
-| Param     | Type | Required | Notes                                              |
-| --------- | ---- | -------- | -------------------------------------------------- |
-| `into_id` | uuid | yes      | Entity that survives the merge (canonical).        |
-| `from_id` | uuid | yes      | Entity merged from; soft-deleted afterward.        |
-| `dry_run` | bool | no       | Return the plan without mutating or emitting.      |
+| Param     | Type | Required | Notes                                                                        |
+| --------- | ---- | -------- | ---------------------------------------------------------------------------- |
+| `into_id` | uuid | yes      | Entity that survives the merge (canonical).                                  |
+| `from_id` | uuid | yes      | Entity merged from; soft-deleted afterward.                                  |
+| `dry_run` | bool | no       | Return the plan without mutating or emitting.                                |
 | `force`   | bool | no       | Skip the entity safety floor; the caller takes responsibility for the merge. |
 
 ```
