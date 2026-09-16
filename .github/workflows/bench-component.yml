@@ -86,7 +86,15 @@ jobs:
           rc=0
           # Bound the whole pass, including every benchmark child. TERM alone
           # can leave timeout waiting forever for a benchmark that ignores it.
-          timeout --kill-after=30s 600 cargo bench "${pkg_args[@]}" --benches -- --quick || rc=$?
+          #
+          # --noplot: the quick profile measures, it does not publish a report.
+          # Criterion's HTML report draws a density plot per benchmark, and on a
+          # sample the quick sampler had to collect in one shot -- which is what
+          # a benchmark slower than the profile's budget produces -- that plot
+          # asserts inside the statistics layer and takes the whole pass down at
+          # exit 101. The trend ledger below reads {new,base}/estimates.json,
+          # which this run still writes; only the plots and the HTML are skipped.
+          timeout --kill-after=30s 600 cargo bench "${pkg_args[@]}" --benches -- --quick --noplot || rc=$?
           echo "phase=criterion elapsed_seconds=$SECONDS exit_code=$rc" | tee -a ../component-phases.log
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then echo "::warning::Criterion pass failed or timed out (exit $rc); retaining partial estimates"; fi
