@@ -141,6 +141,21 @@ const CONTENT_PHRASES: &[&str] = &[
 
 const RECALL_QUERY: &str = "recall scoring fusion vector search memory decay";
 
+/// What a configuration's outcome is allowed to do to the run's exit status.
+///
+/// The fan-out row beyond the gate already declared itself out of it in prose, in the
+/// footer this binary prints: "The M=4 row is contextual and is not part of the gate."
+/// That declaration had no mechanism behind it. A contaminated sample on that row raised
+/// a panic like any other, the process ended, and the two rows the gate actually reads
+/// were discarded after they had already been measured. This is that mechanism.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The gate reads this row. A contaminated measurement fails the run.
+    Gating,
+    /// Printed for context. A contaminated measurement is reported and the run continues.
+    Informational,
+}
+
 /// One gate configuration: which models are registered on the runtime, and how
 /// `memory.recall` is called against them (explicit single model vs. fan-out `None`).
 struct GateConfig {
@@ -149,6 +164,7 @@ struct GateConfig {
     additional: &'static [EmbeddingModel],
     recall_model: Option<EmbeddingModel>,
     gate_note: &'static str,
+    role: Role,
 }
 
 fn gate_configs() -> Vec<GateConfig> {
@@ -159,6 +175,7 @@ fn gate_configs() -> Vec<GateConfig> {
             additional: &[],
             recall_model: Some(PRIMARY_MODEL),
             gate_note: "baseline case M=1 queried",
+            role: Role::Gating,
         },
         GateConfig {
             label: "three-model fan-out",
@@ -166,6 +183,7 @@ fn gate_configs() -> Vec<GateConfig> {
             additional: &RETIRED_MODELS[0..2],
             recall_model: None,
             gate_note: "baseline case M=3 queried",
+            role: Role::Gating,
         },
         GateConfig {
             label: "four-model fan-out (beyond gate, informational)",
@@ -173,6 +191,7 @@ fn gate_configs() -> Vec<GateConfig> {
             additional: &RETIRED_MODELS,
             recall_model: None,
             gate_note: "M=4 queried — contextual fan-out, not a primary-only baseline",
+            role: Role::Informational,
         },
     ]
 }
@@ -273,14 +292,18 @@ fn is_clean_ann_route(resp: &Value) -> bool {
 }
 
 /// Poll `memory.recall` until it returns several consecutive clean (non-degraded,
-/// non-empty) responses, or panic loud if the route never stabilizes. Seeding schedules
-/// an async ANN rebuild; this closes the race instead of assuming N warmup calls are
-/// enough.
+/// non-empty) responses. Seeding schedules an async ANN rebuild; this closes the race
+/// instead of assuming N warmup calls are enough.
+///
+/// Returns the reason as `Err` rather than panicking. The refusal is the same one it
+/// always was: a p95 recorded against a degraded route is not a baseline. What changed is
+/// who decides what that costs, which is [`Role`] at the call site and no longer the
+/// process exiting here.
 async fn wait_until_ann_warm(
     registry: &khive_runtime::VerbRegistry,
     label: &str,
     model: Option<EmbeddingModel>,
-) {
+) -> Result<(), String> {
     let mut consecutive_clean = 0usize;
     for attempt in 0..WARM_WAIT_MAX_ATTEMPTS {
         let (_us, resp) = recall_once(registry, model).await;
@@ -292,18 +315,18 @@ async fn wait_until_ann_warm(
                     attempt + 1,
                     consecutive_clean
                 );
-                return;
+                return Ok(());
             }
         } else {
             consecutive_clean = 0;
             tokio::time::sleep(WARM_WAIT_POLL_INTERVAL).await;
         }
     }
-    panic!(
+    Err(format!(
         "[{label}] ANN route did not reach a stable warm state after {WARM_WAIT_MAX_ATTEMPTS} \
          attempts (model={model:?}) — memory.recall kept returning ann_unavailable degradation \
          or empty results. Refusing to record a p95 baseline against a degraded route."
-    );
+    ))
 }
 
 struct Percentiles {
@@ -330,7 +353,11 @@ fn percentiles(mut latencies_us: Vec<u128>) -> Percentiles {
     }
 }
 
-async fn bench_configuration(config: &GateConfig) -> Percentiles {
+/// Measures one configuration, returning the contamination reason as `Err` instead of
+/// ending the process. Every condition that used to `assert!` here is a statement about
+/// the SAMPLE, so it belongs to the row, and the run's exit status is decided once, by
+/// role, after every row has been printed.
+async fn bench_configuration(config: &GateConfig) -> Result<Percentiles, String> {
     let tmp = tempfile::Builder::new()
         .prefix("khive-p95-gate-")
         .tempdir()
@@ -375,7 +402,7 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
         t_seed.elapsed().as_secs_f64()
     );
 
-    wait_until_ann_warm(&registry, config.label, config.recall_model).await;
+    wait_until_ann_warm(&registry, config.label, config.recall_model).await?;
 
     // Let any durable-epoch debounce check already due from seeding fire (see
     // EPOCH_DEBOUNCE_SETTLE) before opening the timed window, then confirm one more clean
@@ -384,39 +411,43 @@ async fn bench_configuration(config: &GateConfig) -> Percentiles {
     // events inside the timed window (emission is best-effort; see the module docs).
     tokio::time::sleep(EPOCH_DEBOUNCE_SETTLE).await;
     let (_us, settle_resp) = recall_once(&registry, config.recall_model).await;
-    assert!(
-        is_clean_ann_route(&settle_resp),
-        "[{}] post-settle recall observed ann_unavailable degradation (or empty results)",
-        config.label
-    );
+    if !is_clean_ann_route(&settle_resp) {
+        return Err(format!(
+            "[{}] post-settle recall observed ann_unavailable degradation (or empty results)",
+            config.label
+        ));
+    }
 
     let ann_warm_events_before = ann_warm_event_count(&rt).await;
     let mut latencies = Vec::with_capacity(RECALL_ITERS);
     for i in 0..RECALL_ITERS {
         let (us, resp) = recall_once(&registry, config.recall_model).await;
-        assert!(
-            is_clean_ann_route(&resp),
-            "[{}] timed sample {i} observed ann_unavailable degradation (or empty results) — \
-             warm-route assertion failed, refusing to record this baseline",
-            config.label
-        );
+        if !is_clean_ann_route(&resp) {
+            return Err(format!(
+                "[{}] timed sample {i} observed ann_unavailable degradation (or empty results) — \
+                 warm-route check failed, refusing to record this baseline",
+                config.label
+            ));
+        }
         latencies.push(us);
     }
     let ann_warm_events_after = ann_warm_event_count(&rt).await;
-    assert_eq!(
-        ann_warm_events_after, ann_warm_events_before,
-        "[{}] a memory.ann_warm phase event fired during the timed window — an ANN graph \
-         (re)build started mid-measurement, meaning at least one timed sample raced a rebuild \
-         or took the sqlite-vec exact-fallback route (which clears the cached graph and \
-         triggers exactly this event on the following call). Refusing to record this baseline.",
-        config.label
-    );
+    if ann_warm_events_after != ann_warm_events_before {
+        return Err(format!(
+            "[{}] a memory.ann_warm phase event fired during the timed window ({} → {}) — an \
+             ANN graph (re)build started mid-measurement, meaning at least one timed sample \
+             raced a rebuild or took the sqlite-vec exact-fallback route (which clears the \
+             cached graph and triggers exactly this event on the following call). Refusing to \
+             record this baseline.",
+            config.label, ann_warm_events_before, ann_warm_events_after
+        ));
+    }
     let stats = percentiles(latencies);
     eprintln!(
         "  {}: p50={:.3}ms p95={:.3}ms p99={:.3}ms n={}",
         config.label, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.n
     );
-    stats
+    Ok(stats)
 }
 
 #[tokio::main]
@@ -429,12 +460,11 @@ async fn main() {
         configs.len()
     );
 
-    let mut rows = Vec::with_capacity(configs.len());
-    for config in &configs {
-        let stats = bench_configuration(config).await;
-        rows.push((config, stats));
-    }
-
+    // The header and every row are printed as the row is produced, not collected and
+    // printed after the loop. A row that has been measured is a result, and a later row
+    // ending the process should not be able to take it back with it: the previous shape
+    // measured both gating configurations, then lost both to a panic raised while
+    // measuring the third.
     println!("{}", "=".repeat(96));
     println!("memory.recall p95 regression gate — file-backed WAL, warm ANN path");
     println!("{}", "=".repeat(96));
@@ -443,16 +473,63 @@ async fn main() {
         "configuration", "p50 ms", "p95 ms", "p99 ms", "n"
     );
     println!("{}", "-".repeat(96));
-    for (config, stats) in &rows {
-        println!(
-            "{:<45} {:>8.3} {:>8.3} {:>8.3} {:>6}  {}",
-            config.label, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.n, config.gate_note
-        );
+
+    let mut contaminated = Vec::new();
+    for config in &configs {
+        match bench_configuration(config).await {
+            Ok(stats) => println!(
+                "{:<45} {:>8.3} {:>8.3} {:>8.3} {:>6}  {}",
+                config.label, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.n, config.gate_note
+            ),
+            Err(reason) => {
+                println!(
+                    "{:<45} {:>8} {:>8} {:>8} {:>6}  {} [{}]",
+                    config.label,
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    0,
+                    config.gate_note,
+                    match config.role {
+                        Role::Gating => "CONTAMINATED, gating",
+                        Role::Informational => "CONTAMINATED, informational",
+                    }
+                );
+                contaminated.push((config.label, config.role, reason));
+            }
+        }
     }
+
     println!("{}", "=".repeat(96));
     println!(
         "warm-route gate: a change must add at most 1.0ms absolute p95 and at most 5% of \
          the matching M=1 or M=3 baseline's warm memory.recall p95 above. The M=4 row is \
          contextual and is not part of the gate."
     );
+
+    if contaminated.is_empty() {
+        return;
+    }
+
+    println!("{}", "-".repeat(96));
+    for (label, role, reason) in &contaminated {
+        let scope = match role {
+            Role::Gating => "gating, fails this run",
+            Role::Informational => "informational, does not fail this run",
+        };
+        println!("contaminated: {label} ({scope})\n  {reason}");
+    }
+
+    let failing = contaminated
+        .iter()
+        .filter(|(_, role, _)| *role == Role::Gating)
+        .count();
+    if failing > 0 {
+        println!(
+            "GATE FAILED: {failing} of {} gating configuration(s) could not be measured against \
+             a clean warm route; the rows above are what was measured before that.",
+            configs.iter().filter(|c| c.role == Role::Gating).count()
+        );
+        std::process::exit(2);
+    }
 }
