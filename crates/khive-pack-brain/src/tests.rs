@@ -3336,6 +3336,93 @@ async fn test_289_feedback_event_records_nonzero_duration() {
 
 // ── #517: brain.auto_feedback ─────────────────────────────────────────────
 
+/// #2772: the refusal for a malformed `results` has to be actionable by a caller
+/// who cannot read this crate. The accepted form is asserted in the same test as
+/// the refusals so the message and the contract cannot drift apart.
+#[tokio::test]
+async fn issue2772_malformed_results_names_the_parameter_shape_and_an_example() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let first = create_test_entity(&rt, &token).await;
+    let selected = create_test_entity(&rt, &token).await;
+
+    // The shape a caller reaches for after reading `results[].id` out of a
+    // recall response, plus the two neighbouring mistakes.
+    for (label, results) in [
+        ("bare id strings", json!([first.clone(), selected.clone()])),
+        ("numbers", json!([1, 2])),
+        (
+            "an object where an array belongs",
+            json!({ "id": selected }),
+        ),
+        ("objects with a non-string id", json!([{ "id": 7 }])),
+    ] {
+        let error = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "recall calibration target",
+                    "results": results,
+                    "target_id": selected,
+                    "signal": "useful"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err(&format!("{label} must be refused"));
+        let message = error.to_string();
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::InvalidInput(_)),
+            "{label}: {message}"
+        );
+        for required in ["`results`", "array of result objects", "string", "`id`"] {
+            assert!(
+                message.contains(required),
+                "{label}: message must contain {required}: {message}"
+            );
+        }
+        assert!(
+            message.contains(r#"results=[{"id": "1e8807ef"}, {"id": "c3f21b90"}]"#),
+            "{label}: message must carry a literal example: {message}"
+        );
+        // The defect was a message naming an internal type. Nothing that only
+        // exists in this crate may appear in it.
+        for leaked in ["AutoFeedbackResult", "struct", "Vec<", "serde"] {
+            assert!(
+                !message.contains(leaked),
+                "{label}: message must name no Rust type, found {leaked}: {message}"
+            );
+        }
+        assert_eq!(
+            pack.snapshot().balanced_recall.total_events,
+            0,
+            "{label}: a refused call must write nothing"
+        );
+    }
+
+    // The control: one character away from the first rejected shape, and it
+    // still works. Without this arm the assertions above are satisfied by a
+    // handler that refuses everything.
+    let accepted = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "recall calibration target",
+                "results": [{ "id": first }, { "id": selected }],
+                "target_id": selected,
+                "signal": "useful"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("the object form still succeeds");
+    assert_eq!(accepted["emitted"], json!(true));
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 1);
+}
+
 #[tokio::test]
 async fn brain_auto_feedback_credits_only_the_selected_result() {
     let (pack, rt) = make_pack();

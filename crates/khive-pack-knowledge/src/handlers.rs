@@ -245,8 +245,8 @@ impl KnowledgePack {
         if let Some(ref query) = p.query {
             // Search path: hybrid FTS+vector search, then optional domain post-filter.
             // We fetch limit*4 candidates to give the domain filter enough to work with.
-            // `total` = post-filter count of the candidate window (bounded by limit*4),
-            // NOT a true corpus count — see doc comment above.
+            // Report this post-hydration/domain-filter window separately from the
+            // full corpus count returned by the unqueried listing branch.
             let hits = core
                 .hybrid_search(
                     token,
@@ -290,7 +290,7 @@ impl KnowledgePack {
                 })
                 .collect();
 
-            let total = filtered.len();
+            let candidate_window_count = filtered.len();
             let results: Vec<Value> = filtered
                 .into_iter()
                 .take(limit as usize)
@@ -310,7 +310,7 @@ impl KnowledgePack {
                 })
                 .collect();
 
-            Ok(json!({ "results": results, "total": total }))
+            Ok(json!({ "results": results, "candidate_window_count": candidate_window_count }))
         } else {
             // Listing path: DB-level domain filter via tags_any avoids silent
             // truncation (K-3).  `count_entities_tagged` gives the pre-limit

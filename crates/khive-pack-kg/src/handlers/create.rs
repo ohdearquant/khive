@@ -540,10 +540,22 @@ impl KgPack {
             }
         }
 
+        // The caller acts on this field by deciding whether to link instead of
+        // create, so it has to be able to tell "nothing close exists" from "the
+        // comparison did not happen". Emitting the array only when it is
+        // non-empty made those two the same observation, and a failed search
+        // then read as a clean bill of health. So the array is always present
+        // on an entity create that did not opt out, and a comparison that could
+        // not run names itself in the companion field instead of arriving as an
+        // empty list. Both fields appear together or not at all.
+        //
+        // `dedup_name` and `dedup_kind` are both Some here whenever this branch
+        // is taken: the entity arm above refuses a create without a name and
+        // relies on `sub_kind` already being canonicalized.
         if let (Some(ref name), Some(ref kind)) = (&dedup_name, &dedup_kind) {
             const DEDUP_LIMIT: u32 = 3;
             const DEDUP_SCORE_THRESHOLD: f64 = 0.1;
-            match self
+            let (similar, unavailable_reason): (Vec<Value>, Option<String>) = match self
                 .runtime
                 .hybrid_search(
                     token,
@@ -557,9 +569,8 @@ impl KgPack {
                 )
                 .await
             {
-                Ok(hits) => {
-                    let similar: Vec<Value> = hits
-                        .into_iter()
+                Ok(hits) => (
+                    hits.into_iter()
                         .filter(|h| {
                             h.entity_id != new_id && h.score.to_f64() >= DEDUP_SCORE_THRESHOLD
                         })
@@ -571,20 +582,24 @@ impl KgPack {
                                 "score": h.score.to_f64(),
                             })
                         })
-                        .collect();
-                    if !similar.is_empty() {
-                        if let Some(obj) = response.as_object_mut() {
-                            obj.insert("similar_existing".to_string(), json!(similar));
-                        }
-                    }
-                }
+                        .collect(),
+                    None,
+                ),
                 Err(e) => {
                     tracing::warn!(
                         id = %new_id,
                         error = %e,
                         "dedup similarity search failed (entity already created)"
                     );
+                    (Vec::new(), Some(format!("similarity search failed: {e}")))
                 }
+            };
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("similar_existing".to_string(), json!(similar));
+                obj.insert(
+                    "similar_existing_unavailable_reason".to_string(),
+                    json!(unavailable_reason),
+                );
             }
         }
 

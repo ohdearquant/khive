@@ -4396,3 +4396,99 @@ async fn issue_2738_scan_reserved_key_precedes_content_detectors() {
         assert_eq!(registry.dispatch("stats", json!({})).await.unwrap(), before);
     }
 }
+
+// #2750: `similar_existing` is the field a caller reads to decide whether to
+// link instead of create, so the distinction it has to keep is between "the
+// comparison ran and nothing qualified" and "the comparison did not run".
+// Emitting the array only when non-empty made those the same observation.
+//
+// The near-duplicate arm uses the SAME name on purpose: its job is to prove the
+// array carries candidates and their shape, not to measure how fuzzy the scorer
+// is. A fixture that also depended on the scorer's tolerance would fail for two
+// unrelated reasons and distinguish neither.
+#[tokio::test]
+async fn issue2750_entity_create_always_reports_similar_existing_and_whether_it_could_look() {
+    let (_rt, token, pack, registry) = configured_kg_endpoint_test_surface();
+
+    // The comparison runs against a store with no other concept, so the empty
+    // array here is an ANSWER. Before the fix the field was absent and a caller
+    // could not tell this from a search that failed.
+    let first = pack
+        .handle_create(
+            &token,
+            json!({"kind": "concept", "name": "Vector quantization"}),
+            &registry,
+        )
+        .await
+        .expect("first entity creates");
+    assert_eq!(
+        first["similar_existing"],
+        json!([]),
+        "an entity create must report the comparison's result, even when empty: {first}"
+    );
+    assert_eq!(
+        first["similar_existing_unavailable_reason"],
+        Value::Null,
+        "the comparison ran, so nothing is unavailable: {first}"
+    );
+
+    let second = pack
+        .handle_create(
+            &token,
+            json!({"kind": "concept", "name": "Vector quantization"}),
+            &registry,
+        )
+        .await
+        .expect("near-duplicate entity creates");
+    let candidates = second["similar_existing"]
+        .as_array()
+        .expect("similar_existing is an array");
+    let candidate = candidates
+        .iter()
+        .find(|c| c["id"] == first["id"])
+        .unwrap_or_else(|| panic!("the first entity must be offered as a candidate: {second}"));
+    assert_eq!(candidate["name"], json!("Vector quantization"));
+    assert!(
+        candidate["score"].as_f64().is_some_and(|s| s >= 0.1),
+        "a candidate carries the score that admitted it: {candidate}"
+    );
+    assert!(candidates.len() <= 3, "at most three candidates: {second}");
+    assert_eq!(second["similar_existing_unavailable_reason"], Value::Null);
+
+    // Opting out suppresses both fields together. Without this arm, a change
+    // that emitted `similar_existing: []` unconditionally would satisfy every
+    // assertion above while quietly reporting a comparison nobody asked for.
+    let skipped = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept",
+                "name": "Vector quantization",
+                "skip_dedup_check": true,
+            }),
+            &registry,
+        )
+        .await
+        .expect("opted-out entity creates");
+    assert!(
+        skipped.get("similar_existing").is_none()
+            && skipped.get("similar_existing_unavailable_reason").is_none(),
+        "skip_dedup_check suppresses both fields: {skipped}"
+    );
+
+    // Notes have no dedup comparison at all, so neither field may appear —
+    // an empty array there would assert something was checked that never was.
+    let note = pack
+        .handle_create(
+            &token,
+            json!({"kind": "observation", "content": "Vector quantization"}),
+            &registry,
+        )
+        .await
+        .expect("note creates");
+    assert!(
+        note.get("similar_existing").is_none()
+            && note.get("similar_existing_unavailable_reason").is_none(),
+        "a note create reports no dedup comparison: {note}"
+    );
+}

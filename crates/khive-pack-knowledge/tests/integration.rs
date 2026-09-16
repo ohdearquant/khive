@@ -583,55 +583,271 @@ async fn topic_domain_filter_is_case_insensitive_listing_path() {
     );
 }
 
-// ── H2 regression: search-path `total` semantics ─────────────────────────────
+// ── #2732: distinguish corpus size, candidate window and returned rows ────────
 
 #[tokio::test]
-async fn topic_search_path_total_is_bounded_by_candidate_window() {
-    let f = pack(rt());
-
-    // Learn 10 concepts — more than a small limit, so we can observe truncation.
-    for i in 0..10 {
-        f.dispatch(
-            "knowledge.learn",
-            json!({ "name": format!("Attention{i}"), "domain": "attention" }),
+async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..17 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["count-domain".into()],
         )
         .await
-        .expect("learn");
+        .unwrap();
     }
-    f.dispatch(
-        "knowledge.learn",
-        json!({ "name": "LoRA", "domain": "fine-tuning" }),
-    )
-    .await
-    .expect("learn unrelated");
-
-    // Search path with limit=3.  total must be <= limit*4 (12) and >= returned items.
-    let resp = f
+    // An independent, fixed-bound core search supplies exact candidate IDs and scores.
+    let hits = core
+        .hybrid_search(&token, QUERY, None, 12, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        12,
+        "real indexed fixture fills the twelve-candidate window"
+    );
+    let queried = f
+        .dispatch("knowledge.topic", json!({"query": QUERY, "limit": 3}))
+        .await
+        .unwrap();
+    assert_eq!(queried["candidate_window_count"], 12);
+    assert!(
+        queried.get("total").is_none(),
+        "query count must not masquerade as corpus total"
+    );
+    let rows = queried["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for (row, hit) in rows.iter().zip(&hits) {
+        assert_eq!(row["full_id"], hit.entity_id.to_string());
+        assert_eq!(row["score"], json!(hit.score.to_f64()));
+    }
+    let listing = f
         .dispatch(
             "knowledge.topic",
-            json!({ "query": "attention", "limit": 3 }),
+            json!({"domain":"count-domain", "limit":3}),
         )
         .await
-        .expect("topic search ok");
+        .unwrap();
+    assert_eq!(listing["total"], 17);
+    assert_eq!(listing["results"].as_array().unwrap().len(), 3);
+    assert!(listing.get("candidate_window_count").is_none());
+    let null_query = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"domain":"count-domain", "query":null, "limit":3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        null_query, listing,
+        "null query retains unqueried full-count semantics"
+    );
+    assert!(
+        listing["total"].as_u64().unwrap() > queried["candidate_window_count"].as_u64().unwrap()
+    );
+    assert!(queried["candidate_window_count"].as_u64().unwrap() > rows.len() as u64);
+    for (args, count_key, expected, absent) in [
+        (
+            json!({"query":QUERY, "limit":0}),
+            "candidate_window_count",
+            0,
+            "total",
+        ),
+        (
+            json!({"domain":"count-domain", "limit":0}),
+            "total",
+            17,
+            "candidate_window_count",
+        ),
+    ] {
+        let response = f.dispatch("knowledge.topic", args).await.unwrap();
+        assert_eq!(response[count_key], expected);
+        assert_eq!(response["results"], json!([]));
+        assert!(response.get(absent).is_none());
+    }
+}
 
-    let items = resp["results"].as_array().expect("results array");
-    let total = resp["total"].as_u64().expect("total field present");
+/// An empty or whitespace `query` stays on the query branch.
+///
+/// ADR-047's 2026-09-15 amendment decides this as behaviour, and `handle_topic`
+/// implements it by matching `Some(ref query)` with no trim and no emptiness
+/// check. Nothing asserted it. The reason that matters is three lines above the
+/// branch, in the same function: the sibling parameter is normalized the other
+/// way round.
+///
+/// ```ignore
+/// let domain_filter = p.domain.as_deref()
+///     .map(|d| d.trim().to_lowercase())
+///     .filter(|d| !d.is_empty());
+/// ```
+///
+/// So inside one handler an empty string means "no filter" for `domain` and
+/// "search for nothing" for `query`. Adding `.filter(|q| !q.trim().is_empty())`
+/// to the query branch reads as tidying that asymmetry away, and it would move an
+/// empty query onto the listing branch, changing which count key the response
+/// carries from `candidate_window_count` to `total`. A caller keyed on the
+/// presence of one of those two fields sees the shape change with no error.
+#[tokio::test]
+async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..17 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["count-domain".into()],
+        )
+        .await
+        .unwrap();
+    }
 
-    assert!(
-        items.len() <= 3,
-        "items must respect limit: got {}",
-        items.len()
+    // The three spellings the amendment says are one branch, asserted together so
+    // a reader sees them treated alike rather than inferring it from `Some(_)`.
+    // The empty and whitespace cases carry no expected count: what is under test
+    // is WHICH branch answers, and the number a search for nothing returns is not
+    // part of that decision.
+    for query in [QUERY, "", "   "] {
+        let response = f
+            .dispatch("knowledge.topic", json!({"query": query, "limit": 3}))
+            .await
+            .unwrap();
+        assert!(
+            response.get("candidate_window_count").is_some(),
+            "query {query:?} must answer on the query branch: {response}"
+        );
+        assert!(
+            response.get("total").is_none(),
+            "query {query:?} must not report a corpus total: {response}"
+        );
+    }
+
+    // The positive control for the `total` absence above, in the same arm and on
+    // the same fixture. Without it `total.is_none()` would also hold in a build
+    // where nothing emits `total` at all, and the negative assertion would read
+    // as coverage while testing nothing.
+    //
+    // One case, not two: the arm above this one already asserts the omitted-query
+    // and null-query listings against this same corpus, and a second copy here
+    // would be a second place to update rather than a second thing checked.
+    let listing = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"domain": "count-domain", "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing["total"], 17, "{listing}");
+    assert!(listing.get("candidate_window_count").is_none(), "{listing}");
+}
+
+#[tokio::test]
+async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let core = runtime.core();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    const QUERY: &str = "orchardwindowprobe";
+    for slot in 0..13 {
+        core.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("{QUERY} concept {slot:02}"),
+            Some("Controlled concept fixture for query window counts."),
+            None,
+            vec!["other".into()],
+        )
+        .await
+        .unwrap();
+    }
+    let ranked = core
+        .hybrid_search(&token, QUERY, None, 13, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(ranked.len(), 13);
+    let ids: Vec<_> = ranked.iter().map(|hit| hit.entity_id).collect();
+    // Two domain matches inside the four-hit window and two outside it.
+    // Only tags change; verify below that this fixture leaves search order intact.
+    let access = core.sql();
+    let mut writer = access.writer().await.unwrap();
+    for position in [0, 2, 5, 8] {
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE entities SET tags = '[\"wanted\"]' WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(ids[position].to_string())],
+                label: None,
+            })
+            .await
+            .unwrap();
+    }
+    drop(writer);
+    let window = core
+        .hybrid_search(&token, QUERY, None, 4, Some("concept"), None, &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        window.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
+        ids[..4]
     );
-    // total is the candidate-window count, bounded by limit*4 = 12.
-    assert!(
-        total <= 12,
-        "search-path total must be bounded by limit*4 (12), got {total}"
+    let filtered = f
+        .dispatch(
+            "knowledge.topic",
+            json!({"query":QUERY, "domain":" WANTED ", "limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered["candidate_window_count"], 2);
+    assert!(filtered.get("total").is_none());
+    assert_eq!(filtered["results"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["results"][0]["full_id"], ids[0].to_string());
+    let listing = f
+        .dispatch("knowledge.topic", json!({"domain":"wanted", "limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listing["total"], 4,
+        "the corpus has two more matches outside the candidate window"
     );
-    assert!(
-        total >= items.len() as u64,
-        "total must be >= returned items: total={total}, items={}",
-        items.len()
-    );
+    assert!(listing.get("candidate_window_count").is_none());
+    for (args, key, absent) in [
+        (
+            json!({"query":QUERY, "domain":"absent", "limit":1}),
+            "candidate_window_count",
+            "total",
+        ),
+        (
+            json!({"domain":"absent", "limit":1}),
+            "total",
+            "candidate_window_count",
+        ),
+    ] {
+        let response = f.dispatch("knowledge.topic", args).await.unwrap();
+        assert_eq!(response[key], 0);
+        assert_eq!(response["results"], json!([]));
+        assert!(response.get(absent).is_none());
+    }
 }
 
 // ── upsert_atoms ──────────────────────────────────────────────────────────────
@@ -4476,7 +4692,8 @@ async fn resolver_generic_hard_delete_atom() {
 /// pack defers generic update (pack-private records require pack-specific verbs).
 #[tokio::test]
 async fn resolver_generic_update_atom_returns_invalid_input() {
-    let f = pack_via_registry(rt());
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
 
     f.dispatch(
         "knowledge.upsert_atoms",
@@ -4497,13 +4714,31 @@ async fn resolver_generic_update_atom_returns_invalid_input() {
         .expect("get atom");
     let uuid = by_slug["id"].as_str().expect("id string");
 
+    let before = issue_558_snapshot(&runtime).await;
     let err = f
         .dispatch("update", json!({ "id": uuid, "name": "New Name" }))
         .await
         .expect_err("update on knowledge atom must return an error");
-    assert!(
-        matches!(err, RuntimeError::InvalidInput(_)),
-        "expected InvalidInput, got: {err:?}"
+    assert_eq!(issue_558_snapshot(&runtime).await, before);
+    let RuntimeError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got: {err:?}");
+    };
+    for verb in [
+        "knowledge.upsert_atoms",
+        "knowledge.upsert_domains",
+        "knowledge.edit",
+    ] {
+        assert!(
+            message.contains(verb),
+            "missing direction {verb}: {message}"
+        );
+    }
+    assert!(!message.contains(by_slug["content"].as_str().expect("atom content")));
+    assert_eq!(
+        f.dispatch("knowledge.get", json!({"id": uuid}))
+            .await
+            .expect("unchanged atom"),
+        by_slug
     );
 }
 
@@ -5606,6 +5841,610 @@ mod kg_blend {
             ),
             "request cancellation at the KG-blend catch must propagate, got {result:?}"
         );
+    }
+}
+
+const ISSUE_558_PRIVATE_MARKER: &str = "private payload marker marigold";
+const ISSUE_558_CONTENT: &str = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+
+async fn issue_558_rows(runtime: &KhiveRuntime, sql: &str) -> Vec<khive_storage::SqlRow> {
+    runtime
+        .sql()
+        .reader()
+        .await
+        .expect("snapshot reader")
+        .query_all(SqlStatement {
+            sql: sql.into(),
+            params: vec![],
+            label: Some("test.issue_558.snapshot".into()),
+        })
+        .await
+        .expect("snapshot query")
+}
+
+async fn issue_558_snapshot(runtime: &KhiveRuntime) -> Value {
+    let mut state = serde_json::Map::new();
+    for table in [
+        "knowledge_atoms",
+        "knowledge_domains",
+        "entities",
+        "notes",
+        "graph_edges",
+    ] {
+        let rows = issue_558_rows(runtime, &format!("SELECT * FROM {table} ORDER BY id")).await;
+        state.insert(
+            table.into(),
+            serde_json::to_value(rows).expect("serialize rows"),
+        );
+    }
+    let events = issue_558_rows(
+        runtime,
+        "SELECT * FROM events WHERE kind IN ('entity_merged', 'note_merged') ORDER BY id",
+    )
+    .await;
+    state.insert(
+        "merge_events".into(),
+        serde_json::to_value(events).expect("serialize events"),
+    );
+    Value::Object(state)
+}
+
+async fn issue_558_private(runtime: &KhiveRuntime, f: &Fixture, kind: &str) -> String {
+    let slug = format!("issue-558-{kind}");
+    let verb = if kind == "atom" {
+        "knowledge.upsert_atoms"
+    } else {
+        "knowledge.upsert_domains"
+    };
+    let args = if kind == "atom" {
+        json!({"atoms": [{"slug": slug, "name": ISSUE_558_PRIVATE_MARKER,
+            "content": format!("{ISSUE_558_CONTENT} {ISSUE_558_PRIVATE_MARKER}"),
+            "tags": ["test", "resolver"], "properties": {"marker": ISSUE_558_PRIVATE_MARKER}}]})
+    } else {
+        json!({"domains": [{"slug": slug, "name": ISSUE_558_PRIVATE_MARKER,
+            "description": format!("{ISSUE_558_CONTENT} {ISSUE_558_PRIVATE_MARKER}"),
+            "members": ["rag", "dense-retrieval"], "tags": ["test", "resolver"]}]})
+    };
+    let created = f
+        .dispatch(verb, args)
+        .await
+        .expect("create private fixture");
+    assert_eq!(created["created"], 1, "{kind}: {created}");
+    let by_slug = f
+        .dispatch("knowledge.get", json!({"id": slug}))
+        .await
+        .expect("private slug get");
+    let id = by_slug["id"].as_str().expect("private UUID").to_string();
+    let by_id = f
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("real registry resolver positive control");
+    assert_eq!(
+        by_id, by_slug,
+        "{kind}: by-ID resolver must preserve public payload"
+    );
+    assert_eq!(by_id["kind"], kind);
+    if kind == "domain" {
+        for table in ["knowledge_domains", "knowledge_atoms"] {
+            let rows = issue_558_rows(
+                runtime,
+                &format!("SELECT * FROM {table} WHERE id = '{id}' AND deleted_at IS NULL"),
+            )
+            .await;
+            assert_eq!(
+                rows.len(),
+                1,
+                "domain must have its authoritative row and mirror"
+            );
+        }
+    }
+    id
+}
+
+async fn issue_558_ordinary(f: &Fixture, kind: &str, side: &str) -> String {
+    let mut args = json!({"kind": kind, "name": "Merge counterpart",
+        "properties": {side: side}, "skip_dedup_check": true});
+    let field = if kind == "observation" {
+        "content"
+    } else {
+        "description"
+    };
+    args[field] = json!(format!("{ISSUE_558_CONTENT} {side}"));
+    let created = f
+        .dispatch("create", args)
+        .await
+        .expect("create ordinary fixture");
+    created["id"].as_str().expect("ordinary UUID").to_string()
+}
+
+async fn issue_558_edge(f: &Fixture, source: &str, target: &str, note: bool) {
+    f.dispatch(
+        "link",
+        json!({"source_id": source, "target_id": target,
+        "relation": if note { "annotates" } else { "contains" }, "weight": 0.75,
+        "metadata": {"fixture": "issue-558"}}),
+    )
+    .await
+    .expect("create incident edge");
+}
+
+fn issue_558_args(into: &str, from: &str, kind: Option<&str>) -> Value {
+    let mut args = json!({"into_id": into, "from_id": from});
+    if let Some(kind) = kind {
+        args["kind"] = json!(kind);
+    }
+    args
+}
+
+async fn issue_558_unchanged_error(
+    runtime: &KhiveRuntime,
+    f: &Fixture,
+    args: Value,
+    arm: &str,
+) -> RuntimeError {
+    let before = issue_558_snapshot(runtime).await;
+    let result = f.dispatch("merge", args).await;
+    assert_eq!(
+        issue_558_snapshot(runtime).await,
+        before,
+        "{arm}: mutation on refusal"
+    );
+    result.expect_err(arm)
+}
+
+fn issue_558_directing_error(error: RuntimeError, arm: &str) {
+    let RuntimeError::InvalidInput(message) = error else {
+        panic!("{arm}: expected directing InvalidInput, got {error:?}");
+    };
+    for required in [
+        "merge",
+        "not supported",
+        "knowledge.upsert_atoms",
+        "knowledge.upsert_domains",
+        "knowledge.edit",
+    ] {
+        assert!(
+            message.contains(required),
+            "{arm}: missing {required:?} in {message:?}"
+        );
+    }
+    assert!(
+        !message.contains(ISSUE_558_PRIVATE_MARKER),
+        "{arm}: private payload leaked"
+    );
+}
+
+fn issue_558_not_found(error: RuntimeError, expected: &str, arm: &str) {
+    let RuntimeError::NotFound(message) = error else {
+        panic!("{arm}: expected original NotFound, got {error:?}");
+    };
+    assert_eq!(message, expected, "{arm}");
+}
+
+async fn issue_558_private_routes(kinds: &[Option<&str>], note: bool) {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let ordinary =
+        issue_558_ordinary(&f, if note { "observation" } else { "concept" }, "into").await;
+    let anchor = issue_558_ordinary(&f, "concept", "anchor").await;
+    issue_558_edge(&f, &ordinary, &anchor, note).await;
+    for private_kind in ["atom", "domain"] {
+        let private = issue_558_private(&runtime, &f, private_kind).await;
+        for &kind in kinds {
+            for private_into in [true, false] {
+                let arm = format!("{private_kind}/{kind:?}/private_into={private_into}");
+                let (into, from) = if private_into {
+                    (&private, &ordinary)
+                } else {
+                    (&ordinary, &private)
+                };
+                let error =
+                    issue_558_unchanged_error(&runtime, &f, issue_558_args(into, from, kind), &arm)
+                        .await;
+                issue_558_directing_error(error, &arm);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_558_merge_private_entity_operands_refused() {
+    issue_558_private_routes(&[None, Some("entity"), Some("concept")], false).await;
+}
+
+#[tokio::test]
+async fn issue_558_merge_private_note_operands_refused() {
+    issue_558_private_routes(&[Some("note"), Some("observation")], true).await;
+}
+
+#[tokio::test]
+async fn issue_558_merge_private_flags_and_aliases_refused() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let atom = issue_558_private(&runtime, &f, "atom").await;
+    let domain = issue_558_private(&runtime, &f, "domain").await;
+    let ordinary = issue_558_ordinary(&f, "concept", "into").await;
+    let anchor = issue_558_ordinary(&f, "concept", "anchor").await;
+    issue_558_edge(&f, &ordinary, &anchor, false).await;
+    for (into, from) in [
+        (&atom, &ordinary),
+        (&ordinary, &atom),
+        (&domain, &ordinary),
+        (&ordinary, &domain),
+        (&atom, &domain),
+        (&domain, &atom),
+    ] {
+        for (into_key, from_key) in [
+            ("into_id", "from_id"),
+            ("winner_id", "loser_id"),
+            ("target_id", "source_id"),
+        ] {
+            for force in [false, true] {
+                for dry_run in [false, true] {
+                    let arm = format!("{into}/{from}/{into_key}/{force}/{dry_run}");
+                    let args =
+                        json!({into_key: into, from_key: from, "force": force, "dry_run": dry_run});
+                    let error = issue_558_unchanged_error(&runtime, &f, args, &arm).await;
+                    issue_558_directing_error(error, &arm);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_558_merge_missing_and_validation_errors_unchanged() {
+    let runtime = rt();
+    let f = pack_via_registry(runtime.clone());
+    let entity = issue_558_ordinary(&f, "concept", "into").await;
+    let note = issue_558_ordinary(&f, "observation", "into").await;
+    issue_558_edge(&f, &note, &entity, true).await;
+    let atom = issue_558_private(&runtime, &f, "atom").await;
+    let domain = issue_558_private(&runtime, &f, "domain").await;
+    let missing = "00000000-0000-4000-8000-000000000558";
+    for kind in [
+        None,
+        Some("entity"),
+        Some("concept"),
+        Some("note"),
+        Some("observation"),
+    ] {
+        let is_note = matches!(kind, Some("note" | "observation"));
+        let ordinary = if is_note { &note } else { &entity };
+        let expected = if is_note {
+            "not found in this namespace".into()
+        } else {
+            format!("entity {missing}")
+        };
+        for missing_into in [true, false] {
+            let (into, from) = if missing_into {
+                (missing, ordinary.as_str())
+            } else {
+                (ordinary.as_str(), missing)
+            };
+            let arm = format!("missing/{kind:?}/into={missing_into}");
+            let error =
+                issue_558_unchanged_error(&runtime, &f, issue_558_args(into, from, kind), &arm)
+                    .await;
+            issue_558_not_found(error, &expected, &arm);
+        }
+        let arm = format!("earlier-missing-into/{kind:?}");
+        let error =
+            issue_558_unchanged_error(&runtime, &f, issue_558_args(missing, &atom, kind), &arm)
+                .await;
+        issue_558_not_found(error, &expected, &arm);
+    }
+    for (kind, wrong, ordinary, expected) in [
+        ("concept", &note, &entity, format!("entity {note}")),
+        (
+            "observation",
+            &entity,
+            &note,
+            "not found in this namespace".into(),
+        ),
+        ("document", &entity, &entity, format!("document {entity}")),
+        ("insight", &note, &note, format!("insight {note}")),
+    ] {
+        let error = issue_558_unchanged_error(
+            &runtime,
+            &f,
+            issue_558_args(wrong, ordinary, Some(kind)),
+            kind,
+        )
+        .await;
+        issue_558_not_found(error, &expected, kind);
+    }
+    // These exact pre-read errors are independent of the resolver result mapping.
+    let validation_cases = [
+        (
+            json!({"kind": "edge"}),
+            "merge(kind=\"edge\") is unsupported",
+        ),
+        (
+            json!({"kind": "event"}),
+            "events are immutable — create/update/delete are not permitted",
+        ),
+        (
+            json!({"kind": "proposal"}),
+            "proposal events are immutable and cannot be merged",
+        ),
+        (
+            json!({"strategy": "invalid"}),
+            "unknown strategy \"invalid\"; use prefer_into | prefer_from | union",
+        ),
+        (
+            json!({"content_strategy": "invalid"}),
+            "unknown content_strategy \"invalid\"; use append | prefer_into | prefer_from",
+        ),
+        (
+            json!({"winner_id": atom}),
+            "bad params: duplicate field `into_id`",
+        ),
+        (
+            json!({"into_id": "fffffffffffffffffffffffffffffff"}),
+            "no record matches prefix: \"fffffffffffffffffffffffffffffff\"",
+        ),
+    ];
+    for (extra, expected) in validation_cases {
+        let mut args = issue_558_args(&atom, &entity, None);
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = issue_558_unchanged_error(&runtime, &f, args, expected).await;
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message == expected),
+            "{expected}: {error:?}"
+        );
+    }
+    // Freeze baseline parser/name oracles using the resolver-free registry over the same rows.
+    let baseline = pack(runtime.clone());
+    for extra in [
+        json!({"kind": "unknown-558"}),
+        json!({"into_id": "unmatched-558-name"}),
+        json!({"into_id": "not-a-uuid"}),
+    ] {
+        let mut args = issue_558_args(&atom, &entity, None);
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let expected =
+            issue_558_unchanged_error(&runtime, &baseline, args.clone(), "baseline parser").await;
+        let error = issue_558_unchanged_error(&runtime, &f, args, "parser precedence").await;
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+    }
+    for private in [&atom, &domain] {
+        f.dispatch("delete", json!({"id": private}))
+            .await
+            .expect("soft delete private fixture");
+        for kind in [
+            None,
+            Some("entity"),
+            Some("concept"),
+            Some("note"),
+            Some("observation"),
+        ] {
+            let is_note = matches!(kind, Some("note" | "observation"));
+            let ordinary = if is_note { &note } else { &entity };
+            let expected = if is_note {
+                "not found in this namespace".into()
+            } else {
+                format!("entity {private}")
+            };
+            for private_into in [true, false] {
+                let (into, from) = if private_into {
+                    (private, ordinary)
+                } else {
+                    (ordinary, private)
+                };
+                let arm = format!("soft-deleted/{private}/{kind:?}/{private_into}");
+                let error =
+                    issue_558_unchanged_error(&runtime, &f, issue_558_args(into, from, kind), &arm)
+                        .await;
+                issue_558_not_found(error, &expected, &arm);
+            }
+        }
+    }
+    let consumed = issue_558_ordinary(&f, "concept", "from").await;
+    f.dispatch("merge", issue_558_args(&entity, &consumed, None))
+        .await
+        .expect("ordinary merge for continuity control");
+    for (into, from) in [(&consumed, &entity), (&entity, &consumed)] {
+        let error = issue_558_unchanged_error(
+            &runtime,
+            &f,
+            issue_558_args(into, from, None),
+            "consumed entity",
+        )
+        .await;
+        issue_558_not_found(
+            error,
+            &format!("{consumed} was merged into {entity}; query the kept id"),
+            "consumed entity",
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_558_merge_substrate_success_and_dry_run_unchanged() {
+    for note in [false, true] {
+        for dry_run in [false, true] {
+            for (into_key, from_key) in [
+                ("into_id", "from_id"),
+                ("winner_id", "loser_id"),
+                ("target_id", "source_id"),
+            ] {
+                for force in [false, true] {
+                    let arm = format!("note={note}/dry_run={dry_run}/{into_key}/force={force}");
+                    let runtime = rt();
+                    let f = pack_via_registry(runtime.clone());
+                    let kind = if note { "observation" } else { "concept" };
+                    let into = issue_558_ordinary(&f, kind, "into").await;
+                    let from = issue_558_ordinary(&f, kind, "from").await;
+                    let anchor = issue_558_ordinary(&f, "concept", "anchor").await;
+                    issue_558_edge(&f, &from, &anchor, note).await;
+                    let before = issue_558_snapshot(&runtime).await;
+                    let summary = f
+                        .dispatch(
+                            "merge",
+                            json!({into_key: into, from_key: from,
+                        "kind": kind, "dry_run": dry_run, "force": force, "strategy": "union"}),
+                        )
+                        .await
+                        .expect(&arm);
+                    assert_eq!(summary["kept_id"], into, "{arm}");
+                    assert_eq!(summary["removed_id"], from, "{arm}");
+                    assert_eq!(summary["dry_run"], dry_run, "{arm}");
+                    assert_eq!(summary["edges_rewired"], 1, "{arm}");
+                    assert_eq!(summary["properties_merged"], 1, "{arm}");
+                    assert_eq!(summary["content_appended"], true, "{arm}");
+                    let after = issue_558_snapshot(&runtime).await;
+                    if dry_run {
+                        assert_eq!(after, before, "{arm}: dry-run mutation");
+                    } else {
+                        let kept = f
+                            .dispatch("get", json!({"id": into}))
+                            .await
+                            .expect("kept row");
+                        let text = kept[if note { "content" } else { "description" }]
+                            .as_str()
+                            .expect("kept text");
+                        assert!(
+                            text.contains("into") && text.contains("from"),
+                            "{arm}: {text}"
+                        );
+                        assert_eq!(kept["properties"]["into"], "into", "{arm}");
+                        assert_eq!(kept["properties"]["from"], "from", "{arm}");
+                        let table = if note { "notes" } else { "entities" };
+                        let tombstones = issue_558_rows(&runtime, &format!("SELECT id FROM {table} WHERE id = '{from}' AND deleted_at IS NOT NULL")).await;
+                        assert_eq!(
+                            tombstones.len(),
+                            1,
+                            "{arm}: consumed row must be tombstoned"
+                        );
+                        let edges = issue_558_rows(&runtime, &format!("SELECT id FROM graph_edges WHERE source_id = '{into}' AND target_id = '{anchor}' AND deleted_at IS NULL")).await;
+                        assert_eq!(edges.len(), 1, "{arm}: incident edge must be rewired");
+                        assert_eq!(after["merge_events"].as_array().unwrap().len(), 1, "{arm}");
+                        assert_eq!(after["knowledge_atoms"], before["knowledge_atoms"], "{arm}");
+                        assert_eq!(
+                            after["knowledge_domains"], before["knowledge_domains"],
+                            "{arm}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Issue558Probe {
+    fail: bool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::PackByIdResolver for Issue558Probe {
+    async fn resolve_by_id(
+        &self,
+        _id: uuid::Uuid,
+    ) -> Result<Option<khive_runtime::Resolved>, RuntimeError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            Err(RuntimeError::Internal("issue-558 resolver failure".into()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_by_id(&self, _id: uuid::Uuid, _hard: bool) -> Result<Value, RuntimeError> {
+        panic!("diagnostic resolver must never delete")
+    }
+}
+
+#[tokio::test]
+async fn issue_558_merge_resolver_error_propagates() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for fail in [true, false] {
+        for note in [false, true] {
+            let runtime = rt();
+            let real = pack_via_registry(runtime.clone());
+            let atom = issue_558_private(&runtime, &real, "atom").await;
+            let domain = issue_558_private(&runtime, &real, "domain").await;
+            let kind = if note { "observation" } else { "concept" };
+            let ordinary = issue_558_ordinary(&real, kind, "into").await;
+            let other = issue_558_ordinary(&real, kind, "from").await;
+            let anchor = issue_558_ordinary(&real, "concept", "anchor").await;
+            issue_558_edge(&real, &ordinary, &anchor, note).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let later = Arc::new(AtomicUsize::new(0));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register_resolver(
+                "issue-558-first",
+                Box::new(Issue558Probe {
+                    fail,
+                    calls: calls.clone(),
+                }),
+            );
+            builder.register_resolver(
+                "issue-558-later",
+                Box::new(Issue558Probe {
+                    fail: false,
+                    calls: later.clone(),
+                }),
+            );
+            PackRegistry::register_packs(
+                &["kg".into(), "knowledge".into()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("real resolver factory");
+            let f = Fixture {
+                registry: builder.build().expect("probe registry"),
+            };
+            for private in [&atom, &domain] {
+                for private_into in [true, false] {
+                    calls.store(0, Ordering::SeqCst);
+                    later.store(0, Ordering::SeqCst);
+                    let (into, from) = if private_into {
+                        (private, &ordinary)
+                    } else {
+                        (&ordinary, private)
+                    };
+                    let arm = format!("fail={fail}/note={note}/{private}/into={private_into}");
+                    let error = issue_558_unchanged_error(
+                        &runtime,
+                        &f,
+                        issue_558_args(into, from, Some(kind)),
+                        &arm,
+                    )
+                    .await;
+                    if fail {
+                        assert!(
+                            matches!(error, RuntimeError::Internal(ref message) if message == "issue-558 resolver failure"),
+                            "{arm}: {error:?}"
+                        );
+                    } else {
+                        issue_558_directing_error(error, &arm);
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 1, "{arm}");
+                    assert_eq!(
+                        later.load(Ordering::SeqCst),
+                        usize::from(!fail),
+                        "{arm}: resolver error must short-circuit"
+                    );
+                }
+            }
+            calls.store(0, Ordering::SeqCst);
+            later.store(0, Ordering::SeqCst);
+            let before = issue_558_snapshot(&runtime).await;
+            let mut args = issue_558_args(&ordinary, &other, Some(kind));
+            args["dry_run"] = json!(true);
+            f.dispatch("merge", args)
+                .await
+                .expect("successful substrate reads do not probe");
+            assert_eq!(issue_558_snapshot(&runtime).await, before);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(later.load(Ordering::SeqCst), 0);
+        }
     }
 }
 

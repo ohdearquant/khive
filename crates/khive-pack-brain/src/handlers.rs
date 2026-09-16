@@ -2197,6 +2197,51 @@ impl BrainPack {
             serve_attribution: Option<ServeAttribution>,
         }
 
+        // `results` is the shape callers get wrong, because `results[].id` is
+        // exactly what they just read out of a recall response and an array of
+        // those ids is one character away from the accepted form. The
+        // deserializer's own refusal names an internal type and neither the
+        // parameter nor the shape, so a caller who cannot read this file has
+        // nowhere to go. This check only improves the message for inputs serde
+        // rejects anyway; it adds no rule, and anything it admits still has to
+        // pass the deserializer below.
+        fn malformed_results(params: &Value) -> Option<String> {
+            const WANTED: &str =
+                "`results` must be an array of result objects, each with a string \
+                                  `id`; pass the whole result set, for example \
+                                  results=[{\"id\": \"1e8807ef\"}, {\"id\": \"c3f21b90\"}]";
+            let results = params.get("results")?;
+            let Some(items) = results.as_array() else {
+                return Some(format!(
+                    "auto_feedback: {WANTED}. Received {} instead of an array.",
+                    json_shape(results)
+                ));
+            };
+            let (index, bad) = items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| !item.get("id").is_some_and(Value::is_string))?;
+            Some(format!(
+                "auto_feedback: {WANTED}. Element {index} is {}.",
+                json_shape(bad)
+            ))
+        }
+
+        fn json_shape(value: &Value) -> String {
+            match value {
+                Value::Null => "null".to_string(),
+                Value::Bool(_) => "a boolean".to_string(),
+                Value::Number(_) => "a number".to_string(),
+                Value::String(_) => "a string".to_string(),
+                Value::Array(_) => "an array".to_string(),
+                Value::Object(_) => "an object with no string `id`".to_string(),
+            }
+        }
+
+        if let Some(message) = malformed_results(&params) {
+            return Err(RuntimeError::InvalidInput(message));
+        }
+
         let p: AutoFeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 

@@ -2378,6 +2378,7 @@ dependencies = [
  "khive-vamana",
  "lattice-embed",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

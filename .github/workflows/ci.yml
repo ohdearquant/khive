@@ -16,6 +16,29 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A push to a pull request branch moves the merge ref, so the run already in
+# flight is testing a ref nothing will merge; cancelling it frees its macOS
+# shards, which are the required checks on the critical path. Measured before
+# this landed: 9 of 19 active runs were for a head that was no longer the tip of
+# its branch, and macOS job start delay ran p90 34.5 min against 1.5 min for the
+# ubuntu shards.
+#
+# `main` deliberately does NOT cancel. Each main commit's run is the post-merge
+# record other work gates on, and a commit whose run was cancelled is a bisect
+# point that answers nothing later. `cancel-in-progress` takes an expression, so
+# both policies live in one workflow.
+concurrency:
+  # The group key is conditional on purpose, and a plain `github.ref` here would
+  # be wrong. A concurrency group holds at most ONE pending run: when a third
+  # arrives while one is running and one is pending, the pending one is
+  # CANCELLED, and `cancel-in-progress: false` does not prevent that -- it only
+  # governs the run already executing. So putting every `main` push in one group
+  # would cancel intermediate main runs, which is the outcome this is written to
+  # avoid. Keying non-pull_request runs on `github.run_id` gives each its own
+  # group, so nothing on main ever queues behind or displaces anything.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -107,14 +130,28 @@ jobs:
       # fail-fast on, the first red shard cancelled its siblings and the Clippy
       # step on the Linux shard did not run whenever another arm was red first.
       fail-fast: false
+      # The workspace test suite is nextest-partitioned 2-way per OS (see the
+      # "Workspace tests" step below). Every other phase in this job is gated to
+      # shard 1 so it still runs exactly once per OS — shard 2 exists only to
+      # carry the second test partition, not a second copy of lint/clippy/
+      # release/etc.
+      #
+      # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
+      # macos-pr step is gated `matrix.shard == 1`, so there is no second
+      # partition for macOS shard 2 to carry: it runs the one ungated
+      # placeholder scan and nothing else, in ~48s, while holding a macOS
+      # runner slot whose median queue time is 34.5 minutes against 0.1 for
+      # ubuntu. Pull requests therefore enumerate three jobs and leave that
+      # slot to a job that tests something. Push, nightly and manually
+      # dispatched runs are CI_SUITE == 'full', where macOS shard 2 does carry
+      # a real partition, so they keep all four.
+      #
+      # Written as an explicit include list rather than an `exclude` expression
+      # so both branches name every job they produce.
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # The workspace test suite is nextest-partitioned 2-way per OS (see the
-        # "Workspace tests" step below). Every other phase in this job is gated
-        # to shard 1 so it still runs exactly once per OS — shard 2 exists only
-        # to carry the second test partition, not a second copy of lint/clippy/
-        # release/etc.
-        shard: [1, 2]
+        include: ${{ fromJSON(github.event_name == 'pull_request'
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1}]'
+          || '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1},{"os":"macos-latest","shard":2}]') }}
     defaults:
       run:
         working-directory: crates
@@ -291,19 +328,28 @@ jobs:
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh channel-email
-      # Gated like every other shard-1 phase in this job: the introducing
-      # commit (cad6479dc) left no rationale for the lone ungated condition,
-      # and the macos-pr lane already runs the whole khive-mcp suite once via
-      # macos-pr-tests, so the focused portability lane keeps one serial run
-      # of the pair while push/nightly/manual full lanes repeat it 25x per OS
-      # (ADR-049 Amendment 3). timeout-minutes: a warm iteration measures
-      # Observed on ubuntu-latest runners: ~24s per iteration (2 tests,
-      # serial, plus per-iteration cargo overhead), so 25 iterations need
-      # ~10 minutes of test time alone before the initial build. Budget
-      # accordingly; a timeout here means the gate ran out of wall clock,
-      # not that a recovery flake was caught.
+      # Gated to ONE shard per OS, as every non-partitioned phase here is, but
+      # to shard 2 rather than shard 1, which is the only thing "exactly once
+      # per OS" actually requires. Everything else in this job sits on shard 1,
+      # and this step is its largest single contributor at ~14.8 min, so the
+      # two-way split carried ~29 min of work on one side: measured over 12
+      # pull_request runs, ubuntu shard 1 ran a median 48.6 min against shard
+      # 2's 11.2, and CI gate cannot report until both conclude. Moving this
+      # one step puts them at roughly 26 each.
+      #
+      # It runs 25x per OS on push/nightly/manual full lanes; the macos-pr lane
+      # already covers the khive-mcp suite once via macos-pr-tests, so the
+      # focused portability lane keeps one serial run of the pair (ADR-049
+      # Amendment 3). The introducing commit (cad6479dc) left no rationale for
+      # the lone ungated condition it originally carried.
+      #
+      # timeout-minutes: a warm iteration measures ~24s on ubuntu-latest (2
+      # tests, serial, plus per-iteration cargo overhead), so 25 iterations
+      # need ~10 minutes of test time alone before the initial build. Budget
+      # accordingly; a timeout here means the gate ran out of wall clock, not
+      # that a recovery flake was caught.
       - name: Daemon recovery flake gate
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        if: env.CI_SUITE == 'full' && matrix.shard == 2
         timeout-minutes: 25
         run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check

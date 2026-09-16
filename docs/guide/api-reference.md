@@ -249,10 +249,11 @@ request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary positi
 
 Fetch any record by UUID (auto-detects entity/note/edge/event/proposal). Returns the bare record with no envelope: `kind` is the granular kind (`concept`, `task`, `observation`, ...), `entity_type` is the governed subtype when one is set, and an entity's vocabulary type lives at `properties.type`.
 
-| Param             | Type | Required | Notes                                                                                                                  |
-| ----------------- | ---- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                           |
-| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix. |
+| Param             | Type | Required | Notes                                                                                                                                     |
+| ----------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid | yes      | Full UUID or short hex prefix (min 8 chars).                                                                                              |
+| `include_deleted` | bool | no       | Return a caller-owned soft-deleted entity, note, or edge (default false); accepts a full UUID or unique 8+ hex prefix.                    |
+| `parse_content`   | bool | no       | Default false. Parse a returned note's `content` as JSON; invalid JSON refuses with the note id and field. No effect on non-note records. |
 
 ```
 request(ops="get(id=\"3f2a9c1e\")")
@@ -311,10 +312,25 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 | `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `parse_content`              | bool                     | no       | Default false. Parse each returned note's `content` as JSON, including granular note kinds and keyed/cursor pages. Invalid JSON refuses with the note id and field; non-note lists are unchanged.                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
+
+`parse_content=true` replaces only a note's returned `content` field with its JSON value:
+objects, arrays, numbers, booleans, strings, and null are supported. Omission or false preserves
+the existing string representation, including whitespace and escapes. Parsing is a read projection;
+storage, sibling metadata, and pagination envelopes are unchanged. It does not parse note annotations
+inside a non-note `get` response. Content stays opaque to Agent presentation and format reductions,
+so IDs, timestamps, nulls, and empty values inside the payload are preserved. `format=json` returns
+that value directly, and `format=auto` preserves parsed values in its JSON result text.
+`format=table` serializes parsed objects and arrays back to JSON strings for display only;
+a parsed content array inside one `get` record does not itself become a table.
+Invalid JSON under `parse_content=true` returns `invalid_input`, naming the note UUID and
+`content` field; it does not fall back to a string and is distinct from the existing missing-note
+refusal. One invalid returned note refuses its list operation. Both verbs reject
+unknown fields by name; older servers without `parse_content` explicitly reject that parameter.
 
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
@@ -951,9 +967,37 @@ request(ops="scan(content=\"api_key=sk-...\")")
 ### `db_diagnostics` — Assertive
 
 Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
-main database: build identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
+main database: build and process identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
 `-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
 Takes no parameters.
+
+Every report includes `process` alongside `build`:
+
+```json
+{
+  "process": {
+    "pid": 12345,
+    "started_at": 1789272000,
+    "started_at_unavailable_reason": null,
+    "pool_generation": 1
+  }
+}
+```
+
+`pid` identifies the OS process serving this request. `started_at` is its OS-reported creation
+time in whole Unix epoch seconds (UTC), including when the pool or the first diagnostics request
+was created later. If that lookup is unsupported or unavailable, `started_at` is `null` and
+`started_at_unavailable_reason` is nonempty and names the platform limitation; a missing or empty
+reason with a null start time is a producer defect. Request time and zero are never used as
+fallback timestamps. Compare PID and available start time together when distinguishing process
+restarts: PIDs can be reused, and two processes can start within the same second.
+
+`pool_generation` starts at 1 in each process and increments whenever the main pool is
+reconstructed. Additional handles to the same pool and secondary-pool construction do not
+advance it. Reader counters and writer acquisition/task counters belong to that main pool;
+compare `(pid, started_at, pool_generation)` and start a fresh counter window whenever the
+triple changes. Checkpoint counters remain process-global. Point-in-time gauges and
+consecutive-failure counts can also decrease during normal operation.
 
 `reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
 reconstructed. `reader_admission_capacity` and `available_reader_admission_slots` are the
@@ -975,7 +1019,7 @@ The timeout setting applies to each admission attempt. A verb that issues severa
 reads can spend more than one configured timeout in total wall time, but each attempt is bounded
 and saturation never falls back to opening a standalone connection.
 
-`writer_contention` contains monotonic counters captured once per request:
+`writer_contention` contains counters captured once per request:
 `writer_acquisitions` is the total of `pooled_writer_acquisitions`,
 `standalone_writer_acquisitions`, and `writer_task_acquisitions`. The first counts successful
 finite-wait main-pool mutex checkouts, the second counts successful per-operation file-backed
@@ -2295,6 +2339,18 @@ request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uu
 ### `knowledge.topic` — Assertive
 
 List concepts filtered by domain or free-text query.
+
+With a non-null `query` (including an empty string), the response contains
+`results` and `candidate_window_count`, with no `total`. The count is the number
+of candidates remaining after hydration and optional domain filtering, before
+truncating output to `limit`. Search requests at most four times the effective
+output limit; the count is neither a full matching corpus count nor a pagination
+promise. Candidates excluded by the domain filter are not replaced.
+
+Without `query`, or with `query=null`, the response retains `results` and `total`:
+`total` counts all matching caller-visible concepts before the output limit.
+This branch does not include `candidate_window_count`. Any limit-report fields
+retain their own meanings and are independent of both counts.
 
 | Param    | Type    | Required | Notes                                       |
 | -------- | ------- | -------- | ------------------------------------------- |

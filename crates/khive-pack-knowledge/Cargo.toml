@@ -48,6 +48,9 @@ lattice-embed = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+# Test-only: the namespace-move acceptance arm is the primitive's caller, because
+# no verb reaches it yet, so it opens its own connection to the file-backed store.
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [[bench]]
 name = "knowledge_bench"

@@ -1,6 +1,6 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06, 2026-08-29, 2026-08-30b, 2026-08-30c, 2026-09-14, 2026-09-15)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 **Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which adds a bounded,
@@ -181,7 +181,10 @@ Where the body still reads otherwise, this amendment governs:
   [ADR-048](ADR-048-knowledge-section-profiles.md) §"Atom and section content constraints".
 - **`search`, `topic`, and `list` return `{results, total, ...}`**, not
   `{items, total}` — part of the response-envelope normalization. Inline
-  `{items: ...}` references below are stale.
+  `{items: ...}` references below are stale. The key beside `results` is what the
+  [2026-09-15 amendment](#amendment-2026-09-15-topic-query-candidate-window-counts)
+  narrows for one branch: a `topic` request carrying a non-null `query` reports
+  `candidate_window_count` and no `total`.
 
 ## Context
 
@@ -527,7 +530,11 @@ topic(domain?, query?, limit?) → {results: [...], total: N}
 
 The [2026-09-14 limit-report amendment](#amendment-2026-09-14-knowledge-list-and-topic-limit-reports)
 replaces this section's silent-cap, `items`, and cap-through-`total` description
-on acceptance, with separate definitions for the two existing `total` values.
+on acceptance, with separate definitions for the two existing `total` values. The
+[2026-09-15 candidate-window amendment](#amendment-2026-09-15-topic-query-candidate-window-counts)
+then renames the queried one: the signature above holds for the unqueried branch,
+and a request carrying a non-null `query` returns `candidate_window_count` in place
+of `total`.
 
 ### 6. Pack dependency declaration
 
@@ -728,3 +735,54 @@ refreezing, not weakened inequalities. Fixed runs must pass the same controls.
 A mutant kill requires the intended semantic assertion with a nonzero selected
 test count; compilation, setup failure and unrelated errors do not qualify.
 No test or mutation result is claimed by this contract.
+
+## Amendment (2026-09-15): topic query candidate-window counts
+
+**Status: Accepted (2026-09-15).** Related issue: #2732. This follow-on extends
+the accepted 2026-09-14 knowledge list/topic limit-report contract. Its
+implementation proceeds independently of the limit-report implementation; this
+amendment does not claim that those reports are already implemented.
+
+The accepted limit-report amendment deliberately retains `total` for two different quantities.
+This amendment supersedes only the queried topic count name: a successful
+`knowledge.topic` with a non-null `query` returns `candidate_window_count` instead
+of `total`. The count is the hydrated, domain-filtered candidate-window length
+before the final output take. It is bounded by the existing
+`effective_limit * 4` search request and is not a corpus-wide match count or an
+indication that a page walk can enumerate all matches. An empty or whitespace
+query remains on the query branch. Successful empty and zero-limit query results
+report `candidate_window_count: 0` and omit `total`.
+
+Without `query`, or with `query: null`, listing retains its full matching
+caller-visible concept `total` and omits `candidate_window_count`. A zero output
+limit may still report a positive listing total. The names are mutually exclusive;
+retaining the query `total` as an alias would retain the original ambiguity.
+
+Result shape and order, scores/snippets, branch selection, core-backend routing,
+namespace visibility, hydration, domain normalization/post-filtering, candidate
+bound and final take are unchanged. Wherever the three accepted limit-report
+fields are implemented, preserve them and their contract semantics; this
+amendment does not add those reports.
+No additional count, search, refill or storage operation is introduced. This is
+an explicit response-key migration: callers using query `total` must move to
+`candidate_window_count`; the new field remains output-only under the existing
+strict parameter decoder. Unqueried consumers keep using `total`.
+
+Acceptance requires a real indexed corpus with matching count greater than the
+candidate window, itself greater than returned rows; exact queried count and
+key-absence assertions must distinguish all three. A domain-filtered control
+must measure only the surviving initial window and show no refill from matching
+concepts outside it. Unqueried/null-query, zero and empty controls preserve the
+full-count semantics. Wherever limit reports and their queried-count witnesses
+are implemented, retain the reports and migrate only the queried-count key;
+the witnesses' numeric expectations and other controls remain unchanged.
+
+Native result: the arms added in #2818 witness all four requirements above. A
+17-concept corpus, a 12-candidate window and 3 returned rows are asserted with
+strict inequalities between all three, not only at the endpoints. The queried
+branch asserts `candidate_window_count == 12` and the absence of `total`; the
+listing branch asserts `total == 17` and the absence of `candidate_window_count`.
+The domain-filtered control tags four of a thirteen-deep ranking at positions 0,
+2, 5 and 8, requests a four-candidate window, and asserts
+`candidate_window_count == 2` against a listing total of 4, so two matches inside
+the window and two outside it show that the filter does not refill.

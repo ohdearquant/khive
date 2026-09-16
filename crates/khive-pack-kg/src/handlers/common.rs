@@ -432,6 +432,23 @@ fn derive_label(content: &str) -> Option<String> {
     Some(out)
 }
 
+/// Parse only the returned note body, after metadata normalization/projection.
+/// The stored string and all sibling fields remain untouched.
+pub(crate) fn parse_note_content(mut note: Value, enabled: bool) -> Result<Value, RuntimeError> {
+    if enabled {
+        if let Some(content) = note.get("content").and_then(Value::as_str) {
+            let parsed = serde_json::from_str::<Value>(content).map_err(|error| {
+                let id = note.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                RuntimeError::Khive(khive_types::KhiveError::invalid_input(format!(
+                    "note {id} field `content` is not valid JSON: {error}"
+                )))
+            })?;
+            note["content"] = parsed;
+        }
+    }
+    Ok(note)
+}
+
 pub(crate) fn remap_note_status(mut note_value: Value) -> Value {
     let Some(obj) = note_value.as_object_mut() else {
         return note_value;

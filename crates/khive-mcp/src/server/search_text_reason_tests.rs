@@ -200,6 +200,7 @@ mod search_text_reason_tests {
                 mode,
                 0,
                 khive_types::VerbPresentationPolicy::Standard,
+                khive_runtime::presentation::NoteContentScope::None,
             );
             assert_eq!(entry["ok"], true);
             assert_eq!(entry["status"], "complete");
