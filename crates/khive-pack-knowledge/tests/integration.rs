@@ -6231,7 +6231,12 @@ async fn issue_558_merge_missing_and_validation_errors_unchanged() {
         ] {
             let is_note = matches!(kind, Some("note" | "observation"));
             let ordinary = if is_note { &note } else { &entity };
-            let expected = if is_note {
+            // A soft-deleted operand resolves to nothing, so with `kind`
+            // omitted the refusal names the id and no substrate, whichever
+            // side it is on (#2858).
+            let expected = if kind.is_none() {
+                private.to_string()
+            } else if is_note {
                 "not found in this namespace".into()
             } else {
                 format!("entity {private}")
