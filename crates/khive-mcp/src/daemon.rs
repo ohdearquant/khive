@@ -3512,9 +3512,27 @@ mod tests {
                         .args(["-c", "exit 0"])
                         .spawn()
                 };
-                let result =
-                    kill_and_respawn_with_exit_timeout(CFG, NS, &spawn, Duration::from_secs(2))
-                        .await;
+                // Reap our child while recovery observes its exit: without `ps`
+                // access, an exited but unreaped child still looks alive to kill(0).
+                // Keep it in the guard so a timeout or panic still cleans it up.
+                let reap_incumbent = async {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if let Some(status) = cleanup.child_mut().try_wait().unwrap() {
+                            break status;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "incumbent did not finish graceful exit"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                let (result, incumbent_status) = tokio::join!(
+                    kill_and_respawn_with_exit_timeout(CFG, NS, &spawn, Duration::from_secs(2)),
+                    reap_incumbent,
+                );
+                assert!(incumbent_status.success());
                 match (successor_wins, result) {
                     (false, Ok(RecoveryOutcome::Spawned(mut child))) => {
                         assert!(child.wait().unwrap().success());
@@ -3522,7 +3540,6 @@ mod tests {
                     (true, Ok(RecoveryOutcome::Uncertain)) => {}
                     (_, other) => panic!("unexpected recovery outcome: {other:?}"),
                 }
-                assert!(cleanup.child_mut().wait().unwrap().success());
                 assert_eq!(
                     launches.load(Ordering::SeqCst),
                     usize::from(!successor_wins)
