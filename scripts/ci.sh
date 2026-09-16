@@ -60,6 +60,24 @@ phase_lint() {
     uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
 }
 
+phase_docs_fmt() {
+    echo "=== Docs Format Check ==="
+    # The hosted docs job runs `deno fmt --check` from the repo root over the
+    # set named in ./deno.json, and until this phase existed nothing in this
+    # script did, so a markdown table padded by hand passed every local phase
+    # and failed on the hosted side. The job now runs this phase, so the two
+    # sides execute one command rather than two copies of it.
+    #
+    # A missing deno is a refusal, not a skip: a gate whose discovery can be
+    # emptied silently exits 0 and checks nothing. The deno-tests phase needs
+    # the same binary, so a checkout that cannot run this cannot run that either.
+    if ! command -v deno > /dev/null 2>&1; then
+        echo "deno not found on PATH: install deno v2.x (https://deno.com); the deno-tests phase needs it too" >&2
+        exit 1
+    fi
+    (cd "$SCRIPT_DIR/.." && deno fmt --check)
+}
+
 phase_no_stubs_scan() {
     echo "=== No-Stub Guard (placeholder-string panic!/unreachable! scan) ==="
     # SECURITY ORDERING (#560 follow-up): this placeholder-string scan and its
@@ -387,9 +405,45 @@ phase_macos_pr_check() {
 
 phase_macos_pr_tests() {
     echo "=== macOS PR Platform Tests ==="
-    # These crates own the SQLite/filesystem, daemon/process, and native CLI
-    # boundaries where macOS behavior has historically differed from Linux.
-    cargo test -p khive-db -p khive-runtime -p khive-mcp -p khive-pack-git -p kkernel --features khive-mcp/channel-email
+    # The selection is derived from where the tree actually diverges by target
+    # OS, not from which crates sound platform-shaped. `cfg(unix)` is true on
+    # Linux as well, so it selects nothing here; the discriminator is a
+    # `target_os` arm, and every one of them in the workspace lives in
+    # khive-db (walpin, blob store), khive-runtime (daemon, engine config,
+    # resource), khive-pack-exec (sandbox and rlimits), khive-pack-moodboard
+    # (resolving an open file descriptor back to a path) or khive-pack-git
+    # (local remote handling).
+    #
+    # Everything dropped from this list still runs, on the Linux shards, which
+    # partition `cargo nextest run --workspace`. What is given up is a second
+    # execution on macOS of code that compiles identically on both.
+    #
+    # A `target_os` arm is a COMPILE-time divergence, and it is not the only
+    # kind. khive-mcp has no such arm and is still here, because its daemon
+    # rendezvous pair diverges at RUN time: the tests exercise socket recovery
+    # under deliberate contention, which is scheduler behaviour, and the flake
+    # gate that repeats them 25 times says in its own comment that it does so
+    # on every supported CI OS for exactly that reason. That gate runs only on
+    # the full lanes, so dropping khive-mcp here would leave a pull request
+    # with no macOS execution of the pair at all. `--lib` keeps the unit tests
+    # that hold it without pulling in the integration targets.
+    #
+    # khive-pack-exec carries test functions that only exist under
+    # `cfg(target_os = "macos")`, so a Linux shard cannot run them at all.
+    # Before this list included it they ran on pushes to main and never on the
+    # pull request that introduced them.
+    #
+    # khive-pack-moodboard is here for the opposite reason: it has no macOS-only
+    # test, it has two different IMPLEMENTATIONS of one function, reading an
+    # open descriptor's path from /proc on Linux and from fcntl on macOS. Both
+    # compile everywhere, the result guards a symlink escape out of the model
+    # directory, and only running the test decides whether the macOS one is
+    # right.
+    cargo test -p khive-db -p khive-runtime -p khive-pack-exec -p khive-pack-moodboard
+    # khive-pack-git's platform arms are in its unit tests; its integration
+    # targets are git plumbing that behaves the same on both systems. khive-mcp
+    # is `--lib` for the run-time reason given above.
+    cargo test -p khive-pack-git -p khive-mcp --lib
 }
 
 run_phase() {
@@ -403,6 +457,7 @@ run_phase() {
     fi
     case "$1" in
         no-stubs-scan) phase_no_stubs_scan ;;
+        docs-fmt) phase_docs_fmt ;;
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
@@ -424,7 +479,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -433,6 +488,7 @@ run_phase() {
 set_run_all_phases() {
     run_all_phases="\
         no-stubs-scan \
+        docs-fmt \
         lockfile \
         forward-deployed \
         lint \

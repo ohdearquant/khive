@@ -728,7 +728,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "target_id",
                 param_type: "string",
                 required: false,
-                description: "Optional UUID of the atom or entity being rated. When provided alongside a configured brain profile, feedback is also forwarded to brain.feedback for profile-scoped section tracking.",
+                description: "Optional UUID of the atom or entity being rated. It is forwarded to brain.feedback for profile-scoped section tracking only when a profile resolves: one configured on the pack, or one bound to this namespace for consumer_kind knowledge_compose. When neither resolves, the signals are applied to this namespace's pack-local section posteriors and the id is not consulted at all, which the response reports as tier=namespace_local with target_id_used=false. A forwarded id must name an entity or a note, the only kinds brain.feedback resolves; a domain id, such as the ones suggest returns, is not one of them and is refused there.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

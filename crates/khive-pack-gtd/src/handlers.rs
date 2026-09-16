@@ -1142,6 +1142,26 @@ pub async fn prepare_transition(
     let (note, current) = load_task(runtime, token, raw_id).await?;
 
     if current == target {
+        // A same-status transition is a read assertion: ADR-099's mutation-free
+        // amendment says it never advances a version, appends an audit row, or
+        // records a transition note. A caller that supplies a note is therefore
+        // asking for something this path cannot do, and returning success would
+        // report the note as delivered. Refuse instead of discarding it. The
+        // bare form stays idempotent and silent, which is what the assertion is
+        // for.
+        // An empty or whitespace-only note carries nothing to discard, and
+        // `empty_string_noop_note_is_ignored` pins it as accepted, so the
+        // refusal keys on a note with content rather than on the field's
+        // presence.
+        if note_arg.is_some_and(|n| !n.trim().is_empty()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "task {} is already in status {target:?}; a same-status transition asserts the \
+                 status and persists nothing, so the supplied note would be discarded. Omit the \
+                 note to assert the status, or record the annotation with \
+                 update(id, properties={{\"transition_note\": ...}}).",
+                short_id(note.id)
+            )));
+        }
         return Ok(TransitionDecision::NoOp {
             note,
             current,
@@ -1867,21 +1887,23 @@ impl GtdPack {
                 current,
                 target,
             } => {
-                // Same-status is a read assertion, not a lifecycle event. A
-                // caller note describes a transition that did not happen, so
-                // neither the note nor an audit row is persisted.
-                let mut response = json!({
+                // Same-status is a read assertion, not a lifecycle event, so
+                // nothing is persisted. The explanation is returned under
+                // `reason`: it is not the caller's note, and returning it under
+                // `note` handed back a different value under the caller's own
+                // key. `note_recorded` is unconditional, so a caller reads one
+                // field rather than inferring from a key's presence; a note
+                // supplied here is refused in `prepare_transition`, so the only
+                // value this path can report is false.
+                return Ok(json!({
                     "transitioned": false,
+                    "note_recorded": false,
                     "id": short_id(note.id),
                     "full_id": note.id.as_hyphenated().to_string(),
                     "from": current,
                     "to": target,
-                    "note": "already in target status",
-                });
-                if p.note.is_some() {
-                    response["note_recorded"] = json!(false);
-                }
-                return Ok(response);
+                    "reason": "already in target status",
+                }));
             }
             TransitionDecision::Write {
                 mut note,

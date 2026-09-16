@@ -226,10 +226,11 @@ async fn lifecycle_success_reports_audit_degradation_when_insert_fails() {
             }),
         )
         .await
-        .expect("canonical note-bearing no-op remains successful");
-    assert_eq!(noop["transitioned"], false);
-    assert_eq!(noop["note_recorded"], false);
-    assert!(noop.get("audit_persisted").is_none());
+        .expect_err("a note on a same-status request is refused, degraded audit or not");
+    assert!(
+        noop.to_string().contains("already in status"),
+        "the refusal must name the condition: {noop}"
+    );
 
     let mut reader = rt.sql().reader().await.expect("sql reader");
     let rows = reader
@@ -528,25 +529,22 @@ async fn noop_transition_with_note_is_audit_free() {
         .await
         .expect("real transition should succeed");
 
-    // A same-status request is not a lifecycle event. A caller-supplied note
-    // must not claim that a transition happened.
-    let r = fixture
+    // A same-status request is not a lifecycle event, so there is nothing for a
+    // caller note to annotate. Reporting success while dropping it made the
+    // envelope a fabricated positive, so the call is refused instead.
+    let err = fixture
         .dispatch(
             "gtd.transition",
             json!({"id": task_id, "status": "next", "note": "still working on it"}),
         )
         .await
-        .expect("noop transition with note should succeed");
-    assert_eq!(
-        r["transitioned"], false,
-        "noop must still report transitioned=false"
+        .expect_err("a note on a same-status request must be refused");
+    assert!(
+        err.to_string().contains("already in status"),
+        "the refusal must name the condition: {err}"
     );
-    assert_eq!(r["note"], "already in target status");
-    assert_eq!(
-        r["note_recorded"], false,
-        "a caller note on a same-status request is reported as not recorded"
-    );
-    assert!(r.get("audit_persisted").is_none());
+
+    // The refusal is what keeps the audit table clean below: nothing ran.
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
