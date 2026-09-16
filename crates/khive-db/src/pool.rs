@@ -575,6 +575,12 @@ pub struct ReaderGuard<'pool> {
     /// `reader_connection_settings_match_baseline` never touch the hot path
     /// of an ordinary typed checkout.
     dirty: Cell<bool>,
+    /// Names the typed-store operation this checkout was resolved for, set
+    /// once by [`ConnectionPool::resolve_reader_checkout`]. `None` means the
+    /// checkout never passed that route (the pool-internal and raw-SQL
+    /// callers), and the diagnostics maximum reports it as unattributed
+    /// rather than guessing.
+    operation: Option<&'static str>,
 }
 
 impl<'pool> ReaderGuard<'pool> {
@@ -632,6 +638,13 @@ impl<'pool> ReaderGuard<'pool> {
     pub(crate) fn mark_dirty(&self) {
         self.dirty.set(true);
     }
+
+    /// Name the typed-store operation this checkout serves, so a long hold
+    /// can be attributed in diagnostics instead of arriving as a bare
+    /// maximum with no next step (#2793).
+    pub(crate) fn label_operation(&mut self, operation: &'static str) {
+        self.operation = Some(operation);
+    }
 }
 
 impl<'pool> Drop for ReaderGuard<'pool> {
@@ -671,7 +684,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         drop(self.admission_slot.take());
         self.pool
             .reader_acquisition_counters
-            .record_checkout_completed(self.checked_out_at.elapsed());
+            .record_checkout_completed(self.checked_out_at.elapsed(), self.operation);
     }
 }
 
@@ -736,7 +749,10 @@ impl Drop for SharedReaderTransactionGuard {
         drop(self.admission_slot.take());
         self.pool
             .reader_acquisition_counters
-            .record_checkout_completed(self.checked_out_at.elapsed());
+            .record_checkout_completed(
+                self.checked_out_at.elapsed(),
+                Some("explicit_sql_read_transaction"),
+            );
     }
 }
 
@@ -884,12 +900,26 @@ pub struct ReaderAcquisitionSnapshot {
     /// Longest completed checkout hold, including return/reset, in
     /// microseconds. Diagnostic evidence only; never a test timing gate.
     pub max_completed_hold_micros: u64,
+    /// The typed-store operation that held the checkout reported in
+    /// `max_completed_hold_micros`. `None` when that hold came from a route
+    /// that carries no operation name, which is itself the answer rather
+    /// than a missing reading (#2793).
+    pub max_completed_hold_operation: Option<&'static str>,
     /// A disqualified pooled-reader return (reset/pristine-check failure)
     /// whose replacement connection then also failed to open, permanently
     /// shrinking the physical pool by one slot below `max_readers`. Logged at
     /// `warn` when it happens; this counter makes the shrink observable in a
     /// snapshot too, since the pool itself never re-grows on its own.
     pub reader_replacement_open_failures: u64,
+}
+
+/// The longest completed pooled-reader hold and the operation that held it,
+/// kept under one lock so a snapshot cannot pair one checkout's duration with
+/// another's name.
+#[derive(Debug, Default, Clone, Copy)]
+struct LongestCompletedHold {
+    micros: u64,
+    operation: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -901,7 +931,7 @@ struct ReaderAcquisitionCounters {
     active_pooled_checkouts: AtomicU64,
     peak_active_pooled_checkouts: AtomicU64,
     completed_pooled_checkouts: AtomicU64,
-    max_completed_hold_micros: AtomicU64,
+    longest_completed_hold: parking_lot::Mutex<LongestCompletedHold>,
     reader_replacement_open_failures: AtomicU64,
 }
 
@@ -934,14 +964,20 @@ impl ReaderAcquisitionCounters {
         }
     }
 
-    fn record_checkout_completed(&self, hold: Duration) {
+    fn record_checkout_completed(&self, hold: Duration, operation: Option<&'static str>) {
         let previous = self.active_pooled_checkouts.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "reader active-checkout counter underflow");
         self.completed_pooled_checkouts
             .fetch_add(1, Ordering::Relaxed);
         let micros = u64::try_from(hold.as_micros()).unwrap_or(u64::MAX);
-        self.max_completed_hold_micros
-            .fetch_max(micros, Ordering::Relaxed);
+        // The maximum and the name of what held it are one reading: taken
+        // apart they can report a duration from one checkout beside a label
+        // from another, which is worse than no label at all.
+        let mut longest = self.longest_completed_hold.lock();
+        if micros > longest.micros {
+            longest.micros = micros;
+            longest.operation = operation;
+        }
     }
 
     fn snapshot(
@@ -951,6 +987,7 @@ impl ReaderAcquisitionCounters {
     ) -> ReaderAcquisitionSnapshot {
         let pooled_checkouts = self.pooled_checkouts.load(Ordering::Relaxed);
         let standalone_opens = self.standalone_opens.load(Ordering::Relaxed);
+        let longest_completed_hold = *self.longest_completed_hold.lock();
         ReaderAcquisitionSnapshot {
             reader_admission_capacity,
             available_reader_admission_slots,
@@ -964,7 +1001,8 @@ impl ReaderAcquisitionCounters {
             active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
             peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
             completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
-            max_completed_hold_micros: self.max_completed_hold_micros.load(Ordering::Relaxed),
+            max_completed_hold_micros: longest_completed_hold.micros,
+            max_completed_hold_operation: longest_completed_hold.operation,
             reader_replacement_open_failures: self
                 .reader_replacement_open_failures
                 .load(Ordering::Relaxed),
@@ -1360,6 +1398,7 @@ impl ConnectionPool {
                         reusable: true,
                         checked_out_at: Instant::now(),
                         dirty: Cell::new(false),
+                        operation: None,
                     }));
                 }
             }
@@ -1380,6 +1419,7 @@ impl ConnectionPool {
                     reusable: true,
                     checked_out_at: Instant::now(),
                     dirty: Cell::new(false),
+                    operation: None,
                 }));
             }
 
@@ -1654,7 +1694,10 @@ impl ConnectionPool {
         outcome: Result<Option<ReaderGuard<'p>>, SqliteError>,
     ) -> Result<ReaderGuard<'p>, StorageError> {
         match outcome {
-            Ok(Some(guard)) => Ok(guard),
+            Ok(Some(mut guard)) => {
+                guard.label_operation(operation);
+                Ok(guard)
+            }
             Ok(None) => Err(StorageError::Timeout {
                 operation: operation.into(),
             }),
@@ -5398,6 +5441,83 @@ mod tests {
             ),
             "any other checkout error must stay a non-retryable Driver failure \
              under the caller's capability, got {opaque:?}"
+        );
+    }
+
+    /// #2793: a maximum with no name has no next step for the operator who
+    /// reads it. The fast checkouts are the control — they complete through
+    /// the same route, so naming the slow one distinguishes rather than
+    /// restating that something was recorded.
+    #[test]
+    fn the_longest_completed_hold_names_the_operation_that_held_it() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        for _ in 0..3 {
+            let guard = pool
+                .resolve_reader_checkout(
+                    StorageCapability::Sql,
+                    "fast_read",
+                    pool.reader_until(|| false),
+                )
+                .expect("a fast checkout resolves");
+            drop(guard);
+        }
+
+        let slow = pool
+            .resolve_reader_checkout(
+                StorageCapability::Sql,
+                "slow_read",
+                pool.reader_until(|| false),
+            )
+            .expect("the slow checkout resolves");
+        // The sleep orders the holds; nothing here asserts a duration, because
+        // the hold figure is diagnostic evidence and never a timing gate.
+        thread::sleep(Duration::from_millis(20));
+        drop(slow);
+
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(
+            snapshot.completed_pooled_checkouts, 4,
+            "all four checkouts must complete through the pooled route, or the \
+             attribution below is reading a population of one"
+        );
+        assert_eq!(
+            snapshot.max_completed_hold_operation,
+            Some("slow_read"),
+            "the longest hold must name the operation that held it; got {:?} at \
+             {} micros",
+            snapshot.max_completed_hold_operation,
+            snapshot.max_completed_hold_micros
+        );
+    }
+
+    /// The `None` in the snapshot is a reading, not a gap: a checkout that
+    /// never passed `resolve_reader_checkout` carries no operation name, and
+    /// the diagnostics say so rather than attributing it to whatever ran
+    /// nearby.
+    #[test]
+    fn a_checkout_taken_outside_the_resolve_route_reports_no_operation() {
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        })
+        .unwrap();
+
+        let guard = pool
+            .reader_until(|| false)
+            .expect("the checkout succeeds")
+            .expect("the checkout is not cancelled");
+        drop(guard);
+
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.completed_pooled_checkouts, 1);
+        assert_eq!(
+            snapshot.max_completed_hold_operation, None,
+            "an unlabelled route must report no operation rather than borrow one"
         );
     }
 }

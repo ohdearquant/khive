@@ -15104,6 +15104,19 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         );
     }
 
+    // The hold attribution is the one field here that is not a counter: it
+    // names the operation behind `max_completed_reader_hold_micros`, or null
+    // when that hold came through a route carrying no operation name (#2793).
+    // Asserted separately because the loop above requires an integer, and a
+    // field left out of both checks is a field that can disappear unnoticed.
+    let attribution = reader_contention
+        .get("max_completed_reader_hold_operation")
+        .expect("reader_contention.max_completed_reader_hold_operation must be in the payload");
+    assert!(
+        attribution.is_null() || attribution.is_string(),
+        "the hold attribution must be an operation name or null, got {attribution:?}"
+    );
+
     let writer_contention = report
         .get("writer_contention")
         .expect("writer_contention section must be present");
