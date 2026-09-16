@@ -396,3 +396,83 @@ missed: the first skips rows, the second corrupts them.
 - The fixture is built through the store's own writers. A SQL seed produces no fts5 shadow rows, no
   write-log entries and no vector rows, so it would exercise everything except the part that is
   hard.
+
+## Amendment 1 (2026-09-15): the source side of a move, and what a partitioning move cannot carry
+
+**Status: proposed.** Three corrections found while implementing the primitive this ADR specifies.
+Each is a place where the accepted text describes one side of a two-sided operation, or presumes a
+shape of request it does not name.
+
+### 1. The ANN write log takes two entries per moved vector, not one
+
+§"Derived rows move with their parent" says `ann_write_log` is "appended under the target namespace
+at a fresh `seq`". That is one side only.
+
+A consumer builds its index per `(namespace, embedding_model)` and advances a watermark over this
+log; `ann_consumer_watermark` is keyed `(consumer, namespace, embedding_model)`. An `upsert`
+appended under the target tells the target's consumer to take the vector. Nothing tells the source's
+consumer to drop it, so the source index keeps answering searches for a subject that is no longer in
+its namespace.
+
+This is the failure this ADR already names one layer down, for the vectors themselves: "a vector
+left under the source namespace survives a later delete of its record under the target namespace,
+and then keeps answering searches for content the caller deleted." The same argument applies to the
+consumer's copy of that vector, and the document made it in one place and not the other.
+
+**Corrected text:** per moved vector the move appends a `delete` under the source namespace and an
+`upsert` under the target namespace, in that order.
+
+Per MOVED vector, and the qualifier is load-bearing rather than decorative. A target namespace is
+allowed to hold vectors of its own already, and they are not part of this move: telling the target's
+consumer to upsert them costs a tombstone and an insert each, for an index that was correct before
+the request arrived, and the cost scales with the target rather than with the move. The set of moved
+vectors has to be read before the rows are rewritten, because afterwards nothing distinguishes them
+from the residents.
+
+### 2. "The namespace it belongs to" presumes a total single-target move
+
+§"Derived rows move with their parent" lists `proposals_open` as carried "with the namespace it
+belongs to". Read at the schema, it is keyed `proposal_id TEXT PRIMARY KEY`, with `namespace` a
+plain column and no reference to any subject.
+
+So it has exactly the problem this ADR already recognises for `brain_profile_snapshots` and
+`brain_event_log`: in a partitioning move that routes several classes to several targets, there is
+no single namespace left for it to belong to. The phrase presumes a total single-target request
+without saying so.
+
+**Corrected text:** `proposals_open` is a namespace-scoped aggregate. It moves when the request is
+total and single-target, and is reported as left behind otherwise, in the same way as the brain
+aggregates.
+
+### 3. A partial application across backends is a resume point, not a new failure mode
+
+A pack may be assigned its own backend, and SQLite has no transaction across unattached databases.
+The primitive therefore operates on the connection it is given, and a store with three backends is
+the same route map applied three times.
+
+That composes, because a routed class with no rows succeeds reporting zero. Atomicity does not
+compose, and this amendment states the consequence rather than leaving it implied: a backend whose
+move did not run holds the state that existed before anyone asked, so a partial application is a
+resume point and re-running the same request against the remaining backends is defined.
+
+### Acceptance
+
+This amendment is accepted on an executable arm, not on the text above. Asserting that two
+`ann_write_log` rows were appended is a claim about what was written; it passes against a consumer
+that never reads them. The arm asserts what the index does:
+
+1. Warm namespace A's consumer and search A for the subject, requiring a **hit**. This pre-state
+   control is the load-bearing one: without it, a fixture whose source consumer was never warm
+   produces a miss in step 4 for a reason that has nothing to do with the move.
+2. Move the subject from A to B.
+3. Advance A's consumer past its watermark.
+4. Search A, requiring a **miss**.
+5. Search B in the same run, requiring a **hit**.
+
+Falsifier: remove the `delete`-under-source append from the implementation and step 4 must FAIL, its
+search of A returning the hit the move was supposed to have retired. An arm that cannot be reddened
+by removing the mechanism it names is not testing it, and the direction has to be written down
+because every step here asserts an absence except the two controls that bracket it.
+
+The arm's home is the knowledge pack, above `khive-db`, because that is where the consumer surface
+and the watermark actually live.
