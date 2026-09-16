@@ -377,9 +377,12 @@ pub struct CheckpointConfig {
     /// WAL page count above which a high-pressure WARNING is logged.
     ///
     /// The periodic task always runs PASSIVE regardless; this threshold signals
-    /// that a long-lived reader may be pinning an old WAL snapshot that PASSIVE
-    /// cannot reclaim. An operator can then schedule a blocking TRUNCATE at a
-    /// safe moment outside normal write traffic.
+    /// only that the WAL is not draining. Whether an old snapshot is pinning it
+    /// is decided at the crossing from the transaction registry, against
+    /// `tx_warn_secs` — see `log_wal_high_water_warn`, which names a holder when
+    /// one exists and rules the hypothesis out when none does. Either way an
+    /// operator can schedule a blocking TRUNCATE at a safe moment outside
+    /// normal write traffic; the two cases differ in what else is worth doing.
     ///
     /// Overridable via `KHIVE_WAL_HIGH_WATER_PAGES`.
     /// Default: 6000 pages (~24 MB at 4 KiB page size).
@@ -2308,11 +2311,11 @@ pub async fn run_checkpoint_task(
         let high_water_crossed = crossing_warn(above_high_water, &mut was_above_high_water);
         if high_water_crossed {
             log_tx_registry_snapshot_warn(wal_pages);
-            tracing::warn!(
+            log_wal_high_water_warn(
                 wal_pages,
-                high_water = config.high_water_pages,
-                "WAL high-water mark exceeded; sustained WAL pressure — \
-                 a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
+                config.high_water_pages,
+                oldest_tx.as_ref(),
+                config.tx_warn_secs,
             );
         }
 
@@ -2515,6 +2518,58 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
             tx_label = label.as_deref().unwrap_or("<unlabeled>"),
             "WAL high-water: open transaction registry entry"
         );
+    }
+}
+
+/// Emits the high-water WARN, deciding its text from the registry entry this
+/// tick already read instead of asserting a cause the evidence beside it can
+/// refute.
+///
+/// The previous text named "a long-lived reader ... pinning an old snapshot"
+/// unconditionally, immediately after `log_tx_registry_snapshot_warn` printed
+/// the registry. In a capture of six consecutive crossings the oldest open
+/// transaction was never older than six milliseconds and was a writer every
+/// time, so the line sent an operator hunting a reader that did not exist
+/// while the WAL grew monotonically. The two cases have disjoint remedies —
+/// find the holder, versus checkpoint cadence, autocheckpoint threshold and
+/// write batching — which is why naming the wrong one costs more than naming
+/// none.
+///
+/// `warn_after` is `tx_warn_secs`, the same threshold the age ladder earlier
+/// in the tick already uses to call an open span old; a second, private
+/// threshold here would let the two disagree about the same registry. An entry
+/// at or past it is named with its age and label. Anything younger, and an
+/// empty registry, take the other branch, which states what was measured and
+/// rules the pin hypothesis OUT rather than leaving it standing.
+///
+/// The age field carries `Option` on that branch rather than a zero: a young
+/// entry and no entry are different observations, and a fabricated 0.0 would
+/// make them read the same.
+fn log_wal_high_water_warn(
+    wal_pages: u64,
+    high_water: u64,
+    oldest: Option<&khive_storage::tx_registry::OldestSpan>,
+    warn_after: Duration,
+) {
+    match oldest.filter(|span| span.age >= warn_after) {
+        Some(span) => tracing::warn!(
+            wal_pages,
+            high_water,
+            oldest_tx_age_secs = span.age.as_secs_f64(),
+            oldest_tx_label = span.label.as_deref().unwrap_or("<unlabeled>"),
+            "WAL high-water mark exceeded; an open transaction older than the age \
+             threshold is pinning a snapshot PASSIVE cannot reclaim"
+        ),
+        None => tracing::warn!(
+            wal_pages,
+            high_water,
+            oldest_tx_age_secs = ?oldest.map(|span| span.age.as_secs_f64()),
+            oldest_tx_label = oldest
+                .and_then(|span| span.label.as_deref())
+                .unwrap_or("<none>"),
+            "WAL high-water mark exceeded with no open transaction old enough to pin \
+             a snapshot; the WAL is growing faster than PASSIVE checkpoints reclaim it"
+        ),
     }
 }
 
@@ -3399,6 +3454,131 @@ mod tests {
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Builds two `OldestSpan`s that differ ONLY in age, off one real
+    /// registration so the id and origin are the ones the tick would carry.
+    /// The ages straddle the threshold passed to the function under test.
+    fn spans_straddling(
+        threshold: Duration,
+    ) -> (
+        khive_storage::tx_registry::OldestSpan,
+        khive_storage::tx_registry::OldestSpan,
+    ) {
+        let _handle = khive_storage::tx_registry::register(Some("writer_task_tx".to_string()));
+        let (id, _age, _label) =
+            khive_storage::tx_registry::oldest().expect("a registration is open");
+        let base = khive_storage::tx_registry::OldestSpan {
+            id,
+            age: Duration::ZERO,
+            label: Some("writer_task_tx".to_string()),
+            origin: khive_storage::tx_registry::TxOrigin::Unscoped,
+        };
+        let aged = khive_storage::tx_registry::OldestSpan {
+            age: threshold + Duration::from_secs(1),
+            ..base.clone()
+        };
+        let young = khive_storage::tx_registry::OldestSpan {
+            // The capture that produced this fix: 5.8 ms, a writer.
+            age: Duration::from_micros(5_849),
+            ..base
+        };
+        (aged, young)
+    }
+
+    fn capture<F: FnOnce()>(f: F) -> Vec<CapturedEvent> {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        tracing::subscriber::with_default(subscriber, f);
+        let events = buffer.lock().unwrap();
+        events.clone()
+    }
+
+    /// An entry at or past the threshold: the WARN names it, its age and its
+    /// label. This is the branch the old unconditional text was right about.
+    #[test]
+    #[serial(tx_registry)]
+    fn high_water_warn_names_the_pin_when_an_aged_entry_exists() {
+        let threshold = Duration::from_secs(30);
+        let (aged, _young) = spans_straddling(threshold);
+
+        let events = capture(|| log_wal_high_water_warn(6003, 6000, Some(&aged), threshold));
+
+        let message = events
+            .iter()
+            .find_map(|e| e.message.clone())
+            .expect("one WARN is emitted");
+        assert!(
+            message.contains("is pinning a snapshot"),
+            "an aged entry must produce the pin wording, got {message:?}"
+        );
+        assert_eq!(
+            events.iter().find_map(|e| e.oldest_tx_label.clone()),
+            Some("writer_task_tx".to_string()),
+            "the named entry is the one handed in"
+        );
+    }
+
+    /// WAL over the high-water mark with nothing old enough to be pinning:
+    /// different text, and the control below is the point of the arm.
+    #[test]
+    #[serial(tx_registry)]
+    fn high_water_warn_rules_the_pin_out_when_the_oldest_entry_is_young() {
+        let threshold = Duration::from_secs(30);
+        let (aged, young) = spans_straddling(threshold);
+
+        let young_message =
+            capture(|| log_wal_high_water_warn(6003, 6000, Some(&young), threshold))
+                .iter()
+                .find_map(|e| e.message.clone())
+                .expect("one WARN is emitted");
+        let aged_message = capture(|| log_wal_high_water_warn(6003, 6000, Some(&aged), threshold))
+            .iter()
+            .find_map(|e| e.message.clone())
+            .expect("one WARN is emitted");
+
+        // One fixture cannot demonstrate a branch: the two must differ.
+        assert_ne!(
+            young_message, aged_message,
+            "the two registry states must produce different text"
+        );
+        assert!(
+            young_message.contains("no open transaction old enough to pin"),
+            "got {young_message:?}"
+        );
+        // THE CONTROL, and it is the exact failure being fixed: the young
+        // branch must not carry the pin hypothesis in any form.
+        assert!(
+            !young_message.contains("pinning"),
+            "the young branch must not assert a pin, got {young_message:?}"
+        );
+        assert!(
+            !young_message.contains("long-lived reader"),
+            "the young branch must not name a reader, got {young_message:?}"
+        );
+    }
+
+    /// An empty registry is the same branch as a young entry, and it must not
+    /// be reached by the aged path through a `None` that compares as old.
+    #[test]
+    #[serial(tx_registry)]
+    fn high_water_warn_with_an_empty_registry_takes_the_no_pin_branch() {
+        let events = capture(|| log_wal_high_water_warn(6003, 6000, None, Duration::from_secs(30)));
+        let message = events
+            .iter()
+            .find_map(|e| e.message.clone())
+            .expect("one WARN is emitted");
+        assert!(
+            message.contains("no open transaction old enough to pin"),
+            "got {message:?}"
+        );
+        assert_eq!(
+            events.iter().find_map(|e| e.oldest_tx_label.clone()),
+            Some("<none>".to_string()),
+            "an absent entry is labelled as absent, never as unlabeled"
+        );
     }
 
     /// `log_tx_registry_oldest_debug` names the oldest open registry entry.
