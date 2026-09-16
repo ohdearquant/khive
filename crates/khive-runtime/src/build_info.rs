@@ -138,6 +138,72 @@ mod tests {
         assert_eq!(build_info_support::source_revision(non_git.path()), None);
     }
 
+    /// A `rerun-if-changed` path that does not exist is not "unchanged" to cargo, it is
+    /// permanently stale, so the unit rebuilds on every invocation forever. `git rev-parse
+    /// --git-path refs/heads/<branch>` answers with the loose ref path whether or not the ref is
+    /// loose, and packing prunes that file.
+    #[test]
+    fn git_rerun_inputs_drop_the_loose_ref_path_once_the_ref_is_packed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo_with_one_commit(repo.path());
+        run_git(repo.path(), &["pack-refs", "--all"]);
+
+        let branch = build_info_support::git_output(repo.path(), &["symbolic-ref", "-q", "HEAD"])
+            .expect("a fresh repository is on a branch");
+        let loose = repo.path().join(".git").join(&branch);
+
+        // THE PRECONDITION IS ASSERTED, NOT ASSUMED. If a git version stopped pruning the
+        // loose ref here the arm would otherwise pass while testing nothing.
+        assert!(
+            !loose.exists(),
+            "packing did not prune {loose:?}; this arm no longer reproduces the condition"
+        );
+
+        let inputs = build_info_support::git_rerun_inputs(repo.path());
+        let missing: Vec<_> = inputs.iter().filter(|path| !path.exists()).collect();
+        assert!(
+            missing.is_empty(),
+            "these registered paths do not exist and would make the unit permanently stale: \
+             {missing:?}"
+        );
+        assert!(!inputs.contains(&loose));
+
+        // And the packed case is still observed, which is what makes dropping the loose entry
+        // free rather than a loss of signal. Without this a fix that returned an empty vector
+        // would satisfy the arm above.
+        assert!(
+            inputs.iter().any(|path| path.ends_with("packed-refs")),
+            "packed-refs must stay registered: {inputs:?}"
+        );
+    }
+
+    #[test]
+    fn git_rerun_inputs_keep_the_loose_ref_path_while_it_exists() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo_with_one_commit(repo.path());
+
+        let branch = build_info_support::git_output(repo.path(), &["symbolic-ref", "-q", "HEAD"])
+            .expect("a fresh repository is on a branch");
+        let loose = repo.path().join(".git").join(&branch);
+        assert!(loose.exists(), "an unpacked ref must be a file: {loose:?}");
+
+        let inputs = build_info_support::git_rerun_inputs(repo.path());
+        assert!(
+            inputs.contains(&loose),
+            "the branch ref must stay registered while it exists: {inputs:?}"
+        );
+    }
+
+    fn init_repo_with_one_commit(repo: &Path) {
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "khive test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("tracked.txt"), "clean\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "--quiet", "-m", "baseline"]);
+    }
+
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
             .env_remove("GIT_DIR")

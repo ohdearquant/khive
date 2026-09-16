@@ -6,7 +6,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 #[path = "src/build_info_support.rs"]
 mod build_info_support;
 
-use build_info_support::{git_output, source_revision};
+use build_info_support::{git_output, git_rerun_inputs, source_revision};
 
 const UNSTAMPED_REVISION: &str = "unstamped";
 
@@ -44,25 +44,7 @@ fn build_time() -> String {
 }
 
 fn register_git_inputs(repo_root: &Path) {
-    let mut inputs = vec![
-        "HEAD".to_string(),
-        "index".to_string(),
-        "packed-refs".to_string(),
-    ];
-    if let Some(reference) = git_output(repo_root, &["symbolic-ref", "-q", "HEAD"]) {
-        inputs.push(reference);
-    }
-
-    for input in inputs {
-        let Some(path) = git_output(repo_root, &["rev-parse", "--git-path", &input]) else {
-            continue;
-        };
-        let path = PathBuf::from(path);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            repo_root.join(path)
-        };
+    for path in git_rerun_inputs(repo_root) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 }
