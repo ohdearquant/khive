@@ -95,6 +95,134 @@ fn note_insert_columns(words: &[String]) -> Option<usize> {
         .then_some(table + 1)
 }
 
+fn starts_with_ci(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
+    bytes.len() >= at + needle.len() && bytes[at..at + needle.len()].eq_ignore_ascii_case(needle)
+}
+
+/// The assignment list of an `UPDATE`: the text between the top-level `SET` and
+/// the top-level `WHERE`, with parentheses and every quoting form respected.
+///
+/// Splitting at the first ` WHERE ` would end the list at a subquery's own
+/// predicate and stop looking exactly where a later assignment could still be
+/// hiding, so this walks the statement instead.
+///
+/// All four of SQLite's quoting forms are tracked, not just `\'`, and the reason
+/// is that missing one shortens the list, which is the UNSAFE direction. With
+/// only `\'` handled, `UPDATE {} SET "col WHERE x" = ?1, version = ?2 WHERE id = ?3`
+/// ends its list at `"col`, never reaches the `version` assignment, and is
+/// admitted. Measured against this function before the other three were added,
+/// with `\`` and `[...]` behaving the same way.
+fn assignment_list(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    // The delimiter that would close the span currently open, so that `[` can be
+    // closed by `]` rather than by itself. `None` means not inside one.
+    let mut closes: Option<u8> = None;
+    let mut start: Option<usize> = None;
+    // Where the list ends, recorded rather than returned, so the scan carries on
+    // to the end of the literal looking for a statement separator.
+    let mut end: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(end) = closes {
+            if c == end {
+                closes = None;
+            }
+            i += 1;
+            continue;
+        }
+        // Comments are skipped for the same reason quoted spans are, and they are
+        // the other half of one class: ANY run of text that can contain the
+        // characters ` WHERE ` without being a predicate will end the assignment
+        // list early if it is not skipped, and a shorter list is the direction
+        // that ADMITS. Measured on this scanner: with comments unhandled,
+        // `UPDATE {} SET a = ?1 /* WHERE */, version = ?2 WHERE id = ?3` produced
+        // the list `a = ?1 /*` and was admitted, and the `--` form did the same.
+        if c == b'-' && starts_with_ci(bytes, i, b"--") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && starts_with_ci(bytes, i, b"/*") {
+            i += 2;
+            while i < bytes.len() && !starts_with_ci(bytes, i, b"*/") {
+                i += 1;
+            }
+            // An unterminated comment runs to the end of the literal, which
+            // leaves `start` set and no top-level WHERE found, so the list
+            // becomes everything after SET. That is the refusing direction.
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        match c {
+            b'\'' => closes = Some(b'\''),
+            b'"' => closes = Some(b'"'),
+            b'`' => closes = Some(b'`'),
+            b'[' => closes = Some(b']'),
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            // A `;` outside every quoted span and comment separates STATEMENTS, and
+            // this predicate reasons about one. A second statement assigns
+            // whatever it likes while the first supplies a `WHERE` that ends the
+            // list before it: measured on this scanner,
+            // `UPDATE {} SET a = 1; SELECT 1 WHERE 1=1; UPDATE {} SET version = 2
+            // WHERE id = 1` yielded the list `a = 1; SELECT 1`, which carries no
+            // `VERSION`, and was admitted. Refusing the whole literal is the
+            // direction that costs nothing: a reader of one statement has no
+            // business ruling on two.
+            //
+            // A `;` closing a single statement is not that, so it ends the scan
+            // rather than refusing; otherwise the ordinary trailing semicolon
+            // would refuse every statement that carries one.
+            b';' => {
+                if bytes[i + 1..].iter().all(u8::is_ascii_whitespace) {
+                    break;
+                }
+                return None;
+            }
+            _ => {
+                if depth == 0 {
+                    if start.is_none() && starts_with_ci(bytes, i, b" SET ") {
+                        start = Some(i + 5);
+                        i += 5;
+                        continue;
+                    }
+                    if start.is_some() && end.is_none() && starts_with_ci(bytes, i, b" WHERE ") {
+                        end = Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    start.map(|from| &sql[from..end.unwrap_or(sql.len())])
+}
+
+/// Whether a statement whose table name is interpolated can still be ruled out as
+/// a writer of `notes.version`.
+///
+/// The census cannot resolve `UPDATE {} SET ...` to a table, and for that reason
+/// it refused every dynamic target outright. That refuses on the wrong axis. The
+/// invariant is that no production writer assigns `version`, and the assignment
+/// list decides it on its own: if that list is static and names no `version`
+/// column, then no table the interpolation can resolve to has its version
+/// assigned here. A `WHERE` clause assigns nothing, so it may stay dynamic.
+fn assignments_rule_out_version(sql: &str) -> bool {
+    match assignment_list(sql) {
+        // `VERSION` is searched for as a case-insensitive substring of the whole
+        // list, never as a token. `json_set(properties, '$.version', ?2)` assigns
+        // the field without ever spelling it as a bare word, so a tokenizer that
+        // respected quoting would admit exactly the statement this exists to
+        // refuse. Over-refusal is the safe direction, so a column merely
+        // containing the letters (`versioned_at`) refuses too; narrowing that is
+        // a deliberate later change, not something to be clever about here.
+        Some(list) => !list.contains('{') && !list.to_ascii_uppercase().contains("VERSION"),
+        None => false,
+    }
+}
+
 fn test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("test")
@@ -210,8 +338,8 @@ impl<'ast> Visit<'ast> for Scanner {
                 .split_once(" SET ")
                 .map_or(sql.as_str(), |(target, _)| target);
             assert!(
-                !target.contains('{'),
-                "dynamic UPDATE target in {}: {sql}",
+                !target.contains('{') || assignments_rule_out_version(&sql),
+                "dynamic UPDATE target with an uninspectable assignment list in {}: {sql}",
                 self.owner
             );
         }
@@ -588,4 +716,248 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         );
         assert_eq!(version(&conn), 2, "direct DDL: {direct}");
     }
+}
+
+/// The relaxation that admits an interpolated table name, stated as the set of
+/// shapes it admits and the set it still refuses.
+///
+/// This arm exists because the relaxation's only new beneficiary is the namespace
+/// mover, written in the same change, so "it still catches what it was for" is a
+/// claim that has to be executed rather than asserted in prose.
+#[test]
+fn a_dynamic_update_target_is_admitted_only_on_a_static_version_free_assignment_list() {
+    // The shapes the namespace-move primitive needs. It is schema-derived over
+    // every table carrying a namespace column and SQLite cannot bind a table
+    // name, so an interpolated target is not avoidable there.
+    assert!(assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 WHERE namespace = ?1 AND kind = ?3"
+    ));
+    assert!(assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 WHERE namespace = ?1"
+    ));
+    // A dynamic predicate is still fine: a WHERE clause assigns nothing.
+    assert!(assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 WHERE namespace = ?1 AND subject_id IN ({selector})"
+    ));
+
+    // Still refused: the assignment list names the column this census protects.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET version = ?2 WHERE id = ?1"
+    ));
+    // Still refused: the assignment list is itself interpolated, so nothing about
+    // it can be read at all.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET {} WHERE id = ?1"
+    ));
+    // Still refused, and this is the one a depth-blind split at the first
+    // " WHERE " would have admitted: the version assignment sits after a
+    // subquery's own predicate.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET a = (SELECT 1 FROM t WHERE x = ?1), version = ?2 WHERE id = ?3"
+    ));
+    // Still refused: the version assignment is not the first one. A rule reading
+    // only the assignment nearest to SET would admit this.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2, version = ?3 WHERE id = ?1"
+    ));
+    // Still refused, and this is the shape that makes the substring search
+    // load-bearing: the column is assigned through a json path, so `VERSION`
+    // never appears as a word and a quoting-aware tokenizer admits it.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET properties = json_set(properties,'$.version',?2) WHERE id = ?1"
+    ));
+    // Still refused: no SET at all reads as unknown, not as safe.
+    assert!(!assignments_rule_out_version("UPDATE {} WHERE id = ?1"));
+
+    // Admitted with no WHERE at all: the list then runs to the end of the
+    // literal, which is the branch `assignment_list` takes when it finds no
+    // top-level predicate.
+    assert!(assignments_rule_out_version("UPDATE {} SET namespace = ?2"));
+}
+
+/// A quoted identifier cannot be used to hide the rest of the assignment list.
+///
+/// SQLite quotes identifiers four ways, and the scanner originally tracked only
+/// `'`. That is not a cosmetic gap: an unhandled quote lets a ` WHERE ` INSIDE an
+/// identifier end the assignment list early, so everything assigned after it is
+/// never inspected and the statement is admitted. Shortening the list is the
+/// unsafe direction, which is why each form gets an arm rather than a comment.
+#[test]
+fn a_where_inside_a_quoted_identifier_does_not_end_the_assignment_list() {
+    for opened in [
+        r#"UPDATE {} SET "col WHERE x" = ?1, version = ?2 WHERE id = ?3"#,
+        "UPDATE {} SET `col WHERE x` = ?1, version = ?2 WHERE id = ?3",
+        r#"UPDATE {} SET [col WHERE x] = ?1, version = ?2 WHERE id = ?3"#,
+        r#"UPDATE {} SET a = ' WHERE ', version = ?2 WHERE id = ?3"#,
+    ] {
+        assert!(
+            !assignments_rule_out_version(opened),
+            "a WHERE inside a quoted span must not end the list: {opened}"
+        );
+    }
+
+    // The control, in the same arm: the same statements without the version
+    // assignment are still admitted, so the arm above is not passing merely
+    // because every quoted identifier now refuses.
+    for benign in [
+        r#"UPDATE {} SET "col WHERE x" = ?1 WHERE id = ?3"#,
+        "UPDATE {} SET `col WHERE x` = ?1 WHERE id = ?3",
+    ] {
+        assert!(
+            assignments_rule_out_version(benign),
+            "a quoted identifier is not itself a reason to refuse: {benign}"
+        );
+    }
+}
+
+/// A comment cannot be used to hide the rest of the assignment list either.
+///
+/// Same class as the quoted identifier above and the same unsafe direction: a
+/// comment holding the text ` WHERE ` ends the list early, so everything assigned
+/// after the comment is never inspected. Both comment forms get an arm because
+/// they terminate differently, and an unterminated block comment gets one because
+/// its fallback has to be the refusing direction rather than a panic or a
+/// truncated read.
+#[test]
+fn a_where_inside_a_comment_does_not_end_the_assignment_list() {
+    for hidden in [
+        "UPDATE {} SET a = ?1 /* WHERE */, version = ?2 WHERE id = ?3",
+        "UPDATE {} SET a = ?1, -- WHERE \n version = ?2 WHERE id = ?3",
+        "UPDATE {} SET a = ?1 /* WHERE and never closed, version = ?2",
+    ] {
+        assert!(
+            !assignments_rule_out_version(hidden),
+            "a WHERE inside a comment must not end the list: {hidden}"
+        );
+    }
+
+    // The control: a comment that hides nothing is not itself a reason to refuse,
+    // so the arm above cannot be passing merely because comments now refuse.
+    assert!(assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 /* the move itself, nothing hidden */ WHERE id = ?1"
+    ));
+
+    // What that costs, executed rather than described. The comment's own text
+    // sits inside the assignment list, so a comment that merely spells the word
+    // refuses. The first draft of the control above read
+    // `/* the move, not a version write */` and failed right here. It is the same
+    // over-refusal `assignments_rule_out_version` already takes for a column named
+    // `versioned_at`, and it is recorded rather than removed: stripping comment
+    // text before the substring check would hand the word a place to sit where
+    // nothing looks at it, and a comment is not somewhere a caller needs an
+    // admission from.
+    assert!(!assignments_rule_out_version(
+        "UPDATE {} SET namespace = ?2 /* not a version write */ WHERE id = ?1"
+    ));
+}
+
+/// Two statements in one literal are two statements, and this reads one.
+///
+/// Third of the same class as the quoted identifier and the comment, and the one
+/// that does not fit their shape: here the text ending the list early is a real
+/// `WHERE`, belonging to a real predicate, of a different statement. Whatever the
+/// second statement assigns is outside everything the predicate looks at, so the
+/// refusal is on the LITERAL rather than on the list.
+///
+/// Both placements get a case because they fail differently: a separator inside
+/// the list leaves a `;` in the text a list-scoped rule could still see, and one
+/// after the list leaves nothing there at all.
+#[test]
+fn a_second_statement_in_one_literal_is_not_read_and_so_is_refused() {
+    for hidden in [
+        "UPDATE {} SET a = 1; SELECT 1 WHERE 1=1; UPDATE {} SET version = 2 WHERE id = 1",
+        "UPDATE {} SET a = 1 WHERE id = 1; UPDATE notes SET version = 2 WHERE id = 1",
+    ] {
+        assert!(
+            !assignments_rule_out_version(hidden),
+            "a second statement is never read, so a literal holding one is refused: {hidden}"
+        );
+    }
+
+    // The controls, and a rule keyed on the character alone would refuse both: a
+    // single statement written with its terminator, and a semicolon inside a
+    // quoted value, where it is data rather than a separator.
+    for benign in [
+        "UPDATE {} SET namespace = ?2 WHERE id = ?1;",
+        "UPDATE {} SET namespace = ?2 WHERE note = ';'",
+    ] {
+        assert!(
+            assignments_rule_out_version(benign),
+            "one statement is still one statement: {benign}"
+        );
+    }
+}
+
+/// What would have to be true for the predicate to be wrong, executed rather
+/// than described.
+///
+/// The predicate is a conjunction, and a conjunction invites the reading that one
+/// half is redundant. These are the two collapses, each run against the arms
+/// above:
+///
+/// - Widening the brace check from the assignment list to the whole literal
+///   refuses the mover's real statement, because its `WHERE` carries an
+///   interpolated selector. That is the reason the check is scoped to the list.
+/// - Dropping the brace check and keeping only `VERSION` admits `SET {}`, where
+///   nothing at all can be read. That is the reason the two halves are separate
+///   rather than one.
+#[test]
+fn neither_half_of_the_predicate_is_redundant() {
+    // The mover's real statement, the one the relaxation exists for.
+    let movers = "UPDATE {} SET namespace = ?2 WHERE namespace = ?1 AND subject_id IN ({selector})";
+    // An interpolated assignment list, which no rule can inspect.
+    let opaque = "UPDATE {} SET {} WHERE id = ?1";
+
+    // The predicate as written: admits the first, refuses the second.
+    assert!(assignments_rule_out_version(movers));
+    assert!(!assignments_rule_out_version(opaque));
+
+    // Falsifier 1 — brace check widened to the whole literal. This is the
+    // version that reddens the arm the change is for.
+    let no_brace_anywhere = |sql: &str| !sql.contains('{');
+    assert!(
+        !no_brace_anywhere(movers),
+        "if this ever admits the mover's statement, the assignment-list scoping \
+         has stopped being load-bearing and this whole relaxation is unmotivated"
+    );
+
+    // Falsifier 2 — the VERSION half alone, with the brace check dropped. It
+    // reddens nothing new, and admits the statement nobody can read.
+    let version_only = |sql: &str| match assignment_list(sql) {
+        Some(list) => !list.to_ascii_uppercase().contains("VERSION"),
+        None => false,
+    };
+    assert!(
+        version_only(opaque),
+        "the VERSION half cannot see an interpolated assignment list, which is \
+         why the brace check is a separate conjunct rather than a special case"
+    );
+    assert!(version_only(movers), "and it agrees on everything else");
+}
+
+/// The scanner's own refusal, driven through the real visitor rather than the
+/// predicate, so the wiring is covered too.
+#[test]
+#[should_panic(expected = "uninspectable assignment list")]
+fn a_dynamic_update_assigning_version_still_stops_the_scanner() {
+    let source = r#"
+        fn writer() -> String {
+            format!("UPDATE {} SET version = ?2 WHERE id = ?1", table)
+        }
+    "#;
+    let mut scanner = Scanner::default();
+    scanner.visit_file(&syn::parse_file(source).unwrap());
+}
+
+/// The positive half of the pair. Without it the arm above passes on a scanner
+/// that panics at everything.
+#[test]
+fn a_dynamic_update_setting_only_namespace_passes_the_scanner() {
+    let source = r#"
+        fn writer() -> String {
+            format!("UPDATE {} SET namespace = ?2 WHERE namespace = ?1", table)
+        }
+    "#;
+    let mut scanner = Scanner::default();
+    scanner.visit_file(&syn::parse_file(source).unwrap());
 }
