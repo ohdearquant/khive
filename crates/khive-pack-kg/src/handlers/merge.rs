@@ -16,6 +16,17 @@ use super::common::{
 };
 use crate::KgPack;
 
+/// Substrate word for a resolved kind, for a refusal that has to name both sides.
+fn substrate_name(spec: &KindSpec) -> &'static str {
+    match spec {
+        KindSpec::Entity { .. } => "entity",
+        KindSpec::Note { .. } => "note",
+        KindSpec::Edge => "edge",
+        KindSpec::Event => "event",
+        KindSpec::Proposal => "proposal",
+    }
+}
+
 async fn diagnose_private_merge<T>(
     result: Result<T, RuntimeError>,
     id: Uuid,
@@ -51,11 +62,74 @@ impl KgPack {
         // (ADR-007 Rev 6 / #391 §3) — the Gate is the authz seam, not this lookup.
         let into_id = resolve_uuid_unfiltered(&p.into_id, &self.runtime, token).await?;
         let from_id = resolve_uuid_unfiltered(&p.from_id, &self.runtime, token).await?;
-        let raw_kind = p.kind.as_deref().unwrap_or("entity");
-        let spec = resolve_kind_spec(raw_kind, registry)?;
+        let explicit_spec = match p.kind.as_deref() {
+            Some(raw_kind) => Some(resolve_kind_spec(raw_kind, registry)?),
+            None => None,
+        };
         let policy = parse_entity_policy(p.strategy.as_deref().unwrap_or("prefer_into"))?;
         let content_strategy =
             parse_content_strategy(p.content_strategy.as_deref().unwrap_or("append"))?;
+        // An omitted `kind` resolves the substrate from `into_id`, which is what
+        // the parameter has always documented. It used to default to "entity",
+        // so a caller merging two notes without the hint was told "not found:
+        // entity <id>" about records that exist: a refusal naming a substrate
+        // the caller never chose, for a default the caller never saw.
+        //
+        // The inference reads records, so it runs after every argument the call
+        // can be refused on without a read. A bad `strategy` was a pre-read error
+        // before this change and stays one: putting a lookup in front of it would
+        // answer a malformed call with a record's problem.
+        let spec = match explicit_spec {
+            Some(spec) => spec,
+            None => {
+                let into_spec = diagnose_private_merge(
+                    self.infer_kind_from_uuid(token, into_id, &p.into_id).await,
+                    into_id,
+                    registry,
+                )
+                .await;
+                let from_spec = diagnose_private_merge(
+                    self.infer_kind_from_uuid(token, from_id, &p.from_id).await,
+                    from_id,
+                    registry,
+                )
+                .await;
+                match (into_spec, from_spec) {
+                    (Ok(into_spec), Ok(from_spec)) => {
+                        // Inferring the substrate makes a disagreement reachable
+                        // without the caller having typed anything: under the old
+                        // default both ids were read as entities, so a note on
+                        // either side failed as a missing entity. Name both sides
+                        // rather than letting the survivor's substrate turn the
+                        // other one into a lookup failure.
+                        if substrate_name(&into_spec) != substrate_name(&from_spec) {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "cannot merge across substrates: into_id {into_id} resolves as \
+                                 {}, from_id {from_id} resolves as {}; merge joins two records of \
+                                 one substrate, so pass the pair you meant or name the kind \
+                                 explicitly",
+                                substrate_name(&into_spec),
+                                substrate_name(&from_spec)
+                            )));
+                        }
+                        into_spec
+                    }
+                    // Inference answers only when an id resolves to a record. When
+                    // one does not, the historical "entity" default stands and the
+                    // ordinary lookup below produces the refusal it always
+                    // produced, in the order it always produced it: a missing
+                    // `into_id` is reported before `from_id` is considered at all,
+                    // which `khive-pack-knowledge`'s issue-558 arms pin. A refusal
+                    // about an id that resolves to nothing names no substrate the
+                    // caller can act on, so changing its wording is a separate
+                    // decision from this one.
+                    (Err(RuntimeError::NotFound(_)), _) | (_, Err(RuntimeError::NotFound(_))) => {
+                        resolve_kind_spec("entity", registry)?
+                    }
+                    (Err(error), _) | (_, Err(error)) => return Err(error),
+                }
+            }
+        };
         let dry_run = p.dry_run.unwrap_or(false);
         let force = p.force.unwrap_or(false);
         let reason = p.reason.clone();
