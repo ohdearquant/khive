@@ -43,7 +43,7 @@ use std::sync::Arc;
 // can produce a non-trivial index.
 
 const MODEL_KEY: &str = "all-minilm-l6-v2";
-const DIM: usize = 384;
+pub(super) const DIM: usize = 384;
 
 struct FakeDimService;
 
@@ -327,7 +327,7 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
 /// `knowledge.index(rebuild_ann=true)` only writes v2 segments when the backend
 /// has a `data_dir`. An in-memory runtime has none, and ADR-079 removed the v1
 /// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
-fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
+pub(super) fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -354,7 +354,7 @@ fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     rt
 }
 
-fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
+pub(super) fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(crate::KnowledgePack::new(rt.clone()));
