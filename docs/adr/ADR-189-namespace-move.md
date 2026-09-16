@@ -399,7 +399,11 @@ missed: the first skips rows, the second corrupts them.
 
 ## Amendment 1 (2026-09-15): the source side of a move, and what a partitioning move cannot carry
 
-**Status: proposed.** Three corrections found while implementing the primitive this ADR specifies.
+**Status: accepted (2026-09-16).** Accepted on its own acceptance arm rather than on review:
+`the_source_index_stops_answering_for_a_moved_subject`, in the knowledge pack, holds the source
+bridge at its pre-move watermark, drives the fresh-tail leg past it, and asserts that the tail
+carries a delete naming the moved subject. Three corrections found while implementing the primitive
+this ADR specifies.
 Each is a place where the accepted text describes one side of a two-sided operation, or presumes a
 shape of request it does not name.
 
