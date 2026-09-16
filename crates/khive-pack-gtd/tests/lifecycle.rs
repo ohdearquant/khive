@@ -109,7 +109,12 @@ async fn transition_to_same_status_is_idempotent_noop() {
         .await
         .unwrap();
     assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note"], "already in target status");
+    assert_eq!(r["note_recorded"], false);
+    assert_eq!(r["reason"], "already in target status");
+    assert!(
+        r.get("note").is_none(),
+        "the explanation belongs under `reason`; `note` is the caller's key: {r:?}"
+    );
 }
 
 #[tokio::test]
@@ -569,7 +574,7 @@ async fn dsl_parallel_c2_double_complete_second_must_fail() {
 }
 
 #[tokio::test]
-async fn noop_transition_without_note_omits_note_recorded_field() {
+async fn noop_transition_without_note_reports_note_recorded_false() {
     let pack = pack(rt());
     let resp = assign(
         &pack,
@@ -583,10 +588,12 @@ async fn noop_transition_without_note_omits_note_recorded_field() {
         .await
         .unwrap();
     assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note"], "already in target status");
-    assert!(
-        r.get("note_recorded").is_none(),
-        "note_recorded must be absent (not just false) when no note was supplied — issue #15"
+    assert_eq!(r["reason"], "already in target status");
+    assert_eq!(
+        r["note_recorded"], false,
+        "note_recorded is unconditional: issue #15 made it conditional so that `false` could not \
+         be read as `your note was dropped`, and that reading is now impossible because a note \
+         with content is refused before this response is built"
     );
 }
 
@@ -603,17 +610,19 @@ async fn noop_transition_with_note_does_not_change_properties() {
     .await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    // A same-status request has no lifecycle event to annotate.
-    let r = pack
+    // A same-status request has no lifecycle event to annotate, so a note with
+    // content is refused rather than dropped.
+    let err = pack
         .dispatch(
             "gtd.transition",
             json!({"id": id, "status": "next", "note": "blocked on review"}),
         )
         .await
-        .expect("noop transition with note should succeed");
-    assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note_recorded"], false);
-    assert!(r.get("audit_persisted").is_none());
+        .expect_err("a note on a same-status request must be refused");
+    assert!(
+        err.to_string().contains("already in status"),
+        "the refusal must name the condition: {err}"
+    );
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("sql reader");
@@ -656,16 +665,17 @@ async fn repeated_noop_notes_leave_properties_unchanged() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     for note in ["first update", "second update"] {
-        let r = pack
+        let err = pack
             .dispatch(
                 "gtd.transition",
                 json!({"id": id, "status": "next", "note": note}),
             )
             .await
-            .expect("noop transition with note should succeed");
-        assert_eq!(r["transitioned"], false);
-        assert_eq!(r["note_recorded"], false);
-        assert!(r.get("audit_persisted").is_none());
+            .expect_err("each note on a same-status request must be refused");
+        assert!(
+            err.to_string().contains("already in status"),
+            "the refusal must name the condition: {err}"
+        );
     }
 
     let sql = rt.sql();
@@ -690,6 +700,61 @@ async fn repeated_noop_notes_leave_properties_unchanged() {
         }),
         None,
         "noop notes must not create or overwrite transition_note"
+    );
+}
+
+/// The bare same-status call is what the no-op exists for, and the refusal above
+/// must not have touched it: it succeeds, reports the tier of the outcome in
+/// `reason`, and leaves the row byte-for-byte alone. Without this arm the
+/// refusal could have been written as "reject every same-status call" and every
+/// other arm here would still pass.
+#[tokio::test]
+async fn bare_same_status_call_is_still_idempotent_and_writes_nothing() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+    let resp = assign(
+        &pack,
+        json!({"title": "bare same-status assertion", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let read_revision = |rt: khive_runtime::KhiveRuntime, id: String| async move {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("sql reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT version, updated_at FROM notes WHERE id = ?1".into(),
+                params: vec![SqlValue::Text(id)],
+                label: None,
+            })
+            .await
+            .expect("revision query");
+        assert_eq!(rows.len(), 1, "task row must exist");
+        format!(
+            "{:?}|{:?}",
+            rows[0].get("version"),
+            rows[0].get("updated_at")
+        )
+    };
+
+    let before = read_revision(rt.clone(), id.clone()).await;
+
+    let r = pack
+        .dispatch("gtd.transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("a bare same-status call still succeeds");
+    assert_eq!(r["transitioned"], false);
+    assert_eq!(r["note_recorded"], false);
+    assert_eq!(r["reason"], "already in target status");
+    assert!(r.get("audit_persisted").is_none());
+
+    let after = read_revision(rt.clone(), id.clone()).await;
+    assert_eq!(
+        before, after,
+        "the assertion must not advance the version or the update timestamp"
     );
 }
 

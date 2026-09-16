@@ -428,7 +428,8 @@ async fn transition_to_same_status_is_idempotent_noop() {
         .await
         .unwrap();
     assert_eq!(r["transitioned"], false);
-    assert_eq!(r["note"], "already in target status");
+    assert_eq!(r["note_recorded"], false);
+    assert_eq!(r["reason"], "already in target status");
 }
 
 #[tokio::test]

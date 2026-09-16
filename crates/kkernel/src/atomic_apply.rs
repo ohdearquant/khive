@@ -1179,13 +1179,19 @@ async fn build_op_result(
                         anyhow::anyhow!("atomic gtd.transition result: missing status")
                     })?;
                 let target = normalize_status(raw_status);
+                // Same shape as the pack handler's no-op arm: the explanation
+                // is `reason`, never the caller's `note` key, and
+                // `note_recorded` is unconditional. A note supplied with a
+                // same-status transition is refused in `prepare_transition`,
+                // which this path calls, so it cannot reach here.
                 Ok(json!({
                     "transitioned": false,
+                    "note_recorded": false,
                     "id": task["id"],
                     "full_id": task["full_id"],
                     "from": target,
                     "to": target,
-                    "note": "already in target status",
+                    "reason": "already in target status",
                 }))
             } else {
                 let (from_status, to_status) =
@@ -3024,7 +3030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_same_status_transition_with_note_remains_mutation_and_audit_free() {
+    async fn atomic_same_status_transition_with_note_is_refused_at_prepare() {
         let runtime = scratch_runtime();
         let token = runtime
             .authorize(Namespace::parse("local").expect("ns"))
@@ -3042,9 +3048,62 @@ mod tests {
             "status": "next",
             "note": "canonical-only note event",
         });
+
+        // The refusal lives in the shared decide step, so the prepared-plan path
+        // inherits it and the unit never reaches the runner. This test used to
+        // assert that the plan committed while persisting nothing, which is the
+        // behaviour the refusal replaces: nothing persisted is right, reporting
+        // it as a success was not.
+        let err = prepare_gtd_transition(&runtime, &token, &args)
+            .await
+            .expect_err("a note on a same-status transition must be refused at prepare");
+        assert!(
+            err.to_string().contains("already in status"),
+            "the refusal must name the condition: {err}"
+        );
+
+        let after = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            after.version, before.version,
+            "a refused prepare must not mutate the note revision"
+        );
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(task_properties(&after).get("transition_note").is_none());
+    }
+
+    /// The bare form still commits as a mutation-free assertion, and the result
+    /// this path renders must carry the same shape as the pack handler's: the
+    /// explanation under `reason`, never under the caller's `note` key, and
+    /// `note_recorded` present rather than inferred from a missing field.
+    #[tokio::test]
+    async fn atomic_same_status_transition_without_note_renders_reason_and_note_recorded() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let before = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        let args = json!({"id": task_id.to_string(), "status": "next"});
+
         let plan = prepare_gtd_transition(&runtime, &token, &args)
             .await
-            .expect("prepare atomic same-status no-op");
+            .expect("a bare same-status prepare still succeeds");
         let outcome = khive_runtime::atomic_runner::run_atomic_unit(
             runtime.sql().as_ref(),
             vec![plan.clone()],
@@ -3070,7 +3129,12 @@ mod tests {
         .await
         .expect("render no-op result");
         assert_eq!(result["transitioned"], false);
-        assert!(result.get("note_recorded").is_none());
+        assert_eq!(result["note_recorded"], false);
+        assert_eq!(result["reason"], "already in target status");
+        assert!(
+            result.get("note").is_none(),
+            "the explanation belongs under `reason`; `note` is the caller's key: {result:?}"
+        );
         assert!(result.get("audit_persisted").is_none());
 
         let after = runtime
@@ -3080,16 +3144,11 @@ mod tests {
             .await
             .expect("read task")
             .expect("task exists");
-        assert_eq!(after.updated_at, before.updated_at);
-        assert_eq!(
-            after.version, before.version,
-            "a same-status assertion must not mutate the note revision"
-        );
         assert_eq!(
             serde_json::to_value(&after).unwrap(),
-            serde_json::to_value(&before).unwrap()
+            serde_json::to_value(&before).unwrap(),
+            "the assertion must leave the row untouched"
         );
-        assert!(task_properties(&after).get("transition_note").is_none());
     }
 
     /// GAP-5 (ADR-099 B3): a committed atomic `gtd.transition` AND a
