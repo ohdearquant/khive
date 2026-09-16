@@ -117,14 +117,28 @@ async fn legacy_state_refusal_preserves_history_on_canonical_and_atomic_prepare_
             .to_string()
             .contains("invalid stored status \"archived\""));
     }
-    let transition_error = prepare_transition(&runtime, &token, &id, "cancelled", None)
-        .await
-        .err()
-        .expect("atomic transition preparation rejects invalid stored state");
-    let complete_error = prepare_complete(&runtime, &token, &id, Some("cancelled"), None)
-        .await
-        .err()
-        .expect("atomic completion preparation rejects invalid stored state");
+    let transition_error = prepare_transition(
+        &runtime,
+        &token,
+        &id,
+        "cancelled",
+        None,
+        khive_pack_gtd::handlers::DependencyOptions::default(),
+    )
+    .await
+    .err()
+    .expect("atomic transition preparation rejects invalid stored state");
+    let complete_error = prepare_complete(
+        &runtime,
+        &token,
+        &id,
+        Some("cancelled"),
+        None,
+        khive_pack_gtd::handlers::DependencyOptions::default(),
+    )
+    .await
+    .err()
+    .expect("atomic completion preparation rejects invalid stored state");
     for error in [transition_error, complete_error] {
         assert!(error
             .to_string()

@@ -428,3 +428,23 @@ async fn issue_2678_task_filter_metadata_and_public_help_match_the_query_contrac
         assert!(!required.contains(&json!(name)), "{name} stays optional");
     }
 }
+
+#[tokio::test]
+async fn dependency_completion_override_is_published_on_both_verbs() {
+    let pack = pack(rt());
+    for name in ["gtd.complete", "gtd.transition"] {
+        let verb = pack
+            .verbs()
+            .into_iter()
+            .find(|verb| verb.name == name)
+            .unwrap();
+        let override_param = verb
+            .params
+            .iter()
+            .find(|param| param.name == "ignore_dependencies")
+            .expect("explicit override must be discoverable");
+        assert_eq!(override_param.param_type, "boolean");
+        assert!(!override_param.required);
+        assert!(override_param.description.contains("Default false"));
+    }
+}

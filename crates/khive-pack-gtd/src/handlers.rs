@@ -251,6 +251,8 @@ pub struct CompleteParams {
     /// status='cancelled' for cancellation."
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    ignore_dependencies: bool,
 }
 
 /// Validates the target terminal status for `complete()`.
@@ -295,6 +297,8 @@ pub struct TransitionParams {
     status: String,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    ignore_dependencies: bool,
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1102,6 +1106,13 @@ pub enum TransitionDecision {
     },
 }
 
+/// Dependency policy for lifecycle preparation. The default checks readiness
+/// before moving to `done`; cancellation and nonterminal moves remain allowed.
+#[derive(Default)]
+pub struct DependencyOptions {
+    pub ignore_dependencies: bool,
+}
+
 /// Decide step of `gtd.transition` (ADR-099 B3 r6 second pass): normalizes
 /// and validates the target status, secret-gates the caller-supplied
 /// transition note, loads the task, and either returns the idempotent no-op
@@ -1115,6 +1126,7 @@ pub async fn prepare_transition(
     raw_id: &str,
     raw_status: &str,
     note_arg: Option<&str>,
+    options: DependencyOptions,
 ) -> Result<TransitionDecision, RuntimeError> {
     let target = normalize_status(raw_status);
     if !is_valid_status(target) {
@@ -1154,6 +1166,15 @@ pub async fn prepare_transition(
              allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
         )));
     }
+
+    crate::dependency::ensure_completion_dependencies_ready(
+        runtime,
+        token,
+        &note,
+        target,
+        options.ignore_dependencies,
+    )
+    .await?;
 
     // Carries forward `note.properties`, which was already reservation-checked
     // at task creation (`gtd.assign` writes through `KhiveRuntime::create_note`);
@@ -1232,6 +1253,7 @@ pub async fn prepare_complete(
     raw_id: &str,
     status_arg: Option<&str>,
     result_arg: Option<&str>,
+    options: DependencyOptions,
 ) -> Result<CompleteDecision, RuntimeError> {
     let target = complete_target_status(status_arg)?;
 
@@ -1259,6 +1281,15 @@ pub async fn prepare_complete(
              allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
         )));
     }
+
+    crate::dependency::ensure_completion_dependencies_ready(
+        runtime,
+        token,
+        &note,
+        target,
+        options.ignore_dependencies,
+    )
+    .await?;
 
     // Carries forward `note.properties`, which was already reservation-checked
     // at task creation (`gtd.assign` writes through `KhiveRuntime::create_note`);
@@ -1522,6 +1553,9 @@ impl GtdPack {
             &p.id,
             p.status.as_deref(),
             p.result.as_deref(),
+            DependencyOptions {
+                ignore_dependencies: p.ignore_dependencies,
+            },
         )
         .await?;
         let CompleteDecision {
@@ -1815,8 +1849,17 @@ impl GtdPack {
         // and either returns the idempotent no-op case or the fully computed
         // patch — the SAME function the ADR-099 `--atomic` `gtd.transition`
         // prepare path in `kkernel` calls.
-        let decision =
-            prepare_transition(self.runtime(), token, &p.id, &p.status, p.note.as_deref()).await?;
+        let decision = prepare_transition(
+            self.runtime(),
+            token,
+            &p.id,
+            &p.status,
+            p.note.as_deref(),
+            DependencyOptions {
+                ignore_dependencies: p.ignore_dependencies,
+            },
+        )
+        .await?;
 
         let (note, current, target, audit_persisted) = match decision {
             TransitionDecision::NoOp {
@@ -2006,6 +2049,7 @@ mod lifecycle_snapshot_tests {
             &task.id.as_hyphenated().to_string(),
             "next",
             None,
+            DependencyOptions::default(),
         )
         .await
         .expect("prepare transition");
@@ -2041,6 +2085,7 @@ mod lifecycle_snapshot_tests {
             &task.id.as_hyphenated().to_string(),
             "next",
             None,
+            DependencyOptions::default(),
         )
         .await
         .expect("prepare transition");
@@ -2091,6 +2136,7 @@ mod lifecycle_snapshot_tests {
             &task.id.as_hyphenated().to_string(),
             None,
             Some("shipped"),
+            DependencyOptions::default(),
         )
         .await
         .expect("prepare complete");
