@@ -7259,6 +7259,54 @@ async fn merge_with_kind_omitted_refuses_an_unresolvable_id_without_naming_a_sub
         );
     }
 
+    // An entity an earlier merge consumed is the one unresolvable id with
+    // something true to say: the kept id. Omitting `kind` keeps that pointer on
+    // either side of the merge, exactly as `kind="entity"` does.
+    let kept = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "reader hold kept 2858"}),
+        )
+        .await
+        .expect("create the kept entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let consumed = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "reader hold consumed 2858"}),
+        )
+        .await
+        .expect("create the entity to consume")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    pack.dispatch("merge", json!({"into_id": &kept, "from_id": &consumed}))
+        .await
+        .expect("consume one entity into the other");
+    let redirect = format!("not found: {consumed} was merged into {kept}; query the kept id");
+    for (into, from, arm) in [
+        (consumed.as_str(), kept.as_str(), "consumed into_id"),
+        (kept.as_str(), consumed.as_str(), "consumed from_id"),
+    ] {
+        for kind in [None, Some("entity")] {
+            let mut args = json!({"into_id": into, "from_id": from});
+            if let Some(kind) = kind {
+                args["kind"] = json!(kind);
+            }
+            let error = match pack.dispatch("merge", args).await {
+                Ok(value) => panic!("{arm}/{kind:?}: a consumed id must be refused; got: {value}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                redirect,
+                "{arm}/{kind:?}: the refusal names the id the entity was merged into"
+            );
+        }
+    }
+
     // The control for the second arm: with BOTH ids present and of one
     // substrate, nothing above fires and the merge runs. Without this, an
     // implementation that refused every omitted-kind merge would pass.
