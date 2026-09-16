@@ -8098,6 +8098,83 @@ mod tests {
         );
     }
 
+    /// ADR-018 Amendment 5 says the forced-merge trail names the acting actor.
+    /// The emission site passes an empty actor string, so reading it alone says
+    /// the opposite; `KhiveRuntime::events` wraps the store in the attribution
+    /// decorator, which replaces namespace and actor from the authorized token
+    /// on every append. This pins the PERSISTED value, and the second arm makes
+    /// it a reading of the token rather than of a constant.
+    #[tokio::test]
+    async fn a_forced_merge_event_names_the_acting_actor_not_an_empty_string() {
+        async fn forced_merge_event_actor(actor_id: Option<&str>) -> (String, serde_json::Value) {
+            let rt = KhiveRuntime::new(crate::RuntimeConfig {
+                db_path: None,
+                packs: vec!["kg".to_string()],
+                brain_profile: None,
+                actor_id: actor_id.map(str::to_string),
+                ..crate::RuntimeConfig::no_embeddings()
+            })
+            .expect("runtime");
+            let tok = rt.authorize(crate::Namespace::local()).expect("authorize");
+            let into = rt
+                .create_entity(&tok, "concept", None, "Flash Attention", None, None, vec![])
+                .await
+                .unwrap();
+            let from = rt
+                .create_entity(&tok, "concept", None, "Paged KV Cache", None, None, vec![])
+                .await
+                .unwrap();
+            rt.merge_entity_with_reason_and_force(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+                None,
+                true,
+            )
+            .await
+            .expect("the floor refuses this pair, so only force lands it");
+            let events = rt
+                .events(&tok)
+                .unwrap()
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![EventKind::EntityMerged],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        offset: 0,
+                        limit: 10,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(events.items.len(), 1, "one forced merge, one event");
+            let event = &events.items[0];
+            (event.actor.clone(), event.payload.clone())
+        }
+
+        let (actor, payload) = forced_merge_event_actor(Some("merge-forcer")).await;
+        assert_eq!(
+            actor, "actor:merge-forcer",
+            "the persisted event must name the actor the token carries"
+        );
+        assert_eq!(
+            payload.get("force"),
+            Some(&serde_json::Value::Bool(true)),
+            "the force marker rides the same event: {payload}"
+        );
+
+        let (anonymous, _) = forced_merge_event_actor(None).await;
+        assert_eq!(
+            anonymous, "anonymous:local",
+            "an unconfigured runtime stamps the anonymous fallback, so the field \
+             tracks the token rather than a constant"
+        );
+    }
+
     #[tokio::test]
     async fn merge_entity_with_reason_preserves_an_explicit_empty_reason() {
         let rt = rt();

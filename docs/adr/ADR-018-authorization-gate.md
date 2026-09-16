@@ -913,11 +913,27 @@ preview and appends no event. An ungated deployment therefore still records whic
 merges suspended the floor, under which actor and namespace, without depending on
 any policy being installed.
 
+The actor on that event does not come from the emission site, which passes an
+empty string, and a reader who stops there concludes the trail is anonymous.
+`KhiveRuntime::events` wraps the store in an attribution decorator that replaces
+namespace and actor from the sealed token on every append
+(`crates/khive-runtime/src/event_store_guard.rs`), so the persisted event carries
+`kind:id` for the acting token and a caller cannot select either field.
+`a_forced_merge_event_names_the_acting_actor_not_an_empty_string` pins the
+persisted value, with an unconfigured runtime as its second arm so the assertion
+reads the token rather than a constant.
+
 The field is a marker: it is present only when the merge was forced, and an
 ordinary merge carries no `force` key at all. Consumers read presence, not value.
 That shape is stated here so a reader does not have to recover it from the
 emission site, and a change to it is a change to this contract.
 
-`dry_run` is deliberately not covered. A preview writes nothing and suspends
-nothing; it evaluates the floor and reports what the merge would do, which is the
-opposite of bypassing it.
+`dry_run` is not itself a privileged argument. A dry run reports what the same
+call would do, so an unforced preview evaluates the floor and a forced preview
+skips it exactly as the forced write would, and neither appends an event
+(`merge_forced_dry_run_plans_the_merge_the_floor_would_refuse` pins the forced
+case). A preview that evaluated a floor the real call skips would be lying about
+the real call. That is also why the rule above is stated over the argument and not
+over the write: the gate reads `force` out of the request before the handler's
+dry-run branch is reached, so a policy that refuses forcing refuses the forced
+preview too.
