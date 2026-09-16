@@ -1995,6 +1995,7 @@ mod request_cancellation_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn no_model_recall_records_fts_without_inventing_vector_stage_work() {
         let rt = khive_runtime::KhiveRuntime::memory().unwrap();
         assert!(rt.registered_embedding_model_names().is_empty());
