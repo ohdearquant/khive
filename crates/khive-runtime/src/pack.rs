@@ -818,7 +818,9 @@ impl VerbRegistryBuilder {
     ///
     /// The sink is resolved during [`Self::build`] using the final default
     /// namespace, so the order of namespace and sink configuration does not
-    /// change its read scope. Sink initialization errors are returned by build.
+    /// change its read scope. Sink initialization errors are returned by build:
+    /// a serving registry never silently drops a configured runtime audit sink.
+    /// Metadata builds and explicit replacement sinks do not open this sink.
     pub fn with_runtime_event_store(
         &mut self,
         runtime: &KhiveRuntime,
@@ -4093,10 +4095,9 @@ pub struct PackRegistry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestAuditStore {
     /// Mirror `KhiveMcpServer::with_packs` (`khive-mcp/src/server.rs`): a
-    /// writable runtime attaches its own event store, logging and continuing
-    /// on failure rather than refusing to build; a read-only runtime retains
-    /// no `EventStore` handle and an advisory travels beside each result
-    /// instead.
+    /// writable runtime attaches its own event store and refuses to build if
+    /// sink initialization fails; a read-only runtime retains no `EventStore`
+    /// handle and an advisory travels beside each result instead.
     Attach,
     /// Build the registry with no audit event store, for a caller with no use
     /// for persisted audit rows.
@@ -4210,8 +4211,9 @@ impl PackRegistry {
         if audit_store == IngestAuditStore::Attach {
             if runtime.is_read_only() {
                 builder.with_read_only_audit_store();
-            } else if let Err(error) = builder.with_runtime_event_store(runtime) {
-                tracing::warn!(%error, "ingest registry audit event store is unavailable");
+            } else {
+                // Attach requires a usable sink; build propagates open failures.
+                builder.with_runtime_event_store(runtime)?;
             }
         }
         Self::register_packs(

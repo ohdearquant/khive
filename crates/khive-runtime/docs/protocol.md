@@ -132,4 +132,13 @@ part of the current by-ID contract described above.
   `runtime.events(&token)` decorator as the registry sink: it would replace request
   attribution with the construction token. See
   [ADR-162](../../../docs/adr/ADR-162-unified-event-plane-ownership.md).
+  A serving `build()` fails if this configured runtime sink cannot be initialized;
+  daemon startup and ingest with audit attachment propagate the failure instead of
+  warning and continuing without audit persistence. Operators must correct the
+  reported main/events storage initialization error, including path/access, schema,
+  writer admission, locking or I/O failures, then restart the daemon or retry ingest.
+  This initialization check does not guarantee later event writes or remote endpoint
+  availability: Unix socket mode constructs its client without connecting. Explicit
+  read-only mode keeps its existing advisory behavior; metadata builds do not
+  initialize an audit sink. Dispatch-time append error handling is unchanged.
 - Add a post-dispatch hook: implement `DispatchHook`, call `VerbRegistryBuilder::with_dispatch_hook()`.
