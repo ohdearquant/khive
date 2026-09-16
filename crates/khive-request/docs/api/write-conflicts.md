@@ -13,8 +13,11 @@ Only statically available string arguments contribute keys:
 | `merge(into_id=..., from_id=...)`                            | one `entity:` key per ID                 |
 | singleton `link(source_id=..., target_id=..., relation=...)` | one natural edge key                     |
 | bulk `link(links=[...])`                                     | one natural edge key per complete object |
+| `merge(..., dry_run=true)`                                   | none: the op writes nothing              |
 
 Unknown tools, missing fields, non-string values, and dynamic `$prev` arguments contribute no key because their target is not statically knowable. `create` is excluded because its UUID is generated later and database uniqueness constraints own concurrent-create conflicts.
+
+A `merge` carrying a literal `dry_run=true` contributes no key either: it reads the pair, evaluates the safety floor and the strategy, and returns a prediction, so it targets no stored record. Only the literal boolean counts. An absent, `false` or non-boolean `dry_run` keeps the keys, by the same rule as above: an argument the parser cannot read as a preview stays conservative. A preview may therefore sit in a batch beside a write to the same record, and its prediction describes the state it read, which is what a read beside a parallel write already means here.
 
 ## Substrate separation
 
