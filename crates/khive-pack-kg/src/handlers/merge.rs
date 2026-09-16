@@ -4,7 +4,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{
-    entity_merge_guard_error, validate_entity_merge_floor, NamespaceToken, RuntimeError,
+    entity_merge_guard_compared_values, entity_merge_guard_error,
+    entity_merge_guard_refusal_message, validate_entity_merge_floor, NamespaceToken, RuntimeError,
     VerbRegistry,
 };
 
@@ -86,8 +87,33 @@ impl KgPack {
                 )
                 .await?;
                 if !force {
-                    validate_entity_merge_floor(&into_entity, &from_entity)
-                        .map_err(entity_merge_guard_error)?;
+                    if let Err(guard) = validate_entity_merge_floor(&into_entity, &from_entity) {
+                        // A dry run is a prediction, so the safety floor it would
+                        // hit is part of what there is to predict. Returning the
+                        // conflict error here instead would make `dry_run=true`
+                        // fail on exactly the merges a caller has most reason to
+                        // ask about, and would contradict the parameter's own
+                        // contract of returning the plan without mutating.
+                        if dry_run {
+                            let (into_value, from_value) = entity_merge_guard_compared_values(
+                                guard,
+                                &into_entity,
+                                &from_entity,
+                            );
+                            return Ok(serde_json::json!({
+                                "dry_run": true,
+                                "would_merge": false,
+                                "refused_by": guard.as_str(),
+                                "compared": guard.compared(),
+                                "into_id": into_id,
+                                "from_id": from_id,
+                                "into_value": into_value,
+                                "from_value": from_value,
+                                "detail": entity_merge_guard_refusal_message(guard),
+                            }));
+                        }
+                        return Err(entity_merge_guard_error(guard));
+                    }
                 }
                 self.runtime
                     .merge_entity_with_reason_and_force(
@@ -142,6 +168,15 @@ impl KgPack {
         let truncated = summary.embedding_truncation.any_truncated();
         let mut response = to_json(&summary)?;
         super::create::add_embedding_truncation_warning(&mut response, truncated);
+        // Every dry run answers the same question, so it answers it with the same
+        // field whether the plan is a merge or a refusal. A caller that had to
+        // read `would_merge` as present-or-absent would be reading a missing key
+        // as a verdict, which is the reading that fails silently.
+        if dry_run {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("would_merge".to_string(), Value::Bool(true));
+            }
+        }
         Ok(response)
     }
 }

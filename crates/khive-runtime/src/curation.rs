@@ -165,6 +165,19 @@ impl EntityMergeGuard {
             Self::ProjectCompatibility => "project_compatibility",
         }
     }
+
+    /// What this guard compared, phrased for the caller that hit it.
+    ///
+    /// The refusal a caller reads has to say what was looked at, because the
+    /// guard name alone ("name_similarity") does not tell a caller which two
+    /// fields it has to change to make the merge acceptable.
+    pub fn compared(self) -> &'static str {
+        match self {
+            Self::EntityKind => "the records' entity kinds",
+            Self::NameSimilarity => "the records' names",
+            Self::ProjectCompatibility => "the project lists in the records' properties",
+        }
+    }
 }
 
 /// Validate the non-forced entity-merge safety floor.
@@ -181,17 +194,59 @@ pub fn validate_entity_merge_floor(into: &Entity, from: &Entity) -> Result<(), E
     Ok(())
 }
 
+/// The sentence a safety-floor refusal shows its caller.
+///
+/// It names the check, says what that check compared, and gives the caller an
+/// action it can actually take. It deliberately does not name the override
+/// parameter: the override exists for a developer integrating this runtime, and
+/// a consumer principal that is handed the parameter's name spends its next turn
+/// retrying with it instead of looking at the two records.
+pub fn entity_merge_guard_refusal_message(guard: EntityMergeGuard) -> String {
+    format!(
+        "entity merge refused by the {} check, which compared {}; make the records agree on \
+         that check before merging, or ask an operator to authorize an override",
+        guard.as_str(),
+        guard.compared()
+    )
+}
+
+/// The two values `guard` compared, for a caller-facing preview of the refusal.
+///
+/// The project side returns whatever that property holds, or `null` when the
+/// record has none. `projects_are_disjoint` refuses only on two non-empty
+/// arrays, so what a caller is shown here is what the guard read.
+pub fn entity_merge_guard_compared_values(
+    guard: EntityMergeGuard,
+    into: &Entity,
+    from: &Entity,
+) -> (Value, Value) {
+    let projects = |entity: &Entity| {
+        entity
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("projects"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    match guard {
+        EntityMergeGuard::EntityKind => (
+            Value::String(into.kind.clone()),
+            Value::String(from.kind.clone()),
+        ),
+        EntityMergeGuard::NameSimilarity => (
+            Value::String(into.name.clone()),
+            Value::String(from.name.clone()),
+        ),
+        EntityMergeGuard::ProjectCompatibility => (projects(into), projects(from)),
+    }
+}
+
 /// Convert a safety-floor refusal into the merge verb's structured conflict contract.
 pub fn entity_merge_guard_error(guard: EntityMergeGuard) -> RuntimeError {
     RuntimeError::Khive(
-        KhiveError::conflict(format!(
-            "entity merge refused by {} guard; use force=true only when the caller accepts responsibility",
-            guard.as_str()
-        ))
-        .with_details(Details::new([
-            ("guard", guard.as_str()),
-            ("override", "force=true"),
-        ])),
+        KhiveError::conflict(entity_merge_guard_refusal_message(guard)).with_details(Details::new(
+            [("guard", guard.as_str()), ("compared", guard.compared())],
+        )),
     )
 }
 
