@@ -167,9 +167,32 @@ impl LettreSmtp {
         let mut cached = self.connection.lock().await;
         // Own the connection during every exchange. Cancellation or an error
         // must never return a partially completed SMTP transaction to the cache.
-        let mut session = match cached.take() {
-            Some(session) if session.credentials == credentials => session,
-            _ => {
+        //
+        // A cached session is probed before it is trusted. The far side closes
+        // idle sessions on its own schedule, and a socket the server has already
+        // closed looks identical to a live one until something is written to it.
+        // The probe is the only repair available here: retrying a FAILED send is
+        // not, because `send` drives MAIL, RCPT and DATA, and a transport error
+        // after the server accepted DATA cannot be told apart at this layer from
+        // one before it. Retrying then would deliver the message twice, and a
+        // late notification is better than a duplicated one. A probe is safe
+        // precisely because it is idempotent and happens before the message is
+        // offered.
+        let reusable = match cached.take() {
+            Some(mut session) if session.credentials == credentials => {
+                // Note the asymmetry with the fresh-connection call below, which
+                // is deliberate: there, a refused NOOP is a real failure and
+                // `classify_smtp_preamble_status` turns it into an error. Here
+                // the same `false` means the session aged out, which is an
+                // ordinary state and not an error. One value, two meanings,
+                // separated by which arm read it.
+                session.connection.test_connected().await.then_some(session)
+            }
+            _ => None,
+        };
+        let mut session = match reusable {
+            Some(session) => session,
+            None => {
                 let mut connection = connect().await?;
                 connection
                     .auth(mechanisms, &credentials)
@@ -607,7 +630,13 @@ mod tests {
     fn successful_session(mechanism: Mechanism, secret: &str, messages: usize) -> Script {
         let mut script = handshake(mechanism, secret, "235 authenticated");
         script.push(step("NOOP", "250 ready"));
-        for _ in 0..messages {
+        for delivery in 0..messages {
+            // The first delivery follows the handshake NOOP. Every later one
+            // reuses the cached session, and the reuse path probes it with its
+            // own NOOP before offering the message.
+            if delivery > 0 {
+                script.push(step("NOOP", "250 ready"));
+            }
             script.extend([
                 step("MAIL FROM:", "250 sender accepted"),
                 step("RCPT TO:", "250 recipient accepted"),
@@ -663,6 +692,9 @@ mod tests {
         }
         drop(connector);
         let counts = server.finish().await;
+        // One connection, one AUTH, three messages: the point of the change. The
+        // three NOOPs are the handshake probe plus one reuse probe per later
+        // delivery, which is what reuse costs now.
         assert_eq!(
             (
                 counts.connections,
@@ -670,7 +702,7 @@ mod tests {
                 counts.noop,
                 counts.messages
             ),
-            (1, 1, 1, 3)
+            (1, 1, 3, 3)
         );
     }
 
@@ -700,7 +732,7 @@ mod tests {
                 counts.noop,
                 counts.messages
             ),
-            (2, 2, 2, 4)
+            (2, 2, 4, 4)
         );
     }
 
@@ -775,6 +807,8 @@ mod tests {
             let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
             let mut refused = successful_session(Mechanism::Plain, "test-password", 1);
             refused.extend([
+                // The second delivery reuses this session, so it probes first.
+                step("NOOP", "250 ready"),
                 step("MAIL FROM:", "250 sender accepted"),
                 step("RCPT TO:", reply),
                 step("QUIT", "221 goodbye"),
@@ -817,13 +851,53 @@ mod tests {
                     counts.noop,
                     counts.messages
                 ),
-                (3, 3, 2, 2)
+                (3, 3, 3, 2)
             );
         }
     }
 
+    /// The recovery the probe buys, and the arm the old name here claimed
+    /// without running: a session the far side closed while it sat idle costs a
+    /// handshake and nothing else, and the message is still delivered.
+    ///
+    /// This is the mutation check for the probe. Without it the second delivery
+    /// is offered to the dead socket, the send fails, and `messages` reads 1.
     #[tokio::test]
-    async fn smtp_closed_connection_retries_without_hiding_reconnect_auth_rejection() {
+    async fn smtp_closed_connection_reconnects_and_still_delivers() {
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let mut closed = successful_session(Mechanism::Plain, "test-password", 1);
+        closed.push(("CLOSE".to_string(), String::new()));
+        let server = ScriptedSmtp::new(vec![
+            closed,
+            successful_session(Mechanism::Plain, "test-password", 1),
+        ]);
+        for _ in 0..2 {
+            scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap();
+        }
+        drop(connector);
+        let counts = server.finish().await;
+        // Two handshakes, and both messages delivered. The probe that found the
+        // closed socket is written to it and never reaches a server, so it is
+        // not counted; the two NOOPs here are the two handshake probes.
+        assert_eq!(
+            (
+                counts.connections,
+                counts.auth,
+                counts.noop,
+                counts.messages
+            ),
+            (2, 2, 2, 2)
+        );
+    }
+
+    /// The control for the arm above, and the case it must not swallow: when the
+    /// reconnect's own AUTH is refused, the caller sees `Auth`, not a transport
+    /// error. The probe changes which delivery pays for a closed session; it
+    /// must not change whether a refused re-authentication is visible.
+    #[tokio::test]
+    async fn smtp_closed_connection_surfaces_a_refused_reauth_as_auth() {
         let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
         let mut closed = successful_session(Mechanism::Plain, "test-password", 1);
         closed.push(("CLOSE".to_string(), String::new()));
@@ -838,10 +912,6 @@ mod tests {
         scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
             .await
             .unwrap();
-        let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ChannelError::Transport(_)));
         let err = scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
             .await
             .unwrap_err();
@@ -893,7 +963,7 @@ mod tests {
                 counts.noop,
                 counts.messages
             ),
-            (2, 2, 2, 3)
+            (2, 2, 3, 3)
         );
     }
 
