@@ -16,28 +16,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# A push to a pull request branch moves the merge ref, so the run already in
-# flight is testing a ref nothing will merge; cancelling it frees its macOS
-# shards, which are the required checks on the critical path. Measured before
-# this landed: 9 of 19 active runs were for a head that was no longer the tip of
-# its branch, and macOS job start delay ran p90 34.5 min against 1.5 min for the
-# ubuntu shards.
+# Main pushes share one admitted run and up to 100 waiting runs. `queue: max`
+# preserves waiting commits instead of replacing them when a newer push arrives.
+# GitHub cancels arrivals beyond that limit: those landed commits have no completed
+# CI gate until rerun. A backlog also delays post-merge results; serialization
+# limits runner pressure, not the total work required to test every commit.
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
-# `main` deliberately does NOT cancel. Each main commit's run is the post-merge
-# record other work gates on, and a commit whose run was cancelled is a bisect
-# point that answers nothing later. `cancel-in-progress` takes an expression, so
-# both policies live in one workflow.
+# PR synchronize events keep the same refs/pull/<number>/merge group and replace
+# superseded work. `queue: max` cannot be combined with cancel-in-progress=true,
+# so only main pushes opt in. Integration, nightly and manual runs stay independent.
+# REST run status=queued does not mean concurrency-pending: jobs may already be
+# running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
-  # The group key is conditional on purpose, and a plain `github.ref` here would
-  # be wrong. A concurrency group holds at most ONE pending run: when a third
-  # arrives while one is running and one is pending, the pending one is
-  # CANCELLED, and `cancel-in-progress: false` does not prevent that -- it only
-  # governs the run already executing. So putting every `main` push in one group
-  # would cancel intermediate main runs, which is the outcome this is written to
-  # avoid. Keying non-pull_request runs on `github.run_id` gives each its own
-  # group, so nothing on main ever queues behind or displaces anything.
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
 
 jobs:
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
