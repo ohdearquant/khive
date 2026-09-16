@@ -7198,6 +7198,67 @@ async fn merge_across_substrates_with_kind_omitted_names_both_sides() {
     );
 }
 
+/// An id that resolves to nothing has no substrate to infer, so the omitted-kind
+/// path keeps the historical entity refusal rather than reporting the inference's
+/// own miss. `khive-pack-knowledge`'s issue-558 arms pin this exact message and
+/// this exact ordering across the pack boundary, and a change to it belongs to
+/// whoever decides that contract, not to this one.
+#[tokio::test]
+async fn merge_with_kind_omitted_keeps_the_historical_refusal_for_an_id_that_resolves_to_nothing() {
+    let pack = pack();
+    let present = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create the present record")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let missing = "00000000-0000-4000-8000-000000000558";
+
+    // The present record is a NOTE on both arms. Inference would have resolved it
+    // as one, so a fallback that read the surviving side would answer "note" here;
+    // only the historical entity default produces the refusals below.
+    //
+    // The two arms name different ids on purpose. Under the entity default the
+    // `into_id` is checked first, so a missing `into_id` is reported by its own id
+    // and a missing `from_id` is never reached: the present note fails the entity
+    // check before it. That ordering is the historical behaviour this arm exists
+    // to keep, and a fix that "improved" it would move which id a caller sees.
+    for (into, from, arm, named) in [
+        (missing, present.as_str(), "missing into_id", missing),
+        (
+            present.as_str(),
+            missing,
+            "missing from_id",
+            present.as_str(),
+        ),
+    ] {
+        let error = match pack
+            .dispatch("merge", json!({"into_id": into, "from_id": from}))
+            .await
+        {
+            Ok(value) => panic!("{arm}: a merge naming a missing id must be refused; got: {value}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("entity"),
+            "{arm}: the refusal must come from the historical entity default; got: {error}"
+        );
+        assert!(
+            error.contains(named),
+            "{arm}: the refusal must name {named}; got: {error}"
+        );
+        assert!(
+            !error.contains("cannot merge across substrates"),
+            "{arm}: an unresolvable id is a lookup failure, never a substrate disagreement; \
+             got: {error}"
+        );
+    }
+}
+
 /// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
 /// If A already has a `competes_with` edge to C, the rewire is a conflict:
 /// exactly ONE live edge must survive, and its stored endpoints must satisfy
