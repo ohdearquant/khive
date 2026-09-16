@@ -7099,6 +7099,105 @@ async fn merge_disjoint_projects_is_refused_by_properties_guard() {
     );
 }
 
+// ---- merge resolves an omitted kind from into_id, as the parameter documents ----
+
+/// `kind` has always documented "omit to resolve the substrate from into_id".
+/// The code defaulted to `"entity"`, so merging two notes without the hint was
+/// refused as a missing entity: a refusal naming a substrate the caller never
+/// chose, about records that exist.
+#[tokio::test]
+async fn merge_with_kind_omitted_resolves_the_substrate_from_into_id() {
+    let pack = pack();
+    let into_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader pool saturates at eight slots", "salience": 0.4}),
+        )
+        .await
+        .expect("create into note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create from note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch("merge", json!({"into_id": &into_id, "from_id": &from_id}))
+        .await
+        .expect("two notes must merge with no kind hint");
+    assert_eq!(result["kept_id"], json!(&into_id), "result: {result}");
+    assert_eq!(result["removed_id"], json!(&from_id), "result: {result}");
+}
+
+/// Inference makes a substrate disagreement reachable without the caller having
+/// typed a kind, so the refusal names both sides instead of reporting the second
+/// record as missing under the first record's substrate.
+#[tokio::test]
+async fn merge_across_substrates_with_kind_omitted_names_both_sides() {
+    let pack = pack();
+    let entity_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Reader Admission"}),
+        )
+        .await
+        .expect("create entity")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let note_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "reader admission saturates", "salience": 0.4}),
+        )
+        .await
+        .expect("create note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let error = match pack
+        .dispatch("merge", json!({"into_id": &entity_id, "from_id": &note_id}))
+        .await
+    {
+        Ok(value) => panic!("a cross-substrate merge must be refused; got: {value}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("cannot merge across substrates")
+            && error.contains("resolves as entity")
+            && error.contains("resolves as note"),
+        "the refusal must name both sides; got: {error}"
+    );
+    assert!(
+        !error.contains("not found"),
+        "both records exist, so the refusal must not read as a lookup failure; got: {error}"
+    );
+
+    // Control: the same pair with the substrates the other way round refuses the
+    // same way, so the message is not reporting whichever side happens to be
+    // second.
+    let reversed = match pack
+        .dispatch("merge", json!({"into_id": &note_id, "from_id": &entity_id}))
+        .await
+    {
+        Ok(value) => panic!("the reversed pair must also be refused; got: {value}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        reversed.contains("resolves as note") && reversed.contains("resolves as entity"),
+        "reversed refusal must name both sides; got: {reversed}"
+    );
+}
+
 /// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
 /// If A already has a `competes_with` edge to C, the rewire is a conflict:
 /// exactly ONE live edge must survive, and its stored endpoints must satisfy
