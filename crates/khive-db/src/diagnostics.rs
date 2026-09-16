@@ -712,6 +712,11 @@ pub struct ReaderContentionDiagnostics {
     pub completed_pooled_reader_checkouts: u64,
     /// Longest completed hold, including return/reset, in microseconds.
     pub max_completed_reader_hold_micros: u64,
+    /// The typed-store operation that held the checkout this maximum came
+    /// from. `None` means that hold came through a route carrying no
+    /// operation name — the pool's own internal checkout — which is the
+    /// answer to "which read was it", not a gap in the reading (#2793).
+    pub max_completed_reader_hold_operation: Option<&'static str>,
     /// A disqualified pooled-reader return whose replacement connection then
     /// also failed to open, permanently shrinking the physical pool by one
     /// slot below `max_readers`. Non-zero here means the pool has fewer
@@ -734,6 +739,7 @@ impl ReaderContentionDiagnostics {
             peak_active_pooled_reader_checkouts: reader.peak_active_pooled_checkouts,
             completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
             max_completed_reader_hold_micros: reader.max_completed_hold_micros,
+            max_completed_reader_hold_operation: reader.max_completed_hold_operation,
             reader_replacement_open_failures: reader.reader_replacement_open_failures,
         }
     }
@@ -2247,6 +2253,7 @@ mod tests {
                 peak_active_pooled_reader_checkouts: 0,
                 completed_pooled_reader_checkouts: 0,
                 max_completed_reader_hold_micros: 0,
+                max_completed_reader_hold_operation: None,
                 reader_replacement_open_failures: 0,
             },
             "the diagnostics probe itself must not masquerade as request reader traffic"
