@@ -1226,6 +1226,32 @@ async fn validate_read_target(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if direction == "outbound" {
+        // #2866: a sent copy is refused either way, but only a party to the
+        // exchange may learn that it is a sent copy and what its full id is. The
+        // outbound refusal names the resolved uuid, so a caller who asked by
+        // prefix about someone else's sent message would otherwise learn that it
+        // exists, exactly which one it is and its direction: the disclosure
+        // #2564 removed from the addressee refusal below. A non-party gets that
+        // refusal verbatim instead, so a sent copy and an inbound message
+        // addressed to someone else are indistinguishable to it. The party rule
+        // is `reply`'s (#113): sender or addressee, failing open only when the
+        // row carries neither attribution (pre-ADR-057 legacy).
+        let party = |key: &str| {
+            note.properties
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_str)
+        };
+        let caller_actor = token.actor().id.as_str();
+        let (from_actor, to_actor) = (party("from_actor"), party("to_actor"));
+        if (from_actor.is_some() || to_actor.is_some())
+            && from_actor != Some(caller_actor)
+            && to_actor != Some(caller_actor)
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "read: that message is not addressed to caller actor {caller_actor:?}"
+            )));
+        }
         return Err(RuntimeError::InvalidInput(format!(
             "read: message {id} is outbound; only received (inbound) messages can be marked as read"
         )));

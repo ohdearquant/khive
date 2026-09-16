@@ -2237,6 +2237,96 @@ async fn issue2564_third_party_refusal_does_not_disclose_the_resolved_id() {
     }
 }
 
+/// #2866: the #2564 rule holds for a SENT copy too. A third party asking by
+/// 8-char prefix about someone else's outbound copy gets the same refusal as for
+/// an inbound message it is not addressed to: no resolved uuid, and nothing that
+/// says the record is a sent copy. Both parties to the exchange still get the
+/// outbound refusal, which is the control that the direction check still runs.
+#[tokio::test]
+async fn issue2866_third_party_read_of_a_sent_copy_does_not_disclose_it() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "sent by A, for B" }),
+        )
+        .await
+        .expect("A sends to B");
+
+    let local_tok = rt_a.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt_a
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .unwrap();
+    let copy_id = |direction: &str| {
+        notes
+            .iter()
+            .find(|n| {
+                n.deleted_at.is_none()
+                    && n.properties
+                        .as_ref()
+                        .and_then(|p| p.get("direction"))
+                        .and_then(|v| v.as_str())
+                        == Some(direction)
+            })
+            .map(|n| n.id.as_hyphenated().to_string())
+            .unwrap_or_else(|| panic!("the {direction} copy of A's message must exist"))
+    };
+    let outbound_id = copy_id("outbound");
+    let inbound_id = copy_id("inbound");
+    let prefix = outbound_id[..8].to_string();
+    let tail = outbound_id[8..].to_string();
+
+    async fn refuse(registry: &VerbRegistry, id: String) -> String {
+        registry
+            .dispatch("comm.read", serde_json::json!({ "id": id }))
+            .await
+            .expect_err("a read of a sent copy is always refused")
+            .to_string()
+    }
+
+    // The third party, by prefix and by full id.
+    for asked in [prefix.clone(), outbound_id.clone()] {
+        let error = refuse(&registry_c, asked.clone()).await;
+        assert!(
+            !error.contains(&tail) && !error.contains(&outbound_id),
+            "#2866: a third party must not learn the sent copy's id (asked {asked}); got {error:?}"
+        );
+        assert!(
+            !error.contains("outbound"),
+            "#2866: a third party must not learn the record is a sent copy; got {error:?}"
+        );
+        assert!(
+            error.contains("lambda:c")
+                && !error.contains("lambda:a")
+                && !error.contains("lambda:b"),
+            "#2866: the refusal names only the caller's own actor; got {error:?}"
+        );
+    }
+
+    // Indistinguishable from the #2564 refusal for an inbound copy it is not
+    // addressed to.
+    let for_inbound = refuse(&registry_c, inbound_id[..8].to_string()).await;
+    assert_eq!(
+        refuse(&registry_c, prefix.clone()).await,
+        for_inbound,
+        "#2866: a sent copy and someone else's inbound message must refuse identically"
+    );
+
+    // Controls: both parties still get the direction refusal.
+    for (who, registry) in [("sender", &registry_a), ("addressee", &registry_b)] {
+        let error = refuse(registry, prefix.clone()).await;
+        assert!(
+            error.contains("outbound"),
+            "#2866 control: the {who} still gets the outbound refusal; got {error:?}"
+        );
+    }
+}
+
 /// The anonymous/"local" single-actor deployment (no actor.id configured) must keep working: caller and to_actor both resolve to "local", so the equality check passes.
 #[tokio::test]
 async fn t87_anonymous_local_single_actor_read_still_works() {
