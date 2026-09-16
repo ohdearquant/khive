@@ -34,6 +34,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      # This job compiles the bench targets and then runs them, which is two
+      # cargo invocations over one checkout. crates/khive-runtime/build.rs stamps
+      # KHIVE_BUILD_TIME from the wall clock unless SOURCE_DATE_EPOCH is set, so
+      # the second invocation can find khive-runtime dirty and rebuild it and
+      # everything above it inside the criterion phase's own budget. Pinning the
+      # stamp to the commit under test makes both phases see the same value.
+      - name: Pin the build stamp to the commit under test
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@1.95.0
 

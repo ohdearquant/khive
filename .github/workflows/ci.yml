@@ -170,6 +170,17 @@ jobs:
       LATTICE_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
+      # crates/khive-runtime/build.rs stamps KHIVE_BUILD_TIME from the wall clock
+      # unless SOURCE_DATE_EPOCH is set, so every re-run of that script emits a
+      # different rustc-env and dirties khive-runtime and every crate above it.
+      # A restored cache then buys this job almost nothing: khive-runtime rebuilt
+      # in nine separate cargo invocations against the main workspace on the head
+      # this was measured at, while not one third-party crate did. Pinning the
+      # stamp to the commit under test makes each re-run emit the same value, so
+      # the script stops being a source of churn. Genuine feature and profile
+      # variations still rebuild, which is what they are for.
+      - name: Pin the build stamp to the commit under test
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
       # check + clippy + test + release passes exceed that, and ld's mmap'd
       # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
