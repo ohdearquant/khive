@@ -648,7 +648,7 @@ jobs:
         with:
           deno-version: v2.x
       - name: Check markdown formatting
-        run: deno fmt --check
+        run: scripts/ci.sh docs-fmt
 
   marketplace:
     name: Marketplace example validator
