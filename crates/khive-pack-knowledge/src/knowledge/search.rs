@@ -494,7 +494,14 @@ async fn rarest_fts_terms_first(
     stage: &mut LexicalStage,
 ) -> Result<Vec<String>, khive_storage::StorageError> {
     let mut frequencies = Vec::with_capacity(terms.len());
-    for term in terms {
+    // The index has exactly one reader, the `cfg(test)` seam at the bottom of
+    // this loop, so in a non-test build it genuinely has none and clippy says
+    // so. The exemption is scoped to that configuration rather than written as
+    // a bare allow, and the alternatives were both worse: a hand-rolled counter
+    // is an unused assignment in a non-test build and an explicit counter loop
+    // in a test one, and dropping the index removes the seam.
+    #[cfg_attr(not(test), allow(clippy::unused_enumerate_index))]
+    for (_probe_index, term) in terms.into_iter().enumerate() {
         // Count only a bounded index prefix. Rare counts are exact; terms
         // above the cap tie by spelling, without scanning their whole lists.
         // Aggregating inside SQLite avoids materializing up to 501 owned
@@ -515,6 +522,8 @@ async fn rarest_fts_terms_first(
         if frequency > 0 {
             frequencies.push((term, frequency));
         }
+        #[cfg(test)]
+        advance_fts_test_probe_deadline_after_term(_probe_index + 1).await;
     }
     frequencies
         .sort_unstable_by(|(a, a_count), (b, b_count)| a_count.cmp(b_count).then_with(|| a.cmp(b)));
@@ -544,6 +553,36 @@ const PHASE_A_WIDEN_CEILING: usize = 8000;
 /// sizing). A lexical-stage timeout therefore no longer means the request
 /// itself is out of time — only that this one stage's own budget is.
 pub(crate) const LEXICAL_STAGE_BUDGET_MS: u64 = 2_000;
+
+/// Share of the lexical stage budget the rarity probe may spend before it is
+/// cut off and the terms are used in the order they arrived.
+///
+/// `rarest_fts_terms_first` fetches no candidates. It issues one bounded
+/// `count(*)` per term, sequentially, and its entire product is an ORDERING of
+/// the terms the real fetch then queries. Before this bound existed it ran
+/// against the whole stage budget, and on a production corpus a five-to-seven
+/// term query spent all 2000 ms in it — after which the caller returned an
+/// empty candidate list for a stage that had not yet asked for a candidate
+/// (issue #2766). An optimization must not be able to consume the budget of
+/// the work it optimizes, and its expiry must degrade to the unoptimized path
+/// rather than to no path.
+///
+/// A quarter, rather than a half or a tenth, for two reasons stated so a later
+/// change has something to argue against. The probe's value is largest on the
+/// first few terms (querying the rarest term first is what bounds the rowid
+/// window the later terms widen) and falls off across the tail, so it does not
+/// need most of the budget to deliver most of its benefit. And the fetch it
+/// precedes is the part that can return nothing useful when it is short of
+/// time, so the remainder belongs to the fetch.
+const RARITY_PROBE_BUDGET_NUMERATOR: u32 = 1;
+const RARITY_PROBE_BUDGET_DENOMINATOR: u32 = 4;
+
+/// The rarity probe's own deadline, derived from whatever stage budget is in
+/// force (including the test override) rather than from a second constant that
+/// could drift away from it.
+fn rarity_probe_budget() -> std::time::Duration {
+    lexical_stage_budget() / RARITY_PROBE_BUDGET_DENOMINATOR * RARITY_PROBE_BUDGET_NUMERATOR
+}
 
 // ── Test-only seam: override the lexical-stage budget and the phase-A widen
 // ceiling ──────────────────────────────────────────────────────────────────
@@ -677,6 +716,48 @@ async fn advance_fts_test_deadline_after_term(completed_terms: usize) {
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static FTS_TEST_PROBE_DEADLINE_ADVANCE: FtsTestDeadlineAdvance;
+}
+
+/// Sibling of [`advance_fts_test_deadline_after_term`] for the rarity probe.
+/// A SEPARATE task-local, not a shared counter: the probe loop and the
+/// per-term fetch loop are different boundaries, and a test that wants the
+/// probe to expire must not also move the fetch's clock.
+#[cfg(test)]
+async fn advance_fts_test_probe_deadline_after_term(completed_terms: usize) {
+    let advance_by = FTS_TEST_PROBE_DEADLINE_ADVANCE
+        .try_with(|control| {
+            (completed_terms == control.after_completed_terms).then_some(control.by)
+        })
+        .ok()
+        .flatten();
+    if let Some(advance_by) = advance_by {
+        tokio::time::advance(advance_by).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn with_fts_probe_deadline_advance_after_term<F>(
+    after_completed_terms: usize,
+    by: std::time::Duration,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FTS_TEST_PROBE_DEADLINE_ADVANCE
+        .scope(
+            FtsTestDeadlineAdvance {
+                after_completed_terms,
+                by,
+            },
+            future,
+        )
+        .await
+}
+
+#[cfg(test)]
 pub(crate) async fn with_fts_deadline_advance_after_term<F>(
     after_completed_terms: usize,
     by: std::time::Duration,
@@ -798,15 +879,37 @@ async fn fetch_fts_candidates(
         per_term_limit
     };
 
+    // Set when the ordering probe below is cut off by its own deadline. The
+    // per-term fetch has `term_query_timed_out` for the same purpose; this is a
+    // second, independent way for the stage to have degraded, and the classifier
+    // at the bottom has to see both or an expired probe reads as a clean miss.
+    let mut rarity_probe_timed_out = false;
     if terms.len() > 1 {
-        terms = match rarest_fts_terms_first(reader.as_mut(), terms, &mut stage).await {
+        // The probe runs under its OWN, tighter deadline nested inside the
+        // stage's. `scope_request_read_deadline` keeps whichever deadline is
+        // earlier and restores the wider one on the way out, so this bounds
+        // the probe and leaves the rest of the stage budget to the fetch.
+        //
+        // On expiry the terms are used in the order the candidate list
+        // produced them. That order is not the caller's word order:
+        // `fts5_candidate_terms` runs `expand_terms`, which sorts, so the
+        // fallback is lexicographic and two spellings of the same query fall
+        // back identically. It is the unoptimized path, not a failure path:
+        // the ordering is a hint about which term to query first, and every
+        // term is queried either way. The recorded timeout still rides out on
+        // `stage.timeout`, so the response says the stage degraded and names
+        // `term_frequency` as the phase.
+        let arrival_order = terms.clone();
+        let probe_budget = rarity_probe_budget();
+        let probed = khive_storage::scope_request_read_deadline(probe_budget, async {
+            rarest_fts_terms_first(reader.as_mut(), terms, &mut stage).await
+        })
+        .await;
+        terms = match probed {
             Ok(terms) => terms,
             Err(e) if is_timeout(&e) => {
-                return Ok(FtsFetchOutcome {
-                    atoms: Vec::new(),
-                    timeout: stage.timeout,
-                    state: LexicalCandidateState::TimedOut,
-                });
+                rarity_probe_timed_out = true;
+                arrival_order
             }
             Err(e) => return Err(sql_err("search fts term frequency probe", e)),
         };
@@ -980,7 +1083,14 @@ async fn fetch_fts_candidates(
         }
     }
 
-    if term_query_timed_out {
+    // Either degradation lands here. A cut-off ordering probe with candidates in
+    // hand is `PartialTimeout`, which is what issue #2766 asks for: the lexical
+    // arm survives and the degradation is still reported. With no candidates it
+    // is `TimedOut` exactly as a per-term expiry is, because the alternative is
+    // for the classifier below to call it a clean local miss, and a miss and a
+    // stage that ran out of time are the two answers a caller must be able to
+    // tell apart.
+    if term_query_timed_out || rarity_probe_timed_out {
         return Ok(FtsFetchOutcome {
             state: if combined.is_empty() {
                 LexicalCandidateState::TimedOut
@@ -4516,6 +4626,192 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 3);
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// Issue #2766. `rarest_fts_terms_first` fetches no candidates — it sorts
+    /// the terms — and before this bound it ran against the whole lexical
+    /// stage budget, after which the caller returned an EMPTY candidate list
+    /// for a stage that had not yet asked for a candidate. The probe now has
+    /// its own quarter-budget and its expiry falls back to the arrival order.
+    ///
+    /// This arm fails on the unpatched code, where `atoms` is empty and the
+    /// state is `TimedOut`.
+    #[tokio::test(start_paused = true)]
+    async fn rarity_probe_expiry_keeps_the_lexical_arm() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+        let stage_budget = std::time::Duration::from_secs(1);
+
+        let outcome = with_lexical_stage_budget_override_ms(
+            1_000,
+            khive_storage::scope_request_read_deadline(
+                stage_budget,
+                // Past the quarter-budget (250 ms) after the first probe, and
+                // short of the stage budget, so only the probe is cut off.
+                with_fts_probe_deadline_advance_after_term(
+                    1,
+                    std::time::Duration::from_millis(300),
+                    fetch_fts_candidates(
+                        &runtime,
+                        "local",
+                        "term1 term18",
+                        None,
+                        &[],
+                        &[],
+                        CANDIDATE_POOL,
+                    ),
+                ),
+            ),
+        )
+        .await
+        .expect("a cut-off ordering probe must not fail the fetch");
+
+        assert!(
+            !outcome.atoms.is_empty(),
+            "the ordering probe timing out must not discard the lexical arm"
+        );
+        assert!(
+            outcome.timeout.is_some(),
+            "the degradation must still be reported, not swallowed"
+        );
+        assert_eq!(
+            outcome.state,
+            LexicalCandidateState::PartialTimeout,
+            "candidates in hand with a recorded timeout is partial, never clean"
+        );
+        let detail = outcome.timeout.expect("recorded timeout");
+        assert_eq!(
+            detail.phase,
+            LexicalPhase::TermFrequency,
+            "the reported phase must name the probe, not the fetch"
+        );
+    }
+
+    /// The pairing that shows the fallback IS the candidate-list order and
+    /// that the probe is what produced the rarest-first ordering. One arm
+    /// cannot show both, so both run here over the same corpus and the same
+    /// per-term expiry, differing only in whether the probe was allowed to
+    /// finish.
+    ///
+    /// The fallback order is NOT the caller's word order, and this arm is
+    /// written the way it is because the first version of it assumed that and
+    /// failed: `fts5_candidate_terms` ends in `expand_terms`, which sorts
+    /// (`scoring.rs`), so the candidate list is lexicographic whatever the
+    /// caller wrote. Both spellings therefore fall back to `term1` first, and
+    /// running both is the evidence for that rather than a repetition.
+    ///
+    /// The term pair is chosen, not incidental. The corpus writes
+    /// `discusses topic termN` for N in 0..20, so every token matches 50 rows
+    /// EXCEPT `term1`, whose FTS prefix family also covers `term10`..`term19`
+    /// and therefore matches about 550. `term1` is the only common token
+    /// available, and it has to be paired with a token OUTSIDE its own prefix
+    /// family or the two match sets are nested and no assertion can separate
+    /// them. `term7` qualifies; `term18` does not, which is what an earlier
+    /// version of this arm got wrong.
+    ///
+    /// The reading instrument is the FIRST atom. The merge loop walks the
+    /// per-term row vectors in order, so `atoms[0]` is the first row of the
+    /// first term the fetch actually queried, whatever the candidate cap does
+    /// to the rest.
+    #[tokio::test(start_paused = true)]
+    async fn rarity_probe_decides_the_order_and_its_expiry_falls_back_to_arrival() {
+        let stage_budget = std::time::Duration::from_secs(1);
+
+        // Anchored on the corpus's own surrounding words: a bare `term1` needle
+        // is a prefix of `term18` and of `term10`, and would match rows the
+        // assertion means to exclude.
+        let topic = |term: &str| format!("topic {term} ");
+        // Lexicographically first in the candidate list, hence first in the
+        // fallback; `term7` is the rarer one, hence first when the probe runs.
+        let fallback_first_term = "term1";
+        for query in ["term1 term7", "term7 term1"] {
+            // Probe allowed to finish: the RARE term is queried first whatever
+            // the caller wrote.
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+            let ordered = with_lexical_stage_budget_override_ms(
+                1_000,
+                khive_storage::scope_request_read_deadline(
+                    stage_budget,
+                    with_fts_deadline_advance_after_term(
+                        1,
+                        stage_budget,
+                        fetch_fts_candidates(
+                            &runtime,
+                            "local",
+                            query,
+                            None,
+                            &[],
+                            &[],
+                            CANDIDATE_POOL,
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .expect("partial fetch");
+            let ordered_first = ordered
+                .atoms
+                .first()
+                .map(|atom| atom.content.clone())
+                .expect("the probe-intact fetch must produce candidates");
+            assert!(
+                ordered_first.contains(&topic("term7")),
+                "with the probe intact the rarer term is queried first whatever the \
+                 caller wrote ({query}); got {} atoms, first content {ordered_first:?}",
+                ordered.atoms.len()
+            );
+
+            // Probe cut off: the order is the one the caller wrote.
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            seed_low_overlap_corpus(&runtime, 1_000, 20).await;
+            let fallback = with_lexical_stage_budget_override_ms(
+                1_000,
+                khive_storage::scope_request_read_deadline(
+                    stage_budget,
+                    with_fts_probe_deadline_advance_after_term(
+                        1,
+                        std::time::Duration::from_millis(300),
+                        with_fts_deadline_advance_after_term(
+                            1,
+                            stage_budget,
+                            fetch_fts_candidates(
+                                &runtime,
+                                "local",
+                                query,
+                                None,
+                                &[],
+                                &[],
+                                CANDIDATE_POOL,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .expect("partial fetch");
+            assert!(
+                !fallback.atoms.is_empty(),
+                "the fallback must still produce candidates ({query})"
+            );
+            let fallback_first = fallback
+                .atoms
+                .first()
+                .map(|atom| atom.content.clone())
+                .expect("the fallback must still produce candidates");
+            assert!(
+                fallback_first.contains(&topic(fallback_first_term)),
+                "with the probe cut off the fetch must use the candidate-list \
+                 order, expected {fallback_first_term} first ({query}); got {} \
+                 atoms, first content {fallback_first:?}",
+                fallback.atoms.len()
+            );
+            // And the degradation is still reported rather than read as a miss.
+            assert!(
+                fallback.timeout.is_some(),
+                "a cut-off probe must still be reported ({query})"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
