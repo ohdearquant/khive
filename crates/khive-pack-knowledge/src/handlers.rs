@@ -346,6 +346,13 @@ impl KnowledgePack {
     /// 1. Explicit brain profile in config (`self.brain_profile`) → route via `brain.feedback`
     /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → route via `brain.feedback`
     /// 3. Namespace-local section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
+    ///
+    /// The response names the tier that ran (`tier`) and whether `target_id` was
+    /// consulted (`target_id_used`), so a caller does not have to infer the rung
+    /// from which other keys happen to be present. Tier 3 never consults
+    /// `target_id` — there is no resolver for it on this path, so an id naming
+    /// nothing is accepted exactly like a real one, and the response says so
+    /// rather than reporting a bare success.
     pub(crate) async fn handle_feedback(
         &self,
         token: &NamespaceToken,
@@ -407,7 +414,9 @@ impl KnowledgePack {
                     .await?;
                 return Ok(json!({
                     "ok": true,
+                    "tier": "explicit_profile",
                     "brain_profile": profile_id,
+                    "target_id_used": true,
                     "signals_applied": signals.len(),
                     "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
                 }));
@@ -438,7 +447,9 @@ impl KnowledgePack {
                     .await?;
                 return Ok(json!({
                     "ok": true,
+                    "tier": "bound_profile",
                     "brain_profile": profile_id,
+                    "target_id_used": true,
                     "signals_applied": signals.len(),
                     "emitted": result.get("emitted").and_then(|v| v.as_bool()).unwrap_or(false),
                 }));
@@ -458,6 +469,8 @@ impl KnowledgePack {
 
         Ok(json!({
             "ok": true,
+            "tier": "namespace_local",
+            "target_id_used": false,
             "total_events": total_events,
             "signals_applied": signals.len(),
         }))
