@@ -1054,6 +1054,62 @@ class HarnessEnvironmentTests(unittest.TestCase):
         self.assertIn("contract-suite", completed.stderr)
 
 
+class DocsFormatPhaseTests(unittest.TestCase):
+    def run_docs_fmt(self, path_value):
+        env = os.environ.copy()
+        env["PATH"] = path_value
+        return subprocess.run(
+            ["sh", str(REPO_ROOT / "scripts" / "ci.sh"), "docs-fmt"],
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_docs_job_runs_the_committed_phase(self):
+        # The hosted docs job and a local run have to execute one command, not
+        # two copies of it: the workflow carried its own `deno fmt --check` for
+        # long enough that a hand-padded markdown table passed every phase in
+        # ci.sh and failed on the hosted side.
+        docs_job = indented_block(workflow_text("ci.yml"), "docs", 2)
+        self.assertIn("run: scripts/ci.sh docs-fmt", docs_job)
+        self.assertNotIn("deno fmt", docs_job)
+        self.assertIn("denoland/setup-deno@v2", docs_job)
+
+    def test_docs_fmt_refuses_when_deno_is_absent(self):
+        # The absence arm decides whether this gate can be emptied in silence: a
+        # skip would exit 0 and check nothing. The stub arm runs the identical
+        # invocation with a deno on PATH, so the pair shows the refusal comes
+        # from the missing binary rather than from the phase never running, and
+        # it reads back the argv to prove the phase checks rather than formats.
+        minimal_path = "/usr/bin:/bin"
+        for directory in minimal_path.split(":"):
+            if pathlib.Path(directory, "deno").exists():
+                self.skipTest(f"deno is installed in {directory}, which the absence arm empties")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub_dir = pathlib.Path(tmp, "bin")
+            stub_dir.mkdir()
+            argv_log = pathlib.Path(tmp, "argv")
+            stub = stub_dir / "deno"
+            stub.write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$@" > {shlex.quote(str(argv_log))}\n'
+                "exit 0\n"
+            )
+            stub.chmod(0o755)
+
+            absent = self.run_docs_fmt(minimal_path)
+            self.assertEqual(absent.returncode, 1, absent.stdout + absent.stderr)
+            self.assertIn("deno not found on PATH", absent.stderr)
+            self.assertFalse(argv_log.exists())
+
+            present = self.run_docs_fmt(f"{stub_dir}:{minimal_path}")
+            self.assertEqual(present.returncode, 0, present.stdout + present.stderr)
+            self.assertEqual(argv_log.read_text().split(), ["fmt", "--check"])
+
+
 class NpmReleaseWorkflowTests(unittest.TestCase):
     def test_release_publishes_cli_alias_after_exact_version_umbrella(self):
         workflow = workflow_text("release.yml")

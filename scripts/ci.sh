@@ -60,6 +60,24 @@ phase_lint() {
     uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
 }
 
+phase_docs_fmt() {
+    echo "=== Docs Format Check ==="
+    # The hosted docs job runs `deno fmt --check` from the repo root over the
+    # set named in ./deno.json, and until this phase existed nothing in this
+    # script did, so a markdown table padded by hand passed every local phase
+    # and failed on the hosted side. The job now runs this phase, so the two
+    # sides execute one command rather than two copies of it.
+    #
+    # A missing deno is a refusal, not a skip: a gate whose discovery can be
+    # emptied silently exits 0 and checks nothing. The deno-tests phase needs
+    # the same binary, so a checkout that cannot run this cannot run that either.
+    if ! command -v deno > /dev/null 2>&1; then
+        echo "deno not found on PATH: install deno v2.x (https://deno.com); the deno-tests phase needs it too" >&2
+        exit 1
+    fi
+    (cd "$SCRIPT_DIR/.." && deno fmt --check)
+}
+
 phase_no_stubs_scan() {
     echo "=== No-Stub Guard (placeholder-string panic!/unreachable! scan) ==="
     # SECURITY ORDERING (#560 follow-up): this placeholder-string scan and its
@@ -403,6 +421,7 @@ run_phase() {
     fi
     case "$1" in
         no-stubs-scan) phase_no_stubs_scan ;;
+        docs-fmt) phase_docs_fmt ;;
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
@@ -424,7 +443,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -433,6 +452,7 @@ run_phase() {
 set_run_all_phases() {
     run_all_phases="\
         no-stubs-scan \
+        docs-fmt \
         lockfile \
         forward-deployed \
         lint \
