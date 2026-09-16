@@ -78,12 +78,18 @@ fn main() {
                 json!({
                     "slug": format!("bench-atom-{i}"),
                     "name": format!("Bench Atom {i}"),
-                    "description": format!(
-                        "knowledge retrieval embedding reranking benchmark atom {i} tensor neural"
-                    ),
-                    // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by the knowledge pack.
+                    // Content must satisfy MIN_ATOM_CONTENT_WORDS = 20 enforced by
+                    // the knowledge pack. The first clause was a `description`
+                    // field until this was fixed: an atom write has no such field
+                    // and the params struct denies unknown ones, so every run of
+                    // this bench died in its seed. Its words are kept here rather
+                    // than dropped, because `knowledge` and `reranking` appear in
+                    // the query below and nowhere else in the corpus -- deleting
+                    // the key would have left the bench running and measuring a
+                    // search for terms the corpus no longer contains.
                     "content": format!(
-                        "dense sparse retrieval corpus benchmark search latency atom {i} gradient neural transformer embedding semantic index query score rank precision recall vector"
+                        "knowledge retrieval embedding reranking benchmark atom {i} tensor neural \
+                         dense sparse retrieval corpus benchmark search latency atom {i} gradient neural transformer embedding semantic index query score rank precision recall vector"
                     ),
                 })
             })

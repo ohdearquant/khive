@@ -98,7 +98,16 @@ fn bench_schedule(c: &mut Criterion) {
                     .dispatch(
                         "schedule.schedule",
                         black_box(json!({
-                            "action": "remind(content=\"scheduled action\")",
+                            // The action is stored to be replayed, so it is
+                            // validated at write time: the verb must carry its
+                            // pack prefix, and every argument the replay will
+                            // need must already be present. `remind` alone was
+                            // refused as unregistered, and the prefixed form
+                            // without its own `at` is refused for the missing
+                            // argument. The inner `at` belongs to the reminder
+                            // that gets created; the outer one is when this
+                            // action runs.
+                            "action": "schedule.remind(content=\"scheduled action\", at=\"2199-06-01T12:00:00Z\")",
                             "at": "2199-06-01T12:00:00Z"
                         })),
                     )
