@@ -90,7 +90,7 @@ impl KgPack {
                 if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
                     return Ok(payload_val);
                 }
-                return Err(RuntimeError::NotFound(format!("not found: {id_ref}")));
+                return Err(RuntimeError::NotFound(id_ref.to_string()));
             }
         };
 
@@ -220,7 +220,7 @@ impl KgPack {
             return Err(RuntimeError::NotFound(hint));
         }
 
-        Err(RuntimeError::NotFound(format!("not found: {id_ref}")))
+        Err(RuntimeError::NotFound(id_ref.to_string()))
     }
 
     /// Annotating notes for an edge (#803): the `annotates` convention only

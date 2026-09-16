@@ -140,7 +140,7 @@ impl KgPack {
                 if self.runtime.get_edge(token, id).await?.is_some() {
                     Ok(KindSpec::Edge)
                 } else {
-                    Err(RuntimeError::NotFound(format!("not found: {id_str}")))
+                    Err(RuntimeError::NotFound(id_str.to_string()))
                 }
             }
         }
@@ -170,7 +170,7 @@ impl KgPack {
                 {
                     Ok(KindSpec::Edge)
                 } else {
-                    Err(RuntimeError::NotFound(format!("not found: {id_str}")))
+                    Err(RuntimeError::NotFound(id_str.to_string()))
                 }
             }
         }
@@ -213,7 +213,7 @@ impl KgPack {
                             ));
                         }
                     }
-                    return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+                    return Err(RuntimeError::NotFound(p.id.clone()));
                 }
                 Err(e) => return Err(e),
             },
@@ -381,7 +381,7 @@ impl KgPack {
                                 return resolver.delete_by_id(id, hard).await;
                             }
                         }
-                        return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+                        return Err(RuntimeError::NotFound(p.id.clone()));
                     }
                     Err(e) => return Err(e),
                 }
@@ -499,7 +499,7 @@ impl KgPack {
                     .runtime
                     .get_entity_including_deleted(token, id)
                     .await?
-                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                    .ok_or_else(|| RuntimeError::NotFound(p.id.clone()))?;
                 // Ownership before the kind hint: the by-id read has no
                 // namespace term, so comparing a hint first would disclose a
                 // foreign tombstone's kind. A foreign row gets the same answer
@@ -527,7 +527,7 @@ impl KgPack {
                     .runtime
                     .get_note_including_deleted(token, id)
                     .await?
-                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                    .ok_or_else(|| RuntimeError::NotFound(p.id.clone()))?;
                 if existing.namespace != token.namespace().as_str() {
                     return Err(foreign_restore_target(&p.id));
                 }
@@ -551,7 +551,7 @@ impl KgPack {
                     .runtime
                     .get_edge_including_deleted(token, id)
                     .await?
-                    .ok_or_else(|| RuntimeError::NotFound(format!("not found: {}", p.id)))?;
+                    .ok_or_else(|| RuntimeError::NotFound(p.id.clone()))?;
                 let Some((edge, restored)) = self.runtime.restore_edge(token, id).await? else {
                     return Err(foreign_restore_target(&p.id));
                 };

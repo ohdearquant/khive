@@ -909,7 +909,7 @@ async fn load_task(
         .get_note(uuid)
         .await
         .map_err(|e| RuntimeError::Internal(format!("get_note: {e}")))?
-        .ok_or_else(|| RuntimeError::NotFound(format!("not found: {raw_id}")))?;
+        .ok_or_else(|| RuntimeError::NotFound(raw_id.to_string()))?;
 
     if note.kind != "task" {
         return Err(RuntimeError::InvalidInput(format!(
