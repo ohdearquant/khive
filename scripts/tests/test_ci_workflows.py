@@ -123,6 +123,26 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
         self.assertEqual(permissions, {"contents: write", "pull-requests: write"})
 
 
+class CiConcurrencyWorkflowTests(unittest.TestCase):
+    def test_main_pushes_queue_without_replacing_landed_commit_runs(self):
+        concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
+        self.assertEqual(
+            mapping_entries(concurrency),
+            {
+                "group: ci-${{ github.workflow }}-${{ "
+                "github.event_name == 'pull_request' && github.ref || "
+                "github.event_name == 'push' && github.ref == 'refs/heads/main' "
+                "&& github.ref || github.run_id }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "queue: ${{ github.event_name == 'push' && "
+                "github.ref == 'refs/heads/main' && 'max' || 'single' }}",
+            },
+            "Main pushes must share the bounded queue without cancelling its "
+            "waiting commits; PRs retain ref-scoped cancellation, and other "
+            "events retain independent run groups.",
+        )
+
+
 class WasmtimeParityWorkflowTests(unittest.TestCase):
     def test_pinned_runtime_is_cached_retried_and_verified(self):
         workflow = workflow_text("ci.yml")
