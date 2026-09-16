@@ -487,10 +487,21 @@ hard-delete cascade. The same preimages are stored in the merge audit event.
 When the surviving entity or note is reindexed and an embedder bounds its input, the successful
 response also includes the standard embedding-truncation `warnings` advisory.
 
-| Param     | Type | Required | Notes                                       |
-| --------- | ---- | -------- | ------------------------------------------- |
-| `into_id` | uuid | yes      | Entity that survives the merge (canonical). |
-| `from_id` | uuid | yes      | Entity merged from; soft-deleted afterward. |
+Entity merges pass a cheap safety floor first: the two records must share an
+entity kind, carry similar names, and not be owned by disjoint projects. A merge
+that fails it is refused with a conflict error naming the check in
+`details.guard` and what the check compared in `details.compared`. Under
+`dry_run=true` that refusal is returned as the plan instead of as an error —
+`{dry_run: true, would_merge: false, refused_by, compared, into_value,
+from_value, detail}` — so a dry run predicts the floor rather than failing on
+it. Every `dry_run` response carries `would_merge`.
+
+| Param     | Type | Required | Notes                                                                        |
+| --------- | ---- | -------- | ---------------------------------------------------------------------------- |
+| `into_id` | uuid | yes      | Entity that survives the merge (canonical).                                  |
+| `from_id` | uuid | yes      | Entity merged from; soft-deleted afterward.                                  |
+| `dry_run` | bool | no       | Return the plan without mutating or emitting.                                |
+| `force`   | bool | no       | Skip the entity safety floor; the caller takes responsibility for the merge. |
 
 ```
 request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
