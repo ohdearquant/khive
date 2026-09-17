@@ -24,6 +24,12 @@ preserves best-effort hook updates); on a mismatch, the snapshot JSON is fetched
 and used as the mutation base. Avoiding that full decode on the matched steady-state path keeps
 the writer exclusion window bounded to work the mutation actually needs. The proposed
 `BrainState` is published only after commit.
+Both mutation paths serialize the proposed state through a borrowed snapshot view.
+Profile and posterior projections retain the existing snapshot semantics, while
+bindings, opaque router bytes, and adapter records are serialized without cloning
+them into a second owned snapshot. The initial private-state reconstruction and
+the encoded JSON allocation remain. Serialization and snapshot-write failures
+still roll back the whole atomic unit without publishing the proposed state.
 The event and snapshot share a transaction timestamp chosen as
 `max(wall_clock, previous_updated_at + 1)`, so a writer that waited behind a newer process
 cannot move the replay boundary backward and cause already-snapshotted feedback to replay twice.
