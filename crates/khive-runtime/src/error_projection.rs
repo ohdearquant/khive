@@ -73,6 +73,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "audit_event_id": receipt.audit_event_id.map(|id| id.to_string()),
             "audit_outcome": receipt.audit_outcome.wire_code(),
         }),
+        RuntimeError::SecretDetected(matched) => {
+            let message = RuntimeError::SecretDetected(matched.clone()).to_string();
+            json!({
+                "kind": "runtime_error",
+                "code": "secret_detected",
+                "detector": matched.detector,
+                "location": matched.location,
+                "message": message,
+            })
+        }
         RuntimeError::RefusedWithReceipt(refusal) => {
             let crate::error::ReceiptRefusal {
                 code,
@@ -143,7 +153,6 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         | RuntimeError::AmbiguousId { .. }
         | RuntimeError::CrossNamespaceWrite { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::SecretDetected(_)
         | RuntimeError::DeadlineExceeded { .. }) => {
             if let Some(context) = other.writer_task_failure_context() {
                 json!({"kind":"storage", "code":context.stage, "stage":context.stage,
