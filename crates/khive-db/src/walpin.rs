@@ -53,6 +53,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 #[cfg(any(unix, test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2118,6 +2120,16 @@ pub struct CensusResult {
     pub holders: std::collections::HashSet<u32>,
     pub uninspectable_pids: Vec<u32>,
     pub truncated: bool,
+    /// Set when the walk stopped because its wall-clock budget was spent.
+    /// This also sets `truncated`, so `is_complete()` needs no knowledge of
+    /// it; the two are kept apart because they have opposite operational
+    /// meanings. A budget stop is a configurable trade the caller asked for
+    /// and says nothing about the health of the machine. Every other
+    /// truncation is positive evidence that process enumeration itself
+    /// misbehaved. A report that folded them together would describe a
+    /// healthy bounded census in the same words as a broken one, on every
+    /// call, on every busy box — which is how a real signal gets ignored.
+    pub budget_exhausted: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -2262,6 +2274,49 @@ pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Res
 where
     C: Fn() -> bool,
 {
+    census_holders_inner(db_path, should_stop, None)
+}
+
+/// Walk the holder census under a wall-clock budget, returning what was seen
+/// so far rather than an error when the budget is spent.
+///
+/// This is deliberately NOT expressible through [`census_holders_until`]. That
+/// function's stop closure is a CANCELLATION: every one of its check sites
+/// returns `Err(Interrupted)`, which is right for a caller that no longer
+/// wants the answer (a shutting-down background worker) and wrong for a caller
+/// that wants a fast, honest one. An interactive diagnostic asking "is anything
+/// stalled" must not be told "cancelled" because the machine had many processes
+/// to walk.
+///
+/// A budget stop therefore sets [`CensusResult::truncated`] and
+/// [`CensusResult::budget_exhausted`] and returns `Ok`, exactly as an
+/// unreadable PID sets `uninspectable_pids` and continues. Both are
+/// incompleteness, not failure, and [`CensusResult::is_complete`] already
+/// folds them together — so a caller that does not branch on it reads a
+/// bounded census as if it were whole, which is why the field is the
+/// load-bearing part of this change rather than the bound.
+#[cfg(target_os = "macos")]
+pub fn census_holders_until_within<C>(
+    db_path: &Path,
+    should_stop: C,
+    budget: Duration,
+) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    census_holders_inner(db_path, should_stop, Some(Instant::now() + budget))
+}
+
+#[cfg(target_os = "macos")]
+fn census_holders_inner<C>(
+    db_path: &Path,
+    should_stop: C,
+    deadline: Option<Instant>,
+) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    let budget_spent = || deadline.is_some_and(|d| Instant::now() >= d);
     use std::os::raw::{c_int, c_void};
     use std::os::unix::fs::MetadataExt;
 
@@ -2375,12 +2430,17 @@ where
 
     let mut holders = std::collections::HashSet::new();
     let mut uninspectable: Vec<u32> = Vec::new();
-    for &pid in &pid_buf {
+    let mut budget_exhausted = false;
+    'pids: for &pid in &pid_buf {
         if should_stop() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "WAL holder census cancelled",
             ));
+        }
+        if budget_spent() {
+            budget_exhausted = true;
+            break 'pids;
         }
         if pid <= 0 {
             continue;
@@ -2424,6 +2484,10 @@ where
                     io::ErrorKind::Interrupted,
                     "WAL holder census cancelled",
                 ));
+            }
+            if budget_spent() {
+                budget_exhausted = true;
+                break 'pids;
             }
             if fdinfo.proc_fdtype != PROX_FDTYPE_VNODE {
                 continue;
@@ -2478,7 +2542,8 @@ where
     let mut census = CensusResult {
         holders,
         uninspectable_pids: uninspectable,
-        truncated: pid_list_truncated,
+        truncated: pid_list_truncated || budget_exhausted,
+        budget_exhausted,
     };
     census.apply_self_canary();
     Ok(census)
@@ -2634,6 +2699,49 @@ pub(crate) fn census_holders_until<C>(db_path: &Path, should_stop: C) -> io::Res
 where
     C: Fn() -> bool,
 {
+    census_holders_inner(db_path, should_stop, None)
+}
+
+/// Walk the holder census under a wall-clock budget, returning what was seen
+/// so far rather than an error when the budget is spent.
+///
+/// This is deliberately NOT expressible through [`census_holders_until`]. That
+/// function's stop closure is a CANCELLATION: every one of its check sites
+/// returns `Err(Interrupted)`, which is right for a caller that no longer
+/// wants the answer (a shutting-down background worker) and wrong for a caller
+/// that wants a fast, honest one. An interactive diagnostic asking "is anything
+/// stalled" must not be told "cancelled" because the machine had many processes
+/// to walk.
+///
+/// A budget stop therefore sets [`CensusResult::truncated`] and
+/// [`CensusResult::budget_exhausted`] and returns `Ok`, exactly as an
+/// unreadable PID sets `uninspectable_pids` and continues. Both are
+/// incompleteness, not failure, and [`CensusResult::is_complete`] already
+/// folds them together — so a caller that does not branch on it reads a
+/// bounded census as if it were whole, which is why the field is the
+/// load-bearing part of this change rather than the bound.
+#[cfg(target_os = "linux")]
+pub fn census_holders_until_within<C>(
+    db_path: &Path,
+    should_stop: C,
+    budget: Duration,
+) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    census_holders_inner(db_path, should_stop, Some(Instant::now() + budget))
+}
+
+#[cfg(target_os = "linux")]
+fn census_holders_inner<C>(
+    db_path: &Path,
+    should_stop: C,
+    deadline: Option<Instant>,
+) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    let budget_spent = || deadline.is_some_and(|d| Instant::now() >= d);
     use std::os::unix::fs::MetadataExt;
 
     if should_stop() {
@@ -2662,13 +2770,19 @@ where
         Some(true) | None => truncated = true,
     }
 
+    let mut budget_exhausted = false;
     let proc_dir = fs::read_dir("/proc")?;
-    for entry_result in proc_dir {
+    'pids: for entry_result in proc_dir {
         if should_stop() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "WAL holder census cancelled",
             ));
+        }
+        if budget_spent() {
+            truncated = true;
+            budget_exhausted = true;
+            break 'pids;
         }
         let proc_entry = match entry_result {
             Ok(e) => e,
@@ -2702,6 +2816,11 @@ where
                     io::ErrorKind::Interrupted,
                     "WAL holder census cancelled",
                 ));
+            }
+            if budget_spent() {
+                truncated = true;
+                budget_exhausted = true;
+                break 'pids;
             }
             let fd_entry = match fd_result {
                 Ok(e) => e,
@@ -2742,6 +2861,7 @@ where
         holders,
         uninspectable_pids: uninspectable,
         truncated,
+        budget_exhausted,
     };
     census.apply_self_canary();
     Ok(census)
@@ -2774,6 +2894,20 @@ where
     Err(io_other(
         "OS-derived holder census has no implementation on this Unix target",
     ))
+}
+
+/// A budget cannot make an absent implementation partial: there is no walk to
+/// stop early, so this stays the same census failure the unbounded form is.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub fn census_holders_until_within<C>(
+    db_path: &Path,
+    should_stop: C,
+    _budget: Duration,
+) -> io::Result<CensusResult>
+where
+    C: Fn() -> bool,
+{
+    census_holders_until(db_path, should_stop)
 }
 
 /// Ensure `dir` exists and is trustworthy: a real directory (never a
@@ -5390,6 +5524,7 @@ mod tests {
             holders: std::collections::HashSet::from([1, 2]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
         assert!(complete.is_complete());
 
@@ -5397,8 +5532,96 @@ mod tests {
             holders: std::collections::HashSet::from([1]),
             uninspectable_pids: vec![7],
             truncated: false,
+            budget_exhausted: false,
         };
         assert!(!incomplete.is_complete());
+    }
+
+    /// A bounded walk that finds fewer holders is indistinguishable from a
+    /// store with fewer holders unless the result declares its own truncation
+    /// and the consumer branches on it — so this asserts the declaration, not
+    /// the speed. Timing it would pass on a fast machine with the bound
+    /// removed, which is the one arm that must fail.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_spent_budget_truncates_the_census_instead_of_failing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        let handle = fs::File::create(&db_path).unwrap();
+
+        // Control, same process and same file in the same test: an unbounded
+        // census never reports a spent budget, so the flag below cannot be
+        // something every census on this host sets.
+        let unbounded = census_holders(&db_path).expect("unbounded census of a live target");
+        assert!(
+            !unbounded.budget_exhausted,
+            "an unbounded census has no budget to spend"
+        );
+
+        let bounded = census_holders_until_within(&db_path, || false, Duration::ZERO)
+            .expect("a spent budget returns the partial census, never an error");
+        assert!(
+            bounded.budget_exhausted,
+            "a walk stopped by its budget must say so; a caller cannot otherwise \
+             tell a bounded answer from a complete one"
+        );
+        assert!(
+            bounded.truncated,
+            "budget exhaustion is an incompleteness signal, folded into the same \
+             field every other incompleteness uses"
+        );
+        assert!(
+            !bounded.is_complete(),
+            "the consumer branches on is_complete(); a bounded census that reads \
+             complete is the defect this bound would otherwise introduce"
+        );
+
+        drop(handle);
+    }
+
+    /// The two stop mechanisms are not interchangeable and the difference is
+    /// the whole reason the budget could not simply be expressed as a
+    /// `should_stop` closure: a cancellation says the caller stopped wanting
+    /// the answer, a spent budget says the caller wants whatever was found.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_cancel_and_a_spent_budget_leave_by_opposite_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        let handle = fs::File::create(&db_path).unwrap();
+
+        let cancelled = census_holders_until(&db_path, || true)
+            .expect_err("a cancellation is an error by design");
+        assert_eq!(
+            cancelled.kind(),
+            io::ErrorKind::Interrupted,
+            "a cancelled census reports Interrupted"
+        );
+
+        let bounded = census_holders_until_within(&db_path, || false, Duration::ZERO)
+            .expect("a spent budget is not a cancellation");
+        assert!(bounded.budget_exhausted);
+
+        drop(handle);
+    }
+
+    /// A budget generous enough for the walk must leave no trace: the flag
+    /// reports what happened, never that a bound was configured.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn an_unspent_budget_is_invisible_in_the_result() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("test.db");
+        let handle = fs::File::create(&db_path).unwrap();
+
+        let bounded = census_holders_until_within(&db_path, || false, Duration::from_secs(300))
+            .expect("census of a live target");
+        assert!(
+            !bounded.budget_exhausted,
+            "a five-minute budget cannot be spent by one process walk on a test host"
+        );
+
+        drop(handle);
     }
 
     #[test]
@@ -5412,6 +5635,7 @@ mod tests {
             holders: std::collections::HashSet::from([1]),
             uninspectable_pids: Vec::new(),
             truncated: true,
+            budget_exhausted: false,
         };
         assert!(!truncated.is_complete());
     }
@@ -5423,6 +5647,7 @@ mod tests {
             holders: std::collections::HashSet::from([42]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
         census.apply_self_canary_for(Some(scanner_pid));
         assert!(
@@ -5439,6 +5664,7 @@ mod tests {
             holders: std::collections::HashSet::from([scanner_pid]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
         census.apply_self_canary_for(Some(scanner_pid));
         assert!(
@@ -5454,6 +5680,7 @@ mod tests {
             holders: std::collections::HashSet::from([scanner_pid]),
             uninspectable_pids: Vec::new(),
             truncated: true,
+            budget_exhausted: false,
         };
         census.apply_self_canary_for(Some(scanner_pid));
         assert!(
