@@ -3,7 +3,7 @@
 //! Shipped:
 //! - `kkernel vector capabilities` — print VectorStoreCapabilities for the active backend
 //!
-//! Deferred (returns `NotImplemented`, tracked in #381):
+//! Deferred (returns `NotImplemented`, tracked in #2874):
 //! - `kkernel vector sweep` — run an orphan-sweep to remove stale vector rows
 
 use std::path::PathBuf;
@@ -141,7 +141,7 @@ fn cmd_vector_capabilities(args: VectorCapabilitiesArgs) -> Result<()> {
 fn cmd_vector_sweep(_args: VectorSweepArgs) -> Result<()> {
     Err(anyhow!(
         "vector sweep is not yet implemented (backend orphan-sweep deferred to \
-         follow-up #381). SqliteVecStore returns Unsupported."
+         follow-up #2874). SqliteVecStore returns Unsupported."
     ))
 }
 
@@ -208,7 +208,7 @@ mod tests {
             "expected 'not yet implemented' in error, got: {msg}"
         );
         assert!(
-            msg.contains("#381"),
+            msg.contains("#2874"),
             "expected follow-up issue reference in error, got: {msg}"
         );
     }

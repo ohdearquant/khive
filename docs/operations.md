@@ -564,7 +564,7 @@ purely a row-state check: does an `_embedding_models` row for that engine have `
 
 `engine migrate <name> [--to <model> | --resume | --abort]` and `engine drift-check <name>
 [--sample <n>]` parse and validate their flags but **always return an error**: "not yet
-implemented (... deferred to follow-up #380)", regardless of which options are passed. Their args
+implemented (... deferred to follow-up #2873)", regardless of which options are passed. Their args
 are accepted by clap and even mutually validated (`--to`/`--resume`/`--abort` are pairwise
 `conflicts_with`), but the handlers do nothing: no DB mutation, no re-embedding, no drift
 computation happens today. Do not script against these as if they perform work.
@@ -581,7 +581,7 @@ current sqlite-vec baseline, not a live probe (`vector.rs:95-136`).
 
 `vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run] [--engine <name>] [--db <path>]`
 parses all its flags but **always returns an error**: "not yet implemented (backend orphan-sweep
-deferred to follow-up #381)". No orphan detection, dry-run behavior, or deletion happens today;
+deferred to follow-up #2874)". No orphan detection, dry-run behavior, or deletion happens today;
 none of its flags do anything yet.
 
 ---

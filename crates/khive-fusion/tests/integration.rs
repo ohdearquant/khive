@@ -170,7 +170,7 @@ mod integration_tests {
 }
 
 // =============================================================================
-// Property Tests (Issue #746)
+// Property Tests
 // TODO(port): proptest not yet added as a dev-dependency; the proptest macro
 // forms below have been converted to deterministic unit tests covering the same
 // properties. Re-introduce proptest once it is added to Cargo.toml [dev-dependencies].

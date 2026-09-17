@@ -162,7 +162,7 @@ mod integration_tests {
 }
 
 // Property tests: deterministic coverage of RRF/union/weighted properties.
-// Proptest integration deferred (see issue #746).
+// Proptest integration deferred.
 
 #[cfg(test)]
 mod property_tests {

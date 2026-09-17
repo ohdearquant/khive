@@ -4,7 +4,7 @@
 //! - `kkernel engine list`   — show all engines and their model history
 //! - `kkernel engine status` — per-engine active model and migration state
 //!
-//! Deferred (returns `NotImplemented`, tracked in #380):
+//! Deferred (returns `NotImplemented`, tracked in #2873):
 //! - `kkernel engine migrate`     — model migration (EmbedMigrationWorker)
 //! - `kkernel engine drift-check` — one-shot drift detection (lattice_transport)
 //!
@@ -199,7 +199,7 @@ async fn cmd_engine_status(args: EngineStatusArgs) -> Result<()> {
 fn cmd_engine_migrate(_args: EngineMigrateArgs) -> Result<()> {
     Err(anyhow!(
         "engine migrate is not yet implemented (EmbedMigrationWorker deferred \
-         to follow-up #380). Use 'kkernel engine list' / 'status' to inspect registered models."
+         to follow-up #2873). Use 'kkernel engine list' / 'status' to inspect registered models."
     ))
 }
 
@@ -208,7 +208,7 @@ fn cmd_engine_migrate(_args: EngineMigrateArgs) -> Result<()> {
 fn cmd_engine_drift_check(_args: EngineDriftCheckArgs) -> Result<()> {
     Err(anyhow!(
         "engine drift-check is not yet implemented (lattice_transport integration \
-         deferred). Track follow-up #380."
+         deferred). Track follow-up #2873."
     ))
 }
 
@@ -332,7 +332,7 @@ mod tests {
             "expected 'not yet implemented' in error, got: {msg}"
         );
         assert!(
-            msg.contains("#380"),
+            msg.contains("#2873"),
             "expected follow-up issue reference in error, got: {msg}"
         );
     }
@@ -381,7 +381,7 @@ mod tests {
             "expected 'not yet implemented' in error, got: {msg}"
         );
         assert!(
-            msg.contains("#380"),
+            msg.contains("#2873"),
             "expected follow-up issue reference in error, got: {msg}"
         );
     }
