@@ -556,6 +556,46 @@ enum ReaderLease<'pool> {
     Shared(parking_lot::MutexGuard<'pool, Connection>),
 }
 
+/// A value-extraction view of one row from a reader lease.
+///
+/// It deliberately exposes neither the prepared statement nor its connection.
+///
+/// ```compile_fail
+/// fn statement(row: &khive_db::ReaderRow<'_, '_>) {
+///     let _: &rusqlite::Statement<'_> = row.as_ref();
+/// }
+/// ```
+pub struct ReaderRow<'row, 'statement> {
+    row: &'row rusqlite::Row<'statement>,
+}
+
+impl ReaderRow<'_, '_> {
+    /// Extract a value by zero-based column index or column name.
+    pub fn get<I: rusqlite::RowIndex, T: rusqlite::types::FromSql>(
+        &self,
+        index: I,
+    ) -> rusqlite::Result<T> {
+        self.row.get(index)
+    }
+
+    /// Borrow a SQLite value without exposing statement metadata or execution.
+    pub fn get_ref<I: rusqlite::RowIndex>(
+        &self,
+        index: I,
+    ) -> rusqlite::Result<rusqlite::types::ValueRef<'_>> {
+        self.row.get_ref(index)
+    }
+}
+
+/// One public query owns this lease's connection-global progress handler.
+struct ReaderQueryInProgress<'a>(&'a Cell<bool>);
+
+impl Drop for ReaderQueryInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// A reader connection checked out from the pool.
 /// Returns the connection to the pool on drop.
 pub struct ReaderGuard<'pool> {
@@ -565,7 +605,8 @@ pub struct ReaderGuard<'pool> {
     /// been reset/replaced and made reusable.
     admission_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: &'pool ConnectionPool,
-    reusable: bool,
+    reusable: Cell<bool>,
+    query_in_progress: Cell<bool>,
     checked_out_at: Instant,
     /// Set by [`Self::mark_dirty`] whenever this checkout ran a `SqlReader`
     /// raw-SQL statement (`sql_bridge`'s `run_pool_reader_query`), never by a
@@ -616,21 +657,60 @@ impl<'pool> ReaderGuard<'pool> {
     /// still marks the checkout dirty unconditionally, so `Drop` always pays
     /// the pristine-state scan (or, in degraded shared-lease mode, the
     /// settings/rollback verification) on return.
+    ///
+    /// SQL stepping cooperatively observes the current request's cancellation
+    /// and original absolute deadline. Synchronous mapper/native callback code
+    /// cannot be forcibly preempted; a post-check refuses a successful result
+    /// if the request stopped while that code ran.
     pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<T, SqliteError>
     where
         P: rusqlite::Params,
-        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        F: FnOnce(&ReaderRow<'_, '_>) -> rusqlite::Result<T>,
     {
         crate::sql_bridge::reader_capability_admits(sql).map_err(SqliteError::InvalidData)?;
+        if !self.reusable.get() {
+            return Err(SqliteError::InvalidData(
+                "reader lease is quarantined after failed read cleanup".into(),
+            ));
+        }
+        // Params may call user-provided ToSql before stepping, and the mapper
+        // also runs user code. Neither may replace this query's progress handler
+        // by recursively querying the same lease.
+        if self.query_in_progress.replace(true) {
+            return Err(SqliteError::InvalidData(
+                "reader lease is already executing a query".into(),
+            ));
+        }
+        let _in_progress = ReaderQueryInProgress(&self.query_in_progress);
         self.mark_dirty();
-        Ok(self.conn().query_row(sql, params, f)?)
+        crate::read_cancellation::run_borrowed_reader(self, |conn| {
+            conn.query_row(sql, params, |row| f(&ReaderRow { row }))
+                .map_err(|error| {
+                    StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
+                })
+        })
+        .map_err(|error| match error {
+            StorageError::Driver {
+                capability,
+                operation,
+                source,
+            } => match source.downcast::<rusqlite::Error>() {
+                Ok(error) => SqliteError::Rusqlite(*error),
+                Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+                    capability,
+                    operation,
+                    source,
+                }),
+            },
+            other => SqliteError::RequestReadStopped(other),
+        })
     }
 
     /// Fail closed when connection-global state could not be restored after
     /// a read. A pooled reader is closed and replaced on drop; a degraded
     /// shared-writer reader is quarantined for the lifetime of the pool.
-    pub(crate) fn discard(&mut self) {
-        self.reusable = false;
+    pub(crate) fn discard(&self) {
+        self.reusable.set(false);
     }
 
     /// Mark this checkout as having run a raw-SQL statement, so `Drop` pays
@@ -654,14 +734,14 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         };
 
         match lease {
-            ReaderLease::Pooled(conn) if self.reusable => {
+            ReaderLease::Pooled(conn) if self.reusable.get() => {
                 self.pool.return_reader(conn, self.dirty.get())
             }
             ReaderLease::Pooled(conn) => {
                 close_connection_quietly(conn);
                 self.pool.replace_discarded_reader_slot();
             }
-            ReaderLease::Shared(guard) if !self.reusable => {
+            ReaderLease::Shared(guard) if !self.reusable.get() => {
                 self.pool.retire_pooled_writer(&guard);
             }
             ReaderLease::Shared(guard) => {
@@ -1395,7 +1475,8 @@ impl ConnectionPool {
                         lease: Some(ReaderLease::Shared(guard)),
                         admission_slot: Some(admission_slot),
                         pool: self,
-                        reusable: true,
+                        reusable: Cell::new(true),
+                        query_in_progress: Cell::new(false),
                         checked_out_at: Instant::now(),
                         dirty: Cell::new(false),
                         operation: None,
@@ -1416,7 +1497,8 @@ impl ConnectionPool {
                     lease: Some(ReaderLease::Pooled(conn)),
                     admission_slot: Some(admission_slot),
                     pool: self,
-                    reusable: true,
+                    reusable: Cell::new(true),
+                    query_in_progress: Cell::new(false),
                     checked_out_at: Instant::now(),
                     dirty: Cell::new(false),
                     operation: None,
@@ -3895,7 +3977,7 @@ mod tests {
 
         let before = pool.reader_acquisition_snapshot();
 
-        let mut reader = pool.reader().unwrap();
+        let reader = pool.reader().unwrap();
         reader.discard();
         // The replacement open this triggers on drop must fail deterministically:
         // remove the file a fresh SQLITE_OPEN_READ_ONLY open needs.
