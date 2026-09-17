@@ -833,3 +833,171 @@ async fn visible_registration_invalidates_legacy_grants_on_every_decision_surfac
         "default"
     );
 }
+
+#[tokio::test]
+async fn an_active_grant_survives_five_hundred_newer_rows() {
+    for registered in [false, true] {
+        let f = Fixture::new();
+        if registered {
+            f.register("old-approval").await;
+        }
+        let id = f.request("old-approval").await;
+        f.grant(&id).await;
+        f.write(
+            "UPDATE tool_grants SET requested_at=1 WHERE id=?1",
+            vec![SqlValue::Text(id.clone())],
+        )
+        .await;
+        f.call(
+            "tool.policy",
+            json!({"actor":"agent:requester", "tool":"old-approval", "decision":"deny"}),
+        )
+        .await;
+        assert_eq!(f.check("old-approval").await["grant_id"], id);
+
+        f.write(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<550) \
+             INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at) \
+             SELECT 'unrelated-' || i, 'local', 'agent:filler' || i, 'other', 'granted', 1000+i FROM n",
+            vec![],
+        )
+        .await;
+        let after = f.check("old-approval").await;
+        assert_eq!(after["source"], "grant", "registered={registered}: {after}");
+        assert_eq!(after["grant_id"], id);
+        assert_eq!(after["decision"], "allow");
+
+        f.write(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<550) \
+             INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at, expires_at, registry_id, definition_digest) \
+             SELECT 'expired-' || i, namespace, actor, tool, status, 2000+i, 1, registry_id, definition_digest \
+             FROM n CROSS JOIN tool_grants WHERE id=?1",
+            vec![SqlValue::Text(id.clone())],
+        )
+        .await;
+        assert_eq!(f.check("old-approval").await["grant_id"], id);
+        f.call("tool.revoke", json!({"id":id})).await;
+        let revoked = f.check("old-approval").await;
+        assert_eq!(revoked["source"], "policy");
+        assert_eq!(revoked["decision"], "deny");
+    }
+}
+
+#[tokio::test]
+async fn grant_matching_keeps_literal_case_sensitive_byte_prefixes() {
+    let f = Fixture::new();
+    f.write(
+        "INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at) \
+         VALUES ('pattern', 'local', '*', '*', 'granted', 1)",
+        vec![],
+    )
+    .await;
+    for (pattern, value, matches) in [
+        ("*", "anything", true),
+        ("*", "", true),
+        ("exact", "exact", true),
+        ("exact", "exactly", false),
+        ("Exact", "exact", false),
+        ("pre*", "prefix", true),
+        ("Pre*", "prefix", false),
+        ("%_*", "%_literal", true),
+        ("%_*", "wildcards", false),
+        ("a*b", "a*b", true),
+        ("a*b", "axxb", false),
+        ("a**", "a*tail", true),
+        ("a**", "abc", false),
+        ("é*", "éclair", true),
+        ("é*", "eclair", false),
+        ("nul\0*", "nul\0tail", true),
+        ("nul\0*", "nul", false),
+        ("nul\0exact", "nul\0other", false),
+    ] {
+        for column in ["actor", "tool"] {
+            f.write(
+                &format!(
+                    "UPDATE tool_grants SET actor='*', tool='*', {column}=?1 WHERE id='pattern'"
+                ),
+                vec![SqlValue::Text(pattern.into())],
+            )
+            .await;
+            let decision = khive_pack_tool::policy::decide(
+                &f.rt,
+                "local",
+                if column == "actor" { value } else { "caller" },
+                if column == "tool" { value } else { "tool" },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                decision.source == "grant",
+                matches,
+                "{column}: pattern={pattern:?}, value={value:?}: {decision:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn grants_keep_newest_request_precedence_and_namespace() {
+    let f = Fixture::new();
+    f.call(
+        "tool.policy",
+        json!({"actor":"agent:requester", "tool":"unregistered", "decision":"deny"}),
+    )
+    .await;
+    f.write(
+        "INSERT INTO tool_grants (id, namespace, actor, tool, scope, status, requested_at) VALUES \
+         ('exact-old', 'local', 'agent:requester', 'unregistered', NULL, 'granted', 1), \
+         ('wild-new', 'local', '*', '*', 'descriptive-only', 'granted', 2), \
+         ('foreign', 'other', '*', '*', NULL, 'granted', 3), \
+         ('revoked', 'local', '*', '*', NULL, 'revoked', 4)",
+        vec![],
+    )
+    .await;
+    assert_eq!(f.check("unregistered").await["grant_id"], "wild-new");
+    f.write(
+        "UPDATE tool_grants SET expires_at=1 WHERE id='wild-new'",
+        vec![],
+    )
+    .await;
+    assert_eq!(f.check("unregistered").await["grant_id"], "exact-old");
+    f.write(
+        "UPDATE tool_grants SET invalidated_at=1 WHERE id='exact-old'",
+        vec![],
+    )
+    .await;
+    let after = f.check("unregistered").await;
+    assert_eq!(after["source"], "policy");
+    assert_eq!(after["decision"], "deny");
+    let foreign = khive_pack_tool::policy::decide(
+        &f.rt,
+        "other",
+        "agent:requester",
+        "unregistered",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(foreign.grant_id.as_deref(), Some("foreign"));
+}
+
+#[tokio::test]
+async fn equal_request_times_keep_the_existing_grant_selection() {
+    let f = Fixture::new();
+    f.write(
+        "INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at) VALUES \
+         ('z-first', 'local', 'agent:requester', 'unregistered', 'granted', 1), \
+         ('a-second', 'local', 'agent:requester', 'unregistered', 'granted', 1)",
+        vec![],
+    )
+    .await;
+    let listed = f.call("tool.requests", json!({"status":"granted"})).await;
+    assert_eq!(
+        f.check("unregistered").await["grant_id"],
+        listed["requests"][0]["id"],
+        "a check cites the grant tool.requests lists first when request times tie"
+    );
+}
