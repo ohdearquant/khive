@@ -15,7 +15,8 @@ Offset-mode `list` results for entities, edges, and notes use `items` (R1):
   "items": [],
   "requested_limit": 50,
   "effective_limit": 50,
-  "limit_clamped": false
+  "limit_clamped": false,
+  "has_more": false
 }
 ```
 
@@ -23,6 +24,14 @@ This renderer does not emit `total` or `next_offset`. A client can preserve thos
 fields when another response supplies them, but must not manufacture a count or
 an offset continuation and attribute it to this server response. An absent count
 means not counted, not zero.
+
+`limit_clamped` and `has_more` answer different questions and a page can carry
+either, both, or neither. `limit_clamped` reports that the server cap reduced the
+caller's requested limit. `has_more` reports that the population continued past
+the page that was returned. At a requested limit equal to the cap the first is
+always false regardless of how many rows were withheld, so a client must not read
+`limit_clamped: false` as an exhaustion signal, and must not conclude a record is
+absent from a single `list` call unless that call returned `has_more: false`.
 
 Supplying `after=""` selects cursor mode from the beginning. Subsequent calls
 supply the full UUID returned as `next_after`. The collection key is `entities`,
@@ -36,6 +45,7 @@ present (R2). The Python facade exposes these rows as `Page.items`.
   "requested_limit": 1,
   "effective_limit": 1,
   "limit_clamped": false,
+  "has_more": true,
   "scan_incomplete": true
 }
 ```
@@ -47,7 +57,8 @@ than the effective limit. `next_after: null` is the normal cursor exhaustion
 marker; `scan_incomplete: true` explicitly prevents an exhaustion conclusion.
 Filtered offset-mode notes can also report `scan_incomplete: true`, without a
 cursor. That response reports incomplete scanning, not a resumable scan token
-(R3).
+(R3). A scan that stopped at its own ceiling also reports `has_more: true`, since
+rows it never examined are rows the caller has not seen.
 
 The current requested limit caps are 500 entities, 200 notes, and 1,000 edges.
 For example, requesting 201 notes yields `requested_limit: 201`,
@@ -266,9 +277,9 @@ review those changes and use behavioral fixtures for the client obligations.
 
 | Rule | Source-line citations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1   | crates/khive-pack-kg/src/handlers/list.rs -- "fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {"; crates/khive-pack-kg/src/handlers/list.rs -- "\"items\": items,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"requested_limit\": requested,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"effective_limit\": effective,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"limit_clamped\": requested > effective,"                                                                                                                                                                                                                                                                                                                                                 |
-| R2   | crates/khive-pack-kg/src/handlers/list.rs -- "if raw.is_empty() {"; crates/khive-pack-kg/src/handlers/list.rs -- "uuid::Uuid::parse_str(raw).map(Some)"; crates/khive-pack-kg/src/handlers/list.rs -- "\"entities\": normalize_entity_timestamps_array(to_json(&entities)?),"; crates/khive-pack-kg/src/handlers/list.rs -- "\"edges\": to_json(&edges)?,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"notes\": remapped,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"next_after\": next_after,"; crates/khive-pack-kg/src/handlers/list.rs -- "add_list_limit_metadata(&mut response, requested, limit);"                                                                                                                                                                                       |
-| R3   | crates/khive-pack-kg/src/handlers/list.rs -- "} else if raw_more && scanned >= MAX_SCAN_TOTAL {"; crates/khive-pack-kg/src/handlers/list.rs -- "!has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,"; crates/khive-pack-kg/src/handlers/list.rs -- "response[\"scan_incomplete\"] = Value::Bool(true);"; crates/khive-pack-kg/src/handlers/list.rs -- "let mut response = render_list_response(to_json(&remapped)?, requested, limit);"                                                                                                                                                                                                                                                                                                                                                               |
+| R1   | crates/khive-pack-kg/src/handlers/list.rs -- "pub(super) fn render_list_response("; crates/khive-pack-kg/src/handlers/list.rs -- "\"items\": items,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"requested_limit\": requested,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"effective_limit\": effective,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"limit_clamped\": requested > effective,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"has_more\": has_more,"                                                                                                                                                                                                                                                                                                                                                 |
+| R2   | crates/khive-pack-kg/src/handlers/list.rs -- "if raw.is_empty() {"; crates/khive-pack-kg/src/handlers/list.rs -- "uuid::Uuid::parse_str(raw).map(Some)"; crates/khive-pack-kg/src/handlers/list.rs -- "\"entities\": normalize_entity_timestamps_array(to_json(&entities)?),"; crates/khive-pack-kg/src/handlers/list.rs -- "\"edges\": to_json(&edges)?,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"notes\": remapped,"; crates/khive-pack-kg/src/handlers/list.rs -- "\"next_after\": next_after,"; crates/khive-pack-kg/src/handlers/list.rs -- "add_list_limit_metadata(&mut response, requested, limit, next_after.is_some());"                                                                                                                                                                                       |
+| R3   | crates/khive-pack-kg/src/handlers/list.rs -- "} else if raw_more && scanned >= MAX_SCAN_TOTAL {"; crates/khive-pack-kg/src/handlers/list.rs -- "!has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,"; crates/khive-pack-kg/src/handlers/list.rs -- "response[\"scan_incomplete\"] = Value::Bool(true);"; crates/khive-pack-kg/src/handlers/list.rs -- "render_list_response(to_json(&remapped)?, requested, limit, has_more);"                                                                                                                                                                                                                                                                                                                                                               |
 | R4   | crates/khive-pack-kg/src/handlers/list.rs -- "const ENTITY_LIST_CAP: u32 = 500;"; crates/khive-pack-kg/src/handlers/list.rs -- "const NOTE_LIST_CAP: u32 = 200;"; crates/khive-runtime/src/operations.rs -- "pub const EDGE_LIST_MAX_LIMIT: u32 = 1000;"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | R5   | crates/khive-mcp/src/server.rs -- "results[index] = Some(entry);"; crates/khive-mcp/src/server.rs -- "\"summary\": { \"total\": total, \"succeeded\": succeeded, \"failed\": failed, \"aborted\": 0 },"; crates/khive-mcp/src/server.rs -- "if failed == 0 && aborted == 0 {"; crates/khive-mcp/src/server.rs -- "ops (reported as {\"ok\": false, \"aborted\": true}). Committed ops are not rolled back."                                                                                                                                                                                                                                                                                                                                                                                                 |
 | R6   | crates/khive-pack-kg/src/handlers/get.rs -- "Err(RuntimeError::NotFound(id_ref.to_string()))"; crates/khive-runtime/src/error.rs -- "pub(crate) fn after_handler(source: RuntimeError, domain_succeeded: bool) -> Self {"; crates/khive-runtime/src/error_projection.rs -- "json!({\"kind\":\"runtime_error\", \"message\":other.to_string()})"; crates/khive-runtime/src/error_projection.rs -- "value[\"domain_disposition\"] = json!(disposition.as_str());"; crates/khive-mcp/src/server.rs -- "let projected = khive_runtime::runtime_error_value(error, disposition);"; crates/khive-mcp/src/server.rs -- "let mut value = error_with_disposition(projected, disposition);"; crates/khive-mcp/src/server.rs -- "value[\"domain_disposition\"] = json!(projected_disposition.as_str());" |
