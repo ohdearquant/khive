@@ -873,9 +873,9 @@ async fn dispatch_config_single_parameter() {
     assert!((mean - 0.7).abs() < 1e-6);
 }
 
-// ── Regression tests (issues #355, #356, #357, #295) ──────────────────────
+// ── Regression tests ──────────────────────────────────────────────────────
 
-// #356 (MAJ-003): profile_record.total_events must stay in sync with
+// MAJ-003: profile_record.total_events must stay in sync with
 // balanced_recall.total_events via BOTH the handle_feedback path AND the
 // on_dispatch hook path.  The previous fix only wired the sync helper; this
 // test pins that removing EITHER call would be caught.
@@ -975,7 +975,7 @@ async fn test_356_profile_record_total_events_synced_after_feedback() {
     );
 }
 
-// #357 (MAJ-004): brain.feedback must NOT double-count total_events.
+// MAJ-004: brain.feedback must NOT double-count total_events.
 //
 // The double-count path: VerbRegistry::dispatch calls the registered pack
 // handler (handle_feedback folds once) and then calls on_dispatch on every
@@ -1034,7 +1034,7 @@ async fn test_357_feedback_no_double_count() {
     );
 }
 
-// #295: brain.reset must restore domain-informed priors, not Beta(1,1).
+// brain.reset must restore domain-informed priors, not Beta(1,1).
 //
 // This test now exercises the full
 // production path — handle_reset → reset_posteriors → sync helper — and
@@ -1256,7 +1256,7 @@ async fn brain_reset_accepts_empty_params() {
     assert_eq!(result["reset"], json!(true));
 }
 
-// #355 (regression — real dispatch path): temporal posterior must update
+// (regression — real dispatch path): temporal posterior must update
 // when a recall hits via the on_dispatch hook carrying real hit/latency.
 //
 // This test exercises the production wiring added in the P12 fix:
@@ -3297,7 +3297,7 @@ async fn r3_create_profile_id_grammar_enforced() {
     .expect("valid alphanumeric-hyphen name must succeed");
 }
 
-// #289: feedback event must record a non-zero duration_us.
+// Feedback event must record a non-zero duration_us.
 #[tokio::test]
 async fn test_289_feedback_event_records_nonzero_duration() {
     let (pack, rt) = make_pack();
@@ -3334,7 +3334,7 @@ async fn test_289_feedback_event_records_nonzero_duration() {
     );
 }
 
-// ── #517: brain.auto_feedback ─────────────────────────────────────────────
+// ── brain.auto_feedback ───────────────────────────────────────────────────
 
 /// #2772: the refusal for a malformed `results` has to be actionable by a caller
 /// who cannot read this crate. The accepted form is asserted in the same test as

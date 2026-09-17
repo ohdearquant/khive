@@ -2465,7 +2465,7 @@ async fn note_create_blocks_path_dressed_base64_credential_in_value_syntax() {
 }
 
 // =============================================================================
-// EmbedderRegistry integration tests (#397)
+// EmbedderRegistry integration tests
 // =============================================================================
 
 mod embedder_registry_tests {

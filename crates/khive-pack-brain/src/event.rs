@@ -82,7 +82,7 @@ pub fn interpret(event: &Event) -> BrainSignal {
                 serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v.clone()).ok()
             });
 
-            // Issue #268: try semantic event kind names first, then fall back to
+            // Try semantic event kind names first, then fall back to
             // legacy FeedbackSignal (useful / not_useful / wrong).
             if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal_str) {
                 // ADR-081 §2: the fold gate (handlers::handle_feedback) computes the

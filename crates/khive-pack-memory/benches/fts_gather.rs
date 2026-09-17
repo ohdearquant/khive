@@ -1,8 +1,8 @@
-//! Real-corpus latency + quality benchmark for the FTS candidate-gather path (PR #625).
+//! Real-corpus latency + quality benchmark for the FTS candidate-gather path.
 //!
 //! Why this exists: the prior parameter sweep (`tests/khive-contract/tune/`) ran on a
 //! synthetic corpus that produced a flat recall@10 = 0.9333 for *every* config — it
-//! could not discriminate any parameter, so PR #625's gather optimization shipped as
+//! could not discriminate any parameter, so that gather optimization shipped as
 //! inert infrastructure (`enabled: false`) with no evidence it helps or is safe.
 //!
 //! This benchmark uses the REAL memory corpus (~12k local notes extracted from

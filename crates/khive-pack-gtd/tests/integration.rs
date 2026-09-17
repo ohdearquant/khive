@@ -792,7 +792,7 @@ async fn complete_writes_lifecycle_audit_record() {
     );
 }
 
-// ── #273: terminal-state enforcement tests ───────────────────────────────────
+// ── Terminal-state enforcement tests ─────────────────────────────────────────
 
 /// Transitioning out of `done` must be rejected with a clear terminal-state error.
 #[tokio::test]
@@ -2174,9 +2174,9 @@ async fn concurrent_complete_two_threads_one_wins_one_loses_atomic() {
     );
 }
 
-// ── #522 regression: complete after explicit transition to active ─────────────
+// ── Regression: complete after explicit transition to active ──────────────────
 
-/// Regression for #522: assign → transition(active) → gtd.complete must succeed.
+/// Regression: assign → transition(active) → gtd.complete must succeed.
 #[tokio::test]
 async fn complete_after_transition_to_active_succeeds() {
     let pack = pack(rt());
@@ -2203,9 +2203,9 @@ async fn complete_after_transition_to_active_succeeds() {
         .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} - {e}"));
 }
 
-// ── #520 regression: context_entity_id on gtd.assign ─────────────────────────
+// ── Regression: context_entity_id on gtd.assign ──────────────────────────────
 
-/// Regression for #520: context_entity_id round-trips through assign, tasks, and get.
+/// Regression: context_entity_id round-trips through assign, tasks, and get.
 #[tokio::test]
 async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
     let rt = rt();
@@ -2277,7 +2277,7 @@ async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
     );
 }
 
-/// Regression for #520: malformed context_entity_id must produce a clear error.
+/// Regression: malformed context_entity_id must produce a clear error.
 #[tokio::test]
 async fn assign_rejects_malformed_context_entity_id() {
     let pack = pack(rt());

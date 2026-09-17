@@ -285,7 +285,7 @@ fn search_params_accepts_min_score() {
     assert_eq!(p.min_score, Some(0.1));
 }
 
-// #518: SearchParams must accept a `tags` field.
+// SearchParams must accept a `tags` field.
 #[test]
 fn search_tags_params_accepts_tags() {
     use super::SearchParams;
@@ -301,7 +301,7 @@ fn search_tags_params_accepts_tags() {
     );
 }
 
-// #518: absent tags → None (no filter applied).
+// Absent tags → None (no filter applied).
 #[test]
 fn search_params_tags_absent_is_none() {
     use super::SearchParams;
@@ -316,7 +316,7 @@ fn search_params_tags_absent_is_none() {
     );
 }
 
-// #518: tags_match_any — OR semantics, case-insensitive.
+// tags_match_any — OR semantics, case-insensitive.
 #[test]
 fn tags_match_any_or_semantics() {
     use super::tags_match_any;
@@ -554,7 +554,7 @@ fn normalize_entity_timestamps_array_converts_each_element() {
     }
 }
 
-// ---- Issue #486: link endpoint validation should suggest valid relations ----
+// ---- Link endpoint validation should suggest valid relations ----------------
 
 // Unit test: valid_relations_for_entity_pair returns expected relations for known pairs.
 #[test]
@@ -1255,7 +1255,7 @@ async fn create_attached_symmetric_edge_rejection_preserves_new_entity_as_source
     );
 }
 
-// ── #567 regression: ensure_note_kind must not disclose foreign note metadata ──
+// ── Regression: ensure_note_kind must not disclose foreign note metadata ───────
 
 #[tokio::test]
 async fn ensure_note_kind_rejects_foreign_note_before_kind_check() {

@@ -470,7 +470,7 @@ pub struct ScoringConfig {
 
     // ── Relevance thresholds ───────────────────────────────────────────────
     /// Minimum raw cosine similarity to include a vector hit. Hits below this
-    /// are excluded before RRF fusion (#2272). Default: 0.10.
+    /// are excluded before RRF fusion. Default: 0.10.
     pub min_raw_relevance: f32,
     /// Minimum RRF score after fusion before normalization. Default: 0.0.
     pub min_rrf_relevance: f32,

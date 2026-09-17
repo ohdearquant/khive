@@ -1824,7 +1824,7 @@ async fn test_traverse_depth_2() {
 
 /// Diamond graph: A→B, A→C, B→D, C→D.
 /// D is reachable via two paths at depth 2.  After the fix it must appear
-/// exactly once in the result (#285).
+/// exactly once in the result.
 #[tokio::test]
 async fn test_traverse_dedups_multipath_node() {
     let store = setup_memory_store();
@@ -2244,7 +2244,7 @@ async fn test_upsert_edges_batch() {
     assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 10);
 }
 
-// ---- #229 deduplication test ----
+// ---- Deduplication test ---------
 
 #[tokio::test]
 async fn graph_duplicate_edges_ignored() {
@@ -2348,7 +2348,7 @@ async fn graph_duplicate_edges_refresh_existing_row() {
     );
 }
 
-// Regression test for #476: symmetric edges stored via upsert_edge must
+// Regression test: symmetric edges stored via upsert_edge must
 // always have source_id < target_id (lexicographic on UUID bytes).
 #[tokio::test]
 async fn upsert_edge_canonicalizes_symmetric_relation() {
