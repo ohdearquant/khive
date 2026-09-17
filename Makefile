@@ -235,6 +235,13 @@ local: verify-local-artifact
 	SOCK=$${KHIVE_SOCKET:-$$HOME/.khive/khived.sock}; \
 	OLD_PID=$$(cat "$$KHIVE_PID_FILE" 2>/dev/null | tr -dc "0-9"); \
 	if [ -n "$$OLD_PID" ] && ! ps -p "$$OLD_PID" >/dev/null 2>&1; then OLD_PID=""; fi; \
+	if [ -n "$$OLD_PID" ]; then \
+	  OLD_COMM=$$(basename "$$(ps -p "$$OLD_PID" -o comm= 2>/dev/null)" 2>/dev/null); \
+	  if [ "$$OLD_COMM" != "$$(basename "$$DEST")" ]; then \
+	    echo "==> $$KHIVE_PID_FILE names pid $$OLD_PID, but that process is '$$OLD_COMM', not $$(basename "$$DEST"). Stale PID file over a reused PID; treating as no live daemon."; \
+	    OLD_PID=""; \
+	  fi; \
+	fi; \
 	OLD_PACKS=""; \
 	if [ -n "$$OLD_PID" ]; then \
 	  OLD_PACKS=$$(ps -p "$$OLD_PID" -o command= 2>/dev/null | tr " " "\n" | awk 'p{printf " --pack %s", $$0; p=0} /^--pack$$/{p=1}'); \
@@ -278,13 +285,19 @@ local: verify-local-artifact
 	  ( cd "$$START_CWD" && exec nohup "$$DEST" mcp --daemon $$OLD_PACKS >> "$$DLOG" 2>&1 & ); \
 	  echo "==> Daemon log: $$DLOG"; \
 	  if [ -n "$$MARKER_OWNED" ]; then \
-	    i=0; \
+	    i=0; SERVING=""; \
 	    while [ $$i -lt 40 ]; do \
-	      if [ -S "$$SOCK" ] && lsof -t "$$SOCK" >/dev/null 2>&1; then break; fi; \
+	      if [ -S "$$SOCK" ] && /usr/sbin/lsof -t "$$SOCK" >/dev/null 2>&1; then SERVING=1; break; fi; \
 	      i=$$((i+1)); sleep 0.25; \
 	    done; \
 	    rm -f "$$MARKER"; MARKER_OWNED=""; \
-	    echo "==> Replacement is serving; released $$MARKER"; \
+	    if [ -n "$$SERVING" ]; then \
+	      echo "==> Replacement is serving; released $$MARKER"; \
+	    else \
+	      echo "==> ERROR: nothing holds $$SOCK 10s after the start. Released $$MARKER so clients are not left blocked. Daemon log tail:"; \
+	      tail -20 "$$DLOG" 2>/dev/null | sed "s/^/    /"; \
+	      exit 1; \
+	    fi; \
 	  fi; \
 	else \
 	  if [ -n "$$MARKER_OWNED" ]; then rm -f "$$MARKER"; MARKER_OWNED=""; fi; \
