@@ -2374,6 +2374,10 @@ mod tests {
     /// A `git clone` failure must not leave a staging wrapper behind.
     #[test]
     fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
@@ -2405,6 +2409,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ensure_clone_interrupts_an_inflight_transfer_at_the_size_cap() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let bin_dir = dir.path().join("bin");
@@ -2514,6 +2522,10 @@ printf 'finished\n' > '{}'
     /// of an existing slot must leave the checkout AT the fetched tip.
     #[test]
     fn reensure_advances_checkout_to_fetched_tip() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
@@ -2605,6 +2617,10 @@ printf 'finished\n' > '{}'
     /// a reset, and the assertion on the fresh clone alone would not catch it.
     #[test]
     fn cache_slot_never_materializes_a_working_tree() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _scratch = ScratchRootGuard::set(dir.path());
@@ -2675,6 +2691,10 @@ printf 'finished\n' > '{}'
     #[cfg(unix)] // migration is unix-only; see migrate_legacy_slot
     #[test]
     fn an_existing_slot_with_a_worktree_is_migrated_on_next_use() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _scratch = ScratchRootGuard::set(dir.path());
@@ -2737,6 +2757,10 @@ printf 'finished\n' > '{}'
     #[cfg(unix)] // migration is unix-only; see migrate_legacy_slot
     #[test]
     fn a_legacy_slot_reached_by_the_repair_path_is_migrated_too() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _scratch = ScratchRootGuard::set(dir.path());
@@ -2787,6 +2811,10 @@ printf 'finished\n' > '{}'
 
     #[test]
     fn evict_lru_removes_oldest_past_repo_cap() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
@@ -2820,6 +2848,10 @@ printf 'finished\n' > '{}'
     /// afterward exactly one owned slot remains.
     #[test]
     fn a_failed_mutation_enforces_caps_over_the_settled_set() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
@@ -2882,6 +2914,10 @@ printf 'finished\n' > '{}'
 
     #[test]
     fn evict_lru_only_touches_children_of_root() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "5");
@@ -2900,6 +2936,10 @@ printf 'finished\n' > '{}'
 
     #[test]
     fn evict_lru_never_removes_a_foreign_directory_under_root() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Cap of 0 repos: without ownership filtering this would previously
@@ -2952,6 +2992,10 @@ printf 'finished\n' > '{}'
 
     #[test]
     fn evict_lru_never_removes_an_owned_looking_dir_missing_the_marker() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "0");
@@ -2993,6 +3037,10 @@ printf 'finished\n' > '{}'
     /// the shape under which `-C` discovery would have fetched into it.
     #[test]
     fn a_swapped_slot_is_refused_and_never_reaches_an_ancestor_repo() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -3061,6 +3109,10 @@ printf 'finished\n' > '{}'
     #[cfg(unix)]
     #[test]
     fn a_bound_command_follows_the_validated_object_not_the_swapped_pathname() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -3119,6 +3171,10 @@ printf 'finished\n' > '{}'
     #[cfg(unix)]
     #[test]
     fn a_bound_command_follows_the_validated_git_object_not_a_swapped_git_child() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -3176,6 +3232,10 @@ printf 'finished\n' > '{}'
     /// into, overwritten, or claimed.
     #[test]
     fn install_fresh_clone_refuses_a_foreign_occupied_slot() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _scratch = ScratchRootGuard::set(dir.path());
@@ -3267,6 +3327,10 @@ printf 'finished\n' > '{}'
     /// `keep` vanishing must propagate, not be treated as an empty slot.
     #[test]
     fn evict_lru_errors_when_keep_itself_is_missing() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "5");
@@ -3420,6 +3484,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_updates_an_existing_slot_to_the_remote_tip() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3446,6 +3514,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_over_cap_cleanup_never_deletes_an_unproven_slot() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3480,6 +3552,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn refetch_clone_refuses_a_markerless_slot_under_the_cap() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3517,6 +3593,10 @@ printf 'finished\n' > '{}'
 
     #[test]
     fn refetch_clone_errors_when_no_slot_exists() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3535,6 +3615,10 @@ printf 'finished\n' > '{}'
     /// credential or query-string token from the caller-supplied URL.
     #[test]
     fn refetch_clone_no_slot_error_redacts_credential_bearing_url() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3562,6 +3646,10 @@ printf 'finished\n' > '{}'
     /// waiting on a real network timeout.
     #[test]
     fn ensure_clone_failure_message_redacts_credential_bearing_url() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
@@ -3585,6 +3673,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn reclone_replaces_a_slot_whose_refetch_cannot_succeed() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3631,6 +3723,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn reclone_refuses_to_replace_a_foreign_looking_directory() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3659,6 +3755,10 @@ printf 'finished\n' > '{}'
     /// No slot exists yet: `reclone` simply installs a fresh clone.
     #[test]
     fn reclone_installs_fresh_when_no_slot_exists_yet() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3677,6 +3777,10 @@ printf 'finished\n' > '{}'
     /// crates/khive-pack-git/docs/api/cache.md#test-module-notes.
     #[test]
     fn ensure_clone_refuses_a_markerless_git_directory_at_the_cache_key_path() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3716,6 +3820,10 @@ printf 'finished\n' > '{}'
     #[cfg(unix)]
     #[test]
     fn ensure_clone_refuses_a_symlink_at_the_cache_key_path() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -3859,6 +3967,10 @@ printf 'finished\n' > '{}'
     /// despite its guard and the operation resumed over a missing slot.
     #[test]
     fn eviction_defers_a_candidate_with_an_active_slot_mutation() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
@@ -3908,6 +4020,10 @@ printf 'finished\n' > '{}'
     /// concurrent call succeeds and resolves to the same slot.
     #[test]
     fn concurrent_ensure_clone_on_same_key_never_races_the_slot() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = ENV_MUTEX.blocking_lock();
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());

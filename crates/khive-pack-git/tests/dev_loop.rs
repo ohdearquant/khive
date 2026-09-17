@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/test_process.rs"]
+mod test_process;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
@@ -504,6 +507,10 @@ impl Fixture {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     let manifest = f.tree(&[("a.txt", b"caller program control\n", 644)]).await;
     let refs = f.git_bytes(&["show-ref"]);
@@ -592,6 +599,10 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm13_existing_branch_refuses_without_repository_changes() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, false).await;
     f.policy("git.branch", "allow").await;
     let refs = f.git_bytes(&["show-ref"]);
@@ -621,6 +632,10 @@ async fn arm13_existing_branch_refuses_without_repository_changes() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm14_moved_parent_refuses_before_ref_move() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     let manifest = f.tree(&[("a.txt", b"new\n", 644)]).await;
@@ -638,6 +653,10 @@ async fn arm14_moved_parent_refuses_before_ref_move() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm14_ref_move_race_preserves_rival_with_atomic_compare() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     let manifest = f.tree(&[("a.txt", b"ours\n", 644)]).await;
@@ -680,6 +699,10 @@ async fn arm14_ref_move_race_preserves_rival_with_atomic_compare() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     let index = std::fs::read(f.repo.join(".git/index")).expect("index before");
@@ -717,6 +740,10 @@ async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm14_manifest_commit_preserves_index_and_worktree_residue() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     std::fs::write(f.repo.join("a.txt"), b"staged\n").expect("staged content");
@@ -778,6 +805,10 @@ async fn arm14_manifest_commit_preserves_index_and_worktree_residue() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm15_overrides_and_unmapped_actor_refuse_before_resolver() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     for mapped in [true, false] {
         let f = Fixture::new(true, mapped).await;
         f.policy("git.commit", "allow").await;
@@ -811,6 +842,10 @@ async fn arm15_overrides_and_unmapped_actor_refuse_before_resolver() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm16_hostile_hooks_filters_and_config_never_execute() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     let hooks = f.dir.path().join("hooks");
@@ -906,6 +941,10 @@ async fn arm16_hostile_hooks_filters_and_config_never_execute() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm26_receipts_bind_real_policy_ids_and_gate_denial_has_null_policy() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     for allowlisted in [false, true] {
         let f = Fixture::new(allowlisted, false).await;
         let policy_id = f.policy("git.branch", "allow").await;
@@ -933,6 +972,10 @@ async fn arm26_receipts_bind_real_policy_ids_and_gate_denial_has_null_policy() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn receipts_page_by_actor_session_and_never_echo_resolved_secrets() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.commit", "allow").await;
     let manifest = f.tree(&[("a.txt", b"new\n", 644)]).await;
@@ -1026,6 +1069,10 @@ async fn receipts_page_by_actor_session_and_never_echo_resolved_secrets() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn checkout_preserves_status_index_and_raw_content() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, false).await;
     std::fs::write(f.repo.join("a.txt"), b"staged\n").unwrap();
     f.git_bytes(&["add", "--", "a.txt"]);
@@ -1055,6 +1102,10 @@ async fn checkout_preserves_status_index_and_raw_content() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn checkout_refuses_symlinks_and_submodules_without_checkout() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     for entry_kind in ["symlink", "submodule"] {
         let f = Fixture::new(true, false).await;
         if entry_kind == "symlink" {
@@ -1086,6 +1137,10 @@ async fn checkout_refuses_symlinks_and_submodules_without_checkout() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn diff_bytes_and_inputs_match_independent_native_oracle_for_commits_and_trees() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, false).await;
     let base_tree = f
         .call("git.checkout", json!({"repo":f.repo,"ref":f.base}))
@@ -1148,6 +1203,10 @@ async fn diff_bytes_and_inputs_match_independent_native_oracle_for_commits_and_t
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn tree_diff_symlink_changes_match_native_git_patches() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
@@ -1229,6 +1288,10 @@ async fn tree_diff_symlink_changes_match_native_git_patches() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm28_symbolic_branch_refuses_both_moves_and_plain_ref_controls_proceed() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.branch", "allow").await;
     f.policy("git.commit", "allow").await;
@@ -1288,6 +1351,10 @@ async fn arm28_symbolic_branch_refuses_both_moves_and_plain_ref_controls_proceed
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm29_reconcile_requires_matching_receipt_marker_and_new_sha() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     let policy_id = f.policy("git.commit", "allow").await;
     let native_tree = f.git_text(&["rev-parse", "HEAD^{tree}"]);
@@ -1484,6 +1551,10 @@ async fn arm29_reconcile_requires_matching_receipt_marker_and_new_sha() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm30_tool_pack_absence_refuses_tree_commit_but_preserves_legacy_paths() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new_with_tool_pack(true, true, false).await;
     let mut reader = f.rt.sql().reader().await.expect("schema reader");
     let tables = reader.query_all(SqlStatement {
@@ -1573,6 +1644,10 @@ async fn arm30_tool_pack_absence_refuses_tree_commit_but_preserves_legacy_paths(
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn arm31_reflog_append_without_ref_install_stays_unknown_until_descendant_installed() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     let policy_id = f.policy("git.commit", "allow").await;
     let native_tree = f.git_text(&["rev-parse", "HEAD^{tree}"]);
@@ -1704,6 +1779,10 @@ fn status_paths(result: &Value) -> Vec<String> {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn status_agrees_with_native_porcelain_and_changes_nothing_on_disk() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     for verb in ["git.status", "git.log"] {
         f.policy(verb, "allow").await;
@@ -1744,6 +1823,10 @@ async fn status_agrees_with_native_porcelain_and_changes_nothing_on_disk() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn status_total_counts_the_whole_repository_even_when_entries_are_capped() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
     for n in 0..7 {
@@ -1768,6 +1851,10 @@ async fn status_total_counts_the_whole_repository_even_when_entries_are_capped()
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn status_keeps_a_path_holding_a_newline_a_space_and_non_ascii_as_one_entry() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
     // A space would split a whitespace parser, a newline would split a line parser, and the CJK
@@ -1785,6 +1872,10 @@ async fn status_keeps_a_path_holding_a_newline_a_space_and_non_ascii_as_one_entr
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
     let attached = f.call("git.status", json!({"repo": f.repo})).await;
@@ -1838,6 +1929,10 @@ async fn status_reports_a_detached_head_as_a_null_branch_beside_a_real_sha() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn log_refusal_names_the_git_exit_status() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.log", "allow").await;
     let control = f.call("git.log", json!({"repo": f.repo, "limit": 1})).await;
@@ -1865,6 +1960,10 @@ async fn log_refusal_names_the_git_exit_status() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn log_agrees_with_native_rev_list_and_bounds_its_page() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.log", "allow").await;
     let page = f
@@ -1909,6 +2008,10 @@ async fn log_agrees_with_native_rev_list_and_bounds_its_page() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn log_treats_a_path_filter_literally_rather_than_as_a_glob() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.log", "allow").await;
     std::fs::write(f.repo.join("*.txt"), b"star\n").expect("a file literally named *.txt");
@@ -1943,6 +2046,10 @@ async fn log_treats_a_path_filter_literally_rather_than_as_a_glob() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn status_and_log_refuse_off_allowlist_and_on_deny_and_write_no_receipt() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     // No status/log grant is made here on purpose. The allowlist is consulted before the policy,
     // so the off-allowlist arm below refuses without one, which is what proves that ordering.
     let f = Fixture::new(true, true).await;
@@ -1991,6 +2098,10 @@ async fn status_and_log_refuse_off_allowlist_and_on_deny_and_write_no_receipt() 
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn init_makes_an_allowlisted_empty_directory_a_repository_and_records_a_receipt() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
     f.policy("git.status", "allow").await;
@@ -2037,6 +2148,10 @@ async fn init_makes_an_allowlisted_empty_directory_a_repository_and_records_a_re
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn init_refuses_a_target_that_already_holds_a_repository_and_leaves_it_untouched() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
     let head_before = f.git_text(&["rev-parse", "HEAD"]);
@@ -2066,6 +2181,10 @@ async fn init_refuses_a_target_that_already_holds_a_repository_and_leaves_it_unt
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn init_refuses_a_directory_that_is_not_allowlisted() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
     let outside = f.dir.path().join("unlisted-target");
@@ -2092,6 +2211,10 @@ async fn init_refuses_a_directory_that_is_not_allowlisted() {
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn read_verbs_never_execute_repository_configured_filters_or_signers() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.status", "allow").await;
     f.policy("git.log", "allow").await;
@@ -2212,6 +2335,10 @@ exit 0
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
 async fn init_reports_an_unestablished_outcome_when_it_leaves_a_repository_behind() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let f = Fixture::new(true, true).await;
     f.policy("git.init", "allow").await;
     let shim_dir = f.dir.path().join(SHIM_DIR);
@@ -2266,6 +2393,10 @@ async fn init_reports_an_unestablished_outcome_when_it_leaves_a_repository_behin
 #[test]
 #[serial_test::serial(git_dev_loop_env)]
 fn the_native_git_resolver_never_answers_a_fixture_shim() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let native = git_program();
     let dir = tempfile::tempdir().expect("temp dir");
     let shim_dir = dir.path().join(SHIM_DIR);

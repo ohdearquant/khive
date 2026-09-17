@@ -15,12 +15,9 @@
 //! `KHIVE_CONFIG`). This also means these tests carry zero ambient-env risk
 //! for policy resolution.
 //!
-//! Every test still holds `cache::ENV_MUTEX` for its full body:
-//! `crate::cache`'s and `crate::recovery_tests`' tests shadow the
-//! process-global `PATH` to inject fake `git` binaries, which would
-//! otherwise race against every `Command::new("git")` spawn here (both this
-//! module's own `git_command` helper and the handler code under test
-//! resolve `git` via `PATH` at spawn time).
+//! Existing fixture locks remain, but they are not the isolation boundary:
+//! environment-interposing cases first re-execute as the sole test in a child.
+//! Unlocked git observers in the parent therefore cannot resolve their shims.
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -35,7 +32,7 @@ use khive_types::EventOutcome;
 use crate::GitPack;
 
 /// Restores one process-global environment variable when dropped. Callers
-/// must hold [`crate::cache::ENV_MUTEX`] for the guard's full lifetime.
+/// must first enter an isolated child with `test_process::run_in_child`.
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
@@ -245,6 +242,10 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
 /// configuration deterministically hostile to `git commit`.
 #[tokio::test]
 async fn commit_ignores_hostile_ambient_global_config_in_tests() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
@@ -855,6 +856,10 @@ async fn branch_denied_when_no_policy_configured() {
 
 #[tokio::test]
 async fn invalid_repo_values_emit_denied_audits_without_invoking_git() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;

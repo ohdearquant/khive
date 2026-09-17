@@ -7,6 +7,9 @@
 //! touched its path, and a squash-merge commit's PR edge resolves. Also
 //! covers `KindHook` validation and secret-masking on ingested content.
 
+#[path = "../src/test_process.rs"]
+mod test_process;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1016,6 +1019,10 @@ async fn ingest_records_both_sides_of_a_rename() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project_id = create(
@@ -1591,6 +1598,10 @@ async fn ingest_masks_secret_shaped_changed_paths() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -1680,6 +1691,10 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -1773,6 +1788,10 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -1863,6 +1882,10 @@ async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_body() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -1942,6 +1965,10 @@ async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_b
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2021,6 +2048,10 @@ async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_issue_title_unmasked() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2093,6 +2124,10 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2178,6 +2213,10 @@ async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2267,6 +2306,10 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2343,6 +2386,10 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2423,6 +2470,10 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_persists_raw_value() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2508,6 +2559,10 @@ async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_pers
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_rejects_credential_shaped_pr_updated_at_and_cursor_never_persists_raw_value() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2603,6 +2658,10 @@ async fn ingest_rejects_credential_shaped_pr_updated_at_and_cursor_never_persist
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2698,6 +2757,10 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2817,6 +2880,10 @@ async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -2924,6 +2991,10 @@ async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -3163,6 +3234,10 @@ async fn issue_hook_requires_exact_project_id_and_canonicalizes_complete_spellin
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -3544,6 +3619,10 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn gh_boundary_contract_and_partial_ingest_failure() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -3777,6 +3856,10 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -3926,6 +4009,10 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -4112,6 +4199,10 @@ async fn read_git_cursor(rt: &KhiveRuntime, project_id: Uuid, kind: &str) -> Opt
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -4244,6 +4335,10 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     rt.register_embedder(FailOnceEmbedderProvider);
@@ -4394,6 +4489,10 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -4495,6 +4594,10 @@ async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_ingest_retries_tie_at_cursor_timestamp() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -4615,6 +4718,10 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn pr_ingest_retries_tie_at_cursor_timestamp() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     rt.register_embedder(FailOnceEmbedderProvider);
@@ -5218,6 +5325,10 @@ async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
 
@@ -5657,6 +5768,10 @@ fn issue_fixture(number: u64, title: &str, updated_at: &str) -> Value {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -5763,6 +5878,10 @@ async fn digest_history_exhausted_is_true_when_include_is_empty() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -5870,6 +5989,10 @@ async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_stays_skipped() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -5980,6 +6103,10 @@ esac
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -6082,6 +6209,10 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     rt.register_embedder(FailOnceEmbedderProvider);
@@ -6195,6 +6326,10 @@ async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -6538,6 +6673,10 @@ async fn digest_report_serializes_omitted_sources_as_null() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project_id = create(
@@ -6609,6 +6748,10 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
 #[cfg(unix)]
 #[tokio::test]
 async fn digest_remote_issues_only_never_invokes_git_clone() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
 
@@ -6693,6 +6836,10 @@ esac
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_installed_but_unusable_gh_is_reported_false_without_leaking_stderr() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
 
@@ -6782,6 +6929,10 @@ esac
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_multi_remote_configured_default_cannot_redirect_github_ingest() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
     let project_id = create(
@@ -6894,6 +7045,10 @@ esac
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_verb_pr_issue_sources_skipped_on_gh_list_failure() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
 
@@ -8330,6 +8485,10 @@ async fn ingest_leaves_clean_commit_author_and_subject_unmasked() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -8413,6 +8572,10 @@ async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -8497,6 +8660,10 @@ async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 
@@ -8580,6 +8747,10 @@ async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn ingest_leaves_clean_pr_author_and_refs_unmasked() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
 

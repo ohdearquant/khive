@@ -2152,6 +2152,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_setup_failure_is_typed_without_reclassifying_bad_input() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let _guard = crate::cache::ENV_MUTEX.lock().await;
         let scratch = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());

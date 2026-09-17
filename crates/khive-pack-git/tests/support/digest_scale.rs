@@ -179,6 +179,10 @@ async fn query_plans(rt: &KhiveRuntime, project: Uuid) {
 #[serial_test::serial(config_ledger)]
 #[ignore = "file-backed ingest scale measurement; run explicitly with --ignored --nocapture"]
 async fn digest_scale_existing_tracker() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env_lock = ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("tracker.db");

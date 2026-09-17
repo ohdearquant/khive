@@ -60,6 +60,10 @@ mod remote_tests;
 pub mod remote_transport;
 mod remote_vocab;
 pub mod source;
+#[cfg(test)]
+mod test_process;
+#[cfg(all(test, unix))]
+mod test_process_tests;
 pub(crate) mod vocab;
 pub mod write_argv;
 pub mod write_handlers;

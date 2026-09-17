@@ -44,6 +44,10 @@ fn options(repo: &Path, project: Uuid, prs: bool, max: u64) -> IngestOptions {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_one_item_handles_undated_ties_and_unseen_lower_numbers() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
@@ -155,6 +159,10 @@ async fn digest_resume_one_item_handles_undated_ties_and_unseen_lower_numbers() 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_legacy_timestamp_charges_existing_before_new_records() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
@@ -200,6 +208,10 @@ async fn digest_resume_legacy_timestamp_charges_existing_before_new_records() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_rejected_tie_is_charged_and_retried() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project = create(&registry, json!({"kind":"project","name":"retry boundary"})).await;
@@ -258,6 +270,10 @@ async fn digest_resume_rejected_tie_is_charged_and_retried() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_completed_pr_yields_to_issue_and_commit_with_merge_annotation() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project = create(
@@ -327,6 +343,10 @@ async fn digest_resume_completed_pr_yields_to_issue_and_commit_with_merge_annota
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_first_page_survives_second_fetch_failure() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
@@ -431,6 +451,10 @@ esac
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_commit_prefix_survives_later_cursor_write_failure() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project = create(
@@ -499,6 +523,10 @@ async fn digest_resume_commit_prefix_survives_later_cursor_write_failure() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_record_stall_survives_atomic_checkpoint_failure() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
@@ -551,6 +579,10 @@ async fn digest_resume_record_stall_survives_atomic_checkpoint_failure() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_resume_undated_acknowledgments_do_not_fill_across_windows() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;

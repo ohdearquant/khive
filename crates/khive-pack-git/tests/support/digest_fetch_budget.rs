@@ -138,6 +138,10 @@ fn fetch_limits(logs: &Path) -> Vec<(String, usize)> {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_fetch_budget_is_shared_between_remote_sources() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for max in [5, 20] {
         let (rt, token, registry) = fixture().await;
@@ -184,6 +188,10 @@ async fn digest_fetch_budget_is_shared_between_remote_sources() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_fetch_budget_one_visit_resumes_undated_and_timestamp_ties() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
@@ -267,6 +275,10 @@ async fn digest_fetch_budget_one_visit_resumes_undated_and_timestamp_ties() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_fetch_budget_preserves_a_failed_cursor_before_later_existing_rows() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
     let project = create(
@@ -338,6 +350,10 @@ async fn digest_fetch_budget_preserves_a_failed_cursor_before_later_existing_row
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn digest_fetch_budget_reduces_the_second_page_and_resumes_existing_history() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _lock = ENV_MUTEX.lock().await;
     for prs in [false, true] {
         let (rt, token, registry) = fixture().await;
