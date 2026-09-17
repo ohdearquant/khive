@@ -680,7 +680,8 @@ care; alert pipelines do.
   - `RuntimeConfig::default()` installs an unprovisioned `CapabilityGate`.
   - `RuntimeConfig::permissive()` and `permissive_no_embeddings()` select
     `AllowAllGate` explicitly.
-- `crates/khive-capability/src/boot.rs` (never landed on `main`) and production composition roots:
+- `crates/khive-capability/src/boot.rs` (that crate is named in no `Cargo.toml` and no source
+  file in this repository; see #2920) and production composition roots:
   - Normalize configured grants, mint them into one `CapabilityGate`, and install
     that same instance before runtime construction.
 - `crates/khive-gate-rego/src/lib.rs`:
