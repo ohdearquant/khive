@@ -1567,8 +1567,14 @@ impl KhiveMcpServer {
         // registry exposes an advisory beside each successful result instead.
         if runtime.is_read_only() {
             builder.with_read_only_audit_store();
-        } else if let Err(error) = builder.with_runtime_event_store(&runtime) {
-            tracing::warn!(%error, "registry audit event store is unavailable");
+        } else {
+            // The configured sink must open at build before serving starts.
+            builder
+                .with_runtime_event_store(&runtime)
+                .map_err(|source| PackRegError {
+                    failure: PackRegFailure::Registry(source),
+                    runtime: runtime.clone(),
+                })?;
         }
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {

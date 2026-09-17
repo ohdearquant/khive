@@ -643,6 +643,8 @@ pub struct VerbRegistryBuilder {
     /// registry does not depend on the full `KhiveRuntime` surface — only the
     /// audit-persistence capability is needed here.
     event_store: Option<Arc<dyn EventStore>>,
+    /// Defers the runtime sink's namespace-scoped read binding until build.
+    runtime_event_store: Option<KhiveRuntime>,
     /// The configured audit backend is intentionally read-only, so dispatch
     /// omits the known-failing append and the transport surfaces an advisory.
     audit_store_read_only: bool,
@@ -670,6 +672,7 @@ impl VerbRegistryBuilder {
             visible_namespaces: vec![],
             actor_id: None,
             event_store: None,
+            runtime_event_store: None,
             audit_store_read_only: false,
             dispatch_hook: None,
             audit_batch_config: None,
@@ -808,6 +811,7 @@ impl VerbRegistryBuilder {
     /// a durable receipt and therefore fails safely when no store is configured.
     pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
         self.event_store = Some(store);
+        self.runtime_event_store = None;
         self.audit_store_read_only = false;
         self
     }
@@ -820,12 +824,20 @@ impl VerbRegistryBuilder {
     /// public token-scoped [`KhiveRuntime::events`] decorator would otherwise
     /// replace every per-request stamp with the single actor that happened to
     /// construct the registry.
+    ///
+    /// The sink is resolved during [`Self::build`] using the final default
+    /// namespace, so the order of namespace and sink configuration does not
+    /// change its read scope. Sink initialization errors are returned by build:
+    /// a serving registry never silently drops a configured runtime audit sink.
+    /// Metadata builds and explicit replacement sinks do not open this sink.
     pub fn with_runtime_event_store(
         &mut self,
         runtime: &KhiveRuntime,
     ) -> Result<&mut Self, RuntimeError> {
-        let store = runtime.raw_events_for_namespace(self.default_namespace.as_str())?;
-        Ok(self.with_event_store(store))
+        self.event_store = None;
+        self.runtime_event_store = Some(runtime.clone());
+        self.audit_store_read_only = false;
+        Ok(self)
     }
 
     /// Override the ADR-133 audit-batch seam's tunables, applied when
@@ -849,6 +861,7 @@ impl VerbRegistryBuilder {
     /// advisory without changing their canonical verb result shape.
     pub fn with_read_only_audit_store(&mut self) -> &mut Self {
         self.event_store = None;
+        self.runtime_event_store = None;
         self.audit_store_read_only = true;
         self
     }
@@ -881,6 +894,7 @@ impl VerbRegistryBuilder {
     /// The result exposes no dispatch, preparation hooks, or serving-registry conversion.
     pub fn build_metadata(mut self) -> Result<PackMetadataRegistry, RuntimeError> {
         self.event_store = None;
+        self.runtime_event_store = None;
         self.dispatch_hook = None;
         self.resolvers.clear();
         self.build_registry(false)
@@ -1070,7 +1084,11 @@ impl VerbRegistryBuilder {
         // dispatch that produced it still reports success, and nothing here
         // distinguishes that from a healthy registry. Reject it now, with an
         // actionable message, instead of at the first audited dispatch.
-        if let Some(store) = &self.event_store {
+        let event_store = match self.runtime_event_store {
+            Some(runtime) => Some(runtime.raw_events_for_namespace(&self.default_namespace)?),
+            None => self.event_store,
+        };
+        if let Some(store) = &event_store {
             if !store.supports_idempotent_audit_batch() {
                 return Err(RuntimeError::IncompatibleEventStore(
                     "the configured EventStore does not implement ADR-133's \
@@ -1084,7 +1102,7 @@ impl VerbRegistryBuilder {
                 ));
             }
         }
-        let audit_batch = self.event_store.clone().map(|store| {
+        let audit_batch = event_store.clone().map(|store| {
             crate::audit_batch::AuditBatch::new(
                 store,
                 self.audit_batch_config.clone().unwrap_or_default(),
@@ -1098,7 +1116,7 @@ impl VerbRegistryBuilder {
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
             actor_id: self.actor_id,
-            event_store: self.event_store,
+            event_store,
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
@@ -4086,10 +4104,9 @@ pub struct PackRegistry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestAuditStore {
     /// Mirror `KhiveMcpServer::with_packs` (`khive-mcp/src/server.rs`): a
-    /// writable runtime attaches its own event store, logging and continuing
-    /// on failure rather than refusing to build; a read-only runtime retains
-    /// no `EventStore` handle and an advisory travels beside each result
-    /// instead.
+    /// writable runtime attaches its own event store and refuses to build if
+    /// sink initialization fails; a read-only runtime retains no `EventStore`
+    /// handle and an advisory travels beside each result instead.
     Attach,
     /// Build the registry with no audit event store, for a caller with no use
     /// for persisted audit rows.
@@ -4203,8 +4220,9 @@ impl PackRegistry {
         if audit_store == IngestAuditStore::Attach {
             if runtime.is_read_only() {
                 builder.with_read_only_audit_store();
-            } else if let Err(error) = builder.with_runtime_event_store(runtime) {
-                tracing::warn!(%error, "ingest registry audit event store is unavailable");
+            } else {
+                // Attach requires a usable sink; build propagates open failures.
+                builder.with_runtime_event_store(runtime)?;
             }
         }
         Self::register_packs(
@@ -10100,6 +10118,200 @@ pub(crate) mod tests {
             invoked.load(Ordering::SeqCst),
             2,
             "neither denied request may reach the existence oracle"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn runtime_audit_sink_uses_final_namespace_in_both_builder_orders() {
+        for namespace_first in [true, false] {
+            let runtime = KhiveRuntime::memory().expect("memory runtime");
+            runtime
+                .raw_events_for_namespace("local")
+                .expect("local sink")
+                .append_event(Event::new(
+                    "local",
+                    "list",
+                    EventKind::Audit,
+                    SubstrateKind::Event,
+                    "actor:unrelated",
+                ))
+                .await
+                .expect("local control event");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_actor_id(Some("lambda:dispatcher".to_string()));
+            if namespace_first {
+                builder.with_default_namespace("audit-tenant");
+            }
+            builder
+                .with_runtime_event_store(&runtime)
+                .expect("configure runtime sink");
+            if !namespace_first {
+                builder.with_default_namespace("audit-tenant");
+            }
+            let registry = builder.build().expect("registry builds");
+            registry
+                .dispatch("list", serde_json::json!({}))
+                .await
+                .expect("dispatch persists its audit");
+
+            // Raw writes retain their supplied namespace even when the sink's
+            // read scope is stale, so a separate runtime accessor hides the bug.
+            let page = registry
+                .event_store()
+                .expect("registry retains the sink")
+                .query_events(
+                    EventFilter {
+                        verbs: vec!["list".to_string()],
+                        ..EventFilter::default()
+                    },
+                    PageRequest {
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query the registry's sink");
+            assert_eq!(page.items.len(), 1, "namespace_first={namespace_first}");
+            let event = &page.items[0];
+            assert_eq!(event.namespace, "audit-tenant");
+            assert_eq!(event.actor, "actor:lambda:dispatcher");
+            assert_eq!(event.outcome, EventOutcome::Success);
+        }
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn runtime_audit_sink_configuration_preserves_last_setter() {
+        #[derive(Clone, Copy, Debug)]
+        enum Sink {
+            Runtime,
+            Custom,
+            ReadOnly,
+        }
+
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        runtime
+            .raw_events_for_namespace("audit-tenant")
+            .expect("runtime sink")
+            .append_event(Event::new(
+                "audit-tenant",
+                "audit.fixture",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "actor:creator",
+            ))
+            .await
+            .expect("runtime control event");
+        let custom: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+
+        for (first, last) in [
+            (Sink::Runtime, Sink::Custom),
+            (Sink::Runtime, Sink::ReadOnly),
+            (Sink::Custom, Sink::Runtime),
+            (Sink::Custom, Sink::ReadOnly),
+            (Sink::ReadOnly, Sink::Runtime),
+            (Sink::ReadOnly, Sink::Custom),
+        ] {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_default_namespace("audit-tenant");
+            for sink in [first, last] {
+                match sink {
+                    Sink::Runtime => {
+                        builder
+                            .with_runtime_event_store(&runtime)
+                            .expect("configure runtime sink");
+                    }
+                    Sink::Custom => {
+                        builder.with_event_store(custom.clone());
+                    }
+                    Sink::ReadOnly => {
+                        builder.with_read_only_audit_store();
+                    }
+                }
+            }
+            let registry = builder.build().expect("registry builds");
+            match last {
+                Sink::Runtime => {
+                    let store = registry.event_store().expect("runtime sink wins");
+                    assert!(!Arc::ptr_eq(&store, &custom));
+                    assert_eq!(
+                        store.count_events(EventFilter::default()).await.unwrap(),
+                        1,
+                        "runtime event remains readable after {first:?}"
+                    );
+                    assert!(registry.audit_persistence_advisory().is_none());
+                    assert!(registry.audit_batch_metrics().is_some());
+                }
+                Sink::Custom => {
+                    assert!(Arc::ptr_eq(
+                        &registry.event_store().expect("custom sink wins"),
+                        &custom
+                    ));
+                    assert!(registry.audit_persistence_advisory().is_none());
+                    assert!(registry.audit_batch_metrics().is_some());
+                }
+                Sink::ReadOnly => {
+                    assert!(registry.event_store().is_none());
+                    assert!(registry.audit_persistence_advisory().is_some());
+                    assert!(registry.audit_batch_metrics().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial(config_ledger)]
+    fn runtime_audit_sink_is_not_bound_when_replaced_or_building_metadata() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = KhiveRuntime::new(crate::runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec![],
+            brain_profile: None,
+            actor_id: None,
+            events_split: Some(crate::events_split::EventsSplitConfig {
+                db_path: directory.path().to_path_buf(),
+                socket_path: None,
+            }),
+            ..crate::runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime creation does not open the events sink");
+
+        let mut metadata = VerbRegistryBuilder::new();
+        metadata.register(AlphaPack);
+        metadata
+            .with_runtime_event_store(&runtime)
+            .expect("configuration defers the invalid sink");
+        let metadata = metadata.build_metadata().expect("metadata needs no sink");
+        assert!(metadata.has_verb("list"));
+        assert!(metadata.registry.event_store().is_none());
+        assert!(metadata.registry.audit_batch_metrics().is_none());
+
+        let mut custom = VerbRegistryBuilder::new();
+        custom.with_runtime_event_store(&runtime).unwrap();
+        custom.with_event_store(Arc::new(MemoryEventStore::default()));
+        assert!(custom
+            .build()
+            .expect("custom replaces runtime")
+            .event_store()
+            .is_some());
+
+        let mut read_only = VerbRegistryBuilder::new();
+        read_only.with_runtime_event_store(&runtime).unwrap();
+        read_only.with_read_only_audit_store();
+        assert!(read_only
+            .build()
+            .expect("read-only replaces runtime")
+            .event_store()
+            .is_none());
+
+        let mut serving = VerbRegistryBuilder::new();
+        serving.with_runtime_event_store(&runtime).unwrap();
+        assert!(
+            serving.build().is_err(),
+            "serving build must surface the error opening a directory as an events database"
         );
     }
 

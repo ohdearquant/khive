@@ -184,6 +184,87 @@ fn secret_gate_refusal_has_stable_token_and_json_reason() {
         .is_some_and(|error| error.contains("write blocked")));
 }
 
+fn secret_refusal_fields_response() -> &'static serde_json::Value {
+    static RESPONSE: OnceLock<serde_json::Value> = OnceLock::new();
+    RESPONSE.get_or_init(|| {
+        let home = TempDir::new().unwrap();
+        let content = "AKIAFAKEKEY1234567890";
+        let ops = serde_json::json!([
+            {"tool": "scan", "args": {"content": content}},
+            {"tool": "create", "args": {"kind": "note", "content": content}},
+            {"tool": "get", "args": {}}
+        ]);
+        let output = run_exec(
+            &home,
+            &ops.to_string(),
+            "kg",
+            &["--actor", "lambda:test", "--strict"],
+            false,
+        );
+        stdout_json(&output)
+    })
+}
+
+fn assert_secret_refusal_fields_match_preview(response: &serde_json::Value) {
+    let preview = &response["results"][0]["result"];
+    let expected = serde_json::json!({
+        "detector": preview["detector"].as_str().expect("preview detector"),
+        "location": preview["location"].as_str().expect("preview location"),
+    });
+    let refusal = &response["results"][1]["error"];
+    let actual = serde_json::json!({
+        "detector": refusal["detector"],
+        "location": refusal["location"],
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn secret_refusal_detector_and_location_match_preview_fields() {
+    assert_secret_refusal_fields_match_preview(secret_refusal_fields_response());
+}
+
+#[test]
+fn secret_refusal_fields_ignore_message_wording() {
+    for message in [
+        None,
+        Some(""),
+        Some("content matches secret pattern a-different-detector in another.field"),
+    ] {
+        let mut response = secret_refusal_fields_response().clone();
+        let refusal = response["results"][1]["error"]
+            .as_object_mut()
+            .expect("refused write error");
+        match message {
+            Some(message) => {
+                refusal.insert("message".into(), serde_json::json!(message));
+            }
+            None => {
+                refusal.remove("message");
+            }
+        }
+        assert_secret_refusal_fields_match_preview(&response);
+    }
+}
+
+#[test]
+fn unrelated_refusal_has_no_detector_field() {
+    let response = secret_refusal_fields_response();
+    let refused = &response["results"][2];
+    assert_eq!(refused["ok"], false);
+    assert!(refused["error"]
+        .as_object()
+        .expect("invalid get error")
+        .get("detector")
+        .is_none());
+}
+
+#[test]
+fn secret_refusal_code_reaches_exec_envelope() {
+    let response = secret_refusal_fields_response();
+    assert_eq!(response["results"][1]["error"]["code"], "secret_detected");
+}
+
 struct StreamPolicyOutputs {
     ordinary: Vec<Output>,
     atomic_update: Output,

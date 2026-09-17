@@ -47,10 +47,11 @@ freshly-reconstructed `RuntimeConfig::default()` would drain
 creation verbs append an immutable, target-bound creator-provenance event before
 activating the staged row. The drain reconstructs the exact actor kind from that
 event and supplies it through the typed per-request identity seam, so replay remains
-the creator even when a different actor owns the daemon. Generic scheduled actions
-without that proof fail closed. Legacy reminders ignore forgeable note metadata and
-use the configured scheduler actor, then anonymous `local`, under ADR-106's narrower
-compatibility policy.
+the creator even when a different actor owns the daemon. Both event types fail
+closed without that proof. The former reminder-only daemon/`local` fallback is
+removed: no recipient is chosen from either daemon configuration or forgeable note
+metadata. The diagnostic receipt records `not_invoked`, `anonymous:local`, and an
+explicit missing-provenance error visible through `get(id="...")`.
 
 ## Why the tick loop uses a fixed interval with `Skip`
 
@@ -89,16 +90,17 @@ event to the immutable event substrate, and only then activate it as `pending`. 
 the runner reconstructs the exact verified actor kind from that event's actor column:
 attributed principals use `VerifiedActor`, while `anonymous:local` remains anonymous. It
 never treats the caller-editable note property or stored DSL as authority, and replay preserves the public
-verb-visibility boundary (internal subhandlers stay denied). Generic scheduled actions
-written before immutable provenance existed fail closed: the payload is not dispatched, the
-row becomes terminal `status="failed"`, and `dispatch_error` plus `dispatch_failed_at`
-explain the migration-policy failure. Legacy reminders ignore any unprovenanced actor claim
-and use the current server actor, then `local`, preserving a safe form of Amendment C's
-fallback without permitting forged delivery identity. Refused generic rows retain
-`anonymous:local` in their diagnostic receipt because they have no verified creator; the daemon
-fallback is reminder-only. Legacy batches and chains are also refused before
-`mark_dispatch_invoking`, with terminal `failed`/`not_invoked` state, so best-effort partial
-success can never be retried as a whole and duplicated.
+verb-visibility boundary (internal subhandlers stay denied). Rows written without
+immutable provenance fail closed: no action or reminder delivery is dispatched, and
+the row becomes terminal `status="failed"`. Generic actions persist `dispatch_error`
+and `dispatch_failed_at`; reminders persist `delivery_error` and `delivery_failed_at`.
+The retained `not_invoked` receipt names the missing proof and uses `anonymous:local`
+because no creator was verified. The former reminder fallback selected the daemon
+actor on every occurrence of a repeating row; it no longer applies. Refused repeats
+do not rearm. Inspect the row through `get`, then create a new reminder through
+`schedule.remind` to establish caller-bound provenance. Legacy batches and chains
+are also refused before `mark_dispatch_invoking`, with terminal `failed`/`not_invoked`
+state, so best-effort partial success can never be retried as a whole and duplicated.
 
 Other generic dispatch failures remain per-event: they are persisted as
 `dispatch_error`/`dispatch_failed_at`. A failed one-shot returns to `pending` for a later
@@ -145,8 +147,8 @@ refusals use `state="not_invoked"` with `completed_at` and a non-empty `error`, 
 grace-window skips use `state="missed"` with `completed_at` and `error=null`. These
 states prove that no target action future was polled; they are not dispatch outcomes.
 Missed reminders still resolve immutable creator provenance so their retained receipt is
-creator-attributed; only a genuinely legacy reminder without provenance uses the scheduler
-fallback.
+creator-attributed. A reminder without provenance is refused before the grace policy,
+with an anonymous `not_invoked` receipt, and cannot rearm as a missed repeat.
 Recovery re-checks the current deadline and matches the exact serialized properties selected by
 its scan in every requeue, quarantine, and lifecycle-finalization CAS. A renewal, durable outcome,
 or any other intervening properties mutation therefore wins ownership instead of being overwritten
