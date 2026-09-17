@@ -270,10 +270,10 @@ pub struct EventsSplitConfig {
 
 #[cfg(unix)]
 type ClientMap = std::collections::HashMap<PathBuf, Arc<EventsSplitClient>>;
-/// Keyed by (path, read_only): a read-only open and a writable open of the
-/// same file are different pools with different guarantees and must never be
-/// handed out interchangeably.
-type BackendMap = std::collections::HashMap<(PathBuf, bool), Arc<StorageBackend>>;
+/// One admission per canonical path. The access mode belongs to the entry,
+/// so another mode cannot run raw-file preflight over a live SQLite pool.
+/// Strong entries retain the existing process lifetime, including derived stores.
+type BackendMap = std::collections::HashMap<PathBuf, (bool, Arc<StorageBackend>)>;
 
 #[cfg(unix)]
 fn client_registry() -> &'static std::sync::Mutex<ClientMap> {
@@ -324,10 +324,8 @@ fn direct_backend(
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (db_path.to_path_buf(), read_only);
-    if let Some(existing) = registry.get(&key) {
-        return Ok(Arc::clone(existing));
-    }
+    let absolute_path = absolutize(db_path);
+    let db_path = absolute_path.as_path();
     refuse_events_db_symlinks(db_path)
         .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     #[cfg(unix)]
@@ -344,6 +342,38 @@ fn direct_backend(
     #[cfg(unix)]
     ensure_events_db_parent_trusted(db_path)
         .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+    let key = std::fs::canonicalize(db_path)
+        .or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            let parent = db_path.parent().ok_or(error)?;
+            let name = db_path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "events path has no file name",
+                )
+            })?;
+            std::fs::canonicalize(parent).map(|parent| parent.join(name))
+        })
+        .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
+    if let Some((existing_read_only, existing)) = registry.get(&key) {
+        if *existing_read_only != read_only {
+            let existing_mode = if *existing_read_only {
+                "read-only"
+            } else {
+                "writable"
+            };
+            let requested_mode = if read_only { "read-only" } else { "writable" };
+            return Err(crate::error::RuntimeError::InvalidInput(format!(
+                "events database {} is already open {existing_mode} in this process; cannot \
+                 open it {requested_mode}; read-only events access requires a separate frozen snapshot",
+                key.display()
+            )));
+        }
+        return Ok(Arc::clone(existing));
+    }
+    let db_path = key.as_path();
     // Embedded writable mode holds the events database to the daemon's own
     // contract: owner-only from the first byte, never at the process umask,
     // and — because event rows carry the same audit payloads either way — a
@@ -367,7 +397,7 @@ fn direct_backend(
     } else {
         StorageBackend::sqlite(db_path)?
     });
-    registry.insert(key, Arc::clone(&backend));
+    registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
 }
 
