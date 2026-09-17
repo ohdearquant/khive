@@ -97,6 +97,12 @@ delivery and acknowledgement rules.
   the list always reflects whichever pack crates are linked into the binary.
 - Loaded-pack selection resolves once at startup with precedence `--pack` →
   `KHIVE_PACKS` → `[runtime].packs` → the built-in production set.
+- The `initialize` instructions keep those two sets apart: `get_info` names the
+  registry's own `pack_names()` as loaded, and names `builtin_pack_names()`
+  minus those as linked-but-selectable. Merging them advertised packs whose
+  verbs the same string's catalog did not contain and whose calls are refused.
+  A configured mount is in `pack_names()` and never in the link-time inventory,
+  so it reads as loaded, which is what it is.
 - Pack registration fails fast on unknown names or unsatisfied dependencies —
   a misconfigured `KHIVE_PACKS` is a boot error, not a silent degradation.
 - `pack.rs` force-references one public symbol per pack crate so the linker
