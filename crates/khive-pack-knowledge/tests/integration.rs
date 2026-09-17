@@ -4724,6 +4724,7 @@ async fn resolver_generic_update_atom_returns_invalid_input() {
         panic!("expected InvalidInput, got: {err:?}");
     };
     for verb in [
+        "the knowledge pack's own verbs",
         "knowledge.upsert_atoms",
         "knowledge.upsert_domains",
         "knowledge.edit",
@@ -5999,6 +6000,7 @@ fn issue_558_directing_error(error: RuntimeError, arm: &str) {
     for required in [
         "merge",
         "not supported",
+        "the knowledge pack's own verbs",
         "knowledge.upsert_atoms",
         "knowledge.upsert_domains",
         "knowledge.edit",
@@ -6455,6 +6457,89 @@ async fn issue_558_merge_resolver_error_propagates() {
             assert_eq!(issue_558_snapshot(&runtime).await, before);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert_eq!(later.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+/// A resolver that claims every id for a pack other than knowledge.
+struct OtherPackProbe {
+    verbs: &'static [&'static str],
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::PackByIdResolver for OtherPackProbe {
+    async fn resolve_by_id(
+        &self,
+        _id: uuid::Uuid,
+    ) -> Result<Option<khive_runtime::Resolved>, RuntimeError> {
+        Ok(Some(khive_runtime::Resolved::PackRecord {
+            pack: "probe-pack".into(),
+            kind: "probe".into(),
+            data: json!({}),
+        }))
+    }
+
+    async fn delete_by_id(&self, _id: uuid::Uuid, _hard: bool) -> Result<Value, RuntimeError> {
+        panic!("diagnostic resolver must never delete")
+    }
+
+    fn private_record_verbs(&self) -> &'static [&'static str] {
+        self.verbs
+    }
+}
+
+/// The refusal for a generic verb on a pack-private record names the pack
+/// whose resolver claimed the record, and offers only that pack's verbs.
+#[tokio::test]
+async fn private_record_refusal_names_the_pack_that_claimed_the_record() {
+    let cases: [(&'static [&'static str], &str); 2] = [
+        (&[], ""),
+        (&["probe-pack.revise"], " (e.g. probe-pack.revise)"),
+    ];
+    for (verbs, examples) in cases {
+        let runtime = rt();
+        let real = pack_via_registry(runtime.clone());
+        let ordinary = issue_558_ordinary(&real, "concept", "from").await;
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_resolver("probe-pack", Box::new(OtherPackProbe { verbs }));
+        PackRegistry::register_packs(
+            &["kg".into(), "knowledge".into()],
+            runtime.clone(),
+            &mut builder,
+        )
+        .expect("real resolver factory");
+        let f = Fixture {
+            registry: builder.build().expect("probe registry"),
+        };
+        let claimed = uuid::Uuid::new_v4().to_string();
+
+        let merge = issue_558_unchanged_error(
+            &runtime,
+            &f,
+            issue_558_args(&claimed, &ordinary, Some("concept")),
+            "merge",
+        )
+        .await;
+        let before = issue_558_snapshot(&runtime).await;
+        let update = f
+            .dispatch("update", json!({"id": claimed, "name": "New Name"}))
+            .await
+            .expect_err("update of a claimed record must be refused");
+        assert_eq!(issue_558_snapshot(&runtime).await, before);
+
+        for (verb, error) in [("merge", merge), ("update", update)] {
+            let RuntimeError::InvalidInput(message) = error else {
+                panic!("{verb}: expected InvalidInput, got {error:?}");
+            };
+            let expected = format!("use the probe-pack pack's own verbs{examples}");
+            assert!(
+                message.starts_with(verb) && message.ends_with(&expected),
+                "{verb}: {message:?} does not end with {expected:?}"
+            );
+            assert!(
+                !message.contains("knowledge"),
+                "{verb}: directed to another pack's verbs: {message:?}"
+            );
         }
     }
 }

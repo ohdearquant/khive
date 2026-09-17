@@ -10,9 +10,9 @@ use khive_runtime::{
 };
 
 use super::common::{
-    deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, parse_content_strategy,
-    parse_entity_policy, resolve_kind_spec, resolve_uuid_unfiltered, to_json, KindSpec,
-    MergeParams,
+    deser, ensure_entity_kind, ensure_note_kind, immutable_event_error, pack_private_record_error,
+    parse_content_strategy, parse_entity_policy, resolve_kind_spec, resolve_uuid_unfiltered,
+    to_json, KindSpec, MergeParams,
 };
 use crate::KgPack;
 
@@ -27,6 +27,8 @@ fn substrate_name(spec: &KindSpec) -> &'static str {
     }
 }
 
+/// Turn a merge operand's `NotFound` into a directing refusal when a pack's
+/// resolver owns the id.
 async fn diagnose_private_merge<T>(
     result: Result<T, RuntimeError>,
     id: Uuid,
@@ -34,13 +36,12 @@ async fn diagnose_private_merge<T>(
 ) -> Result<T, RuntimeError> {
     match result {
         Err(original @ RuntimeError::NotFound(_)) => {
-            for (_pack_name, resolver) in registry.resolvers() {
+            for (pack_name, resolver) in registry.resolvers() {
                 if resolver.resolve_by_id(id).await?.is_some() {
-                    return Err(RuntimeError::InvalidInput(
-                        "merge of pack-private records is not supported; \
-                         use the pack's own verbs (e.g. knowledge.upsert_atoms, \
-                         knowledge.upsert_domains, knowledge.edit)"
-                            .into(),
+                    return Err(pack_private_record_error(
+                        "merge of pack-private records is not supported",
+                        pack_name,
+                        resolver.as_ref(),
                     ));
                 }
             }

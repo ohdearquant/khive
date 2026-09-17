@@ -12,9 +12,10 @@ use khive_types::pack::PACK_REGISTRY_TAGS;
 
 use super::common::{
     description_patch, deser, immutable_event_error, normalize_entity_timestamps,
-    optional_string_patch, parse_relation, remap_note_status, resolve_kind_spec,
-    resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted, string_value, to_json,
-    validate_entity_type, DeleteParams, KindSpec, RestoreParams, UpdateParams,
+    optional_string_patch, pack_private_record_error, parse_relation, remap_note_status,
+    resolve_kind_spec, resolve_uuid_unfiltered, resolve_uuid_unfiltered_including_deleted,
+    string_value, to_json, validate_entity_type, DeleteParams, KindSpec, RestoreParams,
+    UpdateParams,
 };
 use crate::KgPack;
 
@@ -203,13 +204,12 @@ impl KgPack {
                 Ok(s) => s,
                 Err(RuntimeError::NotFound(_)) => {
                     // Check if a pack resolver claims this UUID; if so, update is deferred.
-                    for (_pack_name, resolver) in registry.resolvers() {
+                    for (pack_name, resolver) in registry.resolvers() {
                         if resolver.resolve_by_id(id).await?.is_some() {
-                            return Err(RuntimeError::InvalidInput(
-                                "update of pack-private records is not yet supported; \
-                                 use the pack's own verbs (e.g. knowledge.upsert_atoms, \
-                                 knowledge.upsert_domains, knowledge.edit)"
-                                    .into(),
+                            return Err(pack_private_record_error(
+                                "update of pack-private records is not yet supported",
+                                pack_name,
+                                resolver.as_ref(),
                             ));
                         }
                     }

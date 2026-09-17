@@ -464,6 +464,14 @@ impl PackByIdResolver for KnowledgePack {
         Ok(None)
     }
 
+    fn private_record_verbs(&self) -> &'static [&'static str] {
+        &[
+            "knowledge.upsert_atoms",
+            "knowledge.upsert_domains",
+            "knowledge.edit",
+        ]
+    }
+
     /// Delete a knowledge domain or atom by UUID.
     ///
     /// Soft-delete by default (`hard=false`): sets `deleted_at = now()`.
