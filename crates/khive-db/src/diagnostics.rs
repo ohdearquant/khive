@@ -61,7 +61,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -357,6 +357,24 @@ pub enum WalPinCensus {
     },
 }
 
+/// Name the reason a holder census stopped short.
+///
+/// A budget stop and an enumeration failure both set `truncated`, and an
+/// operator reading one sentence has to be able to tell them apart: the first
+/// is a configurable trade this process made on purpose and is expected on a
+/// busy box, the second is evidence that process enumeration itself
+/// misbehaved. Describing both as "truncated" would make the report cry wolf
+/// on every bounded call, which is how the sentence that matters stops being
+/// read.
+fn census_truncation_cause(budget_exhausted: bool) -> String {
+    if budget_exhausted {
+        "the OS process walk stopped at its wall-clock budget (see          collection_cost.wal_pin_census_budget_ms)"
+            .to_string()
+    } else {
+        "the OS process walk was truncated".to_string()
+    }
+}
+
 /// One PID's live heartbeat as reported to an operator.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinHolder {
@@ -414,6 +432,7 @@ fn wal_pin_attribution_without_sidecar(
     census_uninspectable_pids.sort_unstable();
     census_uninspectable_pids.dedup();
     let census_truncated = census.truncated;
+    let census_budget_exhausted = census.budget_exhausted;
 
     let mut status_reasons = vec![sidecar_reason];
     let census = if census_is_complete {
@@ -423,7 +442,7 @@ fn wal_pin_attribution_without_sidecar(
     } else {
         let mut causes = Vec::new();
         if census_truncated {
-            causes.push("the OS process walk was truncated".to_string());
+            causes.push(census_truncation_cause(census_budget_exhausted));
         }
         if !census_uninspectable_pids.is_empty() {
             causes.push(format!(
@@ -479,6 +498,7 @@ fn wal_pin_attribution_from_evidence(
     census_uninspectable_pids.sort_unstable();
     census_uninspectable_pids.dedup();
     let census_truncated = census.truncated;
+    let census_budget_exhausted = census.budget_exhausted;
     let census_carrier = if census_is_complete {
         WalPinCensus::Complete {
             holder_pids: census_holder_pids.clone(),
@@ -486,7 +506,7 @@ fn wal_pin_attribution_from_evidence(
     } else {
         let mut causes = Vec::new();
         if census_truncated {
-            causes.push("the OS process walk was truncated".to_string());
+            causes.push(census_truncation_cause(census_budget_exhausted));
         }
         if !census_uninspectable_pids.is_empty() {
             causes.push(format!(
@@ -1222,6 +1242,90 @@ fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSize
     })
 }
 
+/// What this report cost to assemble, per section, in milliseconds.
+///
+/// `db_diagnostics` is the verb an operator reaches for when the system feels
+/// slow, and its own cost was measured varying more than five-fold between
+/// consecutive calls against one unchanged store on one box. A surface that
+/// varies that much has to say which part varied; otherwise the reader is left
+/// to guess, and the cheapest guess is "the store is stalled", which is the
+/// conclusion this verb exists to test rather than to suggest.
+///
+/// Every field is wall-clock and measured in this process, so it includes time
+/// spent waiting on a contended machine. That is deliberate: the contention is
+/// the thing being reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CollectionCost {
+    /// Whole-report assembly, from the first section to the last.
+    pub total_ms: u64,
+    /// SQLite-side inspection: the PASSIVE checkpoint probe, page composition,
+    /// the graph-edge ledger counts and the FTS5 segment records.
+    pub sqlite_ms: u64,
+    /// `stat` of the WAL file. The cheap sibling of the census; reported so the
+    /// comparison beside it is legible rather than asserted.
+    pub wal_file_stat_ms: u64,
+    /// The OS holder census: a walk of every process on the host.
+    pub wal_pin_census_ms: u64,
+    /// The sidecar directory enumeration the census is reconciled against.
+    pub wal_pin_sidecar_ms: u64,
+    /// The wall-clock budget the census was given, or `None` when it ran
+    /// unbounded. An `Option` rather than a sentinel `0` because a producer
+    /// that failed to record a budget would write `0`, which is exactly the
+    /// value "unbounded" would have claimed.
+    pub wal_pin_census_budget_ms: Option<u64>,
+    /// Whether the census stopped because that budget was spent. When true the
+    /// holder list is partial by design and `wal_pin.census.status` is
+    /// `incomplete` for that reason and no other.
+    pub wal_pin_census_budget_exhausted: bool,
+}
+
+impl CollectionCost {
+    /// A report whose file-backed sections never ran (an in-memory backend):
+    /// the SQLite side still costs what it costs, and the census did not run
+    /// at all rather than running fast.
+    fn in_memory(total_ms: u64) -> Self {
+        Self {
+            total_ms,
+            sqlite_ms: 0,
+            wal_file_stat_ms: 0,
+            wal_pin_census_ms: 0,
+            wal_pin_sidecar_ms: 0,
+            wal_pin_census_budget_ms: None,
+            wal_pin_census_budget_exhausted: false,
+        }
+    }
+}
+
+/// The default wall-clock budget for the OS holder census on the request path.
+///
+/// Sized from the measurements in the report that asked for the bound: five
+/// consecutive samples on a 971-process box cost 3.4s to 18.6s, while every
+/// contention counter the same report carried read zero. Two seconds keeps the
+/// verb interactive on a busy machine and completes untruncated on an idle one.
+const DEFAULT_CENSUS_BUDGET: Duration = Duration::from_millis(2000);
+
+/// Environment override for [`DEFAULT_CENSUS_BUDGET`], in milliseconds.
+///
+/// `0` disables the bound and restores the unbounded full-machine walk, for an
+/// operator who would rather wait than read a partial holder list. An
+/// unparseable value is ignored in favour of the default rather than failing
+/// the request: a diagnostic verb that refuses to answer because its own
+/// tuning knob is malformed is worse than one that answers on the default and
+/// says which budget it used — which the report does, in
+/// `collection_cost.wal_pin_census_budget_ms`.
+const CENSUS_BUDGET_ENV: &str = "KHIVE_WALPIN_CENSUS_BUDGET_MS";
+
+fn request_census_budget() -> Option<Duration> {
+    match std::env::var(CENSUS_BUDGET_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(DEFAULT_CENSUS_BUDGET),
+        },
+        Err(_) => Some(DEFAULT_CENSUS_BUDGET),
+    }
+}
+
 /// The full database-integrity, reader/writer-contention, and WAL/checkpoint
 /// payload.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1252,6 +1356,8 @@ pub struct DbDiagnostics {
     /// maintenance steps.
     pub fts_maintenance: crate::FtsMaintenanceCounters,
     pub wal_pin: WalPinAttribution,
+    /// Per-section assembly cost for this report. See [`CollectionCost`].
+    pub collection_cost: CollectionCost,
 }
 
 /// Assemble the report for `pool`'s database.
@@ -1337,6 +1443,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
+    let started = Instant::now();
     let process = ProcessIdentity::current(&pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
@@ -1376,19 +1483,24 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
+            collection_cost: CollectionCost::in_memory(elapsed_ms(started)),
         });
     };
 
     let inspection_pool = Arc::clone(&pool);
+    let sqlite_started = Instant::now();
     let inspection = crate::read_cancellation::run_interruptible_read(
         StorageCapability::Sql,
         "db_diagnostics.sqlite",
         move |scope| inspect_pool_interruptibly(&inspection_pool, scope),
     )
     .await?;
+    let sqlite_ms = elapsed_ms(sqlite_started);
     crate::ensure_request_read_active("db_diagnostics")?;
     let canonical = operational_db_path(&pool, &path);
-    let (wal_file, wal_pin) = inspect_file_state_interruptibly(canonical, sweep_interval).await?;
+    let budget = request_census_budget();
+    let (wal_file, wal_pin, file_state_cost) =
+        inspect_file_state_interruptibly(canonical, sweep_interval, budget).await?;
     crate::ensure_request_read_active("db_diagnostics")?;
 
     Ok(DbDiagnostics {
@@ -1409,6 +1521,15 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         fts_segments_error: inspection.fts_segments_error,
         fts_maintenance: crate::fts_maintenance_counters(),
         wal_pin,
+        collection_cost: CollectionCost {
+            total_ms: elapsed_ms(started),
+            sqlite_ms,
+            wal_file_stat_ms: file_state_cost.wal_file_stat_ms,
+            wal_pin_census_ms: file_state_cost.census_ms,
+            wal_pin_sidecar_ms: file_state_cost.sidecar_ms,
+            wal_pin_census_budget_ms: budget.map(|b| b.as_millis() as u64),
+            wal_pin_census_budget_exhausted: file_state_cost.census_budget_exhausted,
+        },
     })
 }
 
@@ -1436,6 +1557,7 @@ fn collect_inner(
     audit_append_failures: Option<u64>,
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
 ) -> DbDiagnostics {
+    let started = Instant::now();
     let process = ProcessIdentity::current(pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
@@ -1474,17 +1596,26 @@ fn collect_inner(
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
+            collection_cost: CollectionCost::in_memory(elapsed_ms(started)),
         };
     };
 
+    let sqlite_started = Instant::now();
     let inspection = inspect_pool(pool);
+    let sqlite_ms = elapsed_ms(sqlite_started);
     let canonical = operational_db_path(pool, &path);
+    let wal_file_started = Instant::now();
+    let wal_file = wal_file_state(&canonical);
+    let wal_file_stat_ms = elapsed_ms(wal_file_started);
+    let census_started = Instant::now();
+    let wal_pin = wal_pin_attribution(&canonical, sweep_interval);
+    let wal_pin_ms = elapsed_ms(census_started);
 
     DbDiagnostics {
         build,
         process,
         db_path: Some(path.display().to_string()),
-        wal_file: Some(wal_file_state(&canonical)),
+        wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
         checkpoint_probe_error: inspection.checkpoint_probe_error,
@@ -1497,7 +1628,21 @@ fn collect_inner(
         fts_segments: inspection.fts_segments,
         fts_segments_error: inspection.fts_segments_error,
         fts_maintenance: crate::fts_maintenance_counters(),
-        wal_pin: wal_pin_attribution(&canonical, sweep_interval),
+        wal_pin,
+        collection_cost: CollectionCost {
+            total_ms: elapsed_ms(started),
+            sqlite_ms,
+            wal_file_stat_ms,
+            // This path does not separate the census from the sidecar read it
+            // is reconciled against: it calls the combined `wal_pin_attribution`,
+            // so splitting them here would mean inventing a number. The
+            // request path, which is the one the operator waits on, does split
+            // them.
+            wal_pin_census_ms: wal_pin_ms,
+            wal_pin_sidecar_ms: 0,
+            wal_pin_census_budget_ms: None,
+            wal_pin_census_budget_exhausted: false,
+        },
     }
 }
 
@@ -1627,10 +1772,25 @@ impl Drop for StopCensusOnDrop {
     }
 }
 
+/// Wall-clock cost of the file-backed half of a report, split so the census
+/// can be told apart from the two cheap reads it sits between.
+#[derive(Debug, Clone, Copy, Default)]
+struct FileStateCost {
+    wal_file_stat_ms: u64,
+    census_ms: u64,
+    sidecar_ms: u64,
+    census_budget_exhausted: bool,
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
+}
+
 async fn inspect_file_state_interruptibly(
     path: PathBuf,
     sweep_interval: Duration,
-) -> StorageResult<(WalFileState, WalPinAttribution)> {
+    census_budget: Option<Duration>,
+) -> StorageResult<(WalFileState, WalPinAttribution, FileStateCost)> {
     const OPERATION: &str = "db_diagnostics.wal_holder_census";
     crate::ensure_request_read_active(OPERATION)?;
     let stopped = Arc::new(AtomicBool::new(false));
@@ -1640,7 +1800,10 @@ async fn inspect_file_state_interruptibly(
         armed: true,
     };
     let mut worker = tokio::task::spawn_blocking(move || {
+        let mut cost = FileStateCost::default();
+        let wal_file_started = Instant::now();
         let wal_file = wal_file_state(&path);
+        cost.wal_file_stat_ms = elapsed_ms(wal_file_started);
         if worker_stopped.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -1648,10 +1811,26 @@ async fn inspect_file_state_interruptibly(
             ));
         }
         #[cfg(unix)]
-        let attribution = match crate::walpin::census_holders_until(&path, || {
-            worker_stopped.load(Ordering::SeqCst)
-        }) {
+        let census_started = Instant::now();
+        #[cfg(unix)]
+        let census_result = match census_budget {
+            Some(budget) => crate::walpin::census_holders_until_within(
+                &path,
+                || worker_stopped.load(Ordering::SeqCst),
+                budget,
+            ),
+            None => {
+                crate::walpin::census_holders_until(&path, || worker_stopped.load(Ordering::SeqCst))
+            }
+        };
+        #[cfg(unix)]
+        {
+            cost.census_ms = elapsed_ms(census_started);
+        }
+        #[cfg(unix)]
+        let attribution = match census_result {
             Ok(census) => {
+                cost.census_budget_exhausted = census.budget_exhausted;
                 if worker_stopped.load(Ordering::SeqCst) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
@@ -1661,10 +1840,12 @@ async fn inspect_file_state_interruptibly(
                 if !crate::walpin::sidecar_enabled(true) {
                     wal_pin_attribution_without_sidecar(census, SIDECAR_DISABLED_REASON.to_string())
                 } else {
+                    let sidecar_started = Instant::now();
                     let sidecar = crate::walpin::inspect_live(
                         &crate::walpin::sidecar_dir_for(&path),
                         sweep_interval,
                     );
+                    cost.sidecar_ms = elapsed_ms(sidecar_started);
                     if worker_stopped.load(Ordering::SeqCst) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
@@ -1684,8 +1865,14 @@ async fn inspect_file_state_interruptibly(
             Err(error) => WalPinAttribution::unavailable(format!("census_holders failed: {error}")),
         };
         #[cfg(not(unix))]
-        let attribution = wal_pin_attribution(&path, sweep_interval);
-        Ok((wal_file, attribution))
+        let attribution = {
+            let _ = census_budget;
+            let census_started = Instant::now();
+            let attribution = wal_pin_attribution(&path, sweep_interval);
+            cost.census_ms = elapsed_ms(census_started);
+            attribution
+        };
+        Ok((wal_file, attribution, cost))
     });
 
     tokio::select! {
@@ -1777,6 +1964,98 @@ mod tests {
 
     use super::*;
     use crate::pool::{ConnectionPool, PoolConfig};
+
+    /// The budget knob is read per request, so a wrong read is a wrong bound
+    /// on every call. `0` has to mean unbounded rather than "spend nothing",
+    /// because a zero-millisecond budget would truncate every census on the
+    /// first process and report a holder list of nothing at all.
+    #[test]
+    #[serial_test::serial(khive_walpin_census_budget_env)]
+    fn census_budget_reads_zero_as_unbounded_and_survives_a_malformed_value() {
+        let _guard = crate::walpin::EnvVarGuard::capture(CENSUS_BUDGET_ENV);
+
+        std::env::remove_var(CENSUS_BUDGET_ENV);
+        assert_eq!(
+            request_census_budget(),
+            Some(DEFAULT_CENSUS_BUDGET),
+            "an unset variable takes the default bound"
+        );
+
+        std::env::set_var(CENSUS_BUDGET_ENV, "0");
+        assert_eq!(
+            request_census_budget(),
+            None,
+            "0 restores the unbounded full-machine walk"
+        );
+
+        std::env::set_var(CENSUS_BUDGET_ENV, " 750 ");
+        assert_eq!(
+            request_census_budget(),
+            Some(Duration::from_millis(750)),
+            "a surrounding-whitespace value is still a number"
+        );
+
+        std::env::set_var(CENSUS_BUDGET_ENV, "soon");
+        assert_eq!(
+            request_census_budget(),
+            Some(DEFAULT_CENSUS_BUDGET),
+            "a malformed budget must not fail the request; the report states \
+             which budget was actually used"
+        );
+    }
+
+    /// A budget stop and an enumeration failure both set `truncated`, and an
+    /// operator reads one sentence. If that sentence is the same for both,
+    /// the bound makes the report cry wolf on every busy box.
+    #[test]
+    fn a_budget_stop_and_an_enumeration_failure_do_not_share_a_reason() {
+        let budget = census_truncation_cause(true);
+        let failure = census_truncation_cause(false);
+        assert_ne!(budget, failure);
+        assert!(
+            budget.contains("budget"),
+            "the budget reason must name the budget: {budget}"
+        );
+        assert!(
+            budget.contains("wal_pin_census_budget_ms"),
+            "and must point at the field carrying the value: {budget}"
+        );
+        assert!(
+            !failure.contains("budget"),
+            "an enumeration failure must not be described as a budget stop: {failure}"
+        );
+    }
+
+    /// `wal_pin_census_budget_ms` is an `Option` precisely so that a producer
+    /// which failed to record the budget cannot write the value that means
+    /// "unbounded". This pins the wire shape of both states.
+    #[test]
+    fn collection_cost_distinguishes_an_unbounded_census_from_a_zero_cost_one() {
+        let unbounded = CollectionCost {
+            total_ms: 9,
+            sqlite_ms: 4,
+            wal_file_stat_ms: 0,
+            wal_pin_census_ms: 5,
+            wal_pin_sidecar_ms: 0,
+            wal_pin_census_budget_ms: None,
+            wal_pin_census_budget_exhausted: false,
+        };
+        let bounded = CollectionCost {
+            wal_pin_census_budget_ms: Some(2000),
+            wal_pin_census_budget_exhausted: true,
+            ..unbounded
+        };
+
+        let unbounded = serde_json::to_value(unbounded).unwrap();
+        let bounded = serde_json::to_value(bounded).unwrap();
+        assert_eq!(
+            unbounded["wal_pin_census_budget_ms"],
+            serde_json::Value::Null
+        );
+        assert_eq!(bounded["wal_pin_census_budget_ms"], 2000);
+        assert_eq!(unbounded["wal_pin_census_budget_exhausted"], false);
+        assert_eq!(bounded["wal_pin_census_budget_exhausted"], true);
+    }
 
     #[test]
     fn process_identity_serializes_os_start_time_or_explicit_unavailability() {
@@ -2557,6 +2836,7 @@ mod tests {
             holders: std::collections::HashSet::new(),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         });
 
         assert_eq!(pin.sidecar_listing_truncated, None);
@@ -2579,6 +2859,7 @@ mod tests {
             holders: std::collections::HashSet::from([41, 7]),
             uninspectable_pids: vec![99],
             truncated: true,
+            budget_exhausted: false,
         });
 
         let json = serde_json::to_value(pin).expect("attribution serializes");
@@ -2678,6 +2959,7 @@ mod tests {
             holders: std::collections::HashSet::from([41, 7]),
             uninspectable_pids: vec![99, 99],
             truncated: true,
+            budget_exhausted: false,
         };
 
         let pin = wal_pin_attribution_from_census(census);
@@ -2720,6 +3002,7 @@ mod tests {
             holders: std::collections::HashSet::from([7]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
 
         let pin = wal_pin_attribution_from_census(census);
@@ -2744,6 +3027,7 @@ mod tests {
             holders: std::collections::HashSet::from([7]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
         let sidecar = crate::walpin::WalpinReport {
             entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
@@ -2771,6 +3055,7 @@ mod tests {
             holders: std::collections::HashSet::from([7, 41]),
             uninspectable_pids: Vec::new(),
             truncated: false,
+            budget_exhausted: false,
         };
         let sidecar = crate::walpin::WalpinReport {
             entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
