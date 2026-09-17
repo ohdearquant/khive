@@ -1188,13 +1188,23 @@ class MakefileGateContractTests(unittest.TestCase):
             'if [ "$$VERIFIED_SHA256" != "$$COPIED_SHA256" ]'
         )
         install = local_recipe.index('mv "$$DEST.new" "$$DEST"')
-        daemon_stop = local_recipe.index("pkill -f 'kkernel mcp --daemon'")
+        # The outgoing daemon is stopped by the pid recorded before the install,
+        # never by a command-line pattern. A pattern names a class rather than a
+        # process, so it also reaches a daemon that started during the install
+        # window -- including the replacement this target just launched. The pid
+        # has to be read before the stop, and it is read before the install so the
+        # process is still alive to answer for its own pack list.
+        pid_read = local_recipe.index('OLD_PID=$$(cat "$$KHIVE_PID_FILE"')
+        daemon_stop = local_recipe.index('kill "$$OLD_PID"')
+        self.assertNotIn("pkill", local_recipe)
+        self.assertNotIn("pgrep", local_recipe)
         self.assertNotIn('"$$VERIFIED_VERBS" -lt', local_recipe)
         self.assertLess(stamp_check, assignments)
         self.assertLess(assignments, hash_check)
         self.assertLess(hash_check, copy)
         self.assertLess(copy, staged_check)
         self.assertLess(staged_check, install)
+        self.assertLess(pid_read, install)
         self.assertLess(install, daemon_stop)
 
     def test_full_packs_names_every_pack_build_local_links(self) -> None:
