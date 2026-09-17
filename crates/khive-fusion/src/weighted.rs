@@ -405,7 +405,7 @@ mod tests {
         assert!((normalized[1] - 0.5).abs() < 1e-10);
     }
 
-    // ── #2496 / #2639: per-source min-max normalization before fusion ──────
+    // ── Per-source min-max normalization before fusion ─────────────────────
 
     #[test]
     fn test_weighted_fusion_mixed_scales_bm25_vs_cosine() {

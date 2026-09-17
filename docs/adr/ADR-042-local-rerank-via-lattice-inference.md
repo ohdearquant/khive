@@ -432,7 +432,7 @@ deployments compile the flag in but never load a LoRA profile.
 
 ### Handler
 
-- `crates/khive-pack-memory/src/handlers.rs`: add `handle_recall_rerank`.
+- `crates/khive-pack-memory/src/handlers/sub_handlers.rs`: add `handle_recall_rerank`.
 - `crates/khive-pack-memory/src/lib.rs`: register `recall_rerank` handler at
   `Visibility::Internal`.
 - `crates/khive-pack-brain/src/lib.rs`: add `resolve_rerank_hook(caller_ctx,
@@ -511,6 +511,6 @@ are deferred with native rerank.
   `recall.rerank` stage and `reranker_weights` config field.
 - [ADR-041](ADR-041-event-provenance-projection.md): Event Provenance Projection —
   `RerankExecuted` events project candidates + selected via per-kind decoder.
-- `crates/khive-pack-memory/src/handlers.rs`: rerank handler.
+- `crates/khive-pack-memory/src/handlers/sub_handlers.rs`: rerank handler.
 - `crates/khive-pack-brain/src/lib.rs`: `resolve_rerank_hook`.
 - `crates/khive-runtime/src/runtime.rs`: `rerank_model_id` config wiring.

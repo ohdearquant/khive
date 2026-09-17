@@ -839,7 +839,7 @@ Converts `KhiveConfig` to `RuntimeConfig`: the `default = true` engine becomes
 `RuntimeConfig::embedding_model`; others go to `additional_embedding_models`. Unknown model
 names are skipped with a warning.
 
-**CLI flag** (`crates/khive-mcp/src/main.rs`):
+**CLI flag** (`crates/khive-mcp/src/args.rs`):
 
 ```
 --config <PATH>    (env: KHIVE_CONFIG)
@@ -887,6 +887,11 @@ strategy; no automatic wiring exists yet.
 | `crates/khive-mcp/Cargo.toml`               | `tempfile` in dev-deps                                                              |
 | `crates/khive-mcp/tests/integration.rs`     | `engine_config_three_engines_all_registered` test                                   |
 | `docs/khive-config-example.toml`            | New — annotated example config                                                      |
+
+The table above records the files this ADR's implementation touched at the time.
+`crates/khive-mcp/src/main.rs` was removed in `2f2f3ca7` when the binaries were
+unified; the `--config` / `KHIVE_CONFIG` flag now lives in
+`crates/khive-mcp/src/args.rs`.
 
 ---
 

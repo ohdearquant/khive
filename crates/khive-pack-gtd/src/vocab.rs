@@ -57,7 +57,7 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
             ("someday", "active"),
             ("someday", "done"),
             ("someday", "cancelled"),
-            // done and cancelled are terminal — no outgoing transitions (#273).
+            // done and cancelled are terminal — no outgoing transitions.
         ],
     },
 }];

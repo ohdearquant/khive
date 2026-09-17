@@ -630,7 +630,7 @@ pub mod metrics {
         namespace: &str,
     ) -> Result<f32, EngineError> {
         let conn = engine.store().conn();
-        // brain_events.payload stores namespace under legacy key "lambda_id" (#2536).
+        // brain_events.payload stores namespace under legacy key "lambda_id".
         // The JSON key cannot be renamed without a data migration; the column name
         // was already `namespace` in v25 when the table was created.
         let namespace_str = namespace.to_string();

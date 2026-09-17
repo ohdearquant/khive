@@ -192,7 +192,7 @@ async fn learn_rejects_missing_name_and_content() {
     );
 }
 
-// ── learn content-alias (issue #488) ─────────────────────────────────────────
+// ── learn content-alias ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn learn_content_without_name_auto_generates_name() {

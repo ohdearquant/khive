@@ -572,5 +572,5 @@ impl KhiveRuntime {
 - `crates/khive-db/src/stores/event.rs`: `SqlEventStore` — `query_events`, existing DDL
   and indexes
 - `crates/khive-runtime/src/operations.rs`: `Resolved::Event` variant
-- `crates/khive-pack-kg/src/handlers.rs`: `handle_list`, `handle_get`, `handle_update`,
+- `crates/khive-pack-kg/src/handlers/`: `handle_list`, `handle_get`, `handle_update`,
   `handle_delete` — extension points

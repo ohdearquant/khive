@@ -424,11 +424,11 @@ impl NeighborCursor {
 
 /// One neighbor returned by a graph query.
 ///
-/// Field naming (#148): on the JSON wire, the node identifier is serialized as
+/// Field naming: on the JSON wire, the node identifier is serialized as
 /// `id` (not `node_id`) so it matches the verb-wide identifier convention.
 /// Internal Rust code still uses `.node_id` on the struct.
 ///
-/// Enrichment (#162): `name` and `kind` are populated by the runtime layer
+/// Enrichment: `name` and `kind` are populated by the runtime layer
 /// after the storage call returns. Storage `GraphStore` impls leave them
 /// `None`; the runtime batch-fetches the entity rows and fills them in.
 ///
