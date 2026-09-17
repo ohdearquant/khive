@@ -35,10 +35,8 @@ fn list_items(response: &Value) -> &[Value] {
         .expect("list response must contain an items array")
 }
 
-/// Every test here mutates process-global state (`PATH`,
-/// `KHIVE_GIT_DIGEST_SCRATCH_ROOT`) -- share `cache`'s lock so these tests
-/// never race against `cache::tests` or each other within the same `cargo
-/// test` binary.
+/// Retained fixture lock. Environment-interposing cases first re-execute as
+/// the sole test in a child, so unlocked git observers cannot see their shims.
 async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
     cache::ENV_MUTEX.lock().await
 }
@@ -388,6 +386,10 @@ fn add_commit(repo: &Path, rel: &str, contents: &str, message: &str) {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn public_digest_recovery_cache_failures_keep_remote_type_and_stage() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     for unsafe_refetch in [true, false] {
         let bin_dir = tempfile::tempdir().expect("bin dir");
@@ -474,6 +476,10 @@ async fn public_digest_recovery_cache_failures_keep_remote_type_and_stage() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn corrupt_promisor_cache_self_heals_via_refetch_on_first_call() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
     let log_dir = tempfile::tempdir().expect("log dir");
@@ -537,6 +543,10 @@ async fn corrupt_promisor_cache_self_heals_via_refetch_on_first_call() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn refetch_failure_falls_through_to_one_reclone_and_still_self_heals() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
     let log_dir = tempfile::tempdir().expect("log dir");
@@ -609,6 +619,10 @@ async fn refetch_failure_falls_through_to_one_reclone_and_still_self_heals() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn persistent_corruption_is_bounded_and_never_reports_false_success() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
     let log_dir = tempfile::tempdir().expect("log dir");
@@ -674,6 +688,10 @@ async fn persistent_corruption_is_bounded_and_never_reports_false_success() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn local_source_never_repairs_even_when_recovery_would_succeed() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let bin_dir = tempfile::tempdir().expect("bin dir");
     let log_dir = tempfile::tempdir().expect("log dir");
@@ -729,6 +747,10 @@ fn head_sha_reads_the_real_current_commit() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     use async_trait::async_trait;
     use khive_runtime::{arm_vector_fail_after, EmbedderProvider};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
@@ -1021,6 +1043,10 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn public_verb_refuses_a_markerless_lookalike_at_the_cache_key_path() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let scratch = tempfile::tempdir().expect("scratch root");
     std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -1078,6 +1104,10 @@ async fn public_verb_refuses_a_markerless_lookalike_at_the_cache_key_path() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn public_verb_refuses_a_symlink_at_the_cache_key_path() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let scratch = tempfile::tempdir().expect("scratch root");
     std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
@@ -1204,6 +1234,10 @@ fn loose_object_path(repo: &Path, sha: &str) -> std::path::PathBuf {
 /// real.
 #[tokio::test]
 async fn refetch_clone_restores_a_genuinely_missing_promisor_object() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
     let _env = env_guard().await;
     let scratch = tempfile::tempdir().expect("scratch root");
     std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());

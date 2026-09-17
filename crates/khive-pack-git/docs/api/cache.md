@@ -399,13 +399,33 @@ is logged, and the mutation's own error is what propagates.
 
 ## `ENV_MUTEX`
 
-`scratch_root()` reads process-global env vars; serialize any in-crate
-test (in this module or elsewhere, e.g. `recovery_tests.rs`) that touches
-it, so the whole `cargo test` binary's parallel test threads never race on
-`KHIVE_GIT_DIGEST_SCRATCH_ROOT`/cache-cap env vars/`PATH`. A
-`tokio::sync::Mutex` rather than `std::sync::Mutex` so async tests can hold
-the guard across `.await` points (`blocking_lock()` for this module's plain
-sync `#[test]`s).
+Test cases that interpose `PATH`, scratch-root/cap settings, or git config
+first call `test_process::run_in_child`, before fixture setup. That helper
+re-executes the current test binary with an exact test name and one test thread;
+only the selected child case may continue to its environment mutation/guards.
+Child selection uses `Command::env`, leaving the parent environment untouched.
+The child asserts its exact selector and single-thread arguments before any
+mutation, then must report exactly one passing test. An empty selector or a
+marker inherited under different arguments cannot bypass this boundary. Guards
+still drop normally before the child test completes; a panic cannot leak its
+environment back into the parent.
+
+Existing `ENV_MUTEX` fixture locks remain for now, but they are not the
+isolation guarantee and unlocked observers need not join them. A child can
+still create runtime/helper threads; the guarantee is one test case, not one
+OS thread. The hostile-shim regression enters the same re-exec helper from a
+named worker before installing a wrapper that rejects every git invocation.
+Readiness and release markers hold the interposition open while real-git
+observers run. Bypassing the helper contaminates their inherited PATH and makes
+all three local repository identity observers fail. The control also checks
+parent environment preservation on success and failure, rejects a zero-test
+child result, and rejects mismatched child arguments before mutation.
+
+The `acceptance` and `dev_loop` integration binaries import the same test-only
+helper. Their interposing cases enter it before calling `PathGuard`,
+`remote_fixture`, or the `dev_loop` fixture that temporarily removes
+`KHIVE_BLOB_ROOT`. Existing fixture locks remain, including the shared
+acceptance support modules, but observers need no additional serialization.
 
 ## Test module notes
 

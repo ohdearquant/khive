@@ -440,6 +440,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn graphql_review_read_binds_variables_and_rejects_partial_errors() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
         let _lock = crate::cache::ENV_MUTEX.lock().await;
         struct RestorePath(Option<std::ffi::OsString>);
@@ -473,10 +477,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        // Prepend rather than replace: `PATH` is process-global and every other case in
-        // this binary resolves `git` by name through it, so a replacement makes their spawns
-        // fail with NotFound for the length of this case (#2589). Prepending still shadows
-        // `gh`, which is all this fixture needs.
+        // Keep real tools available inside this isolated case while shadowing gh.
         let shimmed = match std::env::var_os("PATH") {
             Some(prior) => {
                 let mut paths = vec![dir.path().to_path_buf()];
@@ -491,8 +492,7 @@ mod tests {
                 .arg("--version")
                 .output()
                 .is_ok_and(|out| out.status.success()),
-            "this case must leave `git` resolvable on PATH: the variable is process-global and \
-             concurrent cases in this binary spawn `git` by name"
+            "this isolated case must leave real git resolvable alongside its gh shim"
         );
         let pr = json!({"headRefOid":"a".repeat(40),"reviewDecision":"APPROVED"});
         let data = json!({"data":{"repository":{"pullRequest":pr}}});
