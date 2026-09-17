@@ -66,6 +66,26 @@ impl BrainState {
 
     /// Serialize the current state to a `BrainStateSnapshot` for persistence.
     pub fn to_snapshot(&self) -> BrainStateSnapshot {
+        let view = self.snapshot_view();
+        BrainStateSnapshot {
+            profiles: view.profiles,
+            balanced_recall: view.balanced_recall,
+            profile_states: view.profile_states,
+            bindings: view.bindings.to_vec(),
+            section_states: view.section_states,
+            router_state: view.router_state.clone(),
+            adapter_set: view.adapter_set.clone(),
+        }
+    }
+
+    /// Encode the same persisted snapshot without copying opaque router bytes
+    /// or adapter records into a second owned snapshot. The live posterior
+    /// projections are still materialized exactly as in `to_snapshot`.
+    pub fn to_snapshot_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.snapshot_view())
+    }
+
+    fn snapshot_view(&self) -> BrainStateSnapshotView<'_> {
         let extra: HashMap<String, BalancedRecallSnapshot> = self
             .profile_states
             .iter()
@@ -81,14 +101,14 @@ impl BrainState {
             .keys()
             .filter_map(|id| self.materialized_profile(id).map(|r| (id.clone(), r)))
             .collect();
-        BrainStateSnapshot {
+        BrainStateSnapshotView {
             profiles,
             balanced_recall: self.balanced_recall.to_snapshot(),
             profile_states: extra,
-            bindings: self.bindings.clone(),
+            bindings: &self.bindings,
             section_states,
-            router_state: self.router_state.clone(),
-            adapter_set: self.adapter_set.clone(),
+            router_state: &self.router_state,
+            adapter_set: &self.adapter_set,
         }
     }
 
@@ -305,6 +325,18 @@ pub struct BrainStateSnapshot {
     pub router_state: HashMap<String, RouterStateBlob>,
     #[serde(default)]
     pub adapter_set: HashMap<String, Vec<AdapterRecord>>,
+}
+
+/// Serialization-only view; field names and values match the owned snapshot.
+#[derive(Serialize)]
+struct BrainStateSnapshotView<'a> {
+    profiles: HashMap<String, ProfileRecord>,
+    balanced_recall: BalancedRecallSnapshot,
+    profile_states: HashMap<String, BalancedRecallSnapshot>,
+    bindings: &'a [ProfileBinding],
+    section_states: HashMap<String, SectionPosteriorSnapshot>,
+    router_state: &'a HashMap<String, RouterStateBlob>,
+    adapter_set: &'a HashMap<String, Vec<AdapterRecord>>,
 }
 
 /// Validate all BetaPosterior values in a snapshot.
