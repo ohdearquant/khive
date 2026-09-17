@@ -501,3 +501,283 @@ async fn clean_directory_import_still_succeeds_under_the_byte_caps() {
         "both well-under-cap atoms must be persisted"
     );
 }
+
+const PREFLIGHT_SECTION: &str = "This existing section has enough meaningful content to meet the governed section minimum while retaining its original identity and metadata across a refused batch.";
+const PREFLIGHT_NEW_SECTION: &str = "This new section describes a distinct topic with enough content to meet validation and must remain absent whenever a later batch member is rejected.";
+const PREFLIGHT_CORRECTED_SECTION: &str = "This corrected section provides a valid replacement for the rejected suffix and proves that the same batch succeeds once all its members pass validation.";
+
+async fn assert_edit_preflight(invalid: Value, expected_error: &str) {
+    let f = fixture();
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "edit-preflight", "name": "Edit Preflight",
+            "content": markdown("Edit Preflight")
+        }] }),
+    )
+    .await
+    .expect("seed atom");
+    f.dispatch(
+        "knowledge.edit",
+        json!({ "id": "edit-preflight", "sections": [{
+            "section_type": "overview", "heading": "Original heading",
+            "content": PREFLIGHT_SECTION, "sort_order": 7
+        }] }),
+    )
+    .await
+    .expect("seed section");
+    let get = json!({ "id": "edit-preflight", "include_sections": true });
+    let before = f
+        .dispatch("knowledge.get", get.clone())
+        .await
+        .expect("before");
+    let mut request = json!({ "id": "edit-preflight", "sections": [
+        { "section_type": "overview", "heading": "Updated heading",
+          "content": PREFLIGHT_SECTION, "sort_order": 2 },
+        { "section_type": "examples", "heading": "New heading",
+          "content": PREFLIGHT_NEW_SECTION },
+        invalid
+    ] });
+    let error = f
+        .dispatch("knowledge.edit", request.clone())
+        .await
+        .expect_err("invalid suffix must refuse the batch");
+    if expected_error == "secret heading" {
+        match &error {
+            RuntimeError::SecretDetected(found) => {
+                assert_eq!(found.location.as_deref(), Some("section[2].heading"));
+            }
+            other => panic!("expected located secret refusal, got {other:?}"),
+        }
+        assert!(!error
+            .to_string()
+            .contains(request["sections"][2]["heading"].as_str().unwrap()));
+    } else {
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)), "{error:?}");
+        assert!(error.to_string().contains(expected_error), "{error}");
+    }
+    let after = f
+        .dispatch("knowledge.get", get.clone())
+        .await
+        .expect("after refusal");
+    assert_eq!(
+        after, before,
+        "neither the metadata update nor the new section may persist"
+    );
+    assert_eq!(
+        f.count("SELECT COUNT(*) AS count FROM knowledge_sections")
+            .await,
+        1
+    );
+
+    request["sections"][2] = json!({
+        "section_type": "formalism", "heading": "Corrected heading",
+        "content": PREFLIGHT_CORRECTED_SECTION
+    });
+    let accepted = f
+        .dispatch("knowledge.edit", request)
+        .await
+        .expect("corrected batch");
+    assert_eq!(accepted["upserted"], 3);
+    let after = f
+        .dispatch("knowledge.get", get)
+        .await
+        .expect("after correction");
+    let sections = after["sections"].as_array().expect("sections");
+    assert_eq!(sections.len(), 3);
+    let updated = sections
+        .iter()
+        .find(|section| section["content"] == PREFLIGHT_SECTION)
+        .unwrap();
+    assert_eq!(updated["id"], before["sections"][0]["id"]);
+    assert_eq!(updated["heading"], "Updated heading");
+    assert_eq!(updated["sort_order"], 2);
+    assert_eq!(updated["status"], before["sections"][0]["status"]);
+    assert!(sections
+        .iter()
+        .any(|section| section["content"] == PREFLIGHT_NEW_SECTION));
+    assert!(sections
+        .iter()
+        .any(|section| section["content"] == PREFLIGHT_CORRECTED_SECTION));
+}
+
+#[tokio::test]
+async fn edit_later_invalid_type_preserves_new_and_existing_sections() {
+    assert_edit_preflight(
+        json!({ "section_type": "unknown-section-type", "content": PREFLIGHT_CORRECTED_SECTION }),
+        "unknown section_type",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edit_later_short_content_preserves_new_and_existing_sections() {
+    assert_edit_preflight(
+        json!({ "section_type": "formalism", "content": "too short" }),
+        "section content must be at least",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edit_later_secret_heading_preserves_new_and_existing_sections() {
+    let credential = ["ghp_", "FakeGitHubToken0000000000000000000"].concat();
+    assert_edit_preflight(
+        json!({ "section_type": "formalism", "content": PREFLIGHT_CORRECTED_SECTION, "heading": credential }),
+        "secret heading",
+    ).await;
+}
+
+async fn seed_import_conflict(f: &Fixture, slug: &str, tombstone: bool, namespace: &str) {
+    if tombstone {
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "namespace": namespace, "atoms": [{
+                "slug": slug, "name": "Retired atom", "content": markdown("Retired atom")
+            }] }),
+        )
+        .await
+        .expect("seed atom to retire");
+        f.dispatch(
+            "knowledge.delete_atoms",
+            json!({ "namespace": namespace, "ids": [slug] }),
+        )
+        .await
+        .expect("retire atom");
+    } else {
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({ "namespace": namespace, "domains": [{
+                "slug": slug, "name": "Protected domain", "description": markdown("Protected domain")
+            }] }),
+        ).await.expect("seed domain mirror");
+    }
+}
+
+async fn assert_import_target_preflight(tombstone: bool) {
+    for canonical in [false, true] {
+        let f = fixture();
+        let slug = if canonical {
+            "reserved-target"
+        } else {
+            "z-conflict"
+        };
+        seed_import_conflict(&f, slug, tombstone, "local").await;
+        let root = TempDir::new().expect("temp root");
+        let valid_path = root.path().join("a-valid.md");
+        let conflict_path = root.path().join("z-conflict.md");
+        std::fs::write(&valid_path, markdown("Valid First")).expect("first source");
+        let mut source = markdown("Conflicting Last");
+        if canonical {
+            source = format!("---\nid: Reserved.Target\n---\n{source}");
+        }
+        std::fs::write(&conflict_path, source).expect("later source");
+        let request = json!({ "path": root.path().to_str().unwrap() });
+        let error = f
+            .dispatch("knowledge.import", request.clone())
+            .await
+            .expect_err("target conflict");
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)), "{error:?}");
+        let expected = if tombstone {
+            "previously deleted"
+        } else {
+            "domain mirror"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(error.to_string().contains(slug), "{error}");
+        assert_eq!(
+            f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+                .await,
+            1,
+            "later existing-target refusal must not persist the valid first file"
+        );
+        f.dispatch("knowledge.get", json!({ "id": "a-valid" }))
+            .await
+            .expect_err("first atom absent");
+
+        // Correct the conflicting identity while keeping the same directory request.
+        std::fs::write(
+            &conflict_path,
+            format!(
+                "---\nid: Available.Target\n---\n{}",
+                markdown("Corrected Last")
+            ),
+        )
+        .expect("correct source identity");
+        let accepted = f
+            .dispatch("knowledge.import", request.clone())
+            .await
+            .expect("corrected import");
+        assert_eq!(accepted["imported_atoms"], 2);
+        let before = f
+            .dispatch("knowledge.get", json!({ "id": "available-target" }))
+            .await
+            .expect("imported atom");
+        // The heading becomes the atom's NAME, so two documents differing only in
+        // their H1 store identical content. Vary the body as well, or the
+        // content assertion below can never hold no matter what import does.
+        let replacement = format!(
+            "{}\n\nA second paragraph distinguishes this revision from the first import.",
+            markdown("Updated Same Identity")
+        );
+        std::fs::write(
+            &conflict_path,
+            format!("---\nid: Available.Target\n---\n{replacement}"),
+        )
+        .expect("same identity update");
+        f.dispatch("knowledge.import", request)
+            .await
+            .expect("same-slug update succeeds");
+        let after = f
+            .dispatch("knowledge.get", json!({ "id": "available-target" }))
+            .await
+            .expect("updated atom");
+        assert_eq!(after["id"], before["id"]);
+        assert_eq!(after["name"], "Updated Same Identity");
+        assert_ne!(after["content"], before["content"]);
+        assert_eq!(
+            f.count("SELECT COUNT(*) AS count FROM knowledge_atoms")
+                .await,
+            3
+        );
+    }
+}
+
+#[tokio::test]
+async fn import_later_domain_collision_preflights_path_and_canonical_identity() {
+    assert_import_target_preflight(false).await;
+}
+
+#[tokio::test]
+async fn import_later_tombstone_collision_preflights_path_and_canonical_identity() {
+    assert_import_target_preflight(true).await;
+}
+
+#[tokio::test]
+async fn import_target_conflicts_in_other_namespaces_do_not_block() {
+    let f = fixture();
+    seed_import_conflict(&f, "domain", false, "other").await;
+    seed_import_conflict(&f, "retired", true, "other").await;
+    let root = TempDir::new().expect("temp root");
+    std::fs::write(root.path().join("domain.md"), markdown("Local Domain Slug")).expect("source");
+    std::fs::write(
+        root.path().join("retired.md"),
+        markdown("Local Retired Slug"),
+    )
+    .expect("source");
+    let accepted = f
+        .dispatch(
+            "knowledge.import",
+            json!({ "path": root.path().to_str().unwrap() }),
+        )
+        .await
+        .expect("only caller namespace participates in collision checks");
+    assert_eq!(accepted["imported_atoms"], 2);
+    for slug in ["domain", "retired"] {
+        let atom = f
+            .dispatch("knowledge.get", json!({ "id": slug }))
+            .await
+            .expect("local atom");
+        assert_eq!(atom["namespace"], "local");
+    }
+}
