@@ -232,6 +232,7 @@ local: verify-local-artifact
 	SIGNED_SHA256=$$({ shasum -a 256 "$$DEST.new" 2>/dev/null || sha256sum "$$DEST.new"; } | awk '{print $$1}'); \
 	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
 	KHIVE_PID_FILE=$${KHIVE_PID:-$$HOME/.khive/khived.pid}; \
+	SOCK=$${KHIVE_SOCKET:-$$HOME/.khive/khived.sock}; \
 	OLD_PID=$$(cat "$$KHIVE_PID_FILE" 2>/dev/null | tr -dc "0-9"); \
 	if [ -n "$$OLD_PID" ] && ! ps -p "$$OLD_PID" >/dev/null 2>&1; then OLD_PID=""; fi; \
 	OLD_PACKS=""; \
@@ -240,6 +241,15 @@ local: verify-local-artifact
 	fi; \
 	echo "==> Atomically moving into place..."; \
 	mv "$$DEST.new" "$$DEST"; \
+	MARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \
+	MARKER_OWNED=""; \
+	if [ -n "$$OLD_PID" ] && [ ! -e "$$MARKER" ]; then \
+	  printf 'make-local\n%s\n' "$$OLD_PID" > "$$MARKER" && MARKER_OWNED=1; \
+	  trap '[ -n "$$MARKER_OWNED" ] && rm -f "$$MARKER"' EXIT INT TERM; \
+	  echo "==> Claimed the daemon rendezvous with $$MARKER so client requests wait for the replacement instead of spawning a competing daemon"; \
+	elif [ -e "$$MARKER" ]; then \
+	  echo "==> $$MARKER already exists; a supervisor owns this rendezvous. Leaving it untouched."; \
+	fi; \
 	if [ -n "$$OLD_PID" ]; then \
 	  echo "==> Stopping daemon pid $$OLD_PID (read from $$KHIVE_PID_FILE before the install)..."; \
 	  kill "$$OLD_PID" 2>/dev/null || true; \
@@ -267,8 +277,18 @@ local: verify-local-artifact
 	  fi; \
 	  ( cd "$$START_CWD" && exec nohup "$$DEST" mcp --daemon $$OLD_PACKS >> "$$DLOG" 2>&1 & ); \
 	  echo "==> Daemon log: $$DLOG"; \
+	  if [ -n "$$MARKER_OWNED" ]; then \
+	    i=0; \
+	    while [ $$i -lt 40 ]; do \
+	      if [ -S "$$SOCK" ] && lsof -t "$$SOCK" >/dev/null 2>&1; then break; fi; \
+	      i=$$((i+1)); sleep 0.25; \
+	    done; \
+	    rm -f "$$MARKER"; MARKER_OWNED=""; \
+	    echo "==> Replacement is serving; released $$MARKER"; \
+	  fi; \
 	else \
-	  echo "==> KHIVE_LOCAL_NO_START set: not starting a replacement daemon."; \
+	  if [ -n "$$MARKER_OWNED" ]; then rm -f "$$MARKER"; MARKER_OWNED=""; fi; \
+	  echo "==> KHIVE_LOCAL_NO_START set: not starting a replacement daemon; released $$MARKER so clients may spawn."; \
 	fi; \
 	DEST_HASH=$$(md5 -q "$$DEST"); \
 	DEST_SIZE=$$(stat -f '%z' "$$DEST"); \
