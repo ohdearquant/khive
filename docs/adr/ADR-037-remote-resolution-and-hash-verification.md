@@ -269,7 +269,7 @@ escape hatch for legitimate upstream updates.
 
 ### Integration points
 
-- `resolve_uuid_async` (`crates/khive-pack-kg/src/handlers.rs`) — shipped local resolver:
+- `resolve_uuid_async` (`crates/khive-pack-kg/src/handlers/common.rs`) — shipped local resolver:
   full UUID, 8+ hex prefix, then entity name.
 - `kkernel kg fetch` / `kkernel kg sync` — explicit operator paths for remote archive fetch,
   staging, canonical hash computation, pin comparison, and cache/meta publication.

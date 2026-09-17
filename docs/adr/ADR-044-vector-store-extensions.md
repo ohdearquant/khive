@@ -524,15 +524,15 @@ ADR-033, ADR-032, and ADR-043 will be amended to cite these methods explicitly (
 
 ### File locations
 
-| Artifact                                                                             | Location                                                                                              |
-| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `VectorStore` trait (5 new defaults)                                                 | `crates/khive-storage/src/vectors.rs`                                                                 |
-| New types (`PropertyFilter`, `PropertyOp`, `OrphanSweepConfig`, `OrphanSweepResult`) | `crates/khive-storage/src/types.rs`                                                                   |
-| `VectorMetadataFilter` field rename                                                  | `crates/khive-storage/src/types.rs` (`properties` → `property_filters`, type → `Vec<PropertyFilter>`) |
-| `VectorStoreCapabilities` new field                                                  | add `supports_orphan_sweep: bool` (default `false`)                                                   |
-| `SqliteVecStore` overrides                                                           | `crates/khive-db/src/stores/vectors.rs`                                                               |
-| CLI `vec-capabilities` / `vec-sweep`                                                 | `crates/khive-cli/src/vec.rs` (new)                                                                   |
-| Compliance test harness                                                              | `crates/khive-storage/src/tests/compliance/vector_filter_suite.rs` (new)                              |
+| Artifact                                                                             | Location                                                                                                     |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `VectorStore` trait (5 new defaults)                                                 | `crates/khive-storage/src/vectors.rs`                                                                        |
+| New types (`PropertyFilter`, `PropertyOp`, `OrphanSweepConfig`, `OrphanSweepResult`) | `crates/khive-storage/src/types/vector.rs`                                                                   |
+| `VectorMetadataFilter` field rename                                                  | `crates/khive-storage/src/types/vector.rs` (`properties` → `property_filters`, type → `Vec<PropertyFilter>`) |
+| `VectorStoreCapabilities` new field                                                  | add `supports_orphan_sweep: bool` (default `false`)                                                          |
+| `SqliteVecStore` overrides                                                           | `crates/khive-db/src/stores/vectors.rs`                                                                      |
+| CLI `vec-capabilities` / `vec-sweep`                                                 | `crates/khive-cli/src/vec.rs` (new)                                                                          |
+| Compliance test harness                                                              | `crates/khive-storage/src/tests/compliance/vector_filter_suite.rs` (new)                                     |
 
 No required-method additions to `VectorStore`. Default impls return `Unsupported` when
 the capability flag is `false`. Existing backends continue to compile unchanged.
