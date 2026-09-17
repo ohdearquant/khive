@@ -114,7 +114,7 @@ impl KnowledgePack {
 
         // Resolve name: explicit `name` wins; otherwise auto-generate from `content`
         // (the `description` field).  Truncate at the last word boundary before 60
-        // chars so the generated name is readable — issue #488.
+        // chars so the generated name is readable.
         let name = match p.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(n) => n.to_string(),
             None => {

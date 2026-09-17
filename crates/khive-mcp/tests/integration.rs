@@ -1132,7 +1132,7 @@ async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false);
-    // Per P15 (PR #418), terminal states (done/cancelled) reject ALL outgoing
+    // Per P15, terminal states (done/cancelled) reject ALL outgoing
     // transitions with "task X is in terminal state Y; no further transitions allowed".
     assert!(
         first["error"]["message"]
@@ -1515,7 +1515,7 @@ async fn gtd_assign_creates_depends_on_edge_between_two_tasks() -> anyhow::Resul
     .await?;
 
     let hits = neighbors.as_array().expect("neighbors returns array");
-    // #148: response uses canonical `id` (legacy `node_id` accepted as alias on input only).
+    // Response uses canonical `id` (legacy `node_id` accepted as alias on input only).
     let targets: Vec<&str> = hits.iter().filter_map(|h| h["id"].as_str()).collect();
     assert!(
         targets.iter().any(|t| *t == blocker_full),
@@ -3431,7 +3431,7 @@ async fn help_propose_params_non_empty_with_title_description_changeset() -> any
     Ok(())
 }
 
-// ── help=true schema envelopes for comm + schedule verbs (issue #287) ─────────
+// ── help=true schema envelopes for comm + schedule verbs ──────────────────────
 
 fn make_comm_schedule_server() -> KhiveMcpServer {
     disable_daemon();
@@ -5522,10 +5522,10 @@ async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── #545: brain.feedback default Agent response preserves full target_id ──────
+// ── brain.feedback default Agent response preserves full target_id ────────────
 
 /// `brain.feedback` in default Agent mode must return `target_id` as the full
-/// 36-char UUID, not the 8-char Agent-mode prefix (#545).
+/// 36-char UUID, not the 8-char Agent-mode prefix.
 #[tokio::test]
 async fn brain_feedback_default_agent_response_preserves_full_target_id() -> anyhow::Result<()> {
     let client = connect_brain_only().await?;
@@ -5702,10 +5702,10 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
     Ok(())
 }
 
-// ── #546: schedule.agenda Agent response preserves properties.trigger_at ──────
+// ── schedule.agenda Agent response preserves properties.trigger_at ────────────
 
 /// Schedule agenda in default Agent mode must not compact `trigger_at` inside
-/// `properties` — the full ISO-8601 string must round-trip verbatim (#546).
+/// `properties` — the full ISO-8601 string must round-trip verbatim.
 #[tokio::test]
 async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> anyhow::Result<()> {
     let client = connect_schedule().await?;

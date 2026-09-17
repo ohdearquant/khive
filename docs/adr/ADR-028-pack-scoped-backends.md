@@ -266,7 +266,7 @@ hides bugs where two packs unintentionally claim the same logical table.
 ### 8. Deferred target boot sequence
 
 ```rust
-// crates/khive-mcp/src/main.rs (and kkernel boot)
+// crates/kkernel/src/main.rs (kkernel boot)
 fn main() -> Result<(), ServerError> {
     let cfg = AppConfig::load(&config_path)?;
 

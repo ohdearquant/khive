@@ -1,4 +1,4 @@
-//! End-to-end tests for `BrainPack` as a `DispatchHook` (issue #158).
+//! End-to-end tests for `BrainPack` as a `DispatchHook`.
 //!
 //! Per ADR-032, `BrainState` now holds a profile registry; the BalancedRecall
 //! profile's `total_events` counter lives in `snapshot.balanced_recall.total_events`.

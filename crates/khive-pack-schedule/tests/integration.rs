@@ -412,7 +412,7 @@ async fn test_cancel_accepts_short_id() {
     );
 }
 
-// ── #544 regression: cancel already-cancelled event ─────────────────────────
+// ── Regression: cancel already-cancelled event ──────────────────────────────
 
 #[tokio::test]
 async fn cancel_rejects_already_cancelled_event() {

@@ -204,7 +204,7 @@ async fn test_should_sample() {
     assert!(!should_sample(-0.5)); // clamped to 0.0
 }
 
-// -- Issue #865: HNSW shadow validation test --
+// -- HNSW shadow validation test --------------
 
 #[tokio::test]
 async fn test_hnsw_shadow_validation_passes() {
@@ -268,7 +268,7 @@ async fn test_hnsw_shadow_validation_with_tombstones() {
     assert_eq!(validation.expected.tombstone_count, 1);
 }
 
-// -- Issue #866: Namespace isolation test --
+// -- Namespace isolation test --------------
 
 #[tokio::test]
 async fn test_namespace_isolation() {
@@ -333,7 +333,7 @@ async fn test_namespace_isolation() {
     assert_eq!(loaded2_after.unwrap().doc_count(), 2);
 }
 
-// -- Issue #868: Corrupted data handling tests --
+// -- Corrupted data handling tests --------------
 
 #[tokio::test]
 async fn test_corrupted_bm25_data_returns_error() {
@@ -399,7 +399,7 @@ async fn test_corrupted_hnsw_data_returns_error() {
     assert!(matches!(err, PersistError::Deserialize(_)));
 }
 
-// -- Issue #868: Additional corrupted data handling tests --
+// -- Additional corrupted data handling tests --------------
 
 #[tokio::test]
 async fn test_valid_json_wrong_schema_bm25() {
@@ -549,7 +549,7 @@ async fn test_empty_blob_returns_error() {
     assert!(matches!(err, PersistError::Deserialize(_)));
 }
 
-// -- Issue #869: Empty index persistence edge case tests --
+// -- Empty index persistence edge case tests --------------
 
 #[tokio::test]
 async fn test_empty_bm25_index_persistence() {
@@ -615,7 +615,7 @@ async fn test_empty_hnsw_shadow_validation() {
     assert_eq!(validation.expected.item_count, 0);
 }
 
-// -- Issue #867: Test that verify() is called during shadow validation --
+// -- Test that verify() is called during shadow validation --------------
 
 #[tokio::test]
 async fn test_hnsw_shadow_validation_calls_verify() {
@@ -651,7 +651,7 @@ async fn test_hnsw_shadow_validation_calls_verify() {
 }
 
 // ==========================================================================
-// Issue #1114: HNSW index corruption recovery tests
+// HNSW index corruption recovery tests
 // ==========================================================================
 //
 // These tests verify that the persistence layer correctly detects and handles

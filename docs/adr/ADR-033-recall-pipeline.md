@@ -550,5 +550,5 @@ ordering, or the opt-in `KHIVE_RECALL_PROFILE` stream.
 - [ADR-025](ADR-025-verb-speech-acts.md) — recall is an assertive verb; memory.recall_* handlers inherit
 - ADR-031 — multi-engine retrieval; `memory.recall_embed` uses its fan-out
 - ADR-032 — brain profile orchestration; brain tunes recall config posteriors via feedback events
-- `crates/khive-pack-memory/src/handlers.rs` — current recall implementation
+- `crates/khive-pack-memory/src/handlers/recall.rs` — current recall implementation
 - `crates/khive-runtime/src/fusion.rs` — `FusionStrategy` (RRF, Weighted, Union, VectorOnly)

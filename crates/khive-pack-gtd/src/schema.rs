@@ -81,7 +81,7 @@ pub fn is_terminal(s: &str) -> bool {
 /// - `done`      → (terminal — no outgoing transitions)
 /// - `cancelled` → (terminal — no outgoing transitions)
 ///
-/// **Design decision (GTD-AUD-001 / issue #273)**: `done` and `cancelled` are
+/// **Design decision (GTD-AUD-001)**: `done` and `cancelled` are
 /// permanently terminal — they have no outgoing transitions. The implementation
 /// explicitly closes terminal states to prevent accidental resurrection of
 /// completed or abandoned work. This is the authoritative contract.
@@ -150,7 +150,7 @@ mod tests {
         assert!(can_transition("active", "done"));
         assert!(!can_transition("active", "inbox"));
         assert!(!can_transition("done", "waiting"));
-        // Terminal states have no outgoing transitions (enforced per #273).
+        // Terminal states have no outgoing transitions (enforced).
         assert!(!can_transition("done", "next"));
         assert!(!can_transition("done", "active"));
         assert!(!can_transition("cancelled", "next"));

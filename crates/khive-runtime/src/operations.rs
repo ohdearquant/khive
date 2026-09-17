@@ -6108,6 +6108,52 @@ impl KhiveRuntime {
             .collect())
     }
 
+    /// Count edges by the base each endpoint resolves against. Used by
+    /// `stats()` so a caller can name the denominator of a density figure
+    /// instead of inheriting the flat edge total, which on a real store is
+    /// mostly provenance.
+    ///
+    /// The per-namespace fallback sums the same buckets, so the aggregate and
+    /// the fallback are checkable against each other and against
+    /// `count_edges` by the invariant that the buckets sum to the total.
+    pub async fn count_edges_by_endpoint_base(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<khive_storage::types::EdgeEndpointBaseCounts> {
+        use khive_storage::types::EdgeEndpointBaseCounts;
+
+        let namespaces: Vec<String> = token
+            .visible_namespaces()
+            .iter()
+            .map(|namespace| namespace.as_str().to_owned())
+            .collect();
+        let graph = self.graph(token)?;
+        match graph
+            .count_edges_by_endpoint_base_in_namespaces(&namespaces)
+            .await
+        {
+            Ok(counts) => Ok(counts),
+            Err(khive_storage::StorageError::Unsupported { operation, .. })
+                if operation == "count_edges_by_endpoint_base_in_namespaces"
+                    || operation == "count_edges_by_endpoint_base" =>
+            {
+                let mut totals = EdgeEndpointBaseCounts::default();
+                for namespace in token.visible_namespaces() {
+                    let scoped = NamespaceToken::for_namespace(namespace.clone());
+                    let counts = self.graph(&scoped)?.count_edges_by_endpoint_base().await?;
+                    totals.entity_entity =
+                        totals.entity_entity.saturating_add(counts.entity_entity);
+                    totals.entity_note = totals.entity_note.saturating_add(counts.entity_note);
+                    totals.note_entity = totals.note_entity.saturating_add(counts.note_entity);
+                    totals.note_note = totals.note_note.saturating_add(counts.note_note);
+                    totals.unresolved = totals.unresolved.saturating_add(counts.unresolved);
+                }
+                Ok(totals)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// DML-only body of the symmetric-relation conflict-resolution path in
     /// [`Self::update_edge`]. Runs the conflict-check SELECT, then either the
     /// DELETE+UPDATE (case b, a canonical row already exists) or the

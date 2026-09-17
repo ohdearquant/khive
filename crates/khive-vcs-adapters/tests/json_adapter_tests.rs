@@ -3,7 +3,7 @@
 //! Integration tests for [`JsonFormatAdapter`].
 //!
 //! These tests drive the public API — no access to private fields.
-//! They cover the three required scenarios from issue #366:
+//! They cover the three required scenarios:
 //!   1. Roundtrip: entities + edges survive parse → re-serialize
 //!   2. Empty input: valid JSON empty array produces zero records
 //!   3. Malformed input: invalid JSON returns a parse error, no panic

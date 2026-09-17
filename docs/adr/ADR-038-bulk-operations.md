@@ -69,7 +69,7 @@ Bulk:
 #### Rust type additions
 
 ```rust
-// crates/khive-pack-kg/src/handlers.rs
+// crates/khive-pack-kg/src/handlers/params.rs
 
 #[derive(Deserialize)]
 struct BulkLinkEntry {
