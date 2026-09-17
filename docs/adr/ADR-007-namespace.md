@@ -1,9 +1,10 @@
-# ADR-007 Rev 7: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
+# ADR-007 Rev 8: Namespace as Attribution-Only Open String — Dumb Storage, Single Gate, Operator-Configured Read Visibility
 
 **Status**: Accepted/Ratified (2026-06-19)
 **Date**: 2026-06-19
 **Authors**: khive maintainers
-**Amends**: ADR-007-namespace.md (adds Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rule 8 is additive)
+**Amends**: ADR-007-namespace.md (Rev 8 adds Rule 9 and corrects one sentence of Rule 4; Rev 7 added
+Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rules 8 and 9 are additive)
 **Amended by**: proposed [ADR-068](ADR-068-process-isolation-topology.md), which
 replaces Rule 4's TenantGate clause if accepted.
 **Supersedes (partial)**: None — additive amendment only
@@ -15,6 +16,13 @@ KG-pack namespace-rebinding clause only; the remainder of this record stays auth
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
 | ADR-002 (edge cascade, no dangling refs) | ADR-057 (comm actor-addressed delivery) |
 ADR-063 (comm pack principal model and remote backend isolation)
+
+**Rev 8 summary (2026-09-17)**: Adds Rule 9, which states where tenant isolation lives for a
+deployment that serves more than one tenant, and corrects one sentence of Rule 4 that described a
+policy input the gate's request type does not carry. Rev 8 adds no check anywhere and changes no
+behaviour: it writes down a property the code already has, because the absence of the statement was
+being read as an oversight to fix at the store, which Rules 1 and 2 forbid. Rules 0 through 8 are
+unchanged.
 
 **Rev 7 summary (2026-06-19)**: Introduces a carve-out for packs whose backend carries its own
 principal-scoped isolation contract. Through Rev 6, ADR-007 stated that namespace is attribution
@@ -143,6 +151,45 @@ The following constraints apply:
 
 **The comm pack is the first pack invoking this carve-out.** Its isolation contract is
 specified in ADR-063.
+
+### Rule 9 — Tenant isolation is a storage-layer property, not a property of this surface (Rev 8, additive)
+
+Rules 1 and 2 make by-ID `update`, `delete` and edge creation namespace-agnostic: a globally
+unique id resolves without a namespace check at the store, the runtime or the handler. Rule 9
+states the deployment consequence, so that the absence of a check is read as the design it is
+rather than as an omission to repair.
+
+1. **The gate's input contract is caller-side.** A gate check receives the acting actor, the
+   caller's namespace, the verb, the raw arguments, and a context value. It does not receive the
+   namespace of the record an id argument resolves to, and nothing resolves that record before the
+   check runs. A policy behind the Gate can therefore refuse a verb, or refuse a caller, or refuse
+   an argument shape. It cannot refuse a target.
+
+2. **So the bare surface over a shared store isolates nothing between namespaces for by-ID ops.**
+   Two callers holding different namespace strings against one store can read, update, delete and
+   link each other's records by id. This is Rule 2 working as specified, observed from the
+   deployment side.
+
+3. **A namespace-scoped credential over a shared store is not a supported deployment shape.** A
+   deployment that hands two tenants two namespace values against one store has no tenant boundary,
+   and no configuration of the Gate supplies one, because of point 1.
+
+4. **The supported multi-tenant shape is one store per tenant.** Isolation is established below the
+   surface, before a request reaches a verb: a tenant's requests reach a store that holds only that
+   tenant's data, so a by-id op cannot name a record it should not see. The embedder owns this. The
+   hosted deployment of this project is built that way and fails closed when a shared store is
+   configured without an explicit operator opt-in.
+
+5. **Namespace keeps its stated jobs.** Attribution, query filtering, a policy input describing the
+   _caller_, and the Rule 3b visible-set read scope. Rule 8's principal-scoped pack backends are
+   unaffected: their isolation is a connection-time property of the backend, which is point 4 applied
+   to one pack rather than to the store.
+
+6. **No check is added by this rule.** Not in the store SQL, not in the runtime, not in a handler,
+   not as a resolved-target field on the gate request. A per-record namespace equality check on a
+   shared store is the v1 bug pattern Rule 2 removed; adding one back as "defence in depth" would
+   restore its cost and its inconsistency (present on the verbs someone remembered, absent on the
+   next verb added) while still not being the boundary. The boundary is the store.
 
 ---
 
@@ -573,8 +620,11 @@ change.
 storage boundary. The invariant is absolute regardless of Gate implementation:
 storage is never partitioned by namespace, and by-ID ops resolve a globally-unique UUID with
 no namespace check. The only difference between a permissive and an isolating deployment is which Gate is installed. The gate receives
-the acting actor, the request namespace, and the target records' attribution as policy input,
-and returns allow/deny:
+the acting actor, the request namespace, the verb, the raw arguments and a context value, and
+returns allow/deny. _(Corrected in Rev 8: this sentence previously read "and the target records'
+attribution as policy input". The request type carries the caller's namespace and the unresolved
+arguments; no record is fetched before the check, so no target attribution is available to a policy.
+Rule 9 states what follows from that.)_
 
 - AllowAllGate ignores all of it and returns allow.
 - A TenantGate MAY key per-tenant isolation on the namespace string (or any attribution
