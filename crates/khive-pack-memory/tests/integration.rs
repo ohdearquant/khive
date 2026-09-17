@@ -391,7 +391,7 @@ fn test_memory_pack_requires_kg() {
     assert_eq!(MemoryPack::NOTE_KINDS, &["memory"]);
 }
 
-/// Regression test for issue #93: source_id must NOT be stored in note properties.
+/// Regression test: source_id must NOT be stored in note properties.
 /// The annotates edge is the sole authorized source reference (ADR-036 §4).
 #[tokio::test]
 async fn test_remember_source_id_not_in_properties() {
@@ -981,7 +981,7 @@ async fn test_recall_breakdown_total_matches_composite_score() {
     );
 }
 
-/// Regression test for issue #94: non-memory notes must not appear in recall results.
+/// Regression test: non-memory notes must not appear in recall results.
 ///
 /// Creates more non-memory notes than the default `limit * 4` candidate threshold (the amount
 /// at which non-memory notes can dominate the candidate pool without pre-filtering), then
@@ -1141,7 +1141,7 @@ async fn recall_candidate_cap_counts_eligible_memories_not_generic_notes() {
     }
 }
 
-/// Regression for #159: PackTunable::apply_config must actually affect recall
+/// Regression: PackTunable::apply_config must actually affect recall
 /// scoring, not just mutate a Mutex that handlers ignore.
 ///
 /// The wire is:
@@ -1153,7 +1153,7 @@ async fn recall_candidate_cap_counts_eligible_memories_not_generic_notes() {
 /// This test uses `recall.score` (deterministic — no FTS/vector noise) with
 /// no per-call `config` argument, applies different configs via
 /// PackTunable::apply_config, and verifies the resulting `total` score
-/// reflects the tuned weights. Without the active_config wire (issue #159
+/// reflects the tuned weights. Without the active_config wire (the
 /// bug), the result would always reflect RecallConfig::default() regardless
 /// of apply_config.
 #[tokio::test]
@@ -1509,9 +1509,9 @@ async fn test_recall_score_floor() {
     );
 }
 
-// ── Reranker integration tests (PR #375) ────────────────────────────────────
+// ── Reranker integration tests ──────────────────────────────────────────────
 
-/// PR #375: empty reranker_weights is a pass-through — results must be identical
+/// Empty reranker_weights is a pass-through — results must be identical
 /// to a baseline recall with no reranker config.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
@@ -1567,7 +1567,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
     );
 }
 
-/// PR #375: reranker_weights with salience=1.0 must promote the highest-salience
+/// reranker_weights with salience=1.0 must promote the highest-salience
 /// memory to rank #1, even when it would rank lower under the default compute_score.
 ///
 /// Strengthened: captures baseline ordering first (no reranker) and asserts that
@@ -1686,7 +1686,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     );
 }
 
-/// PR #375: the recall.rerank subhandler applies request weights and returns
+/// The recall.rerank subhandler applies request weights and returns
 /// non-zero rerank_scores when reranker_weights are provided.
 #[tokio::test]
 async fn test_rerank_subhandler_uses_request_weights() {
@@ -1823,7 +1823,7 @@ async fn test_remember_source_id_accepts_short_id() {
     );
 }
 
-/// Fix 2: recall(help=true) must expose all params added in PRs #406/#421.
+/// Fix 2: recall(help=true) must expose all params the recall handler accepts.
 #[test]
 fn test_handler_def_recall_params_complete() {
     use khive_types::Pack;
@@ -1851,7 +1851,7 @@ fn test_handler_def_recall_params_complete() {
         param_names.contains(&"embedding_model"),
         "recall HandlerDef must expose embedding_model param; got: {param_names:?}"
     );
-    // Issue #482: verb-level presentation renamed to include_breakdown.
+    // Verb-level presentation renamed to include_breakdown.
     assert!(
         param_names.contains(&"include_breakdown"),
         "recall HandlerDef must expose include_breakdown param (not presentation); got: {param_names:?}"
@@ -2047,7 +2047,7 @@ async fn test_recall_include_breakdown_flag_includes_breakdown() {
     );
 }
 
-/// #514 regression: presentation= must be rejected by deny_unknown_fields.
+/// Regression: presentation= must be rejected by deny_unknown_fields.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn recall_presentation_alias_is_rejected_by_deny_unknown_fields() {
@@ -2484,7 +2484,7 @@ fn test_handler_def_remember_memory_type_description_lists_valid_values() {
     );
 }
 
-// Issue #288: recall text_candidates must be non-empty when the query partially
+// Recall text_candidates must be non-empty when the query partially
 // matches a memory note. Previously the conjunction Plain MATCH returned zero
 // candidates if the note only contained some of the query terms.
 #[tokio::test]
@@ -2537,8 +2537,8 @@ async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
     }
 }
 
-// Issue #482: recall include_breakdown=true must include per-component breakdown.
-// presentation= was removed in #514 and is now rejected by deny_unknown_fields.
+// Recall include_breakdown=true must include per-component breakdown.
+// presentation= was removed and is now rejected by deny_unknown_fields.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn recall_include_breakdown_true_includes_breakdown() {
@@ -2624,7 +2624,7 @@ async fn recall_handler_metadata_advertises_include_breakdown_not_presentation()
     );
 }
 
-// Issue #277: search(kind="memory") must resolve when memory pack is loaded.
+// search(kind="memory") must resolve when memory pack is loaded.
 // The KG resolver is registry-driven: memory kind only appears in all_note_kinds()
 // when MemoryPack is registered alongside KgPack. Without it the verb rejects
 // "memory" as an unknown kind.
@@ -2652,9 +2652,9 @@ async fn search_kind_memory_resolves_when_memory_pack_loaded() {
     );
 }
 
-// ── #515: tag-filtered recall ─────────────────────────────────────────────────
+// ── Tag-filtered recall ───────────────────────────────────────────────────────
 
-/// #515: tag filter — OR (any), AND (all), and no-filter behaviors.
+/// Tag filter — OR (any), AND (all), and no-filter behaviors.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn recall_tags_filter_any_all_and_no_filter() {
@@ -2854,7 +2854,7 @@ async fn recall_raw_score_field_always_present_with_tag_filter() {
     }
 }
 
-/// #515 metadata: memory.recall handler must advertise tags and tag_mode params.
+/// Metadata: memory.recall handler must advertise tags and tag_mode params.
 #[test]
 fn recall_handler_metadata_advertises_tags_and_tag_mode() {
     let recall_def = khive_pack_memory::MemoryPack::HANDLERS
@@ -2873,9 +2873,9 @@ fn recall_handler_metadata_advertises_tags_and_tag_mode() {
     );
 }
 
-// ── #566: recall_embed vectors opt-in ────────────────────────────────────────
+// ── recall_embed vectors opt-in ──────────────────────────────────────────────
 
-/// #566: default recall_embed omits embedding vectors, keeps model+dimension metadata.
+/// Default recall_embed omits embedding vectors, keeps model+dimension metadata.
 #[tokio::test]
 async fn recall_embed_default_omits_embedding_vectors() {
     const MODEL_A: &str = "embed-a";
@@ -2916,7 +2916,7 @@ async fn recall_embed_default_omits_embedding_vectors() {
     );
 }
 
-/// #566: include_embeddings=true returns full vector payload.
+/// include_embeddings=true returns full vector payload.
 #[tokio::test]
 async fn recall_embed_include_embeddings_returns_vectors() {
     const MODEL_A: &str = "embed-a";
@@ -2956,7 +2956,7 @@ async fn recall_embed_include_embeddings_returns_vectors() {
     );
 }
 
-/// #566 metadata: memory.recall_embed handler must advertise include_embeddings param.
+/// Metadata: memory.recall_embed handler must advertise include_embeddings param.
 #[test]
 fn recall_embed_handler_metadata_advertises_include_embeddings() {
     let embed_def = khive_pack_memory::MemoryPack::HANDLERS

@@ -183,7 +183,7 @@ pub struct HandlerDef {
     /// Illocutionary force classification. Use `Assertive` for `Subhandler`
     /// entries that have no external callers.
     pub category: VerbCategory,
-    /// Parameter schema for `help=true` introspection (issue #287).
+    /// Parameter schema for `help=true` introspection.
     ///
     /// Empty (`&[]`) is the correct default for handlers that predate this
     /// field or have no fixed parameter schema (e.g. free-form query verbs).
@@ -217,7 +217,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// `brain.feedback` is included because callers chain `target_id` from the
     /// response back into subsequent feedback or profile queries; an 8-char
-    /// prefix is ambiguous and defeats the acknowledged-ID contract (#545).
+    /// prefix is ambiguous and defeats the acknowledged-ID contract.
     /// `memory.feedback` has the same exact-target contract and rejects prefix
     /// resolution, so its acknowledged `target_id` must remain canonical.
     /// `brain.auto_feedback` acknowledges the same canonical `target_id` and

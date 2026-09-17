@@ -1249,7 +1249,7 @@ async fn test_sanitize_fts5_query() {
     assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
     assert_eq!(sanitize_fts5_query("NEAR(smile, 5)"), "smile 5");
     assert_eq!(sanitize_fts5_query("a,b,c"), "a b c");
-    // #570: full operator-class matrix
+    // Full operator-class matrix
     // Apostrophe fix: single quote is an FTS5 string-literal delimiter in Plain mode.
     assert_eq!(sanitize_fts5_query("Bob's tenant"), "Bobs tenant");
     assert_eq!(
@@ -1745,7 +1745,7 @@ async fn test_search_trigram_operator_short_operand_does_not_broaden() {
     }
 }
 
-/// #570: all FTS5 operator classes must not crash the generic text search surface.
+/// All FTS5 operator classes must not crash the generic text search surface.
 #[tokio::test]
 async fn test_search_with_fts_operator_matrix_does_not_crash() {
     let store = setup_memory_store("fts_operator_matrix");
@@ -1862,7 +1862,7 @@ async fn test_search_with_bare_dollar_returns_empty_not_error() {
 }
 
 /// #388 regression: `$` combined with an embedded quote must not crash the FTS5 leg
-/// either, exercising both the apostrophe (#570) and dollar-sign (#388) fixes together.
+/// either, exercising both the apostrophe and dollar-sign (#388) fixes together.
 #[tokio::test]
 async fn test_search_with_dollar_and_quote_does_not_crash() {
     let store = setup_memory_store("dollar_quote_query");

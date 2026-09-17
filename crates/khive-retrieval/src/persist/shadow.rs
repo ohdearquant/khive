@@ -1,12 +1,12 @@
 //! Shadow validation types and helpers for persistence integrity checking.
 //!
-//! Shadow validation (Issue #628) verifies persisted snapshots can be correctly
+//! Shadow validation verifies persisted snapshots can be correctly
 //! restored without blocking production operations. Discrepancies are logged only.
 
 use rand::Rng;
 
 // ---------------------------------------------------------------------------
-// Shadow Validation (Issue #628)
+// Shadow Validation
 // ---------------------------------------------------------------------------
 
 /// Configuration for shadow validation.

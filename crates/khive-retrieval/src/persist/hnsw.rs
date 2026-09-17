@@ -75,7 +75,7 @@ impl RetrievalPersistence {
         // Try to load the snapshot back
         match self.load_hnsw_snapshot().await {
             Ok(Some(snapshot)) => {
-                // Issue #867: Deep verification using HnswSnapshot::verify()
+                // Deep verification using HnswSnapshot::verify()
                 // This checks internal consistency beyond just count comparison:
                 // - Count consistency: total_nodes == live_nodes + tombstone_count
                 // - ID count integrity: indexed_ids.len() == total_nodes

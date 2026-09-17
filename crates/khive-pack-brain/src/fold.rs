@@ -366,9 +366,9 @@ mod tests {
         );
     }
 
-    // ── Regression tests (issues #355, #356, #357, #295) ──────────────────────
+    // ── Regression tests ──────────────────────────────────────────────────────
 
-    // #355 (MAJ-001): salience and temporal posteriors must update after dispatch.
+    // MAJ-001: salience and temporal posteriors must update after dispatch.
     #[test]
     fn test_355_posteriors_update_after_dispatch() {
         let fold = BalancedRecallFold::new(100);

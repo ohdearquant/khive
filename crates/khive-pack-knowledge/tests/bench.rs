@@ -1,4 +1,4 @@
-//! #595 — knowledge.search latency benchmark.
+//! knowledge.search latency benchmark.
 //!
 //! Run with:
 //!   cd crates && cargo test -p khive-pack-knowledge --test bench -- --ignored --nocapture
@@ -6,7 +6,7 @@
 //! Measures warm p50/p95 for three dispatch variants:
 //!   - `rerank=false` baseline (pure TF-IDF, no embedding)
 //!   - `rerank=true`  explicit (embedding blend)
-//!   - default (omitted rerank = true when embedder configured, after #561)
+//!   - default (omitted rerank = true when embedder configured)
 //!
 //! Cold first-query cost is measured separately and printed but excluded from
 //! the warm percentiles, because cold-start is dominated by model weight load
@@ -66,7 +66,7 @@ fn percentile(sorted: &[u128], pct: f64) -> u128 {
     sorted[idx]
 }
 
-/// #595 warm latency benchmark.
+/// Warm latency benchmark.
 ///
 /// Ignored by default — run manually with:
 ///   cargo test -p khive-pack-knowledge --test bench benchmark_knowledge_search_warm_latency -- --ignored --nocapture

@@ -11,7 +11,7 @@ pub enum FeedbackSignal {
     Wrong,
 }
 
-/// Semantic event taxonomy for brain fold updates (issue #268).
+/// Semantic event taxonomy for brain fold updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackEventKind {

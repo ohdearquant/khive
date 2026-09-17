@@ -1663,7 +1663,7 @@ async fn fts_query_special_characters_do_not_crash() {
     }
 }
 
-// #570: full FTS5 operator regression matrix
+// Full FTS5 operator regression matrix
 #[tokio::test]
 async fn fts_operator_matrix_does_not_crash() {
     let f = pack(rt());
@@ -1818,7 +1818,7 @@ async fn stats_embedding_coverage_counts_atom_vectors() {
     );
 }
 
-// ── #523: score normalization integration ────────────────────────────────────
+// ── Score normalization integration ──────────────────────────────────────────
 
 #[tokio::test]
 async fn search_scores_are_normalized_without_rank_inversion() {
@@ -1896,7 +1896,7 @@ async fn search_scores_are_normalized_without_rank_inversion() {
     }
 }
 
-// ── #561: default rerank tests ────────────────────────────────────────────────
+// ── Default rerank tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
