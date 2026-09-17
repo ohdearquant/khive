@@ -5247,20 +5247,18 @@ mod tests {
         }
         let prior_timeout = std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS").ok();
         let _restore = RestoreTimeout(prior_timeout.clone());
-        // #705: an instrumented coverage run (cargo llvm-cov --workspace) runs
-        // this test's binary alongside every other workspace test binary, and
-        // instrumentation overhead widens the contention window this test's
-        // 120s floor was sized for on a plain (uninstrumented) run. Rather than
-        // unconditionally clobbering down to "120" — which would silently
-        // discard a larger value the coverage job set specifically for this
-        // path — take the max of the ambient value (if any) and the 120s
-        // floor, so a caller can raise it further without this test undoing
-        // that raise.
+        // #705's coverage margin applies to this test, not every workspace
+        // reader (#2367). Preserve a larger explicit pool override as well.
+        let replay_floor = std::env::var("KHIVE_TEST_REPLAY_CHECKOUT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120)
+            .max(120);
         let effective_timeout = prior_timeout
             .as_deref()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(|ambient| ambient.max(120))
-            .unwrap_or(120);
+            .map(|ambient| ambient.max(replay_floor))
+            .unwrap_or(replay_floor);
         std::env::set_var("KHIVE_CHECKOUT_TIMEOUT_SECS", effective_timeout.to_string());
 
         let (_tmp, db_path) = tmp_db();
