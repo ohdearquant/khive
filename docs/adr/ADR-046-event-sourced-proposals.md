@@ -636,9 +636,9 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 
 ### Crate placement
 
-- Verb handlers: `crates/khive-pack-kg/src/handlers.rs`
-- Apply worker: `crates/khive-pack-kg/src/apply_worker.rs`
-- Projection table + projection worker: `crates/khive-pack-kg/src/projection_worker.rs`
+- Verb handlers: `crates/khive-pack-kg/src/handlers/`
+- Apply worker: `crates/khive-pack-kg/src/apply_worker/`
+- Projection table + projection worker: `crates/khive-pack-kg/src/projection_worker/`
 - Payload types: `khive-types::events::proposal_payloads`
 
 ### Migration

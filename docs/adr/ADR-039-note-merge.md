@@ -46,7 +46,7 @@ state change occurs. The caller is responsible for ensuring both IDs are the sam
 ### Extended MergeParams
 
 ```rust
-// crates/khive-pack-kg/src/handlers.rs
+// crates/khive-pack-kg/src/handlers/params.rs
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MergeParams {

@@ -216,6 +216,11 @@ bound (`crates/khive-runtime/src/daemon.rs`); it has no dependency on `khive-mcp
 async fn drain_pending_events(&self) -> Result<DrainSummary, DrainError>;
 ```
 
+> The move described in this section landed in `6d92490a`. The drain types and the
+> internal functions named below now live in `crates/khive-mcp/src/pending_events.rs`;
+> the `crates/kkernel/src/pending_events.rs` paths cited here are the pre-move
+> locations and are no longer in the tree.
+
 `DrainSummary` moves from `crates/kkernel/src/pending_events.rs` into
 `khive-runtime/src/daemon.rs`, defined alongside `DaemonDispatch` itself, carrying all
 seven fields the existing type already has today
