@@ -124,9 +124,11 @@ those methods remain compatible; explicit `&rusqlite::Row` annotations must use
 
 Each call captures the current request context and observes its original
 absolute deadline; later calls on the same lease do not renew that deadline.
-An already cancelled or expired request never enters the mapper. SQLite VM
-stepping polls cancellation and the deadline through the common progress-handler
-scope, and a stopped read returns
+An already cancelled or expired request never enters the mapper. Mapper entry is
+gated on its own poll, so a cancellation arriving during parameter conversion,
+which runs before any stepping, is refused there rather than after the mapper has
+seen the row. SQLite VM stepping polls cancellation and the deadline through the
+common progress-handler scope, and a stopped read returns
 `SqliteError::RequestReadStopped(StorageError::Timeout { .. })`. Unrelated SQLite
 and value-conversion failures retain their ordinary `SqliteError::Rusqlite`
 variants, including a failure returned by the mapper after cancellation.

@@ -683,11 +683,26 @@ impl<'pool> ReaderGuard<'pool> {
         }
         let _in_progress = ReaderQueryInProgress(&self.query_in_progress);
         self.mark_dirty();
-        crate::read_cancellation::run_borrowed_reader(self, |conn| {
-            conn.query_row(sql, params, |row| f(&ReaderRow { row }))
-                .map_err(|error| {
-                    StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
-                })
+        crate::read_cancellation::run_borrowed_reader(self, |conn, admission| {
+            conn.query_row(sql, params, |row| {
+                // Parameter conversion runs before any stepping, and a query
+                // cheap enough not to trip the progress handler never polls at
+                // all, so this is the only point that can keep the documented
+                // guarantee: a cancelled request does not enter the mapper.
+                // SQLITE_INTERRUPT is the code the scope already recognises, so
+                // the refusal converts to the same timeout error as a
+                // cancellation observed during stepping.
+                if !admission.admits() {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                        Some("request stopped before the mapper".into()),
+                    ));
+                }
+                f(&ReaderRow { row })
+            })
+            .map_err(|error| {
+                StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
+            })
         })
         .map_err(|error| match error {
             StorageError::Driver {

@@ -407,3 +407,58 @@ async fn reader_lease_parameter_reentry_cannot_remove_outer_progress_handler() {
     );
     assert_eq!(outcome.take().unwrap().unwrap(), 17);
 }
+
+/// `docs/api/pool.md` states that an already cancelled or expired request never enters the
+/// mapper. Parameter conversion is arbitrary caller code that runs inside the read, after the
+/// pre-read poll, and a statement cheap enough to finish without tripping the progress handler
+/// polls cancellation nowhere in between. The outcome was already the typed stop error; what
+/// the guarantee is about is whether the mapper saw the row first.
+#[tokio::test]
+async fn reader_lease_cancellation_during_parameter_conversion_never_enters_the_mapper() {
+    struct CancellingParameter<'a> {
+        cancellation: &'a tokio::sync::watch::Sender<bool>,
+    }
+
+    impl rusqlite::types::ToSql for CancellingParameter<'_> {
+        fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+            self.cancellation.send(true).unwrap();
+            Ok(rusqlite::types::ToSqlOutput::Owned(
+                rusqlite::types::Value::Integer(23),
+            ))
+        }
+    }
+
+    for file_backed in [false, true] {
+        let (_dir, pool) = owned_pool(file_backed);
+        let lease = pool.reader().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mapper_called = Cell::new(false);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let result = crate::scope_test_read_progress(
+            Arc::clone(&progress),
+            crate::scope_request_read_cancellation(rx, async {
+                lease.query_row(
+                    "SELECT ?1",
+                    rusqlite::params![CancellingParameter { cancellation: &tx }],
+                    |row| {
+                        mapper_called.set(true);
+                        row.get::<_, i64>(0)
+                    },
+                )
+            }),
+        )
+        .await;
+        assert!(
+            !mapper_called.get(),
+            "a request cancelled during parameter conversion must not reach the mapper \
+             (file_backed={file_backed})"
+        );
+        assert_stopped(result);
+        assert_eq!(
+            lease
+                .query_row("SELECT 23", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            23
+        );
+    }
+}
