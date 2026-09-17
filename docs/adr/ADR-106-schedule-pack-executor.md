@@ -785,16 +785,27 @@ fires, the drain derives the recipient and dispatch actor from that immutable pr
 and dispatches `comm.send`, producing an inbound message in the creator's actor-addressed
 inbox. Delivery therefore remains attributed to the creator across daemon restarts and
 changes in the daemon's own actor identity without trusting mutable note properties.
-Rows created before immutable provenance existed are the exception: the drain ignores
-any unprovenanced actor claim, logs a warning, and falls back to the current server actor,
-then to `local` when the server has no configured actor.
+Rows without immutable provenance fail closed, including legacy and hand-written rows.
+The former compatibility fallback selected the current server actor, then `local`, on
+every occurrence; a recurring row retained the same note ID and therefore repeated the
+misdelivery when its provenance was absent (#2393). The drain now chooses no recipient,
+ignores forgeable `created_by_actor`, and retains terminal `status="failed"` with
+`delivery_error`, `delivery_failed_at`, and a `not_invoked` dispatch receipt. The receipt
+uses `anonymous:local` because no creator was verified, and its error explains that no
+recipient was selected. Refused repeats do not advance or rearm, even outside the grace
+window. Callers can inspect the diagnostic with `get(id="...")` and create a replacement
+through `schedule.remind` to establish new caller-bound provenance. This does not change
+delivery or recurrence for a verified creator, including `anonymous:local`.
 
 A reminder-delivery failure is observable through the drain and persisted state. The
 drain logs the error, increments `DrainSummary.failed`, and persists `delivery_error` plus
 `delivery_failed_at` on the `scheduled_event` row. It also appends an error-outcome
 audit event with verb `schedule.remind.fire`, the scheduled-event note as its target,
-and the intended recipient actor and error text in its payload. Failure remains
-per-event: it does not abort the drain or prevent later due rows from dispatching in
+and the intended recipient actor and error text in its payload. The event's namespace
+and canonical actor stamp match the immutable creator provenance; the payload retains
+the raw recipient ID used by `comm.send`. A missing-provenance refusal has no delivery
+attempt and emits no delivery-failure event. Failure remains per-event: it does not abort
+the drain or prevent later due rows from dispatching in
 the same pass. Amendment F supersedes this amendment's original one-shot terminalization:
 a failed one-shot returns to `pending` with its durable failure receipt and error fields,
 while a named repeat remains re-armed at its next occurrence. A later successful
@@ -888,15 +899,15 @@ only executable-state mutation paths; generic deletion can still remove a row bu
 amend or reactivate it. Generic creation of an unprovenanced row still follows the
 fail-closed policy below.
 
-A generic scheduled-action row without immutable creator provenance fails closed: the payload is not
-dispatched, the claimed row becomes terminal `status="failed"`, and the drain persists
-`dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written
-before creator attribution and deliberately differs from Amendment C's reminder-only legacy
-fallback: an unprovenanced reminder ignores its note actor claim and targets only the current
-server actor (then `local`). The refusal receipt for an unprovenanced generic action is stamped
-`anonymous:local`, because no actor was verified; the daemon fallback is reserved for genuinely
-legacy reminders. Other generic dispatch failures remain per-event. Amendment F
-supersedes their one-shot lifecycle: a failed one-shot remains `pending` and retryable; a
+A scheduled-event row without immutable creator provenance fails closed: neither a generic
+payload nor reminder delivery is dispatched, and the claimed row becomes terminal
+`status="failed"`. The drain persists `dispatch_error` plus `dispatch_failed_at` for generic
+actions, or `delivery_error` plus `delivery_failed_at` for reminders. This migration policy
+replaces Amendment C's former reminder-only daemon fallback. The retained `not_invoked`
+receipt is stamped `anonymous:local` and explains the missing provenance, because no actor
+was verified. A refused repeat does not advance or rearm. Other generic dispatch failures
+remain per-event. Amendment F supersedes their one-shot lifecycle: a failed one-shot
+remains `pending` and retryable; a
 named repeat advances normally. Both persist the same error fields, and later success clears
 them.
 
@@ -947,9 +958,9 @@ non-empty error; an occurrence skipped by the grace policy uses `state="missed"`
 `error=null`. Both carry `completed_at`, and neither state means that the action future began.
 
 The receipt actor is derived from the same immutable creator provenance as replay, including
-for reminders skipped by the missed-event policy. Only a genuinely legacy reminder with no
-provenance uses the configured scheduler/anonymous-local fallback. A refused generic row with
-no verified creator uses `anonymous:local`, never the daemon actor. The receipt is diagnostic
+for reminders skipped by the missed-event policy. A row without provenance is refused
+before that policy, retains an `anonymous:local` / `not_invoked` receipt, and never inherits
+the daemon actor. This applies to both event types and repeating rows. The receipt is diagnostic
 and never authorizes the dispatch; `VerifiedActor`, namespace injection, public visibility,
 and Gate evaluation remain the authority boundary described by Amendment E.
 

@@ -115,8 +115,21 @@ delivery and acknowledgement rules.
 - The authorization gate from `runtime.config().gate` is threaded into the
   registry. Gate decisions are hard-enforcing — a `Deny` result blocks pack
   dispatch and returns `PermissionDenied`.
-- The `EventStore` is wired into the registry via `builder.with_event_store` for
-  audit persistence of all dispatched operations.
+- Production runtime audit persistence uses `builder.with_runtime_event_store(&runtime)`.
+  The raw sink is bound at `build()` with the final default namespace, preserving
+  each resolved request's actor and namespace. `builder.with_event_store` is reserved
+  for explicitly trusted custom sinks that preserve supplied attribution. A
+  token-scoped `runtime.events(&token)` sink would overwrite per-request attribution
+  with the construction token; see
+  [ADR-162](../../../docs/adr/ADR-162-unified-event-plane-ownership.md).
+- An initialization failure for the configured runtime audit sink now refuses
+  registry construction and daemon startup, replacing the former warning-only
+  continuation without a sink. Correct the reported main/events storage
+  initialization error, including path/access, schema, writer admission, locking or
+  I/O failures, then restart. Sink initialization is not a remote endpoint readiness
+  or future-write guarantee: Unix socket mode constructs its client without
+  connecting. Explicit read-only mode retains its audit advisory; metadata-only
+  construction does not open the sink. Dispatch-time append error handling is unchanged.
 
 ### Write-Key Conflict Detection (ADR-038)
 

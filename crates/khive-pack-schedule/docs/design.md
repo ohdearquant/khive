@@ -52,11 +52,23 @@ only after provenance is durable.
 Replay reconstructs the exact verified actor kind from the event (including
 preserving `anonymous:local`), preserves public verb visibility, and therefore
 cannot inherit daemon authority, authorize rewritten executable intent, or invoke an
-internal subhandler; legacy generic rows without provenance fail closed.
+internal subhandler; rows of either event type without provenance fail closed.
 `payload` is null for reminders and a JSON-encoded verb call string for scheduled
 dispatch. Reminder delivery uses the same dual-write path as `comm.send`. Use
 `schedule.schedule(action="comm.send(...)")` for delivery to an actor other than
 the creator.
+
+Legacy reminders previously fell back to the draining daemon's configured actor,
+then `local`, on every occurrence. A daily or weekly row retained the same note ID,
+so missing provenance repeatedly selected that fallback; `created_by_actor` could
+not repair it. The drain now refuses such a row without choosing a recipient. It
+persists terminal `status="failed"`, `delivery_error`, `delivery_failed_at`, and a
+`dispatch_receipt` with `state="not_invoked"`, `actor="anonymous:local"`, and an
+explicit missing-provenance reason. Repeating rows do not rearm, including when
+already outside the grace window. Inspect these properties with `get(id="...")`;
+`schedule.agenda` only lists pending rows. Create a replacement with
+`schedule.remind` to establish new caller-bound provenance. Verified reminders,
+including verified `anonymous:local` creators, keep their normal recurrence.
 
 **Four verbs:**
 

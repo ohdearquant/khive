@@ -124,5 +124,21 @@ part of the current by-ID contract described above.
 
 - Add a new pack: implement `Pack + PackRuntime`, call `VerbRegistryBuilder::pack()`.
 - Add a gate: implement `Gate`, call `VerbRegistryBuilder::with_gate()`.
-- Add an audit sink: implement `EventStore`, call `VerbRegistryBuilder::with_event_store()`.
+- Wire production runtime audit persistence with
+  `VerbRegistryBuilder::with_runtime_event_store(&runtime)`. The raw sink is resolved
+  at `build()` using the final default namespace; each audit event retains the actor
+  and namespace of its resolved request. Reserve `with_event_store()` for explicitly
+  trusted custom sinks that preserve those stamps. Do not pass the token-scoped
+  `runtime.events(&token)` decorator as the registry sink: it would replace request
+  attribution with the construction token. See
+  [ADR-162](../../../docs/adr/ADR-162-unified-event-plane-ownership.md).
+  A serving `build()` fails if this configured runtime sink cannot be initialized;
+  daemon startup and ingest with audit attachment propagate the failure instead of
+  warning and continuing without audit persistence. Operators must correct the
+  reported main/events storage initialization error, including path/access, schema,
+  writer admission, locking or I/O failures, then restart the daemon or retry ingest.
+  This initialization check does not guarantee later event writes or remote endpoint
+  availability: Unix socket mode constructs its client without connecting. Explicit
+  read-only mode keeps its existing advisory behavior; metadata builds do not
+  initialize an audit sink. Dispatch-time append error handling is unchanged.
 - Add a post-dispatch hook: implement `DispatchHook`, call `VerbRegistryBuilder::with_dispatch_hook()`.
