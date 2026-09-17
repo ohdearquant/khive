@@ -51,8 +51,9 @@ closed instead of inheriting daemon authority.
 ## Repeat advancement
 
 Named aliases are advanced as follows:
-- `"daily"`   → `trigger_at + 1 day`
-- `"weekly"`  → `trigger_at + 7 days`
+
+- `"daily"` → `trigger_at + 1 day`
+- `"weekly"` → `trigger_at + 7 days`
 - `"monthly"` → `trigger_at + 1 calendar month`
 
 Five-field cron is rejected by schedule creation because the executor cannot
@@ -64,7 +65,7 @@ invocation instead of silently degrading to one-shot delivery.
 An event is "missed" when it is discovered overdue by more than
 `KHIVE_FIRE_GRACE_SECS` (default 300s / 5 minutes). A missed event is
 **never dispatched** — it is marked `status="missed"` with `missed_at`
-stamped (epoch µs) and `fired_at` left null. A missed *repeating* event is
+stamped (epoch µs) and `fired_at` left null. A missed _repeating_ event is
 skipped for this occurrence and re-armed at the next occurrence strictly
 after now (looping past every accumulated occurrence) — it never fires a
 catch-up burst. This means a daemon that was offline for a long stretch (or
@@ -107,7 +108,7 @@ falling through to it. Routing this default namespace through
 `[actor] id`, and — under strict actor mode with the comm pack — could make
 server construction itself fail despite a valid config.
 `build_server_with_explicit_namespace` is the seam that lets this caller
-assert the narrower, correct semantic instead: the namespace *is* a real
+assert the narrower, correct semantic instead: the namespace _is_ a real
 default (`namespace_explicit: true`, so it still becomes `default_namespace`
 and fills `actor_id` when non-`"local"`), but it is **not** an actor
 override (`actor_explicit: false`), so a `"local"` resolution keeps falling
@@ -146,7 +147,7 @@ round-trip the caller's original string (offset included), and
 `validate_at` accepts any RFC 3339 offset. A raw lexicographic `<=` against
 a UTC `now`-string therefore mis-ranks any non-UTC-offset `trigger_at`:
 e.g. `"2026-07-10T02:00:00+04:00"` (chronologically `2026-07-09T22:00:00Z`,
-overdue) sorts *after* a UTC `now` string like
+overdue) sorts _after_ a UTC `now` string like
 `"2026-07-10T00:47:00.123+00:00"` as raw text, so it would never be
 fetched — never fire, never get marked missed, forever. `datetime(...)`
 normalizes both sides to UTC before comparing, so the predicate is
@@ -168,9 +169,9 @@ silently exclude an entire namespace from every future pass — not just skip
 one row.
 
 Regression coverage: a due event stored with a positive `trigger_at` offset
-(sorting lexicographically *after* a UTC "now" string) must still fire, and
+(sorting lexicographically _after_ a UTC "now" string) must still fire, and
 a future event stored with a negative offset (sorting lexicographically
-*before* a UTC "now" string, a false positive under the old raw-text
+_before_ a UTC "now" string, a false positive under the old raw-text
 predicate) must not — the Rust-side `trigger_at > now` re-check is the
 backstop for the latter direction even before the SQL fix. A backlog larger
 than the drain's page size (201 rows, one more than `PAGE_SIZE`) must be
@@ -210,7 +211,7 @@ not a logic gate. On a CPU-oversubscribed CI runner (`cargo test
 --workspace` runs dozens of test binaries, each further parallelized,
 against 2-4 physical cores), a task can be scheduled off-CPU for longer than
 the checkout timeout while queued for that mutex, so the checkout times out
-*before* the claim's SQL `UPDATE` ever runs: the drain loop counts
+_before_ the claim's SQL `UPDATE` ever runs: the drain loop counts
 `summary.failed += 1` and the row stays `status="pending"`, retryable on the
 next cron drain — but the zero-failure contract this test asserts still
 requires the first invocation to succeed.
@@ -224,3 +225,12 @@ dispatch regression), the test removes the contention boundary
 deterministically: it runs serially (`#[serial_test::serial]`) and raises
 the writer-pool checkout timeout for its own duration, keeping the original
 single-drain zero-failure contract intact.
+
+Coverage supplies `KHIVE_TEST_REPLAY_CHECKOUT_TIMEOUT_SECS=300` to this
+test. The effective timeout is the maximum of that test-specific value,
+its ordinary 120-second floor, and any explicit
+`KHIVE_CHECKOUT_TIMEOUT_SECS`. The previous pool override is restored
+afterward. Other test binaries retain the ordinary pool checkout timeout
+(5 seconds by default); the coverage job does not raise it globally.
+This keeps an unrelated contention stall from consuming five minutes of
+the coverage measurement budget (#2367).

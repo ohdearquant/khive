@@ -4103,8 +4103,9 @@ mod tests {
     #[serial]
     fn pool_config_default_values_match_constants() {
         // Ensure defaults are not accidentally changed. The process env may
-        // legitimately carry overrides (CI jobs set KHIVE_CHECKOUT_TIMEOUT_SECS),
-        // so clear them first — this test asserts the constants, not the env.
+        // legitimately carry overrides — a sibling test in this process sets
+        // KHIVE_CHECKOUT_TIMEOUT_SECS around its own body — so clear them
+        // first: this test asserts the constants, not the env.
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
         assert_eq!(
