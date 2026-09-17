@@ -81,6 +81,7 @@ def _page(raw: Any, parse: Any, *, cursor_key: str) -> Page:
             requested_limit=raw.get("requested_limit"),
             effective_limit=raw.get("effective_limit"),
             limit_clamped=raw.get("limit_clamped"),
+            has_more=raw.get("has_more"),
         )
     return Page(items=[parse(x) for x in raw or []])
 

@@ -74,10 +74,16 @@ pub(super) async fn list_keyed_notes(
     }
     if limit == 0 {
         if p.offset.is_some() {
+            // A zero-row page can only be complete if the population is empty,
+            // and this path never asks. `true` is the answer that cannot be
+            // read as "you have seen everything"; reporting `false` here would
+            // reintroduce the defect in the one case where no row was examined
+            // at all.
             return Ok(render_list_response(
                 serde_json::json!([]),
                 requested,
                 limit,
+                true,
             ));
         }
         return Err(RuntimeError::InvalidInput(
@@ -159,12 +165,17 @@ pub(super) async fn list_keyed_notes(
                 .and_then(|note| parse_note_content(note, p.parse_content))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // `more_matches` is computed after the per-note filters run, which is the
+    // only place it is correct: the store's page and the caller's page are not
+    // the same set. `incomplete` means the scan stopped at its ceiling with
+    // rows unexamined, which is also not a complete page.
+    let has_more = more_matches || incomplete;
     let mut response = if p.offset.is_some() {
-        render_list_response(to_json(&notes)?, requested, limit)
+        render_list_response(to_json(&notes)?, requested, limit, has_more)
     } else {
         serde_json::json!({"notes": notes, "next_after": next.as_ref().map(encode_cursor).transpose()?})
     };
-    add_list_limit_metadata(&mut response, requested, limit);
+    add_list_limit_metadata(&mut response, requested, limit, has_more);
     if incomplete {
         response["scan_incomplete"] = Value::Bool(true);
     }

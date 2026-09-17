@@ -200,6 +200,11 @@ class Page(BaseModel, Generic[T]):
     requested_limit: int | None = None
     effective_limit: int | None = None
     limit_clamped: bool | None = None
+    # Whether the population continued past this page. `None` means the server
+    # did not say, which is not the same as `False`: a caller establishing that
+    # a record is absent needs an explicit `False` here, and older servers do
+    # not send the field at all.
+    has_more: bool | None = None
 
 
 class OpError(BaseModel):

@@ -61,6 +61,7 @@ def test_native_pages_keep_records_and_metadata(substrate, cursor):
         "requested_limit": 2000,
         "effective_limit": cap,
         "limit_clamped": True,
+        "has_more": True,
     }
     if cursor:
         payload["next_after"] = NEXT_ID
@@ -70,9 +71,54 @@ def test_native_pages_keep_records_and_metadata(substrate, cursor):
     assert page.requested_limit == 2000
     assert page.effective_limit == cap
     assert page.limit_clamped is True
+    assert page.has_more is True
     assert page.next_after == (NEXT_ID if cursor else None)
     assert page.next_offset is None
     assert page.total is None
+
+
+@pytest.mark.parametrize("cursor", [False, True])
+def test_a_full_page_and_a_complete_one_are_distinguishable(cursor):
+    """The limit metadata alone cannot separate them: at a requested limit equal
+    to the cap, `limit_clamped` is False whether or not rows were withheld."""
+    base = {
+        "requested_limit": 500,
+        "effective_limit": 500,
+        "limit_clamped": False,
+    }
+    truncated = dict(base, has_more=True)
+    complete = dict(base, has_more=False)
+    for payload, expected in ((truncated, True), (complete, False)):
+        payload = dict(payload)
+        payload["entities" if cursor else "items"] = [ROWS["entities"]]
+        if cursor:
+            payload["next_after"] = NEXT_ID
+        db = client_for([{"ok": True, "tool": "list", "result": payload}])
+        page = list_page(db, "entities", limit=500, **({"after": ""} if cursor else {}))
+        assert page.limit_clamped is False
+        assert page.has_more is expected
+
+
+def test_a_server_that_does_not_send_the_field_is_not_a_complete_page():
+    """`None` must not collapse to `False`: an older server saying nothing and a
+    current server saying "no more rows" are different facts, and only the
+    second one supports an absence claim."""
+    db = client_for(
+        [
+            {
+                "ok": True,
+                "tool": "list",
+                "result": {
+                    "items": [ROWS["entities"]],
+                    "requested_limit": 500,
+                    "effective_limit": 500,
+                    "limit_clamped": False,
+                },
+            }
+        ]
+    )
+    page = list_page(db, "entities", limit=500)
+    assert page.has_more is None
 
 
 @pytest.mark.parametrize("cursor", [False, True])
@@ -83,6 +129,7 @@ def test_empty_filtered_page_preserves_incomplete_scan(cursor):
         "requested_limit": 1,
         "effective_limit": 1,
         "limit_clamped": False,
+        "has_more": True,
     }
     if cursor:
         payload["next_after"] = NEXT_ID
@@ -90,6 +137,7 @@ def test_empty_filtered_page_preserves_incomplete_scan(cursor):
     page = db.notes.list(limit=1, tags=["cursor-test"], **({"after": ""} if cursor else {}))
     assert page.items == []
     assert page.scan_incomplete is True
+    assert page.has_more is True, "a scan that stopped short has not seen the population"
     assert page.next_after == (NEXT_ID if cursor else None)
 
 

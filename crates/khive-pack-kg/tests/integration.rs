@@ -16567,3 +16567,114 @@ async fn stats_separates_structure_from_provenance_in_its_edge_counts() {
         Some(1)
     );
 }
+
+/// #2780: the disclosure fields answer "was your limit reduced", never "is
+/// there more". At `limit` exactly equal to the population they are identical
+/// to the case where the population continues, which is the value a caller
+/// enumerating a set picks.
+#[tokio::test]
+async fn list_entity_a_full_page_is_distinguishable_from_a_complete_one() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..10u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("p2780-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let truncated = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 5}))
+        .await
+        .expect("a page under the population must succeed");
+    assert_eq!(list_items(&truncated).len(), 5);
+    assert_eq!(
+        truncated["limit_clamped"], false,
+        "5 is under the cap, so nothing clamped it; that is exactly why the \
+         older fields cannot carry this"
+    );
+    assert_eq!(
+        truncated["has_more"], true,
+        "five of ten rows is not a complete enumeration"
+    );
+
+    let exact = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 10}))
+        .await
+        .expect("a page equal to the population must succeed");
+    assert_eq!(list_items(&exact).len(), 10);
+    assert_eq!(exact["limit_clamped"], false);
+    assert_eq!(
+        exact["has_more"], false,
+        "a page that consumed the population is complete"
+    );
+
+    let roomy = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 20}))
+        .await
+        .expect("a page over the population must succeed");
+    assert_eq!(list_items(&roomy).len(), 10);
+    assert_eq!(roomy["has_more"], false);
+
+    // The over-fetched row must never reach the caller, at any of the three.
+    for page in [&truncated, &exact, &roomy] {
+        let returned = list_items(page).len() as u64;
+        let effective = page["effective_limit"].as_u64().expect("effective_limit");
+        assert!(
+            returned <= effective,
+            "a page returned {returned} rows for an effective limit of {effective}"
+        );
+    }
+}
+
+/// The reported repro: `limit` exactly at the cap over a population larger than
+/// the cap. Every older field says nothing was withheld.
+#[tokio::test]
+async fn list_entity_at_the_cap_reports_the_population_it_did_not_return() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..501u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("p2780-cap-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let at_cap = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 500}))
+        .await
+        .expect("a page at the cap must succeed");
+    assert_eq!(list_items(&at_cap).len(), 500);
+    assert_eq!(at_cap["requested_limit"], 500);
+    assert_eq!(at_cap["effective_limit"], 500);
+    assert_eq!(
+        at_cap["limit_clamped"], false,
+        "the caller asked for exactly the cap, so nothing was clamped"
+    );
+    assert_eq!(
+        at_cap["has_more"], true,
+        "#2780: 500 of 501 rows must not report as a complete enumeration"
+    );
+
+    // Over-cap is the case that was already warned about; it must keep saying
+    // both things, so that the two causes stay separately readable.
+    let over_cap = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 600}))
+        .await
+        .expect("an over-cap page must succeed");
+    assert_eq!(list_items(&over_cap).len(), 500);
+    assert_eq!(over_cap["limit_clamped"], true);
+    assert_eq!(over_cap["has_more"], true);
+}

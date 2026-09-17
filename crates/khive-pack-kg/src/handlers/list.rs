@@ -27,19 +27,55 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
 
-pub(super) fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
+/// How many rows to ask the store for when the caller wants `limit` of them.
+///
+/// The extra row is never returned. Its only job is to answer "is there
+/// more", which `limit_clamped` cannot: a caller that passes exactly the cap
+/// gets `limit_clamped: false` whether the population held 500 rows or 9,285.
+/// That is the one limit value at which the disclosure was guaranteed to say
+/// nothing, and it is the value a caller enumerating a population picks,
+/// because it is the largest page it can get.
+pub(super) fn overfetch_limit(limit: u32) -> u32 {
+    limit.saturating_add(1)
+}
+
+/// Splits an over-fetched page into the rows to return and whether the
+/// population continued past them.
+pub(super) fn split_overfetched<T>(mut items: Vec<T>, limit: u32) -> (Vec<T>, bool) {
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    (items, has_more)
+}
+
+pub(super) fn render_list_response(
+    items: Value,
+    requested: u32,
+    effective: u32,
+    has_more: bool,
+) -> Value {
     serde_json::json!({
         "items": items,
         "requested_limit": requested,
         "effective_limit": effective,
         "limit_clamped": requested > effective,
+        "has_more": has_more,
     })
 }
 
-pub(super) fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
+pub(super) fn add_list_limit_metadata(
+    response: &mut Value,
+    requested: u32,
+    effective: u32,
+    has_more: bool,
+) {
     response["requested_limit"] = serde_json::json!(requested);
     response["effective_limit"] = serde_json::json!(effective);
     response["limit_clamped"] = serde_json::json!(requested > effective);
+    // Separate causes, because a caller can act on one and can only page
+    // through the other: `limit_clamped` says the cap reduced the request,
+    // `has_more` says the population did not fit. They are independent, and a
+    // page can be truncated with neither, either, or both set.
+    response["has_more"] = serde_json::json!(has_more);
 }
 
 fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
@@ -344,10 +380,13 @@ impl KgPack {
                         "entities": normalize_entity_timestamps_array(to_json(&entities)?),
                         "next_after": next_after,
                     });
-                    add_list_limit_metadata(&mut response, requested, limit);
+                    // Keyset mode already carries the answer: a continuation
+                    // boundary exists exactly when the population continued.
+                    add_list_limit_metadata(&mut response, requested, limit, next_after.is_some());
                     return Ok(response);
                 }
                 let offset = p.offset.unwrap_or(0);
+                let fetch = overfetch_limit(limit);
                 let entities = if let Some(ref tag_list) = p.tags {
                     if tag_list.is_empty() {
                         self.runtime
@@ -355,7 +394,7 @@ impl KgPack {
                                 token,
                                 kind_filter.as_deref(),
                                 validated_et.as_deref(),
-                                limit,
+                                fetch,
                                 offset,
                             )
                             .await?
@@ -386,7 +425,7 @@ impl KgPack {
                                 filter,
                                 PageRequest {
                                     offset: offset.into(),
-                                    limit,
+                                    limit: fetch,
                                 },
                             )
                             .await
@@ -399,15 +438,17 @@ impl KgPack {
                             token,
                             kind_filter.as_deref(),
                             validated_et.as_deref(),
-                            limit,
+                            fetch,
                             offset,
                         )
                         .await?
                 };
+                let (entities, has_more) = split_overfetched(entities, limit);
                 Ok(render_list_response(
                     normalize_entity_timestamps_array(to_json(&entities)?),
                     requested,
                     limit,
+                    has_more,
                 ))
             }
             KindSpec::Edge => {
@@ -452,15 +493,21 @@ impl KgPack {
                         "edges": to_json(&edges)?,
                         "next_after": next_after,
                     });
-                    add_list_limit_metadata(&mut out, requested, limit);
+                    add_list_limit_metadata(&mut out, requested, limit, next_after.is_some());
                     Ok(out)
                 } else {
                     let offset = p.offset.unwrap_or(0);
                     let edges = self
                         .runtime
-                        .list_edges(token, filter, limit, offset)
+                        .list_edges(token, filter, overfetch_limit(limit), offset)
                         .await?;
-                    Ok(render_list_response(to_json(&edges)?, requested, limit))
+                    let (edges, has_more) = split_overfetched(edges, limit);
+                    Ok(render_list_response(
+                        to_json(&edges)?,
+                        requested,
+                        limit,
+                        has_more,
+                    ))
                 }
             }
             KindSpec::Note { specific } => {
@@ -596,7 +643,15 @@ impl KgPack {
                     if scan_incomplete {
                         response["scan_incomplete"] = Value::Bool(true);
                     }
-                    add_list_limit_metadata(&mut response, requested, limit);
+                    // A continuation boundary means more matches; a scan that
+                    // hit its ceiling means more rows were never examined.
+                    // Either way the caller has not seen the whole population.
+                    add_list_limit_metadata(
+                        &mut response,
+                        requested,
+                        limit,
+                        next_after.is_some() || scan_incomplete,
+                    );
                     return Ok(response);
                 }
 
@@ -605,7 +660,9 @@ impl KgPack {
                 let notes: Vec<_> = if has_note_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
-                    let target_after_skip = offset as usize + limit as usize;
+                    // One past the page, so a full page is distinguishable
+                    // from a complete one. The extra match is dropped below.
+                    let target_after_skip = offset as usize + limit as usize + 1;
                     loop {
                         let remaining_scan =
                             MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
@@ -637,8 +694,21 @@ impl KgPack {
                     collected
                 } else {
                     self.runtime
-                        .list_notes_filtered(token, filter.clone(), limit, offset)
+                        .list_notes_filtered(token, filter.clone(), overfetch_limit(limit), offset)
                         .await?
+                };
+
+                // Computed from the RAW fetch, before soft-deleted rows are
+                // dropped below. The unfiltered branch's query returns deleted
+                // notes, so a page can come back short of `limit` while the
+                // population continues; asking the raw count keeps `has_more`
+                // answering "is there another page" rather than "was this page
+                // full", and it cannot report complete on a population that
+                // is not.
+                let has_more = if has_note_filter {
+                    notes.len() > offset as usize + limit as usize
+                } else {
+                    notes.len() > limit as usize
                 };
 
                 let remapped: Vec<Value> = if has_note_filter {
@@ -660,6 +730,7 @@ impl KgPack {
                     notes
                         .iter()
                         .filter(|n| n.deleted_at.is_none())
+                        .take(limit as usize)
                         .map(|n| {
                             parse_note_content(
                                 to_json(n)
@@ -671,7 +742,8 @@ impl KgPack {
                         })
                         .collect::<Result<_, _>>()?
                 };
-                let mut response = render_list_response(to_json(&remapped)?, requested, limit);
+                let mut response =
+                    render_list_response(to_json(&remapped)?, requested, limit, has_more);
                 if scan_incomplete {
                     response["scan_incomplete"] = Value::Bool(true);
                 }
@@ -701,8 +773,9 @@ impl KgPack {
                     let mut skipped = 0u32;
                     let mut raw_offset = 0u32;
                     let scan_ceiling = offset.saturating_add(limit).saturating_mul(20);
+                    let want = overfetch_limit(limit);
 
-                    while (items.len() as u32) < limit {
+                    while (items.len() as u32) < want {
                         let remaining = scan_ceiling.saturating_sub(raw_offset);
                         if remaining == 0 {
                             scan_incomplete = true;
@@ -736,7 +809,7 @@ impl KgPack {
                                 continue;
                             }
                             items.push(event);
-                            if (items.len() as u32) >= limit {
+                            if (items.len() as u32) >= want {
                                 break;
                             }
                         }
@@ -753,17 +826,19 @@ impl KgPack {
                             token,
                             filter,
                             PageRequest {
-                                limit,
+                                limit: overfetch_limit(limit),
                                 offset: offset.into(),
                             },
                         )
                         .await?;
                     page.items
                 };
+                let (items, has_more) = split_overfetched(items, limit);
                 let mut response = render_list_response(
                     normalize_event_timestamps_array(to_json(&items)?),
                     requested,
                     limit,
+                    has_more,
                 );
                 if scan_incomplete {
                     response["scan_incomplete"] = Value::Bool(true);
@@ -777,8 +852,78 @@ impl KgPack {
 #[cfg(test)]
 mod tests {
     use super::parse_after_cursor;
+    use super::{
+        add_list_limit_metadata, overfetch_limit, render_list_response, split_overfetched,
+    };
     use crate::handlers::common::{event_filter_from_params, ListParams};
     use crate::sql::sql;
+
+    /// The defect this field exists for: at `limit == cap` the three older
+    /// disclosure fields are identical for a complete page and a truncated one.
+    #[test]
+    fn a_full_page_at_the_cap_is_distinguishable_from_a_complete_one() {
+        let truncated = render_list_response(serde_json::json!([]), 500, 500, true);
+        let complete = render_list_response(serde_json::json!([]), 500, 500, false);
+
+        for page in [&truncated, &complete] {
+            assert_eq!(page["requested_limit"], 500);
+            assert_eq!(page["effective_limit"], 500);
+            assert_eq!(page["limit_clamped"], false);
+        }
+        assert_ne!(
+            truncated, complete,
+            "a truncated page and a complete one must not serialize identically"
+        );
+        assert_eq!(truncated["has_more"], true);
+        assert_eq!(complete["has_more"], false);
+    }
+
+    /// The two truncation causes are independent: the cap clamp is something a
+    /// caller can act on, the population is something it can only page through.
+    #[test]
+    fn the_cap_clamp_and_the_population_are_reported_separately() {
+        let clamped_and_complete = render_list_response(serde_json::json!([]), 600, 500, false);
+        assert_eq!(clamped_and_complete["limit_clamped"], true);
+        assert_eq!(clamped_and_complete["has_more"], false);
+
+        let unclamped_and_truncated = render_list_response(serde_json::json!([]), 10, 10, true);
+        assert_eq!(unclamped_and_truncated["limit_clamped"], false);
+        assert_eq!(unclamped_and_truncated["has_more"], true);
+    }
+
+    #[test]
+    fn the_added_metadata_form_carries_the_same_pair() {
+        let mut response = serde_json::json!({"entities": [], "next_after": null});
+        add_list_limit_metadata(&mut response, 500, 500, true);
+        assert_eq!(response["limit_clamped"], false);
+        assert_eq!(response["has_more"], true);
+        assert_eq!(response["entities"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_over_fetched_row_is_never_returned_and_is_the_whole_signal() {
+        let exactly_full: Vec<u32> = (0..5).collect();
+        let (page, has_more) = split_overfetched(exactly_full, 5);
+        assert_eq!(page.len(), 5);
+        assert!(!has_more, "a page the store could not extend is complete");
+
+        let one_over: Vec<u32> = (0..6).collect();
+        let (page, has_more) = split_overfetched(one_over, 5);
+        assert_eq!(page, vec![0, 1, 2, 3, 4], "the extra row must not escape");
+        assert!(has_more);
+
+        let short: Vec<u32> = (0..2).collect();
+        let (page, has_more) = split_overfetched(short, 5);
+        assert_eq!(page.len(), 2);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn the_over_fetch_asks_for_exactly_one_more_and_cannot_overflow() {
+        assert_eq!(overfetch_limit(0), 1);
+        assert_eq!(overfetch_limit(500), 501);
+        assert_eq!(overfetch_limit(u32::MAX), u32::MAX);
+    }
 
     #[test]
     fn after_cursor_rejects_prefix_with_keyset_consequence() {
