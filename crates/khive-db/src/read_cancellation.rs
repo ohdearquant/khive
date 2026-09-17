@@ -649,6 +649,29 @@ impl InterruptibleReadScope {
     }
 }
 
+/// Admission to the mapper, checked from inside the query.
+///
+/// The progress handler polls cancellation while SQLite is STEPPING. Parameter
+/// conversion happens before any stepping, and a query cheap enough to finish
+/// without tripping the handler never polls at all, so a request cancelled in
+/// that window reached the mapper: `SELECT ?1` returned a timeout with the
+/// mapper already called. The scope's own polls sit on either side of the whole
+/// read, which is too coarse to see inside it.
+pub(crate) struct MapperAdmission<'a> {
+    control: &'a Arc<ReadControl>,
+    context: &'a RequestReadContext,
+}
+
+impl MapperAdmission<'_> {
+    /// True when the mapper may run. Polls the request first, so a cancellation
+    /// that arrived during parameter conversion is observed here rather than
+    /// after the mapper has already seen the row.
+    pub(crate) fn admits(&self) -> bool {
+        self.control.poll_blocking_request(self.context);
+        !self.control.progress_should_stop()
+    }
+}
+
 /// A synchronous lease cannot move its borrowed connection to spawn_blocking.
 /// Reuse the same registration, stop translation and unwind quarantine in place.
 pub(crate) fn run_borrowed_reader<R, F>(
@@ -656,7 +679,7 @@ pub(crate) fn run_borrowed_reader<R, F>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+    F: FnOnce(&rusqlite::Connection, MapperAdmission<'_>) -> StorageResult<R>,
 {
     let context = capture_request_read_context();
     let scope = InterruptibleReadScope {
@@ -668,7 +691,14 @@ where
         control: Arc::clone(&scope.control),
     };
     let conn = quarantine.guard.conn();
-    scope.run_with_cleanup_and_context(conn, || read(conn), || Ok(()), Some(context))
+    // The scope takes ownership of the context; the admission needs its own
+    // borrowable copy for the duration of the read.
+    let admission_context = context.clone();
+    let admission = MapperAdmission {
+        control: &scope.control,
+        context: &admission_context,
+    };
+    scope.run_with_cleanup_and_context(conn, || read(conn, admission), || Ok(()), Some(context))
 }
 
 fn storage_error_is_sqlite_interrupt(error: &StorageError) -> bool {
