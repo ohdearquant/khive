@@ -4965,15 +4965,31 @@ fn rendered_response_daemon_frame_len(rendered: &str, served_config_id: &str) ->
         .len()
 }
 
-/// Build the `initialize` instructions string from the verb catalog and the
-/// loaded builtin pack names. Extracted from [`ServerHandler::get_info`] so
+/// Build the `initialize` instructions string from the verb catalog, the
+/// packs this server actually loaded, and the packs that are linked into the
+/// binary but were not selected. Extracted from [`ServerHandler::get_info`] so
 /// the docs-pointer section (#594) is unit-testable without standing up a
 /// full server.
-fn build_instructions(catalog: &str, builtins: &str) -> String {
+///
+/// The two pack lists answer different questions and the instructions must not
+/// merge them (#2913). `loaded` is what the caller can call right now: the
+/// selection resolved at startup, plus any configured mounts. `unloaded` is
+/// what `KHIVE_PACKS` or `--pack` could additionally select from this binary.
+/// Naming the linked set alone told callers that packs contributing nothing to
+/// the catalog below were available, and every verb of theirs is refused.
+fn build_instructions(catalog: &str, loaded: &str, unloaded: &str) -> String {
+    let selectable = if unloaded.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Also linked into this binary but not loaded here, so their verbs are \
+             absent from the catalog below until selected: {unloaded}."
+        )
+    };
     format!(
         "khive — request-only MCP surface. One tool, `request`, \
          dispatches verbs through the loaded pack registry. Configure packs via \
-         KHIVE_PACKS or --pack (built-ins: {builtins}). The kg pack's verbs are \
+         KHIVE_PACKS or --pack. Loaded on this server: {loaded}.{selectable} The kg pack's verbs are \
          unprefixed (create, get, list, search, link, neighbors, ...); every other pack's \
          verbs are written pack.verb. Read verbs return their record or hits directly \
          unless the verb's help says it wraps them in an envelope. Verbs registered on this \
@@ -5014,8 +5030,17 @@ impl ServerHandler for KhiveMcpServer {
 
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
-        let builtins = builtin_pack_names().join(", ");
-        let instructions = build_instructions(&catalog, &builtins);
+        let loaded_names = self.registry.pack_names();
+        let loaded = loaded_names.join(", ");
+        // Linked minus loaded: the packs `--pack`/`KHIVE_PACKS` could still
+        // select. `builtin_pack_names` is the link-time inventory, so it never
+        // lists a configured mount; a mount is only ever in `loaded_names`.
+        let unloaded = builtin_pack_names()
+            .into_iter()
+            .filter(|name| !loaded_names.contains(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let instructions = build_instructions(&catalog, &loaded, &unloaded);
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -8967,12 +8992,103 @@ mod tests {
 
     #[test]
     fn instructions_carry_docs_address_and_guidance_pointers() {
-        let instructions = build_instructions("  create — Create an entity or note.\n", "kg, gtd");
+        let instructions =
+            build_instructions("  create — Create an entity or note.\n", "kg, gtd", "web");
         assert!(instructions.contains("https://ohdearquant.github.io/khive/"));
         assert!(instructions.contains("docs/configuration.md"));
         assert!(instructions.contains("docs/guide/tips-and-tricks.md"));
         // help=true / live-catalog-over-training-knowledge guidance present.
         assert!(instructions.contains("help=true"));
+    }
+
+    #[test]
+    fn the_packs_loaded_and_the_packs_merely_linked_are_named_separately() {
+        let instructions = build_instructions(
+            "  create — Create an entity.\n",
+            "kg, gtd",
+            "web, telemetry",
+        );
+
+        let loaded = instructions
+            .split_once("Loaded on this server: ")
+            .expect("the loaded clause is always present")
+            .1
+            .split_once('.')
+            .expect("the loaded clause ends in a period")
+            .0;
+        assert_eq!(loaded, "kg, gtd");
+
+        let selectable = instructions
+            .split_once("until selected: ")
+            .expect("a non-empty unloaded set produces the selectable clause")
+            .1
+            .split_once('.')
+            .expect("the selectable clause ends in a period")
+            .0;
+        assert_eq!(selectable, "web, telemetry");
+
+        // The defect: one list labelled "built-ins" carried both sets, so a
+        // caller read every linked pack as callable. Spelling it out here
+        // because a future rewording that re-merges them would otherwise
+        // satisfy both assertions above.
+        assert!(!instructions.contains("(built-ins:"));
+    }
+
+    #[test]
+    fn a_fully_loaded_binary_gets_no_selectable_clause() {
+        let instructions = build_instructions("  create — Create an entity.\n", "kg, gtd", "");
+
+        assert!(instructions.contains("Loaded on this server: kg, gtd."));
+        assert!(!instructions.contains("Also linked into this binary"));
+        assert!(!instructions.contains("until selected"));
+        // The configure affordance survives an empty unloaded set: it is the
+        // reason the linked list was in this string to begin with.
+        assert!(instructions.contains("Configure packs via KHIVE_PACKS or --pack."));
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn the_instructions_name_as_loaded_only_what_this_server_loaded() {
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".into()];
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("the kg factory is linked");
+
+        let info = rmcp::ServerHandler::get_info(&server);
+        let instructions = info
+            .instructions
+            .expect("get_info always sets instructions");
+
+        let loaded: Vec<&str> = instructions
+            .split_once("Loaded on this server: ")
+            .expect("the loaded clause is always present")
+            .1
+            .split_once('.')
+            .expect("the loaded clause ends in a period")
+            .0
+            .split(", ")
+            .collect();
+        assert_eq!(loaded, vec!["kg"]);
+
+        let selectable: Vec<&str> = instructions
+            .split_once("until selected: ")
+            .expect("selecting one pack leaves the rest of the binary unloaded")
+            .1
+            .split_once('.')
+            .expect("the selectable clause ends in a period")
+            .0
+            .split(", ")
+            .collect();
+
+        // `web` is linked into every build of this binary and contributes no
+        // verb under this selection. Naming it as loaded is the whole defect.
+        assert!(selectable.contains(&"web"), "selectable was {selectable:?}");
+        assert!(!loaded.contains(&"web"));
+        // The two sets partition the linked inventory: nothing is in both.
+        for pack in &loaded {
+            assert!(!selectable.contains(pack), "{pack} appears in both clauses");
+        }
     }
 
     #[test]
