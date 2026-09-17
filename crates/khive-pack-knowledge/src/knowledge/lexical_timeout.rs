@@ -58,6 +58,40 @@ impl LexicalPhase {
     }
 }
 
+/// Which budget governed the read that timed out.
+///
+/// The lexical stage runs one read under a budget tighter than its own: the
+/// rarity probe, which spends a quarter of the stage budget deciding which
+/// term to query first (`rarity_probe_budget`). Its expiry and a cut candidate
+/// fetch are not the same event. The probe produces an ORDERING, every term is
+/// queried either way, and the fetch that follows still gets the rest of the
+/// budget — so the response is complete and the optimization was skipped. A
+/// cut fetch is a response that is missing rows it would otherwise have had.
+///
+/// Callers pass this in rather than it being inferred from the phase. Today
+/// `TermFrequency` reaches the stage only from the probe, so the phase alone
+/// would answer correctly, and it would go on answering correctly right up
+/// until someone adds a second term-frequency read under the stage budget —
+/// at which point every such read would silently be reported as a skipped
+/// optimization. The bound is a property of the call, so the call states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LexicalBound {
+    /// The read ran under the lexical stage's own budget.
+    Stage,
+    /// The read ran under the rarity probe's tighter nested budget.
+    OrderingProbe,
+}
+
+impl LexicalBound {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::OrderingProbe => "ordering_probe",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LexicalTimeout {
     pub(super) pass: LexicalPass,
@@ -66,6 +100,17 @@ pub(super) struct LexicalTimeout {
     pub(super) operation_elapsed_ms: u64,
     pub(super) configured_budget_ms: u64,
     pub(super) effective_budget_ms: u64,
+    /// Which budget governed this read.
+    pub(super) bound: LexicalBound,
+    /// The budget that governed THIS read, which is the stage budget only for
+    /// a `Stage`-bounded read. `configured_budget_ms` and
+    /// `effective_budget_ms` both describe the STAGE at its entry, by their
+    /// documented definitions, so on a probe-bounded read they name an
+    /// allowance that never applied to the read being reported: a reader
+    /// reconstructing the cause sees `stage_elapsed_ms=501` against
+    /// `effective_budget_ms=1999` and concludes a 2000 ms budget expired at
+    /// 501 ms (issue #2879).
+    pub(super) read_budget_ms: u64,
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -108,20 +153,45 @@ impl LexicalStage {
         }
     }
 
+    /// Run a read under the stage's own budget.
+    ///
+    /// The governing bound is the EFFECTIVE budget, not the configured one: a
+    /// parent deadline tighter than the stage budget is what actually cuts the
+    /// read, and `effective_budget_ms` is already defined as the smaller of the
+    /// two. Passing the configured budget here would put a number on the record
+    /// that never governed the read, which is the defect this field exists to
+    /// remove rather than relocate.
     pub(super) async fn read<T>(
         &mut self,
         phase: LexicalPhase,
         read: impl Future<Output = Result<T, StorageError>>,
     ) -> Result<T, StorageError> {
+        let stage_budget = Duration::from_millis(self.effective_budget_ms);
+        self.read_bounded(phase, LexicalBound::Stage, stage_budget, read)
+            .await
+    }
+
+    /// Run a read under `budget`, which the caller has already scoped as a
+    /// read deadline. `budget` is recorded, not enforced: the enforcement is
+    /// the caller's `scope_request_read_deadline`, and passing it here is what
+    /// lets the timeout record name the allowance that actually governed the
+    /// read instead of the stage's.
+    pub(super) async fn read_bounded<T>(
+        &mut self,
+        phase: LexicalPhase,
+        bound: LexicalBound,
+        budget: Duration,
+        read: impl Future<Output = Result<T, StorageError>>,
+    ) -> Result<T, StorageError> {
         let operation_started = Instant::now();
         #[cfg(test)]
         if let Some(error) = tests::inject_timeout(self.pass, phase).await {
-            self.capture_timeout(phase, operation_started);
+            self.capture_timeout(phase, bound, budget, operation_started);
             return Err(error);
         }
         let result = read.await;
         if matches!(&result, Err(StorageError::Timeout { .. })) {
-            self.capture_timeout(phase, operation_started);
+            self.capture_timeout(phase, bound, budget, operation_started);
         } else {
             self.record_completed(phase, operation_started.elapsed());
         }
@@ -150,7 +220,13 @@ impl LexicalStage {
             .collect()
     }
 
-    fn capture_timeout(&mut self, phase: LexicalPhase, operation_started: Instant) {
+    fn capture_timeout(
+        &mut self,
+        phase: LexicalPhase,
+        bound: LexicalBound,
+        budget: Duration,
+        operation_started: Instant,
+    ) {
         let now = Instant::now();
         let detail = LexicalTimeout {
             pass: self.pass,
@@ -159,14 +235,18 @@ impl LexicalStage {
             operation_elapsed_ms: millis(now.saturating_duration_since(operation_started)),
             configured_budget_ms: self.configured_budget_ms,
             effective_budget_ms: self.effective_budget_ms,
+            bound,
+            read_budget_ms: millis(budget),
         };
         tracing::warn!(
             pass = detail.pass.label(),
             phase = detail.phase.label(),
+            bound = detail.bound.label(),
             stage_elapsed_ms = detail.stage_elapsed_ms,
             operation_elapsed_ms = detail.operation_elapsed_ms,
             configured_budget_ms = detail.configured_budget_ms,
             effective_budget_ms = detail.effective_budget_ms,
+            read_budget_ms = detail.read_budget_ms,
             completed_reads = ?self.completed_reads(),
             "lexical read timed out"
         );

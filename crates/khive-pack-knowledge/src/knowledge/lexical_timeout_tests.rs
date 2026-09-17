@@ -152,10 +152,17 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
         let detail = outcome
             .timeout
             .unwrap_or_else(|| panic!("missing timeout detail for {label}"));
+        // The term-frequency site is the ordering probe and runs under its own
+        // quarter-of-the-stage bound; every other site runs under the stage's.
+        // Asserting that here is what keeps the bound from being silently
+        // mislabelled at a catch site nobody looks at.
+        let probe_site = matches!(phase, LexicalPhase::TermFrequency);
         let expected = json!({
             "pass": "full", "phase": label,
+            "bound": if probe_site { "ordering_probe" } else { "stage" },
             "stage_elapsed_ms": 7, "operation_elapsed_ms": 7,
             "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+            "read_budget_ms": if probe_site { 500 } else { 2000 },
         });
         assert_eq!(serde_json::to_value(detail).unwrap(), expected, "{label}");
         // The log record now also carries the completed-read breakdown, whose
@@ -273,8 +280,10 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
                 *detail,
                 json!({
                     "pass": pass, "phase": "term_frequency",
+                    "bound": "ordering_probe",
                     "stage_elapsed_ms": 9, "operation_elapsed_ms": 9,
                     "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "read_budget_ms": 500,
                 })
             );
         }
@@ -289,14 +298,19 @@ async fn public_dispatch_preserves_boolean_and_all_three_pass_tags() {
                 .remove("lexical_timeout_instrumented"),
             Some(json!(true))
         );
+        // The injected expiry is the ORDERING PROBE's, so the response reports a
+        // skipped optimization and NOT `lexical_timeout`: every term was still
+        // queried and no rows are missing. `candidate_provenance` is unchanged,
+        // because the candidate-state classification is deliberately untouched.
         let expected = if verb == "knowledge.search" {
             json!({
                 "results": [], "total": 0,
                 "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
-                "degraded": {"lexical_timeout": true}
+                "degraded": {"lexical_timeout": true, "lexical_ordering_probe_timeout": true}
             })
         } else {
-            json!({"results": [], "total": 0, "degraded": {"lexical_timeout": true}})
+            json!({"results": [], "total": 0,
+                   "degraded": {"lexical_timeout": true, "lexical_ordering_probe_timeout": true}})
         };
         assert_eq!(response, expected, "empty-timeout response: {verb}");
     }
@@ -404,17 +418,29 @@ async fn public_details_do_not_reveal_foreign_matches_or_data_dependent_phases()
             )
             .await
             .expect("public timing-only phase");
+            // Both phases in this loop are PUBLIC, but only one of them is the
+            // ordering probe, so the bound, the read budget and the extra flag
+            // all differ between them. That the two corpora agree for EACH is
+            // the property under test; that the two phases differ from each
+            // other is just the contract.
+            let probe_site = matches!(phase, LexicalPhase::TermFrequency);
+            let mut expected = json!({"results": [], "total": 0,
+            "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
+            "degraded": {
+                "lexical_timeout": true, "lexical_timeout_instrumented": true,
+                "lexical_timeout_details": [{
+                    "pass": "full", "phase": phase.label(),
+                    "bound": if probe_site { "ordering_probe" } else { "stage" },
+                    "stage_elapsed_ms": 11,
+                    "operation_elapsed_ms": 11, "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "read_budget_ms": if probe_site { 500 } else { 2000 },
+                }]
+            }});
+            if probe_site {
+                expected["degraded"]["lexical_ordering_probe_timeout"] = json!(true);
+            }
             assert_eq!(
-                response,
-                json!({"results": [], "total": 0,
-                "candidate_provenance": {"lexical": "timed_out", "fallback": "none", "terms_truncated": false},
-                "degraded": {
-                    "lexical_timeout": true, "lexical_timeout_instrumented": true,
-                    "lexical_timeout_details": [{
-                        "pass": "full", "phase": phase.label(), "stage_elapsed_ms": 11,
-                        "operation_elapsed_ms": 11, "configured_budget_ms": 2000, "effective_budget_ms": 2000,
-                    }]
-                }}),
+                response, expected,
                 "public diagnostic must not vary with foreign corpus: {foreign}"
             );
         }
@@ -510,11 +536,14 @@ async fn mixed_pass_capability_marker_does_not_reveal_foreign_matches() {
             json!({"results": [], "total": 0,
             "candidate_provenance": {"lexical": "partial_timeout", "fallback": "none", "terms_truncated": false},
             "degraded": {
-                "lexical_timeout": true, "lexical_timeout_instrumented": true,
+                "lexical_timeout": true, "lexical_ordering_probe_timeout": true,
+                "lexical_timeout_instrumented": true,
                 "lexical_timeout_details": [{
                     "pass": "full", "phase": "term_frequency",
+                    "bound": "ordering_probe",
                     "stage_elapsed_ms": 11, "operation_elapsed_ms": 11,
                     "configured_budget_ms": 2000, "effective_budget_ms": 2000,
+                    "read_budget_ms": 500,
                 }]
             }}),
             "both corpora must disclose exactly the same public record"
@@ -552,6 +581,8 @@ fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases(
                 operation_elapsed_ms: 3,
                 configured_budget_ms: 2000,
                 effective_budget_ms: 70,
+                bound: LexicalBound::Stage,
+                read_budget_ms: 2000,
             }],
         );
         assert_eq!(
@@ -573,6 +604,8 @@ fn attachment_preserves_other_degradation_fields_and_hides_operator_only_phases(
             operation_elapsed_ms: 3,
             configured_budget_ms: 2000,
             effective_budget_ms: 70,
+            bound: LexicalBound::Stage,
+            read_budget_ms: 2000,
         }],
     );
     assert_eq!(
@@ -760,5 +793,202 @@ async fn configured_budget_uses_the_stage_override() {
     assert_eq!(
         response["degraded"]["lexical_timeout_details"][0]["effective_budget_ms"],
         137
+    );
+}
+
+/// Build a timeout record differing only in which budget governed the read, so
+/// a test can vary the bound with every other field held equal.
+fn bounded_record(
+    bound: LexicalBound,
+    phase: LexicalPhase,
+    stage_elapsed_ms: u64,
+    read_budget_ms: u64,
+) -> LexicalTimeout {
+    LexicalTimeout {
+        pass: LexicalPass::Full,
+        phase,
+        stage_elapsed_ms,
+        operation_elapsed_ms: 123,
+        configured_budget_ms: 2000,
+        effective_budget_ms: 1999,
+        bound,
+        read_budget_ms,
+    }
+}
+
+/// A skipped ordering hint and a cut candidate fetch must not produce the same
+/// `degraded` payload (issue #2879).
+///
+/// Both records name the SAME phase. That is the point of the fixture: the
+/// bound is the only thing that differs, so a fix that keyed off
+/// `term_frequency` instead of the bound would fail here rather than passing
+/// for the wrong reason.
+#[test]
+fn a_probe_fallback_and_a_cut_fetch_do_not_produce_the_same_degraded_payload() {
+    let probe = bounded_record(
+        LexicalBound::OrderingProbe,
+        LexicalPhase::TermFrequency,
+        501,
+        500,
+    );
+    let cut = bounded_record(LexicalBound::Stage, LexicalPhase::TermFrequency, 2000, 2000);
+
+    let mut probe_out = json!({});
+    attach_lexical_timeout_degradation(&mut probe_out, &[probe]);
+    let mut cut_out = json!({});
+    attach_lexical_timeout_degradation(&mut cut_out, &[cut]);
+
+    // The discriminating assertion runs FIRST, deliberately. Under the
+    // shared-flag behaviour the two arms collapse to one payload, and a
+    // per-arm equality placed ahead of this would fire instead -- so the
+    // assertion that actually separates "the optimization was skipped" from
+    // "rows are missing" would never execute in the case it exists for.
+    assert_ne!(
+        probe_out, cut_out,
+        "a skipped ordering hint and a cut candidate fetch must be tellable apart \
+         somewhere in the payload, or a complete response reads as though rows were lost"
+    );
+
+    assert_eq!(
+        probe_out["degraded"]["lexical_ordering_probe_timeout"],
+        json!(true),
+        "the skipped optimization must still be disclosed, under its own name"
+    );
+    assert!(
+        cut_out["degraded"]
+            .get("lexical_ordering_probe_timeout")
+            .is_none(),
+        "a stage-bounded read is not an ordering-probe fallback"
+    );
+
+    // BOTH keep `lexical_timeout`, and that is deliberate. Issue #2879 asked for
+    // it to be ABSENT on a pure fallback. That cannot be done safely: the flag
+    // would then be false for a probe-only expiry and true as soon as a later
+    // phase timed out, and the later phases are reachable only through GLOBAL
+    // index matches -- so a caller would learn that another namespace's row
+    // matched by watching this flag appear. The coarse flag is load-bearing
+    // BECAUSE it is coarse. What the caller gets instead is the record's own
+    // `bound`, safe to publish because the probe runs in a public phase.
+    assert_eq!(probe_out["degraded"]["lexical_timeout"], json!(true));
+    assert_eq!(cut_out["degraded"]["lexical_timeout"], json!(true));
+    assert_eq!(
+        probe_out["degraded"]["lexical_timeout_details"][0]["bound"],
+        json!("ordering_probe")
+    );
+    assert_eq!(
+        cut_out["degraded"]["lexical_timeout_details"][0]["bound"],
+        json!("stage"),
+        "the bound is what separates them in the public record"
+    );
+}
+
+/// A decomposed request runs up to three passes, so one pass can fall back on
+/// its ordering probe while another has its candidate fetch cut. Those are two
+/// different things that happened and both must be reported.
+#[test]
+fn a_pass_that_fell_back_and_a_pass_that_was_cut_are_both_reported() {
+    let mut out = json!({});
+    attach_lexical_timeout_degradation(
+        &mut out,
+        &[
+            bounded_record(
+                LexicalBound::OrderingProbe,
+                LexicalPhase::TermFrequency,
+                501,
+                500,
+            ),
+            bounded_record(
+                LexicalBound::Stage,
+                LexicalPhase::PhaseBHydration,
+                2000,
+                2000,
+            ),
+        ],
+    );
+    assert_eq!(out["degraded"]["lexical_timeout"], json!(true));
+    assert_eq!(
+        out["degraded"]["lexical_ordering_probe_timeout"],
+        json!(true)
+    );
+}
+
+/// The record names the budget that governed the read it describes.
+///
+/// `configured_budget_ms` and `effective_budget_ms` keep their documented
+/// meaning -- both describe the stage at its entry -- which is exactly why a
+/// probe-bounded record needs a third number: without it the record reads as a
+/// 2000 ms budget that expired at 501 ms.
+#[test]
+fn a_probe_bounded_record_names_the_probe_budget_not_the_stage_budget() {
+    let probe = bounded_record(
+        LexicalBound::OrderingProbe,
+        LexicalPhase::TermFrequency,
+        501,
+        500,
+    );
+    assert_eq!(probe.read_budget_ms, 500);
+    assert_eq!(
+        probe.effective_budget_ms, 1999,
+        "the stage-entry allowance keeps its documented meaning and is not overwritten"
+    );
+    assert_ne!(
+        probe.read_budget_ms, probe.effective_budget_ms,
+        "if these were equal the new field would carry no information the old one lacked"
+    );
+
+    let cut = bounded_record(
+        LexicalBound::Stage,
+        LexicalPhase::PhaseBHydration,
+        2000,
+        1999,
+    );
+    assert_eq!(
+        cut.read_budget_ms, cut.effective_budget_ms,
+        "a stage-bounded read is governed by the EFFECTIVE budget: a parent deadline tighter than          the stage budget is what actually cuts it, so naming the configured budget here would          reintroduce the defect this field exists to remove"
+    );
+}
+
+/// `degraded.lexical_ordering_probe_timeout` is safe to publish ONLY because the
+/// ordering probe runs in a phase whose entry does not depend on corpus
+/// contents. `LexicalPhase::public` is where that property is declared, and this
+/// test is the tripwire on it.
+///
+/// If `term_frequency` were ever reclassified as operator-only — which is what
+/// would happen if its reachability became corpus-dependent — then the probe
+/// flag would begin telling a caller that a row in another namespace matched.
+/// That is precisely the disclosure the neighbouring `lexical_timeout` flag is
+/// kept deliberately COARSE to avoid, and it would arrive through the new flag
+/// instead. The reclassification must fail a test rather than pass review, so
+/// the invariant is asserted here and not only described in `docs/design.md`.
+#[test]
+fn the_ordering_probe_flag_rests_on_term_frequency_being_corpus_independent() {
+    assert!(
+        LexicalPhase::TermFrequency.public(),
+        "the ordering probe's phase must be corpus-independent, or the probe flag \
+         derived from it becomes a cross-namespace disclosure channel"
+    );
+
+    // The exact public set, asserted as a set rather than a sample: a phase
+    // ADDED here is a phase whose records start reaching callers, and a phase
+    // REMOVED is one a published flag may no longer rest on. Either direction
+    // needs a deliberate decision, so either direction reddens this.
+    let public: Vec<&str> = [
+        LexicalPhase::ReaderOpen,
+        LexicalPhase::TermFrequency,
+        LexicalPhase::PhaseARowids,
+        LexicalPhase::PhaseBHydration,
+        LexicalPhase::EligibilityFallback,
+        LexicalPhase::NamespaceMembership,
+        LexicalPhase::NamespaceExistence,
+        LexicalPhase::ExactNameProbe,
+    ]
+    .into_iter()
+    .filter(|phase| phase.public())
+    .map(LexicalPhase::label)
+    .collect();
+    assert_eq!(
+        public,
+        vec!["reader_open", "term_frequency"],
+        "the public phase set decides what every published flag and record may reveal"
     );
 }
