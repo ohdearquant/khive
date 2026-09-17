@@ -2386,6 +2386,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "uuid",
@@ -2419,6 +2420,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

@@ -111,6 +111,42 @@ sequential reads, and each operation-scoped checkout has its own bounded wait;
 the caller's total wall time can therefore exceed five seconds even though no
 single admission wait does. The timeout never triggers a fresh connection open.
 
+### Synchronous `ReaderGuard::query_row`
+
+A held `ReaderGuard` exposes one public SQL method, synchronous
+`query_row(&self, sql, params, mapper)`. It retains the reader admission
+classifier: writes, transaction control, and state-changing pragmas are refused
+before SQLite execution. The mapper receives `khive_db::ReaderRow`, a borrowed
+value-extraction view with `get` and `get_ref` by column index or name. It exposes
+neither `rusqlite::Statement` nor a connection. Inferred mapper closures using
+those methods remain compatible; explicit `&rusqlite::Row` annotations must use
+`&ReaderRow<'_, '_>`.
+
+Each call captures the current request context and observes its original
+absolute deadline; later calls on the same lease do not renew that deadline.
+An already cancelled or expired request never enters the mapper. SQLite VM
+stepping polls cancellation and the deadline through the common progress-handler
+scope, and a stopped read returns
+`SqliteError::RequestReadStopped(StorageError::Timeout { .. })`. Unrelated SQLite
+and value-conversion failures retain their ordinary `SqliteError::Rusqlite`
+variants, including a failure returned by the mapper after cancellation.
+
+This is cooperative interruption. Synchronous Rust mapper code and native
+callbacks cannot be forcibly preempted; after they return, a post-check refuses
+a successful result if the request stopped. The method does not promise a hard
+wall-time bound for such callbacks. Async pooled-reader progress checks retain
+their lock-free path; only this synchronous borrowed path polls the request's
+watch signal directly.
+
+Callback cleanup and panic unwinding reuse the pooled-reader cleanup scope. A
+cleanly interrupted or unwound lease remains usable. If cleanup fails, the held
+lease refuses further queries; dropping it replaces a file-backed pooled reader
+or retires the shared in-memory writer connection for the pool's lifetime.
+Same-lease recursive calls from parameter conversion or mapper code are refused
+before they can replace the outer query's progress handler. Calls using a
+different lease and connection remain allowed. The in-progress guard clears on
+ordinary return and panic unwinding.
+
 ### Closed standalone-reader exceptions
 
 `ConnectionPool::open_standalone_reader` is crate-private and requires a

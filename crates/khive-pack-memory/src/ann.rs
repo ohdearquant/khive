@@ -898,34 +898,46 @@ pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
 /// between ticks, so dropping the pack ends it even in a non-daemon stdio
 /// process; daemon shutdown is an immediate second exit path.
 pub(crate) fn start_rotation_watcher(rt: &KhiveRuntime, ann: &SharedAnn) {
-    let Some(ann_root) = rt.backend_ann_root() else {
-        return;
-    };
+    drop(start_rotation_watcher_with_shutdown(
+        rt,
+        ann,
+        khive_runtime::daemon_shutdown_token(),
+    ));
+}
+
+fn start_rotation_watcher_with_shutdown(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let ann_root = rt.backend_ann_root()?;
     if ann
         .rotation_watch_started
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return;
+        return None;
     }
 
     let ann = Arc::downgrade(ann);
-    let shutdown = khive_runtime::daemon_shutdown_token();
-    khive_runtime::track_named_background_task("memory_ann_rotation_watch", async move {
-        let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
-        let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = ticks.tick() => {}
+    Some(khive_runtime::spawn_named_tracked_task(
+        "memory_ann_rotation_watch",
+        async move {
+            let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
+            let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticks.tick() => {}
+                }
+                let Some(ann) = ann.upgrade() else {
+                    break;
+                };
+                refresh_rotated_segments_in_root(&ann_root, &ann).await;
             }
-            let Some(ann) = ann.upgrade() else {
-                break;
-            };
-            refresh_rotated_segments_in_root(&ann_root, &ann).await;
-        }
-    });
+        },
+    ))
 }
 
 /// Poll every installed mmap bridge once and replace any generation published
@@ -3050,6 +3062,54 @@ async fn classify_and_adopt_segment(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test(start_paused = true)]
+    #[serial(background_tasks)]
+    async fn rotation_watcher_exits_on_local_shutdown_without_advancing_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(dir.path().join("rotation-shutdown.db")),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("writable runtime");
+        let ann = new_shared();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let before = khive_runtime::background_task_count();
+        let started_at = tokio::time::Instant::now();
+
+        let watcher = start_rotation_watcher_with_shutdown(&rt, &ann, shutdown.clone())
+            .expect("file-backed ANN state starts a watcher");
+        assert!(rotation_watch_started_for_test(&ann));
+        assert_eq!(khive_runtime::background_task_count(), before + 1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(khive_runtime::background_task_count(), before + 1);
+
+        assert!(
+            !watcher.is_finished(),
+            "uncancelled watcher must stay active"
+        );
+
+        shutdown.cancel();
+        for _ in 0..100 {
+            if watcher.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if !watcher.is_finished() {
+            watcher.abort();
+            let _ = watcher.await;
+            panic!("local shutdown must stop the watcher while its ANN state is alive");
+        }
+        watcher
+            .await
+            .expect("rotation watcher must finish successfully after local shutdown");
+        assert_eq!(khive_runtime::background_task_count(), before);
+        assert_eq!(Arc::strong_count(&ann), 1);
+        assert_eq!(tokio::time::Instant::now(), started_at);
+    }
 
     /// Owns a file-backed runtime and removes its database directory after shutdown.
     struct TestRuntime {

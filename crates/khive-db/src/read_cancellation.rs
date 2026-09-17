@@ -259,6 +259,21 @@ impl ReadControl {
         self.stopped.load(Ordering::Acquire)
     }
 
+    fn poll_blocking_request(&self, context: &RequestReadContext) {
+        if self.lifecycle.load(Ordering::Acquire) >= PHASE_CLEANING {
+            return;
+        }
+        if let Some(reason) = context.blocking_stop_reason() {
+            let _ = self.stop_reason.compare_exchange(
+                STOP_NONE,
+                stop_reason_code(reason),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.stopped.store(true, Ordering::Release);
+        }
+    }
+
     fn timeout_error(&self) -> StorageError {
         StorageError::Timeout {
             operation: self.operation.into(),
@@ -289,6 +304,7 @@ impl ReadControl {
         self: &Arc<Self>,
         conn: &'a rusqlite::Connection,
         capability: StorageCapability,
+        blocking_context: Option<RequestReadContext>,
     ) -> StorageResult<ActiveRead<'a>> {
         if self.progress_should_stop() {
             return Err(self.timeout_error());
@@ -319,6 +335,12 @@ impl ReadControl {
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(probe) = &callback.progress_probe {
                     probe.fetch_add(1, Ordering::Relaxed);
+                }
+                // Only the synchronous borrowed lease has no async waiter to
+                // latch its watch signal. Keep watch polling off the ordinary
+                // async progress path (its predicate remains lock-free).
+                if let Some(context) = &blocking_context {
+                    callback.poll_blocking_request(context);
                 }
                 callback.progress_should_stop()
             }),
@@ -438,7 +460,7 @@ pub(crate) struct InterruptibleReadScope {
 }
 
 struct QuarantinePooledReaderOnDrop<'guard, 'pool> {
-    guard: &'guard mut crate::pool::ReaderGuard<'pool>,
+    guard: &'guard crate::pool::ReaderGuard<'pool>,
     control: Arc<ReadControl>,
 }
 
@@ -521,8 +543,30 @@ impl InterruptibleReadScope {
         F: FnOnce() -> StorageResult<R>,
         C: FnOnce() -> StorageResult<()>,
     {
-        let mut active = self.control.register(conn, self.capability)?;
+        self.run_with_cleanup_and_context(conn, read, interrupted_cleanup, None)
+    }
+
+    fn run_with_cleanup_and_context<R, F, C>(
+        &self,
+        conn: &rusqlite::Connection,
+        read: F,
+        interrupted_cleanup: C,
+        blocking_context: Option<RequestReadContext>,
+    ) -> StorageResult<R>
+    where
+        F: FnOnce() -> StorageResult<R>,
+        C: FnOnce() -> StorageResult<()>,
+    {
+        if let Some(context) = &blocking_context {
+            self.control.poll_blocking_request(context);
+        }
+        let mut active = self
+            .control
+            .register(conn, self.capability, blocking_context.clone())?;
         let result = read();
+        if let Some(context) = &blocking_context {
+            self.control.poll_blocking_request(context);
+        }
         let stop_reason = self.control.begin_cleanup();
         let cleanup = if stop_reason != STOP_NONE {
             interrupted_cleanup()
@@ -603,6 +647,28 @@ impl InterruptibleReadScope {
         };
         read(quarantine.guard.conn())
     }
+}
+
+/// A synchronous lease cannot move its borrowed connection to spawn_blocking.
+/// Reuse the same registration, stop translation and unwind quarantine in place.
+pub(crate) fn run_borrowed_reader<R, F>(
+    guard: &crate::pool::ReaderGuard<'_>,
+    read: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+{
+    let context = capture_request_read_context();
+    let scope = InterruptibleReadScope {
+        control: ReadControl::new(&context, "reader_guard.query_row"),
+        capability: StorageCapability::Sql,
+    };
+    let quarantine = QuarantinePooledReaderOnDrop {
+        guard,
+        control: Arc::clone(&scope.control),
+    };
+    let conn = quarantine.guard.conn();
+    scope.run_with_cleanup_and_context(conn, || read(conn), || Ok(()), Some(context))
 }
 
 fn storage_error_is_sqlite_interrupt(error: &StorageError) -> bool {

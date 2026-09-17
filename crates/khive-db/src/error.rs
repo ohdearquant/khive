@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
-    /// A request stopped before a store constructor acquired its writer.
+    /// A request-scoped read or store acquisition stopped, or read cleanup failed.
     #[error(transparent)]
     RequestReadStopped(khive_storage::StorageError),
 

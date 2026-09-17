@@ -32,6 +32,7 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
 

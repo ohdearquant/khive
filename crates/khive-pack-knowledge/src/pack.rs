@@ -711,6 +711,7 @@ mod tests {
     /// Time is paused so the watcher's 5-second tick can be crossed
     /// deterministically instead of by a real sleep.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(background_tasks)]
     async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = RuntimeConfig {

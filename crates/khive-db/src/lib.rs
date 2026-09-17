@@ -64,7 +64,7 @@ pub use migrations::{
     run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
     MIGRATIONS,
 };
-pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
+pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, ReaderRow, WriterGuard};
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
@@ -75,3 +75,6 @@ pub use writer_task::WriterTaskHandle;
 mod namespace_move_fixture_tests;
 #[cfg(test)]
 mod stream_schema_tests;
+
+#[cfg(test)]
+mod reader_lease_tests;

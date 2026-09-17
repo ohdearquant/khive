@@ -25,6 +25,7 @@ khive-score = { version = "0.8.0", path = "../khive-score" }
 khive-vamana = { version = "0.8.0", path = "../khive-vamana" }
 inventory = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
