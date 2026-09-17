@@ -1145,6 +1145,27 @@ class Bench1mExtractSelfCheck(unittest.TestCase):
         self.assertEqual(metrics["assertion.recall_at_10.pass"], 1.0)
         self.assertEqual(metrics["row.n10000.recall_at_10"], payload["rows"][0]["recall_at_10"])
 
+    def test_fixture_records_no_machine_local_paths(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+
+        def strings(node, path):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    yield from strings(value, f"{path}.{key}" if path else key)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from strings(value, path)
+            elif isinstance(node, str):
+                yield path, node
+
+        absolute = [(path, value) for path, value in strings(payload, "") if value.startswith("/")]
+        self.assertEqual(absolute, [], "a refreshed fixture keeps machine-local paths redacted")
+        for field in payload["fixture_redactions"]["fields"]:
+            node = payload
+            for part in field.split("."):
+                node = node[part]
+            self.assertIsInstance(node, str, f"declared redaction {field} names a string field")
+
     def test_schema_version_drift_rejected(self) -> None:
         payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
         payload["schema_version"] = "999.0"
