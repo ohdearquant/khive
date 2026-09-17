@@ -160,13 +160,13 @@ instead of silently dropping data.
 Shipped startup code registers configured embedding models directly in `_embedding_models`.
 I found no shipped event emission path for startup population. Operator migration and
 drift commands are parsable under `kkernel engine`, but `migrate` and `drift-check`
-return NotImplemented and point to follow-up #380.
+return NotImplemented and point to follow-up #2873.
 
 | Source                                                       | Shipped action                                    | Event emitted today |
 | ------------------------------------------------------------ | ------------------------------------------------- | ------------------- |
 | Engine config at startup                                     | Register active model rows in `_embedding_models` | None found          |
-| Operator CLI: `kkernel engine migrate <engine> --to <model>` | Callable stub returns NotImplemented (#380)       | None                |
-| Operator CLI: `kkernel engine drift-check <engine>`          | Callable stub returns NotImplemented (#380)       | None                |
+| Operator CLI: `kkernel engine migrate <engine> --to <model>` | Callable stub returns NotImplemented (#2873)      | None                |
+| Operator CLI: `kkernel engine drift-check <engine>`          | Callable stub returns NotImplemented (#2873)      | None                |
 
 `EmbeddingModelChanged`, `EmbeddingMigrationCompleted`, `EmbeddingMigrationFailed`, and
 `EmbeddingDriftDetected` remain event enum contracts for the deferred migration worker and
@@ -176,7 +176,7 @@ drift implementation.
 
 No shipped `EmbedMigrationWorker` or `MigrationController` integration was found under
 `khive-runtime` or `khive-pack-memory`. The migration state machine, pending-table swap,
-resume/abort behavior, and completion/failure event emission are deferred to #380.
+resume/abort behavior, and completion/failure event emission are deferred to #2873.
 
 ### 4. Recall during migration
 
@@ -202,20 +202,20 @@ during this window so the gap is observable.
 ### 5. Drift detection — deferred
 
 `kkernel engine drift-check <engine> [--sample N]` is a parsable operator command, but the
-shipped implementation returns NotImplemented and points to #380. Sampling, Wasserstein
+shipped implementation returns NotImplemented and points to #2873. Sampling, Wasserstein
 distance computation, `EmbeddingDriftDetected` emission, and `drift_threshold` config are
 deferred.
 
 ### 6. Verb surface — CLI only
 
-| Command                                            | Shipped status | Purpose                                                     |
-| -------------------------------------------------- | -------------- | ----------------------------------------------------------- |
-| `kkernel engine list`                              | shipped        | List engines and model history from `_embedding_models`.    |
-| `kkernel engine status <engine>`                   | shipped        | Show active model and whether a pending row exists.         |
-| `kkernel engine migrate <engine> --to <model>`     | stub           | Returns NotImplemented; migration worker deferred to #380.  |
-| `kkernel engine migrate <engine> --resume`         | stub           | Returns NotImplemented; migration worker deferred to #380.  |
-| `kkernel engine migrate <engine> --abort`          | stub           | Returns NotImplemented; migration worker deferred to #380.  |
-| `kkernel engine drift-check <engine> [--sample N]` | stub           | Returns NotImplemented; drift integration deferred to #380. |
+| Command                                            | Shipped status | Purpose                                                      |
+| -------------------------------------------------- | -------------- | ------------------------------------------------------------ |
+| `kkernel engine list`                              | shipped        | List engines and model history from `_embedding_models`.     |
+| `kkernel engine status <engine>`                   | shipped        | Show active model and whether a pending row exists.          |
+| `kkernel engine migrate <engine> --to <model>`     | stub           | Returns NotImplemented; migration worker deferred to #2873.  |
+| `kkernel engine migrate <engine> --resume`         | stub           | Returns NotImplemented; migration worker deferred to #2873.  |
+| `kkernel engine migrate <engine> --abort`          | stub           | Returns NotImplemented; migration worker deferred to #2873.  |
+| `kkernel engine drift-check <engine> [--sample N]` | stub           | Returns NotImplemented; drift integration deferred to #2873. |
 
 No MCP verbs. Agents do not initiate migrations — brain profiles tune what they're
 given but cannot decide to swap the underlying model. This is the architectural
@@ -357,11 +357,11 @@ Tracked in `.khive/plans/embedding-version-config.md`.
 
 - `_embedding_models` schema: `khive-db` migrations and backend registry helpers; runtime
   exposes read access via `KhiveRuntime::list_embedding_models`.
-- Migration worker: deferred to #380.
+- Migration worker: deferred to #2873.
 - Engine operator subcommands: `crates/kkernel/src/engine.rs`; the TypeScript `khive`
   CLI has no `engine` group.
 - Event kinds: `khive-types::event::EventKind`.
-- Lattice migration/drift composition: deferred to #380.
+- Lattice migration/drift composition: deferred to #2873.
 
 ### `MigrationPlanSummary`
 
@@ -452,8 +452,8 @@ The shipped command group is `kkernel engine`, implemented in `crates/kkernel/sr
 match cmd {
     EngineCommand::List(args) => cmd_engine_list(args).await,
     EngineCommand::Status(args) => cmd_engine_status(args).await,
-    EngineCommand::Migrate(args) => cmd_engine_migrate(args),        // NotImplemented (#380)
-    EngineCommand::DriftCheck(args) => cmd_engine_drift_check(args), // NotImplemented (#380)
+    EngineCommand::Migrate(args) => cmd_engine_migrate(args),        // NotImplemented (#2873)
+    EngineCommand::DriftCheck(args) => cmd_engine_drift_check(args), // NotImplemented (#2873)
 }
 ```
 

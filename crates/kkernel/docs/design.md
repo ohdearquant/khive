@@ -103,14 +103,14 @@
 
 - `kkernel engine list/status` expose `_embedding_models` table data.
 - `kkernel engine migrate` and `kkernel engine drift-check` are deferred to follow-up
-  #380 (EmbedMigrationWorker and lattice_transport integration).
+  #2873 (EmbedMigrationWorker and lattice_transport integration).
 - No MCP verbs are exposed for engine management — these are operator-only commands.
 
 ### Vector store capabilities and orphan sweep (ADR-044)
 
 - `kkernel vector capabilities` emits the sqlite-vec baseline capability flags.
   Values match `SqliteVecStore::capabilities()` in `khive-db`.
-- `kkernel vector sweep` is deferred to follow-up #381; `SqliteVecStore` returns
+- `kkernel vector sweep` is deferred to follow-up #2874; `SqliteVecStore` returns
   `Unsupported` for the orphan-sweep operation.
 
 ### Proposal lifecycle (ADR-046)
