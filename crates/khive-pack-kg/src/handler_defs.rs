@@ -478,7 +478,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       live rows across caller-visible namespaces; count_scope repeats this scope \
                       in the response. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
-                      know the true per-relation population before sampling.",
+                      know the true per-relation population before sampling, and an \
+                      edges_by_endpoint_base breakdown (entity_entity, entity_note, note_entity, \
+                      note_note, unresolved) whose buckets sum to edges. edges is every live edge \
+                      and is not a density denominator: on a populated store most edges are \
+                      provenance, so edges/entities overstates connectedness. edges_structural \
+                      (entity-to-entity) is the denominator that answers that question and \
+                      edges_annotates names the largest thing excluded from it. Deriving \
+                      structure as edges minus annotates is wrong: supports and refutes are \
+                      same-substrate, so a note-to-note edge is neither annotates nor structure.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],

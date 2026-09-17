@@ -13,9 +13,9 @@ use crate::error::StorageError;
 pub type StorageResult<T> = Result<T, StorageError>;
 
 pub use graph::{
-    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField,
-    EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, GraphPath,
-    GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
+    DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts, EdgeFilter, EdgeSeekPage,
+    EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
+    GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
     GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, LinkId,
     MissingEndpoints, NeighborCursor, NeighborHit, NeighborQuery, PathNode, SortDirection,
     SortOrder, TimeRange, TraversalExecutionBudget, TraversalOptions, TraversalRequest,

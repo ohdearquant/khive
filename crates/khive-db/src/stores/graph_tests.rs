@@ -5401,3 +5401,95 @@ async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
         "no duplicate or spurious nodes"
     );
 }
+
+/// #2911: a relation breakdown cannot separate structure from provenance,
+/// because relations do not determine endpoint bases. The fixture puts one
+/// edge in every bucket, including a `note -> note` `supports` edge, which is
+/// the case that makes `edges - annotates` the wrong derivation: it is neither
+/// annotates nor structure, so subtracting annotates alone still overcounts.
+#[tokio::test]
+async fn endpoint_base_counts_separate_structure_from_provenance() {
+    let (pool, store) = setup_memory_store_with_substrates();
+
+    let (e1, e2, e3, e4) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for id in [e1, e2, e3, e4] {
+        insert_live_entity(&pool, id);
+    }
+    let (n1, n2, n3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for id in [n1, n2, n3] {
+        insert_note(&pool, id, false);
+    }
+    // Endpoints in neither table. Absence is not a tombstone, so these stay
+    // counted, and they must land in `unresolved` rather than a named bucket.
+    let (ghost_a, ghost_b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    for edge in [
+        make_edge(e1, e2, EdgeRelation::Contains, 1.0),
+        make_edge(e3, e4, EdgeRelation::DependsOn, 1.0),
+        make_edge(n1, e1, EdgeRelation::Annotates, 1.0),
+        make_edge(e2, n2, EdgeRelation::Annotates, 1.0),
+        make_edge(n2, n3, EdgeRelation::Supports, 1.0),
+        make_edge(ghost_a, ghost_b, EdgeRelation::DependsOn, 1.0),
+    ] {
+        store.upsert_edge(edge).await.unwrap();
+    }
+
+    let counts = store.count_edges_by_endpoint_base().await.unwrap();
+    assert_eq!(counts.entity_entity, 2, "{counts:?}");
+    assert_eq!(counts.note_entity, 1, "{counts:?}");
+    assert_eq!(counts.entity_note, 1, "{counts:?}");
+    assert_eq!(counts.note_note, 1, "{counts:?}");
+    assert_eq!(counts.unresolved, 1, "{counts:?}");
+
+    // The invariant that makes the breakdown checkable: it partitions the same
+    // population `count_edges` reports.
+    let total = store.count_edges(EdgeFilter::default()).await.unwrap();
+    assert_eq!(total, 6);
+    assert_eq!(counts.total(), total, "buckets must partition the total");
+
+    // The derivation a caller would reach for, shown wrong on this fixture.
+    let by_relation: HashMap<_, _> = store
+        .count_edges_by_relation()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let annotates = by_relation
+        .get(&EdgeRelation::Annotates)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(annotates, 2);
+    assert_ne!(
+        total - annotates,
+        counts.entity_entity,
+        "total minus annotates is 4, structure is 2: the note-to-note support edge and the \
+         unresolved pair are why that subtraction cannot be the definition"
+    );
+
+    // The namespace-scoped variant answers the same question.
+    let namespaces = vec!["default".to_string()];
+    assert_eq!(
+        store
+            .count_edges_by_endpoint_base_in_namespaces(&namespaces)
+            .await
+            .unwrap(),
+        counts,
+        "scoped and unscoped counts must agree"
+    );
+
+    // A tombstoned endpoint leaves its bucket, exactly as it leaves the total.
+    soft_delete_note(&pool, n2);
+    let after = store.count_edges_by_endpoint_base().await.unwrap();
+    assert_eq!(after.entity_note, 0, "{after:?}");
+    assert_eq!(after.note_note, 0, "{after:?}");
+    assert_eq!(after.entity_entity, 2, "{after:?}");
+    assert_eq!(
+        after.total(),
+        store.count_edges(EdgeFilter::default()).await.unwrap()
+    );
+}
