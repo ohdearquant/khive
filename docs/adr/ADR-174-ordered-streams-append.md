@@ -1247,3 +1247,114 @@ The form axis is not symmetric, which is why it is written here rather than give
 `observed` is a list and has one form, while a fence is an object or a list, so the fence column
 carries both forms wherever the rule can be expressed in either. The fenced write being a creation has no batch counterpart at
 all, because a batch member is an append.
+
+## Amendment 10 (2026-09-16): a total fence-entry budget for `stream.batch`
+
+**Status**: Accepted (2026-09-16).
+
+ADR-172 Amendment 3 limits each ordered fence list to 100 entries. ADR-174
+Amendment 7 independently limits a batch to 1000 members and 100 observations.
+Those limits admit 100,000 member-fence entries in one atomic transaction.
+Each fence requires a keyed read while the writer is held, so bounding each
+list does not bound the total precondition work of the request.
+
+### A10.1 The number and what it counts
+
+`stream.batch` admits at most **100 total fence entries per call**, in both
+atomic and per-member modes. Count one for a supplied non-null batch-wide
+`fence`, one for each append-member object fence, and the length of each
+append-member fence list. Omitted member fences and an omitted or null
+batch-wide fence contribute zero. An explicit null member fence remains invalid.
+
+Every supplied entry counts, including repeated `(kind, key)` guards in different
+members or in both the batch-wide and member positions. These are separate
+reads on the existing execution path; counting distinct keys would understate
+the work. The count is an admission bound on the request, not a measurement of
+reads actually completed: an earlier refusal can stop execution before later
+guards are read. The same complete-call budget applies in per-member mode,
+before any member transaction begins, so switching modes does not change which
+input is admitted. The batch-wide fence remains forbidden in per-member mode.
+
+The number matches the existing 100-entry fence-list and observation allowances:
+each limits keyed precondition reads performed while holding the writer. It
+removes the member-count multiplier without changing the existing single-list
+boundary. This is a numeric admission policy, not a measured wall-time bound.
+No new latency measurement is claimed by this amendment.
+
+A total of 1000 would retain the ability to attach one fence to every member of
+a maximum-size batch, but would still admit ten times the existing 100-entry
+keyed-precondition allowance. Choosing 100 uses that existing allowance as the
+explicit total fence budget. Consequently some previously valid calls are newly
+refused, including 1000 single-fence members, two 100-entry member lists, or a
+100-entry member list together with one batch-wide fence. Unfenced 1000-member
+batches, and a single 100-entry fence list without another fence, remain valid
+subject to their existing checks.
+
+The 100-entry `observed` cap remains independent: 100 fence entries and 100
+observations can coexist. Write members carry no fence and add no fence entries.
+Other work inside the transaction, including keyed-write guards and optional
+deadline reads, retains its existing contract; this budget is not a limit on
+all SQL statements.
+
+### A10.2 Refusal placement and existing errors
+
+After the existing parsing and admission-phase validation of the complete call,
+compute the total and refuse an oversized call with `invalid_input`, before
+preparing note plans or requesting any writer. The message names the cap, the
+total sent and the reason: each fence is a read taken while holding the writer.
+
+Keep the per-list 100-entry check and its more specific error, including its
+position before interpreting malformed entries. Existing parsing and
+admission-phase validation retain their order and precede the new aggregate
+refusal. Therefore a later 101-entry member list still reports that member's
+per-list error even if earlier valid lists have already taken the aggregate
+above 100. Over-budget requests do not reach preparation-stage validation;
+the aggregate refusal is returned **in place of any preparation-stage error**
+the call would otherwise have received. Those preparation errors are not
+evaluated. This changes the error identity of some already-invalid calls, in
+addition to refusing some previously valid calls. No member commits on aggregate refusal, including in
+per-member mode.
+
+The runtime checks this admission bound on both batch entry points. Successful
+response shapes, fence predicate order and conflict details remain unchanged.
+The help text states the total, counting scope, both modes, independent observed
+cap and refusal placement.
+
+This amendment supplements ADR-172 Amendment 3's cardinality paragraph. Its
+sentence describing the old bound as per-list remains true for that check;
+it does not imply an exemption from this new aggregate bound.
+
+### Acceptance
+
+1. Exactly 100 member-fence entries commit in both modes, as two 50-entry lists
+   and as 100 object fences, including repeated keys across members.
+2. A 99-entry member list plus one batch-wide fence commits together with 100
+   independent observations. A 100-entry list plus that batch-wide fence
+   refuses as 101; null batch-wide fence contributes zero and retains its mode
+   default.
+3. 101 total entries refuse in both modes, for list and object forms, naming
+   101 and 100 and retaining the writer-read rationale. The stream and domain
+   population remain unchanged.
+4. 1000 members with 100 distinct fence entries each refuse in both modes,
+   naming 100000 and 100. Repetition across members must not be deduplicated.
+5. A later oversized malformed list, invalid stream name or unknown member
+   field retains its existing more specific invalid-input error even when the
+   other members already exceed the aggregate budget.
+6. The refusal leaves writer-acquisition counters unchanged. In the same
+   fixture an accepted at-cap request must increase those counters, proving
+   the observation is capable of detecting real writer admission. Unchanged
+   rows alone do not prove this placement.
+7. Mutation, predicted before execution: move only the aggregate refusal into
+   the existing transaction-owner closure, before predicates or DML, carrying
+   the original whole-call count into each mode. Refusal and unchanged-row
+   controls remain green; the before-writer control alone goes red. Removing
+   the aggregate refusal makes the over-cap controls red. Record actual
+   results and exit codes only after those native runs occur.
+8. In both atomic and per-member modes, submit a valid-shaped keyed head-write
+   whose tag contains `kind:` followed by 65 ASCII characters. With 100
+   otherwise-valid fence entries, require the existing document-kind-length
+   invalid-input error. With 101 otherwise-valid entries and the same invalid
+   write, require the aggregate-budget invalid-input error in place of that
+   preparation error. No member commits in either case. The at-cap control
+   establishes that the preparation error is reachable and the fixture is not
+   refused by an earlier admission check.

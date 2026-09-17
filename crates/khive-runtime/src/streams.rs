@@ -228,6 +228,31 @@ pub enum StreamBatchMember {
     Refused(KhiveError),
 }
 
+// Like the per-list fence and observation bounds, this limits precondition
+// reads while holding the writer; member count alone does not bound their sum.
+const MAX_BATCH_FENCE_ENTRIES: usize = 100;
+
+fn stream_batch_fence_count(members: &[StreamBatchMember], fence: Option<&NoteFence>) -> usize {
+    usize::from(fence.is_some())
+        + members
+            .iter()
+            .filter_map(|member| match member {
+                StreamBatchMember::Append(spec) => spec.fence.as_ref(),
+                StreamBatchMember::Write(_) | StreamBatchMember::Refused(_) => None,
+            })
+            .map(|fences| fences.entries().len())
+            .sum::<usize>()
+}
+
+fn validate_stream_batch_fence_count(count: usize) -> RuntimeResult<()> {
+    if count > MAX_BATCH_FENCE_ENTRIES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "stream.batch admits at most {MAX_BATCH_FENCE_ENTRIES} total fence entries; this call sent {count}: each fence is a read taken while holding the writer"
+        )));
+    }
+    Ok(())
+}
+
 /// The member refusal that stopped an atomic batch; nothing was written.
 #[derive(Debug)]
 pub struct StreamBatchRefusal {
@@ -1288,6 +1313,7 @@ impl KhiveRuntime {
                 ));
             }
         }
+        validate_stream_batch_fence_count(stream_batch_fence_count(&members, fence.as_ref()))?;
         for (member, item) in members.iter().enumerate() {
             if let StreamBatchMember::Refused(error) = item {
                 return Ok(Err(StreamBatchRefusal {
@@ -1328,6 +1354,7 @@ impl KhiveRuntime {
         registry: &VerbRegistry,
     ) -> RuntimeResult<Vec<Value>> {
         self.validate_stream_batch(&members, false)?;
+        validate_stream_batch_fence_count(stream_batch_fence_count(&members, None))?;
         let mut results = Vec::with_capacity(members.len());
         let prepared = self.prepare_stream_batch(token, members, registry).await?;
         for member in prepared {

@@ -1701,3 +1701,6 @@ mod observed_id_tests;
 
 #[path = "stream_batch_cap_tests.rs"]
 mod batch_cap_tests;
+
+#[path = "stream_batch_fence_budget_tests.rs"]
+mod batch_fence_budget_tests;
