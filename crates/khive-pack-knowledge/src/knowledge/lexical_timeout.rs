@@ -77,6 +77,13 @@ pub(super) struct LexicalStage {
     started: Instant,
     configured_budget_ms: u64,
     effective_budget_ms: u64,
+    /// Time spent in reads that did not time out, with each phase's read
+    /// count, in the order the phases first ran. A cut read that ran for a
+    /// few milliseconds says nothing about where the rest of the stage went;
+    /// this does. Only the timeout log record carries it: time spent in the
+    /// later phases depends on other namespaces' index matches, so it never
+    /// reaches the response.
+    completed: Vec<(LexicalPhase, Duration, u32)>,
     pub(super) timeout: Option<LexicalTimeout>,
 }
 
@@ -96,6 +103,7 @@ impl LexicalStage {
             started,
             configured_budget_ms: millis(configured),
             effective_budget_ms: millis(effective),
+            completed: Vec::new(),
             timeout: None,
         }
     }
@@ -114,8 +122,32 @@ impl LexicalStage {
         let result = read.await;
         if matches!(&result, Err(StorageError::Timeout { .. })) {
             self.capture_timeout(phase, operation_started);
+        } else {
+            self.record_completed(phase, operation_started.elapsed());
         }
         result
+    }
+
+    fn record_completed(&mut self, phase: LexicalPhase, elapsed: Duration) {
+        match self
+            .completed
+            .iter_mut()
+            .find(|(seen, _, _)| *seen == phase)
+        {
+            Some((_, total, reads)) => {
+                *total += elapsed;
+                *reads += 1;
+            }
+            None => self.completed.push((phase, elapsed, 1)),
+        }
+    }
+
+    /// `(phase, total_ms, reads)` for every phase with a completed read.
+    fn completed_reads(&self) -> Vec<(&'static str, u64, u32)> {
+        self.completed
+            .iter()
+            .map(|&(phase, total, reads)| (phase.label(), millis(total), reads))
+            .collect()
     }
 
     fn capture_timeout(&mut self, phase: LexicalPhase, operation_started: Instant) {
@@ -135,6 +167,7 @@ impl LexicalStage {
             operation_elapsed_ms = detail.operation_elapsed_ms,
             configured_budget_ms = detail.configured_budget_ms,
             effective_budget_ms = detail.effective_budget_ms,
+            completed_reads = ?self.completed_reads(),
             "lexical read timed out"
         );
         self.timeout = Some(detail);
@@ -143,6 +176,8 @@ impl LexicalStage {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     tokio::task_local! {
@@ -262,6 +297,127 @@ pub(super) mod tests {
             assert_eq!(detail.effective_budget_ms, 2000);
         })
         .await;
+    }
+
+    /// `(message, completed_reads)` for every event emitted while installed.
+    type Records = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    struct TimeoutRecords(Records);
+
+    #[derive(Default)]
+    struct TimeoutRecordVisitor {
+        message: String,
+        completed_reads: Option<String>,
+    }
+
+    impl tracing::field::Visit for TimeoutRecordVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => self.message = format!("{value:?}"),
+                "completed_reads" => self.completed_reads = Some(format!("{value:?}")),
+                _ => {}
+            }
+        }
+    }
+
+    impl tracing::Subscriber for TimeoutRecords {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = TimeoutRecordVisitor::default();
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((visitor.message, visitor.completed_reads));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Runs the completed reads, then one read that times out after 11 ms,
+    /// and returns the stage elapsed time and the logged `completed_reads`.
+    async fn timeout_record_after(reads: &[(LexicalPhase, u64)]) -> (u64, Option<String>) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(TimeoutRecords(Arc::clone(&records)));
+        let started = Instant::now();
+        let stage_elapsed_ms =
+            khive_storage::scope_request_read_deadline(Duration::from_millis(2000), async {
+                let mut stage =
+                    LexicalStage::new(LexicalPass::Full, started, Duration::from_millis(2000));
+                for &(phase, ms) in reads {
+                    stage
+                        .read(phase, async move {
+                            tokio::time::advance(Duration::from_millis(ms)).await;
+                            Ok::<(), StorageError>(())
+                        })
+                        .await
+                        .unwrap();
+                }
+                let result: Result<(), StorageError> = stage
+                    .read(LexicalPhase::PhaseBHydration, async {
+                        tokio::time::advance(Duration::from_millis(11)).await;
+                        Err(StorageError::Timeout {
+                            operation: "test.read".into(),
+                        })
+                    })
+                    .await;
+                assert!(result.is_err());
+                let detail = stage.timeout.expect("missing timeout detail");
+                assert_eq!(detail.operation_elapsed_ms, 11);
+                assert!(
+                    serde_json::to_value(detail)
+                        .unwrap()
+                        .get("completed_reads")
+                        .is_none(),
+                    "the response detail must not carry the breakdown"
+                );
+                detail.stage_elapsed_ms
+            })
+            .await;
+        let records = records.lock().unwrap();
+        let logged: Vec<_> = records
+            .iter()
+            .filter(|(message, _)| message == "lexical read timed out")
+            .collect();
+        assert_eq!(logged.len(), 1, "one timeout record: {records:?}");
+        (stage_elapsed_ms, logged[0].1.clone())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_record_names_the_time_completed_reads_spent() {
+        let (stage_elapsed_ms, completed_reads) = timeout_record_after(&[
+            (LexicalPhase::ReaderOpen, 3),
+            (LexicalPhase::TermFrequency, 40),
+            (LexicalPhase::TermFrequency, 60),
+            (LexicalPhase::PhaseARowids, 5),
+            (LexicalPhase::PhaseBHydration, 900),
+            (LexicalPhase::PhaseARowids, 7),
+        ])
+        .await;
+        let expected: Vec<(&str, u64, u32)> = vec![
+            ("reader_open", 3, 1),
+            ("term_frequency", 100, 2),
+            ("phase_a_rowids", 12, 2),
+            ("phase_b_hydration", 900, 1),
+        ];
+        assert_eq!(completed_reads, Some(format!("{expected:?}")));
+        assert_eq!(stage_elapsed_ms, 1026);
+        let spent: u64 = expected.iter().map(|(_, ms, _)| ms).sum();
+        assert!(spent <= stage_elapsed_ms);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_on_the_first_read_logs_an_empty_breakdown() {
+        let (stage_elapsed_ms, completed_reads) = timeout_record_after(&[]).await;
+        assert_eq!(completed_reads.as_deref(), Some("[]"));
+        assert_eq!(stage_elapsed_ms, 11);
     }
 
     #[tokio::test]
