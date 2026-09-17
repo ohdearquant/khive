@@ -1202,7 +1202,16 @@ async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_prope
         .await
         .expect("non-lifecycle task properties remain patchable");
     assert_eq!(updated["properties"]["priority"], "p1");
-    assert_eq!(updated["properties"]["due"], "2026-08-09T12:00:00Z");
+    // Same instant, re-serialized: a `due` written through `properties` is now normalized into
+    // the shape `gtd.assign` stores, so the two writers agree. This assertion previously pinned
+    // the verbatim string, which is the behaviour that let an un-normalized value sit in the
+    // field beside an anchor from an earlier write.
+    assert_eq!(updated["properties"]["due"], "2026-08-09T12:00:00+00:00");
+    // The task carries no anchor, so the zone resolves to the configured display zone, and the
+    // pair this update writes is byte-identical to what `gtd.assign` writes for the same input:
+    // the value keeps the offset it was given, and the anchor records the zone the task's
+    // deadlines are read in. That is the whole point of running one normalization on both paths.
+    assert_eq!(updated["properties"]["due_timezone"], "America/New_York");
     assert_eq!(updated["properties"]["planning_label"], "reviewed");
     assert_eq!(updated["properties"]["status"], "inbox");
 }
