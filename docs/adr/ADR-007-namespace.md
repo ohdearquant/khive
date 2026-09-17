@@ -3,7 +3,7 @@
 **Status**: Accepted/Ratified (2026-06-19)
 **Date**: 2026-06-19
 **Authors**: khive maintainers
-**Amends**: ADR-007-namespace.md (Rev 8 adds Rule 9 and corrects one sentence of Rule 4; Rev 7 added
+**Amends**: ADR-007-namespace.md (Rev 8 adds Rule 9 and corrects three statements in Rule 4; Rev 7 added
 Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rules 8 and 9 are additive)
 **Amended by**: proposed [ADR-068](ADR-068-process-isolation-topology.md), which
 replaces Rule 4's TenantGate clause if accepted.
@@ -18,8 +18,10 @@ KG-pack namespace-rebinding clause only; the remainder of this record stays auth
 ADR-063 (comm pack principal model and remote backend isolation)
 
 **Rev 8 summary (2026-09-17)**: Adds Rule 9, which states where tenant isolation lives for a
-deployment that serves more than one tenant, and corrects one sentence of Rule 4 that described a
-policy input the gate's request type does not carry. Rev 8 adds no check anywhere and changes no
+deployment that serves more than one tenant, and corrects three statements in Rule 4: one described
+a policy input the gate's request type does not carry, one said the installed Gate is the only
+difference between a permissive and an isolating deployment, and one said a TenantGate may key
+per-tenant isolation on the namespace string. Rev 8 adds no check anywhere and changes no
 behaviour: it writes down a property the code already has, because the absence of the statement was
 being read as an oversight to fix at the store, which Rules 1 and 2 forbid. Rules 0 through 8 are
 unchanged.
