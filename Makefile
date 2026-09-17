@@ -231,17 +231,44 @@ local: verify-local-artifact
 	fi; \
 	SIGNED_SHA256=$$({ shasum -a 256 "$$DEST.new" 2>/dev/null || sha256sum "$$DEST.new"; } | awk '{print $$1}'); \
 	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
+	KHIVE_PID_FILE=$${KHIVE_PID:-$$HOME/.khive/khived.pid}; \
+	OLD_PID=$$(cat "$$KHIVE_PID_FILE" 2>/dev/null | tr -dc "0-9"); \
+	if [ -n "$$OLD_PID" ] && ! ps -p "$$OLD_PID" >/dev/null 2>&1; then OLD_PID=""; fi; \
+	OLD_PACKS=""; \
+	if [ -n "$$OLD_PID" ]; then \
+	  OLD_PACKS=$$(ps -p "$$OLD_PID" -o command= 2>/dev/null | tr " " "\n" | awk 'p{printf " --pack %s", $$0; p=0} /^--pack$$/{p=1}'); \
+	fi; \
 	echo "==> Atomically moving into place..."; \
 	mv "$$DEST.new" "$$DEST"; \
-	echo "==> Killing running kkernel daemon (bridges respawn the NEW binary and self-heal via re-exec)..."; \
-	pkill -f 'kkernel mcp --daemon' 2>/dev/null || true; \
-	for i in 1 2 3 4 5; do \
-	  if pgrep -f 'kkernel mcp --daemon' >/dev/null 2>&1; then sleep 1; else break; fi; \
-	done; \
-	if pgrep -f 'kkernel mcp --daemon' >/dev/null 2>&1; then \
-	  echo "==> WARNING: daemon still running after 5s — SIGKILL"; \
-	  pkill -9 -f 'kkernel mcp --daemon' 2>/dev/null || true; \
-	  sleep 1; \
+	if [ -n "$$OLD_PID" ]; then \
+	  echo "==> Stopping daemon pid $$OLD_PID (read from $$KHIVE_PID_FILE before the install)..."; \
+	  kill "$$OLD_PID" 2>/dev/null || true; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do \
+	    if ps -p "$$OLD_PID" >/dev/null 2>&1; then sleep 1; else break; fi; \
+	  done; \
+	  if ps -p "$$OLD_PID" >/dev/null 2>&1; then \
+	    echo "==> pid $$OLD_PID has not exited after 10s — SIGKILL. This names one process, so it cannot reach a daemon that started during this window."; \
+	    kill -9 "$$OLD_PID" 2>/dev/null || true; \
+	    for i in 1 2 3; do \
+	      if ps -p "$$OLD_PID" >/dev/null 2>&1; then sleep 1; else break; fi; \
+	    done; \
+	  fi; \
+	else \
+	  echo "==> $$KHIVE_PID_FILE names no live process; nothing to stop."; \
+	fi; \
+	if [ -z "$$KHIVE_LOCAL_NO_START" ]; then \
+	  START_CWD=$${KHIVE_LOCAL_START_CWD:-$$HOME/projects}; \
+	  DLOG="$$HOME/.khive/logs/kkernel-daemon-make-local-$$(date +%Y%m%d-%H%M%S).log"; \
+	  mkdir -p "$$HOME/.khive/logs"; \
+	  if [ -n "$$OLD_PACKS" ]; then \
+	    echo "==> Starting the replacement daemon from $$START_CWD with the outgoing daemon's pack list:$$OLD_PACKS"; \
+	  else \
+	    echo "==> Starting the replacement daemon from $$START_CWD with the built-in default pack set (no outgoing daemon to copy a --pack list from)"; \
+	  fi; \
+	  ( cd "$$START_CWD" && exec nohup "$$DEST" mcp --daemon $$OLD_PACKS >> "$$DLOG" 2>&1 & ); \
+	  echo "==> Daemon log: $$DLOG"; \
+	else \
+	  echo "==> KHIVE_LOCAL_NO_START set: not starting a replacement daemon."; \
 	fi; \
 	DEST_HASH=$$(md5 -q "$$DEST"); \
 	DEST_SIZE=$$(stat -f '%z' "$$DEST"); \
