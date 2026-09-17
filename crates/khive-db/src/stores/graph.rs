@@ -10,13 +10,13 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
-    GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedEdgeBatchRefusal,
-    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, MissingEndpoints,
-    NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor, SeekPage,
-    SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
-    TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
+    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
+    EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal,
+    GuardedEdgeBatchRefusal, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
+    GuardedWriteOutcome, MissingEndpoints, NeighborCursor, NeighborHit, NeighborQuery, Page,
+    PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue,
+    TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1186,6 +1186,33 @@ fn edge_order_clause(sort: &[SortOrder<EdgeSortField>]) -> String {
     };
     parts.push(format!("id {dir}"));
     format!(" ORDER BY {}", parts.join(", "))
+}
+
+/// `CASE` expression classifying one edge endpoint by the base it resolves
+/// against. Soft-deleted endpoints are already excluded by
+/// [`LIVE_ENDPOINTS_CONDITION`] in the surrounding `WHERE`, so a row reaching
+/// this expression has live endpoints or none at all.
+fn endpoint_base_case(column: &str) -> String {
+    format!(
+        "CASE WHEN EXISTS (SELECT 1 FROM entities be WHERE be.id = graph_edges.{column}) \
+         THEN 'entity' \
+         WHEN EXISTS (SELECT 1 FROM notes bn WHERE bn.id = graph_edges.{column}) \
+         THEN 'note' ELSE 'none' END"
+    )
+}
+
+/// Folds one `(source_base, target_base, count)` group into the tally. An
+/// unrecognized pair lands in `unresolved` rather than being dropped, so the
+/// buckets keep summing to the live edge total.
+fn fold_endpoint_base_row(counts: &mut EdgeEndpointBaseCounts, source: &str, target: &str, n: u64) {
+    let slot = match (source, target) {
+        ("entity", "entity") => &mut counts.entity_entity,
+        ("entity", "note") => &mut counts.entity_note,
+        ("note", "entity") => &mut counts.note_entity,
+        ("note", "note") => &mut counts.note_note,
+        _ => &mut counts.unresolved,
+    };
+    *slot = slot.saturating_add(n);
 }
 
 /// Restricts an edge count to edges whose endpoints are still live.
@@ -2694,6 +2721,75 @@ impl GraphStore for SqlGraphStore {
                 }
             }
             Ok(totals.into_iter().collect())
+        })
+        .await
+    }
+
+    async fn count_edges_by_endpoint_base(&self) -> Result<EdgeEndpointBaseCounts, StorageError> {
+        let namespace = self.namespace.clone();
+        self.with_reader("count_edges_by_endpoint_base", move |conn| {
+            let source_case = endpoint_base_case("source_id");
+            let target_case = endpoint_base_case("target_id");
+            let sql = format!(
+                "SELECT {source_case} AS source_base, {target_case} AS target_base, COUNT(*) \
+                 FROM graph_edges \
+                 WHERE namespace = ?1 AND deleted_at IS NULL AND {LIVE_ENDPOINTS_CONDITION} \
+                 GROUP BY source_base, target_base"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([&namespace], |row| {
+                let source: String = row.get(0)?;
+                let target: String = row.get(1)?;
+                let count: i64 = row.get(2)?;
+                Ok((source, target, count))
+            })?;
+            let mut counts = EdgeEndpointBaseCounts::default();
+            for row in rows {
+                let (source, target, count) = row?;
+                fold_endpoint_base_row(&mut counts, &source, &target, count as u64);
+            }
+            Ok(counts)
+        })
+        .await
+    }
+
+    async fn count_edges_by_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> Result<EdgeEndpointBaseCounts, StorageError> {
+        let namespaces: Vec<String> = namespaces
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_reader("count_edges_by_endpoint_base_in_namespaces", move |conn| {
+            let source_case = endpoint_base_case("source_id");
+            let target_case = endpoint_base_case("target_id");
+            let mut counts = EdgeEndpointBaseCounts::default();
+            for chunk in namespaces.chunks(NAMESPACE_COUNT_CHUNK_SIZE) {
+                let (where_clause, params) =
+                    build_edge_filter_sql_for_namespaces(chunk, &EdgeFilter::default());
+                let sql = format!(
+                    "SELECT {source_case} AS source_base, {target_case} AS target_base, COUNT(*) \
+                     FROM graph_edges{} GROUP BY source_base, target_base",
+                    with_live_endpoints(&where_clause)
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    let source: String = row.get(0)?;
+                    let target: String = row.get(1)?;
+                    let count: i64 = row.get(2)?;
+                    Ok((source, target, count))
+                })?;
+                for row in rows {
+                    let (source, target, count) = row?;
+                    fold_endpoint_base_row(&mut counts, &source, &target, count as u64);
+                }
+            }
+            Ok(counts)
         })
         .await
     }

@@ -16486,3 +16486,84 @@ async fn issue2757_deleted_notes_and_non_note_results() {
         ));
     }
 }
+
+/// #2911: the flat edge total is mostly provenance on a real store, so every
+/// density figure computed from it is inflated. `stats()` must hand a caller a
+/// denominator it can name.
+#[tokio::test]
+async fn stats_separates_structure_from_provenance_in_its_edge_counts() {
+    let f = pack();
+    let a = create_concept(&f, "Stats2911A").await;
+    let b = create_concept(&f, "Stats2911B").await;
+
+    let note = f
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "observation", "content": "stats 2911 provenance"}),
+        )
+        .await
+        .expect("note creation must succeed");
+    let note_id = note["id"].as_str().expect("note id").to_string();
+
+    f.dispatch(
+        "link",
+        json!({"source_id": a, "target_id": b, "relation": "extends"}),
+    )
+    .await
+    .expect("entity to entity link must succeed");
+    f.dispatch(
+        "link",
+        json!({"source_id": note_id, "target_id": a, "relation": "annotates"}),
+    )
+    .await
+    .expect("note to entity link must succeed");
+
+    let result = f
+        .dispatch("stats", json!({}))
+        .await
+        .expect("stats must succeed");
+
+    let edges = result["edges"].as_u64().expect("edges");
+    let structural = result["edges_structural"]
+        .as_u64()
+        .expect("edges_structural");
+    let annotates = result["edges_annotates"].as_u64().expect("edges_annotates");
+
+    assert_eq!(
+        edges, 2,
+        "fixture has one structural edge and one provenance edge"
+    );
+    assert_eq!(structural, 1, "only the entity-to-entity edge is structure");
+    assert_eq!(annotates, 1);
+    assert!(
+        structural < edges,
+        "the whole point: a density denominator taken from the flat total would be {edges}, \
+         and the honest one is {structural}"
+    );
+
+    let by_base = result["edges_by_endpoint_base"]
+        .as_object()
+        .expect("stats must include edges_by_endpoint_base");
+    assert_eq!(by_base["entity_entity"].as_u64(), Some(1));
+    assert_eq!(by_base["note_entity"].as_u64(), Some(1));
+    assert_eq!(by_base["entity_note"].as_u64(), Some(0));
+    assert_eq!(by_base["note_note"].as_u64(), Some(0));
+    assert_eq!(by_base["unresolved"].as_u64(), Some(0));
+
+    let summed: u64 = by_base.values().filter_map(Value::as_u64).sum();
+    assert_eq!(
+        summed, edges,
+        "the buckets must partition the same population `edges` counts, or the breakdown \
+         cannot be checked against anything"
+    );
+
+    // The older breakdown is unchanged and still agrees.
+    let by_relation = result["edges_by_relation"]
+        .as_object()
+        .expect("edges_by_relation must survive");
+    assert_eq!(by_relation.get("extends").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        by_relation.get("annotates").and_then(Value::as_u64),
+        Some(1)
+    );
+}

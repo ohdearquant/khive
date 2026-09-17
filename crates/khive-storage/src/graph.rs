@@ -8,11 +8,11 @@ use uuid::Uuid;
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, EdgeUpsertRequest, EdgeUpsertResult, GraphPath, GuardedBatchOutcome,
-    GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome, GuardedWriteOutcome, LinkId,
-    NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder,
-    StorageResult, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
+    EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertRequest, EdgeUpsertResult, GraphPath,
+    GuardedBatchOutcome, GuardedEdgeBatchUpsertOutcome, GuardedEdgeUpsertOutcome,
+    GuardedWriteOutcome, LinkId, NeighborCursor, NeighborHit, NeighborQuery, Page, PageRequest,
+    SeekCursor, SeekPage, SortOrder, StorageResult, TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -246,6 +246,36 @@ pub trait GraphStore: Send + Sync + 'static {
                 capability: StorageCapability::Graph,
                 operation: "count_edges_by_relation_in_namespaces".into(),
                 message: "this backend does not implement batched namespace relation counts".into(),
+            }),
+        }
+    }
+    /// Count live edges grouped by the base each endpoint resolves against.
+    ///
+    /// A relation breakdown cannot answer this: relations do not determine
+    /// endpoint bases, and the same relation appears on both sides of the
+    /// structure/provenance line. One aggregate query, same shape and cost as
+    /// the relation counts.
+    async fn count_edges_by_endpoint_base(&self) -> StorageResult<EdgeEndpointBaseCounts> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "count_edges_by_endpoint_base".into(),
+            message: "this backend does not implement endpoint-base edge counts".into(),
+        })
+    }
+    /// Count live edges by endpoint base across the given namespaces in one
+    /// aggregate query.
+    async fn count_edges_by_endpoint_base_in_namespaces(
+        &self,
+        namespaces: &[String],
+    ) -> StorageResult<EdgeEndpointBaseCounts> {
+        match namespaces.len() {
+            0 => Ok(EdgeEndpointBaseCounts::default()),
+            1 => self.count_edges_by_endpoint_base().await,
+            _ => Err(StorageError::Unsupported {
+                capability: StorageCapability::Graph,
+                operation: "count_edges_by_endpoint_base_in_namespaces".into(),
+                message: "this backend does not implement batched namespace endpoint-base counts"
+                    .into(),
             }),
         }
     }
