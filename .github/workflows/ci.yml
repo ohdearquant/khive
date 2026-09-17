@@ -969,14 +969,14 @@ jobs:
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log" 1
 
   coverage-measurement:
-    name: Coverage measurement (advisory)
+    name: Coverage measurement
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
-    # the gate would read an advisory measurement's timeout as a failure while
-    # the unavailable-measurement step never ran. This job-level value only
-    # bounds setup around the step.
-    timeout-minutes: 40
+    # the gate would read the timeout as a cancellation while the
+    # no-measurement step never ran and never reported why. This job-level
+    # value only bounds setup around the step, so it stays above it.
+    timeout-minutes: 75
     outputs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
@@ -1048,10 +1048,15 @@ jobs:
       - name: Compute coverage
         id: compute_coverage
         continue-on-error: true
-        # A step timeout is a step failure, which the unavailable-measurement
-        # path below already handles; the job stays green and the ratchet is
-        # skipped, as for any other measurement failure.
-        timeout-minutes: 28
+        # continue-on-error keeps this step from ending the job at once, so the
+        # step below can say what happened in the run summary. The job still
+        # fails: a step timeout is a step failure, and the measurement is what
+        # the ratchet needs, so an unfinished measurement is a red gate rather
+        # than a skipped one.
+        #
+        # The budget was 28 minutes and the step was cut at it on every run
+        # measured, so no run since the gate was added produced a measurement.
+        timeout-minutes: 55
         working-directory: crates
         # Keep #705's instrumented replay-test margin local to that test.
         # A global checkout override made unrelated recall tests wait 300s
@@ -1072,13 +1077,21 @@ jobs:
         if: steps.compute_coverage.outcome != 'success'
         continue-on-error: true
         run: |
-          echo "::warning title=Coverage measurement unavailable::cargo llvm-cov did not produce a result; the coverage ratchet will be skipped."
+          echo "::error title=Coverage measurement unavailable::cargo llvm-cov did not produce a result; the coverage ratchet cannot run."
           {
             echo "### Coverage measurement unavailable"
             echo
-            echo "The coverage command failed before producing a measurement."
-            echo "No coverage-regression judgment was made, so the ratchet job is skipped."
+            echo "The coverage command failed or ran out of its budget before producing a"
+            echo "measurement, so no coverage-regression judgment was made."
           } >> "$GITHUB_STEP_SUMMARY"
+      # Without this the job concluded success while producing nothing, the
+      # ratchet was skipped for want of an input, and CI gate forgave the skip.
+      # Every run then reported a coverage gate that had not judged anything.
+      - name: Fail when no measurement was produced
+        if: steps.compute_coverage.outcome != 'success'
+        run: |
+          echo "no coverage measurement was produced, so the ratchet has nothing to judge" >&2
+          exit 1
 
   coverage-ratchet:
     name: Coverage ratchet
@@ -1145,10 +1158,13 @@ jobs:
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # These jobs have job-level conditions: the push guard only applies
-          # to qualifying PR synchronizations, dependency review only to PRs,
-          # and the coverage ratchet only when a measurement is available.
+          # to qualifying PR synchronizations, and dependency review only to
+          # PRs. The coverage ratchet is NOT on that list: it skips exactly when
+          # the measurement it needs did not arrive, which is the state this
+          # gate exists to report, and forgiving the skip is what let five
+          # consecutive main pushes report a coverage gate that never ran.
           bad=$(echo "$NEEDS" | jq -r '
-            ["automerge-push-guard", "dependency-review", "coverage-ratchet"] as $allowed_skips
+            ["automerge-push-guard", "dependency-review"] as $allowed_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
                 (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
