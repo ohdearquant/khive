@@ -1125,9 +1125,14 @@ fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 /// How an elapsed handle-slot deadline is classified. ADR-005 pins the closed
 /// raw-SQL standalone exception (`sql_bridge.reader_open`) and reads on a
-/// standalone writer (`sql_bridge.reader_operation`) to
-/// `StorageError::Timeout`; ordinary reader-pool saturation reports the typed
-/// `AdmissionTimeout` through `ConnectionPool::resolve_reader_checkout`.
+/// standalone writer to `StorageError::Timeout`; ordinary reader-pool
+/// saturation reports the typed `AdmissionTimeout` through
+/// `ConnectionPool::resolve_reader_checkout`.
+///
+/// Classification is decided by this enum and never by the operation label.
+/// The label names the caller's own read (`query_row`, `writer.query_all`, and
+/// so on) so that a recorded maximum reader hold can be attributed to the read
+/// that caused it.
 #[derive(Clone, Copy)]
 enum SlotTimeoutClass {
     Admission,
@@ -1458,23 +1463,12 @@ where
         // A read inside an admitted write transaction still counts against the
         // reader budget, but request cancellation cannot skip that admission
         // and strand the transaction between statements.
-        Some(
-            acquire_reader_handle_slot(
-                &pool,
-                "sql_bridge.reader_operation",
-                SlotTimeoutClass::ReaderContract,
-            )
-            .await?,
-        )
+        Some(acquire_reader_handle_slot(&pool, operation, SlotTimeoutClass::ReaderContract).await?)
     } else {
         Some(
             crate::await_request_read_phase(
-                "sql_bridge.reader_operation",
-                acquire_reader_handle_slot(
-                    &pool,
-                    "sql_bridge.reader_operation",
-                    SlotTimeoutClass::ReaderContract,
-                ),
+                operation,
+                acquire_reader_handle_slot(&pool, operation, SlotTimeoutClass::ReaderContract),
             )
             .await??,
         )
@@ -1792,7 +1786,7 @@ impl khive_storage::SqlReader for SqliteReader {
         {
             return run_pool_reader_query(
                 Arc::clone(&self.pool),
-                "sql_bridge.reader_operation",
+                "query_row",
                 move |scope, conn| {
                     execute_query_row_interruptibly(
                         scope,
@@ -1842,7 +1836,7 @@ impl khive_storage::SqlReader for SqliteReader {
         {
             return run_pool_reader_query(
                 Arc::clone(&self.pool),
-                "sql_bridge.reader_operation",
+                "query_all",
                 move |scope, conn| {
                     execute_query_interruptibly(scope, conn, &statement, "query_all", false, true)
                 },
@@ -1886,7 +1880,7 @@ impl khive_storage::SqlReader for SqliteReader {
         {
             return run_pool_reader_query(
                 Arc::clone(&self.pool),
-                "sql_bridge.reader_operation",
+                "query_page",
                 move |scope, conn| {
                     execute_query_page_interruptibly(
                         scope,
@@ -2035,7 +2029,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 admit_reader_capability_sql(&statement, transaction_control, "writer.query_row")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
-                    "sql_bridge.reader_operation",
+                    "writer.query_row",
                     move |scope, conn| {
                         execute_query_row_interruptibly(
                             scope,
@@ -2102,7 +2096,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 admit_reader_capability_sql(&statement, transaction_control, "writer.query_all")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
-                    "sql_bridge.reader_operation",
+                    "writer.query_all",
                     move |scope, conn| {
                         execute_query_interruptibly(
                             scope,
@@ -2170,7 +2164,7 @@ impl khive_storage::SqlReader for SqliteWriter {
                 admit_reader_capability_sql(&statement, transaction_control, "writer.query_page")?;
                 return run_pool_reader_query(
                     Arc::clone(&self.pool),
-                    "sql_bridge.reader_operation",
+                    "writer.query_page",
                     move |scope, conn| {
                         execute_query_page_interruptibly(
                             scope,
@@ -5387,7 +5381,7 @@ mod tests {
             matches!(
                 &blocked,
                 Err(StorageError::AdmissionTimeout { operation, .. })
-                    if operation.as_ref() == "sql_bridge.reader_operation"
+                    if operation.as_ref() == "query_row"
             ),
             "a second logical read must contend with the admitted transaction \
              and fail at the bounded pooled-admission stage; got {blocked:?}"
@@ -8805,7 +8799,7 @@ mod tests {
             matches!(
                 &starved,
                 Err(StorageError::AdmissionTimeout { operation, .. })
-                    if operation.as_ref() == "sql_bridge.reader_operation"
+                    if operation.as_ref() == "writer.query_row"
             ),
             "queue-backed read with reader permits saturated must time out \
              at the shared pooled-reader admission stage; \
@@ -9204,6 +9198,91 @@ mod tests {
         assert_eq!(
             after_atomic_unit.writer_task_acquisitions,
             before.writer_task_acquisitions
+        );
+    }
+
+    /// `max_completed_hold_operation` must name the caller's own read, so a
+    /// recorded maximum hold can be attributed to the query that caused it.
+    ///
+    /// The pool's attribution machinery was already correct and covered by
+    /// `longest_completed_hold_names_its_operation` in `pool.rs`. What defeated
+    /// it was this bridge: every pooled read handed the slot one shared
+    /// constant, so the field was two-valued across the whole product while
+    /// still returning a plausible-looking name (#2793).
+    ///
+    /// The discriminating assertion is the last one, that the two arms DIFFER.
+    /// A single constant satisfies any per-arm expectation you write; only a
+    /// pair of distinct labels shows that the caller's name reached the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_completed_hold_operation_names_the_caller_read_not_a_bridge_constant() {
+        async fn recorded_hold_operation(through_writer: bool) -> (Option<&'static str>, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hold_attribution.db");
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: Some(path),
+                    write_queue_enabled: Some(true),
+                    write_routing_strict: true,
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            );
+            {
+                let guard = pool.writer().unwrap();
+                guard
+                    .conn()
+                    .execute_batch("CREATE TABLE IF NOT EXISTS hold_attr (id INTEGER PRIMARY KEY)")
+                    .unwrap();
+            }
+            let bridge = SqlBridge::new(Arc::clone(&pool), true);
+            let statement = SqlStatement {
+                sql: "SELECT id FROM hold_attr".into(),
+                params: vec![],
+                label: None,
+            };
+            if through_writer {
+                let mut w = bridge.writer().await.unwrap();
+                w.query_row(statement).await.unwrap();
+            } else {
+                let mut r = bridge.reader().await.unwrap();
+                r.query_all(statement).await.unwrap();
+            }
+            let snapshot = pool.reader_acquisition_snapshot();
+            (
+                snapshot.max_completed_hold_operation,
+                snapshot.completed_pooled_checkouts,
+            )
+        }
+
+        let (read_side, read_completed) = recorded_hold_operation(false).await;
+        let (write_side, write_completed) = recorded_hold_operation(true).await;
+
+        assert!(
+            read_completed >= 1 && write_completed >= 1,
+            "both arms must complete a pooled checkout, or the attribution \
+             below is reading an empty population; got {read_completed} and \
+             {write_completed}"
+        );
+        // The discriminating assertion runs FIRST, deliberately. Under the
+        // shared-constant behaviour both arms collapse to one value, and if a
+        // per-arm equality ran ahead of this it would fire instead, so the
+        // assertion that actually separates "attributed" from "constant" would
+        // never execute in the case it exists for.
+        assert_ne!(
+            read_side, write_side,
+            "the recorded operation must tell two different reads apart; a \
+             shared bridge constant makes these equal while still looking \
+             like an answer"
+        );
+        assert_eq!(
+            read_side,
+            Some("query_all"),
+            "a pooled read drawn through the reader must record its own operation"
+        );
+        assert_eq!(
+            write_side,
+            Some("writer.query_row"),
+            "a pooled read drawn through the writer must record its own operation"
         );
     }
 }
