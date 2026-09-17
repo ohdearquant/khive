@@ -1366,6 +1366,9 @@ impl KhiveRuntime {
         // the single-writer task instead of the pool's writer mutex. A lookup
         // failure degrades to the legacy mutex path rather than failing the merge.
         let writer_task = pool.writer_task_handle().ok().flatten();
+        // Minted before the transaction so the tombstone and the EntityMerged
+        // event appended after commit carry the same id.
+        let merge_event_id = Uuid::new_v4();
 
         let (mut summary, updated_entity) = if let Some(writer_task) = writer_task {
             writer_task
@@ -1383,6 +1386,7 @@ impl KhiveRuntime {
                         pack_rules,
                         validation,
                         MergeTxLimits::default(),
+                        merge_event_id,
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -1412,6 +1416,7 @@ impl KhiveRuntime {
                         pack_rules,
                         validation,
                         MergeTxLimits::default(),
+                        merge_event_id,
                     )
                     .map_err(|error| match error {
                         MergeEntitySqlError::Sqlite(error) => error,
@@ -1483,7 +1488,7 @@ impl KhiveRuntime {
             if validation == EntityMergeValidation::Forced {
                 payload["force"] = serde_json::Value::Bool(true);
             }
-            let event = khive_storage::event::Event::new(
+            let mut event = khive_storage::event::Event::new(
                 updated_entity.namespace.clone(),
                 "merge",
                 EventKind::EntityMerged,
@@ -1492,6 +1497,7 @@ impl KhiveRuntime {
             )
             .with_target(summary.kept_id)
             .with_payload(payload);
+            event.id = merge_event_id;
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
             })?;
@@ -2870,6 +2876,7 @@ fn merge_entity_sql(
     pack_rules: Vec<EdgeEndpointRule>,
     validation: EntityMergeValidation,
     limits: MergeTxLimits,
+    merge_event_id: Uuid,
 ) -> Result<(MergeSummary, Entity), MergeEntitySqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Config-scaled fanout (one FTS/vector delete per table, one contract rule
@@ -3310,7 +3317,6 @@ fn merge_entity_sql(
             &namespace,
         )?;
 
-        let merge_event_id = Uuid::new_v4();
         conn.execute(
             "UPDATE entities \
              SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1 \
@@ -8610,6 +8616,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_tombstone_carries_the_id_of_its_merge_event() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "Absorbed", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let [event] = events.items.as_slice() else {
+            panic!(
+                "expected one EntityMerged event, got {}",
+                events.items.len()
+            );
+        };
+        assert_eq!(event.payload["from_id"], serde_json::json!(from.id));
+
+        let tombstone = rt
+            .get_entity_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("tombstone row still present");
+        assert_eq!(
+            tombstone.merge_event_id,
+            Some(event.id),
+            "the tombstone must name the event that recorded its merge"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(kept.merge_event_id, None);
+    }
+
+    #[tokio::test]
     async fn get_entity_on_plain_soft_delete_stays_bare_not_found() {
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -11390,6 +11456,7 @@ mod tests {
                     pack_rules,
                     EntityMergeValidation::LegacyKind,
                     limits,
+                    Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
                     MergeEntitySqlError::Sqlite(error) => error,
@@ -11431,6 +11498,7 @@ mod tests {
                         max_rows: usize::MAX,
                         max_bytes: usize::MAX,
                     },
+                    Uuid::new_v4(),
                 )
                 .map_err(|error| match error {
                     MergeEntitySqlError::Sqlite(error) => error,
