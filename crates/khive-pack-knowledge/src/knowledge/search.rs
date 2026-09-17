@@ -16,7 +16,9 @@ use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
-use super::lexical_timeout::{LexicalPass, LexicalPhase, LexicalStage, LexicalTimeout};
+use super::lexical_timeout::{
+    LexicalBound, LexicalPass, LexicalPhase, LexicalStage, LexicalTimeout,
+};
 use super::matching;
 use super::schema::{Atom, ComposeParams, Domain, SearchParams, SuggestParams};
 use super::scoring::{
@@ -507,8 +509,15 @@ async fn rarest_fts_terms_first(
         // Aggregating inside SQLite avoids materializing up to 501 owned
         // SqlRows just to discard their rowids and count them in Rust.
         let rows = stage
-            .read(
+            .read_bounded(
                 LexicalPhase::TermFrequency,
+                LexicalBound::OrderingProbe,
+                // The caller scoped this same budget as the read deadline;
+                // both sides call `rarity_probe_budget()` so they cannot
+                // disagree, and recording it here is what lets the timeout
+                // record name the 500 ms that governed the read instead of
+                // the stage's 2000 ms (issue #2879).
+                rarity_probe_budget(),
                 reader.query_all(term_frequency_statement(&term)),
             )
             .await?;
@@ -897,8 +906,14 @@ async fn fetch_fts_candidates(
         // back identically. It is the unoptimized path, not a failure path:
         // the ordering is a hint about which term to query first, and every
         // term is queried either way. The recorded timeout still rides out on
-        // `stage.timeout`, so the response says the stage degraded and names
-        // `term_frequency` as the phase.
+        // `stage.timeout`, so the expiry is disclosed rather than swallowed --
+        // but it is disclosed as `degraded.lexical_ordering_probe_timeout`,
+        // NOT as `degraded.lexical_timeout`, which stays the flag for a
+        // candidate fetch that was actually cut short. Reporting both under
+        // one flag is what issue #2879 measured: on one serving process 86 of
+        // 196 timeout records were this graceful fallback, every one of them
+        // at 500-532 ms against a 2000 ms stage budget that had not expired,
+        // wearing the same flag and the same wording as a real cut.
         let arrival_order = terms.clone();
         let probe_budget = rarity_probe_budget();
         let probed = khive_storage::scope_request_read_deadline(probe_budget, async {
@@ -2062,8 +2077,50 @@ fn attach_lexical_timeout_degradation(out: &mut Value, timeouts: &[LexicalTimeou
     {
         out["degraded"] = json!({});
     }
+
+    // `lexical_timeout` STAYS COARSE: any record at all sets it, exactly as
+    // before. It is tempting to narrow it to "a candidate fetch was cut", and
+    // issue #2879 asked for that, but it cannot be done without turning this
+    // boolean into a cross-namespace disclosure channel.
+    //
+    // The later phases (`phase_a_rowids`, `phase_b_hydration`,
+    // `eligibility_fallback`, the namespace probes) are reachable only when the
+    // GLOBAL index matched, which can happen on another namespace's rows when
+    // the local ones do not match at all. That is why their records are
+    // operator-only and withheld from `lexical_timeout_details`. A boolean that
+    // is true when one of them timed out and false when only the ordering probe
+    // did would republish the very fact the detail list is censored to hide:
+    // the caller would learn that a foreign row matched by observing a flag
+    // appear. Measured by
+    // `mixed_pass_capability_marker_does_not_reveal_foreign_matches`, which is
+    // the guard that catches exactly this and did.
+    //
+    // So the coarse flag is load-bearing PRECISELY because it is coarse, and
+    // the ordering-probe fallback is reported ADDITIVELY beside it instead.
     out["degraded"]["lexical_timeout"] = json!(true);
     out["degraded"]["lexical_timeout_instrumented"] = json!(true);
+
+    if timeouts
+        .iter()
+        .any(|detail| detail.bound == LexicalBound::OrderingProbe)
+    {
+        // The ordering hint was skipped and the terms were queried in arrival
+        // order. Safe to publish, and this is the reason it is a separate key
+        // rather than a narrowing of the one above: the probe runs in
+        // `term_frequency`, a PUBLIC phase whose entry does not depend on corpus
+        // contents, so its presence is already disclosed in the detail list and
+        // this flag reveals nothing new. A flag keyed on the later phases would
+        // not have that property.
+        out["degraded"]["lexical_ordering_probe_timeout"] = json!(true);
+    }
+
+    // ONE details list, with the population it always had. Splitting the
+    // BOOLEANS is the fix; splitting the disclosure would have been a
+    // regression, because `term_frequency` is one of only two public phases and
+    // is by far the most common, so a separate list would have emptied the
+    // public timing surface for the majority of timeouts. Each record now
+    // carries `bound`, which is what lets a caller tell the two apart without
+    // losing the timings.
     let details: Vec<_> = timeouts
         .iter()
         .filter(|detail| detail.phase.public())

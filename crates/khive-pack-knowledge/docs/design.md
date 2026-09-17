@@ -129,17 +129,45 @@
   step (embedding rerank, body-line counts, member-size pricing) on the live ambient
   `khive_storage::request_read_is_cancelled()` check rather than the stage-local timeout flag, so a
   lexical-only degradation with request time left to spare still gets a full rerank pass; the
-  `lexical_timeout` degradation flag is still attached to the response whenever the stage itself
-  timed out, independent of whether the rest of the request completed normally.
-- `degraded.lexical_timeout` remains a boolean. On instrumented builds, every response with
-  `degraded.lexical_timeout=true` also carries `degraded.lexical_timeout_instrumented=true`,
-  regardless of whether any phase is withheld. This marker identifies build capability, not
+  `lexical_timeout` degradation flag is still attached to the response whenever the stage's own
+  candidate fetch was cut short, independent of whether the rest of the request completed normally.
+- One read inside the stage runs under a budget tighter than the stage's: the rarity probe, bounded
+  at a quarter of the stage budget. Its expiry is not a cut fetch. The probe produces an ORDERING of
+  the terms, every term is queried either way, and the fetch that follows still has the rest of the
+  stage budget, so the response carries the rows a build without the optimization would have
+  returned. It is reported ADDITIVELY as `degraded.lexical_ordering_probe_timeout`, a boolean set
+  whenever any pass fell back to arrival order, BESIDE `degraded.lexical_timeout` rather than
+  instead of it.
+- `degraded.lexical_timeout` stays COARSE — any lexical timeout sets it — and that is a
+  privacy property, not an oversight. Narrowing it to mean "the candidate fetch was cut" would make
+  it false for a probe-only expiry and true once a later phase timed out; the later phases are
+  reachable only through global-index matches, so the flag would then tell a caller that a row in
+  another namespace matched. That is the same fact the operator-only records are withheld from
+  `lexical_timeout_details` to protect, and it would be republished as a boolean. The
+  ordering-probe flag is safe to add beside it precisely because the probe runs in `term_frequency`,
+  a public phase whose entry does not depend on corpus contents. Guarded by
+  `mixed_pass_capability_marker_does_not_reveal_foreign_matches`, which requires the public JSON to
+  be byte-identical across corpora that differ only in a foreign match. `lexical_timeout_details` stays a SINGLE list covering both, with the population it always
+  had: `term_frequency` is one of only two public phases and is the most common timeout by a wide
+  margin, so giving the probe a separate list would have emptied the public timing surface for the
+  majority of timeouts. A caller separating a fallback from a cut reads `bound` on the records it
+  was given, and takes the absence of a stage-bounded record as "not disclosed" rather than as
+  "did not happen". Each timeout record carries `bound`, naming which budget governed the read
+  (`stage` or `ordering_probe`), and `read_budget_ms`, the budget that governed THAT read — the two
+  fields that let a caller separate the cases without losing the timings. `configured_budget_ms`
+  and `effective_budget_ms` keep their existing meaning and both describe the stage at its entry,
+  which is why a probe-bounded record needs the third number: without it the record reports a read
+  cut at 501 ms against a 1999 ms allowance that had not expired (issue #2879).
+- `degraded.lexical_timeout` remains a boolean. On instrumented builds, every response carrying ANY
+  timeout record also carries `degraded.lexical_timeout_instrumented=true` — including one whose only
+  record is an ordering-probe fallback, because the marker identifies build capability and not
+  whether rows are missing — regardless of whether any phase is withheld. This marker identifies build capability, not
   hidden execution details; healthy lexical responses omit it entirely, never emitting false.
   When a timed-out read's phase can be disclosed
   without exposing global-index match presence, `degraded.lexical_timeout_details` adds at most
   one record per lexical pass (`full`, `subquery_1`, `subquery_2`), at most three records total.
-  Each record contains `pass`, `phase`, `stage_elapsed_ms`, `operation_elapsed_ms`,
-  `configured_budget_ms`, and `effective_budget_ms`. Milliseconds are monotonic durations,
+  Each record contains `pass`, `phase`, `bound`, `stage_elapsed_ms`, `operation_elapsed_ms`,
+  `configured_budget_ms`, `effective_budget_ms`, and `read_budget_ms`. Milliseconds are monotonic durations,
   truncated to integers and captured when the failed read returns. The effective budget is the
   remaining deadline allowance at stage entry, including an earlier parent deadline; it is not
   reset after cancellation or sampled after leaving the scope. Stage elapsed includes earlier
