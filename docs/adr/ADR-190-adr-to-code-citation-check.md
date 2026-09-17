@@ -140,7 +140,11 @@ One instrument, `scripts/lint-adr-citations.py`, enforcing:
 
 - **R1 — the path resolves.** Every pointer citation in an `accepted` ADR resolves against
   `git ls-files`. A trailing `/` denotes a directory and resolves if any tracked file sits under
-  it. Pointers in `Proposed` ADRs are listed as desired state and do not fail.
+  it. Pointers in `Proposed` ADRs are listed as desired state and do not fail. A `Superseded` or
+  `Deprecated` ADR is a record **in its entirety**: its pointers are neither failed nor reported,
+  because the decision it describes is no longer the one in force and the tree it pointed at is no
+  longer the tree it was written against. That is the status half of the role split, and stating it
+  here is what keeps a future reader from narrowing R1 to "accepted fails, everything else warns".
 - **R2 — the quoted passage is present.** A citation that quotes source text must find that text
   exactly once in the file it cites. Zero occurrences fails; more than one fails asking for a
   longer quote, because a quote that matches twice keeps matching after the passage it was written
@@ -188,10 +192,15 @@ and small languages accrete.
 **Neutral.** The 31 never-existed citations under proposed ADRs stay exactly as they are and are
 reported, not failed. They stop counting as breaks, which is the only thing wrong with them today.
 
-**Open, for the sign-off.** PR #2917 fixed the 14 dead citations using this ADR's record/pointer
-split by hand, but wrote its three record annotations as prose rather than in the marker grammar
-above. Those three become markers in the change that lands the check; until then the check would
-flag them.
+**Carried into the implementation.** PR #2917 fixed the 14 dead citations using this ADR's
+record/pointer split by hand, but wrote its three record annotations as prose rather than in the
+marker grammar above. Those three become markers in the same change that lands the check, and that
+change does not wire the check into `scripts/ci.sh` until the marker verifier's three arms each have
+a must-fail control: a `removed in <sha>` whose sha does not delete the path, a
+`moved to <path> in <sha>` whose destination does not resolve, and a `never landed on main` naming a
+path that did land. An exemption grammar whose verifier is untested is a skip list with better
+manners, and the arm most likely to be silently dead is the last one, because its query is the one
+that returns empty for two different reasons.
 
 ## Alternatives considered
 
