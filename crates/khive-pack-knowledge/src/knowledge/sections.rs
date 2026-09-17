@@ -759,10 +759,7 @@ async fn validate_existing_import_identities(
     token: &NamespaceToken,
     prepared_files: &[PreparedImportFile],
 ) -> Result<(), RuntimeError> {
-    if !prepared_files
-        .iter()
-        .any(|prepared| prepared.canonical_id.is_some())
-    {
+    if prepared_files.is_empty() {
         return Ok(());
     }
 
@@ -772,43 +769,76 @@ async fn validate_existing_import_identities(
         .reader()
         .await
         .map_err(|error| sql_err("knowledge.import identity preflight reader", error))?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT slug, source_uri, properties FROM knowledge_atoms \
-                  WHERE namespace = ?1 AND deleted_at IS NULL"
-                .into(),
-            params: vec![SqlValue::Text(namespace)],
-            label: Some("knowledge.import.identity_preflight".into()),
-        })
-        .await
-        .map_err(|error| sql_err("knowledge.import identity preflight", error))?;
-
     let mut slugs_by_identity: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in &rows {
-        let Some(existing_slug) = row_str(row, "slug") else {
-            continue;
-        };
-        for identity in existing_atom_identity_keys(row) {
-            let slugs = slugs_by_identity.entry(identity).or_default();
-            if !slugs.contains(&existing_slug) {
-                slugs.push(existing_slug.clone());
+    if prepared_files
+        .iter()
+        .any(|prepared| prepared.canonical_id.is_some())
+    {
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT slug, source_uri, properties FROM knowledge_atoms \
+                      WHERE namespace = ?1 AND deleted_at IS NULL"
+                    .into(),
+                params: vec![SqlValue::Text(namespace.clone())],
+                label: Some("knowledge.import.identity_preflight".into()),
+            })
+            .await
+            .map_err(|error| sql_err("knowledge.import identity preflight", error))?;
+        for row in &rows {
+            let Some(existing_slug) = row_str(row, "slug") else {
+                continue;
+            };
+            for identity in existing_atom_identity_keys(row) {
+                let slugs = slugs_by_identity.entry(identity).or_default();
+                if !slugs.contains(&existing_slug) {
+                    slugs.push(existing_slug.clone());
+                }
             }
         }
     }
 
     for prepared in prepared_files {
-        let Some(canonical_id) = &prepared.canonical_id else {
-            continue;
-        };
-        if let Some(existing_slugs) = slugs_by_identity.get(&prepared.slug) {
-            if let Some(existing_slug) = existing_slugs
-                .iter()
-                .find(|existing_slug| *existing_slug != &prepared.slug)
+        if let Some(canonical_id) = &prepared.canonical_id {
+            if let Some(existing_slugs) = slugs_by_identity.get(&prepared.slug) {
+                if let Some(existing_slug) = existing_slugs
+                    .iter()
+                    .find(|existing_slug| *existing_slug != &prepared.slug)
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "canonical import identity {canonical_id:?} in {:?} maps to slug {:?}, \
+                         but existing atom {:?} claims the same identity; refusing to create a duplicate",
+                        prepared.source_path, prepared.slug, existing_slug
+                    )));
+                }
+            }
+        }
+
+        // Match upsert_atoms' target checks before any earlier file can be written.
+        // Path-only imports need just these indexed lookups, not the identity scan.
+        let existing = reader
+            .query_row(SqlStatement {
+                sql: "SELECT tags, deleted_at FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 LIMIT 1".into(),
+                params: vec![
+                    SqlValue::Text(prepared.slug.clone()),
+                    SqlValue::Text(namespace.clone()),
+                ],
+                label: Some("knowledge.import.target_preflight".into()),
+            })
+            .await
+            .map_err(|error| sql_err("knowledge.import target preflight", error))?;
+        if let Some(row) = existing {
+            let slug = &prepared.slug;
+            if row_str(&row, "tags")
+                .unwrap_or_default()
+                .contains("type:domain")
             {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "canonical import identity {canonical_id:?} in {:?} maps to slug {:?}, \
-                     but existing atom {:?} claims the same identity; refusing to create a duplicate",
-                    prepared.source_path, prepared.slug, existing_slug
+                    "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
+                )));
+            }
+            if super::util::row_i64(&row, "deleted_at").is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "atom slug {slug:?} was previously deleted; choose a new slug"
                 )));
             }
         }
@@ -925,15 +955,19 @@ impl KnowledgeHandlers {
         let mut upserted = 0usize;
         let mut section_results: Vec<Value> = Vec::with_capacity(p.sections.len());
 
+        let mut section_types = Vec::with_capacity(p.sections.len());
         for (index, su) in p.sections.iter().enumerate() {
             let record = format!("section[{index}]");
             let stype = parse_section_type(&su.section_type)?;
             validate_section_content(&su.content)?;
-            // Secret gate: scan section content and heading before any write.
             khive_runtime::secret_gate::check_at(&su.content, &record, "content")?;
             if let Some(ref h) = su.heading {
                 khive_runtime::secret_gate::check_at(h, &record, "heading")?;
             }
+            section_types.push(stype);
+        }
+
+        for (su, stype) in p.sections.iter().zip(section_types) {
             let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
             let sort_order = su.sort_order.unwrap_or_else(|| {
