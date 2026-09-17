@@ -154,10 +154,28 @@ specified in ADR-063.
 
 ### Rule 9 — Tenant isolation is a storage-layer property, not a property of this surface (Rev 8, additive)
 
-Rules 1 and 2 make by-ID `update`, `delete` and edge creation namespace-agnostic: a globally
-unique id resolves without a namespace check at the store, the runtime or the handler. Rule 9
-states the deployment consequence, so that the absence of a check is read as the design it is
-rather than as an omission to repair.
+Rules 1 and 2 make by-ID resolution namespace-agnostic: a globally unique id resolves without a
+namespace check at the store, the runtime or the handler. Rule 9 states the deployment consequence,
+so that the absence of a check is read as the design it is rather than as an omission to repair.
+
+**The population is every parameter that declares the unscoped-by-ID contract, not a list of verbs.**
+The schema declares it per parameter, and the carriers today are `get(id)`, `update(id)`,
+`delete(id)`, `merge(into_id)` and `merge(from_id)`, `link(source_id)` and `link(target_id)`, the
+gtd pack's lifecycle ids on `complete(id)` and `transition(id)`, and the brain pack's feedback
+`target_id`. Any parameter added later under the same contract joins the population by carrying it,
+which is why the rule is written against the contract rather than against the names.
+`neighbors(node_id)` is the one narrower variant: its _prefix_ form resolves within the caller's
+primary namespace, while a full UUID is still unchecked, so it is a smaller opening and not an
+exception to the rule.
+
+**How an id resolves, since Rule 3b's visible set makes the difference load-bearing.** A full UUID is
+used as given. A short prefix on a parameter carrying this contract resolves through an unfiltered
+lookup: no namespace predicate at all, not the caller's visible set. Visibility-bounded resolution
+and unfiltered resolution are different reaches, and only the unscoped-by-ID parameters take the
+second one. Rule 3b's visible set governs multi-record reads; it does not narrow by-ID resolution,
+and a deployment must not read it as if it did. `neighbors`' prefix form is the exception noted
+above. The entity-name fallback, where a verb has one, does scope to the caller's primary
+namespace.
 
 1. **The gate's input contract is caller-side.** A gate check receives the acting actor, the
    caller's namespace, the verb, the raw arguments, and a context value. It does not receive the
@@ -619,7 +637,11 @@ change.
 **Namespace clarification.** Namespace is attribution and a gate policy-input — never a
 storage boundary. The invariant is absolute regardless of Gate implementation:
 storage is never partitioned by namespace, and by-ID ops resolve a globally-unique UUID with
-no namespace check. The only difference between a permissive and an isolating deployment is which Gate is installed. The gate receives
+no namespace check. _(Corrected in Rev 8: this passage previously continued "The only
+difference between a permissive and an isolating deployment is which Gate is installed." For by-ID
+ops that is false in the direction that matters — no Gate isolates them, because of the input
+contract stated next. The difference a Gate makes is which callers and verbs are admitted; the
+difference isolation makes is which store the caller reaches. See Rule 9.)_ The gate receives
 the acting actor, the request namespace, the verb, the raw arguments and a context value, and
 returns allow/deny. _(Corrected in Rev 8: this sentence previously read "and the target records'
 attribution as policy input". The request type carries the caller's namespace and the unresolved
@@ -627,8 +649,12 @@ arguments; no record is fetched before the check, so no target attribution is av
 Rule 9 states what follows from that.)_
 
 - AllowAllGate ignores all of it and returns allow.
-- A TenantGate MAY key per-tenant isolation on the namespace string (or any attribution
-  field). That is the gate reading namespace as policy input — not storage partitioning on it.
+- A TenantGate MAY key policy on the caller's namespace string (or any attribution field it
+  receives). That is the gate reading namespace as policy input — not storage partitioning on it.
+  _(Corrected in Rev 8: this bullet previously read "MAY key per-tenant isolation on the namespace
+  string". It cannot: the value it keys on describes the caller, and the target of a by-ID op is
+  never presented to it, so what it keys is admission, not isolation. Per-tenant isolation is the
+  storage-layer property of Rule 9 point 4.)_
 
 How an operator's gate maps authenticated identities to allow/deny is operator policy,
 implemented behind the trait. This ADR specifies only the gate's input contract and the
