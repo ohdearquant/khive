@@ -158,7 +158,20 @@ async fn each_catch_site_captures_its_phase_and_identical_structured_event() {
             "configured_budget_ms": 2000, "effective_budget_ms": 2000,
         });
         assert_eq!(serde_json::to_value(detail).unwrap(), expected, "{label}");
-        assert_eq!(*events.0.lock().unwrap(), vec![expected], "{label}");
+        // The log record now also carries the completed-read breakdown, whose
+        // value differs per catch site by construction: it names the phases that
+        // finished before this one was cut. Assert it is present at every site,
+        // then compare the rest, so "identical structured event" still means the
+        // fixed fields and the new field is not silently optional.
+        let mut logged = events.0.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1, "{label}");
+        let mut logged = logged.remove(0);
+        let completed = logged
+            .as_object_mut()
+            .expect("event is an object")
+            .remove("completed_reads");
+        assert!(completed.is_some(), "no completed-read breakdown: {label}");
+        assert_eq!(logged, expected, "{label}");
         assert!(
             outcome.atoms.is_empty(),
             "base drops the unfinished term: {label}"

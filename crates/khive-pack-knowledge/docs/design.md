@@ -155,6 +155,11 @@
   text, row identifiers, namespace names, row counts, or byte counts. A phase identifies where
   the timeout was observed, not why the allowance was exhausted. Pooled-reader waiting occurs
   inside query calls and cannot be separated from execution without separate backend timing.
+  The tracing record also carries `completed_reads`: for each phase that ran a read which did not
+  time out, its total milliseconds and read count, in first-run order, so a cut read that ran
+  briefly still shows where the rest of the stage went. Read counts in the later phases grow with
+  terms, probe widenings and hydration chunks, so like their timings they reflect global-index
+  matches; the breakdown is tracing-only and never enters `lexical_timeout_details`.
 - `load_domain_member_token_sizes` (member-token pricing for `suggest`'s `results[].size`) returns
   a `(HashMap<String, usize>, bool)` — the `bool` marks whether the whole batch timed out before
   any domain could be measured. A single `query_all` call has no partial-completion state, so one
