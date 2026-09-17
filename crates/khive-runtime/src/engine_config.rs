@@ -214,7 +214,12 @@ pub struct EngineConfig {
 /// Rule 3b). Writes remain pinned to `'local'`. An explicit `namespace=` request
 /// param is a precise single-namespace escape and is not widened. A cloud gate
 /// may also consult this list as policy input at its own layer.
+///
+/// The table is closed. Both keys above are authorization input, so a misspelled
+/// key fails startup instead of silently applying its default, and a `[gate]` key
+/// written here is reported rather than discarded.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActorConfig {
     /// Namespace identifier used as the default actor for all operations.
     ///
@@ -787,8 +792,8 @@ pub struct ExecSectionConfig {
 /// - `[display]`: rendering timezone (ADR-169)
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[gate]`, `[brain]`, and `[telemetry]` tables are closed with
-/// `deny_unknown_fields` so a misspelled policy key always fails startup.
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, and `[telemetry]` tables are closed
+/// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     #[serde(default)]
@@ -2848,6 +2853,44 @@ grant_unattributed = false
         let gate = config.gate.expect("gate section");
         assert_eq!(gate.granted_actors, vec!["lambda:enrolled"]);
         assert!(!gate.grant_unattributed);
+    }
+
+    #[test]
+    fn unknown_actor_key_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Control first, in the same test: the identical table carrying only
+        // supported keys must load, so the refusal below is attributable to the
+        // unknown key rather than to the fixture.
+        let supported = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:example"
+visible_namespaces = ["lambda:other"]
+"#,
+        );
+        KhiveConfig::load(Some(&supported))
+            .expect("a config using only supported [actor] keys must parse")
+            .expect("config exists");
+
+        // A `[gate]` key written one table too high. Silently discarding it
+        // leaves anonymous admission at whatever it already was while the file
+        // on disk says otherwise, so it has to fail startup.
+        let misplaced = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:example"
+grant_unattributed = false
+"#,
+        );
+        let err = KhiveConfig::load(Some(&misplaced))
+            .expect_err("a [gate] key written under [actor] must fail startup");
+        assert!(
+            err.to_string().contains("grant_unattributed"),
+            "the refusal must name the offending key, got: {err}"
+        );
     }
 
     #[test]
