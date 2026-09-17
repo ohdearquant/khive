@@ -21,7 +21,10 @@ ADR-063 (comm pack principal model and remote backend isolation)
 deployment that serves more than one tenant, and corrects three statements in Rule 4: one described
 a policy input the gate's request type does not carry, one said the installed Gate is the only
 difference between a permissive and an isolating deployment, and one said a TenantGate may key
-per-tenant isolation on the namespace string. Rev 8 adds no check anywhere and changes no
+per-tenant isolation on the namespace string. Rule 9 names the namespace field the gate receives as
+the namespace the request is directed at rather than the caller's own, since an explicit `namespace`
+argument replaces the identity default before the check runs, which decides how a policy has to be
+written. Rev 8 adds no check anywhere and changes no
 behaviour: it writes down a property the code already has, because the absence of the statement was
 being read as an oversight to fix at the store, which Rules 1 and 2 forbid. Rules 0 through 8 are
 unchanged.
@@ -161,29 +164,42 @@ namespace check at the store, the runtime or the handler. Rule 9 states the depl
 so that the absence of a check is read as the design it is rather than as an omission to repair.
 
 **The population is every parameter that declares the unscoped-by-ID contract, not a list of verbs.**
-The schema declares it per parameter, and the carriers today are `get(id)`, `update(id)`,
-`delete(id)`, `merge(into_id)` and `merge(from_id)`, `link(source_id)` and `link(target_id)`, the
-gtd pack's lifecycle ids on `complete(id)` and `transition(id)`, and the brain pack's feedback
-`target_id`. Any parameter added later under the same contract joins the population by carrying it,
-which is why the rule is written against the contract rather than against the names.
-`neighbors(node_id)` is the one narrower variant: its _prefix_ form resolves within the caller's
-primary namespace, while a full UUID is still unchecked, so it is a smaller opening and not an
-exception to the rule.
+The schema declares it per parameter. Today twelve parameters across ten verbs carry it:
+`get(id)`, `update(id)`, `delete(id)`, `restore(id)`, `merge(into_id)` and `merge(from_id)`,
+`link(source_id)` and `link(target_id)`, the gtd pack's lifecycle ids on `complete(id)` and
+`transition(id)`, and the brain pack's `feedback(target_id)` and the deprecated
+`emit(target_id)`. Any parameter added later under the same contract joins the population by
+carrying it, which is why the rule is written against the contract rather than against the names.
+
+Two qualifications, because the declaration governs _resolution_ and not everything that follows
+it. `restore` resolves by id unscoped and then compares the resolved record's namespace against
+the caller's, refusing a mismatch, so unscoped resolution is not unscoped effect for that verb —
+read the handler, not only the declaration. And the contract has narrower siblings on other verbs:
+several parameters declare prefix-scoped-to-primary resolution instead, `neighbors(node_id)` among
+them, where the _prefix_ form resolves within the caller's primary namespace while a full UUID is
+still unchecked. Those are smaller openings rather than exceptions to the rule.
 
 **How an id resolves, since Rule 3b's visible set makes the difference load-bearing.** A full UUID is
 used as given. A short prefix on a parameter carrying this contract resolves through an unfiltered
 lookup: no namespace predicate at all, not the caller's visible set. Visibility-bounded resolution
 and unfiltered resolution are different reaches, and only the unscoped-by-ID parameters take the
 second one. Rule 3b's visible set governs multi-record reads; it does not narrow by-ID resolution,
-and a deployment must not read it as if it did. `neighbors`' prefix form is the exception noted
-above. The entity-name fallback, where a verb has one, does scope to the caller's primary
+and a deployment must not read it as if it did. The prefix-scoped parameters noted above are the
+narrower case. The entity-name fallback, where a verb has one, does scope to the caller's primary
 namespace.
 
-1. **The gate's input contract is caller-side.** A gate check receives the acting actor, the
-   caller's namespace, the verb, the raw arguments, and a context value. It does not receive the
-   namespace of the record an id argument resolves to, and nothing resolves that record before the
-   check runs. A policy behind the Gate can therefore refuse a verb, or refuse a caller, or refuse
-   an argument shape. It cannot refuse a target.
+1. **The gate's input contract is request-side.** A gate check receives the acting actor, a
+   namespace, the verb, the raw arguments, and a context value. It does not receive the namespace
+   of the record an id argument resolves to, and nothing resolves that record before the check
+   runs. A policy behind the Gate can therefore refuse a verb, or refuse a caller, or refuse an
+   argument shape. It cannot refuse a target.
+
+   The namespace field is the namespace the request is **directed at**, which is not the same as
+   the authenticated caller's scope: it defaults to the identity's namespace and is then replaced
+   by an explicit `namespace` argument when the call carries one, before the check runs. The
+   authenticated principal is the actor field. A policy that authorizes by comparing the namespace
+   field alone is therefore satisfiable by naming a different namespace in the arguments; a policy
+   that means "this principal may act here" has to bind the actor to the namespace itself.
 
 2. **So the bare surface over a shared store isolates nothing between namespaces for by-ID ops.**
    Two callers holding different namespace strings against one store can read, update, delete and
@@ -196,9 +212,10 @@ namespace.
 
 4. **The supported multi-tenant shape is one store per tenant.** Isolation is established below the
    surface, before a request reaches a verb: a tenant's requests reach a store that holds only that
-   tenant's data, so a by-id op cannot name a record it should not see. The embedder owns this. The
-   hosted deployment of this project is built that way and fails closed when a shared store is
-   configured without an explicit operator opt-in.
+   tenant's data, so a by-id op cannot name a record it should not see. The embedder owns this, and
+   nothing in this repository can enforce it for them: there is no guard here that refuses a shared
+   store, so an embedder who wants one must build the refusal at the layer that configures the
+   backend. Stating the requirement is the most this surface can do.
 
 5. **Namespace keeps its stated jobs.** Attribution, query filtering, a policy input describing the
    _caller_, and the Rule 3b visible-set read scope. Rule 8's principal-scoped pack backends are

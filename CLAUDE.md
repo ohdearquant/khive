@@ -343,9 +343,12 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   Do not add such checks.
 - **Authorization lives at one seam: the Gate** (ADR-018). Storage stores are ID-only. The
   Gate is the trust boundary.
-- **The gate sees the caller, never the target** (Rev 8, Rule 9). A gate check carries the actor,
-  the caller's namespace, the verb and the unresolved arguments; nothing fetches the record an id
-  names before the check. A policy can refuse a verb or a caller, not a target.
+- **The gate sees the request, never the target** (Rev 8, Rule 9). A gate check carries the actor,
+  a namespace, the verb and the unresolved arguments; nothing fetches the record an id names before
+  the check. A policy can refuse a verb or a caller, not a target. The namespace it carries is the
+  one the request is directed at: it defaults to the identity's and is replaced by an explicit
+  `namespace` argument when the call carries one, so the authenticated principal is the actor field
+  and a policy comparing namespace alone is satisfiable by naming another namespace.
 - **Tenant isolation is a storage-layer property** (Rev 8, Rule 9). One shared store reached
   through this surface isolates nothing between namespaces for by-ID ops, and a namespace-scoped
   credential over a shared store is not a supported deployment shape. The supported multi-tenant
