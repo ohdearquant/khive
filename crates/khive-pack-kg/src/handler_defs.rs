@@ -245,8 +245,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         name: "list",
         description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
-                      \"limit_clamped\": bool}; clients advance offset by items.length, while M \
-                      discloses the server cap and is not a guaranteed row count. \
+                      \"limit_clamped\": bool, \"has_more\": bool}; clients advance offset by \
+                      items.length, while M discloses the server cap and is not a guaranteed row \
+                      count. `limit_clamped` reports only that the cap reduced the request; \
+                      `has_more` reports that the population continued past this page, which is \
+                      the question a caller enumerating a set needs and the one the other three \
+                      fields cannot answer at limit == cap. Absence is therefore not establishable \
+                      from a single call unless has_more is false. \
                       Entity, note, and edge cursor modes return \
                       {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
                       limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \
@@ -279,7 +284,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 required: false,
                 description: "Maximum records to return (default varies by kind). Values above \
                               the kind's server-side cap are clamped and return explicit \
-                              requested_limit, effective_limit, and limit_clamped metadata.",
+                              requested_limit, effective_limit, and limit_clamped metadata; \
+                              has_more reports separately whether rows remain beyond the page.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
