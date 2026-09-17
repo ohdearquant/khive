@@ -78,10 +78,20 @@ class JsonRpcTransport:
     stderr is drained alongside stdout so diagnostic output cannot park a child.
     """
 
-    def __init__(self, proc: subprocess.Popen, timeout: float):
+    def __init__(self, proc: subprocess.Popen, timeout: float, reap_timeout: float | None = None):
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if reap_timeout is not None and reap_timeout <= 0:
+            raise ValueError("reap_timeout must be positive")
         self.proc, self.timeout = proc, timeout
+        # An exchange budget and a reap budget answer different questions. The
+        # exchange budget bounds a round trip to a running server, which costs
+        # whatever the machine is busy with; the reap budget bounds how long
+        # close waits for a child that may be ignoring EOF, which a caller
+        # shortens deliberately to keep a test from sitting out that wait.
+        # Spending one number on both means asking for a quick reap also
+        # demands that every round trip finish inside the same window.
+        self.reap_timeout = timeout if reap_timeout is None else reap_timeout
         self.selector = selectors.DefaultSelector()
         self.buffer = bytearray()
         self.stderr = bytearray()
@@ -155,11 +165,13 @@ class JsonRpcTransport:
             raise
 
     def close(self, *, force: bool = False):
-        reap_child(self.proc, timeout=self.timeout, force=force)
+        reap_child(self.proc, timeout=self.reap_timeout, force=force)
         self.selector.close()
 
 
-def attach_transport(proc: subprocess.Popen, timeout: float = 10) -> JsonRpcTransport:
-    transport = JsonRpcTransport(proc, timeout)
+def attach_transport(
+    proc: subprocess.Popen, timeout: float = 10, reap_timeout: float | None = None
+) -> JsonRpcTransport:
+    transport = JsonRpcTransport(proc, timeout, reap_timeout)
     proc.contract_transport = transport
     return transport

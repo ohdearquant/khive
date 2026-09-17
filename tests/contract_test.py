@@ -207,7 +207,8 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_server(store: OwnedContractStore, *, timeout: float = 10, env=None) -> subprocess.Popen:
+def _start_server(store: OwnedContractStore, *, timeout: float = 10, env=None,
+                  reap_timeout: float | None = None) -> subprocess.Popen:
     """Spawn an enrolled daemonless server backed by one owned SQLite file."""
     proc = subprocess.Popen(
         [str(Path(BINARY).resolve()), "mcp", "--db", str(store.db), "--config", str(store.config),
@@ -216,7 +217,7 @@ def _start_server(store: OwnedContractStore, *, timeout: float = 10, env=None) -
         bufsize=0, env=store.child_env(env), cwd=store.root,
     )
     try:
-        attach_transport(proc, timeout)
+        attach_transport(proc, timeout, reap_timeout)
         _send(proc, "initialize", {
             "protocolVersion": "2024-11-05", "capabilities": {},
             "clientInfo": {"name": "contract-test", "version": "0.1.0"},

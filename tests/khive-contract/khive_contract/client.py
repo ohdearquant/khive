@@ -177,10 +177,13 @@ class KhiveMcpSession:
         log: str = "error",
         env: Mapping[str, str] | None = None,
         timeout: float = 10.0,
+        reap_timeout: float | None = None,
         presentation: Literal["agent", "verbose", "human"] = "verbose",
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if reap_timeout is not None and reap_timeout <= 0:
+            raise ValueError("reap_timeout must be positive")
         self._binary = _resolve_binary(binary).resolve()
         self._db = db if db in (None, ":memory:") else Path(db).resolve()
         self._config = Path(config).resolve() if config is not None else None
@@ -193,6 +196,9 @@ class KhiveMcpSession:
         self._log = log
         self._env = env
         self._timeout = timeout
+        # Defaults to the exchange budget, so a caller that does not care keeps
+        # the behaviour it had. See JsonRpcTransport for why they are separate.
+        self._reap_timeout = reap_timeout
         self._default_presentation = presentation
         self._id_counter = 0
         self.proc: subprocess.Popen | None = None
@@ -232,7 +238,9 @@ class KhiveMcpSession:
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=0, env=child_env, cwd=self._store.root,
             )
-            self._transport = _harness.attach_transport(self.proc, self._timeout)
+            self._transport = _harness.attach_transport(
+                self.proc, self._timeout, self._reap_timeout
+            )
             self._do_initialize()
             return self
         except BaseException:
@@ -252,7 +260,11 @@ class KhiveMcpSession:
             if self._transport is not None:
                 self._transport.close(force=force)
             else:
-                _harness.reap_child(self.proc, timeout=self._timeout, force=force)
+                _harness.reap_child(
+                    self.proc,
+                    timeout=self._timeout if self._reap_timeout is None else self._reap_timeout,
+                    force=force,
+                )
             self.proc = None
             self._transport = None
         if self._owns_store and self._store is not None:

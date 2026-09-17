@@ -155,14 +155,16 @@ class HarnessTests(unittest.TestCase):
                 os.waitpid(child.pid, os.WNOHANG)
 
     @contextmanager
-    def adapter(self, kind, store, mode="normal", timeout=0.3):
+    def adapter(self, kind, store, mode="normal", timeout=0.3, reap_timeout=None):
         env = dict(os.environ, FAKE_LOG=str(self.log), FAKE_MODE=mode)
         if kind == "pytest":
-            with KhiveMcpSession(binary=self.fake, store=store, env=env, timeout=timeout) as session:
+            with KhiveMcpSession(binary=self.fake, store=store, env=env, timeout=timeout,
+                                 reap_timeout=reap_timeout) as session:
                 yield session.tools_list
         else:
             with mock.patch.object(legacy, "BINARY", str(self.fake)):
-                proc = legacy._start_server(store, env=env, timeout=timeout)
+                proc = legacy._start_server(store, env=env, timeout=timeout,
+                                            reap_timeout=reap_timeout)
                 try:
                     def request():
                         legacy._send(proc, "tools/list", {})
@@ -313,7 +315,12 @@ class HarnessTests(unittest.TestCase):
         for kind in ("legacy", "pytest"):
             with self.subTest(kind=kind), OwnedContractStore() as store:
                 start = time.monotonic()
-                with self.adapter(kind, store, "ignore_eof", timeout=0.12) as request:
+                # The short budget belongs to the reap: this server ignores EOF,
+                # and without it close would sit out the full wait. It used to be
+                # spent on the exchange as well, which made the spawn, the
+                # handshake and a tools/list round trip all have to finish inside
+                # 120 ms, so a machine under load failed the arm for its load.
+                with self.adapter(kind, store, "ignore_eof", reap_timeout=0.12) as request:
                     self.assertEqual(request(), [])
                     if kind == "pytest":
                         session = request.__self__
@@ -326,6 +333,41 @@ class HarnessTests(unittest.TestCase):
                     session.close()
                     session.close()
                 self.assert_reaped()
+
+    def test_reap_budget_is_independent_of_the_exchange_budget(self):
+        from contract_harness import attach_transport
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0)
+        transport = attach_transport(proc, 30.0, 0.05)
+        try:
+            self.assertEqual((transport.timeout, transport.reap_timeout), (30.0, 0.05))
+            # A child that never exits on its own: close returns on the reap
+            # budget, the small number, not on the 30-second exchange budget.
+            start = time.monotonic()
+            transport.close()
+            self.assertLess(time.monotonic() - start, 5)
+            self.assertIsNotNone(proc.returncode)
+        finally:
+            # This suite runs under a 20-second watchdog, so an arm that leaves a
+            # 30-second sleeper behind spends the budget the later arms need.
+            if proc.returncode is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+        # Omitted, the reap budget is the exchange budget, so existing callers
+        # keep the behaviour they had.
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, bufsize=0)
+        try:
+            self.assertEqual(attach_transport(other, 0.25).reap_timeout, 0.25)
+        finally:
+            other.kill()
+            other.wait(timeout=5)
+            for pipe in (other.stdin, other.stdout, other.stderr):
+                pipe.close()
 
     def test_legacy_runner_cleans_setup_failure_and_preserves_parent_home(self):
         from contextlib import redirect_stdout
