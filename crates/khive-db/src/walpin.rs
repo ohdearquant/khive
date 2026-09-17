@@ -2280,8 +2280,8 @@ where
 /// Walk the holder census under a wall-clock budget, returning what was seen
 /// so far rather than an error when the budget is spent.
 ///
-/// This is deliberately NOT expressible through [`census_holders_until`]. That
-/// function's stop closure is a CANCELLATION: every one of its check sites
+/// This is deliberately NOT expressible through the crate-internal
+/// `census_holders_until`. That function's stop closure is a CANCELLATION: every one of its check sites
 /// returns `Err(Interrupted)`, which is right for a caller that no longer
 /// wants the answer (a shutting-down background worker) and wrong for a caller
 /// that wants a fast, honest one. An interactive diagnostic asking "is anything
@@ -2705,8 +2705,8 @@ where
 /// Walk the holder census under a wall-clock budget, returning what was seen
 /// so far rather than an error when the budget is spent.
 ///
-/// This is deliberately NOT expressible through [`census_holders_until`]. That
-/// function's stop closure is a CANCELLATION: every one of its check sites
+/// This is deliberately NOT expressible through the crate-internal
+/// `census_holders_until`. That function's stop closure is a CANCELLATION: every one of its check sites
 /// returns `Err(Interrupted)`, which is right for a caller that no longer
 /// wants the answer (a shutting-down background worker) and wrong for a caller
 /// that wants a fast, honest one. An interactive diagnostic asking "is anything
