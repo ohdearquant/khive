@@ -409,6 +409,16 @@ ensures the `memory_ann_epoch` table exists before its first bump.
 itself) aborts the whole reindex before any mutation runs. A swallowed failure here is
 exactly the bug ADR-107 §4 was written to close.
 
+Namespace Vamana snapshot invalidation is also part of the graph reindex result.
+A failure to acquire its writer or delete matching snapshots sets
+`vamana_snapshot_invalidation_failed: true` in the JSON report and names the failed
+stage in the human report. The default command result is nonzero; `--best-effort`
+retains the flag and warning while allowing a zero exit. Earlier FTS/vector writes
+remain committed, and the command still attempts the memory completion epoch and
+remaining passes. An absent `retrieval_snapshots` table remains a successful no-op.
+This does not change the separate active-memory snapshot deletion's best-effort,
+defense-in-depth role or its completion epoch's existing failure reporting.
+
 ## Consistency Notes
 
 - `kkernel db migrate --dry-run` delegates to `cmd_db_check` rather than implementing

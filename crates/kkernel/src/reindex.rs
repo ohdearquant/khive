@@ -311,6 +311,8 @@ struct ReindexReport {
     /// failure at this point is exactly the bug this fix closes, so it now
     /// surfaces as a fail-closed exit instead of a silent warning.
     epoch_bump_failed: bool,
+    /// Namespace Vamana snapshots could not be invalidated after graph writes.
+    vamana_snapshot_invalidation_failed: bool,
 }
 
 impl ReindexReport {
@@ -324,6 +326,7 @@ impl ReindexReport {
             || self.knowledge_ann_failed
             || self.knowledge_sections_failed > 0
             || self.epoch_bump_failed
+            || self.vamana_snapshot_invalidation_failed
     }
 }
 
@@ -625,6 +628,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut truncation_by_model = BTreeMap::new();
 
     let mut epoch_bump_failed = false;
+    let mut vamana_snapshot_invalidation_failed = false;
 
     // ── entities + notes (graph substrate) ────────────────────────────────────
     if do_graph {
@@ -757,6 +761,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // against the freshly re-embedded entity/note vectors.
         if let Err(e) = invalidate_vamana_snapshots(&rt, &ns_str).await {
             tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
+            vamana_snapshot_invalidation_failed = true;
         }
 
         // Purge stale per-namespace memory Vamana snapshot rows (legacy key format
@@ -904,6 +909,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         entities_fts_failed,
         notes_fts_failed,
         epoch_bump_failed,
+        vamana_snapshot_invalidation_failed,
     };
 
     print_report(&report, args.human);
@@ -1359,6 +1365,11 @@ fn render_human_report(report: &ReindexReport) -> String {
             "Knowledge sections: {} section embed/write failures\n",
             report.knowledge_sections_failed
         ));
+    }
+    if report.vamana_snapshot_invalidation_failed {
+        output.push_str(
+            "Vamana snapshot invalidation: FAILED (snapshots may be stale; prior writes remain committed)\n",
+        );
     }
     if report.knowledge_ann_failed {
         output.push_str("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)\n");
@@ -1967,6 +1978,7 @@ read_only = true
             entities_fts_failed: 0,
             notes_fts_failed: 0,
             epoch_bump_failed: false,
+            vamana_snapshot_invalidation_failed: false,
         }
     }
 
@@ -2056,6 +2068,7 @@ read_only = true
             entities_fts_failed: 0,
             notes_fts_failed: 0,
             epoch_bump_failed: false,
+            vamana_snapshot_invalidation_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -2090,6 +2103,7 @@ read_only = true
             entities_fts_failed: 0,
             notes_fts_failed: 0,
             epoch_bump_failed: false,
+            vamana_snapshot_invalidation_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -2704,6 +2718,7 @@ read_only = true
             entities_fts_failed: 0,
             notes_fts_failed: 1,
             epoch_bump_failed: false,
+            vamana_snapshot_invalidation_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -3484,6 +3499,7 @@ read_only = true
             entities_fts_failed: 1,
             notes_fts_failed: 0,
             epoch_bump_failed: false,
+            vamana_snapshot_invalidation_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -3496,6 +3512,204 @@ read_only = true
         assert!(
             decide_result(report.has_failures(), true).is_ok(),
             "best-effort downgrades entities_fts_failed to exit 0"
+        );
+    }
+
+    #[test]
+    fn snapshot_invalidation_failure_is_reported_and_controls_exit() {
+        let mut report = report_with(0, 0, false);
+        assert!(finish(&report, false).is_ok());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["vamana_snapshot_invalidation_failed"],
+            false
+        );
+        report.vamana_snapshot_invalidation_failed = true;
+        assert!(finish(&report, false).is_err());
+        assert!(finish(&report, true).is_ok());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["vamana_snapshot_invalidation_failed"],
+            true
+        );
+        let human = render_human_report(&report);
+        assert!(human.contains("Reindex completed WITH FAILURES"));
+        assert!(human.contains("Vamana snapshot invalidation: FAILED"));
+        assert!(human.contains("prior writes remain committed"));
+    }
+
+    fn snapshot_reindex_args(dir: &std::path::Path, best_effort: bool) -> ReindexArgs {
+        ReindexArgs {
+            db: Some(dir.join("reindex.db").to_str().unwrap().to_owned()),
+            config: Some(write_empty_test_config(dir)),
+            model: None,
+            batch_size: 100,
+            keep_existing: false,
+            namespace: Some("local".into()),
+            knowledge_only: false,
+            no_knowledge: true,
+            best_effort,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        }
+    }
+
+    fn snapshot_test_runtime(args: &ReindexArgs) -> KhiveRuntime {
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: args.db.as_deref(),
+            config: args.config.as_deref(),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve owned test database");
+        KhiveRuntime::new(cfg).expect("owned test runtime")
+    }
+
+    async fn snapshot_test_count(rt: &KhiveRuntime, query: &str) -> i64 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(SqlStatement {
+                sql: query.into(),
+                params: vec![],
+                label: Some("test.reindex_snapshot.count".into()),
+            })
+            .await
+            .expect("query")
+            .expect("count row");
+        match row.get("n") {
+            Some(SqlValue::Integer(n)) => *n,
+            other => panic!("expected integer count, got {other:?}"),
+        }
+    }
+
+    async fn seed_snapshot_test_note(rt: &KhiveRuntime) {
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // Empty embedding text keeps the real command fixture independent of
+        // model downloads while still requiring an FTS backfill write.
+        rt.notes(&token)
+            .expect("notes")
+            .upsert_note(Note::new("local", "observation", ""))
+            .await
+            .expect("seed note without indexing");
+        assert_eq!(
+            snapshot_test_count(rt, "SELECT count(*) AS n FROM fts_notes").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reindex_snapshot_failure_fails_closed_and_preserves_committed_work() {
+        let dir = tempfile::tempdir().expect("owned database directory");
+        let args = snapshot_reindex_args(dir.path(), false);
+        let rt = snapshot_test_runtime(&args);
+        seed_snapshot_test_note(&rt).await;
+        {
+            let mut writer = rt.sql().writer().await.expect("writer");
+            writer
+                .execute_script(
+                    "CREATE TABLE retrieval_snapshots (
+                        namespace TEXT NOT NULL, index_type TEXT NOT NULL,
+                        snapshot BLOB NOT NULL, created_at INTEGER NOT NULL,
+                        PRIMARY KEY(namespace, index_type));
+                     INSERT INTO retrieval_snapshots VALUES
+                        ('local::vamana::test-model', 'vamana', X'00', 0),
+                        ('other::vamana::test-model', 'vamana', X'00', 0),
+                        ('local::hnsw::test-model', 'hnsw', X'00', 0),
+                        ('global::memory_vamana::test-model', 'memory_vamana', X'00', 0);
+                     CREATE TRIGGER refuse_namespace_snapshot_delete
+                     BEFORE DELETE ON retrieval_snapshots
+                     WHEN OLD.namespace = 'local::vamana::test-model'
+                     BEGIN SELECT RAISE(ABORT, 'injected namespace snapshot failure'); END;"
+                        .into(),
+                )
+                .await
+                .expect("seed snapshots and rejecting trigger");
+        }
+
+        let injected = invalidate_vamana_snapshots(&rt, "local")
+            .await
+            .expect_err("the owned trigger must reject the real invalidation statement");
+        assert!(injected
+            .to_string()
+            .contains("injected namespace snapshot failure"));
+        let error = run_reindex(args)
+            .await
+            .expect_err("snapshot failure must fail the command");
+        assert!(error
+            .to_string()
+            .contains("reindex completed with failures"));
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT count(*) AS n FROM fts_notes").await,
+            1,
+            "the earlier FTS write remains committed"
+        );
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT epoch AS n FROM memory_ann_epoch").await,
+            2,
+            "snapshot failure must not suppress the completion epoch"
+        );
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT count(*) AS n FROM retrieval_snapshots").await,
+            3,
+            "only the independent active-memory snapshot was removed"
+        );
+
+        run_reindex(snapshot_reindex_args(dir.path(), true))
+            .await
+            .expect("explicit best effort allows partial completion");
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT count(*) AS n FROM retrieval_snapshots").await,
+            3,
+            "best effort must not bypass the injected DELETE refusal"
+        );
+        {
+            let mut writer = rt.sql().writer().await.expect("writer");
+            writer
+                .execute_script("DROP TRIGGER refuse_namespace_snapshot_delete;".into())
+                .await
+                .expect("remove injected failure");
+        }
+        run_reindex(snapshot_reindex_args(dir.path(), false))
+            .await
+            .expect("same fixture succeeds once invalidation can commit");
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT count(*) AS n FROM retrieval_snapshots").await,
+            2,
+            "unrelated namespace and HNSW snapshots survive"
+        );
+        assert_eq!(
+            snapshot_test_count(
+                &rt,
+                "SELECT count(*) AS n FROM retrieval_snapshots WHERE namespace = 'local::vamana::test-model'"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reindex_snapshot_missing_table_remains_successful() {
+        let dir = tempfile::tempdir().expect("owned database directory");
+        let args = snapshot_reindex_args(dir.path(), false);
+        let rt = snapshot_test_runtime(&args);
+        seed_snapshot_test_note(&rt).await;
+        let table_count = "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'retrieval_snapshots'";
+        assert_eq!(snapshot_test_count(&rt, table_count).await, 0);
+        run_reindex(args)
+            .await
+            .expect("missing snapshots are a successful no-op");
+        assert_eq!(snapshot_test_count(&rt, table_count).await, 0);
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT count(*) AS n FROM fts_notes").await,
+            1
+        );
+        assert_eq!(
+            snapshot_test_count(&rt, "SELECT epoch AS n FROM memory_ann_epoch").await,
+            2
         );
     }
 }
