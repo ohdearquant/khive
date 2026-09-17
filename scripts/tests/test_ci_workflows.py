@@ -64,13 +64,22 @@ class UnlockedDependencyWorkflowTests(unittest.TestCase):
         self.assertIn("GITHUB_STEP_SUMMARY", workflow)
 
 
+def step_block(job, step_name):
+    """The text of one `- name: <step_name>` step, up to the next step."""
+    return job.split(f"- name: {step_name}", 1)[1].split("\n      - name: ", 1)[0]
+
+
 class CoverageRatchetWorkflowTests(unittest.TestCase):
     def test_measurement_job_reports_compute_unavailability(self):
         workflow = workflow_text("ci.yml")
         self.assertIn("  coverage-measurement:", workflow)
         measurement = indented_block(workflow, "coverage-measurement", 2)
 
-        self.assertIn("name: Coverage measurement (advisory)", measurement)
+        # The job was named "(advisory)" while a missing measurement left the
+        # gate green. It is not advisory now: the step below turns an absent
+        # measurement into a failing job, so the name would misdescribe it.
+        self.assertIn("name: Coverage measurement\n", measurement)
+        self.assertNotIn("advisory", measurement)
         self.assertIn("id: compute_coverage", measurement)
         self.assertIn("continue-on-error: true", measurement)
         self.assertIn(
@@ -105,14 +114,32 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         )
 
     def test_measurement_reporting_step_is_best_effort(self):
-        workflow = workflow_text("ci.yml")
-        measurement = indented_block(workflow, "coverage-measurement", 2)
-        report_step = measurement.split(
-            "- name: Report unavailable coverage measurement", 1
-        )[1]
+        measurement = indented_block(workflow_text("ci.yml"), "coverage-measurement", 2)
+        # Bounded to this step. Unbounded, the tail of the job satisfied the
+        # continue-on-error assertion from whatever step came next, and a step
+        # that must NOT be best-effort now follows this one.
+        report_step = step_block(measurement, "Report unavailable coverage measurement")
 
         self.assertIn("continue-on-error: true", report_step)
         self.assertIn("Coverage measurement unavailable", report_step)
+
+    def test_absent_measurement_fails_the_job(self):
+        measurement = indented_block(workflow_text("ci.yml"), "coverage-measurement", 2)
+        fail_step = step_block(measurement, "Fail when no measurement was produced")
+
+        self.assertIn("if: steps.compute_coverage.outcome != 'success'", fail_step)
+        self.assertNotIn("continue-on-error", fail_step)
+        self.assertIn("exit 1", fail_step)
+
+    def test_measuring_budget_stays_inside_the_job_budget(self):
+        measurement = indented_block(workflow_text("ci.yml"), "coverage-measurement", 2)
+        job = re.findall(r"(?m)^    timeout-minutes: (\d+)$", measurement)
+        step = re.findall(r"(?m)^        timeout-minutes: (\d+)$", measurement)
+        self.assertEqual((len(job), len(step)), (1, 1))
+        # A job-level timeout cancels the job, and a cancelled job is neither
+        # success nor skipped, so the step budget has to expire first for the
+        # reporting and failing steps above to run at all.
+        self.assertLess(int(step[0]), int(job[0]))
 
 
 class AutoMergeGuardWorkflowTests(unittest.TestCase):
@@ -124,9 +151,15 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
+    # Jobs carrying a job-level `if:`, so they are the only ones that CAN skip.
     CONDITIONAL_JOBS = {
         "automerge-push-guard", "dependency-review", "coverage-ratchet",
     }
+    # Jobs whose skip the gate FORGIVES, which is a smaller set and not the same
+    # question. The push guard and dependency review skip on run shape: they do
+    # not apply to this event. The coverage ratchet skips on a missing input, so
+    # forgiving it reports a coverage judgment that was never made.
+    FORGIVEN_SKIPS = {"automerge-push-guard", "dependency-review"}
 
     def setUp(self):
         self.workflow = workflow_text("ci.yml")
@@ -147,13 +180,16 @@ class AggregateGateWorkflowTests(unittest.TestCase):
             capture_output=True, text=True, timeout=5, check=False,
         )
 
-    def test_gate_rejects_skips_outside_conditional_jobs(self):
+    def test_gate_forgives_skips_only_for_jobs_on_its_allow_list(self):
         conditional = {
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
+        # Forgiving a job that cannot skip would be dead configuration, so the
+        # allow list stays inside the conditional set without being equal to it.
+        self.assertTrue(self.FORGIVEN_SKIPS < conditional)
         for job in sorted(self.needs):
             for outcome in ("success", "skipped", "failure", "cancelled"):
                 with self.subTest(job=job, outcome=outcome):
@@ -161,7 +197,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                     results[job] = outcome
                     result = self.run_gate(results)
                     accepted = outcome == "success" or (
-                        outcome == "skipped" and job in conditional
+                        outcome == "skipped" and job in self.FORGIVEN_SKIPS
                     )
                     self.assertEqual(result.returncode, 0 if accepted else 1,
                                      result.stdout + result.stderr)
@@ -178,15 +214,18 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                                  result.stdout + result.stderr)
 
     def test_gate_mixed_results_report_only_rejected_jobs(self):
+        # The gate reports in NEEDS order, so the conditional jobs are inserted
+        # sorted rather than in set-iteration order: one of them is rejected now,
+        # which makes its position in the output an asserted value.
         results = {
             "ci": "skipped", "docs": "failure", "secret-scan": "cancelled",
-            **dict.fromkeys(self.CONDITIONAL_JOBS, "skipped"),
+            **{job: "skipped" for job in sorted(self.CONDITIONAL_JOBS)},
         }
         result = self.run_gate(results)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(
             result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines(),
-            ["ci", "docs", "secret-scan"],
+            ["ci", "docs", "secret-scan", "coverage-ratchet"],
         )
 
 
