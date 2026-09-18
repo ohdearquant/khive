@@ -3370,6 +3370,30 @@ impl VerbRegistry {
         Ok(())
     }
 
+    /// Run the owning kind's shared-note-update property validator, if it
+    /// declares one.
+    ///
+    /// Kept as the validation-only compatibility seam for callers that do not
+    /// own a mutable request object. Canonical and atomic CRUD use
+    /// [`Self::prepare_note_update_hook`] instead, so a hook's
+    /// [`KindHook::normalize_note_update`] can run before its validation does.
+    /// Reaching a hook through this seam therefore runs the validator alone:
+    /// that is the point of it, and it is why callers that CAN supply a
+    /// mutable request should not use it.
+    pub async fn validate_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.validate_note_update(runtime, token, note, properties)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Run shared-link validators grouped by the owning source-note kind.
     ///
     /// Supplying the whole proposed batch lets a kind hook reject an invariant
