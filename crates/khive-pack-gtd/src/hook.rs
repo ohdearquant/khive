@@ -169,11 +169,20 @@ fn resolve_due_zone(
     note: &Note,
     properties: &serde_json::Map<String, Value>,
 ) -> Result<chrono_tz::Tz, RuntimeError> {
-    if let Some(name) = properties
-        .get("due_timezone")
-        .or_else(|| properties.get("timezone"))
-        .and_then(Value::as_str)
-    {
+    // Select on the value, not on the key. Choosing the key first and calling `as_str` on the
+    // result treats a present-but-malformed zone as absent: `{due_timezone: 7, timezone:
+    // "Asia/Tokyo"}` would discard the spelling that parses and fall through to the stored or
+    // configured zone, storing an anchor nobody asked for. A zone the caller wrote is either used
+    // or refused.
+    for key in ["due_timezone", "timezone"] {
+        let Some(value) = properties.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let name = value.as_str().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "{key} must be an IANA zone name string (e.g. \"America/New_York\"); got {value}"
+            ))
+        })?;
         return name.parse::<chrono_tz::Tz>().map_err(|_| {
             RuntimeError::InvalidInput(format!(
                 "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
@@ -526,6 +535,37 @@ mod tests {
             "the assign spelling must not survive into the stored bag; got: {}",
             args["properties"]
         );
+    }
+
+    /// A zone the caller wrote is used or refused, never ignored. Selecting the key before
+    /// checking that its value is a string made a malformed `due_timezone` read as absent, which
+    /// discarded a `timezone` alias that did parse and stored an anchor nobody asked for.
+    #[tokio::test]
+    async fn a_malformed_zone_is_refused_rather_than_read_as_absent() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"due_timezone": "America/New_York"}));
+
+        let mut both = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": 7, "timezone": "Asia/Tokyo"}
+        });
+        let err = normalize_due_update(&runtime, &note, &mut both)
+            .expect_err("a non-string zone must be refused, not skipped for the next spelling");
+        assert!(
+            format!("{err}").contains("due_timezone"),
+            "the refusal must name the key the caller got wrong; got: {err}"
+        );
+        assert_eq!(
+            both["properties"]["due"], "2026-12-25",
+            "a refused update must leave the caller's arguments untouched"
+        );
+
+        // An explicit null is absence, not a malformed value: it falls through to the stored
+        // anchor the way an omitted key does.
+        let mut nulled = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": null}
+        });
+        normalize_due_update(&runtime, &note, &mut nulled).expect("a null zone reads as absent");
+        assert_eq!(nulled["properties"]["due_timezone"], "America/New_York");
     }
 
     /// The wiring, not just the function: the hook the generic update path calls must run it.
