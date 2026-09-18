@@ -1064,13 +1064,29 @@ const SOURCE_FILE_EXTENSIONS: &[&str] =
     &[".py", ".rs", ".ts", ".js", ".sh", ".md", ".toml", ".json"];
 
 /// Returns `true` for a lowercase source filename after a known provider
-/// prefix, such as `vercel_deployment_monitor.py`.
+/// prefix, such as `vercel_deployment_monitor.py`, optionally followed by a
+/// source citation's line reference: `vercel_deployment_monitor.py:412` or
+/// `vercel_deployment_monitor.py:412-418`.
 ///
 /// A source extension alone is not enough. The payload before it must contain
 /// only lowercase ASCII letters and filename/path punctuation; any uppercase
 /// letter or digit is credential-value evidence and keeps the prefix match
 /// fail-closed. Outer Markdown/prose punctuation is ignored, but never any
 /// payload byte inside the filename itself.
+///
+/// The line reference is a POSITIONALLY DISTINCT suffix, never part of the
+/// stem the checks below apply: it is parsed and stripped first, and only
+/// then is the extension matched against what remains, so a digit inside the
+/// stem itself (`some2module.py`) still fails the all-lowercase check exactly
+/// as before.
+///
+/// A trailing colon with nothing after it stays where it has always been: in
+/// the generic prose-punctuation trim just below, which removes it before any
+/// of this runs. `<prefix>some_module.py:` in a sentence was admitted before
+/// line references were understood here and is still admitted, because it is
+/// the same filename it always was with sentence punctuation after it. Adding
+/// a line-reference grammar is a widening of what this function accepts; it
+/// narrows nothing.
 fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
     let token = token.trim_end_matches(|c: char| {
         matches!(
@@ -1082,6 +1098,7 @@ fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
     let Some(payload) = token.strip_prefix(needle) else {
         return false;
     };
+    let payload = strip_source_citation_line_reference(payload);
     let Some(stem) = SOURCE_FILE_EXTENSIONS
         .iter()
         .find_map(|extension| payload.strip_suffix(extension))
@@ -1096,6 +1113,40 @@ fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
         && stem
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b'-' | b'/' | b'.'))
+}
+
+/// Strip a trailing source citation's line reference from `payload` and
+/// return the remainder; returns `payload` unchanged when the tail is not
+/// exactly one of these two shapes.
+///
+/// Grammar: `:<digits>` or `:<digits>-<digits>` — digits only, at least one
+/// digit in each run, no leading `+`/`-` on either run, and a single `-`
+/// separating the two runs in the range form. A second colon, a non-digit
+/// byte, or more than one `-` all mean this is not a line reference, so the
+/// caller's extension match declines exactly as it does for any other
+/// unrecognized suffix.
+///
+/// This grammar is intentionally separate from the stem predicate the caller
+/// applies after this returns: the reference is peeled off BEFORE the
+/// extension is matched, so the digits admitted here never reach the stem,
+/// and they do not loosen what that predicate accepts.
+fn strip_source_citation_line_reference(payload: &str) -> &str {
+    let Some(colon) = payload.rfind(':') else {
+        return payload;
+    };
+    let (head, reference) = (&payload[..colon], &payload[colon + 1..]);
+
+    let is_digit_run = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_line_reference = match reference.split_once('-') {
+        None => is_digit_run(reference),
+        Some((start, end)) => is_digit_run(start) && is_digit_run(end),
+    };
+
+    if is_line_reference {
+        head
+    } else {
+        payload
+    }
 }
 
 /// Shortest line of base64 that counts as PEM key material. Real key blocks
@@ -3834,6 +3885,83 @@ mod tests {
             mask_secrets(content).as_ref(),
             content,
             "masking surface must preserve the filename byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn admits_source_citation_line_reference_and_still_blocks_random_payload() {
+        // Arm 1 — admitted: a file-and-line citation, both the single-line and
+        // range forms, across two different source extensions, including a
+        // path-bearing stem (`/` is in the allowed stem punctuation set).
+        let admitted = [
+            "vercel_deployment_monitor.py:412",
+            "vercel_deployment_monitor.py:412-418",
+            "vercel_src/runtime/checkpoint_loader.rs:97-103",
+        ];
+        for content in admitted {
+            assert!(
+                find_prefix_token(content, "vercel_", 20).is_none(),
+                "file-and-line citation must not be flagged as a credential: {content}"
+            );
+            assert!(
+                check(content).is_ok(),
+                "file-and-line citation must pass the write gate: {content}, got {:?}",
+                scan(content)
+            );
+        }
+
+        // Arm 2 — must-FAIL control, in the SAME test as arm 1: a provider
+        // prefix followed by an ordinary random-looking value is still a
+        // credential. This is the arm a loose "trailing digits anywhere"
+        // suffix match would silently stop catching.
+        let random_payload = "vercel_aB3xQ9mK7pL2wZ8nR4tY6uV1"; // gitleaks:allow
+        assert_eq!(random_payload.len() - "vercel_".len(), 24);
+        assert!(
+            find_prefix_token(random_payload, "vercel_", 20).is_some(),
+            "random payload after the provider prefix must still be flagged: {random_payload}"
+        );
+        assert_eq!(
+            scan(random_payload).map(|matched| matched.detector),
+            Some("vercel-token"),
+            "random-looking payload after the provider prefix must still be scanned as a credential"
+        );
+    }
+
+    #[test]
+    fn source_citation_line_reference_boundary_arms_still_refused() {
+        let needle = "vercel_";
+        let cases = [
+            "vercel_deployment_monitor.py:4a2", // non-digit byte in the run
+            "vercel_deployment_monitor.py:12-", // empty second digit run
+            "vercel_deployment_monitor.py:12-34-56", // more than one '-'
+            // Refused by the SEPARATOR predicate, not the digit one: this stem
+            // carries no `_`, `-`, `/` or `.`. A real shape, but it cannot
+            // isolate the all-lowercase rule.
+            "vercel_deployment2monitor.py:412",
+            // Digit inside the stem WITH a separator present, so the
+            // all-lowercase predicate is the only thing refusing it. This is
+            // the isolating arm for that predicate: loosen it to tolerate
+            // digits and this case alone is admitted.
+            "vercel_deployment2_monitor.py:412",
+        ];
+        for token in cases {
+            assert!(
+                !is_filename_shaped_prefix_match(token, needle),
+                "must still be refused: {token}"
+            );
+        }
+
+        // A bare trailing colon is NOT a boundary case of the line-reference
+        // grammar; it is sentence punctuation, and the generic trim has always
+        // removed it before this function looks at anything. It was admitted
+        // before line references were understood here and must stay admitted:
+        // this change widens what the carve-out accepts and narrows nothing.
+        // Without this arm, a later reading of the boundary list above would
+        // conclude the colon belongs in the grammar and quietly turn a prose
+        // citation into a refusal.
+        assert!(
+            is_filename_shaped_prefix_match("vercel_deployment_monitor.py:", needle),
+            "a trailing colon is prose punctuation and was always trimmed"
         );
     }
 
