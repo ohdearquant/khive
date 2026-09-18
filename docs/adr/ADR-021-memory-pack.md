@@ -9,9 +9,9 @@ id by default, semantic memory writes stamp the shared pool, and an explicit `na
 overrides both.
 **Amended**: 2026-08-30, schema V23 makes the `memory` candidate filter an
 indexed FTS classifier rather than a post-MATCH row filter (#1907).
-**Proposed amendment**: 2026-09-14, [new-memory creation admission](#amendment-new-memory-creation-admission-proposed)
+**Amended**: 2026-09-18, [new-memory creation admission](#amendment-new-memory-creation-admission)
 replaces the generic-create equivalence in §4 and qualifies §10 and the neutral
-consequences. Existing accepted decisions remain in force until this amendment is accepted.
+consequences (#2724 proposed it; accepted 2026-09-18).
 
 ## Context
 
@@ -106,8 +106,10 @@ Edges are the right substrate for "this came from X" relationships.
 
 ### 4. `memory.remember` — sugar over `create` + optional `link`
 
-The generic-create equivalence in this section is superseded only on acceptance of
-the [creation-admission amendment](#amendment-new-memory-creation-admission-proposed).
+The generic-create equivalence in this section is superseded by the
+[creation-admission amendment](#amendment-new-memory-creation-admission). It is kept here
+because the equivalence still describes what `memory.remember` does; what changed is that a
+caller may no longer reach it through generic create.
 
 ```
 memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, tags?, namespace?)
@@ -139,9 +141,12 @@ no explicit `namespace=` argument is supplied, a semantic write stamps `token.na
 shared pool, `'local'` by default) and an episodic write stamps `token.actor().id` (the caller's
 actor id). An explicit `namespace=` argument overrides this for both types.
 
-Agents that prefer explicit CRUD are not blocked:
-`create(kind="memory", salience=0.7, decay_factor=0.01, properties={"memory_type":"semantic"}, ...)`
-followed by an optional `link(annotates)` produces an equivalent result.
+Explicit CRUD is no longer an equivalent route. The
+[creation-admission amendment](#amendment-new-memory-creation-admission) refuses
+`create(kind="memory", ...)` even when the caller supplies `salience`, `decay_factor` and
+`memory_type` itself, because such a request still carries neither the episodic actor routing nor
+the keyed-replay contract `memory.remember` provides. The equivalence above describes what that
+verb does; it is not a second way in.
 
 ### 5. `memory.recall` — memory-scoped retrieval with decay weighting
 
@@ -310,9 +315,8 @@ Resolution rules:
   escape: `memory.remember(content="...", memory_type="episodic", namespace="local")` writes the
   episodic memory into the shared pool, and `memory.remember(content="...",
   memory_type="semantic", namespace="ns-x")` writes the semantic memory into `ns-x`.
-  The proposed [creation-admission amendment](#amendment-new-memory-creation-admission-proposed)
-  removes the generic-create equivalence on acceptance; the `memory.remember`
-  routing rules themselves remain unchanged.
+  The [creation-admission amendment](#amendment-new-memory-creation-admission) removes the
+  generic-create equivalence; the `memory.remember` routing rules themselves are unchanged.
 - The episodic default uses `token.actor().id`, the actor identity threaded onto the request token
   (ADR-053). An anonymous caller has actor id `'local'` (`ActorRef::anonymous`), so when no
   `[actor]` is configured the episodic default resolves to `'local'`, identical to the semantic
@@ -478,19 +482,20 @@ handler logic.
   `annotates` already accepts note → any-substrate per [ADR-002](ADR-002-edge-ontology.md).
 - `khive-pack-kg` is unaffected. Its `search`/`create` paths continue to work as
   specified; the memory pack uses them via the runtime's pack-extensible verb dispatch.
-  The proposed [creation-admission amendment](#amendment-new-memory-creation-admission-proposed)
-  qualifies this statement for generic creation and new `stream.batch` memory writes.
+  The [creation-admission amendment](#amendment-new-memory-creation-admission) qualifies this
+  statement for generic creation and new `stream.batch` memory writes: those two paths refuse
+  through the memory pack's own create hook, and every other kg path is unaffected.
 - The pack composes with [ADR-020](ADR-020-git-native-kg-implementation.md) git-native
   KG: memory notes are part of the notes substrate, which is excluded from v1 KG
   snapshots ([ADR-010](ADR-010-kg-versioning.md) §SnapshotCoverage). Memory persists in
   `working.db` and the main database; cross-instance memory portability is v2 work.
 
-## Amendment: new-memory creation admission (proposed)
+## Amendment: new-memory creation admission
 
-**Status**: proposed scope clarification, 2026-09-14. This revision corrects the
+**Status**: accepted 2026-09-18, scope clarification dated 2026-09-14. This revision corrects the
 earlier amendment's description of public stream append and explicitly preserves
-proposal-based note creation. The clarified contract requires acceptance before
-its implementation merges. It partially supersedes §4's
+proposal-based note creation. The clarified contract was accepted before its
+implementation merged. It partially supersedes §4's
 generic-create equivalence, the equivalent-create clause in §10, and the
 corresponding neutral consequence. Other decisions remain accepted and unchanged.
 
@@ -554,7 +559,7 @@ roundtrip is introduced or claimed.
 Callers of generic create and new `stream.batch` memory writes must move to the
 actual `memory.remember` parameter and result contract. There is no silent
 redirect or compatibility alias with different namespace or key semantics.
-[ADR-007](ADR-007-namespace.md#proposed-qualification-memory-creation-admission)
+[ADR-007](ADR-007-namespace.md#qualification-memory-creation-admission)
 reciprocally qualifies its generic-create equivalence; specialized memory routing
 and namespace-as-attribution decisions remain unchanged.
 

@@ -12,3 +12,14 @@ condition = "AND"
 regexTarget = "secret"
 regexes = ['''^(abcdef0123456789|fedcba9876543210)$''']
 paths = ['''^crates/khive-pack-git/src/cache\.rs$''']
+
+# The secret gate's own tests must contain values the gate refuses, so these two constants are
+# inputs rather than credentials. They are exempted by value and by path, not by fingerprint: a
+# fingerprint is commit:path:rule:line, and two of those four change every time this file is edited,
+# so a fingerprint exemption expires on the next edit and the history scan goes red again.
+[[rules.allowlists]]
+description = "The two synthetic credential-shaped constants in the secret gate's own regression tests"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^(a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4|Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh)$''']
+paths = ['''^crates/khive-runtime/src/secret_gate\.rs$''']

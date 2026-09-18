@@ -2405,6 +2405,7 @@ dependencies = [
  "khive-db",
  "khive-fusion",
  "khive-pack-brain",
+ "khive-pack-gtd",
  "khive-pack-kg",
  "khive-retrieval",
  "khive-runtime",
