@@ -471,7 +471,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
             },
         ],
     },
-    // Assertive: returns aggregate substrate counts (#280)
+    // Assertive: returns aggregate substrate counts
     HandlerDef {
         name: "stats",
         description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
