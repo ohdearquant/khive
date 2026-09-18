@@ -143,9 +143,38 @@ pub enum AuditTerminalReason {
     /// A row shared this generation's id with a previously stored row whose
     /// columns or observation projection did not match exactly.
     IdentityConflict,
-    /// The store returned a terminal (non-retryable, or retries exhausted)
-    /// error for this generation.
+    /// `classify_store_error` judged the store's error non-retryable, and the
+    /// generation stopped on that attempt. Usually that is the first attempt,
+    /// but not necessarily: a generation whose earlier attempts failed
+    /// retryably and whose next one returns a non-retryable error reports
+    /// this reason too, because the attempt that decided the outcome is the
+    /// non-retryable one. Distinct from [`Self::RetryExhausted`], which the
+    /// classifier judged safe to retry on every attempt and which failed
+    /// anyway once they ran out — this reason carries no such hope. Whatever
+    /// the store returned on the deciding attempt, it is not the kind of
+    /// failure `AuditBatchConfig::max_commit_attempts` exists to ride out,
+    /// so a caller or an automated retry policy reading this reason should
+    /// not schedule a bare retry of the same call and should instead treat
+    /// it as a storage fault needing attention.
     StoreFailure,
+    /// The store returned a `classify_store_error`-retryable error on every
+    /// one of `AuditBatchConfig::max_commit_attempts` attempts for this
+    /// generation, and the last attempt still failed retryable. Kept
+    /// distinct from [`Self::StoreFailure`] — the same way
+    /// [`Self::ResolutionDeadlineExpired`] is kept distinct from
+    /// [`Self::AdmissionDeadlineExpired`] — so a caller, and diagnostics
+    /// reading this reason, can tell a store call the classifier judged
+    /// hopeless apart from one that kept failing a condition (write-queue or
+    /// writer-task pressure, pool or timeout) the classifier judged
+    /// transient. The underlying condition may still be
+    /// transient at the moment attempts run out (a daemon restart, pool
+    /// pressure outlasting the configured backoff), so an operator or an
+    /// automated retry policy sitting above this batch can choose to wait
+    /// longer and try again rather than treating it identically to
+    /// [`Self::StoreFailure`]. This reason changes no tolerance, deadline,
+    /// retry count, or backoff on its own — it only names which of the two
+    /// causes produced the generation's failure.
+    RetryExhausted,
     /// The configured `EventStore` backend does not implement
     /// `append_events_idempotent`.
     IdempotencyUnsupported,
@@ -574,7 +603,7 @@ async fn run_generation(
                     tokio::time::sleep(config.retry_backoff).await;
                 }
                 RetryDecision::Retry => {
-                    return GenerationResult::Failed(AuditTerminalReason::StoreFailure)
+                    return GenerationResult::Failed(AuditTerminalReason::RetryExhausted)
                 }
                 RetryDecision::Terminal(reason) => return GenerationResult::Failed(reason),
             },

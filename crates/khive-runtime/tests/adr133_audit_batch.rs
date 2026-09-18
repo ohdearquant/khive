@@ -33,6 +33,12 @@ struct FakeStore {
     /// `StorageError::Pool` — the shape the ADR-170 forwarding lane reports
     /// for an unreachable events daemon.
     fail_pool_next: AtomicUsize,
+    /// Armed N times: the next N `append_events_idempotent` calls fail with
+    /// `StorageError::Internal`, a shape `classify_store_error` has no
+    /// explicit arm for and therefore judges non-retryable on the fallback
+    /// arm — unlike `fail_next`/`fail_pool_next`, which both fail with
+    /// classifier-retryable shapes.
+    fail_terminal_next: AtomicUsize,
     calls: AtomicU64,
     rows: Mutex<Vec<Event>>,
     /// Armed once: the next `append_events_idempotent` call commits its rows
@@ -47,6 +53,7 @@ impl FakeStore {
         Arc::new(Self {
             fail_next: AtomicUsize::new(0),
             fail_pool_next: AtomicUsize::new(0),
+            fail_terminal_next: AtomicUsize::new(0),
             calls: AtomicU64::new(0),
             rows: Mutex::new(Vec::new()),
             ambiguous_ack_once: std::sync::atomic::AtomicBool::new(false),
@@ -114,6 +121,12 @@ impl EventStore for FakeStore {
                 operation: "append_events_idempotent".into(),
                 message: "events daemon unreachable (simulated transient outage)".into(),
             });
+        }
+        if self.fail_terminal_next.load(Ordering::SeqCst) > 0 {
+            self.fail_terminal_next.fetch_sub(1, Ordering::SeqCst);
+            return Err(StorageError::Internal(
+                "simulated non-retryable storage fault".into(),
+            ));
         }
         let ambiguous = self
             .ambiguous_ack_once
@@ -468,7 +481,13 @@ async fn d8_exhausted_commit_retries_set_the_lifetime_degraded_flag() {
             producer: AuditProducer::DispatchSucceeded,
         })
         .await;
-    assert_eq!(result, Err(AuditTerminalReason::StoreFailure));
+    assert_eq!(
+        result,
+        Err(AuditTerminalReason::RetryExhausted),
+        "every attempt failed with a retryable request_state (TransactionRolledBack), so \
+         exhausting max_commit_attempts must report RetryExhausted, not the non-retryable \
+         StoreFailure fallback"
+    );
     let metrics = batch.metrics_snapshot();
     assert_eq!(metrics.flush_failures, 1);
     assert!(
@@ -478,6 +497,37 @@ async fn d8_exhausted_commit_retries_set_the_lifetime_degraded_flag() {
     assert_eq!(
         metrics.degraded_rows, 0,
         "an obligation row released with an error is not a degraded pure-observability row"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn d8_non_retryable_store_error_still_reports_store_failure() {
+    let store = FakeStore::new();
+    store.fail_terminal_next.store(1, Ordering::SeqCst);
+    let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(
+        result,
+        Err(AuditTerminalReason::StoreFailure),
+        "classify_store_error's fallback arm judges this error non-retryable on the first \
+         attempt, so it must still report StoreFailure and never RetryExhausted"
+    );
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        1,
+        "a non-retryable classification must not be retried at all"
+    );
+    let metrics = batch.metrics_snapshot();
+    assert_eq!(metrics.flush_failures, 1);
+    assert!(
+        metrics.degraded,
+        "a generation that failed to flush leaves its rows out of the audit trail"
     );
 }
 
