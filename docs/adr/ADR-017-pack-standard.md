@@ -205,8 +205,18 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
-    /// Normalize a generic note update before the write. The default delegates
-    /// to `validate_note_update` with the request's property patch.
+    /// Normalize caller-facing note-update fields before validation runs.
+    /// This is the extension point a kind-owning pack overrides. Default: no-op.
+    async fn normalize_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> { Ok(()) }
+
+    /// Sequence a generic note update before the write: normalize, then
+    /// validate. This is the sequencing method, not the extension point.
     async fn prepare_note_update(
         &self,
         runtime: &KhiveRuntime,
@@ -214,6 +224,7 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         note: &Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        self.normalize_note_update(runtime, token, note, args).await?;
         let properties = args.get("properties").filter(|value| !value.is_null());
         self.validate_note_update(runtime, token, note, properties).await
     }
@@ -248,8 +259,8 @@ note-property patches, while `validate_links` receives the whole proposed batch 
 cycle formed entirely inside one atomic link request cannot evade validation.
 
 The 2026-08-06 task-mirror amendment adds `prepare_note_update`. Its default delegates
-to `validate_note_update`, so existing hooks retain their behavior. An owning pack may
-override it to normalize coupled caller fields before the shared CRUD patch is built.
+to `validate_note_update`, so existing hooks retain their behavior. An owning pack
+normalizes coupled caller fields before the shared CRUD patch is built.
 GTD uses this seam to keep a task note's searchable `content` synchronized with
 `properties.description`; both canonical dispatch and atomic preparation invoke the
 same hook before constructing their write. The note snapshot supplied to the hook is
@@ -258,9 +269,26 @@ replacement, and atomic plans carry the same revision/deletion predicate into th
 affected-row guard. A concurrent change therefore refuses or rolls back the write
 instead of storing normalization derived from stale state. The registry retains the
 validation-only `validate_note_update_hook` compatibility seam for callers without a
-mutable request. Packs that need neither behavior inherit a no-op. Future hooks
+mutable request, and a caller reaching a hook through that seam runs the validator
+alone. Packs that need neither behavior inherit a no-op. Future hooks
 (`after_update`, `before_delete`) can extend the same pattern when a concrete consumer
 requires them.
+
+The 2026-09-18 sequencing amendment splits normalization out of
+`prepare_note_update` into `normalize_note_update`, and makes `prepare_note_update`
+run normalize and then validate. The override point moves: a kind-owning pack
+overrides `normalize_note_update`, not `prepare_note_update`. The reason is that an
+override of the sequencing method replaces the whole sequence, so a pack that
+overrode it to normalize coupled fields silently retired its own validator; GTD did
+exactly that, keeping its dependency-cycle check alive only because the override
+happened to repeat the call inline. Two copies of an invariant, one of them the only
+reachable one, is the condition this split removes. Rust does not prevent an override
+of `prepare_note_update` as well, so the guarantee is by naming and by test coverage
+of the sequence rather than by the type system; the trait documents that limit at the
+method rather than leaving a reader to infer it. Removing that limit is the accepted
+direction rather than an open question: the sequencing moves off the trait entirely, so
+that the registry orders the two halves and a pack cannot express an ordering at all,
+tracked as issue #2956; until it lands, the guarantee remains naming plus test coverage.
 
 ### `VerbRegistry`: the runtime's pack catalog
 
