@@ -2243,7 +2243,7 @@ impl VerbRegistry {
             .map_err(DispatchError::before_dispatch)?;
         let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
-                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                let audit = masked_audit_event(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -2608,7 +2608,7 @@ impl VerbRegistry {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
                 // Emit audit event via tracing.
-                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                let audit = masked_audit_event(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
@@ -4306,6 +4306,35 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
     args.get("target_id")
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
+}
+
+/// Build the [`AuditEvent`] for one gate check, masking `deny_reason` before
+/// it can reach either downstream sink.
+///
+/// `deny_reason` is gate-authored text this crate does not control: a custom
+/// `Gate` implementation (a Rego policy, an external backend) can echo
+/// request content into why it denied, so the same secret-detection pass
+/// applied to backend error text elsewhere in this file also has to run on a
+/// denial's stated reason. This can't live on [`AuditEvent`] itself —
+/// `khive-gate` cannot depend on `khive-runtime`'s masking, which itself
+/// depends on `khive-gate` (see `khive-runtime/Cargo.toml`); a masker inside
+/// `AuditEvent::from_check` would be a dependency cycle. So masking happens
+/// once, here, immediately after construction and before the event is used
+/// anywhere: every call site that turns a [`GateDecision`] into an
+/// [`AuditEvent`] must go through this function, never `AuditEvent::from_check`
+/// directly, so the `gate.check` tracing line and the row
+/// [`build_audit_storage_event`] re-serializes for the event store always see
+/// the same masked value rather than each needing its own redaction.
+fn masked_audit_event(
+    gate_req: &GateRequest,
+    decision: &GateDecision,
+    gate_impl: &str,
+) -> AuditEvent {
+    let mut audit = AuditEvent::from_check(gate_req, decision, gate_impl);
+    if let Some(reason) = audit.deny_reason.take() {
+        audit.deny_reason = Some(crate::secret_gate::bounded_masked_log_text(&reason));
+    }
+    audit
 }
 
 /// Build a v1-shape audit storage event from a gate check outcome.
@@ -6778,6 +6807,55 @@ pub(crate) mod tests {
         assert_eq!(row.outcome, EventOutcome::Denied);
         assert_eq!(row.kind, EventKind::Audit);
         assert_eq!(row.verb, "create");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn denied_dispatch_masks_secret_shaped_deny_reason_in_stored_event() {
+        // Falsifiable arm for the audit-masking fix (khive#2944): this deny
+        // reason embeds a fake credential in a shape the write-time secret
+        // gate recognizes (`scheme://user:pass@host`). Deleting the masking
+        // call at this call site — `dispatch_with_disposition`'s own
+        // `AuditEvent` construction — turns this test red: the raw
+        // credential would reach the stored row unmasked.
+        #[derive(Debug)]
+        struct SecretDenyGate;
+        impl Gate for SecretDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                let reason = "postgres://svc:not-a-real-secret@internal-host in denied request"; // gitleaks:allow
+                Ok(GateDecision::deny(reason))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(SecretDenyGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let _ = reg.dispatch("list", Value::Null).await.unwrap_err();
+
+        let events = store.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one denial row must commit");
+        let stored_reason = events[0].payload["deny_reason"]
+            .as_str()
+            .expect("deny_reason must be a string on the stored row");
+        // Non-vacuity: the row actually captured content, so the negative
+        // assertion below cannot pass merely because nothing was read.
+        assert!(!stored_reason.is_empty());
+        assert!(
+            stored_reason.contains("in denied request"),
+            "non-secret prose must survive masking: {stored_reason:?}"
+        );
+        assert!(
+            !stored_reason.contains("not-a-real-secret"),
+            "the durable row must never carry the raw credential: {stored_reason:?}"
+        );
+        assert!(
+            stored_reason.contains("***MASKED***"),
+            "the durable row must record that a credential was redacted: {stored_reason:?}"
+        );
     }
 
     #[tokio::test]
@@ -9802,6 +9880,62 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial(config_ledger)]
+    async fn intercepted_denied_dispatch_masks_secret_shaped_deny_reason_in_stored_event() {
+        // Falsifiable arm for the audit-masking fix (khive#2944), exercised
+        // through the intercepted dispatch path's OWN `AuditEvent`
+        // construction site
+        // (`dispatch_intercepted_with_metadata_and_disposition`), distinct
+        // from the plain-dispatch site covered by
+        // `denied_dispatch_masks_secret_shaped_deny_reason_in_stored_event`.
+        // Masking only the plain-dispatch site would leave this call site's
+        // stored row carrying the raw credential and this test red.
+        #[derive(Debug)]
+        struct InterceptedSecretDenyGate;
+        impl Gate for InterceptedSecretDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                let reason = "postgres://svc:not-a-real-secret@internal-host in denied request"; // gitleaks:allow
+                Ok(GateDecision::deny(reason))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(Arc::new(InterceptedSecretDenyGate));
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let _ = registry
+            .dispatch_intercepted_with_identity(
+                "list",
+                &Value::Null,
+                None,
+                move |_namespace| async move { Ok(serde_json::json!({"invoked": true})) },
+            )
+            .await
+            .expect_err("explicit gate denial must refuse intercepted dispatch");
+
+        let events = store.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one denial row must commit");
+        let stored_reason = events[0].payload["deny_reason"]
+            .as_str()
+            .expect("deny_reason must be a string on the stored row");
+        assert!(!stored_reason.is_empty());
+        assert!(
+            stored_reason.contains("in denied request"),
+            "non-secret prose must survive masking: {stored_reason:?}"
+        );
+        assert!(
+            !stored_reason.contains("not-a-real-secret"),
+            "the durable row must never carry the raw credential: {stored_reason:?}"
+        );
+        assert!(
+            stored_reason.contains("***MASKED***"),
+            "the durable row must record that a credential was redacted: {stored_reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
     async fn intercepted_git_digest_uses_the_same_receipt_contract() {
         let project_id = uuid::Uuid::new_v4();
         let store = Arc::new(MemoryEventStore::default());
@@ -11255,6 +11389,135 @@ pub(crate) mod tests {
             payload_json["obligations"],
             serde_json::Value::Array(Vec::new()),
             "obligations must be `[]` on Deny on the tracing payload, not omitted"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_tracing_emits_gate_check_event_with_masked_deny_payload() {
+        // Falsifiable arm for the audit-masking fix (khive#2944): this deny
+        // reason embeds a fake credential in a shape the write-time secret
+        // gate recognizes (`scheme://user:pass@host`). Deleting the masking
+        // call at the production call site — or masking only the durable
+        // sink and not this tracing line — turns this test red.
+        #[derive(Debug)]
+        struct TracingSecretDenyGate;
+        impl Gate for TracingSecretDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                let reason = "postgres://svc:not-a-real-secret@internal-host in denied request"; // gitleaks:allow
+                Ok(GateDecision::deny(reason))
+            }
+            fn impl_name(&self) -> &'static str {
+                "TracingSecretDenyGate"
+            }
+        }
+
+        let events = capture_dispatch_events(async {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_gate(Arc::new(TracingSecretDenyGate));
+            let reg = builder.build().expect("registry builds");
+            let _ = reg.dispatch("create", serde_json::Value::Null).await;
+        });
+
+        let gate_events = gate_check_events_for(&events, "TracingSecretDenyGate");
+        assert_eq!(
+            gate_events.len(),
+            1,
+            "exactly one gate.check tracing event per dispatch (deny); got {gate_events:?}"
+        );
+        let payload = gate_events[0]
+            .audit_event
+            .as_ref()
+            .expect("gate.check event must carry an audit_event field on Deny");
+        // Non-vacuity: the capture actually produced content, so the
+        // negative assertion below cannot pass merely because nothing was
+        // read.
+        assert!(!payload.is_empty());
+        let audit: khive_gate::AuditEvent =
+            serde_json::from_str(payload).expect("audit_event payload must decode to AuditEvent");
+        let masked_reason = audit
+            .deny_reason
+            .as_deref()
+            .expect("deny_reason must be present on a Deny audit event");
+        assert!(
+            masked_reason.contains("in denied request"),
+            "non-secret prose must survive masking: {masked_reason:?}"
+        );
+        assert!(
+            !masked_reason.contains("not-a-real-secret"),
+            "the process log must never carry the raw credential: {masked_reason:?}"
+        );
+        assert!(
+            masked_reason.contains("***MASKED***"),
+            "the log must record that a credential was redacted: {masked_reason:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn intercepted_dispatch_tracing_emits_gate_check_event_with_masked_deny_payload() {
+        // Same falsifiable arm as
+        // `dispatch_tracing_emits_gate_check_event_with_masked_deny_payload`,
+        // exercised through the intercepted dispatch path
+        // (`dispatch_intercepted_with_metadata_and_disposition`), the
+        // audit-emission code's second production `AuditEvent` construction
+        // site. Masking only the plain-dispatch call site would leave this
+        // one red.
+        #[derive(Debug)]
+        struct InterceptedTracingSecretDenyGate;
+        impl Gate for InterceptedTracingSecretDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                let reason = "postgres://svc:not-a-real-secret@internal-host in denied request"; // gitleaks:allow
+                Ok(GateDecision::deny(reason))
+            }
+            fn impl_name(&self) -> &'static str {
+                "InterceptedTracingSecretDenyGate"
+            }
+        }
+
+        let events = capture_dispatch_events(async {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_gate(Arc::new(InterceptedTracingSecretDenyGate));
+            let reg = builder.build().expect("registry builds");
+            let _ = reg
+                .dispatch_intercepted_with_identity(
+                    "list",
+                    &Value::Null,
+                    None,
+                    move |_namespace| async move { Ok(serde_json::json!({"invoked": true})) },
+                )
+                .await;
+        });
+
+        let gate_events = gate_check_events_for(&events, "InterceptedTracingSecretDenyGate");
+        assert_eq!(
+            gate_events.len(),
+            1,
+            "exactly one gate.check tracing event per intercepted dispatch (deny); got {gate_events:?}"
+        );
+        let payload = gate_events[0]
+            .audit_event
+            .as_ref()
+            .expect("gate.check event must carry an audit_event field on Deny");
+        assert!(!payload.is_empty());
+        let audit: khive_gate::AuditEvent =
+            serde_json::from_str(payload).expect("audit_event payload must decode to AuditEvent");
+        let masked_reason = audit
+            .deny_reason
+            .as_deref()
+            .expect("deny_reason must be present on a Deny audit event");
+        assert!(
+            masked_reason.contains("in denied request"),
+            "non-secret prose must survive masking: {masked_reason:?}"
+        );
+        assert!(
+            !masked_reason.contains("not-a-real-secret"),
+            "the process log must never carry the raw credential: {masked_reason:?}"
+        );
+        assert!(
+            masked_reason.contains("***MASKED***"),
+            "the log must record that a credential was redacted: {masked_reason:?}"
         );
     }
 
