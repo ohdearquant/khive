@@ -822,8 +822,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 required: false,
                 description: "Required in singleton mode. Source node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
-                              and prefix lookup search every namespace you can see; \
-                              entity-name fallback uses the primary namespace. Ignored when \
+                              and prefix lookup apply no namespace filter at all, which is a \
+                              wider reach than the caller's visible set; entity-name fallback \
+                              uses the primary namespace. Ignored when \
                               links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
@@ -833,8 +834,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 required: false,
                 description: "Required in singleton mode. Target node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
-                              and prefix lookup search every namespace you can see; \
-                              entity-name fallback uses the primary namespace. Ignored when \
+                              and prefix lookup apply no namespace filter at all, which is a \
+                              wider reach than the caller's visible set; entity-name fallback \
+                              uses the primary namespace. Ignored when \
                               links is supplied.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
@@ -1595,6 +1597,46 @@ mod tests {
             assert!(
                 diagnostics.description.contains(required),
                 "db_diagnostics help must explain {required:?}"
+            );
+        }
+    }
+
+    /// `link`'s id params resolve through `resolve_uuid_unfiltered`, which passes no
+    /// namespace predicate at all (`KhiveRuntime::resolve_prefix_unfiltered` ->
+    /// `resolve_prefix_inner(None, ..)`). Their help text said the lookup searched "every
+    /// namespace you can see", which is a visibility-bounded reach and a narrower claim than
+    /// the truth, while the shared id contract appended to the same description said "no
+    /// namespace filter" — so one description asserted both readings at once and a caller
+    /// could take either.
+    ///
+    /// The must-not-match arm is the load-bearing one: a description can state the correct
+    /// rule and still carry the contradicting sentence beside it, which is exactly the state
+    /// this test was written to end.
+    #[test]
+    fn link_id_params_state_unfiltered_resolution_and_not_a_visible_set() {
+        let link = find_handler("link");
+        for name in ["source_id", "target_id"] {
+            let param = link
+                .params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("link must declare {name:?}"));
+            assert!(
+                param.description.contains("no namespace filter"),
+                "link.{name} help must state that UUID and prefix lookup are unfiltered; got: {}",
+                param.description
+            );
+            assert!(
+                !param.description.contains("every namespace you can see"),
+                "link.{name} help must not describe resolution as bounded by the caller's \
+                 visible set — it is not bounded at all; got: {}",
+                param.description
+            );
+            assert!(
+                param.description.contains("primary namespace"),
+                "link.{name} help must keep the entity-name fallback's namespace scope, which \
+                 IS the caller's primary namespace; got: {}",
+                param.description
             );
         }
     }
