@@ -285,7 +285,10 @@ happened to repeat the call inline. Two copies of an invariant, one of them the 
 reachable one, is the condition this split removes. Rust does not prevent an override
 of `prepare_note_update` as well, so the guarantee is by naming and by test coverage
 of the sequence rather than by the type system; the trait documents that limit at the
-method rather than leaving a reader to infer it.
+method rather than leaving a reader to infer it. Removing that limit is the accepted
+direction rather than an open question: the sequencing moves off the trait entirely, so
+that the registry orders the two halves and a pack cannot express an ordering at all,
+tracked as issue #2956; until it lands, the guarantee remains naming plus test coverage.
 
 ### `VerbRegistry`: the runtime's pack catalog
 
