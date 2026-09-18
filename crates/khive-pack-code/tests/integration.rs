@@ -644,22 +644,40 @@ async fn update_finding_accepts_array_evidence() {
 }
 
 #[tokio::test]
-async fn update_finding_clears_evidence_on_null() {
-    // evidence is optional on create, so clearing it lands in a state the
-    // create path can also produce -- the same rule the enum fields follow.
+async fn update_finding_rejects_null_evidence() {
+    // An explicit null is not a way to clear this field, and the first version of
+    // this arm assumed it was. Measured: the generic property merge STORES the null
+    // rather than removing the key, so admitting one persists
+    // `properties.evidence: null` -- a shape `create` refuses outright, reachable
+    // only through `update`.
+    //
+    // The assertion that missed it read `updated["properties"]["evidence"].is_null()`,
+    // which serde_json answers with `Value::Null` for a key that is not present, so
+    // it read true for "removed" and for "stored as null" alike. A claim about a key
+    // being gone has to ask about the key.
     let reg = registry(rt());
     let created = create_finding(&reg, json!({"evidence": ["src/lib.rs:42"]})).await;
-    let updated = dispatch(
+    let err = dispatch(
         &reg,
         "update",
         json!({"id": created["id"], "properties": {"evidence": null}}),
     )
     .await
-    .expect("evidence is optional on create, so an explicit null must clear it");
+    .expect_err("a null evidence must be refused on update, exactly as create refuses it");
+    let msg = err.to_string();
     assert!(
-        updated["properties"]["evidence"].is_null(),
-        "evidence must be gone, got: {}",
-        updated["properties"]["evidence"]
+        msg.contains("evidence must be an array"),
+        "the refusal must name the array requirement, got: {msg}"
+    );
+
+    // And the refusal must leave the stored row untouched, not half-applied.
+    let after = dispatch(&reg, "get", json!({"id": created["id"]}))
+        .await
+        .expect("the finding still exists after a refused update");
+    assert_eq!(
+        after["properties"]["evidence"],
+        json!(["src/lib.rs:42"]),
+        "a refused update must not have changed the row"
     );
 }
 
