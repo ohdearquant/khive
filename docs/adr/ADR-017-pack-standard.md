@@ -5,6 +5,8 @@
 **Authors**: khive maintainers\
 **Amended by**: [ADR-061](ADR-061-pack-extensible-by-id-resolution.md), which adds the
 `PackByIdResolver` sub-trait.\
+**Amended**: 2026-09-18, [a pack may refuse shared creation of a kind it
+owns](#amendment-2026-09-18-a-pack-may-refuse-shared-creation-of-a-kind-it-owns) (#2965).\
 **Related**: [ADR-055](ADR-055-epistemic-edge-relations.md), which amends ADR-002 by
 adding the `supports` and `refutes` relations. Occurrences of "15 edge relations" in
 this historical pack-standard text reflect the original base set.
@@ -1085,3 +1087,44 @@ only when its declared SQL type matches the declaration's affinity type (`TEXT` 
 `INTEGER`, ignoring case and surrounding whitespace), it is nullable, it has no default,
 and it is neither a primary key nor hidden/generated. A present column that violates any
 of those requirements is incompatible.
+
+## Amendment (2026-09-18): a pack may refuse shared creation of a kind it owns
+
+**Status:** Accepted.
+
+Related issue: [#2963](https://github.com/ohdearquant/khive/issues/2963).
+Implementation: [#2965](https://github.com/ohdearquant/khive/pull/2965).
+
+"Why KindHook for specialization?" says a pack hooks shared CRUD to specialize it. This amendment
+states the limit case of that specialization: a pack may use `KindHook::prepare_create` to _refuse_
+shared creation of a kind it owns, and the refusal names the verb that performs the write instead.
+
+A pack may refuse when the kind's identity, or a set of fields a reader depends on, is produced by
+a specialized writer and cannot be produced on the shared path. Two shapes have arisen:
+
+- **Identity.** The owning verb addresses the row at an id it derives from the record's own
+  coordinates, so a row created at an unrelated id is unreachable by every later write and can be
+  reported alongside the row it duplicates. comm's `channel_health` is the instance.
+- **Derivation.** The owning verb derives several stored fields together, so a row created without
+  them is held in one state and rendered in another. memory's `memory` kind is the instance, per
+  [ADR-021](ADR-021-memory-pack.md)'s creation-admission amendment.
+
+Such a refusal is constrained:
+
+1. It lives on the owning pack's hook. The shared handler does not name any pack's kinds, redirect
+   requests, or enforce a general prohibition on kinds that have specialized verbs.
+2. Its message names the verb that performs the write, so a refused caller has somewhere to go.
+3. It is not gated on a registry probe. A hook exists only when the pack that owns the kind is
+   registered, so a refusal cannot reach a caller who has no such verb to dispatch; the hook's
+   existence is that capability check.
+4. It covers both admitting paths that reach the hook — shared `create`, and a `stream.batch` write
+   member naming the kind. In a batch it refuses during preparation, so no sibling write commits.
+5. It is create-only. Reads, searches, updates, deletion and restoration of existing rows of the
+   kind are unaffected, and so are the creation routes that do not call this hook — standalone
+   `stream.append` and approved `propose`/`review` `AddNote` changesets — which remain governed by
+   their own contracts.
+
+This does not make refusal a default or a property of pack-owned kinds as a class. A kind whose
+shared creation produces a complete record stays creatable through it, and packs that depend on
+shared `create` are unaffected: what is permitted here is a per-kind refusal justified by a named
+writer, not a class-wide denial.
