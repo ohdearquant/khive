@@ -19,6 +19,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = REPO_ROOT / ".gitleaks.toml"
 CACHE_PATH = "crates/khive-pack-git/src/cache.rs"
 CACHE_VALUES = ("abcdef0123456789", "fedcba9876543210")
+GATE_PATH = "crates/khive-runtime/src/secret_gate.rs"
+GATE_VALUES = ("a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4", "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh")
 GITLEAKS = shutil.which("gitleaks")
 
 
@@ -175,6 +177,77 @@ class GitleaksConfigTests(unittest.TestCase):
         findings = self.scan(expected_exit=1)
         self.assertIn("github-pat", {row["RuleID"] for row in findings})
 
+
+    def test_gate_constants_are_exempt_at_the_gate_path(self):
+        self.write_values(GATE_PATH, GATE_VALUES)
+        self.assertEqual(self.scan(expected_exit=0), [])
+
+    def test_gate_constants_are_not_exempt_at_other_paths(self):
+        paths = (
+            "crates/khive-runtime/src/other.rs",
+            "prefix/" + GATE_PATH,
+            GATE_PATH + ".bak",
+        )
+        for path in paths:
+            self.write_values(path, GATE_VALUES)
+        self.write_values(GATE_PATH, GATE_VALUES)  # the exempt site coexists
+        findings = self.scan(expected_exit=1)
+        self.assertEqual({row["File"] for row in findings}, set(paths))
+        self.assertEqual(len(findings), len(GATE_VALUES) * len(paths))
+
+    def test_neighbouring_values_at_the_gate_path_are_not_exempt(self):
+        # Superstrings and a sibling fixture shape: the exemption is two constants,
+        # not the file, so a real credential added here still has to be reported.
+        neighbours = (
+            GATE_VALUES[0] + "ff",
+            "ff" + GATE_VALUES[1],
+            "".join(reversed(GATE_VALUES[0])),
+        )
+        self.write_values(GATE_PATH, neighbours)
+        findings = self.scan(expected_exit=1)
+        self.assertEqual({row["StartLine"] for row in findings}, {1, 2, 3})
+        self.assertEqual({row["File"] for row in findings}, {GATE_PATH})
+
+    def test_gate_exemption_survives_line_moves_and_new_commits(self):
+        # The defect this exemption replaces: a fingerprint pins commit and line,
+        # so editing the file anywhere above the constant reintroduced the finding.
+        self.git("init", "--quiet")
+        hooks = self.root / "empty-hooks"
+        hooks.mkdir()
+        self.git("config", "core.hooksPath", str(hooks))
+        self.git("config", "commit.gpgsign", "false")
+        self.write_values(GATE_PATH, GATE_VALUES)
+        self.git("add", "--", GATE_PATH)
+        self.git("commit", "--quiet", "-m", "original fixtures")
+        first = self.git("rev-parse", "HEAD")
+        self.write_values(GATE_PATH, ())
+        self.git("add", "--", GATE_PATH)
+        self.git("commit", "--quiet", "-m", "remove fixtures before reintroduction")
+        self.write_values(GATE_PATH, GATE_VALUES, padding=31)
+        self.git("add", "--", GATE_PATH)
+        self.git("commit", "--quiet", "-m", "reintroduce the same values at new lines")
+        moved = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(first, moved)
+
+        # Positive control: without the exemption the scanner really does report
+        # the values under both commits, so the pass below is not an empty scan.
+        self.config.write_text("[extend]\nuseDefault = true\n")
+        findings = self.scan(expected_exit=1, history="--all")
+        self.assertEqual({row["Commit"] for row in findings}, {first, moved})
+
+        self.config.write_text(CONFIG.read_text())
+        self.assertEqual(self.scan(expected_exit=0, history="--all"), [])
+
+    def test_every_exempt_gate_constant_still_appears_in_the_file_it_exempts(self):
+        # An exemption outlives the fixture it was written for. This fails when a
+        # constant is renamed or dropped, instead of leaving a dead entry that
+        # quietly widens what the scanner is told to skip.
+        source = (REPO_ROOT / GATE_PATH).read_text()
+        for value in GATE_VALUES:
+            self.assertIn(
+                value, source,
+                f"exempt constant no longer present in {GATE_PATH}; remove the exemption",
+            )
 
 if __name__ == "__main__":
     unittest.main()

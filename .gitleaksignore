@@ -1,10 +1,11 @@
 # gitleaks finding-specific ignores (exact fingerprints; commit:path:rule:line).
-# The cache-lock fixture values are covered by the path- and rule-scoped
-# exemption in .gitleaks.toml, independent of their commit and line number.
+#
+# A fingerprint names a commit and a line number, so it stops matching as soon as the file is
+# edited: the value moves to a new line under a new commit and the history scan reports it again.
+# Anything in a file that will be edited again belongs in .gitleaks.toml instead, scoped by value
+# and path, which is independent of commit and line. The cache-lock fixture values and the secret
+# gate's own test constants are covered there.
+#
 # These two documentation lines are confirmed non-credentials.
 4ce001460f67750796f533b1269c74c90c67eb5c:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:135
 39fb7052c29916e50f20083f5f6281861bb7ebd9:docs/adr/ADR-101-kg-changeset-model.md:generic-api-key:155
-# Synthetic 40-hex test constant in issue_1988_latex_exemption_does_not_hide_credential_runs
-# (secret_gate regression test on the open branch for #2056); flagged by the nightly
-# all-ref scan since 2026-08-30, confirmed non-credential.
-f1c8e732e61b9ec2516b794dbb37afd5152cee59:crates/khive-runtime/src/secret_gate.rs:generic-api-key:3338
