@@ -1,7 +1,7 @@
 //! Validation/defaulting for the shared finding-note create and update paths.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
 use khive_storage::Note;
@@ -50,6 +50,31 @@ fn validate_finding_enum(key: &str, value: &Value) -> Result<(), RuntimeError> {
         return Err(RuntimeError::InvalidInput(format!(
             "invalid {key} {text:?}; valid: {valid_values}"
         )));
+    }
+    Ok(())
+}
+
+/// The `evidence` property must be an array wherever it is present, on either
+/// write path.
+///
+/// One function rather than a block in each path, for the reason the
+/// `FINDING_ENUMS` table above states: two writers of one rule drift. These two
+/// already had, and in the direction that is hard to see -- create refused a
+/// present `evidence` that was not an array, which includes an explicit null,
+/// while update admitted the null.
+///
+/// A null is not a way to clear this field. The generic property merge stores an
+/// explicit null rather than removing the key, so admitting one persists
+/// `properties.evidence: null` -- a shape no create call can produce, and one that
+/// reads as "present but empty" to anything that checks for the key.
+fn validate_finding_evidence(properties: &Map<String, Value>) -> Result<(), RuntimeError> {
+    let Some(value) = properties.get("evidence") else {
+        return Ok(());
+    };
+    if !value.is_array() {
+        return Err(RuntimeError::InvalidInput(
+            "evidence must be an array".into(),
+        ));
     }
     Ok(())
 }
@@ -119,13 +144,7 @@ impl KindHook for FindingHook {
             }
         }
 
-        if let Some(v) = obj.get("evidence") {
-            if !v.is_array() {
-                return Err(RuntimeError::InvalidInput(
-                    "evidence must be an array".into(),
-                ));
-            }
-        }
+        validate_finding_evidence(obj)?;
 
         let content = args
             .get("content")
@@ -197,6 +216,13 @@ impl KindHook for FindingHook {
             }
             validate_finding_enum(key, value)?;
         }
+
+        // `evidence` was checked at create and not here, so `update` stored any
+        // shape the caller sent. Both paths now go through one function, and it
+        // holds the same rule on both: present means array. Unlike the enums
+        // above, an explicit null is NOT a clear here -- the merge stores it.
+        validate_finding_evidence(map)?;
+
         Ok(())
     }
 }

@@ -589,6 +589,99 @@ async fn update_finding_leaves_unmentioned_closed_set_fields_alone() {
 }
 
 #[tokio::test]
+async fn create_finding_rejects_non_array_evidence() {
+    // The control for the pair below: this is the shape create has always
+    // refused. Without it, the update arm cannot show the two paths agree.
+    let reg = registry(rt());
+    let err = dispatch(
+        &reg,
+        "create",
+        json!({
+            "kind": "finding",
+            "title": "Missing bounds check",
+            "properties": {"evidence": 42},
+        }),
+    )
+    .await
+    .expect_err("create must refuse a non-array evidence");
+    assert!(
+        err.to_string().contains("evidence must be an array"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_rejects_non_array_evidence() {
+    // The defect: create refused this shape and update stored it verbatim, so a
+    // finding could hold an evidence value no create could have written.
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"evidence": 42}}),
+    )
+    .await
+    .expect_err("update must refuse the same evidence shape create refuses");
+    assert!(
+        err.to_string().contains("evidence must be an array"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_accepts_array_evidence() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let updated = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"evidence": ["src/lib.rs:42"]}}),
+    )
+    .await
+    .expect("an array evidence must still be accepted");
+    assert_eq!(updated["properties"]["evidence"][0], "src/lib.rs:42");
+}
+
+#[tokio::test]
+async fn update_finding_rejects_null_evidence() {
+    // An explicit null is not a way to clear this field, and the first version of
+    // this arm assumed it was. Measured: the generic property merge STORES the null
+    // rather than removing the key, so admitting one persists
+    // `properties.evidence: null` -- a shape `create` refuses outright, reachable
+    // only through `update`.
+    //
+    // The assertion that missed it read `updated["properties"]["evidence"].is_null()`,
+    // which serde_json answers with `Value::Null` for a key that is not present, so
+    // it read true for "removed" and for "stored as null" alike. A claim about a key
+    // being gone has to ask about the key.
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"evidence": ["src/lib.rs:42"]})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"evidence": null}}),
+    )
+    .await
+    .expect_err("a null evidence must be refused on update, exactly as create refuses it");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("evidence must be an array"),
+        "the refusal must name the array requirement, got: {msg}"
+    );
+
+    // And the refusal must leave the stored row untouched, not half-applied.
+    let after = dispatch(&reg, "get", json!({"id": created["id"]}))
+        .await
+        .expect("the finding still exists after a refused update");
+    assert_eq!(
+        after["properties"]["evidence"],
+        json!(["src/lib.rs:42"]),
+        "a refused update must not have changed the row"
+    );
+}
+
+#[tokio::test]
 async fn create_finding_rejects_non_object_properties() {
     let reg = registry(rt());
     let err = dispatch(
