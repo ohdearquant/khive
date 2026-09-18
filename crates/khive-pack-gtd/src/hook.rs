@@ -14,6 +14,7 @@ use khive_runtime::{KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken,
 use khive_storage::Note;
 
 use crate::handlers::parse_due;
+use crate::schema::{is_valid_priority, priority_to_salience};
 use crate::task_create::{link_depends_on_edges, prepare_task_create, TaskCreateInput};
 
 #[derive(Debug, Default)]
@@ -240,6 +241,68 @@ fn normalize_due_update(
     Ok(())
 }
 
+/// Validate a `priority` written through the generic property path and re-derive the note's
+/// `salience` beside it.
+///
+/// `priority` is the same shape of defect as `due` above, with one difference that makes it worse:
+/// no gtd verb can change a priority at all, so the free-form property path is not a second writer
+/// but the only one. `gtd.assign` checks the value against `p0..p3`, stores it lowercase, and sets
+/// `salience` from it; the property path did none of the three. A nonsense priority was therefore
+/// storable but unreachable, since `gtd.tasks(priority=..)` validates its filter against the same
+/// list, and an escalated task kept ranking at the salience its create had written.
+///
+/// A caller who names `salience` in the same update keeps their value. That is the same rule as
+/// the zone above: what the caller states explicitly wins over what is derived for them.
+fn normalize_priority_update(args: &mut Value) -> Result<(), RuntimeError> {
+    let Some(root) = args.as_object_mut() else {
+        return Ok(());
+    };
+    // Presence, not truthiness: `salience: null` is the tri-state contract's explicit clear
+    // (key absent -> untouched, null -> clear, number -> set), so reading null as "the caller said
+    // nothing" would overwrite a clear with the derived value and silently ignore the instruction.
+    let caller_set_salience = root.contains_key("salience");
+    let Some(priority) = root
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("priority"))
+    else {
+        return Ok(());
+    };
+
+    // An explicit null clears the priority. `gtd.assign` gives a task with no priority a salience
+    // of 0.5, so that is what a cleared one falls back to rather than keeping the old level's.
+    let canonical = if priority.is_null() {
+        None
+    } else {
+        let named = priority.as_str().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "priority must be one of p0, p1, p2, p3, or null; got {priority}"
+            ))
+        })?;
+        let canonical = named.to_ascii_lowercase();
+        if !is_valid_priority(&canonical) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "invalid priority {named:?} — valid: p0, p1, p2, p3"
+            )));
+        }
+        Some(canonical)
+    };
+
+    let salience = canonical
+        .as_deref()
+        .map(priority_to_salience)
+        .unwrap_or(0.5);
+    if let Some(canonical) = canonical {
+        if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert("priority".into(), json!(canonical));
+        }
+    }
+    if !caller_set_salience {
+        root.insert("salience".into(), json!(salience));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl KindHook for TaskHook {
     async fn prepare_create(
@@ -306,6 +369,7 @@ impl KindHook for TaskHook {
     ) -> Result<(), RuntimeError> {
         synchronize_description(note, args)?;
         normalize_due_update(runtime, note, args)?;
+        normalize_priority_update(args)?;
         let properties = args.get("properties").filter(|value| !value.is_null());
         crate::dependency::validate_property_update(runtime, token, note, properties).await
     }
@@ -529,6 +593,128 @@ mod tests {
 
         assert_eq!(args["properties"]["due"], "2026-12-25T00:00:00-05:00");
         assert_eq!(args["properties"]["due_timezone"], "America/New_York");
+    }
+
+    /// The core of #2925: `salience` is derived from `priority` at create and feeds ranking, and
+    /// the property path used to change one without the other. An escalated task kept the level
+    /// its create had written.
+    #[tokio::test]
+    async fn an_escalated_priority_rewrites_the_salience_beside_it() {
+        // No note fixture: the level a task currently holds does not enter this decision. The
+        // salience follows the level named in THIS update, which is what makes the escalation
+        // land rather than being merged against a stored value.
+        let mut args = json!({"properties": {"priority": "p0"}});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["priority"], "p0");
+        assert_eq!(
+            args["salience"], 1.0,
+            "the ranking value must follow the level, not the create"
+        );
+    }
+
+    /// `gtd.assign` stores the level lowercase. The property path now agrees, so one task cannot
+    /// hold a spelling that its own create path would never have written.
+    #[tokio::test]
+    async fn a_priority_is_stored_in_the_spelling_the_create_path_uses() {
+        let mut args = json!({"properties": {"priority": "P1"}});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["priority"], "p1");
+        assert_eq!(args["salience"], 0.75);
+    }
+
+    /// A value outside p0..p3 was storable and then unreachable, because `gtd.tasks(priority=..)`
+    /// validates its filter against the same list the create path validates writes against.
+    #[tokio::test]
+    async fn a_priority_outside_the_levels_is_refused_rather_than_stored() {
+        let mut nonsense = json!({"properties": {"priority": "URGENT!!"}});
+        let err = normalize_priority_update(&mut nonsense)
+            .expect_err("a level outside p0..p3 must not be stored verbatim");
+        assert!(
+            format!("{err}").contains("p0, p1, p2, p3"),
+            "the refusal must name the levels; got: {err}"
+        );
+
+        let mut wrong_type = json!({"properties": {"priority": 0}});
+        normalize_priority_update(&mut wrong_type)
+            .expect_err("a non-string, non-null priority must be refused");
+    }
+
+    /// Clearing the level lands on the salience `gtd.assign` gives a task created without one,
+    /// rather than leaving the cleared level's value behind as derived state with nothing to
+    /// derive from.
+    #[tokio::test]
+    async fn clearing_the_priority_falls_back_to_the_unprioritized_salience() {
+        let mut args = json!({"properties": {"priority": null}});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["salience"], 0.5);
+    }
+
+    /// The caller's own value wins over the derived one, which is the same rule the zone above
+    /// follows: what a caller states explicitly beats what is computed for them.
+    #[tokio::test]
+    async fn a_caller_named_salience_survives_the_derivation() {
+        let mut args = json!({"properties": {"priority": "p0"}, "salience": 0.1});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["priority"], "p0");
+        assert_eq!(args["salience"], 0.1);
+    }
+
+    /// `salience: null` is the tri-state contract's explicit clear, so a caller who sends it
+    /// beside a priority is asking for the level without the derived ranking. Reading null as
+    /// silence would overwrite the clear with the derived number and ignore the instruction.
+    #[tokio::test]
+    async fn an_explicit_null_salience_is_a_clear_and_survives_the_derivation() {
+        let mut args = json!({"properties": {"priority": "p0"}, "salience": null});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["priority"], "p0");
+        assert!(
+            args["salience"].is_null(),
+            "an explicit clear must reach the patch; got: {}",
+            args["salience"]
+        );
+    }
+
+    /// An update that does not mention the level must not mint a salience nobody asked for: doing
+    /// so would rewrite the ranking of every task touched for an unrelated reason.
+    #[tokio::test]
+    async fn an_update_without_a_priority_does_not_touch_the_salience() {
+        let mut args = json!({"properties": {"planning_label": "reviewed"}});
+        normalize_priority_update(&mut args).expect("normalize");
+        assert_eq!(args, json!({"properties": {"planning_label": "reviewed"}}));
+
+        let mut no_properties = json!({"content": "body only"});
+        normalize_priority_update(&mut no_properties).expect("normalize");
+        assert_eq!(no_properties, json!({"content": "body only"}));
+    }
+
+    /// The wiring: the hook every generic update path calls must run it, or the function is
+    /// correct and unreachable.
+    #[tokio::test]
+    async fn the_update_hook_runs_the_priority_normalization() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let note = task_note_with(json!({"description": "body", "priority": "p3"}));
+        let mut args = json!({"properties": {"priority": "p0"}});
+
+        TaskHook
+            .prepare_note_update(&runtime, &token, &note, &mut args)
+            .await
+            .expect("hook");
+
+        assert_eq!(args["properties"]["priority"], "p0");
+        assert_eq!(args["salience"], 1.0);
     }
 
     #[tokio::test]
