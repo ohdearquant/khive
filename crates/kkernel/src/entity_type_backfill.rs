@@ -127,6 +127,12 @@ fn compose_registry(runtime: &KhiveRuntime) -> Result<(VerbRegistry, EntityTypeR
     );
     let registry = PackRegistry::build_ingest_registry(runtime, IngestAuditStore::Detach)?;
     registry.call_register_entity_type_validators(runtime);
+    // #2943: this composed registry is also the one `scan`'s `--apply` path
+    // writes through (`update_entity_if_unchanged` -> `prepare_guarded_entity_update`);
+    // without this, a row whose properties fail a pack's KindHook invariant
+    // is silently unvalidated on this write path while the same row would
+    // be refused through the MCP `update` verb.
+    runtime.install_entity_kind_hooks(registry.entity_kind_hooks());
     let types = EntityTypeRegistry::with_extra(registry.all_entity_types());
     Ok((registry, types))
 }
@@ -387,7 +393,7 @@ pub async fn run_entity_type_backfill(args: EntityTypeBackfillArgs) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::RuntimeConfig;
+    use khive_runtime::{Namespace, RuntimeConfig};
     use serde_json::json;
 
     #[test]
@@ -462,5 +468,100 @@ mod tests {
             classify(&deleted, &types),
             Classification::Ineligible
         ));
+    }
+
+    /// #2943: `compose_registry` must install the same entity-kind hooks the
+    /// MCP boot paths install, because `scan`'s `--apply` mode writes through
+    /// this exact composed registry's runtime (`compose_registry(&runtime)`
+    /// in `backfill_resolved`, then `runtime.update_entity_if_unchanged`
+    /// inside `scan`, sharing the same `Arc`-backed runtime instance). Proves
+    /// the install by exercising a real guarded update end to end rather than
+    /// inspecting the aggregate alone — a hook set that is computed but never
+    /// installed onto `runtime` would pass a weaker, aggregate-only check
+    /// silently.
+    ///
+    /// Mutation prediction: deleting the
+    /// `runtime.install_entity_kind_hooks(registry.entity_kind_hooks());`
+    /// line from `compose_registry` makes the refusal arm below fail — the
+    /// workspace entity's missing `schema_version` update succeeds instead
+    /// of being refused, and `expect_err` panics.
+    #[tokio::test]
+    async fn compose_registry_installs_entity_kind_hooks_for_backfill_writes() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: Vec::new(),
+            packs: vec![
+                "kg".into(),
+                "git".into(),
+                "gtd".into(),
+                "session".into(),
+                "workspace".into(),
+            ],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let (_registry, _types) = compose_registry(&runtime).unwrap();
+        // NamespaceToken::local() is pub(crate) to khive-runtime by design: its own doc
+        // says external callers mint through KhiveRuntime::authorize. Going through
+        // authorize is also the stronger arm -- it exercises the gate check and actor
+        // resolution this backfill actually runs under. Matches lines 178 and 273 above.
+        let tok = runtime.authorize(Namespace::local()).unwrap();
+
+        let invalid = runtime
+            .create_entity(
+                &tok,
+                "workspace",
+                None,
+                "Backfill Workspace",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let error = runtime
+            .update_entity(
+                &tok,
+                invalid.id,
+                EntityPatch {
+                    name: Some("Renamed Backfill Workspace".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err(
+                "compose_registry must install the workspace KindHook onto this runtime, \
+                 refusing an update that leaves properties.schema_version missing",
+            );
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::InvalidInput(ref msg) if msg.contains("schema_version")),
+            "unexpected error: {error:?}"
+        );
+
+        let valid = runtime
+            .create_entity(
+                &tok,
+                "workspace",
+                None,
+                "Valid Backfill Workspace",
+                None,
+                Some(json!({"schema_version": 1})),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let updated = runtime
+            .update_entity(
+                &tok,
+                valid.id,
+                EntityPatch {
+                    name: Some("Renamed Valid Workspace".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a workspace entity carrying a valid schema_version must update freely");
+        assert_eq!(updated.name, "Renamed Valid Workspace");
     }
 }

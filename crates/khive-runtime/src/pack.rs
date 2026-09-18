@@ -470,8 +470,8 @@ pub trait PackRuntime: Send + Sync {
 /// registers them via [`PackRuntime::kind_hook`].
 ///
 /// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
-/// verbs. Shared `create`, note `update`, and `link` calls flow through this
-/// trait when an endpoint kind has an owning pack hook.
+/// verbs. Shared `create`, note `update`, entity `update`, and `link` calls
+/// flow through this trait when an endpoint kind has an owning pack hook.
 #[async_trait]
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Mutate args before the storage write. Fill defaults, normalize values,
@@ -528,6 +528,34 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         _runtime: &KhiveRuntime,
         _token: &NamespaceToken,
         _note: &khive_storage::Note,
+        _properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate a shared entity-property update before storage is mutated.
+    ///
+    /// Runs after the caller's patch has been merged into the entity's
+    /// stored properties, so `properties` reflects the resulting record
+    /// rather than the raw patch — the invariant this validates (e.g. "a
+    /// required key must be present and typed") is a claim about the
+    /// record, not about what one caller happened to send. This is
+    /// deliberately NOT a re-run of `prepare_create`: a `prepare_create`
+    /// body may also enforce create-shape requirements (an argument the
+    /// caller must supply at create time) that a partial update
+    /// legitimately omits, and re-running it would reject valid updates
+    /// with an error message written for create.
+    ///
+    /// The default accepts the update. Kind-owning packs override this when
+    /// a `prepare_create` invariant must also hold after a generic
+    /// `update`, sharing one predicate between both methods the way
+    /// [`validate_note_update`](Self::validate_note_update)'s implementors
+    /// already do for notes.
+    async fn validate_entity_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _entity: &khive_storage::Entity,
         _properties: Option<&Value>,
     ) -> Result<(), RuntimeError> {
         Ok(())
@@ -3270,6 +3298,32 @@ impl VerbRegistry {
             }
         }
         None
+    }
+
+    /// Every `(entity kind, hook)` pair for which the owning pack declares
+    /// the entity kind and registers a `KindHook` — the entity-scoped
+    /// subset of [`Self::find_kind_hook`]'s ownership check, computed once.
+    ///
+    /// `khive-runtime` does not hold a `VerbRegistry` (ownership runs the
+    /// other way: packs are constructed FROM a runtime handle), so
+    /// `KhiveRuntime::install_entity_kind_hooks` is the extension point
+    /// that carries this aggregate to the runtime layer — the transport
+    /// calls this after the registry is built, same timing as
+    /// [`Self::all_edge_rules`]. `Arc<dyn KindHook>` values returned here
+    /// hold no reference back to the pack or registry that produced them
+    /// (every production `kind_hook()` implementation constructs a fresh,
+    /// stateless hook per call), so installing this aggregate on the
+    /// runtime creates no ownership cycle.
+    pub fn entity_kind_hooks(&self) -> crate::runtime::EntityKindHooks {
+        let mut hooks = Vec::new();
+        for pack in self.packs.iter() {
+            for kind in pack.entity_kinds().iter().copied() {
+                if let Some(hook) = pack.kind_hook(kind) {
+                    hooks.push((kind.to_string(), hook));
+                }
+            }
+        }
+        hooks
     }
 
     /// Run the owning kind's shared-note-update normalizer/validator, if it declares one.

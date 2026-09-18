@@ -1626,6 +1626,11 @@ impl KhiveMcpServer {
                 .collect(),
         );
         registry.call_register_note_write_validators(&runtime);
+        // #2943: install entity-kind update hooks so the generic entity
+        // `update` path can re-run a pack's create-time invariant against
+        // the merged properties — same scope/timing as the entity-type
+        // validator above.
+        runtime.install_entity_kind_hooks(registry.entity_kind_hooks());
         // A required pack schema failure must refuse boot before any handler
         // can run. Use the same validation and error path as multi-backend boot.
         registry

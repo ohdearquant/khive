@@ -25,6 +25,10 @@ fn build_registry(rt: KhiveRuntime) -> VerbRegistry {
     builder.register(WorkspacePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
+    // #2943: reach the generic entity `update` path through the same
+    // runtime-layer aggregate the production boot sequence installs, so
+    // these tests exercise the real dispatch, not a bypassed one.
+    rt.install_entity_kind_hooks(registry.entity_kind_hooks());
     registry
 }
 
@@ -289,5 +293,79 @@ async fn workspace_depends_on_issue_is_rejected() {
     assert!(
         !err.to_string().is_empty(),
         "workspace -[depends_on]-> issue must be rejected (only contains is extended)"
+    );
+}
+
+// -----------------------------------------------------------------------
+// #2943: a workspace entity's `properties.schema_version` invariant, which
+// `prepare_create` enforces, was reachable through the generic entity
+// `update` verb with no check at all — the acceptance witness named in the
+// issue.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn update_workspace_rejects_non_integer_schema_version() {
+    let registry = build_registry(rt());
+    let ws = create_workspace(&registry, "ws-update-bad-schema").await;
+
+    let err = registry
+        .dispatch(
+            "update",
+            json!({"id": ws, "properties": {"schema_version": "not-an-int"}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("schema_version"),
+        "error should mention schema_version; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn update_workspace_accepts_integer_schema_version() {
+    let registry = build_registry(rt());
+    let ws = create_workspace(&registry, "ws-update-good-schema").await;
+
+    let resp = registry
+        .dispatch(
+            "update",
+            json!({"id": ws, "properties": {"schema_version": 2}}),
+        )
+        .await
+        .expect("update with a valid integer schema_version succeeds");
+    assert_eq!(resp["properties"]["schema_version"], 2);
+}
+
+/// Class-closing guard (Leo ruling 2026-09-18 04:52Z, issue #2943): every
+/// pack in this registry that declares an entity kind AND registers a
+/// `KindHook` must be on the allowlist below, with a matching update-path
+/// acceptance test (the `update_workspace_*` pair above, for `workspace`).
+///
+/// This enumerates `VerbRegistry::entity_kind_hooks()` over the registered
+/// pack set rather than asserting `kind == "workspace"` directly, so a
+/// second pack in THIS registry (kg/gtd/git/session/workspace) that adds an
+/// entity-kind hook reddens this test the moment it lands, rather than
+/// shipping with its update path unvalidated. It does not cover a pack
+/// outside this registry (e.g. code/comm/memory/brain) gaining an
+/// entity-kind hook — none of those declare a non-empty `ENTITY_KINDS`
+/// today.
+#[tokio::test]
+async fn every_registered_entity_kind_hook_is_on_the_validated_allowlist() {
+    const VALIDATED_ENTITY_KIND_HOOKS: &[&str] = &["workspace"];
+
+    let registry = build_registry(rt());
+    let hooked: std::collections::BTreeSet<String> = registry
+        .entity_kind_hooks()
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    let allowed: std::collections::BTreeSet<String> = VALIDATED_ENTITY_KIND_HOOKS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        hooked, allowed,
+        "a registered pack's entity-kind hook set changed; add/remove the matching \
+         update-path acceptance test before updating VALIDATED_ENTITY_KIND_HOOKS"
     );
 }

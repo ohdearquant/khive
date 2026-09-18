@@ -13,6 +13,7 @@ description = "Workspace pack  -  pack-owned `workspace` entity kind with typed 
 [dependencies]
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
+khive-storage = { version = "0.8.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }

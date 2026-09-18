@@ -3319,6 +3319,10 @@ async fn build_registry_for_multi_backend_inner(
     }
     registry.call_register_embedders(&default_runtime);
     registry.call_register_entity_type_validators(&default_runtime);
+    // #2943: install entity-kind update hooks (same scope/timing as the
+    // entity-type validator above — entities live on the shared/main graph,
+    // reached through `core()`, never on a per-pack secondary backend).
+    default_runtime.install_entity_kind_hooks(registry.entity_kind_hooks());
     // #750: install pack-owned note-mutation hooks (currently
     // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
     // update/delete verbs notify caching packs even though there is no

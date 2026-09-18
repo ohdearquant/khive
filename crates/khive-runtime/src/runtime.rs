@@ -22,6 +22,7 @@ use crate::config::{
     sanitize_key, vec_model_key,
 };
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::pack::KindHook;
 
 /// Callback type for pack-installed entity-type validators.
 ///
@@ -30,6 +31,14 @@ use crate::error::{RuntimeError, RuntimeResult};
 /// When `entity_type` is `None`, the implementation must return `Ok(None)`.
 pub type EntityTypeValidatorFn =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
+
+/// Pack-aggregated entity-kind update hooks: `(entity kind, hook)` for every
+/// kind whose owning pack both declares it and registers a `KindHook`.
+///
+/// Named rather than written inline because the runtime stores it behind an
+/// `Arc<RwLock<..>>` and passes it across the transport boundary, so the bare
+/// form appears three times and reads as noise at each one.
+pub type EntityKindHooks = Vec<(String, Arc<dyn KindHook>)>;
 
 /// Callback type for a pack-installed note-mutation hook.
 ///
@@ -224,6 +233,20 @@ pub struct KhiveRuntime {
     /// the authorization token instead of trusted from caller input. `None`
     /// on a bare runtime (no packs) — the properties pass through unchanged.
     note_write_validator: Arc<RwLock<Option<NoteWriteValidatorFn>>>,
+    /// Pack-installed entity-kind update-validation hooks (issue #2943).
+    ///
+    /// Every `(entity kind, hook)` pair for which an owning pack declares
+    /// the entity kind and registers a `KindHook`, aggregated once by
+    /// `VerbRegistry::entity_kind_hooks` and installed by the transport
+    /// after the registry is built — same timing and rationale as
+    /// `entity_type_validator`: `khive-runtime` does not hold a
+    /// `VerbRegistry`, so this is the extension point that lets
+    /// `prepare_guarded_entity_update` reach a pack's `KindHook` on the
+    /// generic entity `update` path, the counterpart to
+    /// `prepare_note_update_hook` on the note side. Empty until installed
+    /// (bare runtime, or no pack registers an entity-kind hook), which
+    /// leaves the dispatch a no-op.
+    entity_kind_hooks: Arc<RwLock<EntityKindHooks>>,
     /// Pack-owned note kinds — every note kind declared by a pack other than
     /// the generic-CRUD pack, installed by the transport from the registry
     /// (see `VerbRegistry::pack_owned_note_kinds`). Records of these kinds are
@@ -371,6 +394,7 @@ impl KhiveRuntime {
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
             note_write_validator: Arc::new(RwLock::new(None)),
+            entity_kind_hooks: Arc::new(RwLock::new(Vec::new())),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_hydrator: Arc::new(OnceLock::new()),
             fusion_executors: Arc::new(RwLock::new(HashMap::new())),
@@ -425,7 +449,7 @@ impl KhiveRuntime {
     /// this returns a new `KhiveRuntime` backed by the main
     /// `Arc<StorageBackend>` and sharing all registry state (`embedder_registry`,
     /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`,
-    /// `entity_type_validator`, `note_mutation_hook`) with `self`.
+    /// `entity_type_validator`, `note_mutation_hook`, `entity_kind_hooks`) with `self`.
     /// No database I/O occurs; no embedding models are reloaded.
     ///
     /// Use `core()` for notes and entities that must reside in the shared graph
@@ -491,6 +515,7 @@ impl KhiveRuntime {
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
                     note_write_validator: self.note_write_validator.clone(),
+                    entity_kind_hooks: self.entity_kind_hooks.clone(),
                     pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
                     blob_hydrator: self.blob_hydrator.clone(),
                     fusion_executors: self.fusion_executors.clone(),
@@ -1520,6 +1545,34 @@ impl KhiveRuntime {
         if let Ok(mut guard) = self.note_mutation_hook.write() {
             *guard = Some(f);
         }
+    }
+
+    /// Install the pack-aggregated entity-kind update hooks (issue #2943).
+    ///
+    /// Called by the transport after the `VerbRegistry` is built, same
+    /// timing as [`install_kind_registry`](Self::install_kind_registry) —
+    /// pass `registry.entity_kind_hooks()`. Idempotent: a later call
+    /// replaces the set.
+    pub fn install_entity_kind_hooks(&self, hooks: EntityKindHooks) {
+        if let Ok(mut guard) = self.entity_kind_hooks.write() {
+            *guard = hooks;
+        }
+    }
+
+    /// The installed `KindHook` for entity `kind`, if its owning pack
+    /// registered one via [`install_entity_kind_hooks`](Self::install_entity_kind_hooks).
+    ///
+    /// `None` before the transport installs the aggregate (bare runtime) or
+    /// when no pack registered a hook for this entity kind — the caller
+    /// treats this the same as a hook whose `validate_entity_update`
+    /// inherited the trait's `Ok(())` default.
+    pub(crate) fn entity_kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+        self.entity_kind_hooks.read().ok().and_then(|guard| {
+            guard
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, hook)| hook.clone())
+        })
     }
 
     /// Install a pack-owned note-write validator.
