@@ -500,12 +500,34 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &Value,
     ) -> Result<(), RuntimeError>;
 
-    /// Normalize a shared note update before storage is mutated.
+    /// Normalize caller-facing note-update fields before validation runs.
     ///
-    /// The default preserves the original property-validation contract. A
-    /// kind-owning pack overrides this when caller-facing note fields mirror
-    /// owned properties and must be changed together (for example, a task's
-    /// searchable `content` and `properties.description`).
+    /// Override this — not [`Self::prepare_note_update`] — when a kind-owning
+    /// pack's caller-facing note fields mirror owned properties and must be
+    /// changed together (for example, a task's searchable `content` and
+    /// `properties.description`). Validation is not this method's job: it
+    /// runs unconditionally after this method returns, through
+    /// [`Self::prepare_note_update`]'s sequencing, regardless of what this
+    /// method did. The default does nothing.
+    async fn normalize_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        _args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Sequence a shared note update before storage is mutated: normalize,
+    /// then validate.
+    ///
+    /// This is the sequencing method, not the extension point — packs
+    /// override [`Self::normalize_note_update`] instead, so that normalizing
+    /// caller-facing fields can never skip the validator that runs after it.
+    /// Rust does not prevent an override of this method too; the guarantee
+    /// this ordering gives a kind-owning pack is by naming and by the test
+    /// coverage of the sequence, not by the type system.
     async fn prepare_note_update(
         &self,
         runtime: &KhiveRuntime,
@@ -513,6 +535,8 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         note: &khive_storage::Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
+        self.normalize_note_update(runtime, token, note, args)
+            .await?;
         let properties = args.get("properties").filter(|value| !value.is_null());
         self.validate_note_update(runtime, token, note, properties)
             .await
@@ -522,7 +546,9 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     ///
     /// The default accepts the update. Kind-owning packs override this when a
     /// property has invariants that generic CRUD cannot know about (for
-    /// example, GTD task dependency acyclicity).
+    /// example, GTD task dependency acyclicity). This always runs after
+    /// [`Self::normalize_note_update`], through
+    /// [`Self::prepare_note_update`]'s sequencing.
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -3349,8 +3375,11 @@ impl VerbRegistry {
     ///
     /// Kept as the validation-only compatibility seam for callers that do not
     /// own a mutable request object. Canonical and atomic CRUD use
-    /// [`Self::prepare_note_update_hook`] so a hook can also normalize coupled
-    /// fields before its validation runs.
+    /// [`Self::prepare_note_update_hook`] instead, so a hook's
+    /// [`KindHook::normalize_note_update`] can run before its validation does.
+    /// Reaching a hook through this seam therefore runs the validator alone:
+    /// that is the point of it, and it is why callers that CAN supply a
+    /// mutable request should not use it.
     pub async fn validate_note_update_hook(
         &self,
         runtime: &KhiveRuntime,
@@ -13385,6 +13414,228 @@ mod dep_tests {
         let reg = builder.build().expect("packs with REQUIRES=&[] build");
         assert_eq!(reg.pack_requires("no_deps_a").unwrap(), &[] as &[&str]);
         assert_eq!(reg.pack_requires("no_deps_b").unwrap(), &[] as &[&str]);
+    }
+}
+
+// ── Note-update hook sequencing tests ───────────────────────────
+//
+// These tests exercise the DISPATCHER (`VerbRegistry::prepare_note_update_hook`
+// and the `KindHook::prepare_note_update` sequencer it drives), not any one
+// pack's hook. The probe below overrides only `normalize_note_update` and
+// `validate_note_update` — never `prepare_note_update` itself — so the only
+// way both can run, in order, is through the trait's own sequencing.
+
+#[cfg(test)]
+mod note_update_sequencing_tests {
+    use super::*;
+    use khive_types::Pack;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    /// A probe hook shaped like a real kind-owning pack: `normalize_note_update`
+    /// moves a caller-supplied top-level field into `properties`, and
+    /// `validate_note_update` refuses based on what it finds there. The value
+    /// `validate_note_update` inspects does not exist in `properties` until
+    /// `normalize_note_update` puts it there, so a passing refusal assertion
+    /// proves both the ordering and that normalize's mutation reached validate.
+    #[derive(Debug, Default)]
+    struct SequencerProbeHook {
+        normalize_calls: AtomicUsize,
+        validate_calls: AtomicUsize,
+        validate_saw_marker: StdMutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl KindHook for SequencerProbeHook {
+        async fn prepare_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn after_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _id: uuid::Uuid,
+            _args: &Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn normalize_note_update(
+            &self,
+            _runtime: &KhiveRuntime,
+            _token: &NamespaceToken,
+            _note: &khive_storage::Note,
+            args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            self.normalize_calls.fetch_add(1, Ordering::SeqCst);
+            let Some(raw) = args.get("raw_marker").and_then(Value::as_bool) else {
+                return Ok(());
+            };
+            let root = args.as_object_mut().expect("probe test args are an object");
+            root.remove("raw_marker");
+            let mut properties = serde_json::Map::new();
+            properties.insert("marker".into(), Value::Bool(raw));
+            root.insert("properties".into(), Value::Object(properties));
+            Ok(())
+        }
+
+        async fn validate_note_update(
+            &self,
+            _runtime: &KhiveRuntime,
+            _token: &NamespaceToken,
+            _note: &khive_storage::Note,
+            properties: Option<&Value>,
+        ) -> Result<(), RuntimeError> {
+            self.validate_calls.fetch_add(1, Ordering::SeqCst);
+            let marker = properties
+                .and_then(|value| value.get("marker"))
+                .and_then(Value::as_bool);
+            *self.validate_saw_marker.lock().unwrap() = marker;
+            if marker == Some(true) {
+                return Err(RuntimeError::InvalidInput(
+                    "probe validator refuses marker=true".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    struct ProbePack(Arc<SequencerProbeHook>);
+
+    impl Pack for ProbePack {
+        const NAME: &'static str = "sequencer-probe";
+        const NOTE_KINDS: &'static [&'static str] = &["probe-note"];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+    }
+
+    #[async_trait]
+    impl PackRuntime for ProbePack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+            (kind == "probe-note").then(|| self.0.clone() as Arc<dyn KindHook>)
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput(format!(
+                "ProbePack has no verbs: {verb}"
+            )))
+        }
+    }
+
+    /// The arm the issue reported: a normalizer that moves a caller field into
+    /// `properties` and a validator that refuses it must both run by the time
+    /// `prepare_note_update_hook` returns its error.
+    ///
+    /// This arm was confirmed to be load-bearing by a mutation run before the
+    /// change landed, recorded here as a result rather than as a procedure. With
+    /// `KindHook::prepare_note_update`'s provided body reduced to a single
+    /// `self.validate_note_update(...)` call — the pre-fix shape, and what an
+    /// overriding pack that forgets to call the validator reproduces —
+    /// `normalize_note_update` did not run, `marker` did not reach `properties`,
+    /// `validate_note_update` observed `None` where it expects `Some(true)`, and
+    /// the call returned `Ok` instead of the expected `Err`, reddening the first
+    /// assertion below.
+    #[tokio::test]
+    async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_can_refuse() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+        let hook = Arc::new(SequencerProbeHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ProbePack(hook.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let note = khive_storage::Note::new("local", "probe-note", "body");
+        let mut args = serde_json::json!({"raw_marker": true});
+
+        let result = registry
+            .prepare_note_update_hook(&runtime, &token, &note, &mut args)
+            .await;
+
+        let error = result.expect_err("the refusal must fire");
+        assert!(
+            error.to_string().contains("marker=true"),
+            "the error must be the probe validator's own refusal: {error}"
+        );
+        assert_eq!(
+            args["properties"]["marker"],
+            serde_json::json!(true),
+            "normalization must land in args even on the arm that ends in refusal"
+        );
+        assert_eq!(
+            hook.normalize_calls.load(Ordering::SeqCst),
+            1,
+            "normalize must run even though validate goes on to refuse"
+        );
+        assert_eq!(
+            hook.validate_calls.load(Ordering::SeqCst),
+            1,
+            "validate must run exactly once"
+        );
+        assert_eq!(
+            *hook.validate_saw_marker.lock().unwrap(),
+            Some(true),
+            "validate must see the property normalize just wrote, not the caller's raw field"
+        );
+    }
+
+    /// Mirror of the arm above: the same probe, with input that makes the
+    /// validator accept. `prepare_note_update_hook` must still return `Ok`
+    /// AND normalization must still have landed in `args` — an accepting
+    /// validator is not a reason to have skipped normalization.
+    ///
+    /// Under the same mutation described on the arm above,
+    /// `args["properties"]["marker"]` was left unset — `properties` did not
+    /// exist at all — reddening the first assertion below.
+    #[tokio::test]
+    async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_can_accept() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+        let hook = Arc::new(SequencerProbeHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ProbePack(hook.clone()));
+        let registry = builder.build().expect("registry builds");
+
+        let note = khive_storage::Note::new("local", "probe-note", "body");
+        let mut args = serde_json::json!({"raw_marker": false});
+
+        registry
+            .prepare_note_update_hook(&runtime, &token, &note, &mut args)
+            .await
+            .expect("an accepting validator must not refuse");
+
+        assert_eq!(
+            args["properties"]["marker"],
+            serde_json::json!(false),
+            "normalization must land in args even when validation accepts"
+        );
+        assert_eq!(hook.normalize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.validate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*hook.validate_saw_marker.lock().unwrap(), Some(false));
     }
 }
 
