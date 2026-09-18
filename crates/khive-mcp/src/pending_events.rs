@@ -1144,7 +1144,9 @@ async fn run_pending_events_on_with_lease(
                             scheduled_event_id = %id,
                             event_type,
                             recipient_actor = reminder_actor.as_deref(),
-                            error = %error,
+                            error = %khive_runtime::secret_gate::bounded_masked_log_text(
+                                &error.to_string()
+                            ),
                             "pending-events: scheduled event delivery failed"
                         );
                         summary.failed += 1;
@@ -1672,6 +1674,44 @@ async fn renew_dispatch_lease(
     Ok(rows == 1)
 }
 
+/// Recursively mask handler-supplied JSON content before it is embedded in a
+/// durable record.
+///
+/// - `Value::String` leaves are masked with
+///   [`khive_runtime::secret_gate::bounded_masked_log_text`].
+/// - `Value::Array` is masked element-wise.
+/// - `Value::Object` masks BOTH keys and values: `secret_gate::check_json`'s
+///   own scanner checks object keys too (`scan_json_value` calls `check(k)`
+///   on every key), so a masker that skipped keys would leave standing
+///   exactly the one thing the post-mask assert at each call site is
+///   guaranteed to catch. Two distinct keys can mask to the same string;
+///   rather than let the later one silently overwrite the earlier, later
+///   collisions are disambiguated with a `#2`, `#3`, ... suffix. Silent key
+///   loss on a durable failure receipt is the exact class of defect this
+///   function exists to remove.
+/// - Numbers, bools, and null pass through unchanged.
+fn mask_json_content(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(khive_runtime::secret_gate::bounded_masked_log_text(s)),
+        Value::Array(items) => Value::Array(items.iter().map(mask_json_content).collect()),
+        Value::Object(map) => {
+            let mut masked = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                let masked_key_base = khive_runtime::secret_gate::bounded_masked_log_text(key);
+                let mut masked_key = masked_key_base.clone();
+                let mut suffix = 2u32;
+                while masked.contains_key(&masked_key) {
+                    masked_key = format!("{masked_key_base}#{suffix}");
+                    suffix += 1;
+                }
+                masked.insert(masked_key, mask_json_content(val));
+            }
+            Value::Object(masked)
+        }
+        other => other.clone(),
+    }
+}
+
 async fn persist_dispatch_outcome(
     rt: &KhiveRuntime,
     namespace: &str,
@@ -1693,6 +1733,43 @@ async fn persist_dispatch_outcome(
             error.payload.clone().unwrap_or(Value::Null),
         ),
     };
+    // Direct SQL write, bypassing the ordinary note-write path (and with it
+    // curation.rs's write-time content scan) for durability reasons unique to
+    // this seam. The dispatch already happened and the lease is already held
+    // by the time this runs, so a hard refusal here would not stop anything
+    // from occurring -- it would only lose the record of what did, leaving
+    // the row `firing` forever and the occurrence permanently re-drainable.
+    // No caller can act on a refusal at this seam. Mask the handler-supplied
+    // failure content instead of blocking it, then run the same scan the
+    // outbound-message path applies to `last_error` as a POST-MASK ASSERT on
+    // exactly what is about to be embedded -- confirming the masker did its
+    // job, never gating whether the outcome gets recorded.
+    let error = mask_json_content(&error);
+    let error_payload = mask_json_content(&error_payload);
+    if let Err(gate_error) = khive_runtime::secret_gate::check_json_at(
+        &json!({
+            "error": &error,
+            "error_payload": &error_payload,
+        }),
+        "scheduled_event",
+        "dispatch_receipt",
+    ) {
+        // The masker was supposed to make this input pass and did not. This
+        // is a masking-invariant failure, not a caller-actionable refusal:
+        // `SecretMatch`'s `Display` (via `RuntimeError::SecretDetected`'s
+        // `"write blocked: {0}"`) prints only the detector name, an optional
+        // trigger word, the location, and static guidance text -- never the
+        // scanned content, not even the masked excerpt -- so it is safe to
+        // log in full. Persist the masked record anyway: a durable outcome
+        // is worth more than a belt-and-braces assert, and the record about
+        // to be written is the masked one either way.
+        tracing::error!(
+            scheduled_event_id = %id,
+            error = %gate_error,
+            "pending-events: masking invariant failed on dispatch outcome receipt; \
+             persisting the masked record anyway"
+        );
+    }
     let receipt = json!({
         "version": DISPATCH_RECEIPT_VERSION,
         "occurrence_id": claim.occurrence_id,
@@ -2509,6 +2586,96 @@ async fn finalize_firing_event(
         obj.remove("firing_at");
         obj.remove("lease_expires_at");
     }
+    // Same direct-SQL seam as `persist_dispatch_outcome` above, mask-not-
+    // block for the same reason: this is the terminal write shared by
+    // fresh-dispatch finalization and expired-lease recovery, no caller can
+    // act on a refusal here, and refusing would leave the row `firing`
+    // forever instead of recording the outcome that already happened. It
+    // re-embeds the same handler-supplied failure content
+    // (`dispatch_receipt.error`/`error_payload`, plus the legacy flat
+    // `dispatch_error`/`delivery_error` mirror) into a fresh properties blob.
+    // Mask exactly those four fields, not the whole blob: the rest of
+    // `properties` already passed this scan when it was originally written.
+    //
+    // `dispatch_receipt.error`/`error_payload` may already have been masked
+    // by `persist_dispatch_outcome` on the fresh-dispatch path (the receipt
+    // it returns is what `final_properties_after_dispatch` copies into
+    // `properties["dispatch_receipt"]` before this function runs); the
+    // expired-lease recovery path can also reach here with an
+    // already-masked receipt carried over from an earlier pass. A second
+    // `mask_json_content` pass over already-masked text is a no-op:
+    // `bounded_masked_log_text` (secret_gate.rs:770-791) masks through
+    // `mask_secrets` (secret_gate.rs:569-586), whose span collector matches
+    // only known credential shapes and high-entropy runs beside a trigger
+    // word (`TRIGGER_WORDS`, secret_gate.rs:1313-1326); `REDACTION_MARKER`
+    // ("***MASKED***", secret_gate.rs:251) is plain uppercase ASCII with no
+    // digit/hex/base64 shape and contains none of those trigger substrings,
+    // so `collect_mask_spans` finds no span in it and `mask_secrets` returns
+    // its input unchanged (`Cow::Borrowed`, secret_gate.rs:571-572).
+    // `neutralize_log_unsafe_chars` (secret_gate.rs:877-879) is idempotent
+    // the same way: its `\u{XXXX}` escape output contains no Cc/Cf/Zl/Zp
+    // codepoint, so nothing it has already escaped is escaped again.
+    //
+    // `dispatch_error`/`delivery_error` are the legacy flat mirror and
+    // reach this function raw from `final_properties_after_dispatch`
+    // (which derives them from the original, unmasked
+    // `DispatchCompletion`), so this is their first and only mask.
+    let receipt_error = properties
+        .pointer("/dispatch_receipt/error")
+        .cloned()
+        .map(|v| mask_json_content(&v));
+    let receipt_error_payload = properties
+        .pointer("/dispatch_receipt/error_payload")
+        .cloned()
+        .map(|v| mask_json_content(&v));
+    let dispatch_error = properties
+        .get("dispatch_error")
+        .cloned()
+        .map(|v| mask_json_content(&v));
+    let delivery_error = properties
+        .get("delivery_error")
+        .cloned()
+        .map(|v| mask_json_content(&v));
+    if let Some(masked) = &receipt_error {
+        if let Some(slot) = properties.pointer_mut("/dispatch_receipt/error") {
+            *slot = masked.clone();
+        }
+    }
+    if let Some(masked) = &receipt_error_payload {
+        if let Some(slot) = properties.pointer_mut("/dispatch_receipt/error_payload") {
+            *slot = masked.clone();
+        }
+    }
+    if let Some(masked) = &dispatch_error {
+        properties["dispatch_error"] = masked.clone();
+    }
+    if let Some(masked) = &delivery_error {
+        properties["delivery_error"] = masked.clone();
+    }
+    if let Err(gate_error) = khive_runtime::secret_gate::check_json_at(
+        &json!({
+            "dispatch_receipt.error": &receipt_error,
+            "dispatch_receipt.error_payload": &receipt_error_payload,
+            "dispatch_error": &dispatch_error,
+            "delivery_error": &delivery_error,
+        }),
+        "scheduled_event",
+        "dispatch_receipt",
+    ) {
+        // Same masking-invariant posture as `persist_dispatch_outcome`
+        // above: the masker was supposed to make this input pass and did
+        // not. `gate_error`'s `Display` never echoes scanned content (see
+        // the comment there), so it is safe to log in full. Persist the
+        // masked record anyway -- it is the record about to be written
+        // either way, and a durable terminal outcome is worth more than a
+        // belt-and-braces assert.
+        tracing::error!(
+            scheduled_event_id = %id,
+            error = %gate_error,
+            "pending-events: masking invariant failed on finalized dispatch receipt; \
+             persisting the masked record anyway"
+        );
+    }
     let props_json = serde_json::to_string(&properties)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
     let mut writer = rt
@@ -2634,7 +2801,7 @@ async fn append_reminder_delivery_failure_event(
     .with_payload(json!({
         "scheduled_event_id": scheduled_event_id,
         "recipient_actor": recipient_actor,
-        "error": error,
+        "error": khive_runtime::secret_gate::bounded_masked_log_text(error),
     }));
     if let Err(trace_error) = store.append_event(event).await {
         tracing::error!(
@@ -2956,8 +3123,9 @@ async fn dispatch_action(
     verbose: bool,
 ) -> std::result::Result<(), DispatchActionError> {
     let parsed = khive_request::parse_request(action_dsl).map_err(|error| {
+        let masked_dsl = khive_runtime::secret_gate::bounded_masked_log_text(action_dsl);
         DispatchActionError::known(DispatchFailure::plain(format!(
-            "pending-events: action DSL parse error ({error}): {action_dsl:?}"
+            "pending-events: action DSL parse error ({error}): {masked_dsl:?}"
         )))
     })?;
 
@@ -2970,9 +3138,10 @@ async fn dispatch_action(
         let mut args = serde_json::Map::new();
         for (k, v) in &op.args {
             let khive_request::ArgValue::Value(val) = v else {
+                let masked_dsl = khive_runtime::secret_gate::bounded_masked_log_text(action_dsl);
                 return Err(DispatchActionError::known(DispatchFailure::plain(format!(
                     "pending-events: non-literal scheduled action argument {k:?} is not \
-                     replayable: {action_dsl:?}"
+                     replayable: {masked_dsl:?}"
                 ))));
             };
             args.insert(k.clone(), val.clone());
@@ -8046,6 +8215,643 @@ mod tests {
             "run_pending_events must succeed under strict actor mode when a project \
              [actor] id is configured — the same config a live `kkernel mcp --daemon` \
              boot in this project would resolve",
+        );
+    }
+
+    // ── scheduled-error-scan: falsifiability arms ───────────────────────────
+    //
+    // A handler failure whose message matches a real credential pattern must
+    // never reach a stored `scheduled_event` record, the emitted delivery-
+    // failure log, or the durable `schedule.remind.fire` audit event in raw
+    // form -- but on the drain's two direct-SQL receipt writes (this is the
+    // DRAIN path: the dispatch already happened and the lease is already
+    // held), the real outcome must still land durably, masked rather than
+    // refused, so the row leaves `"firing"` instead of sitting there for
+    // expired-lease recovery to reclassify it as `"indeterminate"`.
+    // `AKIAIOSFODNN7EXAMPLE` is AWS's own published example access-key // gitleaks:allow
+    // id (docs.aws.amazon.com), obviously synthetic and recognized by the
+    // `aws-access-key-id` detector regardless of surrounding prose.
+
+    #[derive(Debug)]
+    struct DenyCommSendWithCredentialGate;
+
+    impl Gate for DenyCommSendWithCredentialGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "comm.send" {
+                Ok(GateDecision::deny(
+                    "comm.send denied: credential AKIAIOSFODNN7EXAMPLE in body", // gitleaks:allow
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    /// Captures `tracing` output for masking assertions. Mirrors
+    /// `khive-mcp/src/server.rs`'s `SearchCapturedLog` test helper.
+    #[derive(Clone, Default)]
+    struct CapturedDrainLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedDrainLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured drain log mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedDrainLog {
+        type Writer = CapturedDrainLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedDrainLog {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .expect("captured drain log mutex poisoned")
+                    .clone(),
+            )
+            .expect("captured drain logs are UTF-8")
+        }
+    }
+
+    /// The masker itself: a credential appearing as a JSON object KEY (not
+    /// just a value) must be masked too -- `secret_gate::check_json`'s own
+    /// scanner checks keys (`scan_json_value` calls `check(k)` on every
+    /// key), so an unmasked key is exactly what the post-mask assert at each
+    /// call site is guaranteed to catch. Two distinct keys that mask to the
+    /// same string must both survive, disambiguated, rather than the later
+    /// one silently overwriting the earlier.
+    #[test]
+    fn mask_json_content_masks_object_keys_and_disambiguates_collisions() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        const OTHER_CREDENTIAL: &str = "ASIAFAKEKEY00000000000"; // gitleaks:allow
+
+        let keyed = json!({ CREDENTIAL: "ordinary value" });
+        let masked = mask_json_content(&keyed);
+        let masked_text = masked.to_string();
+        assert!(
+            !masked_text.contains(CREDENTIAL),
+            "a credential used as an object key must never survive unmasked: {masked_text}"
+        );
+        assert!(
+            masked_text.contains("***MASKED***"),
+            "a masked key must carry the masked form: {masked_text}"
+        );
+
+        // Both fixtures are whole-string credential matches -- the
+        // aws-access-key-id detector's AKIA and ASIA prefixes, each with
+        // nothing left over once the marker is substituted in -- so they
+        // mask down to the identical base string: the collision this
+        // function must disambiguate rather than let the second entry
+        // silently replace the first. Assert that precondition explicitly,
+        // so a detector change that breaks it fails here with a clear
+        // message rather than inside the assertions below.
+        let masked_base = khive_runtime::secret_gate::bounded_masked_log_text(CREDENTIAL);
+        assert_eq!(
+            khive_runtime::secret_gate::bounded_masked_log_text(OTHER_CREDENTIAL),
+            masked_base,
+            "fixture precondition: both credentials must mask to the identical \
+             base string for this test to exercise the collision path"
+        );
+
+        let colliding = {
+            let mut map = serde_json::Map::new();
+            map.insert(CREDENTIAL.to_string(), json!("first"));
+            map.insert(OTHER_CREDENTIAL.to_string(), json!("second"));
+            Value::Object(map)
+        };
+        let masked = mask_json_content(&colliding);
+        let object = masked.as_object().expect("masked value is an object");
+        assert_eq!(
+            object.len(),
+            2,
+            "colliding masked keys must both survive, not overwrite one another: {object:?}"
+        );
+        assert_eq!(object.get(masked_base.as_str()), Some(&json!("first")));
+        assert_eq!(
+            object.get(format!("{masked_base}#2").as_str()),
+            Some(&json!("second")),
+            "the second colliding key must be disambiguated with a #2 suffix: {object:?}"
+        );
+    }
+
+    /// A handler failure message matching a real credential pattern must
+    /// never reach the durable `scheduled_event` receipt in raw form via the
+    /// first direct-SQL write that bypasses the ordinary write-time content
+    /// scan (`persist_dispatch_outcome`) -- but unlike the outright refusal
+    /// this test used to assert, the write and the real outcome it records
+    /// must still land: the dispatch already happened and the lease is
+    /// already held by the time this runs, so a `?`-propagated refusal here
+    /// would not stop anything from occurring, only leave
+    /// `dispatch_receipt.state` stuck on `"invoking"` forever, which is
+    /// exactly the state expired-lease recovery treats as unresolved and
+    /// finalizes as `"indeterminate"` -- discarding the real, known
+    /// `"failed"` outcome.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_outcome_write_masks_credential_shaped_failure_content() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+
+        let credential_failure = DispatchCompletion::Failed(DispatchFailure::plain(format!(
+            "action produced 1 failure(s): tool rejected credential {CREDENTIAL}"
+        )));
+        let receipt = persist_dispatch_outcome(&rt, "local", id, &claim, &credential_failure)
+            .await
+            .expect("a credential-shaped failure must be masked, never refused")
+            .expect("claim still owned");
+
+        // Assertion 1: the masked form, not the raw credential, is what is
+        // returned AND what is durably stored.
+        let receipt_text = receipt.to_string();
+        assert!(
+            !receipt_text.contains(CREDENTIAL),
+            "the returned receipt must never carry the raw credential: {receipt_text}"
+        );
+        assert!(
+            receipt_text.contains("***MASKED***"),
+            "the returned receipt must carry the masked form: {receipt_text}"
+        );
+        let raw_props = get_raw_note_properties(&rt, id).await;
+        assert!(
+            !raw_props.contains(CREDENTIAL),
+            "the stored scheduled-event record must never carry the raw credential: {raw_props}"
+        );
+        assert!(
+            raw_props.contains("***MASKED***"),
+            "the stored scheduled-event record must carry the masked form: {raw_props}"
+        );
+
+        // Assertion 2: the REAL outcome is persisted and durable. The
+        // receipt names the true terminal state -- this dispatch failed --
+        // rather than being left on the pre-outcome "invoking" a refusal
+        // would leave behind.
+        assert_eq!(receipt["state"], "failed");
+        let live = get_note_props(&rt, id).await;
+        assert_eq!(live["dispatch_receipt"]["state"], "failed");
+
+        // Negative control, on a fresh row: ordinary failure text with no
+        // detector match persists exactly as written -- the masker must not
+        // over-mask benign content. This cannot reuse the claim above: that
+        // write already advanced `dispatch_receipt.state` past `"invoking"`,
+        // which is the CAS this function's UPDATE is keyed on.
+        let ordinary_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let ordinary_claim = claim_for_test(&rt, ordinary_id, &trigger).await;
+        assert!(mark_dispatch_invoking(
+            &rt,
+            "local",
+            ordinary_id,
+            &ordinary_claim,
+            short_test_lease()
+        )
+        .await
+        .expect("mark invoking"));
+        let ordinary_failure = DispatchCompletion::Failed(DispatchFailure::plain(
+            "action produced 1 failure(s): tool timed out after 30s".to_string(),
+        ));
+        let ordinary_receipt = persist_dispatch_outcome(
+            &rt,
+            "local",
+            ordinary_id,
+            &ordinary_claim,
+            &ordinary_failure,
+        )
+        .await
+        .expect("ordinary failure content is not blocked")
+        .expect("claim still owned");
+        assert_eq!(
+            ordinary_receipt["error"],
+            "action produced 1 failure(s): tool timed out after 30s"
+        );
+    }
+
+    /// Same falsifiability arm as the test above, for the second direct-SQL
+    /// write: the terminal finalize write shared by `finalize_fired_event`
+    /// and expired-lease recovery. Refusing here (this test's prior
+    /// behaviour) would leave the row's `status` stuck on `"firing"`
+    /// forever -- the dispatch and its outcome already happened, so the row
+    /// would sit past its lease deadline until expired-lease recovery swept
+    /// it up and finalized it as `"indeterminate"`, discarding the real,
+    /// known `"failed"` outcome this write is trying to record.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn finalize_fired_event_masks_credential_shaped_final_properties() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        let expected_properties = get_raw_note_properties(&rt, id).await;
+        let mut final_properties: Value =
+            serde_json::from_str(&expected_properties).expect("properties JSON");
+        final_properties["dispatch_error"] =
+            json!(format!("tool rejected credential {CREDENTIAL}"));
+        final_properties["dispatch_receipt"]["state"] = json!("failed");
+        final_properties["status"] = json!("pending");
+
+        let finalized = finalize_fired_event(
+            &rt,
+            "local",
+            id,
+            &final_properties,
+            Utc::now().timestamp_micros(),
+            &claim,
+            &expected_properties,
+        )
+        .await
+        .expect("a credential-shaped dispatch_error must be masked, never refused");
+        assert!(
+            finalized,
+            "the terminal write must land against its CAS guard"
+        );
+
+        // Assertion 1: the masked form, not the raw credential, is what
+        // lands in storage.
+        let raw_props = get_raw_note_properties(&rt, id).await;
+        assert!(
+            !raw_props.contains(CREDENTIAL),
+            "the stored terminal record must never carry the raw credential: {raw_props}"
+        );
+        assert!(
+            raw_props.contains("***MASKED***"),
+            "the stored terminal record must carry the masked form: {raw_props}"
+        );
+
+        // Assertion 2: the REAL outcome is persisted and durable. The row
+        // left `"firing"` for the status this write named, and
+        // `dispatch_receipt.state` is the true terminal state rather than
+        // being left for expired-lease recovery to reclassify.
+        let live = get_note_props(&rt, id).await;
+        assert_eq!(live["status"], "pending");
+        assert_ne!(live["status"], "firing");
+        assert_eq!(live["dispatch_receipt"]["state"], "failed");
+    }
+
+    /// The expired-lease recovery path through `finalize_firing_event`
+    /// (`finalize_expired_firing_event`) is the same masking seam as
+    /// `finalize_fired_event` above, reached by a different caller: a
+    /// process that claimed and invoked a dispatch crashed or lost its
+    /// lease before writing a durable outcome, and a later recovery pass
+    /// finalizes the row from its own reconstructed receipt. That receipt
+    /// carries handler-supplied failure content exactly as the fresh-
+    /// dispatch path does, so it goes through the same mask-then-assert
+    /// seam rather than a refusal that would leave the row `"firing"` for a
+    /// second recovery pass to find again.
+    #[tokio::test]
+    async fn expired_lease_recovery_masks_credential_shaped_final_properties() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        let selected_properties = get_raw_note_properties(&rt, id).await;
+        let mut recovered_properties: Value =
+            serde_json::from_str(&selected_properties).expect("selected properties JSON");
+        recovered_properties["dispatch_receipt"]["state"] = json!("indeterminate");
+        recovered_properties["dispatch_receipt"]["error"] = json!(format!(
+            "dispatch lease expired holding credential {CREDENTIAL}"
+        ));
+        recovered_properties["dispatch_error"] = json!(format!(
+            "dispatch lease expired holding credential {CREDENTIAL}"
+        ));
+        recovered_properties["status"] = json!("failed");
+        let observed_expired_at = Utc::now().timestamp_micros();
+
+        let finalized = finalize_expired_firing_event(
+            &rt,
+            "local",
+            id,
+            &recovered_properties,
+            Utc::now().timestamp_micros(),
+            &claim,
+            RecoverySnapshot {
+                expired_at: observed_expired_at,
+                properties: &selected_properties,
+            },
+        )
+        .await
+        .expect("a credential-shaped recovered receipt must be masked, never refused");
+        assert!(
+            finalized,
+            "the recovery finalize must land against its CAS guard"
+        );
+
+        // Assertion 1: the masked form, not the raw credential, is what
+        // lands in storage.
+        let raw_props = get_raw_note_properties(&rt, id).await;
+        assert!(
+            !raw_props.contains(CREDENTIAL),
+            "the stored recovery record must never carry the raw credential: {raw_props}"
+        );
+        assert!(
+            raw_props.contains("***MASKED***"),
+            "the stored recovery record must carry the masked form: {raw_props}"
+        );
+
+        // Assertion 2: the REAL outcome is persisted and durable, and the
+        // row leaves `"firing"` so a later recovery pass does not sweep it
+        // up again.
+        let live = get_note_props(&rt, id).await;
+        assert_eq!(live["dispatch_receipt"]["state"], "indeterminate");
+        assert_ne!(
+            live["status"], "firing",
+            "the row must leave \"firing\" so recovery does not re-examine it again"
+        );
+    }
+
+    /// End-to-end: a `comm.send` gate denial whose reason happens to match a
+    /// real credential pattern must reach neither the emitted `tracing` log
+    /// nor the stored `scheduled_event` record in raw form -- but the real
+    /// outcome (the delivery failed) must still land durably, and the row
+    /// must leave `"firing"` rather than sit there for expired-lease
+    /// recovery to reclassify. The log carries the masked form
+    /// (`bounded_masked_log_text`, the same helper the gate-failure log path
+    /// in `khive-runtime/src/pack.rs` already uses); the record write is
+    /// masked, not refused, by the mechanism proven directly in
+    /// `dispatch_outcome_write_masks_credential_shaped_failure_content` and
+    /// `finalize_fired_event_masks_credential_shaped_final_properties`.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn reminder_delivery_failure_log_and_record_mask_credential_shaped_denial_reason() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCommSendWithCredentialGate),
+            actor_id: Some("lambda:credential-daemon".to_string()),
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
+        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
+            .expect("server with required reminder delivery pack");
+        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
+
+        let captured = CapturedDrainLog::default();
+        // Capture only THIS module's log output, and do it at the subscriber
+        // rather than by filtering captured text.
+        //
+        // The buffer would otherwise also hold `khive_runtime`'s `gate.check`
+        // audit line, which serializes the whole `AuditEvent` -- `deny_reason`
+        // included -- at INFO with no masking. That is a real sink of the same
+        // shape, and it is deliberately not this change's subject: it belongs
+        // to the gate-audit path in `khive-runtime`, it fires for every verb
+        // rather than for scheduled dispatch, and masking it is a decision
+        // about audit fidelity that a scheduled-dispatch fix has no business
+        // making quietly.
+        //
+        // Filtering the captured text by target name does NOT work here, and
+        // the way it fails is the reason this uses an `EnvFilter`: the audit
+        // line's own JSON payload carries `"gate_impl":
+        // "khive_mcp::pending_events::tests::DenyCommSendWithCredentialGate"`,
+        // so a substring match on this module's path keeps the very line it
+        // was written to exclude. A target filter has to be applied where
+        // targets are structured data, not after they have been flattened into
+        // a message body that can quote them.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "khive_mcp::pending_events=trace",
+            ))
+            .finish();
+        let tracing_guard = tracing::subscriber::set_default(subscriber);
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain continues after masking a credential-shaped failure");
+        drop(tracing_guard);
+
+        let log_text = captured.contents();
+        // Non-vacuity control: a filter that admitted nothing would make every
+        // masking assertion below pass for the wrong reason.
+        assert!(
+            log_text.contains("khive_mcp::pending_events"),
+            "no pending-events log line was captured, so the masking assertions \
+             below would pass vacuously: {log_text:?}"
+        );
+        assert!(
+            !log_text.contains("gate.check"),
+            "the subscriber filter must exclude the gate-audit line; this test \
+             asserts about this module's own sink only: {log_text}"
+        );
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.invoked, 1);
+        assert_eq!(
+            summary.outcomes_persisted, 1,
+            "the masked outcome must be durably persisted, not dropped"
+        );
+        assert_eq!(
+            summary.finalized, 1,
+            "finalization must complete instead of being aborted by a refusal"
+        );
+        assert!(
+            !log_text.contains(CREDENTIAL),
+            "the delivery-failure log must never carry the raw credential: {log_text}"
+        );
+        assert!(
+            log_text.contains("***MASKED***"),
+            "the delivery-failure log must carry the masked form: {log_text}"
+        );
+
+        let raw_props = get_raw_note_properties(&rt, id).await;
+        assert!(
+            !raw_props.contains(CREDENTIAL),
+            "the stored scheduled-event record must never carry the raw credential: \
+             {raw_props}"
+        );
+        assert!(
+            raw_props.contains("***MASKED***"),
+            "the stored scheduled-event record must carry the masked form: {raw_props}"
+        );
+        let props: Value = serde_json::from_str(&raw_props).expect("properties JSON");
+        assert_eq!(
+            props["dispatch_receipt"]["state"], "failed",
+            "the real outcome must be the durable terminal state, not left on \"invoking\""
+        );
+        assert_eq!(
+            props["status"], "pending",
+            "a one-shot failure must return the row to \"pending\" rather than \
+             strand it on \"firing\""
+        );
+    }
+
+    /// The `schedule.remind.fire` audit event is a durable stored record too
+    /// (append-only, per this module's own doc comment); its `error` payload
+    /// must carry the masked form for credential-shaped content and the
+    /// unmasked original for ordinary text.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn reminder_delivery_failure_event_masks_credential_shaped_error() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
+        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
+            .expect("server with required reminder delivery pack");
+        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
+
+        append_reminder_delivery_failure_event(
+            &server,
+            "local",
+            id,
+            "lambda:credential-daemon",
+            "local",
+            &format!("comm.send denied: credential {CREDENTIAL} in body"),
+        )
+        .await;
+        append_reminder_delivery_failure_event(
+            &server,
+            "local",
+            id,
+            "lambda:credential-daemon",
+            "local",
+            "comm.send denied by ordinary policy check",
+        )
+        .await;
+
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let events = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    verbs: vec!["schedule.remind.fire".to_string()],
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query reminder failure events");
+        assert_eq!(
+            events.items.len(),
+            2,
+            "both delivery-failure events must be recorded"
+        );
+
+        let credential_event = events
+            .items
+            .iter()
+            .find(|event| {
+                event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("***MASKED***"))
+            })
+            .expect("the credential-shaped event must have a masked payload");
+        assert!(
+            !credential_event.payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(CREDENTIAL),
+            "the stored event must never carry the raw credential: {:?}",
+            credential_event.payload
+        );
+
+        assert!(
+            events
+                .items
+                .iter()
+                .any(|event| event.payload["error"] == "comm.send denied by ordinary policy check"),
+            "ordinary error text must survive unmasked and unchanged"
+        );
+    }
+
+    /// The two message-construction sites that embed the entire stored
+    /// action DSL (`dispatch_action`'s parse-error and non-literal-argument
+    /// branches) mask it before it ever becomes a `DispatchFailure` message
+    /// -- the mechanism that lets a legitimately-sanitized message pass the
+    /// write-time gate above rather than being refused outright.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_failure() {
+        const CREDENTIAL: &str = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let malformed_dsl = format!("stats({CREDENTIAL}");
+        let err = dispatch_action(
+            &malformed_dsl,
+            "local",
+            Some(VerifiedActor::new("lambda:test").expect("verified actor")),
+            &server,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(CREDENTIAL),
+            "the parse-failure message must never carry the raw stored credential: {msg}"
+        );
+        assert!(
+            msg.contains("***MASKED***"),
+            "the parse-failure message must carry the masked stored action string: {msg}"
+        );
+
+        // Negative control: ordinary malformed DSL with no detector match is
+        // echoed verbatim, so the fix does not degrade an operator's ability
+        // to see what failed to parse.
+        let ordinary_malformed_dsl = "stats(ordinarytoken";
+        let err = dispatch_action(
+            ordinary_malformed_dsl,
+            "local",
+            Some(VerifiedActor::new("lambda:test").expect("verified actor")),
+            &server,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(ordinary_malformed_dsl),
+            "ordinary DSL text must survive unmasked: {err}"
         );
     }
 }
