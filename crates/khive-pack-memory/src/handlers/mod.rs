@@ -12,3 +12,7 @@ mod sub_handlers;
 mod tests;
 
 pub use common::{recall_text_terms, TextSnippetPolicy};
+pub(crate) use common::{
+    validate_memory_type, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC,
+    DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
+};

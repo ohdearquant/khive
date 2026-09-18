@@ -282,7 +282,7 @@ pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
     serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
 }
 
-pub(super) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
+pub(crate) fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
     match mt {
         "episodic" | "semantic" => Ok(()),
         other => Err(RuntimeError::InvalidInput(format!(
@@ -487,13 +487,13 @@ pub(super) fn normalize_relevance(raw: f64, strategy: &FusionStrategy) -> f64 {
 pub(super) const SALIENCE_AMPLIFIER_ALPHA: f64 = 1.5;
 
 /// Default salience for episodic memories (session events; decay quickly).
-pub(super) const DEFAULT_SALIENCE_EPISODIC: f64 = 0.3;
+pub(crate) const DEFAULT_SALIENCE_EPISODIC: f64 = 0.3;
 /// Default salience for semantic memories (durable facts; stronger base weight).
-pub(super) const DEFAULT_SALIENCE_SEMANTIC: f64 = 0.5;
+pub(crate) const DEFAULT_SALIENCE_SEMANTIC: f64 = 0.5;
 /// Default decay_factor for episodic memories (~35-day half-life).
-pub(super) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
+pub(crate) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
 /// Default decay_factor for semantic memories (~139-day half-life).
-pub(super) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
+pub(crate) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
 
 /// `memory.recall` requests whose total handler time reaches this are logged at WARN
 /// with a duration/result-shape breakdown, unconditionally (unlike the opt-in

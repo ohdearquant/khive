@@ -1,14 +1,14 @@
 //! `MemoryPack` struct, trait impls, verb handler table, and inventory registration.
 //! See `crates/khive-pack-memory/docs/api/pack-integration.md`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, NamespaceToken, PackSchemaPlan, RuntimeError, SchemaPlan, VerbRegistry,
+    KhiveRuntime, KindHook, NamespaceToken, PackSchemaPlan, RuntimeError, SchemaPlan, VerbRegistry,
 };
 use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Visibility};
 
@@ -466,6 +466,13 @@ impl PackRuntime for MemoryPack {
 
     fn note_kinds(&self) -> &'static [&'static str] {
         <MemoryPack as Pack>::NOTE_KINDS
+    }
+
+    fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+        match kind {
+            "memory" => Some(Arc::new(crate::hook::MemoryHook)),
+            _ => None,
+        }
     }
 
     fn entity_kinds(&self) -> &'static [&'static str] {
