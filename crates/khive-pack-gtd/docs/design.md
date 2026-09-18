@@ -26,7 +26,7 @@
 - Declares vocabulary via constants: `NOTE_KINDS`, `ENTITY_KINDS`, `HANDLERS`, `EDGE_RULES`,
   `NOTE_KIND_SPECS`, `SCHEMA_PLAN`.
 - The `TaskHook` implements the `KindHook` extension point: normalizes GTD fields on
-  `prepare_create`, synchronizes task content/description on `prepare_note_update`,
+  `prepare_create`, synchronizes task content/description on `normalize_note_update`,
   and wires `depends_on` graph edges on `after_create` (best-effort).
 - Generic create validates the raw shared `CreateParams` shape before `prepare_create`,
   so normalization cannot hide malformed `name`, `content`, or `salience` values.

@@ -13547,13 +13547,15 @@ mod note_update_sequencing_tests {
     /// `properties` and a validator that refuses it must both run by the time
     /// `prepare_note_update_hook` returns its error.
     ///
-    /// Reddening mutation: revert `KindHook::prepare_note_update`'s provided
-    /// body to call only `self.validate_note_update(...)` (the pre-fix shape —
-    /// exactly what a `prepare_note_update`-overriding pack that forgets to
-    /// also call `validate_note_update` reproduces). Then `normalize_note_update`
-    /// never runs, `marker` never reaches `properties`, `validate_note_update`
-    /// observes `None` where it expects `Some(true)`, and this call returns
-    /// `Ok` instead of the expected `Err` — the first assertion below fails.
+    /// This arm was confirmed to be load-bearing by a mutation run before the
+    /// change landed, recorded here as a result rather than as a procedure. With
+    /// `KindHook::prepare_note_update`'s provided body reduced to a single
+    /// `self.validate_note_update(...)` call — the pre-fix shape, and what an
+    /// overriding pack that forgets to call the validator reproduces —
+    /// `normalize_note_update` did not run, `marker` did not reach `properties`,
+    /// `validate_note_update` observed `None` where it expects `Some(true)`, and
+    /// the call returned `Ok` instead of the expected `Err`, reddening the first
+    /// assertion below.
     #[tokio::test]
     async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_can_refuse() {
         let runtime = KhiveRuntime::memory().expect("memory runtime");
@@ -13604,9 +13606,9 @@ mod note_update_sequencing_tests {
     /// AND normalization must still have landed in `args` — an accepting
     /// validator is not a reason to have skipped normalization.
     ///
-    /// Reddening mutation: the same revert as above leaves
-    /// `args["properties"]["marker"]` unset — `properties` never even
-    /// exists — so the first assertion below fails.
+    /// Under the same mutation described on the arm above,
+    /// `args["properties"]["marker"]` was left unset — `properties` did not
+    /// exist at all — reddening the first assertion below.
     #[tokio::test]
     async fn prepare_note_update_hook_runs_normalize_before_validate_and_validate_can_accept() {
         let runtime = KhiveRuntime::memory().expect("memory runtime");

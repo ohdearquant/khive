@@ -2,7 +2,7 @@
 //!
 //! Implements the `KindHook` extension point for the pack standard. Normalises
 //! user-facing GTD fields into the kg storage shape on `prepare_create`, keeps
-//! task body mirrors aligned on `prepare_note_update`, and creates `depends_on`
+//! task body mirrors aligned on `normalize_note_update`, and creates `depends_on`
 //! graph edges on `after_create` (best-effort). GTD lifecycle semantics are
 //! documented in `docs/design.md`.
 
