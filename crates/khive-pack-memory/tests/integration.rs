@@ -5627,15 +5627,16 @@ async fn memory_update_not_naming_the_type_leaves_the_derived_pair_alone() {
 /// Issue #2684. `create(kind="note", note_kind="memory", …)` used to store a row with
 /// `salience`, `decay_factor` and `properties.memory_type` all unset, while `memory.recall`
 /// rendered that same row as episodic at the default salience: one record reading one way from
-/// storage and another through the verb that exists to read it. Generic create now refuses the
-/// kind and names the writer that owns it, which is the shape `scheduled_event`, `edge` and
-/// `proposal` already have in the same match.
+/// storage and another through the verb that exists to read it. Per ADR-021's creation-admission
+/// amendment this pack's own `KindHook::prepare_create` refuses the kind and names the writer that
+/// owns it, so one refusal answers both admitting paths — shared `create` and a `stream.batch`
+/// member — without the generic pack knowing this kind exists.
 #[tokio::test]
 async fn generic_create_refuses_the_memory_kind_and_names_its_writer() {
     let registry = make_registry(make_runtime());
 
-    // Control, in the same request shape and the same pass: an ordinary note kind still creates,
-    // so the refusal below is about the kind and not about how the request was written.
+    // An ordinary note kind still creates through the same request shape, so the refusal below
+    // is attributable to the kind rather than to how the request was written.
     registry
         .dispatch(
             "create",

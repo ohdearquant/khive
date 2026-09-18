@@ -119,9 +119,33 @@ impl KindHook for MemoryHook {
         _runtime: &KhiveRuntime,
         _args: &mut Value,
     ) -> Result<(), RuntimeError> {
-        // `memory.remember` owns the create path and validates there. This hook exists for the
-        // update path; adding create-side checks here would duplicate that verb's contract.
-        Ok(())
+        // Shared creation of this kind refuses here, in the pack that owns it, per ADR-021's
+        // creation-admission amendment. This is the one place both admitting paths converge:
+        // the shared `create` handler calls this hook before it writes a note or a provenance
+        // edge, and a `stream.batch` member of this kind calls it during preparation, so a
+        // refusal aborts that batch before any sibling commits.
+        //
+        // Placing it here rather than in the generic handler is the decision, not an
+        // implementation preference. The generic pack does not know this kind, and a hook only
+        // exists when the pack that owns it is registered — so the refusal can never reach a
+        // caller who has no `memory.remember` to dispatch, without asking the registry anything.
+        //
+        // The refusal is unconditional on the arguments on purpose: a caller supplying the
+        // defaults itself still does not get the derivation, the actor routing or the keyed
+        // replay contract that `memory.remember` provides, and admitting that request would
+        // promise a contract shared creation does not implement.
+        //
+        // Falsifier: if shared `create` ever grows the full specialized contract — stored type,
+        // salience, decay and authenticated actor routing — this refusal is what should be
+        // removed, not worked around.
+        Err(RuntimeError::InvalidInput(
+            "kind=memory is not creatable through shared `create` or a `stream.batch` member — \
+             `memory.remember` derives `memory_type`, `salience` and `decay_factor` together and \
+             owns episodic actor routing, so a row written here is stored without the fields \
+             `memory.recall` supplies at read time and the same record reads differently \
+             depending on which path reads it; use `memory.remember` instead"
+                .into(),
+        ))
     }
 
     async fn after_create(
