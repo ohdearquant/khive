@@ -1160,7 +1160,8 @@ async fn renaming_legacy_task_without_description_preserves_body() {
 
 #[tokio::test]
 async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_properties() {
-    let pack = pack(rt());
+    let runtime = rt();
+    let pack = pack(runtime.clone());
     let created = pack
         .dispatch(
             "create",
@@ -1211,7 +1212,12 @@ async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_prope
     // pair this update writes is byte-identical to what `gtd.assign` writes for the same input:
     // the value keeps the offset it was given, and the anchor records the zone the task's
     // deadlines are read in. That is the whole point of running one normalization on both paths.
-    assert_eq!(updated["properties"]["due_timezone"], "America/New_York");
+    // Read the zone from the runtime rather than naming one: the display zone is a property of
+    // the host, so a literal here passes wherever it was written and fails everywhere else.
+    assert_eq!(
+        updated["properties"]["due_timezone"],
+        runtime.config().display_timezone.name()
+    );
     assert_eq!(updated["properties"]["planning_label"], "reviewed");
     assert_eq!(updated["properties"]["status"], "inbox");
 }
