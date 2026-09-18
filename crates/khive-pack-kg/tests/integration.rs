@@ -967,7 +967,7 @@ async fn list_entity_kind_filter_restricts_results() {
     }
 }
 
-/// Regression for #145: `list(kind="entity")` must honor the `offset` parameter.
+/// Regression: `list(kind="entity")` must honor the `offset` parameter.
 ///
 /// The original bug was that the handler forwarded `limit` to the runtime but
 /// hardcoded `offset: 0`, so requesting page 2 (offset=N) returned page 1.
@@ -1023,7 +1023,7 @@ async fn list_entities_offset_returns_disjoint_pages() {
     }
 }
 
-/// Regression for #145: `list(kind="note")` must honor the `offset` parameter.
+/// Regression: `list(kind="note")` must honor the `offset` parameter.
 #[tokio::test]
 async fn list_notes_offset_returns_disjoint_pages() {
     let pack = pack();
@@ -1214,7 +1214,7 @@ async fn link_two_entities_visible_via_neighbors() {
         !items.is_empty(),
         "source must have at least one outbound neighbor after linking"
     );
-    // #148: NeighborHit serializes as {id, edge_id, relation, weight, name?, kind?}
+    // NeighborHit serializes as {id, edge_id, relation, weight, name?, kind?}
     let node_ids: Vec<&str> = items
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_str))
@@ -1282,7 +1282,7 @@ async fn link_edge_relation_bang_returns_invalid_input() {
     }
 }
 
-/// Regression for #160: search response includes `entity_kind` so agents can
+/// Regression: search response includes `entity_kind` so agents can
 /// distinguish hit kinds without an extra `get()` call.
 #[tokio::test]
 async fn search_entity_response_includes_entity_kind() {
@@ -1363,7 +1363,7 @@ async fn search_entity_response_includes_list_shape_fields() {
     );
 }
 
-/// Regression for #160 (note half): note search response includes `note_kind`.
+/// Regression (note half): note search response includes `note_kind`.
 #[tokio::test]
 async fn search_note_response_includes_note_kind() {
     let pack = pack();
@@ -1502,7 +1502,7 @@ async fn search_rejects_filters_that_do_not_apply_to_the_resolved_substrate() {
     }
 }
 
-/// Regression for #163: `search` accepts a `properties` filter that restricts
+/// Regression: `search` accepts a `properties` filter that restricts
 /// results to entities whose properties contain the given key=value pairs.
 #[tokio::test]
 async fn search_properties_filter_restricts_results() {
@@ -1556,7 +1556,7 @@ async fn search_properties_filter_restricts_results() {
     }
 }
 
-/// #518: entity search with `tags` filter must return only entities whose tags match any
+/// Entity search with `tags` filter must return only entities whose tags match any
 /// of the requested tags (OR semantics, case-insensitive).
 #[tokio::test]
 async fn search_tags_filter_restricts_results_or_semantics() {
@@ -1632,7 +1632,7 @@ async fn search_tags_filter_restricts_results_or_semantics() {
     );
 }
 
-/// Regression for #148: `neighbors` accepts `id` (canonical) AND `node_id` (legacy alias).
+/// Regression: `neighbors` accepts `id` (canonical) AND `node_id` (legacy alias).
 /// Both inputs must work and the response must use `id`.
 #[tokio::test]
 async fn neighbors_accepts_id_alias_and_responds_with_id() {
@@ -1689,7 +1689,7 @@ async fn neighbors_accepts_id_alias_and_responds_with_id() {
     }
 }
 
-/// Regression for #162: neighbor hits include enriched `name` and `kind`
+/// Regression: neighbor hits include enriched `name` and `kind`
 /// from the corresponding entity record.
 #[tokio::test]
 async fn neighbors_enriches_with_name_and_kind() {
@@ -1727,7 +1727,7 @@ async fn neighbors_enriches_with_name_and_kind() {
         .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id))
         .expect("must find tgt in neighbors");
 
-    // #162: enrichment must populate name + kind from the target entity.
+    // Enrichment must populate name + kind from the target entity.
     assert_eq!(
         hit.get("name").and_then(Value::as_str),
         Some("GQA"),
@@ -1812,7 +1812,7 @@ async fn search_note_returns_created_content() {
         !hits.is_empty(),
         "search must return at least one hit for matching content"
     );
-    // Every hit must have id (normalized from substrate-specific note_id — issue #148)
+    // Every hit must have id (normalized from substrate-specific note_id)
     for hit in hits {
         assert!(
             hit.get("id").is_some(),
@@ -1875,7 +1875,7 @@ async fn search_unknown_kind_returns_invalid_input() {
     );
 }
 
-// #570: FTS operator regression matrix for KG note and entity search surfaces.
+// FTS operator regression matrix for KG note and entity search surfaces.
 #[tokio::test]
 async fn search_operator_matrix_does_not_crash() {
     let pack = pack();
@@ -2815,7 +2815,7 @@ async fn create_event_kind_returns_immutable_error() {
     );
 }
 
-// ── Issue #65: link verb name resolution ─────────────────────────────────────
+// ── Link verb name resolution ────────────────────────────────────────────────
 //
 // When `source_id` or `target_id` is not a UUID or hex prefix, the link handler
 // must treat the value as an entity name and resolve it to a UUID.
@@ -3670,7 +3670,7 @@ async fn link_by_name_ambiguous_returns_ambiguous_error() {
     );
 }
 
-// ── Issue #66: MCP display formatting ────────────────────────────────────────
+// ── MCP display formatting ───────────────────────────────────────────────────
 //
 // MCP responses always return full UUIDs and ISO 8601 timestamps.
 // Display formatting (short IDs, compact dates) belongs in the CLI/UI layer.
@@ -8858,7 +8858,7 @@ async fn withdraw_on_already_withdrawn_proposal_returns_error() {
     );
 }
 
-// ---- Issue #489: create_linked — entity creation with immediate edge attachment ----
+// ---- create_linked — entity creation with immediate edge attachment ----------------
 
 /// Happy path: create an entity with a valid edge spec.
 /// Response must include the created entity fields plus an `edges` array with one entry.
@@ -9062,7 +9062,7 @@ async fn create_entity_with_mixed_edges_partial_success() {
     assert_eq!(errs.len(), 1, "#489: one failed edge; got: {errs:?}");
 }
 
-// ---- Issue #487: dedup guard tests ----
+// ---- Dedup guard tests ----------------
 
 // Creating a uniquely-named entity reports an EMPTY comparison, not an absent
 // one. This test asserted absence until #2750: absence could not be told apart
@@ -9205,7 +9205,7 @@ async fn create_note_dedup_never_runs() {
     );
 }
 
-// ---- Issue #393: propose→review→apply/reject/withdraw lifecycle tests ----
+// ---- propose→review→apply/reject/withdraw lifecycle tests ----------------
 
 /// Full lifecycle: propose → review(approve) → proposal auto-applies.
 ///
