@@ -448,6 +448,146 @@ async fn create_finding_rejects_invalid_confidence_with_valid_values() {
     );
 }
 
+/// Create a finding and return its id, so an update test starts from a row the
+/// validating writer produced.
+#[allow(dead_code)]
+async fn create_finding(reg: &VerbRegistry, properties: Value) -> Value {
+    dispatch(
+        reg,
+        "create",
+        json!({
+            "kind": "finding",
+            "title": "Missing bounds check",
+            "properties": properties,
+        }),
+    )
+    .await
+    .expect("create(kind=finding) with valid properties must succeed")
+}
+
+#[tokio::test]
+async fn update_finding_rejects_invalid_kind_status() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"kind_status": "NOT-A-STATUS"}}),
+    )
+    .await
+    .expect_err("the generic update path must refuse a kind_status outside the closed set");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("open, resolved, wontfix, invalid"),
+        "error must name the valid statuses, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_rejects_invalid_severity() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"severity": "catastrophic"}}),
+    )
+    .await
+    .expect_err("the generic update path must refuse a severity outside the closed set");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("critical, high, medium, low, info"),
+        "error must name the valid severities, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_rejects_invalid_confidence() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"confidence": "absolute"}}),
+    )
+    .await
+    .expect_err("the generic update path must refuse a confidence outside the closed set");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("high, medium, low"),
+        "error must name the valid confidences, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_resolves_a_finding() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    assert_eq!(created["properties"]["kind_status"], "open");
+    let updated = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"kind_status": "resolved"}}),
+    )
+    .await
+    .expect("resolving a finding is the one lifecycle action it has and must still work");
+    assert_eq!(updated["properties"]["kind_status"], "resolved");
+}
+
+#[tokio::test]
+async fn update_finding_refuses_to_clear_kind_status() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let err = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"kind_status": null}}),
+    )
+    .await
+    .expect_err("clearing kind_status would produce a row no create path can write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be cleared"),
+        "error must say the field cannot be cleared, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_finding_clears_an_optional_field_on_null() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let updated = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"severity": null}}),
+    )
+    .await
+    .expect("severity is optional on create, so clearing it is a state create can also produce");
+    assert!(
+        updated["properties"]["severity"].is_null(),
+        "severity must be gone, got: {}",
+        updated["properties"]["severity"]
+    );
+    assert_eq!(updated["properties"]["confidence"], "high");
+}
+
+#[tokio::test]
+async fn update_finding_leaves_unmentioned_closed_set_fields_alone() {
+    let reg = registry(rt());
+    let created = create_finding(&reg, json!({"severity": "high", "confidence": "high"})).await;
+    let updated = dispatch(
+        &reg,
+        "update",
+        json!({"id": created["id"], "properties": {"standard": "audit-guidelines.md"}}),
+    )
+    .await
+    .expect("an update naming none of the three closed-set fields must be accepted");
+    assert_eq!(updated["properties"]["kind_status"], "open");
+    assert_eq!(updated["properties"]["severity"], "high");
+    assert_eq!(updated["properties"]["confidence"], "high");
+    assert_eq!(updated["properties"]["standard"], "audit-guidelines.md");
+}
+
 #[tokio::test]
 async fn create_finding_rejects_non_object_properties() {
     let reg = registry(rt());
