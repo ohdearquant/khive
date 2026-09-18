@@ -1099,6 +1099,19 @@ impl KhiveRuntime {
             ));
         }
 
+        // #2943: `entity.properties`, `entity.entity_type`, and `entity.tags`
+        // are all final here — the owning pack's KindHook, if any, validates
+        // the resulting record, mirroring `prepare_note_update_hook` on the
+        // note side. `Ok(())` when no pack registered a hook for this entity
+        // kind (the trait default, or the runtime-layer aggregate was never
+        // installed). Placed after the no-op early return above so a
+        // genuinely unchanged guarded update never re-runs the hook for
+        // nothing; only `updated_at` remains to be bumped after this point.
+        if let Some(hook) = self.entity_kind_hook(&entity.kind) {
+            hook.validate_entity_update(self, token, &entity, entity.properties.as_ref())
+                .await?;
+        }
+
         // `updated_at` is also the optimistic-concurrency revision for
         // full-entity replacement. Make it strictly advance even when two
         // operations land inside one clock microsecond. Saturation is not a
@@ -12678,5 +12691,232 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    // -----------------------------------------------------------------
+    // #2943: prepare_guarded_entity_update dispatches an installed
+    // entity-kind KindHook against the post-merge properties.
+    // -----------------------------------------------------------------
+
+    /// Test-only `KindHook` whose `validate_entity_update` refuses unless
+    /// `properties.ok == true`. Proves `prepare_guarded_entity_update`
+    /// actually dispatches to whichever hook `entity_kind_hook` resolves
+    /// for the entity's kind, and that the properties it sees are the
+    /// MERGED (post-patch) value rather than the caller's raw patch.
+    ///
+    /// Mutation prediction: removing the dispatch call this test exercises
+    /// (the `if let Some(hook) = self.entity_kind_hook(...)` block added at
+    /// the seam) makes `entity_update_dispatches_installed_kind_hook_refusal`
+    /// fail — the refusing hook never runs, so the update that should be
+    /// refused instead succeeds and `expect_err` panics.
+    #[derive(Debug, Default)]
+    struct RefusingKindHook;
+
+    #[async_trait::async_trait]
+    impl crate::pack::KindHook for RefusingKindHook {
+        async fn prepare_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn after_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _id: Uuid,
+            _args: &Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn validate_entity_update(
+            &self,
+            _runtime: &KhiveRuntime,
+            _token: &NamespaceToken,
+            _entity: &Entity,
+            properties: Option<&Value>,
+        ) -> Result<(), RuntimeError> {
+            let ok = properties
+                .and_then(Value::as_object)
+                .and_then(|p| p.get("ok"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if ok {
+                Ok(())
+            } else {
+                Err(RuntimeError::InvalidInput(
+                    "widget update requires properties.ok == true".into(),
+                ))
+            }
+        }
+    }
+
+    /// Test-only `KindHook` implementing only the two required methods, so
+    /// its entity-update path is the trait's inherited default. Proves the
+    /// default is a default (issue #2943 acceptance item 5): a kind can
+    /// register a hook for `create` without that hook opting into
+    /// update-time validation, and a generic entity `update` must still
+    /// succeed.
+    ///
+    /// Mutation prediction: if the trait default stopped returning `Ok(())`
+    /// (e.g. it were changed to re-run `prepare_create`-shaped logic),
+    /// `entity_update_with_hook_missing_the_default_method_still_succeeds`
+    /// fails, because this hook has nothing else to satisfy any such check.
+    #[derive(Debug, Default)]
+    struct SilentKindHook;
+
+    #[async_trait::async_trait]
+    impl crate::pack::KindHook for SilentKindHook {
+        async fn prepare_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _args: &mut Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn after_create(
+            &self,
+            _runtime: &KhiveRuntime,
+            _id: Uuid,
+            _args: &Value,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_update_dispatches_installed_kind_hook_refusal() {
+        let rt = rt();
+        rt.install_entity_kind_hooks(vec![(
+            "widget".to_string(),
+            Arc::new(RefusingKindHook) as Arc<dyn crate::pack::KindHook>,
+        )]);
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "widget",
+                None,
+                "Gadget",
+                None,
+                Some(serde_json::json!({"ok": true})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let error = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"ok": false})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("installed hook must refuse the merged properties");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref msg) if msg.contains("requires properties.ok")),
+            "unexpected error: {error:?}"
+        );
+        let unchanged = rt.get_entity(&tok, entity.id).await.unwrap();
+        assert_eq!(
+            unchanged.properties, entity.properties,
+            "a refused update must not mutate storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_update_dispatches_installed_kind_hook_acceptance() {
+        let rt = rt();
+        rt.install_entity_kind_hooks(vec![(
+            "widget".to_string(),
+            Arc::new(RefusingKindHook) as Arc<dyn crate::pack::KindHook>,
+        )]);
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "widget",
+                None,
+                "Gadget",
+                None,
+                Some(serde_json::json!({"ok": false})),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"ok": true})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("installed hook accepts a merged properties value satisfying its check");
+        assert_eq!(updated.properties, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn entity_update_with_hook_missing_the_default_method_still_succeeds() {
+        let rt = rt();
+        rt.install_entity_kind_hooks(vec![(
+            "widget".to_string(),
+            Arc::new(SilentKindHook) as Arc<dyn crate::pack::KindHook>,
+        )]);
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "widget", None, "Gadget", None, None, vec![])
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    name: Some("Renamed Gadget".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "a hook that does not override validate_entity_update must not block the update",
+            );
+        assert_eq!(updated.name, "Renamed Gadget");
+    }
+
+    /// A kind with no installed hook at all (the pre-#2943 behaviour) must
+    /// still update freely — `entity_kind_hook` returns `None` and the
+    /// dispatch site's `if let Some(hook) = ...` is skipped entirely.
+    #[tokio::test]
+    async fn entity_update_with_no_installed_hook_for_kind_succeeds() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "Plain", None, None, vec![])
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity(
+                &tok,
+                entity.id,
+                EntityPatch {
+                    name: Some("Plain Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("no hook installed for this kind must not block the update");
+        assert_eq!(updated.name, "Plain Renamed");
     }
 }

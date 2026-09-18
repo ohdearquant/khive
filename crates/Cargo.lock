@@ -2580,6 +2580,7 @@ dependencies = [
  "khive-pack-kg",
  "khive-pack-session",
  "khive-runtime",
+ "khive-storage",
  "khive-types",
  "serde_json",
  "tokio",
