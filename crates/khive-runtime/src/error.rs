@@ -148,6 +148,7 @@ impl AuditObligationFailure {
                 AuditTerminalReason::ResolutionDeadlineExpired => "resolution_deadline_expired",
                 AuditTerminalReason::IdentityConflict => "identity_conflict",
                 AuditTerminalReason::StoreFailure => "store_failure",
+                AuditTerminalReason::RetryExhausted => "retry_exhausted",
                 AuditTerminalReason::IdempotencyUnsupported => "idempotency_unsupported",
                 AuditTerminalReason::DriverPanicked => "driver_panicked",
                 AuditTerminalReason::DriverCancelled => "driver_cancelled",
