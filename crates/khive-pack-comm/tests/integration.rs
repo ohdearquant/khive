@@ -13470,13 +13470,13 @@ async fn i2390_inbox_post_filter_keyset_paging_matches_offset_semantics_beyond_p
 async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
     let (registry, _rt) = build_registry_for_ns("local");
     assert!(
-        registry.has_verb("comm.heartbeat"),
-        "the refusal is gated on this verb being registered, so the arm is only meaningful \
-         while the fixture registers it"
+        registry.find_kind_hook("channel_health").is_some(),
+        "the refusal lives on this pack's hook for the kind, so the arm is only meaningful \
+         while the fixture registers the pack that owns it"
     );
 
-    // Control, same request shape and same pass: an ordinary note kind still creates, so the
-    // refusal below is about the kind and not about how the request was written.
+    // An ordinary note kind still creates through the same request shape, so the refusal
+    // below is attributable to the kind rather than to how the request was written.
     registry
         .dispatch(
             "create",
@@ -13538,5 +13538,68 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
     assert_eq!(
         channels[0]["channel_slug"].as_str(),
         Some("recipient@example.com")
+    );
+}
+
+/// Issue #2963, the other admitting path. The refusal lives on this pack's `KindHook`, and that
+/// hook is what `stream.batch` calls when it prepares a write member, so one refusal answers both
+/// entry points. It refuses during preparation rather than as a per-member conflict, so the batch
+/// aborts before any sibling commits.
+#[tokio::test]
+async fn stream_batch_refuses_a_channel_health_write_member_before_any_sibling_commits() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // The same batch shape writes an ordinary kind, so the refusal below is attributable to the
+    // kind rather than to how the batch was written.
+    registry
+        .dispatch(
+            "stream.batch",
+            serde_json::json!({"atomic": true, "ops": [
+                {"op": "write", "key": "control note", "kind": "observation",
+                 "doc": {"note": "an ordinary keyed note written through a batch"}}
+            ]}),
+        )
+        .await
+        .expect("the same batch shape must still write an ordinary keyed note");
+
+    let refusal = registry
+        .dispatch(
+            "stream.batch",
+            serde_json::json!({"atomic": true, "ops": [
+                {"op": "write", "key": "sibling note", "kind": "observation",
+                 "doc": {"note": "a sibling that precedes the refused member"}},
+                {"op": "write", "key": "health row", "kind": "channel_health",
+                 "doc": {"outcome": "success"}}
+            ]}),
+        )
+        .await
+        .expect_err("a channel_health batch member must be refused");
+    let message = refusal.to_string();
+    assert!(
+        message.contains("comm.heartbeat"),
+        "a refusal has to name the verb that does the job: {message}"
+    );
+
+    let siblings = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "observation", "key_prefix": "sibling", "limit": 10}),
+        )
+        .await
+        .expect("list after the refused batch");
+    assert_eq!(
+        siblings["items"].as_array().map(Vec::len),
+        Some(0),
+        "the member preceding the refused one must not have committed: {siblings}"
+    );
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(0),
+        "no channel row may be created through the batch path: {health}"
     );
 }
