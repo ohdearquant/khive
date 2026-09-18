@@ -218,7 +218,7 @@ namespace.
    backend. Stating the requirement is the most this surface can do.
 
 5. **Namespace keeps its stated jobs.** Attribution, query filtering, a policy input describing the
-   _caller_, and the Rule 3b visible-set read scope. Rule 8's principal-scoped pack backends are
+   _request_ rather than the principal behind it, and the Rule 3b visible-set read scope. Rule 8's principal-scoped pack backends are
    unaffected: their isolation is a connection-time property of the backend, which is point 4 applied
    to one pack rather than to the store.
 
@@ -663,17 +663,21 @@ contract stated next. The difference a Gate makes is which callers and verbs are
 difference isolation makes is which store the caller reaches. See Rule 9.)_ The gate receives
 the acting actor, the request namespace, the verb, the raw arguments and a context value, and
 returns allow/deny. _(Corrected in Rev 8: this sentence previously read "and the target records'
-attribution as policy input". The request type carries the caller's namespace and the unresolved
-arguments; no record is fetched before the check, so no target attribution is available to a policy.
-Rule 9 states what follows from that.)_
+attribution as policy input". The request type carries the namespace the request is directed at and
+the unresolved arguments; no record is fetched before the check, so no target attribution is
+available to a policy. Rule 9 states what follows from that, including why that namespace is not
+the same thing as the authenticated caller's scope.)_
 
 - AllowAllGate ignores all of it and returns allow.
-- A TenantGate MAY key policy on the caller's namespace string (or any attribution field it
+- A TenantGate MAY key policy on the request namespace string (or any attribution field it
   receives). That is the gate reading namespace as policy input — not storage partitioning on it.
   _(Corrected in Rev 8: this bullet previously read "MAY key per-tenant isolation on the namespace
-  string". It cannot: the value it keys on describes the caller, and the target of a by-ID op is
-  never presented to it, so what it keys is admission, not isolation. Per-tenant isolation is the
-  storage-layer property of Rule 9 point 4.)_
+  string". It cannot, for two reasons. The target of a by-ID op is never presented to it, so what it
+  keys is admission rather than isolation; and the value it keys on is the namespace the request is
+  directed at, which an explicit `namespace` argument sets, so a policy resting on that value alone
+  is satisfiable by naming another namespace. A policy that means "this principal may act here"
+  binds the actor to the namespace. Per-tenant isolation is the storage-layer property of Rule 9
+  point 4.)_
 
 How an operator's gate maps authenticated identities to allow/deny is operator policy,
 implemented behind the trait. This ADR specifies only the gate's input contract and the
