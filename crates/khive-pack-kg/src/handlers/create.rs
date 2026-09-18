@@ -329,6 +329,27 @@ impl KgPack {
                             .into(),
                     ));
                 }
+                // A `channel_health` row is addressed, not searched: `comm.heartbeat` derives a
+                // deterministic v5 UUID from the namespace, channel kind and slug, and writes at
+                // that id so one channel keeps exactly one health row that later heartbeats update
+                // in place. This path mints a fresh random id instead, producing a row no heartbeat
+                // will ever find or update and no projection will reconcile — a second row for a
+                // channel whose identity scheme exists to make that impossible. Unlike a row that
+                // is merely missing fields, this one is not repairable by reading it: it looks
+                // complete. Gated on the writer being reachable, so a pack that registers the kind
+                // without `comm.heartbeat` is not handed a refusal naming a verb it cannot
+                // dispatch. Falsifier: if `create` ever accepts a caller-supplied id, the identity
+                // could be derived on both paths instead and this refusal would be the wrong shape.
+                if canonical == "channel_health" && registry.has_verb("comm.heartbeat") {
+                    return Err(RuntimeError::InvalidInput(
+                        "kind=channel_health is not creatable via `create` — `comm.heartbeat` \
+                         addresses a channel's health row by a deterministic id derived from the \
+                         namespace, channel kind and slug, so a row created here gets an unrelated \
+                         id that no heartbeat will ever find or update and that leaves two rows \
+                         for one channel; use `comm.heartbeat` instead"
+                            .into(),
+                    ));
+                }
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }

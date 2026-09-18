@@ -13459,3 +13459,84 @@ async fn i2390_inbox_post_filter_keyset_paging_matches_offset_semantics_beyond_p
         "paging in 100-row chunks must reassemble the exact same total order as one wide call"
     );
 }
+
+/// Issue #2963. `comm.heartbeat` addresses a channel's health row by a deterministic id derived
+/// from the namespace, channel kind and slug, and writes at that id, so one channel keeps exactly
+/// one health row that later heartbeats update in place. Generic `create` minted a fresh random id
+/// instead, producing a row no heartbeat would ever find and a second row for one channel. That is
+/// worse than a row missing fields: it looks complete, so reading it does not reveal the defect.
+/// Generic create now refuses the kind and names the writer that owns it.
+#[tokio::test]
+async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    assert!(
+        registry.has_verb("comm.heartbeat"),
+        "the refusal is gated on this verb being registered, so the arm is only meaningful \
+         while the fixture registers it"
+    );
+
+    // Control, same request shape and same pass: an ordinary note kind still creates, so the
+    // refusal below is about the kind and not about how the request was written.
+    registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "an ordinary note created through the generic verb"
+            }),
+        )
+        .await
+        .expect("the same request shape must still create an ordinary note");
+
+    let refusal = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "note",
+                "note_kind": "channel_health",
+                "content": "a channel health row written through the generic create verb"
+            }),
+        )
+        .await
+        .expect_err("kind=channel_health must be refused by generic create");
+    let message = refusal.to_string();
+    assert!(
+        message.contains("comm.heartbeat"),
+        "a refusal has to name the verb that does the job: {message}"
+    );
+
+    // The invariant the refusal protects, asserted rather than assumed: the entry point is closed,
+    // not the kind, and two heartbeats for one channel still leave exactly one row because the
+    // second addresses the id the first derived.
+    for outcome in ["success", "success"] {
+        registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": "local",
+                    "channel_kind": "email",
+                    "channel_slug": "recipient@example.com",
+                    "poll_interval_secs": 5,
+                    "outcome": outcome,
+                }),
+            )
+            .await
+            .expect("comm.heartbeat must still write a channel's health row");
+    }
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert_eq!(
+        channels.len(),
+        1,
+        "two heartbeats for one channel must address one row, not two: {health}"
+    );
+    assert_eq!(
+        channels[0]["channel_slug"].as_str(),
+        Some("recipient@example.com")
+    );
+}
