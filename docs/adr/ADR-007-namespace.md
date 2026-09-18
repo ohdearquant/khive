@@ -8,9 +8,9 @@ Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rules 8 and 9 are ad
 **Amended by**: proposed [ADR-068](ADR-068-process-isolation-topology.md), which
 replaces Rule 4's TenantGate clause if accepted.
 **Supersedes (partial)**: None — additive amendment only
-**Proposed qualification**: 2026-09-14, [memory creation admission](#proposed-qualification-memory-creation-admission)
-partially amends Rev 6's generic-memory-create equivalence upon acceptance; routing
-for `memory.remember` and Rules 1–8 remain unchanged.
+**Qualified**: 2026-09-18, [memory creation admission](#qualification-memory-creation-admission)
+partially amends Rev 6's generic-memory-create equivalence; routing for
+`memory.remember` and Rules 1–8 are unchanged (#2724 proposed it; accepted 2026-09-18).
 **Superseded by**: [ADR-050](ADR-050-kg-token-namespace-contract.md) for the historical
 KG-pack namespace-rebinding clause only; the remainder of this record stays authoritative.
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
@@ -85,11 +85,11 @@ server-side." These are not in conflict: they are statements about different bac
 
 Rule 8 below formalizes this relationship.
 
-### Proposed qualification: memory creation admission
+### Qualification: memory creation admission
 
-**Status**: proposed, 2026-09-14, dependent on the
-[ADR-021 creation-admission amendment](ADR-021-memory-pack.md#amendment-new-memory-creation-admission-proposed).
-Upon acceptance, Rev 6 Rule 0's phrase treating
+**Status**: accepted 2026-09-18, dated 2026-09-14, dependent on the
+[ADR-021 creation-admission amendment](ADR-021-memory-pack.md#amendment-new-memory-creation-admission).
+Rev 6 Rule 0's phrase treating
 `create(kind="memory", properties={"memory_type":"episodic"})` as equivalent to
 `memory.remember` no longer applies: new shared memory creation refuses and directs
 callers to `memory.remember`. New `stream.batch` memory writes also refuse through
@@ -405,9 +405,9 @@ continues to hold for every write path EXCEPT one: an episodic memory write
 `namespace = token.actor().id` by default, rather than the shared `'local'` pool. This is the
 single carve-out from the prior "writes always pin `'local'`" default. It is bounded as follows:
 
-The generic-create equivalence above is qualified, on acceptance, by the
-[proposed memory-creation admission decision](#proposed-qualification-memory-creation-admission).
-That proposal leaves the `memory.remember` routing rules below unchanged.
+The generic-create equivalence above is qualified by the
+[memory-creation admission decision](#qualification-memory-creation-admission).
+That decision leaves the `memory.remember` routing rules below unchanged.
 
 - Scope is episodic memory only. Semantic memory writes (`memory_type = semantic`) are
   unchanged: they stamp `token.namespace()` (the shared pool, `'local'` by default). All
