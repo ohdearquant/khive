@@ -257,7 +257,10 @@ fn normalize_priority_update(args: &mut Value) -> Result<(), RuntimeError> {
     let Some(root) = args.as_object_mut() else {
         return Ok(());
     };
-    let caller_set_salience = root.get("salience").is_some_and(|value| !value.is_null());
+    // Presence, not truthiness: `salience: null` is the tri-state contract's explicit clear
+    // (key absent -> untouched, null -> clear, number -> set), so reading null as "the caller said
+    // nothing" would overwrite a clear with the derived value and silently ignore the instruction.
+    let caller_set_salience = root.contains_key("salience");
     let Some(priority) = root
         .get("properties")
         .and_then(Value::as_object)
@@ -276,12 +279,13 @@ fn normalize_priority_update(args: &mut Value) -> Result<(), RuntimeError> {
                 "priority must be one of p0, p1, p2, p3, or null; got {priority}"
             ))
         })?;
-        if !is_valid_priority(named) {
+        let canonical = named.to_ascii_lowercase();
+        if !is_valid_priority(&canonical) {
             return Err(RuntimeError::InvalidInput(format!(
                 "invalid priority {named:?} — valid: p0, p1, p2, p3"
             )));
         }
-        Some(named.to_ascii_lowercase())
+        Some(canonical)
     };
 
     let salience = canonical
@@ -596,8 +600,9 @@ mod tests {
     /// its create had written.
     #[tokio::test]
     async fn an_escalated_priority_rewrites_the_salience_beside_it() {
-        let note = task_note_with(json!({"priority": "p3", "status": "inbox"}));
-        let _ = &note;
+        // No note fixture: the level a task currently holds does not enter this decision. The
+        // salience follows the level named in THIS update, which is what makes the escalation
+        // land rather than being merged against a stored value.
         let mut args = json!({"properties": {"priority": "p0"}});
 
         normalize_priority_update(&mut args).expect("normalize");
@@ -660,6 +665,23 @@ mod tests {
 
         assert_eq!(args["properties"]["priority"], "p0");
         assert_eq!(args["salience"], 0.1);
+    }
+
+    /// `salience: null` is the tri-state contract's explicit clear, so a caller who sends it
+    /// beside a priority is asking for the level without the derived ranking. Reading null as
+    /// silence would overwrite the clear with the derived number and ignore the instruction.
+    #[tokio::test]
+    async fn an_explicit_null_salience_is_a_clear_and_survives_the_derivation() {
+        let mut args = json!({"properties": {"priority": "p0"}, "salience": null});
+
+        normalize_priority_update(&mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["priority"], "p0");
+        assert!(
+            args["salience"].is_null(),
+            "an explicit clear must reach the patch; got: {}",
+            args["salience"]
+        );
     }
 
     /// An update that does not mention the level must not mint a salience nobody asked for: doing
