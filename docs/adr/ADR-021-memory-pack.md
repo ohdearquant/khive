@@ -141,9 +141,12 @@ no explicit `namespace=` argument is supplied, a semantic write stamps `token.na
 shared pool, `'local'` by default) and an episodic write stamps `token.actor().id` (the caller's
 actor id). An explicit `namespace=` argument overrides this for both types.
 
-Agents that prefer explicit CRUD are not blocked:
-`create(kind="memory", salience=0.7, decay_factor=0.01, properties={"memory_type":"semantic"}, ...)`
-followed by an optional `link(annotates)` produces an equivalent result.
+Explicit CRUD is no longer an equivalent route. The
+[creation-admission amendment](#amendment-new-memory-creation-admission) refuses
+`create(kind="memory", ...)` even when the caller supplies `salience`, `decay_factor` and
+`memory_type` itself, because such a request still carries neither the episodic actor routing nor
+the keyed-replay contract `memory.remember` provides. The equivalence above describes what that
+verb does; it is not a second way in.
 
 ### 5. `memory.recall` — memory-scoped retrieval with decay weighting
 
