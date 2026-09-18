@@ -197,6 +197,21 @@ impl KindHook for FindingHook {
             }
             validate_finding_enum(key, value)?;
         }
+
+        // `evidence` is checked at create (`prepare_create`, the `is_array`
+        // arm) and was not checked here, so `update` stored any shape the
+        // caller sent. Same tri-state contract as the enums above: `evidence`
+        // is optional on create, so clearing it with an explicit null lands in
+        // a state the create path can also produce and is allowed; a present
+        // non-null value must satisfy what create requires of it.
+        if let Some(value) = map.get("evidence") {
+            if !value.is_null() && !value.is_array() {
+                return Err(RuntimeError::InvalidInput(
+                    "evidence must be an array".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
