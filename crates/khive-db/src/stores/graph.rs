@@ -1192,6 +1192,19 @@ fn edge_order_clause(sort: &[SortOrder<EdgeSortField>]) -> String {
 /// against. Soft-deleted endpoints are already excluded by
 /// [`LIVE_ENDPOINTS_CONDITION`] in the surrounding `WHERE`, so a row reaching
 /// this expression has live endpoints or none at all.
+///
+/// The probe reads the same local tables as [`LIVE_ENDPOINTS_CONDITION`] and
+/// [`endpoint_exists_clause`], which is what makes the three agree on what an
+/// endpoint is. Two consequences are deliberate. An `annotates` endpoint that
+/// is an event or another edge is a live endpoint that is not in either base,
+/// so it classifies as `none` and lands in `unresolved`; that is the bucket's
+/// meaning, not a miscount, and `annotates` is excluded from structural
+/// density anyway. And when ADR-009 edge routing is wired, an endpoint held in
+/// another backend will not be in these tables either: `target_backend` is
+/// written by nothing today, so no such row exists yet, but whoever wires the
+/// routing has to decide what the breakdown should say about it and change
+/// this expression deliberately rather than discover it as a silent
+/// `unresolved`.
 fn endpoint_base_case(column: &str) -> String {
     format!(
         "CASE WHEN EXISTS (SELECT 1 FROM entities be WHERE be.id = graph_edges.{column}) \
