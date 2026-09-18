@@ -133,7 +133,7 @@ impl KindHook for MemoryHook {
         Ok(())
     }
 
-    async fn prepare_note_update(
+    async fn normalize_note_update(
         &self,
         _runtime: &KhiveRuntime,
         _token: &NamespaceToken,

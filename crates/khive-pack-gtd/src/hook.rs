@@ -360,18 +360,17 @@ impl KindHook for TaskHook {
         crate::dependency::validate_property_update(runtime, token, note, properties).await
     }
 
-    async fn prepare_note_update(
+    async fn normalize_note_update(
         &self,
         runtime: &KhiveRuntime,
-        token: &NamespaceToken,
+        _token: &NamespaceToken,
         note: &Note,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
         synchronize_description(note, args)?;
         normalize_due_update(runtime, note, args)?;
         normalize_priority_update(args)?;
-        let properties = args.get("properties").filter(|value| !value.is_null());
-        crate::dependency::validate_property_update(runtime, token, note, properties).await
+        Ok(())
     }
 
     async fn validate_links(

@@ -1357,7 +1357,7 @@ impl KindHook for NormalizeHook {
         self.0.lock().unwrap().push(id);
         Ok(())
     }
-    async fn prepare_note_update(
+    async fn normalize_note_update(
         &self,
         _: &KhiveRuntime,
         _: &NamespaceToken,
