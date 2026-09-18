@@ -221,18 +221,21 @@ pub struct TimeRange {
 
 /// Live edge counts grouped by the base each endpoint resolves against.
 ///
-/// An edge's endpoints are ids, and an id resolves against either `entities`
-/// or `notes`. Nothing in an edge row says which, so a relation breakdown
-/// cannot separate structure between concepts from provenance attached to
-/// them. `annotates` is the bulk of the provenance but not all of it:
-/// `supports` and `refutes` are same-substrate, so a `note -> note` support
-/// edge is neither `annotates` nor structure, and subtracting `annotates`
-/// alone still overcounts.
+/// An edge's endpoints are ids, and nothing in an edge row says what an id
+/// resolves against, so a relation breakdown cannot separate structure between
+/// concepts from provenance attached to them. `annotates` is the bulk of the
+/// provenance but not all of it: `supports` and `refutes` are same-substrate,
+/// so a `note -> note` support edge is neither `annotates` nor structure, and
+/// subtracting `annotates` alone still overcounts.
 ///
-/// `unresolved` counts edges with an endpoint in neither base. It exists so
-/// that such rows are reported rather than folded into a bucket they do not
-/// belong to; the four named buckets plus `unresolved` sum to the live edge
-/// total.
+/// The four named buckets cover the entity and note bases, which is what a
+/// structural density figure is asking about. They are not the only legal
+/// endpoints: an `annotates` edge may point at an event or at another edge
+/// (ADR-002/ADR-055), and those are valid, live endpoints rather than dangling
+/// ones. `unresolved` is therefore "an endpoint outside the two bases", not
+/// "an endpoint that is missing". It exists so such rows are reported rather
+/// than folded into a bucket they do not belong to; the four named buckets
+/// plus `unresolved` sum to the live edge total.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeEndpointBaseCounts {
     pub entity_entity: u64,

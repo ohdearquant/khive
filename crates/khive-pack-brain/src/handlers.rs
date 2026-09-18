@@ -293,8 +293,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
-                              or entity the feedback applies to. Prefix resolution is \
-                              searches every namespace you can see.",
+                              or entity the feedback applies to. Prefix resolution applies no \
+                              namespace filter at all, which is a wider reach than the caller's \
+                              visible set.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             khive_types::ParamDef {

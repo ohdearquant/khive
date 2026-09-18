@@ -333,7 +333,7 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   `request`. **Per-verb validation failure** (unknown kind, bad UUID, etc.) returns a per-op
   `{ok: false, error: "..."}` entry — the batch does not abort.
 
-### Namespace (attribution-only — ADR-007 Rev 6, 2026-06-19)
+### Namespace (attribution-only — ADR-007 Rev 8, 2026-09-17)
 
 - **Namespace is attribution, not isolation.** It is a write-stamp on records, queryable and
   filterable, available to the Gate as policy input. It is never a storage boundary.
@@ -343,6 +343,16 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
   Do not add such checks.
 - **Authorization lives at one seam: the Gate** (ADR-018). Storage stores are ID-only. The
   Gate is the trust boundary.
+- **The gate sees the request, never the target** (Rev 8, Rule 9). A gate check carries the actor,
+  a namespace, the verb and the unresolved arguments; nothing fetches the record an id names before
+  the check. A policy can refuse a verb or a caller, not a target. The namespace it carries is the
+  one the request is directed at: it defaults to the identity's and is replaced by an explicit
+  `namespace` argument when the call carries one, so the authenticated principal is the actor field
+  and a policy comparing namespace alone is satisfiable by naming another namespace.
+- **Tenant isolation is a storage-layer property** (Rev 8, Rule 9). One shared store reached
+  through this surface isolates nothing between namespaces for by-ID ops, and a namespace-scoped
+  credential over a shared store is not a supported deployment shape. The supported multi-tenant
+  shape is one store per tenant, established by the embedder below this surface.
 - **Multi-record ops default to `WHERE namespace='local'`**; the only escape is an explicit
   `namespace=` parameter from the caller.
 
