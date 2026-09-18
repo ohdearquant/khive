@@ -9,6 +9,11 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use crate::ann;
 use crate::MemoryPack;
 
+use super::common::{
+    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    DEFAULT_SALIENCE_SEMANTIC,
+};
+
 // ── Params ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -17,6 +22,15 @@ pub(super) struct PruneParams {
     /// Soft-delete memories whose salience is strictly below this value.
     /// `None` means no salience filter.
     pub min_salience: Option<f64>,
+    /// Soft-delete memories whose decay-adjusted ("effective") salience is
+    /// strictly below this value. Effective salience is computed with the
+    /// same `DecayModel::apply` call and the same active recall config that
+    /// `memory.recall` scores with (see `handlers/common.rs::compute_score`),
+    /// over the note's stored `salience`/`decay_factor` and its current age.
+    /// `None` means no effective-salience filter. A row need only match this
+    /// OR `min_salience` OR the expiry filter below to be selected — this
+    /// handler already unions its criteria rather than intersecting them.
+    pub min_effective_salience: Option<f64>,
     /// Soft-delete memories whose `expires_at` is at or before this timestamp
     /// (Unix microseconds). When omitted, defaults to `now`.
     /// Pass `0` to skip the expiry filter entirely.
@@ -50,18 +64,24 @@ impl MemoryPack {
 
         let now_micros = chrono::Utc::now().timestamp_micros();
 
-        // Collect IDs to prune: memories matching either criterion.
+        // `min_effective_salience` scores every row with the same `DecayModel`
+        // and active recall config `memory.recall` serves with (#2937);
+        // resolve that config once, up front, instead of re-locking it per row.
+        let decay_cfg = p.min_effective_salience.map(|_| self.active_config());
+
+        // Collect IDs to prune: memories matching any of the configured criteria.
         // We query via SqlAccess to avoid a full note-store scan.
         let sql = self.runtime.sql();
         let mut reader = sql.reader().await?;
 
         // Build candidate query: kind='memory', not deleted, in namespace.
-        // We'll apply Python-side salience and expires_at filters below.
-        // For large datasets a dedicated SQL WHERE is better, but the note
-        // set is bounded by namespace and kind, so row-level filtering is safe.
+        // We'll apply Rust-side salience, effective-salience, and expires_at
+        // filters below. For large datasets a dedicated SQL WHERE is better,
+        // but the note set is bounded by namespace and kind, so row-level
+        // filtering is safe.
         let rows = reader
             .query_all(SqlStatement {
-                sql: "SELECT id, salience, expires_at \
+                sql: "SELECT id, salience, decay_factor, created_at, expires_at, properties \
                       FROM notes \
                       WHERE kind = 'memory' \
                         AND namespace = ? \
@@ -92,6 +112,63 @@ impl MemoryPack {
                     _ => 0.0, // treat missing salience as 0
                 };
                 if sal < min_sal {
+                    to_delete.push(id);
+                    continue;
+                }
+            }
+
+            // Check decay-adjusted ("effective") salience threshold: the same
+            // `DecayModel::apply` call `memory.recall` ranks with, over this
+            // note's own stored salience/decay_factor and its current age —
+            // so a memory decay has already pushed below relevance, but whose
+            // raw `salience` column was never touched, is selectable too.
+            if let (Some(min_eff), Some(cfg)) = (p.min_effective_salience, decay_cfg.as_ref()) {
+                let memory_type = match row.get("properties") {
+                    Some(SqlValue::Text(s)) => serde_json::from_str::<Value>(s).ok(),
+                    Some(SqlValue::Json(v)) => Some(v.clone()),
+                    _ => None,
+                }
+                .and_then(|v| {
+                    v.get("memory_type")
+                        .and_then(|mt| mt.as_str().map(str::to_owned))
+                })
+                .unwrap_or_else(|| "episodic".to_string());
+                let is_semantic = memory_type == "semantic";
+
+                let raw_salience = match row.get("salience") {
+                    Some(SqlValue::Float(f)) => Some(*f),
+                    Some(SqlValue::Integer(i)) => Some(*i as f64),
+                    _ => None,
+                };
+                let salience = raw_salience.unwrap_or(if is_semantic {
+                    DEFAULT_SALIENCE_SEMANTIC
+                } else {
+                    DEFAULT_SALIENCE_EPISODIC
+                });
+
+                let raw_decay_factor = match row.get("decay_factor") {
+                    Some(SqlValue::Float(f)) => Some(*f),
+                    Some(SqlValue::Integer(i)) => Some(*i as f64),
+                    _ => None,
+                };
+                let decay_factor = raw_decay_factor.unwrap_or(if is_semantic {
+                    DEFAULT_DECAY_SEMANTIC
+                } else {
+                    DEFAULT_DECAY_EPISODIC
+                });
+
+                let created_at = match row.get("created_at") {
+                    Some(SqlValue::Integer(i)) => *i,
+                    _ => now_micros, // no recorded age: treat as freshly written
+                };
+                let age_days = ((now_micros - created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
+                let effective_salience = cfg.decay_model.apply(
+                    salience,
+                    age_days,
+                    decay_factor,
+                    cfg.temporal_half_life_days,
+                );
+                if effective_salience < min_eff {
                     to_delete.push(id);
                     continue;
                 }
@@ -610,6 +687,291 @@ mod prune_index_cleanup_tests {
                 .expect("get_document")
                 .is_some(),
             "survivor note's FTS5 document must remain after prune"
+        );
+    }
+}
+
+// ── #2937: memory.prune must be able to select on the recall-scored
+// decay-adjusted ("effective") salience, not just the raw stored column ────
+
+#[cfg(test)]
+mod prune_effective_salience_tests {
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use serde_json::json;
+
+    use crate::test_support::HashVecProvider;
+
+    /// Backdate a note's `created_at` (Unix microseconds) directly — the same
+    /// raw-SQL idiom `handlers/recall.rs`'s decay/window tests use, since
+    /// there is no verb surface for writing a fabricated age.
+    async fn backdate(rt: &KhiveRuntime, id: uuid::Uuid, age_days: f64) {
+        let created_at =
+            chrono::Utc::now().timestamp_micros() - (age_days * 86_400.0 * 1_000_000.0) as i64;
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        let changed = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                params: vec![
+                    SqlValue::Integer(created_at),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: Some("test.prune_effective_salience.set_created_at".to_string()),
+            })
+            .await
+            .expect("set created_at");
+        assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+    }
+
+    /// `memory_type: "semantic"` writes to the token's own namespace
+    /// ("local"), matching `memory.prune`'s default namespace filter — the
+    /// same reason `prune_index_cleanup_tests` above picks it.
+    fn build_registry() -> (KhiveRuntime, VerbRegistry) {
+        const MODEL: &str = "prune-2937-effective-salience-model";
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: 16,
+        });
+        let ns = Namespace::parse("local").expect("local namespace");
+        rt.authorize(ns).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+        (rt, registry)
+    }
+
+    /// Discriminating fixture: raw salience 0.6 clears `min_salience: 0.3`
+    /// (the OLD predicate alone would never select it), but at 150 days old
+    /// with decay_factor 0.02, `DecayModel::Exponential` puts its effective
+    /// salience at 0.6 * exp(-0.02 * 150) ≈ 0.0299 — below
+    /// `min_effective_salience: 0.05`. The two predicates must disagree on
+    /// this one row, or the test proves nothing (#2937).
+    #[tokio::test]
+    async fn min_effective_salience_prunes_a_row_min_salience_alone_would_spare() {
+        let (rt, registry) = build_registry();
+
+        let remembered = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 discriminating fixture: stale but nominally salient",
+                    "salience": 0.6,
+                    "decay_factor": 0.02,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        let id: uuid::Uuid = remembered["id"]
+            .as_str()
+            .expect("id present")
+            .parse()
+            .expect("valid uuid");
+        backdate(&rt, id, 150.0).await;
+
+        // The raw-only predicate must NOT select it: 0.6 >= 0.3.
+        let raw_only = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_salience": 0.3, "dry_run": true }),
+            )
+            .await
+            .expect("memory.prune dry_run min_salience");
+        assert_eq!(
+            raw_only["would_prune"], 0,
+            "raw salience 0.6 must clear min_salience 0.3: {raw_only:?}"
+        );
+
+        // The effective-salience predicate MUST select it: ~0.0299 < 0.05.
+        let effective_only = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_effective_salience": 0.05, "dry_run": true }),
+            )
+            .await
+            .expect("memory.prune dry_run min_effective_salience");
+        assert_eq!(
+            effective_only["would_prune"], 1,
+            "decay-adjusted salience ~0.0299 must clear min_effective_salience 0.05: \
+             {effective_only:?}"
+        );
+
+        // And the real (non-dry-run) call actually prunes it.
+        let pruned = registry
+            .dispatch("memory.prune", json!({ "min_effective_salience": 0.05 }))
+            .await
+            .expect("memory.prune min_effective_salience");
+        assert_eq!(
+            pruned["pruned"], 1,
+            "must actually soft-delete the row: {pruned:?}"
+        );
+    }
+
+    /// Mirror control: a freshly written row with raw salience 0.1 — caught
+    /// by `min_salience: 0.3` (0.1 < 0.3), but at effectively zero age its
+    /// decayed salience is ~0.1 too, clearing `min_effective_salience: 0.05`
+    /// untouched (0.1 >= 0.05). The new predicate must not over-select where
+    /// the old one already would have pruned.
+    #[tokio::test]
+    async fn min_effective_salience_spares_a_fresh_row_min_salience_alone_would_prune() {
+        let (_rt, registry) = build_registry();
+
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 mirror fixture: low raw salience, freshly written",
+                    "salience": 0.1,
+                    "decay_factor": 0.02,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+
+        let raw_only = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_salience": 0.3, "dry_run": true }),
+            )
+            .await
+            .expect("memory.prune dry_run min_salience");
+        assert_eq!(
+            raw_only["would_prune"], 1,
+            "raw salience 0.1 must be caught by min_salience 0.3: {raw_only:?}"
+        );
+
+        let effective_only = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_effective_salience": 0.05, "dry_run": true }),
+            )
+            .await
+            .expect("memory.prune dry_run min_effective_salience");
+        assert_eq!(
+            effective_only["would_prune"], 0,
+            "near-zero age must keep decayed salience ~0.1, clearing \
+             min_effective_salience 0.05: {effective_only:?}"
+        );
+    }
+
+    /// A row neither predicate selects: raw salience 0.9, freshly written,
+    /// well clear of both `min_salience: 0.3` and `min_effective_salience: 0.05`.
+    #[tokio::test]
+    async fn neither_predicate_selects_a_healthy_row() {
+        let (_rt, registry) = build_registry();
+
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 healthy fixture: high salience, freshly written",
+                    "salience": 0.9,
+                    "decay_factor": 0.02,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+
+        let combined = registry
+            .dispatch(
+                "memory.prune",
+                json!({
+                    "min_salience": 0.3,
+                    "min_effective_salience": 0.05,
+                    "dry_run": true,
+                }),
+            )
+            .await
+            .expect("memory.prune dry_run combined");
+        assert_eq!(
+            combined["would_prune"], 0,
+            "raw 0.9 and effective ~0.9 must clear both thresholds: {combined:?}"
+        );
+    }
+
+    /// Existing behaviour with no new parameter: `min_salience` alone still
+    /// selects strictly on the raw stored column, unaffected by this change.
+    #[tokio::test]
+    async fn min_salience_alone_is_unchanged() {
+        let (_rt, registry) = build_registry();
+
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 regression fixture: low raw salience, no new param sent",
+                    "salience": 0.1,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 regression fixture: high raw salience, no new param sent",
+                    "salience": 0.9,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+
+        // No `min_effective_salience` key in the request at all.
+        let result = registry
+            .dispatch("memory.prune", json!({ "min_salience": 0.3 }))
+            .await
+            .expect("memory.prune");
+        assert_eq!(
+            result["pruned"], 1,
+            "only the low-salience row must be pruned, exactly as before #2937: {result:?}"
+        );
+    }
+
+    /// Separates "compares the raw column" from "the parameter does nothing".
+    ///
+    /// The discriminating fixture above reddens under BOTH of those mutations,
+    /// so on its own it cannot say which one broke. This row is the mirror: raw
+    /// salience 0.02 at an age of zero, so its effective salience is also about
+    /// 0.02. A raw-column comparison selects it (0.02 < 0.05) and an inert
+    /// parameter does not, which is exactly the asymmetry the other test lacks.
+    #[tokio::test]
+    async fn min_effective_salience_selects_a_fresh_row_whose_raw_value_is_already_low() {
+        let (_rt, registry) = build_registry();
+
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": "2937 asymmetry fixture: fresh and already low",
+                    "salience": 0.02,
+                    "decay_factor": 0.02,
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("memory.remember");
+
+        let effective_only = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_effective_salience": 0.05, "dry_run": true }),
+            )
+            .await
+            .expect("memory.prune dry_run min_effective_salience");
+        assert_eq!(
+            effective_only["would_prune"], 1,
+            "a fresh row at raw 0.02 is below 0.05 by either reading and must be \
+             selected; an inert parameter is what this arm exists to catch: \
+             {effective_only:?}"
         );
     }
 }
