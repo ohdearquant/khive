@@ -13,6 +13,7 @@ use uuid::Uuid;
 use khive_runtime::{KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::Note;
 
+use crate::handlers::parse_due;
 use crate::task_create::{link_depends_on_edges, prepare_task_create, TaskCreateInput};
 
 #[derive(Debug, Default)]
@@ -155,6 +156,90 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
     Ok(())
 }
 
+/// Resolve the zone a `due` arriving through the generic update path is anchored in.
+///
+/// Order: the zone named in this update, then the anchor the task already carries, then the
+/// configured display zone. A zone named by the caller must parse — that is their input and a
+/// silent fallback would store an anchor they did not ask for. A stored anchor that does not parse
+/// is a row written before this normalization existed, so it falls through to the configured zone
+/// rather than failing an update that is repairing it.
+fn resolve_due_zone(
+    runtime: &KhiveRuntime,
+    note: &Note,
+    properties: &serde_json::Map<String, Value>,
+) -> Result<chrono_tz::Tz, RuntimeError> {
+    // Select on the value, not on the key. Choosing the key first and calling `as_str` on the
+    // result treats a present-but-malformed zone as absent: `{due_timezone: 7, timezone:
+    // "Asia/Tokyo"}` would discard the spelling that parses and fall through to the stored or
+    // configured zone, storing an anchor nobody asked for. A zone the caller wrote is either used
+    // or refused.
+    for key in ["due_timezone", "timezone"] {
+        let Some(value) = properties.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let name = value.as_str().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "{key} must be an IANA zone name string (e.g. \"America/New_York\"); got {value}"
+            ))
+        })?;
+        return name.parse::<chrono_tz::Tz>().map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
+            ))
+        });
+    }
+    let stored = note
+        .properties
+        .as_ref()
+        .and_then(|value| value.get("due_timezone"))
+        .and_then(Value::as_str)
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok());
+    Ok(stored.unwrap_or_else(|| runtime.config().display_timezone))
+}
+
+/// Normalize a `due` written through the generic property path into the shape `gtd.assign`
+/// produces, and rewrite `due_timezone` beside it.
+///
+/// `due` has a validating writer (`gtd.assign`) and, before this, a silent one: `properties` is a
+/// free-form map, so a reschedule through the generic update stored whatever string arrived, next
+/// to whichever `due_timezone` the create had left. The row then claimed an anchor its value did
+/// not carry, and a normalized row and an un-normalized one were indistinguishable by shape,
+/// because the field beside the value still looked right. Both writers now run the same
+/// normalization, so there is one stored shape rather than two.
+fn normalize_due_update(
+    runtime: &KhiveRuntime,
+    note: &Note,
+    args: &mut Value,
+) -> Result<(), RuntimeError> {
+    let Some(properties) = args.get_mut("properties").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let Some(due) = properties.get("due") else {
+        return Ok(());
+    };
+    // An explicit null clears the deadline. The anchor is derived state, so it goes with it:
+    // leaving it standing is the stale-anchor case this function exists to end.
+    if due.is_null() {
+        properties.insert("due_timezone".into(), Value::Null);
+        return Ok(());
+    }
+    let due = due
+        .as_str()
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!("due must be an ISO-8601 string or null; got {due}"))
+        })?
+        .to_string();
+    let zone = resolve_due_zone(runtime, note, properties)?;
+    // `timezone` is the spelling `gtd.assign` takes, and a caller who learned it there will use it
+    // here. Accepting it and then storing it would leave a junk property that no reader consumes
+    // and that the create path never writes, so it is consumed rather than kept: the anchor lands
+    // in `due_timezone`, which is the stored name.
+    properties.remove("timezone");
+    properties.insert("due".into(), json!(parse_due(&due, zone)?));
+    properties.insert("due_timezone".into(), json!(zone.name()));
+    Ok(())
+}
+
 #[async_trait]
 impl KindHook for TaskHook {
     async fn prepare_create(
@@ -220,6 +305,7 @@ impl KindHook for TaskHook {
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
         synchronize_description(note, args)?;
+        normalize_due_update(runtime, note, args)?;
         let properties = args.get("properties").filter(|value| !value.is_null());
         crate::dependency::validate_property_update(runtime, token, note, properties).await
     }
@@ -239,6 +325,211 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    fn task_note_with(properties: Value) -> Note {
+        let mut task = Note::new("local", "task", "body");
+        task.name = Some("a task".to_string());
+        task.properties = Some(properties);
+        task
+    }
+
+    /// A reschedule through the generic property path lands in the same shape `gtd.assign`
+    /// writes, and keeps the anchor the task already had rather than the host's.
+    #[tokio::test]
+    async fn due_through_properties_is_anchored_in_the_tasks_existing_zone() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({
+            "due": "2026-10-01T00:00:00-04:00",
+            "due_timezone": "America/New_York",
+            "status": "inbox",
+        }));
+        let mut args = json!({"properties": {"due": "2026-12-25"}});
+
+        normalize_due_update(&runtime, &note, &mut args).expect("normalize");
+
+        assert_eq!(
+            args["properties"]["due"], "2026-12-25T00:00:00-05:00",
+            "a date-only due must be anchored to the earliest instant of that local date"
+        );
+        assert_eq!(
+            args["properties"]["due_timezone"], "America/New_York",
+            "the anchor must be rewritten beside the value, not left from the create"
+        );
+    }
+
+    /// The zone named in the update wins over the one the task carries. Only the `due` assertion
+    /// below discriminates: zone names parse case-sensitively, so a zone named in this spelling is
+    /// stored back as the same string the caller sent, and the anchor assertion would hold even if
+    /// nothing rewrote it. The rewrite itself is proved by the `timezone`-spelling test, where the
+    /// stored anchor is a value no caller supplied.
+    #[tokio::test]
+    async fn a_zone_named_in_the_update_wins_over_the_stored_anchor() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"due_timezone": "America/New_York"}));
+        let mut args = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": "Asia/Tokyo"}
+        });
+
+        normalize_due_update(&runtime, &note, &mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["due"], "2026-12-25T00:00:00+09:00");
+        assert_eq!(args["properties"]["due_timezone"], "Asia/Tokyo");
+    }
+
+    /// Both halves of the pair are refused when they cannot be parsed. Before this, each was
+    /// stored verbatim: `due` as "next tuesday-ish" and the zone as "Mars/Olympus".
+    #[tokio::test]
+    async fn an_unparseable_due_or_zone_is_refused() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"status": "inbox"}));
+
+        let mut bad_due = json!({"properties": {"due": "next tuesday-ish"}});
+        normalize_due_update(&runtime, &note, &mut bad_due)
+            .expect_err("an unparseable due must not be stored verbatim");
+
+        let mut bad_zone = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": "Mars/Olympus"}
+        });
+        let err = normalize_due_update(&runtime, &note, &mut bad_zone)
+            .expect_err("an unparseable zone must not be stored verbatim");
+        assert!(
+            format!("{err}").contains("IANA"),
+            "the refusal must name what a zone is; got: {err}"
+        );
+
+        let mut wrong_type = json!({"properties": {"due": 20261225}});
+        normalize_due_update(&runtime, &note, &mut wrong_type)
+            .expect_err("a non-string, non-null due must be refused");
+    }
+
+    /// Clearing the deadline clears its anchor, since the anchor is derived state. A surviving
+    /// `due_timezone` beside an absent `due` is the same stale-pair defect in its other direction.
+    #[tokio::test]
+    async fn clearing_due_clears_the_anchor_with_it() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({
+            "due": "2026-10-01T00:00:00-04:00",
+            "due_timezone": "America/New_York",
+        }));
+        let mut args = json!({"properties": {"due": null}});
+
+        normalize_due_update(&runtime, &note, &mut args).expect("normalize");
+
+        assert!(args["properties"]["due"].is_null());
+        assert!(
+            args["properties"]["due_timezone"].is_null(),
+            "the anchor must not outlive the value it anchors"
+        );
+    }
+
+    /// An update that does not mention `due` leaves the pair untouched, including on a task that
+    /// has none: the normalizer must not mint fields nobody asked for.
+    #[tokio::test]
+    async fn an_update_without_due_touches_neither_field() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"due": "2026-10-01T00:00:00-04:00"}));
+        let mut args = json!({"properties": {"priority": "p1"}});
+
+        normalize_due_update(&runtime, &note, &mut args).expect("normalize");
+
+        assert_eq!(args, json!({"properties": {"priority": "p1"}}));
+
+        let mut no_properties = json!({"content": "body only"});
+        normalize_due_update(&runtime, &note, &mut no_properties).expect("normalize");
+        assert_eq!(no_properties, json!({"content": "body only"}));
+    }
+
+    /// A row written before this normalization can carry an anchor that is not a zone. That is not
+    /// the caller's input, so the update repairs it instead of failing on it.
+    #[tokio::test]
+    async fn a_stored_anchor_that_is_not_a_zone_falls_back_instead_of_failing() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note =
+            task_note_with(json!({"due": "next tuesday-ish", "due_timezone": "Mars/Olympus"}));
+        let mut args = json!({"properties": {"due": "2026-12-25"}});
+
+        normalize_due_update(&runtime, &note, &mut args)
+            .expect("a bad stored anchor must not fail the repair");
+
+        let configured = runtime.config().display_timezone.name().to_string();
+        assert_eq!(args["properties"]["due_timezone"], configured);
+        assert_ne!(args["properties"]["due"], "2026-12-25");
+    }
+
+    /// The `timezone` spelling from `gtd.assign` is accepted here and consumed rather than stored,
+    /// since nothing reads it and the create path never writes it.
+    #[tokio::test]
+    async fn the_assign_spelling_of_the_zone_is_consumed_not_stored() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"due_timezone": "America/New_York"}));
+        let mut args = json!({
+            "properties": {"due": "2026-12-25", "timezone": "Asia/Tokyo"}
+        });
+
+        normalize_due_update(&runtime, &note, &mut args).expect("normalize");
+
+        assert_eq!(args["properties"]["due"], "2026-12-25T00:00:00+09:00");
+        assert_eq!(args["properties"]["due_timezone"], "Asia/Tokyo");
+        assert!(
+            args["properties"].get("timezone").is_none(),
+            "the assign spelling must not survive into the stored bag; got: {}",
+            args["properties"]
+        );
+    }
+
+    /// A zone the caller wrote is used or refused, never ignored. Selecting the key before
+    /// checking that its value is a string made a malformed `due_timezone` read as absent, which
+    /// discarded a `timezone` alias that did parse and stored an anchor nobody asked for.
+    #[tokio::test]
+    async fn a_malformed_zone_is_refused_rather_than_read_as_absent() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let note = task_note_with(json!({"due_timezone": "America/New_York"}));
+
+        let mut both = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": 7, "timezone": "Asia/Tokyo"}
+        });
+        let err = normalize_due_update(&runtime, &note, &mut both)
+            .expect_err("a non-string zone must be refused, not skipped for the next spelling");
+        assert!(
+            format!("{err}").contains("due_timezone"),
+            "the refusal must name the key the caller got wrong; got: {err}"
+        );
+        assert_eq!(
+            both["properties"]["due"], "2026-12-25",
+            "a refused update must leave the caller's arguments untouched"
+        );
+
+        // An explicit null is absence, not a malformed value: it falls through to the stored
+        // anchor the way an omitted key does.
+        let mut nulled = json!({
+            "properties": {"due": "2026-12-25", "due_timezone": null}
+        });
+        normalize_due_update(&runtime, &note, &mut nulled).expect("a null zone reads as absent");
+        assert_eq!(nulled["properties"]["due_timezone"], "America/New_York");
+    }
+
+    /// The wiring, not just the function: the hook the generic update path calls must run it.
+    #[tokio::test]
+    async fn the_update_hook_runs_the_normalization() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let note = task_note_with(json!({
+            "description": "body",
+            "status": "inbox",
+            "due_timezone": "America/New_York",
+        }));
+        let mut args = json!({"properties": {"due": "2026-12-25"}});
+
+        TaskHook
+            .prepare_note_update(&runtime, &token, &note, &mut args)
+            .await
+            .expect("hook");
+
+        assert_eq!(args["properties"]["due"], "2026-12-25T00:00:00-05:00");
+        assert_eq!(args["properties"]["due_timezone"], "America/New_York");
+    }
 
     #[tokio::test]
     async fn normalized_task_update_refuses_a_stale_note_snapshot() {
