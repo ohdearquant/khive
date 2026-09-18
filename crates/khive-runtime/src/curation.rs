@@ -363,6 +363,22 @@ pub struct MergeSummary {
     pub kept_id: Uuid,
     pub removed_id: Uuid,
     pub edges_rewired: usize,
+    /// Edges dropped because both rewired endpoints resolved to the
+    /// surviving record — the edge described a relationship *between* the
+    /// two merge operands (e.g. `supports`/`refutes`), and once merged that
+    /// relationship has no referent to point at, so it is deleted rather
+    /// than kept as a self-referencing row. Distinct from
+    /// `edges_contract_skipped` (an endpoint-contract rejection) and
+    /// `edge_conflict_preimages` (a natural-key collision with an unrelated
+    /// existing edge) — a self-loop has no such competitor.
+    #[serde(default)]
+    pub edges_self_loop_dropped: usize,
+    /// Full preimages for the edges counted in `edges_self_loop_dropped`, in
+    /// the same [`MergeEdgePreimage`] shape `edge_conflict_preimages` uses,
+    /// so a dropped relationship between the merge operands is recoverable
+    /// rather than silently destroyed by the row delete.
+    #[serde(default)]
+    pub self_loop_edge_preimages: Vec<MergeEdgePreimage>,
     /// Incident edges dropped instead of rewired because the rewired
     /// `(source, relation, target)` triple would violate the pack endpoint
     /// contract `link` enforces (khive#1216) — consistent with the existing
@@ -1479,6 +1495,8 @@ impl KhiveRuntime {
                 "policy": policy_str,
                 "content_strategy": format!("{:?}", content_strategy),
                 "edges_rewired": summary.edges_rewired,
+                "edges_self_loop_dropped": summary.edges_self_loop_dropped,
+                "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
                 "edges_contract_skipped": summary.edges_contract_skipped,
                 "edge_conflict_preimages": &summary.edge_conflict_preimages,
             });
@@ -2569,6 +2587,8 @@ impl KhiveRuntime {
                 "policy": policy_str,
                 "content_strategy": format!("{:?}", content_strategy),
                 "edges_rewired": summary.edges_rewired,
+                "edges_self_loop_dropped": summary.edges_self_loop_dropped,
+                "self_loop_edge_preimages": &summary.self_loop_edge_preimages,
                 "edges_contract_skipped": summary.edges_contract_skipped,
                 "edge_conflict_preimages": &summary.edge_conflict_preimages,
             });
@@ -3036,6 +3056,8 @@ fn merge_entity_sql(
     let mut rewired_edge_ids = HashSet::new();
     let mut edges_contract_skipped = 0usize;
     let mut edge_conflict_preimages = Vec::new();
+    let mut edges_self_loop_dropped = 0usize;
+    let mut self_loop_edge_preimages = Vec::new();
     let mut conflict_deleted_edge_ids = HashSet::new();
     for edge in all_edges {
         if conflict_deleted_edge_ids.contains(&edge.id) {
@@ -3060,6 +3082,11 @@ fn merge_entity_sql(
         };
 
         if new_src == new_tgt {
+            // Capture the preimage unconditionally (dry_run and real runs
+            // must report the identical count and rows — khive#2934) before
+            // the write gate below decides whether the DELETE itself runs.
+            self_loop_edge_preimages.push(edge_row_preimage(&edge)?);
+            edges_self_loop_dropped += 1;
             if !dry_run {
                 conn.execute(
                     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
@@ -3353,6 +3380,8 @@ fn merge_entity_sql(
             kept_id: into_id,
             removed_id: from_id,
             edges_rewired,
+            edges_self_loop_dropped,
+            self_loop_edge_preimages,
             edges_contract_skipped,
             edge_conflict_preimages,
             properties_merged,
@@ -3697,6 +3726,8 @@ fn merge_note_sql(
     let mut rewired_edge_ids = HashSet::new();
     let mut edges_contract_skipped = 0usize;
     let mut edge_conflict_preimages = Vec::new();
+    let mut edges_self_loop_dropped = 0usize;
+    let mut self_loop_edge_preimages = Vec::new();
     let mut conflict_deleted_edge_ids = HashSet::new();
     {
         for edge in all_edges {
@@ -3720,6 +3751,12 @@ fn merge_note_sql(
                 None => (raw_src, raw_tgt),
             };
             if new_src == new_tgt {
+                // Capture the preimage unconditionally (dry_run and real runs
+                // must report the identical count and rows — khive#2934)
+                // before the write gate below decides whether the DELETE
+                // itself runs.
+                self_loop_edge_preimages.push(edge_row_preimage(&edge)?);
+                edges_self_loop_dropped += 1;
                 if !dry_run {
                     conn.execute(
                         "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
@@ -3989,6 +4026,8 @@ fn merge_note_sql(
             kept_id: into_id,
             removed_id: from_id,
             edges_rewired,
+            edges_self_loop_dropped,
+            self_loop_edge_preimages,
             edges_contract_skipped,
             edge_conflict_preimages,
             properties_merged,
@@ -7683,7 +7722,15 @@ mod tests {
             .unwrap();
 
         // A `extends` B — merging B into A would produce A `extends` A → drop it.
-        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+        let edge = rt
+            .link(
+                &tok,
+                a.id,
+                b.id,
+                EdgeRelation::Extends,
+                0.6,
+                Some(serde_json::json!({"basis": "shared lineage"})),
+            )
             .await
             .unwrap();
 
@@ -7705,11 +7752,193 @@ mod tests {
             "self-loop should be dropped, not rewired"
         );
 
+        // The dropped self-loop must be counted and its full preimage
+        // captured (khive#2934) — before this fix the edge vanished with
+        // neither the counter nor a recoverable row.
+        assert_eq!(summary.edges_self_loop_dropped, 1);
+        let [preimage] = summary.self_loop_edge_preimages.as_slice() else {
+            panic!(
+                "expected exactly one self-loop preimage, got {:?}",
+                summary.self_loop_edge_preimages
+            );
+        };
+        assert_eq!(preimage.id, Uuid::from(edge.id));
+        assert_eq!(preimage.source_id, a.id);
+        assert_eq!(preimage.target_id, b.id);
+        assert_eq!(preimage.relation, "extends");
+        assert_eq!(preimage.weight, 0.6);
+        assert_eq!(
+            preimage.metadata,
+            Some(serde_json::json!({"basis": "shared lineage"}))
+        );
+
         let a_out = rt
             .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert!(a_out.is_empty(), "no self-loop should remain");
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(
+            events.items[0].payload["edges_self_loop_dropped"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            events.items[0].payload["self_loop_edge_preimages"],
+            serde_json::to_value(&summary.self_loop_edge_preimages).unwrap()
+        );
+    }
+
+    // A dry run must predict the exact self-loop-drop count and preimage a
+    // committed merge produces — before khive#2934 the `continue` in the
+    // self-loop branch ran before both the write gate and any counter, so a
+    // dry run and a real run were indistinguishable for this case.
+    #[tokio::test]
+    async fn merge_entity_self_loop_dry_run_matches_real_run() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(
+                &tok,
+                into.id,
+                from.id,
+                EdgeRelation::Extends,
+                0.5,
+                Some(serde_json::json!({"basis": "dry-run parity"})),
+            )
+            .await
+            .unwrap();
+
+        let dry_summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_some(),
+            "dry run must not delete the self-loop edge"
+        );
+
+        let real_summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dry_summary.edges_self_loop_dropped, 1);
+        let [dry_preimage] = dry_summary.self_loop_edge_preimages.as_slice() else {
+            panic!(
+                "expected exactly one predicted self-loop preimage, got {:?}",
+                dry_summary.self_loop_edge_preimages
+            );
+        };
+        assert_eq!(dry_preimage.id, Uuid::from(edge.id));
+        assert_eq!(dry_preimage.source_id, into.id);
+        assert_eq!(dry_preimage.target_id, from.id);
+        assert_eq!(dry_preimage.relation, "extends");
+        assert_eq!(dry_preimage.weight, 0.5);
+        assert_eq!(
+            dry_summary.edges_self_loop_dropped, real_summary.edges_self_loop_dropped,
+            "a dry run must predict the same self-loop-drop count the committed merge produces"
+        );
+        assert_eq!(
+            dry_summary.self_loop_edge_preimages, real_summary.self_loop_edge_preimages,
+            "a dry run must predict the exact preimage the committed merge produces"
+        );
+
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_none(),
+            "the committed merge must actually delete the self-loop edge"
+        );
+    }
+
+    // Control: no edge exists directly between the merge operands, only one
+    // that survives the rewire — the self-loop counter must stay at zero
+    // rather than firing on every rewired edge.
+    #[tokio::test]
+    async fn merge_entity_no_self_loop_between_operands_reports_zero() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let other = rt
+            .create_entity(&tok, "concept", None, "Other", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(&tok, from.id, other.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.edges_rewired, 1,
+            "the non-self-loop edge must still rewire"
+        );
+        assert_eq!(
+            summary.edges_self_loop_dropped, 0,
+            "no self-loop exists between the merge operands"
+        );
+        assert!(summary.self_loop_edge_preimages.is_empty());
     }
 
     // ---- content_strategy for entity merge ----
@@ -9687,6 +9916,236 @@ mod tests {
                 "rewired {rel:?} edge {src}→{tgt} must survive the merge; got {edges:?}"
             );
         }
+    }
+
+    // The note-merge mirror of `merge_entity_drops_self_loops`. `into`
+    // refutes `from` directly — merging `from` into `into` collapses this
+    // into an into-refutes-into self-loop, which must be dropped and its
+    // preimage captured and audited (khive#2934); before this fix a
+    // refutation between the two merge operands vanished with no counter,
+    // no preimage, and no audit trail.
+    #[tokio::test]
+    async fn merge_note_drops_self_loop_edge_records_preimage() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let edge = rt
+            .link(
+                &tok,
+                into.id,
+                from.id,
+                EdgeRelation::Refutes,
+                0.85,
+                Some(serde_json::json!({"basis": "direct contradiction"})),
+            )
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.edges_self_loop_dropped, 1,
+            "the into-refutes-from edge becomes a self-loop and must be counted"
+        );
+        let [preimage] = summary.self_loop_edge_preimages.as_slice() else {
+            panic!(
+                "expected exactly one self-loop preimage, got {:?}",
+                summary.self_loop_edge_preimages
+            );
+        };
+        assert_eq!(preimage.id, Uuid::from(edge.id));
+        assert_eq!(preimage.source_id, into.id);
+        assert_eq!(preimage.target_id, from.id);
+        assert_eq!(preimage.relation, "refutes");
+        assert_eq!(preimage.weight, 0.85);
+        assert_eq!(
+            preimage.metadata,
+            Some(serde_json::json!({"basis": "direct contradiction"}))
+        );
+
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_none(),
+            "the self-loop edge must actually be removed"
+        );
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(
+            events.items[0].payload["edges_self_loop_dropped"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            events.items[0].payload["self_loop_edge_preimages"],
+            serde_json::to_value(&summary.self_loop_edge_preimages).unwrap()
+        );
+    }
+
+    // Note-path counterpart of `merge_entity_self_loop_dry_run_matches_real_run`.
+    #[tokio::test]
+    async fn merge_note_self_loop_dry_run_matches_real_run() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(
+                &tok,
+                from.id,
+                into.id,
+                EdgeRelation::Supports,
+                0.5,
+                Some(serde_json::json!({"basis": "dry-run parity"})),
+            )
+            .await
+            .unwrap();
+
+        let dry_summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_some(),
+            "dry run must not delete the self-loop edge"
+        );
+
+        let real_summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dry_summary.edges_self_loop_dropped, 1);
+        let [dry_preimage] = dry_summary.self_loop_edge_preimages.as_slice() else {
+            panic!(
+                "expected exactly one predicted self-loop preimage, got {:?}",
+                dry_summary.self_loop_edge_preimages
+            );
+        };
+        assert_eq!(dry_preimage.id, Uuid::from(edge.id));
+        assert_eq!(dry_preimage.source_id, from.id);
+        assert_eq!(dry_preimage.target_id, into.id);
+        assert_eq!(dry_preimage.relation, "supports");
+        assert_eq!(dry_preimage.weight, 0.5);
+        assert_eq!(
+            dry_summary.edges_self_loop_dropped, real_summary.edges_self_loop_dropped,
+            "a dry run must predict the same self-loop-drop count the committed merge produces"
+        );
+        assert_eq!(
+            dry_summary.self_loop_edge_preimages, real_summary.self_loop_edge_preimages,
+            "a dry run must predict the exact preimage the committed merge produces"
+        );
+
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge.id.into())
+                .await
+                .unwrap()
+                .is_none(),
+            "the committed merge must actually delete the self-loop edge"
+        );
+    }
+
+    // Control: no edge exists directly between the merge operands, only one
+    // that survives the rewire — the self-loop counter must stay at zero.
+    #[tokio::test]
+    async fn merge_note_no_self_loop_between_operands_reports_zero() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let other = rt
+            .create_note(&tok, "observation", None, "Other", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(&tok, from.id, other.id, EdgeRelation::Supersedes, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.edges_rewired, 1,
+            "the non-self-loop edge must still rewire"
+        );
+        assert_eq!(
+            summary.edges_self_loop_dropped, 0,
+            "no self-loop exists between the merge operands"
+        );
+        assert!(summary.self_loop_edge_preimages.is_empty());
     }
 
     // Annotates targets may be edges or events — substrates
