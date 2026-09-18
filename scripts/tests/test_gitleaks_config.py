@@ -182,6 +182,21 @@ class GitleaksConfigTests(unittest.TestCase):
         self.write_values(GATE_PATH, GATE_VALUES)
         self.assertEqual(self.scan(expected_exit=0), [])
 
+    def baseline_findings(self):
+        """What the scanner reports with no exemption, for the fixture already written.
+
+        Read rather than assumed: which of these synthetic values the default rules
+        flag differs between scanner versions, so an arm that hard-codes a count is
+        asserting the scanner's breadth instead of the exemption's reach. Every
+        comparison below is against this same-run baseline.
+        """
+        keep = self.config.read_text()
+        self.config.write_text("[extend]\nuseDefault = true\n")
+        try:
+            return self.scan(expected_exit=1)
+        finally:
+            self.config.write_text(keep)
+
     def test_gate_constants_are_not_exempt_at_other_paths(self):
         paths = (
             "crates/khive-runtime/src/other.rs",
@@ -191,9 +206,18 @@ class GitleaksConfigTests(unittest.TestCase):
         for path in paths:
             self.write_values(path, GATE_VALUES)
         self.write_values(GATE_PATH, GATE_VALUES)  # the exempt site coexists
+        baseline = self.baseline_findings()
+        self.assertEqual(
+            {row["File"] for row in baseline}, set(paths) | {GATE_PATH},
+            "control: without the exemption every path must report, or this arm proves nothing",
+        )
         findings = self.scan(expected_exit=1)
         self.assertEqual({row["File"] for row in findings}, set(paths))
-        self.assertEqual(len(findings), len(GATE_VALUES) * len(paths))
+        self.assertEqual(
+            {row["Fingerprint"] for row in findings},
+            {row["Fingerprint"] for row in baseline if row["File"] != GATE_PATH},
+            "the exemption must remove the exempt path's findings and nothing else",
+        )
 
     def test_neighbouring_values_at_the_gate_path_are_not_exempt(self):
         # Superstrings and a sibling fixture shape: the exemption is two constants,
@@ -204,9 +228,15 @@ class GitleaksConfigTests(unittest.TestCase):
             "".join(reversed(GATE_VALUES[0])),
         )
         self.write_values(GATE_PATH, neighbours)
+        baseline = self.baseline_findings()
+        self.assertTrue(baseline, "control: the neighbours must be reportable to begin with")
         findings = self.scan(expected_exit=1)
-        self.assertEqual({row["StartLine"] for row in findings}, {1, 2, 3})
         self.assertEqual({row["File"] for row in findings}, {GATE_PATH})
+        self.assertEqual(
+            {row["Fingerprint"] for row in findings},
+            {row["Fingerprint"] for row in baseline},
+            "a value that merely resembles an exempt constant must still be reported",
+        )
 
     def test_gate_exemption_survives_line_moves_and_new_commits(self):
         # The defect this exemption replaces: a fingerprint pins commit and line,
