@@ -2644,6 +2644,31 @@ async fn search_kind_memory_routes_to_note_substrate_via_registry() {
     }
 }
 
+/// Issue #2684. Generic `create` refuses `kind=memory` so the row cannot be stored without the
+/// fields `memory.remember` derives — but that refusal names a verb, and a refusal naming a verb
+/// the caller cannot dispatch is a dead end. So it is gated on `memory.remember` being registered,
+/// and this pack registers the kind with no handlers at all. The refusing half of the pair lives in
+/// `khive-pack-memory`, where the real pack is loaded.
+#[tokio::test]
+async fn generic_create_accepts_the_memory_kind_when_its_writer_is_not_registered() {
+    let fixture = pack_with_memory();
+    assert!(
+        !fixture.registry.has_verb("memory.remember"),
+        "this arm is only meaningful while the fixture pack registers no writer for the kind"
+    );
+
+    fixture
+        .dispatch(
+            "create",
+            json!({
+                "kind": "memory",
+                "content": "a memory kind registered by a pack that supplies no writer"
+            }),
+        )
+        .await
+        .expect("create must not refuse a kind whose named alternative is unreachable");
+}
+
 #[tokio::test]
 async fn search_kind_entity_still_works_alongside_memory_pack() {
     // Regression guard: loading FakeMemoryPack must not break entity search.

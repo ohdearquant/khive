@@ -5549,33 +5549,45 @@ async fn memory_update_naming_the_same_type_changes_nothing() {
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn memory_update_naming_the_same_type_invents_nothing_for_unset_fields() {
-    // A memory note written through the generic create path carries no salience and no decay: the
-    // pack's own writer is what fills those in. Naming the type it already has must not quietly
-    // populate them, because an unset field and a field holding the default are different states
-    // and only the caller can decide which one this row is in.
+    // A memory row can carry no salience and no decay: the pack's own writer is what fills those
+    // in. Naming the type it already has must not quietly populate them, because an unset field and
+    // a field holding the default are different states and only the caller can decide which one
+    // this row is in.
+    //
+    // The fixture is written at the store layer rather than through `create`, and that is the point
+    // of it: since #2684 no verb produces this shape, so the rows that have it are the ones already
+    // in a database, written before the generic path was closed. This arm exists for exactly those
+    // rows, and building it through a verb would mean it no longer represents any of them.
     let rt = make_runtime();
-    let registry = make_registry(rt);
-    let created = registry
-        .dispatch(
-            "create",
-            json!({
-                "kind": "memory",
-                "content": "a memory note written through the generic create path",
-                "properties": {"memory_type": "episodic"},
-            }),
+    let registry = make_registry(rt.clone());
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let created = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "a memory row stored without the fields the pack's writer derives",
+            None,
+            Some(json!({"memory_type": "episodic"})),
+            Vec::new(),
         )
         .await
-        .expect("creating a memory note through the generic path must succeed");
+        .expect("writing a memory row at the store layer must succeed");
     assert!(
-        created["salience"].is_null(),
-        "precondition: the generic create path leaves salience unset, got {}",
-        created["salience"]
+        created.salience.is_none(),
+        "precondition: this row holds no salience, got {:?}",
+        created.salience
+    );
+    assert!(
+        created.decay_factor.is_none(),
+        "precondition: this row holds no decay factor, got {:?}",
+        created.decay_factor
     );
 
     let updated = registry
         .dispatch(
             "update",
-            json!({"id": created["id"], "properties": {"memory_type": "episodic"}}),
+            json!({"id": created.id.to_string(), "properties": {"memory_type": "episodic"}}),
         )
         .await
         .expect("naming the type it already has must be accepted");
@@ -5610,4 +5622,75 @@ async fn memory_update_not_naming_the_type_leaves_the_derived_pair_alone() {
     assert_eq!(updated["salience"], 0.3);
     assert_eq!(updated["decay_factor"], 0.02);
     assert_eq!(updated["properties"]["memory_type"], "episodic");
+}
+
+/// Issue #2684. `create(kind="note", note_kind="memory", …)` used to store a row with
+/// `salience`, `decay_factor` and `properties.memory_type` all unset, while `memory.recall`
+/// rendered that same row as episodic at the default salience: one record reading one way from
+/// storage and another through the verb that exists to read it. Generic create now refuses the
+/// kind and names the writer that owns it, which is the shape `scheduled_event`, `edge` and
+/// `proposal` already have in the same match.
+#[tokio::test]
+async fn generic_create_refuses_the_memory_kind_and_names_its_writer() {
+    let registry = make_registry(make_runtime());
+
+    // Control, in the same request shape and the same pass: an ordinary note kind still creates,
+    // so the refusal below is about the kind and not about how the request was written.
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "an ordinary note created through the generic verb"
+            }),
+        )
+        .await
+        .expect("the same request shape must still create an ordinary note");
+
+    let refusal = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "memory",
+                "content": "a memory written through the generic create verb"
+            }),
+        )
+        .await
+        .expect_err("kind=memory must be refused by generic create");
+    let message = refusal.to_string();
+    assert!(
+        message.contains("memory.remember"),
+        "a refusal has to name the verb that does the job: {message}"
+    );
+
+    // The kind is not disabled, only its entry point. The writer still creates, and the row it
+    // writes carries the three fields whose absence was the defect.
+    let created = registry
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "a memory written through the verb that owns the kind" }),
+        )
+        .await
+        .expect("memory.remember must still create a memory");
+    let id = created["id"].as_str().expect("remember returns an id");
+
+    let read_back = registry
+        .dispatch("get", json!({ "id": id }))
+        .await
+        .expect("the created memory must be readable");
+    let record = read_back.get("record").unwrap_or(&read_back);
+    assert!(
+        record["salience"].is_number(),
+        "salience must be set at write time, not derived at read time: {record}"
+    );
+    assert!(
+        record["decay_factor"].is_number(),
+        "decay_factor must be set at write time: {record}"
+    );
+    assert_eq!(
+        record["properties"]["memory_type"], "episodic",
+        "the stored row must name its own memory_type: {record}"
+    );
 }

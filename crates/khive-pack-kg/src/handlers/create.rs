@@ -329,6 +329,24 @@ impl KgPack {
                             .into(),
                     ));
                 }
+                // Gated on the verb being reachable, not on the kind name alone. The divergence
+                // this refuses only exists where `memory.remember` and `memory.recall` are the
+                // ones writing and reading the row; a pack that registers a `memory` note kind
+                // without those verbs has no second reader to disagree with storage, and would
+                // be handed a refusal naming a verb it cannot dispatch. Falsifier: if a pack
+                // ever supplies the read-side defaults without registering `memory.remember`,
+                // this predicate is the wrong one and should key on the reader instead.
+                if canonical == "memory" && registry.has_verb("memory.remember") {
+                    return Err(RuntimeError::InvalidInput(
+                        "kind=memory is not creatable via `create` — `memory.remember` derives \
+                         `memory_type`, `salience` and `decay_factor` together and `create` has \
+                         no `decay_factor` parameter, so a row created here is stored without the \
+                         fields `memory.recall` supplies at read time, and the same record reads \
+                         differently depending on which path reads it; use `memory.remember` \
+                         instead"
+                            .into(),
+                    ));
+                }
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }
