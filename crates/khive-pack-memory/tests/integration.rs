@@ -5370,3 +5370,244 @@ async fn recall_include_source_id_reads_the_annotates_edge() {
         "unsourced memory carries null, not absence"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The generic property-update path for `memory` notes.
+//
+// `memory.remember` validates `memory_type` against a closed set and derives
+// `salience` and `decay_factor` from it. These pin the second writer to the
+// same predicate, and pin the derived pair to the label it was derived from.
+// ---------------------------------------------------------------------------
+
+/// Write one memory through the validating writer and return its stored row.
+async fn remembered(registry: &VerbRegistry, extra: Value) -> Value {
+    let mut args = json!({
+        "content": "a memory written by the validating writer, for an update test",
+        "memory_type": "episodic",
+    });
+    if let (Some(root), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            root.insert(key.clone(), value.clone());
+        }
+    }
+    registry
+        .dispatch("memory.remember", args)
+        .await
+        .expect("memory.remember with a valid memory_type must succeed")
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_rejects_a_memory_type_outside_the_closed_set() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({})).await;
+
+    let err = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": "NOT-A-TYPE"}}),
+        )
+        .await
+        .expect_err("the generic update path must refuse a memory_type outside the closed set");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("episodic | semantic"),
+        "the error must name the valid types, got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_refuses_to_clear_memory_type() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({})).await;
+
+    let err = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": null}}),
+        )
+        .await
+        .expect_err("clearing memory_type would leave two derived numbers describing nothing");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be cleared"),
+        "the error must say the field cannot be cleared, got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_moves_the_derived_pair_when_the_type_changes() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({})).await;
+    assert_eq!(
+        created["salience"], 0.3,
+        "episodic starts at the episodic default"
+    );
+    assert_eq!(created["decay_factor"], 0.02);
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": "semantic"}}),
+        )
+        .await
+        .expect("promoting a memory to semantic must be accepted");
+
+    assert_eq!(
+        updated["properties"]["memory_type"], "semantic",
+        "the label must move"
+    );
+    assert_eq!(
+        updated["salience"], 0.5,
+        "and the ranking weight derived from it must move with it"
+    );
+    assert_eq!(
+        updated["decay_factor"], 0.005,
+        "and so must the ageing rate"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_keeps_a_salience_the_caller_chose() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    // 0.9 is not either type's default, so it can only have been chosen deliberately.
+    let created = remembered(&registry, json!({"salience": 0.9})).await;
+    assert_eq!(created["salience"], 0.9);
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": "semantic"}}),
+        )
+        .await
+        .expect("a type change on a hand-weighted memory must still be accepted");
+
+    assert_eq!(
+        updated["salience"], 0.9,
+        "a deliberate weight survives a type change; only a derived one is replaced"
+    );
+    assert_eq!(
+        updated["decay_factor"], 0.005,
+        "the ageing rate was still derived, so it moves"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_keeps_a_salience_named_in_the_same_patch() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({})).await;
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({
+                "id": created["id"],
+                "salience": 0.42,
+                "properties": {"memory_type": "semantic"},
+            }),
+        )
+        .await
+        .expect("naming salience beside the type change must be accepted");
+
+    assert_eq!(
+        updated["salience"], 0.42,
+        "what the caller states in this patch wins over what is derived for them"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_naming_the_same_type_changes_nothing() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({"salience": 0.9})).await;
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": "episodic"}}),
+        )
+        .await
+        .expect("naming the type a memory already has must be accepted");
+
+    assert_eq!(
+        updated["salience"], 0.9,
+        "nothing changed, so nothing is re-derived"
+    );
+    assert_eq!(updated["decay_factor"], 0.02);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_naming_the_same_type_invents_nothing_for_unset_fields() {
+    // A memory note written through the generic create path carries no salience and no decay: the
+    // pack's own writer is what fills those in. Naming the type it already has must not quietly
+    // populate them, because an unset field and a field holding the default are different states
+    // and only the caller can decide which one this row is in.
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "memory",
+                "content": "a memory note written through the generic create path",
+                "properties": {"memory_type": "episodic"},
+            }),
+        )
+        .await
+        .expect("creating a memory note through the generic path must succeed");
+    assert!(
+        created["salience"].is_null(),
+        "precondition: the generic create path leaves salience unset, got {}",
+        created["salience"]
+    );
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"memory_type": "episodic"}}),
+        )
+        .await
+        .expect("naming the type it already has must be accepted");
+
+    assert!(
+        updated["salience"].is_null(),
+        "nothing changed, so nothing is derived into a field the caller never set, got {}",
+        updated["salience"]
+    );
+    assert!(
+        updated["decay_factor"].is_null(),
+        "and the same for the ageing rate, got {}",
+        updated["decay_factor"]
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn memory_update_not_naming_the_type_leaves_the_derived_pair_alone() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let created = remembered(&registry, json!({})).await;
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({"id": created["id"], "properties": {"source": "an unrelated property"}}),
+        )
+        .await
+        .expect("an update naming no memory_type must be accepted");
+
+    assert_eq!(updated["salience"], 0.3);
+    assert_eq!(updated["decay_factor"], 0.02);
+    assert_eq!(updated["properties"]["memory_type"], "episodic");
+}
