@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use khive_runtime::{
     runtime_error_value, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError,
     StreamAppendDisposition, StreamAppendFailure, TelemetryCarrier, TelemetryFailurePosture,
-    TelemetryPolicy,
+    TelemetryPolicy, VerbRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -124,6 +124,7 @@ pub(crate) async fn emit(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
+    registry: &VerbRegistry,
 ) -> Result<Value, RuntimeError> {
     if params.get("payload").is_none() {
         return Err(invalid("missing field `payload`"));
@@ -174,6 +175,7 @@ pub(crate) async fn emit(
             None,
             Some(false),
             None,
+            registry,
         )
         .await;
     let mut result = append_response(&config.stream, policy, appended)?;

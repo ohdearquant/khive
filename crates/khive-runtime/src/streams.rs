@@ -332,7 +332,25 @@ struct StreamCreateFields {
     properties: Option<Value>,
     tags: Option<Vec<String>>,
     salience: Option<f64>,
+    decay_factor: Option<f64>,
     embed: Option<bool>,
+}
+
+fn normalize_stream_create_fields(fields: &mut StreamCreateFields) -> RuntimeResult<()> {
+    if let Some(tags) = fields.tags.take().filter(|tags| !tags.is_empty()) {
+        let mut properties = match fields.properties.take() {
+            None => serde_json::Map::new(),
+            Some(Value::Object(properties)) => properties,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "note tags require object properties".into(),
+                ))
+            }
+        };
+        properties.insert("tags".into(), json!(tags));
+        fields.properties = Some(Value::Object(properties));
+    }
+    Ok(())
 }
 
 struct PreparedStreamCreate {
@@ -741,8 +759,9 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         specs: &[&StreamAppendSpec],
+        registry: &VerbRegistry,
     ) -> RuntimeResult<Vec<PreparedAppend>> {
-        let mut contents = Vec::with_capacity(specs.len());
+        let mut fields = Vec::with_capacity(specs.len());
         for spec in specs {
             spec.validate_embedding(None)?;
             validate_stream(&spec.stream)?;
@@ -752,24 +771,59 @@ impl KhiveRuntime {
                     self.validate_note_kind(&fence.kind)?;
                 }
             }
-            contents.push(
-                serde_json::to_string(&spec.record)
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-            );
+            let content = serde_json::to_string(&spec.record)
+                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+            let hook = registry.find_kind_hook(&spec.note_kind);
+            // A hooked kind may use its ordinary create fields from an object record (for
+            // example, `task` reads `title`), while an unhooked kind keeps the append record as
+            // opaque JSON content exactly as before.
+            let mut args = if hook.is_some() {
+                match &spec.record {
+                    Value::Object(record) => Value::Object(record.clone()),
+                    _ => json!({}),
+                }
+            } else {
+                json!({})
+            };
+            args["kind"] = json!("note");
+            args["note_kind"] = json!(&spec.note_kind);
+            args["content"] = json!(content);
+            args["namespace"] = json!(token.namespace().as_str());
+            if let Some(tags) = &spec.tags {
+                args["tags"] = json!(tags);
+            }
+            if let Some(embed) = spec.embed {
+                args["embed"] = json!(embed);
+            }
+            if let Some(hook) = hook {
+                hook.prepare_create(self, &mut args).await?;
+            }
+            let mut note_fields: StreamCreateFields =
+                serde_json::from_value(args).map_err(|error| {
+                    RuntimeError::InvalidInput(format!("stream append fields: {error}"))
+                })?;
+            normalize_stream_create_fields(&mut note_fields)?;
+            fields.push(note_fields);
         }
         let atomic_specs = specs
             .iter()
-            .zip(&contents)
-            .map(|(spec, content)| AtomicNoteRequest {
+            .zip(&fields)
+            .map(|(spec, fields)| AtomicNoteRequest {
                 spec: AtomicNoteSpec {
                     token,
                     id: None,
                     kind: &spec.note_kind,
-                    name: None,
-                    content,
-                    properties: spec.tags.clone().map(|tags| json!({"tags": tags})),
+                    name: fields.name.as_deref(),
+                    content: &fields.content,
+                    properties: fields.properties.clone(),
                 },
-                options: spec.note_options(),
+                options: AtomicNoteOptions {
+                    salience: fields.salience,
+                    decay_factor: fields.decay_factor,
+                    embed: Some(fields.embed.or(spec.embed).unwrap_or(false)),
+                    embedding_model: spec.embedding_model.as_deref(),
+                    ..Default::default()
+                },
             })
             .collect();
         let prepared = prepare_atomic_note_requests(self, atomic_specs).await?;
@@ -922,6 +976,7 @@ impl KhiveRuntime {
         fence: Option<NoteFences>,
         embed: Option<bool>,
         embedding_model: Option<String>,
+        registry: &VerbRegistry,
     ) -> RuntimeResult<Value> {
         self.stream_append_with_outcome(
             token,
@@ -933,6 +988,7 @@ impl KhiveRuntime {
             fence,
             embed,
             embedding_model,
+            registry,
         )
         .await
         .map_err(StreamAppendFailure::into_source)
@@ -953,6 +1009,7 @@ impl KhiveRuntime {
         fence: Option<NoteFences>,
         embed: Option<bool>,
         embedding_model: Option<String>,
+        registry: &VerbRegistry,
     ) -> Result<Value, StreamAppendFailure> {
         let spec = StreamAppendSpec {
             stream: stream.to_string(),
@@ -965,7 +1022,7 @@ impl KhiveRuntime {
             embedding_model,
         };
         let prepared = self
-            .prepare_stream_appends(token, &[&spec])
+            .prepare_stream_appends(token, &[&spec], registry)
             .await
             .map_err(StreamAppendFailure::not_committed)?;
         let access = self.sql();
@@ -1127,19 +1184,7 @@ impl KhiveRuntime {
         }
         let mut fields: StreamCreateFields = serde_json::from_value(args.clone())
             .map_err(|error| RuntimeError::InvalidInput(format!("stream write fields: {error}")))?;
-        if let Some(tags) = fields.tags.take().filter(|tags| !tags.is_empty()) {
-            let mut properties = match fields.properties.take() {
-                None => serde_json::Map::new(),
-                Some(Value::Object(properties)) => properties,
-                Some(_) => {
-                    return Err(RuntimeError::InvalidInput(
-                        "note tags require object properties".into(),
-                    ))
-                }
-            };
-            properties.insert("tags".into(), json!(tags));
-            fields.properties = Some(Value::Object(properties));
-        }
+        normalize_stream_create_fields(&mut fields)?;
         let mut candidate = Note::new(token.namespace().as_str(), &spec.kind, &fields.content);
         candidate.name = fields.name.clone();
         candidate.properties = fields.properties.clone();
@@ -1216,6 +1261,7 @@ impl KhiveRuntime {
                     },
                     options: AtomicNoteOptions {
                         salience: create.fields.salience,
+                        decay_factor: create.fields.decay_factor,
                         key: Some(&create.key),
                         embed: Some(create.fields.embed.unwrap_or(create.kind != "head")),
                         ..Default::default()
@@ -1481,7 +1527,7 @@ mod tests {
     use super::{allocate_sequence, SequenceRefusal};
     use crate::atomic_prepare::{prepare_delete, prepare_update};
     use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
-    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError};
+    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError, VerbRegistryBuilder};
     use serde_json::{json, Value};
 
     #[test]
@@ -1511,6 +1557,7 @@ mod tests {
     async fn stream_atomic_metadata_cas_preserves_record_and_refuses_stale_plan() {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
+        let registry = VerbRegistryBuilder::new().build().unwrap();
         let appended = rt
             .stream_append(
                 &token,
@@ -1522,6 +1569,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &registry,
             )
             .await
             .unwrap();
@@ -1584,6 +1632,7 @@ mod tests {
         let rt = KhiveRuntime::memory().unwrap();
         let a = rt.authorize(Namespace::parse("a").unwrap()).unwrap();
         let b = rt.authorize(Namespace::parse("b").unwrap()).unwrap();
+        let registry = VerbRegistryBuilder::new().build().unwrap();
         for token in [&a, &b] {
             assert_eq!(
                 rt.stream_append(
@@ -1595,7 +1644,8 @@ mod tests {
                     None,
                     None,
                     None,
-                    None
+                    None,
+                    &registry
                 )
                 .await
                 .unwrap()["seq"],

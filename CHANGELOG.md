@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Standalone `stream.append` now consults the owning pack's `KindHook::prepare_create` before
+  creating a caller-selected note kind, preserving pack-owned admission and field normalization.
+  When the kind has a hook, an object record's fields are read as the create arguments the hook
+  sees, so a pack normalizes or refuses the same input it would receive through `create`.
 - `KHIVE_EMAIL_DEFAULT_ACTOR` now falls back to `local` when unset or blank,
   matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
   instead of a hard-coded identity with no meaning outside the deployment it

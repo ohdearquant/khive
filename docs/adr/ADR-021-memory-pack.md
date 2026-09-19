@@ -483,8 +483,9 @@ handler logic.
 - `khive-pack-kg` is unaffected. Its `search`/`create` paths continue to work as
   specified; the memory pack uses them via the runtime's pack-extensible verb dispatch.
   The [creation-admission amendment](#amendment-new-memory-creation-admission) qualifies this
-  statement for generic creation and new `stream.batch` memory writes: those two paths refuse
-  through the memory pack's own create hook, and every other kg path is unaffected.
+  statement for generic creation, new `stream.batch` memory writes, and standalone `stream.append`
+  memory writes: those paths refuse through the memory pack's own create hook, and every other kg
+  path is unaffected.
 - The pack composes with [ADR-020](ADR-020-git-native-kg-implementation.md) git-native
   KG: memory notes are part of the notes substrate, which is excluded from v1 KG
   snapshots ([ADR-010](ADR-010-kg-versioning.md) §SnapshotCoverage). Memory persists in
@@ -509,7 +510,8 @@ writer's complete decay and actor-routing contract. Treating these entry points
 as interchangeable promises behavior shared create does not provide.
 
 When the memory pack is loaded, `memory.remember` is the supported replacement for
-generic create and new `stream.batch` memory writes. Shared generic creation of
+generic create, new `stream.batch` memory writes, and standalone `stream.append` memory writes.
+Shared generic creation of
 the memory kind refuses before creating a note or provenance edge, with an error
 naming `memory.remember` as the supported writer. This includes
 `create(kind="memory", ...)` and
@@ -525,19 +527,15 @@ with specialized verbs. Generic task creation retains its existing behavior.
 ### Stream consequence and preserved operations
 
 The shared creation hook also governs a new `stream.batch` write whose kind is
-memory. That operation refuses with the same directing error in both atomic and
-per-member modes. It is a preparation failure: no preceding sibling write in that
-batch commits. This consequence is part of the decision, not a new per-member
-conflict result. Public `stream.batch` append members continue to create
-observations.
+memory and a standalone `stream.append` whose `note_kind` is memory. Those operations refuse
+with the same directing error. A batch refusal is a preparation failure: no preceding sibling
+write in that batch commits. This consequence is part of the decision, not a new per-member
+conflict result. Public `stream.batch` append members continue to create observations.
 
-Standalone `stream.append` continues to accept a registered `note_kind`, including
-memory; observation is its default, not its only admitted kind. Approved
-`propose`/`review` changesets containing `AddNote` likewise retain their existing
-registered-kind admission. These two public creation routes do not invoke the
-shared create hook and remain governed by their existing stream and proposal
-contracts. This amendment neither redirects them to `memory.remember` nor gives
-them its stored-default, namespace-routing or keyed-replay contract.
+Approved `propose`/`review` changesets containing `AddNote` retain their existing registered-kind
+admission because they are the one creation route outside the shared create hook. This amendment
+neither redirects that route to `memory.remember` nor gives it the stored-default, namespace-routing
+or keyed-replay contract.
 
 `memory.remember` uses the memory writer directly and remains admitted, including
 existing keyed replay. It retains type-specific stored defaults, explicit zero

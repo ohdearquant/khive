@@ -6201,80 +6201,20 @@ async fn generic_create_of_a_kind_with_its_own_hook_is_unaffected_by_the_memory_
     assert!(refusal.to_string().contains("memory.remember"));
 }
 
-/// The residual is measured, not inferred (added as a condition of the
-/// amendment's signature). Standalone `stream.append` and an approved
-/// `AddNote` changeset both admit the memory kind without invoking the shared
-/// create hook (`prepare_add_note` and the append path both build their own
-/// args and dispatch no pack hook), so neither route derives `salience` or
-/// `decay_factor` — the stored row leaves both unset. `memory.recall` still
-/// renders the row at the type-appropriate effective defaults, because recall
-/// resolves missing values at read time regardless of how the row was
-/// written.
-///
-/// This arm is expected to PASS as written: it PINS a known divergence rather
-/// than guarding against one. Issue #2967 is the row that carries the open
-/// question of whether that residual should ever be closed; do not "fix" this
-/// arm by making it assert a refusal — the amendment explicitly carves both
-/// routes out of the hook.
+/// The approved `AddNote` changeset remains a creation route that does not invoke the shared
+/// create hook (`prepare_add_note` builds its own args), so it leaves `salience` and
+/// `decay_factor` unset. `memory.recall` still renders the row at the type-appropriate effective
+/// defaults, because recall resolves missing values at read time regardless of how the row was
+/// written. Issue #2967 remains the separate AddNote contract question.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-async fn stream_append_and_an_approved_add_note_changeset_admit_memory_leaving_defaults_unset() {
+async fn approved_add_note_changeset_admits_memory_leaving_defaults_unset() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
     let tok = rt.authorize(Namespace::local()).unwrap();
 
-    // Route 1: standalone stream.append. The verb has no salience/decay_factor
-    // argument at all — there is nothing to omit.
-    let appended = registry
-        .dispatch(
-            "stream.append",
-            json!({
-                "stream": "acceptance-2967-append",
-                "record": {"content": "residual defaults check via standalone stream append route"},
-                "note_kind": "memory",
-            }),
-        )
-        .await
-        .expect("standalone stream.append must admit the memory kind");
-    let appended_id: Uuid = appended["id"].as_str().unwrap().parse().unwrap();
-
-    let stored_via_append = rt
-        .notes(&tok)
-        .unwrap()
-        .get_note(appended_id)
-        .await
-        .unwrap()
-        .expect("note exists");
-    assert!(
-        stored_via_append.salience.is_none(),
-        "stream.append must not derive salience"
-    );
-    assert!(
-        stored_via_append.decay_factor.is_none(),
-        "stream.append must not derive decay_factor"
-    );
-
-    let recalled_append = registry
-        .dispatch(
-            "memory.recall",
-            json!({"query": "residual defaults check via standalone stream append route"}),
-        )
-        .await
-        .expect("recall must succeed");
-    let recalled_append = recalled_append.as_array().unwrap();
-    let append_hit = recalled_append
-        .iter()
-        .find(|h| h["id"].as_str() == Some(appended_id.to_string().as_str()))
-        .expect("recall must render the append-written row");
-    assert_eq!(
-        append_hit["salience"].as_f64(),
-        Some(0.3),
-        "recall must render the episodic default even though nothing was stored"
-    );
-    assert_eq!(append_hit["decay_factor"].as_f64(), Some(0.02));
-
-    // Route 2: an approved AddNote changeset. `propose`/`review` apply the note
-    // directly (via `prepare_add_note`), never through the shared create hook.
+    // `propose`/`review` apply the note directly (via `prepare_add_note`), never through the
+    // shared create hook.
     let propose = registry
         .dispatch(
             "propose",
@@ -6326,5 +6266,30 @@ async fn stream_append_and_an_approved_add_note_changeset_admit_memory_leaving_d
     assert!(
         stored_via_addnote.decay_factor.is_none(),
         "an approved add_note changeset must not derive decay_factor"
+    );
+}
+
+/// Issue #2974. Standalone `stream.append` now reaches the memory pack's creation hook, while
+/// the approved AddNote route above remains intentionally outside that hook.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn stream_append_refuses_memory_kind_and_names_memory_remember() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let refusal = registry
+        .dispatch(
+            "stream.append",
+            json!({
+                "stream": "acceptance-2974-memory",
+                "record": {"content": "the hook must refuse this route"},
+                "note_kind": "memory"
+            }),
+        )
+        .await
+        .expect_err("stream.append must refuse memory creation");
+    assert!(
+        refusal.to_string().contains("memory.remember"),
+        "the refusal must name the owning writer: {refusal}"
     );
 }

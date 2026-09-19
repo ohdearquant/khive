@@ -6,7 +6,7 @@ use super::{
 use khive_runtime::{
     runtime_error_value, DomainDisposition, KhiveRuntime, RuntimeConfig, RuntimeError,
     StreamAppendDisposition, StreamAppendFailure, TelemetryCarrier, TelemetryFailurePosture,
-    TelemetryPolicy,
+    TelemetryPolicy, VerbRegistryBuilder,
 };
 use khive_storage::{StorageError, WriterTaskRequestState};
 use serde_json::json;
@@ -74,6 +74,7 @@ async fn proven_append_refusal_drops_in_gap_and_propagates_in_stop() {
     let token = runtime
         .authorize(khive_runtime::Namespace::local())
         .unwrap();
+    let registry = VerbRegistryBuilder::new().build().unwrap();
     for posture in [TelemetryFailurePosture::Stop, TelemetryFailurePosture::Gap] {
         let failure = runtime
             .stream_append_with_outcome(
@@ -86,6 +87,7 @@ async fn proven_append_refusal_drops_in_gap_and_propagates_in_stop() {
                 None,
                 Some(false),
                 None,
+                &registry,
             )
             .await
             .unwrap_err();
