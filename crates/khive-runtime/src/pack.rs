@@ -472,6 +472,104 @@ pub trait PackRuntime: Send + Sync {
 /// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
 /// verbs. Shared `create`, note `update`, entity `update`, and `link` calls
 /// flow through this trait when an endpoint kind has an owning pack hook.
+///
+/// A hook that still overrides the removed sequencing method does not compile, which is the point
+/// of the move: an implementor cannot replace the validator by replacing the sequence, because
+/// there is no sequence on this trait to replace.
+///
+/// ```compile_fail
+/// use async_trait::async_trait;
+/// use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
+/// use serde_json::Value;
+///
+/// #[derive(Debug)]
+/// struct Sequencing;
+///
+/// #[async_trait]
+/// impl KindHook for Sequencing {
+///     async fn prepare_create(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _args: &mut Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+///
+///     async fn after_create(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _id: uuid::Uuid,
+///         _args: &Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+///
+///     async fn prepare_note_update(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _token: &NamespaceToken,
+///         _note: &khive_storage::Note,
+///         _args: &mut Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// The companion below is the control, and it is what makes the arm above mean anything: a
+/// `compile_fail` doctest passes when the code fails to compile for ANY reason, including a stale
+/// import or a renamed type. This one is structurally identical and overrides the two halves a pack
+/// is meant to implement, so it must compile — if it stops compiling, the arm above has stopped
+/// testing the method and is passing on the scaffolding instead.
+///
+/// ```
+/// use async_trait::async_trait;
+/// use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
+/// use serde_json::Value;
+///
+/// #[derive(Debug)]
+/// struct Halves;
+///
+/// #[async_trait]
+/// impl KindHook for Halves {
+///     async fn prepare_create(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _args: &mut Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+///
+///     async fn after_create(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _id: uuid::Uuid,
+///         _args: &Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+///
+///     async fn normalize_note_update(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _token: &NamespaceToken,
+///         _note: &khive_storage::Note,
+///         _args: &mut Value,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+///
+///     async fn validate_note_update(
+///         &self,
+///         _runtime: &KhiveRuntime,
+///         _token: &NamespaceToken,
+///         _note: &khive_storage::Note,
+///         _properties: Option<&Value>,
+///     ) -> Result<(), RuntimeError> {
+///         Ok(())
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Mutate args before the storage write. Fill defaults, normalize values,
@@ -502,13 +600,12 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
 
     /// Normalize caller-facing note-update fields before validation runs.
     ///
-    /// Override this — not [`Self::prepare_note_update`] — when a kind-owning
-    /// pack's caller-facing note fields mirror owned properties and must be
-    /// changed together (for example, a task's searchable `content` and
-    /// `properties.description`). Validation is not this method's job: it
-    /// runs unconditionally after this method returns, through
-    /// [`Self::prepare_note_update`]'s sequencing, regardless of what this
-    /// method did. The default does nothing.
+    /// Override this when a kind-owning pack's caller-facing note fields
+    /// mirror owned properties and must be changed together (for example, a
+    /// task's searchable `content` and `properties.description`). Validation
+    /// is not this method's job: the registry runs
+    /// [`Self::validate_note_update`] after this method returns, regardless of
+    /// what this method did. The default does nothing.
     async fn normalize_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -519,36 +616,13 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Sequence a shared note update before storage is mutated: normalize,
-    /// then validate.
-    ///
-    /// This is the sequencing method, not the extension point — packs
-    /// override [`Self::normalize_note_update`] instead, so that normalizing
-    /// caller-facing fields can never skip the validator that runs after it.
-    /// Rust does not prevent an override of this method too; the guarantee
-    /// this ordering gives a kind-owning pack is by naming and by the test
-    /// coverage of the sequence, not by the type system.
-    async fn prepare_note_update(
-        &self,
-        runtime: &KhiveRuntime,
-        token: &NamespaceToken,
-        note: &khive_storage::Note,
-        args: &mut Value,
-    ) -> Result<(), RuntimeError> {
-        self.normalize_note_update(runtime, token, note, args)
-            .await?;
-        let properties = args.get("properties").filter(|value| !value.is_null());
-        self.validate_note_update(runtime, token, note, properties)
-            .await
-    }
-
     /// Validate a shared note-property update before storage is mutated.
     ///
     /// The default accepts the update. Kind-owning packs override this when a
     /// property has invariants that generic CRUD cannot know about (for
     /// example, GTD task dependency acyclicity). This always runs after
-    /// [`Self::normalize_note_update`], through
-    /// [`Self::prepare_note_update`]'s sequencing.
+    /// [`Self::normalize_note_update`], because
+    /// [`VerbRegistry::prepare_note_update_hook`] calls them in that order.
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -3356,6 +3430,11 @@ impl VerbRegistry {
     ///
     /// Both canonical KG dispatch and user-facing atomic preparation call this
     /// seam so pack-specific property invariants cannot drift between them.
+    ///
+    /// The ordering lives here, at the single dispatch site, rather than in a
+    /// [`KindHook`] method a pack could override: a pack implements the two
+    /// halves and cannot express a sequence, so it cannot replace the
+    /// validator by overriding the sequence. See ADR-017.
     pub async fn prepare_note_update_hook(
         &self,
         runtime: &KhiveRuntime,
@@ -3365,7 +3444,11 @@ impl VerbRegistry {
     ) -> Result<(), RuntimeError> {
         crate::curation::normalize_note_update_tags(args)?;
         if let Some(hook) = self.find_kind_hook(&note.kind) {
-            hook.prepare_note_update(runtime, token, note, args).await?;
+            hook.normalize_note_update(runtime, token, note, args)
+                .await?;
+            let properties = args.get("properties").filter(|value| !value.is_null());
+            hook.validate_note_update(runtime, token, note, properties)
+                .await?;
         }
         Ok(())
     }
@@ -13419,11 +13502,11 @@ mod dep_tests {
 
 // ── Note-update hook sequencing tests ───────────────────────────
 //
-// These tests exercise the DISPATCHER (`VerbRegistry::prepare_note_update_hook`
-// and the `KindHook::prepare_note_update` sequencer it drives), not any one
-// pack's hook. The probe below overrides only `normalize_note_update` and
-// `validate_note_update` — never `prepare_note_update` itself — so the only
-// way both can run, in order, is through the trait's own sequencing.
+// These tests exercise the DISPATCHER (`VerbRegistry::prepare_note_update_hook`),
+// not any one pack's hook. The probe below overrides `normalize_note_update`
+// and `validate_note_update`, which since #2956 are the only two halves a pack
+// can implement — there is no sequencing method on the trait — so the only way
+// both can run, in order, is through the registry's own sequencing.
 
 #[cfg(test)]
 mod note_update_sequencing_tests {
@@ -13549,9 +13632,8 @@ mod note_update_sequencing_tests {
     ///
     /// This arm was confirmed to be load-bearing by a mutation run before the
     /// change landed, recorded here as a result rather than as a procedure. With
-    /// `KindHook::prepare_note_update`'s provided body reduced to a single
-    /// `self.validate_note_update(...)` call — the pre-fix shape, and what an
-    /// overriding pack that forgets to call the validator reproduces —
+    /// the sequencing reduced to a single `validate_note_update` call — the
+    /// pre-fix shape, and what a caller that skips the normalizer reproduces —
     /// `normalize_note_update` did not run, `marker` did not reach `properties`,
     /// `validate_note_update` observed `None` where it expects `Some(true)`, and
     /// the call returned `Ok` instead of the expected `Err`, reddening the first

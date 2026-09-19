@@ -272,7 +272,7 @@ impl KindHook for TaskHook {
     async fn normalize_note_update(/* ..., args: &mut Value */) -> Result<(), RuntimeError> {
         // Keep note.content and properties.description synchronized. The
         // dependency-property validator above runs after this returns, through
-        // the trait's own sequencing -- this method must not call it.
+        // the registry's sequencing -- this method must not call it.
         // ...
     }
 
@@ -710,7 +710,7 @@ minimal. Operators who want GTD configure it explicitly.
   - `prepare_create`: normalize GTD args into kg shape.
   - `after_create`: fire `depends_on` edges (best-effort, logged on failure).
   - `normalize_note_update`: synchronize task content/description. The validator runs
-    after it through the trait's sequencing, so this method does not call it.
+    after it through the registry's sequencing, so this method does not call it.
   - `validate_note_update` / `validate_links`: reject dependency cycles before writes.
 - `crates/khive-pack-gtd/src/dependency.rs`:
   - Bounded property and edge reachability validation.
