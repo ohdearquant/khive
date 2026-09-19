@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `KindHook::prepare_note_update`, the trait method that sequenced a pack's
+  `normalize_note_update` and `validate_note_update`. The registry now runs the two
+  halves in that order at its single dispatch site, so a pack implements the halves
+  and cannot express an order. This is a source-breaking change for an out-of-tree
+  `KindHook` that overrode the removed method: such an impl no longer compiles, and
+  the migration is to move its normalization into `normalize_note_update` and its
+  checks into `validate_note_update`. There is no compatibility path, because an
+  override of the sequencer is the thing being removed: it silently replaced the
+  validator call along with the order.
+
 ### Added
 
 - Chunked blob uploads: `blob.begin`, `blob.put_part`, `blob.commit` and
