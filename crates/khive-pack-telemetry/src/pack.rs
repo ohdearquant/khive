@@ -220,7 +220,7 @@ impl PackRuntime for TelemetryPack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         self.runtime
@@ -230,7 +230,7 @@ impl PackRuntime for TelemetryPack {
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         match verb {
             "telemetry.channels" => handlers::channels(&self.runtime, params),
-            "telemetry.emit" => handlers::emit(&self.runtime, token, params).await,
+            "telemetry.emit" => handlers::emit(&self.runtime, token, params, registry).await,
             "telemetry.read" => handlers::read(&self.runtime, token, params).await,
             "telemetry.counts" => handlers::counts(&self.runtime, token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(

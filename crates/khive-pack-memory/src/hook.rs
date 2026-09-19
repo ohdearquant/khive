@@ -120,10 +120,10 @@ impl KindHook for MemoryHook {
         _args: &mut Value,
     ) -> Result<(), RuntimeError> {
         // Shared creation of this kind refuses here, in the pack that owns it, per ADR-021's
-        // creation-admission amendment. This is the one place both admitting paths converge:
-        // the shared `create` handler calls this hook before it writes a note or a provenance
-        // edge, and a `stream.batch` member of this kind calls it during preparation, so a
-        // refusal aborts that batch before any sibling commits.
+        // creation-admission amendment. This is the one place all three admitting paths
+        // converge: the shared `create` handler, a `stream.batch` write member, and standalone
+        // `stream.append` call this hook before they write a note or a provenance edge. A
+        // refusal aborts batch preparation before any sibling commits.
         //
         // Placing it here rather than in the generic handler is the decision, not an
         // implementation preference. The generic pack does not know this kind, and a hook only
@@ -139,7 +139,8 @@ impl KindHook for MemoryHook {
         // salience, decay and authenticated actor routing — this refusal is what should be
         // removed, not worked around.
         Err(RuntimeError::InvalidInput(
-            "kind=memory is not creatable through shared `create` or a `stream.batch` member — \
+            "kind=memory is not creatable through shared `create`, `stream.batch`, or standalone \
+             `stream.append` — \
              `memory.remember` derives `memory_type`, `salience` and `decay_factor` together and \
              owns episodic actor routing, so a row written here is stored without the fields \
              `memory.recall` supplies at read time and the same record reads differently \

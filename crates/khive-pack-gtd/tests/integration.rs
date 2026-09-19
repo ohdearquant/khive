@@ -91,6 +91,93 @@ async fn assign_creates_a_task_with_defaults() {
     assert!(resp["full_id"].as_str().unwrap().contains('-'));
 }
 
+/// Issue #2974. Standalone stream append must run the same task creation hook as generic create,
+/// including the hook's status/priority/salience mutations. The generic-create note is the
+/// control for the exact same record fields.
+#[tokio::test]
+async fn stream_append_honors_task_hook_mutations_like_generic_create() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let record = json!({"title": "streamed task"});
+
+    let appended = pack
+        .dispatch(
+            "stream.append",
+            json!({
+                "stream": "gtd-task-hook",
+                "record": record,
+                "note_kind": "task"
+            }),
+        )
+        .await
+        .expect("stream.append task must be admitted");
+    let appended_id: uuid::Uuid = appended["id"].as_str().unwrap().parse().unwrap();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "streamed task"
+            }),
+        )
+        .await
+        .expect("generic create task control must be admitted");
+    let created_id: uuid::Uuid = created["full_id"].as_str().unwrap().parse().unwrap();
+
+    let notes = runtime.notes(&token).unwrap();
+    let appended_note = notes
+        .get_note(appended_id)
+        .await
+        .unwrap()
+        .expect("streamed task note exists");
+    let created_note = notes
+        .get_note(created_id)
+        .await
+        .unwrap()
+        .expect("generic task note exists");
+
+    assert_eq!(appended_note.name, created_note.name);
+    assert_eq!(appended_note.content, created_note.content);
+    assert_eq!(appended_note.salience, created_note.salience);
+    assert_eq!(
+        appended_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("status")),
+        created_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("status"))
+    );
+    assert_eq!(
+        appended_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("priority")),
+        created_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("priority"))
+    );
+    assert_eq!(
+        appended_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("status")),
+        Some(&json!("inbox"))
+    );
+    assert_eq!(
+        appended_note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("priority")),
+        Some(&json!("p2"))
+    );
+}
+
 #[tokio::test]
 async fn assign_rejects_empty_title() {
     let pack = pack(rt());

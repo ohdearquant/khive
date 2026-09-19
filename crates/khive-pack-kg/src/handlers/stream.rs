@@ -253,6 +253,7 @@ impl KgPack {
                 p.fence,
                 p.embed,
                 p.embedding_model,
+                registry,
             )
             .await
     }

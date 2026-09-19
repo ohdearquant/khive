@@ -13541,6 +13541,69 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
     );
 }
 
+/// Issue #2974. Standalone `stream.append` is another creation route that accepts a
+/// caller-selected note kind, so it must consult the owning hook before writing. The ordinary
+/// observation control remains admitted, and two heartbeats for one channel still address one
+/// deterministic health row.
+#[tokio::test]
+async fn stream_append_refuses_channel_health_and_preserves_heartbeat_identity() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "stream.append",
+            serde_json::json!({
+                "stream": "standalone-control",
+                "record": {"note": "an ordinary streamed observation"},
+                "note_kind": "observation"
+            }),
+        )
+        .await
+        .expect("the same append shape must still create an observation");
+
+    let refusal = registry
+        .dispatch(
+            "stream.append",
+            serde_json::json!({
+                "stream": "standalone-channel-health",
+                "record": {"outcome": "success"},
+                "note_kind": "channel_health"
+            }),
+        )
+        .await
+        .expect_err("stream.append must refuse channel_health creation");
+    assert!(
+        refusal.to_string().contains("comm.heartbeat"),
+        "the refusal must name the owning writer: {refusal}"
+    );
+
+    for outcome in ["success", "success"] {
+        registry
+            .dispatch(
+                "comm.heartbeat",
+                serde_json::json!({
+                    "namespace": "local",
+                    "channel_kind": "email",
+                    "channel_slug": "stream-append@example.com",
+                    "poll_interval_secs": 5,
+                    "outcome": outcome
+                }),
+            )
+            .await
+            .expect("comm.heartbeat must still write the channel health row");
+    }
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("comm.health succeeds");
+    assert_eq!(
+        health["channels"].as_array().map(Vec::len),
+        Some(1),
+        "two heartbeats for one channel must leave one row: {health}"
+    );
+}
+
 /// Issue #2963, the other admitting path. The refusal lives on this pack's `KindHook`, and that
 /// hook is what `stream.batch` calls when it prepares a write member, so one refusal answers both
 /// entry points. It refuses during preparation rather than as a per-member conflict, so the batch

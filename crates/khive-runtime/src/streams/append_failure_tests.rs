@@ -1,5 +1,8 @@
 use super::{StreamAppendDisposition, StreamAppendFailure, StreamAppendSpec};
-use crate::{runtime_error_value, DomainDisposition, KhiveRuntime, Namespace, RuntimeError};
+use crate::{
+    runtime_error_value, DomainDisposition, KhiveRuntime, Namespace, RuntimeError,
+    VerbRegistryBuilder,
+};
 use khive_storage::{
     AtomicUnitOp, SqlAccess, SqlReader, SqlRow, SqlStatement, SqlValue, SqlWriter,
     StorageCapability, StorageError, StorageResult, WriterTaskRequestState,
@@ -244,6 +247,7 @@ async fn submission_evidence_separates_refusal_lost_reply_and_downcast_without_r
     ] {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
+        let registry = VerbRegistryBuilder::new().build().unwrap();
         let spec = StreamAppendSpec {
             stream: "evidence".into(),
             record: json!({"kind": "event"}),
@@ -254,7 +258,10 @@ async fn submission_evidence_separates_refusal_lost_reply_and_downcast_without_r
             tags: None,
             fence: None,
         };
-        let prepared = rt.prepare_stream_appends(&token, &[&spec]).await.unwrap();
+        let prepared = rt
+            .prepare_stream_appends(&token, &[&spec], &registry)
+            .await
+            .unwrap();
         let access = FaultAccess {
             inner: rt.sql(),
             fault,
@@ -284,6 +291,7 @@ async fn submission_evidence_separates_refusal_lost_reply_and_downcast_without_r
 async fn append_preparation_and_sequence_refusal_preserve_compatibility_errors() {
     let rt = KhiveRuntime::memory().unwrap();
     let token = rt.authorize(Namespace::local()).unwrap();
+    let registry = VerbRegistryBuilder::new().build().unwrap();
     for (stream, expected_seq) in [("invalid\0name", None), ("sequence", Some(2))] {
         let source = rt
             .stream_append(
@@ -296,6 +304,7 @@ async fn append_preparation_and_sequence_refusal_preserve_compatibility_errors()
                 None,
                 None,
                 None,
+                &registry,
             )
             .await
             .unwrap_err();
@@ -310,6 +319,7 @@ async fn append_preparation_and_sequence_refusal_preserve_compatibility_errors()
                 None,
                 None,
                 None,
+                &registry,
             )
             .await
             .unwrap_err();
@@ -333,6 +343,7 @@ async fn append_preparation_and_sequence_refusal_preserve_compatibility_errors()
             None,
             None,
             None,
+            &registry,
         )
         .await
         .unwrap();

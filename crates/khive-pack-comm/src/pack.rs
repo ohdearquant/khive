@@ -175,18 +175,18 @@ impl KindHook for ChannelHealthHook {
         // looks complete. The defect is in its identity.
         //
         // The refusal lives here, in the pack that owns the kind, rather than in the generic
-        // create handler, because this hook is where both admitting paths converge: shared
-        // `create` calls it before writing the note, and a `stream.batch` member of this kind
-        // calls it during preparation, so a refusal aborts that batch before any sibling
+        // create handler, because this hook is where all three admitting paths converge: shared
+        // `create`, a `stream.batch` write member, and standalone `stream.append` all call it
+        // before writing the note. In a batch, the refusal aborts preparation before any sibling
         // commits. A hook also exists only when the pack that owns it is registered, so the
-        // refusal can never reach a caller who has no `comm.heartbeat` to dispatch — the
-        // hook's existence is that capability check, with nothing to ask the registry.
+        // refusal can never reach a caller who has no `comm.heartbeat` to dispatch — the hook's
+        // existence is that capability check, with nothing to ask the registry.
         //
         // Falsifier: if `create` ever accepts a caller-supplied id, the derivation could be
-        // applied on both paths instead and this refusal would be the wrong shape.
+        // applied on all three paths instead and this refusal would be the wrong shape.
         Err(RuntimeError::InvalidInput(
-            "kind=channel_health is not creatable through shared `create` or a `stream.batch` \
-             member — `comm.heartbeat` addresses a channel's health row by an id derived from \
+            "kind=channel_health is not creatable through shared `create`, `stream.batch`, or \
+             standalone `stream.append` — `comm.heartbeat` addresses a channel's health row by an id derived from \
              the namespace, channel kind and slug, so a row written here gets an unrelated id \
              that no heartbeat will ever find or update and that leaves two rows for one \
              channel; use `comm.heartbeat` instead"
