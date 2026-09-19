@@ -125,7 +125,7 @@ async fn stream_append_honors_task_hook_mutations_like_generic_create() {
         )
         .await
         .expect("generic create task control must be admitted");
-    let created_id: uuid::Uuid = created["full_id"].as_str().unwrap().parse().unwrap();
+    let created_id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
 
     let notes = runtime.notes(&token).unwrap();
     let appended_note = notes
