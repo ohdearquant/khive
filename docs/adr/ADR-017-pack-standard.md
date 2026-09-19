@@ -1116,12 +1116,12 @@ Such a refusal is constrained:
 3. It is not gated on a registry probe. A hook exists only when the pack that owns the kind is
    registered, so a refusal cannot reach a caller who has no such verb to dispatch; the hook's
    existence is that capability check.
-4. It covers both admitting paths that reach the hook — shared `create`, and a `stream.batch` write
-   member naming the kind. In a batch it refuses during preparation, so no sibling write commits.
+4. It covers every creation route that accepts a caller `note_kind` — shared `create`, a
+   `stream.batch` write member, and standalone `stream.append`. In a batch it refuses during
+   preparation, so no sibling write commits.
 5. It is create-only. Reads, searches, updates, deletion and restoration of existing rows of the
-   kind are unaffected, and so are the creation routes that do not call this hook — standalone
-   `stream.append` and approved `propose`/`review` `AddNote` changesets — which remain governed by
-   their own contracts.
+   kind are unaffected. The only approved creation route that does not call this hook is
+   `propose`/`review` with an `AddNote` changeset, which remains governed by its own contract.
 
 This does not make refusal a default or a property of pack-owned kinds as a class. A kind whose
 shared creation produces a complete record stays creatable through it, and packs that depend on
