@@ -1118,7 +1118,8 @@ Such a refusal is constrained:
    existence is that capability check.
 4. It covers every creation route that accepts a caller `note_kind` — shared `create`, a
    `stream.batch` write member, and standalone `stream.append`. In a batch it refuses during
-   preparation, so no sibling write commits.
+   preparation, so no sibling write commits. On the append routes an object record's fields are
+   read as the create arguments the hook sees, so the pack judges the same input on every route.
 5. It is create-only. Reads, searches, updates, deletion and restoration of existing rows of the
    kind are unaffected. The only approved creation route that does not call this hook is
    `propose`/`review` with an `AddNote` changeset, which remains governed by its own contract.

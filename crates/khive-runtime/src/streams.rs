@@ -29,8 +29,6 @@ use crate::atomic_runner::{
 use crate::note_write::{
     NoteFence, NoteFences, NoteWriteConflict, NoteWriteGuard, NoteWriteOptions,
 };
-#[cfg(test)]
-use crate::VerbRegistryBuilder;
 use crate::{
     micros_to_iso, DomainDisposition, KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult,
     VerbRegistry,
@@ -1529,7 +1527,7 @@ mod tests {
     use super::{allocate_sequence, SequenceRefusal};
     use crate::atomic_prepare::{prepare_delete, prepare_update};
     use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
-    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError};
+    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError, VerbRegistryBuilder};
     use serde_json::{json, Value};
 
     #[test]
