@@ -153,6 +153,57 @@ impl KindHook for MessageHook {
     }
 }
 
+/// Refuses shared creation of `channel_health`, the kind this pack owns and writes by
+/// derived id.
+#[derive(Debug, Default)]
+struct ChannelHealthHook;
+
+#[async_trait]
+impl KindHook for ChannelHealthHook {
+    async fn prepare_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        _args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        // A `channel_health` row is addressed, not searched: `handle_heartbeat` derives a v5
+        // UUID from the namespace, channel kind and slug and writes at that id, so one channel
+        // keeps exactly one health row that later heartbeats update in place. A row created
+        // through a generic path gets a fresh random id instead — one no heartbeat will ever
+        // find or update, and one `comm.health` nevertheless reports as an additional channel,
+        // because it queries by kind. Unlike a row missing its defaults or its validation, this
+        // one cannot be repaired by reading it: it has content, a kind and a timestamp, and it
+        // looks complete. The defect is in its identity.
+        //
+        // The refusal lives here, in the pack that owns the kind, rather than in the generic
+        // create handler, because this hook is where both admitting paths converge: shared
+        // `create` calls it before writing the note, and a `stream.batch` member of this kind
+        // calls it during preparation, so a refusal aborts that batch before any sibling
+        // commits. A hook also exists only when the pack that owns it is registered, so the
+        // refusal can never reach a caller who has no `comm.heartbeat` to dispatch — the
+        // hook's existence is that capability check, with nothing to ask the registry.
+        //
+        // Falsifier: if `create` ever accepts a caller-supplied id, the derivation could be
+        // applied on both paths instead and this refusal would be the wrong shape.
+        Err(RuntimeError::InvalidInput(
+            "kind=channel_health is not creatable through shared `create` or a `stream.batch` \
+             member — `comm.heartbeat` addresses a channel's health row by an id derived from \
+             the namespace, channel kind and slug, so a row written here gets an unrelated id \
+             that no heartbeat will ever find or update and that leaves two rows for one \
+             channel; use `comm.heartbeat` instead"
+                .into(),
+        ))
+    }
+
+    async fn after_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        _id: uuid::Uuid,
+        _args: &Value,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
 /// Derive a `message` note's authored-by identity from the authorization
 /// token, whatever the caller supplied.
 ///
@@ -173,8 +224,11 @@ impl KindHook for MessageHook {
 /// a transport-supplied `sent_at`. Deriving either here would overwrite a value
 /// a legitimate caller must set.
 ///
-/// Kinds other than `message` — including comm's own `channel_health` — pass
-/// through untouched: the runtime holds one validator slot for all packs.
+/// Kinds other than `message` pass through this validator untouched: the
+/// runtime holds one validator slot for all packs. comm's own `channel_health`
+/// is answered elsewhere — `ChannelHealthHook::prepare_create` refuses shared
+/// creation of that kind outright, because what goes wrong there is the row's
+/// identity rather than a field this validator could derive.
 pub(crate) fn derive_message_identity(
     kind: &str,
     actor_id: &str,
@@ -233,10 +287,10 @@ impl PackRuntime for CommPack {
         &COMM_HANDLERS
     }
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
-        if kind == "message" {
-            Some(std::sync::Arc::new(MessageHook))
-        } else {
-            None
+        match kind {
+            "message" => Some(std::sync::Arc::new(MessageHook)),
+            "channel_health" => Some(std::sync::Arc::new(ChannelHealthHook)),
+            _ => None,
         }
     }
     fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
