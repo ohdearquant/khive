@@ -13580,6 +13580,22 @@ async fn stream_batch_refuses_a_channel_health_write_member_before_any_sibling_c
         "a refusal has to name the verb that does the job: {message}"
     );
 
+    // Control for the read below: the same `list` shape finds the note the control batch
+    // committed, so an empty page for the sibling means "not committed" rather than "the filter
+    // matched nothing".
+    let committed = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "observation", "key_prefix": "control", "limit": 10}),
+        )
+        .await
+        .expect("list of the control batch's note");
+    assert_eq!(
+        committed["notes"].as_array().map(Vec::len),
+        Some(1),
+        "the control batch's note must be visible to this read: {committed}"
+    );
+
     let siblings = registry
         .dispatch(
             "list",
@@ -13588,7 +13604,7 @@ async fn stream_batch_refuses_a_channel_health_write_member_before_any_sibling_c
         .await
         .expect("list after the refused batch");
     assert_eq!(
-        siblings["items"].as_array().map(Vec::len),
+        siblings["notes"].as_array().map(Vec::len),
         Some(0),
         "the member preceding the refused one must not have committed: {siblings}"
     );
