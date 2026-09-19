@@ -386,6 +386,23 @@ impl KindHook for TaskHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{VerbRegistry, VerbRegistryBuilder};
+
+    /// Since #2956 the note-update sequence lives at the registry, so a test that means to
+    /// exercise the path generic update takes has to go through one.
+    ///
+    /// `kg` is registered because `gtd` declares it as a required pack, so a registry holding
+    /// only `gtd` refuses to build with `MissingPackDependency`. This mirrors the fixture in
+    /// `tests/common`, which is the crate's canonical way to stand one up.
+    fn registry_with_gtd(runtime: &KhiveRuntime) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(runtime.clone()));
+        builder.register(crate::GtdPack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        registry
+    }
 
     use serde_json::json;
 
@@ -571,13 +588,17 @@ mod tests {
         assert_eq!(nulled["properties"]["due_timezone"], "America/New_York");
     }
 
-    /// The wiring, not just the function: the hook the generic update path calls must run it.
+    /// The wiring, not just the function: the dispatch site every generic update path calls must
+    /// run it. Since #2956 that site is `VerbRegistry::prepare_note_update_hook` and not a hook
+    /// method, so this goes through the registry — calling the hook's normalizer directly would
+    /// assert only that the function does what it does.
     #[tokio::test]
     async fn the_update_hook_runs_the_normalization() {
         let runtime = KhiveRuntime::memory().expect("memory runtime");
         let token = runtime
             .authorize(Namespace::local())
             .expect("authorize local");
+        let registry = registry_with_gtd(&runtime);
         let note = task_note_with(json!({
             "description": "body",
             "status": "inbox",
@@ -585,8 +606,8 @@ mod tests {
         }));
         let mut args = json!({"properties": {"due": "2026-12-25"}});
 
-        TaskHook
-            .prepare_note_update(&runtime, &token, &note, &mut args)
+        registry
+            .prepare_note_update_hook(&runtime, &token, &note, &mut args)
             .await
             .expect("hook");
 
@@ -696,19 +717,22 @@ mod tests {
         assert_eq!(no_properties, json!({"content": "body only"}));
     }
 
-    /// The wiring: the hook every generic update path calls must run it, or the function is
-    /// correct and unreachable.
+    /// The wiring: the dispatch site every generic update path calls must run it, or the function
+    /// is correct and unreachable. Since #2956 that site is
+    /// `VerbRegistry::prepare_note_update_hook` and not a hook method, so this goes through the
+    /// registry — calling the normalizer directly would be the unreachable case this guards.
     #[tokio::test]
     async fn the_update_hook_runs_the_priority_normalization() {
         let runtime = KhiveRuntime::memory().expect("memory runtime");
         let token = runtime
             .authorize(Namespace::local())
             .expect("authorize local");
+        let registry = registry_with_gtd(&runtime);
         let note = task_note_with(json!({"description": "body", "priority": "p3"}));
         let mut args = json!({"properties": {"priority": "p0"}});
 
-        TaskHook
-            .prepare_note_update(&runtime, &token, &note, &mut args)
+        registry
+            .prepare_note_update_hook(&runtime, &token, &note, &mut args)
             .await
             .expect("hook");
 

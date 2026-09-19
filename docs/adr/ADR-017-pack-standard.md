@@ -215,20 +215,6 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         args: &mut Value,
     ) -> Result<(), RuntimeError> { Ok(()) }
 
-    /// Sequence a generic note update before the write: normalize, then
-    /// validate. This is the sequencing method, not the extension point.
-    async fn prepare_note_update(
-        &self,
-        runtime: &KhiveRuntime,
-        token: &NamespaceToken,
-        note: &Note,
-        args: &mut Value,
-    ) -> Result<(), RuntimeError> {
-        self.normalize_note_update(runtime, token, note, args).await?;
-        let properties = args.get("properties").filter(|value| !value.is_null());
-        self.validate_note_update(runtime, token, note, properties).await
-    }
-
     /// Validate a generic note-property update before the write. Default: accept.
     async fn validate_note_update(
         &self,
@@ -289,6 +275,19 @@ method rather than leaving a reader to infer it. Removing that limit is the acce
 direction rather than an open question: the sequencing moves off the trait entirely, so
 that the registry orders the two halves and a pack cannot express an ordering at all,
 tracked as issue #2956; until it lands, the guarantee remains naming plus test coverage.
+
+The 2026-09-18 sequencing-off-the-trait amendment completes that direction and
+supersedes the paragraph above where the two disagree. `prepare_note_update` is removed
+from `KindHook`. `VerbRegistry::prepare_note_update_hook` now calls
+`normalize_note_update` and then `validate_note_update` itself, so the ordering lives at
+the single dispatch site every generic update path already goes through. A pack
+implements the two halves and cannot express a sequence, which is what makes the
+ordering a property of the type system rather than of naming and coverage: an
+implementor cannot replace the validator by replacing the sequence, because there is no
+sequence on the trait to replace. This is a breaking change for any out-of-tree
+implementor that overrode the removed method; none exist in this workspace. The
+validation-only `validate_note_update_hook` seam is unchanged, and so is what reaching a
+hook through it does.
 
 ### `VerbRegistry`: the runtime's pack catalog
 
