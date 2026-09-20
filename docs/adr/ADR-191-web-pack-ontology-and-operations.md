@@ -213,3 +213,31 @@ The pack shrinks to what the web is: three subtypes, one new relation, two rules
 Every application-level concept previously hosted here is expressible on top of it by a consumer pack
 through D6, and none of it lives in this repository. The runtime gains one relation, which is the cost of
 having a web ontology at all.
+
+## Amendment 1 (2026-09-20): disk ingest confinement, and how stored bodies stay alive
+
+Two normative additions found during implementation review. Both narrow the record; neither changes
+the ontology, the relation rules, or a verb signature.
+
+### A1.1 D3: `web.ingest` reads disk only under `[web] read_roots`
+
+D3 lets `web.ingest` take a served tree on disk. As written it bounds nothing about which directories
+that may be, so the verb would read any file the daemon can read and store it as a `resource` under a
+caller-chosen origin. The configuration section `[web]` gains `read_roots`, a list of directory paths.
+A disk source is admitted only when its canonical path lies under one of them; a path that leaves a
+root through a symlink is refused; an absent or empty list refuses every disk source with a message
+naming the setting. This mirrors `[exec] read_roots`, the same shape for the same reason. URL sources
+are unaffected. Acceptance A5 keeps its arm and gains a control: the served tree is a configured root,
+and the identical ingest with the tree outside every root is refused.
+
+### A1.2 D4: bodies are rooted by attachment, not by the property that names them
+
+D4 says every receipt carries a blob reference and D3 says a `page` or `resource` carries `blob_ref`.
+Neither keeps the blob alive: blob garbage collection consults the attachments table
+([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property or a receipt field
+is collectable once the grace period passes. Every stored body is therefore also recorded as an
+attachment with role `content` on the row that holds it (the `page` or `resource`, and the receipt
+note of the request that stored it), written on the canonical main backend whatever backend the pack
+is routed to. A body stored without a persisted row (`persist` false) is rooted by its receipt alone.
+Acceptance gains an arm: after a fetch the entity and its receipt each carry one `content` attachment
+naming the stored reference; a HEAD request stores no body and roots nothing.
