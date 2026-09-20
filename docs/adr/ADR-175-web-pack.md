@@ -476,7 +476,7 @@ arm are fixture stubs and the public hostnames are stub-resolved names:
 
 ## Amendment 2 (2026-09-20): the web pack describes origins, it does not model applications
 
-**Status**: Proposed\
+**Status**: Accepted (2026-09-20)\
 **Supersedes within this record**: D1's "one ingest verb" reading of scope, D4's dedicated map
 database target, D6.1 (the granularity fence), and acceptance arm 5.
 
@@ -553,9 +553,11 @@ nothing it does not understand and loses nothing.
 Every entity the reader derives from a manifest (`page`, `machine_view`, `agent_tool`,
 `agent_skill`) carries `origin` (the canonical host, as used in its UUIDv5 key) and `site_id` (the
 owning site's id) as properties. The reader also sets the entity tag `origin:<host>` on every derived entity, because
-tag predicates are applied at the SQL level of `search` while property predicates are applied inside
-a bounded candidate window (the `search` help text states the bound); an origin-restricted query
-must not miss a match that ranks below the window. This makes "restrict discovery to one origin" answerable by `search(tags=["origin:<host>"])` and
+the `search` help states that both tag and property predicates are applied before result truncation
+inside a bounded candidate window, with the entity-tag predicate applied at the SQL level through the
+entity filter and the property predicate applied in the result loop. Whether the SQL-level tag
+predicate lets an origin-restricted query reach a match that ranks below the window is a claim this
+amendment makes and arm 39 proves, per retrieval leg; it is not a guarantee the help text gives. This makes "restrict discovery to one origin" answerable by `search(tags=["origin:<host>"])` and
 "which site owns this hit" answerable from the hit itself, with no neighbor walk. It is a
 transcription of a fact the reader already knows, not a derived judgment.
 
@@ -654,12 +656,15 @@ map from key name to count (a bare total told the reader nothing about what was 
 37. **Create-seam parity.** A fixture page whose declaration would be refused by `create` (an
     invalid tag shape) is quarantined by the reader and absent from the graph; the same page created
     by hand through `create` is refused with the same reason.
-38. **Backend isolation by configuration.** With `[packs.web] backend = \"X\"`, an ingest lands every
+38. **Backend isolation by configuration.** With `[packs.web] backend = "X"`, an ingest lands every
     row in X and the main store's entity count is unchanged; with no route, the rows land in main.
-39. **Below-the-window origin query.** On a graph where origin B's only matching page ranks below
-    the search candidate window globally, `search(query, tags=[\"origin:B\"])` still returns it.
-    Control: the same query with `properties={\"origin\": \"B\"}` is allowed to miss it, which is why
-    the tag exists.
+39. **Below-the-window origin query, per retrieval leg.** On a graph where origin B's only matching
+    page ranks below the search candidate window globally, `search(query, tags=["origin:B"],
+    source="text")` returns it, and `search(query, tags=["origin:B"], source="vector")` is run as
+    its own arm with its own expected result stated before the run: a vector-leg miss (candidates
+    taken from the nearest-neighbour top-k before the tag predicate applies) is a finding against
+    the search path, recorded as such, not a reason to soften the arm. Control on each leg: the
+    same query with `properties={"origin": "B"}` is allowed to miss, which is why the tag exists.
 
 ### A2.8 What this changes in the tree
 
