@@ -473,3 +473,172 @@ arm are fixture stubs and the public hostnames are stub-resolved names:
     ordinary `blob.put` control: local reads use the reference, and the hosted gate permits the
     tenant with the put-ledger entry and refuses an ungranted tenant, even when the receipt write
     subsequently fails.
+
+## Amendment 2 (2026-09-20): the web pack describes origins, it does not model applications
+
+**Status**: Proposed\
+**Supersedes within this record**: D1's "one ingest verb" reading of scope, D4's dedicated map
+database target, D6.1 (the granularity fence), and acceptance arm 5.
+
+### A2.1 Scope ruling
+
+The web pack owns one thing: a generic vocabulary for what a web origin declares about itself, and
+the verbs that move such declarations into the graph and out of the network. It is not the schema of
+any one manifest format, and it carries no application's domain model. The test for a candidate
+addition is whether it describes something every agent-readable origin can say (a page exists, a
+page has a machine rendering, an origin exposes a callable, an origin publishes an instruction file,
+an origin implements a protocol), or whether it describes what one application does with origins
+(a registry, a catalog of storefronts, a checkout flow, an auth broker). The first belongs here. The
+second is expressed on top of this vocabulary by the application, using the kg pack's generic
+mechanisms, and the pack never learns the application's keys.
+
+Consequences, stated as rules:
+
+1. **No application abstraction enters the pack.** A registry of origins is a set of `site` entities
+   under a namespace; there is no registry entity, no registry verb. A visual registry (screenshots,
+   favicons, rendered views) is attachments and blob references on the entities that already exist;
+   there is no visual kind.
+2. **Domain blocks are not transcribed into pack-owned properties.** Blocks such as commerce, oauth,
+   api catalogs, integrations, policies and bot-auth declarations describe what an application layer
+   does with an origin. The pack does not read them, does not name them, and does not store them as
+   `site` properties. They stay reachable in full through A2.3, so nothing is lost and nothing is
+   modeled.
+3. **A source format is a reader, not the ontology.** The ARW manifest is the first reader
+   (`manifest.rs`, `views.rs`). A second format (an MCP server card, an agent card, an `llms.txt`
+   without a manifest) is a second reader that emits the same entities and edges. Format-specific
+   knowledge, including which manifest key declares a protocol, lives in the reader and nowhere else.
+4. **Prototypes above the pack are the application's.** An application prototype that composes the
+   pack's output with its own notes, edges and properties through the MCP verbs is the intended
+   consumer shape; the pack gains no verb to serve one prototype's query.
+
+### A2.2 Coverage: everything an origin can declare, and where khive holds it
+
+The table is written against the ARW 1.0 manifest schema (`arw.schema.json`, fourteen top-level
+keys), its well-known surface, `llms.txt` and machine-view frontmatter, and asks of each item which
+khive mechanism expresses it. "Reader" means the ARW reader transcribes it; "attachment" means it is
+reachable through the stored manifest (A2.3); "application" means the layer above expresses it with
+generic verbs and the pack does not read it.
+
+| Declared thing                                                               | khive expression                                                                                                                  | Who         |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| the origin (`site`: name, description, homepage, contact)                    | `service`/`site` entity; declared fields as properties                                                                            | reader      |
+| `version`, `profile`, `content_signals`                                      | `site` properties, verbatim                                                                                                       | reader      |
+| a content entry (`content[]`)                                                | `document`/`page`; declared fields as properties; `site contains page`                                                            | reader      |
+| a machine view (`markdown_url`, frontmatter, chunks)                         | `document`/`machine_view`; `machine_view derived_from page`                                                                       | reader      |
+| a callable (`tools[]`)                                                       | `service`/`agent_tool`; `site contains agent_tool`                                                                                | reader      |
+| a skill (`skills[]`, `agent-skills/index.json`)                              | `document`/`agent_skill`; `site contains agent_skill`; `agent_skill depends_on agent_tool`                                        | reader      |
+| a protocol the origin implements                                             | `site implements concept/interface` (ADR-085 subtype, alias `protocol`)                                                           | reader      |
+| the manifest bytes themselves                                                | blob reference on the `site` entity (A2.3), digest, ingest time                                                                   | reader      |
+| `llms.txt`                                                                   | cross-check against the manifest (D4), quarantine on disagreement                                                                 | reader      |
+| a visual asset (screenshot, favicon, rendered view)                          | blob reference on the owning entity; no new kind                                                                                  | either      |
+| integrations, commerce, oauth, api catalog, policies, bot auth, computer use | reachable through the stored manifest; expressed above the pack as properties, notes and edges on the entities the reader created | application |
+| a registry of origins                                                        | the `site` entities under one namespace; a `project` entity if the application wants a handle                                     | application |
+| an observation or judgment about an origin                                   | `observation` or `insight` note `annotates` the entity                                                                            | application |
+| provenance of a claim about an origin                                        | `document`/`artifact` `supports` or `refutes` a `concept` (ADR-055)                                                               | application |
+| who runs the origin                                                          | `service introduced_by org` or `person` (base rule)                                                                               | application |
+
+No new base kind, no new note kind, no new relation, and no new subtype is required for any row.
+The five D2 subtypes plus the existing `interface` subtype cover every declared thing; the rest is
+properties, attachments and generic notes.
+
+### A2.3 The manifest is an attachment, and every derived entity carries its origin
+
+The reader stores the manifest's raw bytes in the blob store (`blob.put`, idempotent, BLAKE3 ref)
+and sets three properties on the `site` entity: `manifest_ref` (the ContentRef), `manifest_digest`
+(BLAKE3 of the same bytes, hex, as today), `ingested_at` (RFC 3339). The whole declaration is
+therefore reachable by anyone who can read the site entity, including every key the pack does not
+model, through `blob.get`. This replaces transcribing unknown keys into properties: the pack keeps
+nothing it does not understand and loses nothing.
+
+Every entity the reader derives from a manifest (`page`, `machine_view`, `agent_tool`,
+`agent_skill`) carries `origin` (the canonical host, as used in its UUIDv5 key) and `site_id` (the
+owning site's id) as properties. This makes "restrict discovery to one origin" and "which site owns
+this hit" answerable by `search(properties={...})` and by reading the hit, with no neighbor walk.
+It is a transcription of a fact the reader already knows, not a derived judgment.
+
+Protocol presence is transcribed as `site implements interface`. The reader's mapping from manifest
+evidence to protocol name (an `integrations[]` entry of type `mcp`, `a2a` or `agent-comm`; a
+commerce block with `enabled: true` for `ucp`, `acp`, `mpp` or `x402`; an `oauth` block; a
+`computer_use` block) is reader knowledge under A2.1.3: the pack reads those blocks only to answer
+"is the protocol declared", never to store them. `interface` entities are created on first reference
+under the caller's namespace with id UUIDv5(pack namespace, `["interface", name]`), so a second
+ingest of any origin links to the same row. A `webhooks` integration is not an agent protocol and
+yields no edge.
+
+### A2.4 Verbs: what stays, what goes
+
+| Verb         | Disposition                                                                                                                                                                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web.ingest` | Stays; signature becomes `web.ingest(source, include_views?, namespace?)`. Writes the caller's graph through the validated create path, under the caller's namespace. `db` is removed. |
+| `web.fetch`  | As Amendment 1, unchanged.                                                                                                                                                             |
+| `web.search` | As Amendment 1, unchanged.                                                                                                                                                             |
+| `web.query`  | Not added. Every registry query shape maps onto kg verbs on the same graph (A2.5).                                                                                                     |
+
+`web.ingest` writes the shared graph. The D6.1 granularity fence ("whole-fleet ingests target
+dedicated map databases") is retired, and with it the production-database refusal, the default
+`<source>/.khive/web-map.db` path, the pack's private runtime construction and the pack-local write
+path that bypassed the runtime's create seam. Isolation of a bulk ingest is the namespace: an
+ingest of one hundred origins under `namespace="arw-registry"` is invisible to every other namespace
+by the existing visibility rules, and is removed by the existing namespace tooling. A dedicated
+database remains available as a deployment shape through the shipped `[[backends]]` and
+`[packs.web] backend=` configuration (ADR-028 Amendment A4), chosen by the operator, never by a verb
+argument.
+
+Writing through the runtime's create seam has two consequences that the map-database path could
+not provide. Entities embed with the runtime's configured embedders at write time, so the vector arm
+exists without an operator reindex. And the kind hooks, entity-type validation and edge rules run
+on every row exactly as they do for a hand-written `create`, so a reader cannot emit a row the graph
+would refuse from anyone else.
+
+### A2.5 Query shapes, answered by kg verbs
+
+| Question                             | Verb                                                                           |
+| ------------------------------------ | ------------------------------------------------------------------------------ |
+| free-text discovery across origins   | `search(kind="entity", query=...)`; each hit carries `origin` and `site_id`    |
+| discovery restricted to one subtype  | `search(entity_type="agent_tool")`                                             |
+| discovery restricted to one origin   | `search(properties={"origin": "<host>"})`                                      |
+| which origins implement a protocol   | `neighbors(id=<interface id>, direction="incoming", relations=["implements"])` |
+| tag filter                           | `search(tags=[...])`                                                           |
+| property filter on the site block    | `search(entity_type="site", properties={...})`                                 |
+| enumerate origins with freshness     | `list(entity_type="site")`; `ingested_at` and `manifest_digest` are properties |
+| read a block the pack does not model | `get(site)` then `blob.get(manifest_ref)`                                      |
+
+### A2.6 Report
+
+The ingest report keeps its counts and quarantines and changes two fields: `ignored_keys` becomes a
+map from key name to count (a bare total told the reader nothing about what was skipped), and
+`implements` in `relation_counts` is populated by A2.3. `db_path` is removed; `namespace` is added.
+
+### A2.7 Acceptance, replacing arm 5 and extending the base numbering
+
+31. **Namespace isolation** (replaces arm 5). Ingesting tree A under namespace X and tree B under
+    namespace Y: a search from X returns no row of B, a search from Y returns no row of A, and a
+    search from a namespace that can see both returns both. Mutation: drop the namespace from the
+    create path and the isolation arm goes red.
+32. **Manifest round-trip.** After ingest, `get(site)` yields `manifest_ref`; `blob.get(manifest_ref)`
+    returns bytes whose BLAKE3 equals `manifest_digest`; a one-byte change to the manifest and a
+    re-ingest yields a new ref and digest on the same site id.
+33. **Origin stamp.** Every derived entity carries `origin` and `site_id`; `search(properties=
+    {"origin": A})` on a two-origin graph returns rows of A only. Mutation: drop the stamp and the arm
+    goes red.
+34. **Protocol presence.** A fixture declaring `mcp` under integrations, `ucp` and `acp` enabled
+    under commerce, and an `oauth` block yields four `implements` edges to four `interface` rows;
+    removing the commerce block from the fixture and re-ingesting drops exactly the `ucp` and `acp`
+    edges. A `webhooks` integration yields no edge (control).
+35. **No domain transcription.** After ingesting the A2.34 fixture, the `site` entity's properties
+    contain none of `commerce`, `oauth`, `integrations`, `api_catalog`, `policies`, `web_bot_auth`,
+    `computer_use`; the report's `ignored_keys` names each with its count.
+36. **Vector arm without reindex.** On a runtime with an embedder configured, `search(source="vector")`
+    returns an ingested page immediately after ingest, with no reindex step between.
+37. **Create-seam parity.** A fixture page whose declaration would be refused by `create` (an
+    invalid tag shape) is quarantined by the reader and absent from the graph; the same page created
+    by hand through `create` is refused with the same reason.
+
+### A2.8 What this changes in the tree
+
+`db_target.rs` is removed with its tests; `persistence.rs` shrinks to a call into the runtime's create
+and link operations under the caller's token; `manifest.rs` gains the protocol-presence read and
+by-name ignored keys and loses nothing; `extract.rs` stamps `origin` and `site_id`; `handlers.rs`
+takes `namespace` and drops `db`; `docs/packs/web.md` is rewritten for the new signature and the
+namespace model. Amendment 1's fetch and search are implemented after this amendment lands, on the
+same create-free footing (they write blobs and receipts, never the graph).
