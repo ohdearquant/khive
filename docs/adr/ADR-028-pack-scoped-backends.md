@@ -746,3 +746,22 @@ This preserves ADR-029's separation: each backend runtime owns its embedding
 search and engine fusion; the coordinator fuses backend result lists.
 
 Implementation acceptance must separately prove that the verbatim documented example validates; implicit-main routes reject unknown backends; explicit declarations and actual coordinator runtimes cover both searchable substrates; and mixed `no_embed` packs retain vector search without changing write opt-out. Existing invalid-field and empty-declaration guards remain. Default/extra-model and all-text-only controls accompany selection. The production coordinator-attached boot path is covered; APIs that construct a server without a coordinator do not gain a new fan-out claim from this amendment. Extra-model-only selection preserves configured models without changing the existing default-model vector-arm policy.
+
+## Amendment A4: `[[backends]]` and `[packs.<name>]` are shipped, not deferred (2026-09-20)
+
+**Status**: Accepted
+
+Section 1 above lists `[[backends]]`, `[packs.<name>]` and `[packs.<name>].backend` as target
+fields "not part of the shipped parser". That was true when the section was written and is no
+longer true: the shipped parser reads both. `KhiveConfig.backends: Vec<BackendConfig>` and
+`KhiveConfig.packs: HashMap<String, PackConfig>` are deserialized from the config file
+(`crates/khive-runtime/src/engine_config.rs`, `KhiveConfig` with its `backends` and `packs`
+fields, `BackendConfig`, and `PackConfig.backend` with its `no_embed` opt-out), and the serve
+boot path constructs one pack runtime per assigned backend and applies each pack's schema plan
+on that backend (`crates/khive-mcp/src/serve.rs`, the per-pack runtime map and `backend_for_pack`).
+Amendments A2 and A3 already describe behavior that only exists because these fields are
+parsed. A reader deciding where a new pack's data lives should read the config schema from
+`engine_config.rs` and the examples in Sections 4 through 7, and treat the "deferred" list in
+Section 1 as a record of the original plan. The tuning fields named there (`cache_mb`,
+`journal_mode`, `pragma_synchronous`, `read_only`) keep the A3 position: parsed and rejected,
+or in the case of `read_only`, the A2 snapshot-inspection semantics.
