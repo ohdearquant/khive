@@ -6,6 +6,7 @@ mod atomic_apply;
 pub mod cli;
 pub mod code_audit;
 pub mod code_ingest;
+pub mod compose;
 pub mod coordinator;
 pub mod dbpath;
 pub mod engine;

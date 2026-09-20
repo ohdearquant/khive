@@ -13,7 +13,11 @@
 //! hops that never carry a body — becomes a `site`-scoped `page`/`resource`
 //! row (unfetched placeholders for anything but the terminal hop), a
 //! permanent redirect (301/308) becomes `new supersedes old` (D2), and the
-//! terminal hop gets the blob, the full property set, and the receipt.
+//! terminal hop gets the blob, the full property set, and the receipt. The
+//! terminal hop's own mint/blob/patch sequence is [`settle_content`], shared
+//! with `web.ingest`'s disk-tree path (`crate::ingest::ingest_disk_file`) so
+//! there is one row-minting code path for both a fetched and an ingested
+//! `page`/`resource` row (ADR-192 S3).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -196,11 +200,13 @@ struct CredentialAttachment {
 
 /// One traversed redirect: `from` responded `status` naming `to` as its
 /// `Location`. Never the terminal hop — that one is handled by [`settle`]
-/// directly from the loop's final outcome.
-struct RedirectHop {
-    from: Url,
-    to: Url,
-    status: u16,
+/// (or, for `web.refresh`, [`settle_redirect_hops`] directly) from the
+/// loop's final outcome. `pub(crate)` so [`crate::refresh`] shares this type
+/// rather than declaring an equivalent one of its own.
+pub(crate) struct RedirectHop {
+    pub(crate) from: Url,
+    pub(crate) to: Url,
+    pub(crate) status: u16,
 }
 
 async fn run_fetch(
@@ -226,7 +232,7 @@ async fn run_fetch(
             .into())
         }
     };
-    let mut url = Url::parse(&params.url)
+    let url = Url::parse(&params.url)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
     let persist = params.persist.unwrap_or(true);
 
@@ -265,22 +271,79 @@ async fn run_fetch(
     };
 
     let deadline = Instant::now() + Duration::from_secs(timeout_s);
+
+    let (outcome, redirect_hops) = run_hop_chain(
+        resolver,
+        cfg,
+        url.clone(),
+        method.clone(),
+        max_bytes,
+        deadline,
+        |current_url| {
+            if credential.is_some() {
+                egress::check_credential_scheme(current_url)?;
+                let host = current_url.host_str().unwrap_or_default();
+                egress::check_credential(
+                    cfg,
+                    params.credential.as_deref().unwrap_or_default(),
+                    host,
+                )?;
+            }
+            let mut hop_headers_out: Vec<(String, String)> = allowed_headers.clone();
+            if let Some(credential) = &credential {
+                hop_headers_out.push(credential.header.clone());
+            }
+            Ok(hop_headers_out)
+        },
+    )
+    .await?;
+
+    settle(
+        runtime,
+        token,
+        &method_name,
+        &outcome.final_url,
+        outcome.status,
+        &outcome.headers,
+        outcome.body,
+        &redirect_hops,
+        persist,
+    )
+    .await
+}
+
+/// Bounded multi-hop redirect chain, address-safety-checked at every hop
+/// (scheme/userinfo, host allowlist, DNS resolve-and-pin — the same egress
+/// rules on hop 1 and hop N): shared by [`run_fetch`] and
+/// [`crate::refresh::run_refresh`] so a redirect is followed identically by
+/// both verbs, per ADR-191 D2's "same egress rules" requirement.
+///
+/// `headers_for_hop` is called once per hop with that hop's (possibly
+/// redirected) URL; it returns the request headers for that hop and is also
+/// the caller's opportunity to re-validate anything URL-dependent before the
+/// hop is dialed (`run_fetch` re-checks its credential's host scope there —
+/// `run_refresh` never carries a credential, so its closure is a constant).
+/// Returns the terminal hop's outcome plus every traversed redirect, in
+/// order — never the terminal hop itself, matching [`RedirectHop`]'s doc.
+pub(crate) async fn run_hop_chain<F>(
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
+    mut url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    mut headers_for_hop: F,
+) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+{
     let mut redirects = 0u32;
     let mut redirect_hops: Vec<RedirectHop> = Vec::new();
-    let mut hop_status: u16;
-    let mut hop_headers: reqwest::header::HeaderMap;
-    let mut final_url: Url;
-    let mut body: Option<(Vec<u8>, bool)>;
 
     loop {
         egress::check_scheme_and_userinfo(&url)?;
         egress::check_allowlist(url.host_str().unwrap_or_default(), cfg)?;
-        if let Some(credential) = &credential {
-            egress::check_credential_scheme(&url)?;
-            let host = url.host_str().unwrap_or_default();
-            egress::check_credential(cfg, params.credential.as_deref().unwrap_or_default(), host)?;
-            let _ = credential;
-        }
+        let hop_headers_out = headers_for_hop(&url)?;
         let host = url
             .host_str()
             .ok_or_else(|| RuntimeError::InvalidInput("url has no host".to_string()))?
@@ -296,11 +359,6 @@ async fn run_fetch(
             deadline.saturating_duration_since(Instant::now()),
         )?;
 
-        let mut hop_headers_out: Vec<(String, String)> = allowed_headers.clone();
-        if let Some(credential) = &credential {
-            hop_headers_out.push(credential.header.clone());
-        }
-
         let outcome = run_one_hop(
             &client,
             &url,
@@ -310,12 +368,8 @@ async fn run_fetch(
             deadline,
         )
         .await?;
-        hop_status = outcome.status;
-        hop_headers = outcome.headers;
-        final_url = outcome.final_url;
-        body = outcome.body;
 
-        match outcome.redirect_to {
+        match &outcome.redirect_to {
             Some(next) => {
                 if redirects >= MAX_REDIRECTS {
                     return Err(Refusal::new(
@@ -327,28 +381,15 @@ async fn run_fetch(
                 redirect_hops.push(RedirectHop {
                     from: url.clone(),
                     to: next.clone(),
-                    status: hop_status,
+                    status: outcome.status,
                 });
                 redirects += 1;
-                url = next;
+                url = next.clone();
                 continue;
             }
-            None => break,
+            None => return Ok((outcome, redirect_hops)),
         }
     }
-
-    settle(
-        runtime,
-        token,
-        &method_name,
-        &final_url,
-        hop_status,
-        &hop_headers,
-        body,
-        &redirect_hops,
-        persist,
-    )
-    .await
 }
 
 /// A resource/page identity resolved for one URL, minted (bare, if absent)
@@ -402,6 +443,123 @@ async fn canonical_site(
     Ok(entity.id)
 }
 
+/// Mint a placeholder row for every traversed redirect and, for a permanent
+/// redirect (301/308), link `new supersedes old` — D2's "document supersedes
+/// document" on a permanent redirect. Shared by [`settle`] (`web.fetch`) and
+/// [`crate::refresh::run_refresh`] (`web.refresh`) so both verbs record a
+/// redirect chain identically; returns every entity id touched (the `from`
+/// side of each hop — the `to` side is either another hop's `from` or the
+/// terminal entity a caller mints separately).
+pub(crate) async fn settle_redirect_hops(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    redirect_hops: &[RedirectHop],
+) -> Result<Vec<Uuid>, RuntimeError> {
+    let mut entities_touched: Vec<Uuid> = Vec::new();
+    for hop in redirect_hops {
+        let (_from_site, from_id) = mint_bare(runtime, token, &hop.from).await?;
+        let (_to_site, to_id) = mint_bare(runtime, token, &hop.to).await?;
+        crate::entities::patch(
+            runtime,
+            token,
+            from_id,
+            None,
+            json!({ "status": hop.status, "redirect_to": hop.to.to_string() }),
+        )
+        .await?;
+        entities_touched.push(from_id);
+        if hop.status == 301 || hop.status == 308 {
+            runtime
+                .link(token, to_id, from_id, EdgeRelation::Supersedes, 1.0, None)
+                .await?;
+        }
+    }
+    Ok(entities_touched)
+}
+
+/// Mint (if absent), blob-store the body, and patch one page/resource
+/// entity's full row: identity resolve, `site contains {page|resource}`
+/// link (arm29: minted before the blob put, so a failing store still leaves
+/// a fetchable placeholder behind), blob put, then the fetched-content
+/// property patch (url/content_type/blob_ref/content_digest/size/status/
+/// fetched_at/etag/last_modified). Shared by [`settle`] (`web.fetch`'s
+/// terminal hop, when `persist` is set) and `ingest::ingest_disk_file`
+/// (`web.ingest`'s disk-tree path, which always persists) — LEG_B_REPORT.md
+/// flagged the two as a partial duplication before this extraction.
+pub(crate) struct SettledContent {
+    pub id: Uuid,
+    pub content_ref: Option<String>,
+    pub bytes: u64,
+    pub truncated: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn settle_content(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    url: &Url,
+    content_type: Option<&str>,
+    status: u16,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    body: Option<(Vec<u8>, bool)>,
+) -> Result<SettledContent, RuntimeError> {
+    let canonical = identity::canonicalize(url.clone());
+    let site = canonical_site(runtime, token, &canonical).await?;
+    let path_and_query = identity::path_and_query(&canonical);
+    let id = identity::document_id(site, &path_and_query);
+    let entity_type = classify_entity_type(content_type);
+    crate::entities::get_or_create(
+        runtime,
+        token,
+        id,
+        "document",
+        entity_type,
+        canonical.as_ref(),
+        json!({ "url": canonical.to_string() }),
+    )
+    .await?;
+    runtime
+        .link(token, site, id, EdgeRelation::Contains, 1.0, None)
+        .await?;
+
+    let (content_ref, bytes, truncated) = match body {
+        None => (None, 0u64, false),
+        Some((buffer, truncated)) => {
+            let store = crate::blob_store(runtime)?;
+            let len = buffer.len() as u64;
+            let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
+            (Some(content_ref.to_string()), len, truncated)
+        }
+    };
+
+    crate::entities::patch(
+        runtime,
+        token,
+        id,
+        Some(entity_type),
+        json!({
+            "url": canonical.to_string(),
+            "content_type": content_type,
+            "blob_ref": content_ref,
+            "content_digest": content_ref,
+            "size": bytes,
+            "status": status,
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "etag": etag,
+            "last_modified": last_modified,
+        }),
+    )
+    .await?;
+
+    Ok(SettledContent {
+        id,
+        content_ref,
+        bytes,
+        truncated,
+    })
+}
+
 /// Everything after the redirect loop settles on a final hop: every
 /// traversed redirect becomes a placeholder row plus (for 301/308)
 /// `new supersedes old`; the terminal hop's GET body (if any) goes to the
@@ -422,92 +580,46 @@ async fn settle(
     let mut entities_touched: Vec<Uuid> = Vec::new();
 
     if persist {
-        for hop in redirect_hops {
-            let (_from_site, from_id) = mint_bare(runtime, token, &hop.from).await?;
-            let (_to_site, to_id) = mint_bare(runtime, token, &hop.to).await?;
-            crate::entities::patch(
-                runtime,
-                token,
-                from_id,
-                None,
-                json!({ "status": hop.status, "redirect_to": hop.to.to_string() }),
-            )
-            .await?;
-            entities_touched.push(from_id);
-            if hop.status == 301 || hop.status == 308 {
-                runtime
-                    .link(token, to_id, from_id, EdgeRelation::Supersedes, 1.0, None)
-                    .await?;
-            }
-        }
+        entities_touched.extend(settle_redirect_hops(runtime, token, redirect_hops).await?);
     }
 
     let response_headers_json = extract_allowed_headers(headers);
     let content_type = header_str(headers, "content-type").map(str::to_string);
 
-    // Entity identity is address-derived and independent of the blob put
-    // below (arm29): mint/link the row first so a failing store still
-    // leaves a fetchable entity behind, then patch in the put-dependent
-    // fields once the put outcome (success or failure) is known.
-    let mut final_entity_id: Option<Uuid> = None;
-    if persist {
-        let canonical = identity::canonicalize(final_url.clone());
-        let site = canonical_site(runtime, token, &canonical).await?;
-        let path_and_query = identity::path_and_query(&canonical);
-        let id = identity::document_id(site, &path_and_query);
-        let entity_type = classify_entity_type(content_type.as_deref());
-        crate::entities::get_or_create(
+    // persist=false still blob-puts and reports the content_ref/bytes back
+    // to the caller (a dry-run-ish read) but never touches the graph, so it
+    // cannot go through `settle_content` (which always mints); persist=true
+    // delegates the whole mint+link+blob+patch sequence to it.
+    let (final_entity_id, content_ref, bytes, truncated) = if persist {
+        let settled = settle_content(
             runtime,
             token,
-            id,
-            "document",
-            entity_type,
-            canonical.as_ref(),
-            json!({ "url": canonical.to_string() }),
+            final_url,
+            content_type.as_deref(),
+            status,
+            header_str(headers, "etag"),
+            header_str(headers, "last-modified"),
+            body,
         )
         .await?;
-        runtime
-            .link(token, site, id, EdgeRelation::Contains, 1.0, None)
-            .await?;
-        entities_touched.push(id);
-        final_entity_id = Some(id);
-    }
-
-    let (content_ref, bytes, truncated) = match &body {
-        None => (None, 0u64, false),
-        Some((buffer, truncated)) => {
-            let store = crate::blob_store(runtime)?;
-            let len = buffer.len() as u64;
-            let content_ref = store
-                .put(buffer.clone())
-                .await
-                .map_err(RuntimeError::from)?;
-            (Some(content_ref.to_string()), len, *truncated)
+        entities_touched.push(settled.id);
+        (
+            Some(settled.id),
+            settled.content_ref,
+            settled.bytes,
+            settled.truncated,
+        )
+    } else {
+        match body {
+            None => (None, None, 0u64, false),
+            Some((buffer, truncated)) => {
+                let store = crate::blob_store(runtime)?;
+                let len = buffer.len() as u64;
+                let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
+                (None, Some(content_ref.to_string()), len, truncated)
+            }
         }
     };
-
-    if let Some(id) = final_entity_id {
-        let canonical = identity::canonicalize(final_url.clone());
-        let entity_type = classify_entity_type(content_type.as_deref());
-        crate::entities::patch(
-            runtime,
-            token,
-            id,
-            Some(entity_type),
-            json!({
-                "url": canonical.to_string(),
-                "content_type": content_type,
-                "blob_ref": content_ref,
-                "content_digest": content_ref,
-                "size": bytes,
-                "status": status,
-                "fetched_at": chrono::Utc::now().to_rfc3339(),
-                "etag": header_str(headers, "etag"),
-                "last_modified": header_str(headers, "last-modified"),
-            }),
-        )
-        .await?;
-    }
 
     let redirect_chain: Vec<Value> = redirect_hops
         .iter()

@@ -14,11 +14,14 @@
 //! chain: the history of one resource's fetches"), whether or not the body
 //! changed.
 //!
-//! Single-hop only: unlike `fetch`, this does not follow redirects. D2 lists
-//! `refresh` among the operations that can produce `document supersedes
-//! document` on a permanent redirect, which a full implementation would
-//! need `fetch.rs`'s redirect loop for; flagged as an open question in
-//! LEG_B_REPORT.md rather than duplicated here under this leg's time bound.
+//! Follows redirects the same bounded chain `fetch` does, through the same
+//! egress checks on every hop — [`crate::fetch::run_hop_chain`], shared
+//! rather than a second redirect loop. Every traversed hop gets the same
+//! treatment `fetch::settle` gives it ([`crate::fetch::settle_redirect_hops`]):
+//! a placeholder row per hop and, on a permanent redirect (301/308),
+//! `document supersedes document` (D2). The entity the caller asked to
+//! refresh (`id`) stays the entity patched with the terminal content; only
+//! its recorded `url` follows the chain to the terminal hop's address.
 
 use std::time::{Duration, Instant};
 
@@ -30,7 +33,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::egress::{self, Refusal, Resolver, SystemResolver};
-use crate::fetch::{resolve_effective_token, run_one_hop, HopOutcome};
+use crate::fetch::{resolve_effective_token, HopOutcome};
 use crate::receipt::write_receipt;
 use crate::WebPack;
 
@@ -130,23 +133,6 @@ async fn run_refresh(
     )?;
     let deadline = Instant::now() + Duration::from_secs(timeout_s);
 
-    egress::check_scheme_and_userinfo(&url)?;
-    egress::check_allowlist(url.host_str().unwrap_or_default(), cfg)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| RuntimeError::InvalidInput("url has no host".to_string()))?
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| RuntimeError::InvalidInput("url has no resolvable port".to_string()))?;
-    let addr = egress::resolve_and_pin(resolver, &host).await?;
-    let client = egress::pinned_client(
-        &host,
-        addr,
-        port,
-        deadline.saturating_duration_since(Instant::now()),
-    )?;
-
     let mut headers: Vec<(String, String)> = Vec::new();
     if let Some(etag) = properties.get("etag").and_then(Value::as_str) {
         headers.push(("If-None-Match".to_string(), etag.to_string()));
@@ -155,13 +141,19 @@ async fn run_refresh(
         headers.push(("If-Modified-Since".to_string(), last_modified.to_string()));
     }
 
-    let outcome = run_one_hop(
-        &client,
-        &url,
+    // Same bounded chain, same per-hop egress checks as `web.fetch`
+    // (`crate::fetch::run_hop_chain`) — a refresh that hits a moved resource
+    // follows the redirect rather than conditional-GETing the old address
+    // forever. The conditional headers are resent unchanged on every hop,
+    // same as `web.fetch` resends its own fixed header set per hop.
+    let (outcome, redirect_hops) = crate::fetch::run_hop_chain(
+        resolver,
+        cfg,
+        url,
         reqwest::Method::GET,
-        &headers,
         max_bytes,
         deadline,
+        |_current_url| Ok(headers.clone()),
     )
     .await?;
 
@@ -172,16 +164,24 @@ async fn run_refresh(
         &url_str,
         &stored_content_ref,
         outcome,
+        &redirect_hops,
     )
     .await
 }
 
-/// Everything after a refresh's single hop has an outcome — egress-free on
-/// purpose, so tests can drive it from a locally-dialed `run_one_hop` the
+/// Everything after a refresh's hop chain has an outcome — egress-free on
+/// purpose, so tests can drive it from locally-dialed `run_one_hop` calls the
 /// same way `fetch::settle` is exercised directly, without going through
 /// `resolve_and_pin` (which refuses 127.0.0.1 as loopback regardless of
 /// which `Resolver` answers it — the address class is checked on the
 /// resolved IP itself, not on resolver trust).
+///
+/// `redirect_hops` gets the exact same treatment `fetch::settle` gives it
+/// (`crate::fetch::settle_redirect_hops`, shared, not duplicated): a
+/// placeholder row per traversed hop and `new supersedes old` on 301/308.
+/// `id` — the entity the caller asked to refresh — stays the entity that is
+/// patched with the terminal content; only its recorded `url` property
+/// follows the chain to `outcome.final_url` when hops were traversed.
 async fn settle_refresh(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -189,13 +189,21 @@ async fn settle_refresh(
     url_str: &str,
     stored_content_ref: &str,
     outcome: HopOutcome,
+    redirect_hops: &[crate::fetch::RedirectHop],
 ) -> Result<Value, RuntimeError> {
     let previous_receipt = latest_receipt(runtime, token, id).await?;
 
+    let mut entities_touched: Vec<Uuid> = vec![id];
+    entities_touched
+        .extend(crate::fetch::settle_redirect_hops(runtime, token, redirect_hops).await?);
+
+    let final_url_str = outcome.final_url.to_string();
+
     let mut changed = false;
     let mut new_content_ref: Option<String> = None;
+    let mut final_id: Option<Uuid> = None;
     if outcome.status != 304 {
-        if let Some((buffer, _truncated)) = &outcome.body {
+        if let Some((buffer, truncated)) = &outcome.body {
             let store = crate::blob_store(runtime)?;
             let content_ref = store
                 .put(buffer.clone())
@@ -209,58 +217,94 @@ async fn settle_refresh(
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let entity_type = match content_type.as_deref() {
-                    Some(ct) => {
-                        let base = ct
-                            .split(';')
-                            .next()
-                            .unwrap_or_default()
-                            .trim()
-                            .to_ascii_lowercase();
-                        if base == "text/html" || base == "application/xhtml+xml" {
-                            "page"
-                        } else {
-                            "resource"
+                if redirect_hops.is_empty() {
+                    let entity_type = match content_type.as_deref() {
+                        Some(ct) => {
+                            let base = ct
+                                .split(';')
+                                .next()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_ascii_lowercase();
+                            if base == "text/html" || base == "application/xhtml+xml" {
+                                "page"
+                            } else {
+                                "resource"
+                            }
                         }
+                        None => "resource",
+                    };
+                    crate::entities::patch(
+                        runtime,
+                        token,
+                        id,
+                        Some(entity_type),
+                        json!({
+                            "url": url_str,
+                            "content_type": content_type,
+                            "blob_ref": content_ref_str,
+                            "content_digest": content_ref_str,
+                            "size": buffer.len() as u64,
+                            "status": outcome.status,
+                            "fetched_at": chrono::Utc::now().to_rfc3339(),
+                            "etag": outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
+                            "last_modified": outcome.headers.get("last-modified").and_then(|v| v.to_str().ok()),
+                        }),
+                    )
+                    .await?;
+                } else {
+                    // Identity is by address: the body served at the terminal
+                    // hop belongs to that address's own row, which
+                    // `settle_redirect_hops` has already minted (and, on
+                    // 301/308, linked `supersedes` over the caller's row).
+                    // The caller-named row keeps its own url.
+                    let settled = crate::fetch::settle_content(
+                        runtime,
+                        token,
+                        &outcome.final_url,
+                        content_type.as_deref(),
+                        outcome.status,
+                        outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
+                        outcome
+                            .headers
+                            .get("last-modified")
+                            .and_then(|v| v.to_str().ok()),
+                        Some((buffer.clone(), *truncated)),
+                    )
+                    .await?;
+                    if !entities_touched.contains(&settled.id) {
+                        entities_touched.push(settled.id);
                     }
-                    None => "resource",
-                };
-                crate::entities::patch(
-                    runtime,
-                    token,
-                    id,
-                    Some(entity_type),
-                    json!({
-                        "url": url_str,
-                        "content_type": content_type,
-                        "blob_ref": content_ref_str,
-                        "content_digest": content_ref_str,
-                        "size": buffer.len() as u64,
-                        "status": outcome.status,
-                        "fetched_at": chrono::Utc::now().to_rfc3339(),
-                        "etag": outcome.headers.get("etag").and_then(|v| v.to_str().ok()),
-                        "last_modified": outcome.headers.get("last-modified").and_then(|v| v.to_str().ok()),
-                    }),
-                )
-                .await?;
+                    final_id = Some(settled.id);
+                }
             }
             new_content_ref = Some(content_ref_str);
         }
     }
 
+    let redirect_chain: Vec<Value> = redirect_hops
+        .iter()
+        .map(|hop| {
+            json!({ "from": hop.from.to_string(), "to": hop.to.to_string(), "status": hop.status })
+        })
+        .collect();
+
     let request_record = json!({
         "verb": "web.refresh",
         "url": url_str,
+        "final_url": final_url_str,
         "status": outcome.status,
         "changed": changed,
         "content_ref": new_content_ref,
+        "redirects": redirect_hops.len() as u32,
+        "redirect_chain": redirect_chain,
     });
     let receipt_id = write_receipt(
         runtime,
         token,
         &format!("web.refresh {url_str}"),
         request_record,
-        vec![id],
+        entities_touched,
     )
     .await
     .map_err(|error| {
@@ -285,6 +329,8 @@ async fn settle_refresh(
         "status": outcome.status,
         "changed": changed,
         "receipt_id": receipt_id.to_string(),
+        "redirects": redirect_hops.len() as u32,
+        "final_id": final_id.map(|value| value.to_string()),
     }))
 }
 
@@ -312,6 +358,7 @@ impl WebPack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::run_one_hop;
     use crate::identity;
     use khive_types::Namespace;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -359,7 +406,31 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
         )
         .await?;
-        settle_refresh(runtime, token, id, &url_str, &stored_content_ref, outcome).await
+        settle_refresh(
+            runtime,
+            token,
+            id,
+            &url_str,
+            &stored_content_ref,
+            outcome,
+            &[],
+        )
+        .await
+    }
+
+    /// The in-crate test runtime carries no `VerbRegistry`, so the web
+    /// pack's own `EDGE_RULES` (`site contains page|resource`) are never
+    /// installed on it by default — a redirect-hop `link(Contains, ...)` (via
+    /// `mint_bare`) then refuses against the base allowlist alone. Register
+    /// kg+web through a throwaway registry purely to read back their
+    /// combined `all_edge_rules()`, matching `fetch.rs`'s own test helper of
+    /// the same name.
+    fn install_web_edge_rules(runtime: &KhiveRuntime) {
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(WebPack::new(runtime.clone()));
+        let registry = builder.build().expect("registry builds");
+        runtime.install_edge_rules(registry.all_edge_rules());
     }
 
     async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
@@ -367,6 +438,7 @@ mod tests {
         let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
             .expect("fs blob store");
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
             .expect("install blob store");
@@ -596,5 +668,156 @@ mod tests {
             "the second refresh's receipt supersedes the first"
         );
         assert_eq!(second_neighbors[0].node_id, first_receipt);
+    }
+
+    // LEG_C item 3 (ADR-191 D2/D6): refresh follows redirects the same way
+    // fetch does and emits `document supersedes document` on 301/308 —
+    // through the shared `crate::fetch::settle_redirect_hops`, exercised
+    // here exactly the way `fetch.rs`'s own
+    // `a3_permanent_redirect_supersedes_temporary_redirect_no_edge` exercises
+    // `fetch::settle`: hand-built `RedirectHop`/`HopOutcome` values, no
+    // network. Control: a 302 hop yields no supersedes edge, just a receipt
+    // naming the hop.
+    #[tokio::test]
+    async fn refresh_301_yields_supersedes_edge_302_control_receipt_names_the_hop() {
+        let (runtime, token, _dir) = test_runtime().await;
+
+        // 301: settle_refresh must mint the new address and link
+        // new supersedes old, exactly like fetch::settle does for the same
+        // redirect status.
+        let old_url = Url::parse("http://127.0.0.1:40101/r").unwrap();
+        let new_url = Url::parse("http://127.0.0.1:40101/moved").unwrap();
+        let old_id = seed(&runtime, &token, 40101, b"stale body").await;
+        let old_entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(old_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_ref = old_entity.properties.clone().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let hop = crate::fetch::RedirectHop {
+            from: old_url.clone(),
+            to: new_url.clone(),
+            status: 301,
+        };
+        let outcome = HopOutcome {
+            status: 200,
+            final_url: new_url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            redirect_to: None,
+            body: Some((b"content at the new address".to_vec(), false)),
+        };
+        let reply = settle_refresh(
+            &runtime,
+            &token,
+            old_id,
+            old_url.as_ref(),
+            &stored_ref,
+            outcome,
+            &[hop],
+        )
+        .await
+        .expect("settle_refresh dispatches");
+        assert_eq!(reply["redirects"], 1);
+
+        let new_id = identity::document_id(
+            identity::site_id(&identity::canonicalize(new_url.clone())),
+            &identity::path_and_query(&identity::canonicalize(new_url.clone())),
+        );
+        let neighbors = runtime
+            .neighbors(&token, new_id, khive_storage::Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert!(
+            neighbors
+                .iter()
+                .any(|n| n.node_id == old_id && n.relation == EdgeRelation::Supersedes),
+            "301 during refresh must yield new supersedes old, exactly like fetch"
+        );
+
+        let receipt_id = uuid::Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+        let receipt = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = receipt.properties.unwrap()["request"].clone();
+        assert_eq!(request["redirects"], 1);
+        assert_eq!(request["redirect_chain"][0]["status"], 301);
+        assert_eq!(request["redirect_chain"][0]["to"], new_url.to_string());
+
+        // Control: a 302 hop yields no supersedes edge, just a receipt
+        // naming the hop.
+        let old_url2 = Url::parse("http://127.0.0.1:40102/r").unwrap();
+        let new_url2 = Url::parse("http://127.0.0.1:40102/temp").unwrap();
+        let old_id2 = seed(&runtime, &token, 40102, b"stale body two").await;
+        let old_entity2 = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(old_id2)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_ref2 = old_entity2.properties.clone().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let hop2 = crate::fetch::RedirectHop {
+            from: old_url2.clone(),
+            to: new_url2.clone(),
+            status: 302,
+        };
+        let outcome2 = HopOutcome {
+            status: 200,
+            final_url: new_url2.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            redirect_to: None,
+            body: Some((b"content at the temp address".to_vec(), false)),
+        };
+        let reply2 = settle_refresh(
+            &runtime,
+            &token,
+            old_id2,
+            old_url2.as_ref(),
+            &stored_ref2,
+            outcome2,
+            &[hop2],
+        )
+        .await
+        .expect("settle_refresh dispatches");
+        assert_eq!(reply2["redirects"], 1);
+
+        let new_id2 = identity::document_id(
+            identity::site_id(&identity::canonicalize(new_url2.clone())),
+            &identity::path_and_query(&identity::canonicalize(new_url2.clone())),
+        );
+        let neighbors2 = runtime
+            .neighbors(&token, new_id2, khive_storage::Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !neighbors2
+                .iter()
+                .any(|n| n.relation == EdgeRelation::Supersedes),
+            "a 302 during refresh yields no supersedes edge"
+        );
+
+        let receipt_id2 = uuid::Uuid::parse_str(reply2["receipt_id"].as_str().unwrap()).unwrap();
+        let receipt2 = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(receipt_id2)
+            .await
+            .unwrap()
+            .unwrap();
+        let request2 = receipt2.properties.unwrap()["request"].clone();
+        assert_eq!(request2["redirects"], 1);
+        assert_eq!(request2["redirect_chain"][0]["status"], 302);
     }
 }

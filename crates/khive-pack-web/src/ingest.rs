@@ -11,10 +11,11 @@
 //! looping `fetch` then `extract` would (D3's own framing: "as fetch +
 //! extract"), so there is no second entity-minting code path to keep in
 //! sync for that arm. The disk path (A5) cannot call `handle_fetch` — there
-//! is no HTTP request — so it mints entities directly via the same
-//! `entities::get_or_create`/`patch` + blob-put + receipt sequence
-//! `fetch::settle` uses for its terminal hop; flagged as a partial
-//! duplication (not a shared code path) in LEG_B_REPORT.md.
+//! is no HTTP request — so it calls [`crate::fetch::settle_content`]
+//! directly, the same identity-resolve/mint/blob-put/patch sequence
+//! `fetch::settle` uses for its terminal hop (LEG_B_REPORT.md flagged the
+//! pre-existing duplication between the two; this leg folds them onto one
+//! function, ADR-192 S3).
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -63,78 +64,51 @@ fn guess_content_type(path: &Path) -> &'static str {
     }
 }
 
-/// Mint/update the entity for one disk-tree file, exactly as
-/// `fetch::settle` would for the equivalent HTTP response, minus redirect
-/// handling (files on disk do not redirect).
+/// Mint/patch the entity for one disk-tree file through
+/// [`crate::fetch::settle_content`] — the same identity/mint/blob-put/patch
+/// sequence `fetch::settle` uses for its terminal hop, minus redirect
+/// handling (files on disk do not redirect) and with a status/type derived
+/// from the file itself rather than an HTTP response.
 async fn ingest_disk_file(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     origin: &Url,
-    site_id: Uuid,
     relative_path: &str,
     bytes: Vec<u8>,
 ) -> Result<Uuid, RuntimeError> {
     let target_url = origin.join(relative_path).map_err(|error| {
         RuntimeError::Internal(format!("bad relative path {relative_path:?}: {error}"))
     })?;
-    let canonical = identity::canonicalize(target_url);
-    let path_and_query = identity::path_and_query(&canonical);
-    let id = identity::document_id(site_id, &path_and_query);
     let content_type = guess_content_type(Path::new(relative_path));
-    let entity_type = if content_type == "text/html" {
-        "page"
-    } else {
-        "resource"
-    };
 
-    let store = crate::blob_store(runtime)?;
-    let content_ref = store.put(bytes.clone()).await.map_err(RuntimeError::from)?;
-
-    crate::entities::get_or_create(
+    let settled = crate::fetch::settle_content(
         runtime,
         token,
-        id,
-        "document",
-        entity_type,
-        canonical.as_ref(),
-        json!({ "url": canonical.to_string() }),
+        &target_url,
+        Some(content_type),
+        200,
+        None,
+        None,
+        Some((bytes, false)),
     )
     .await?;
-    crate::entities::patch(
-        runtime,
-        token,
-        id,
-        Some(entity_type),
-        json!({
-            "url": canonical.to_string(),
-            "content_type": content_type,
-            "blob_ref": content_ref.to_string(),
-            "content_digest": content_ref.to_string(),
-            "size": bytes.len() as u64,
-            "status": 200,
-            "fetched_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-    .await?;
-    runtime
-        .link(token, site_id, id, EdgeRelation::Contains, 1.0, None)
-        .await?;
 
+    let canonical = identity::canonicalize(target_url);
     let request_record = json!({
         "verb": "web.ingest",
         "mode": "disk",
         "url": canonical.to_string(),
-        "bytes": bytes.len() as u64,
+        "bytes": settled.bytes,
     });
     write_receipt(
         runtime,
         token,
         &format!("web.ingest (disk) {canonical}"),
         request_record,
-        vec![id],
+        vec![settled.id],
     )
     .await?;
-    Ok(id)
+    Ok(settled.id)
 }
 
 fn walk_files(root: &Path) -> Result<Vec<std::path::PathBuf>, RuntimeError> {
@@ -195,8 +169,7 @@ async fn ingest_disk(
                 path.display()
             ))
         })?;
-        let id =
-            ingest_disk_file(runtime, token, &canonical_origin, site_id, &relative, bytes).await?;
+        let id = ingest_disk_file(runtime, token, &canonical_origin, &relative, bytes).await?;
         minted.push(id.to_string());
     }
     Ok(json!({ "mode": "disk", "site": site_id.to_string(), "ingested": minted }))
@@ -362,8 +335,9 @@ mod tests {
     // entity per file, each with the id its URL would deterministically
     // compute to under that origin (D1) — the row-by-row id-equality
     // assertion the ADR calls for, checked against `identity::document_id`
-    // directly rather than against a live HTTP ingest of the same tree
-    // (this leg has no test HTTP-serving-a-directory fixture available).
+    // directly. `a5_literal_http_served_tree_parity...` below is the fuller
+    // form: the same tree served over a real HTTP listener, compared
+    // against this disk ingest's own output rather than a recomputed id.
     #[tokio::test]
     async fn a5_disk_ingest_mints_ids_matching_the_declared_origin() {
         let (runtime, token, _dir) = test_runtime().await;
@@ -449,5 +423,155 @@ mod tests {
             err.to_string().contains("source must be a directory path"),
             "{err}"
         );
+    }
+
+    /// Serve `body` once over a real local listener as a plain
+    /// `text/html` response, matching `fetch::tests`' own raw-response
+    /// helpers (that module's are private to it, so this is a minimal
+    /// from-scratch equivalent rather than a shared one).
+    async fn spawn_http_file_server(body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    // A5 literal: id/edge-set parity between the disk ingest and an
+    // HTTP-served ingest of the identical tree, minted under the same
+    // declared origin. `web.ingest`'s own URL-crawl mode has no
+    // origin-override (it mints under whatever URL it crawls) and a real
+    // crawl of a loopback listener is refused outright by
+    // `egress::resolve_and_pin` regardless of allowlist configuration
+    // (`egress.rs` arm9: loopback is a hard refusal, not a configurable
+    // one) — matching `fetch::tests`' own precedent of calling
+    // `run_one_hop` directly to bypass that refusal for local-server
+    // tests. So this test reads each file's bytes over a real socket via
+    // `crate::fetch::run_one_hop` against a local listener, then mints
+    // them through `crate::fetch::settle_content` under the declared
+    // origin — the same function `ingest_disk_file` now calls — so a
+    // divergence in either path's minting would show up as a mismatched
+    // id or a missing edge here.
+    #[tokio::test]
+    async fn a5_literal_http_served_tree_parity_id_and_edge_set_equality_with_disk_ingest() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+
+        let tree = tempfile::tempdir().expect("tree");
+        std::fs::write(
+            tree.path().join("index.html"),
+            b"<html><body>root</body></html>",
+        )
+        .unwrap();
+        std::fs::create_dir(tree.path().join("sub")).unwrap();
+        std::fs::write(
+            tree.path().join("sub/page.html"),
+            b"<html><body>sub</body></html>",
+        )
+        .unwrap();
+
+        let origin = "https://served.example.test";
+        let disk_reply = pack
+            .handle_ingest(
+                &token,
+                json!({ "source": tree.path().to_string_lossy(), "origin": origin }),
+            )
+            .await
+            .expect("disk ingest succeeds");
+        let mut disk_ids: Vec<String> = disk_reply["ingested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        disk_ids.sort();
+        assert_eq!(disk_ids.len(), 2, "one entity per file on the disk side");
+
+        let origin_url = Url::parse(origin).unwrap();
+        let canonical_origin = identity::canonicalize(origin_url);
+        let mut http_ids: Vec<String> = Vec::new();
+        for relative in ["index.html", "sub/page.html"] {
+            let bytes = std::fs::read(tree.path().join(relative)).unwrap();
+            let port = spawn_http_file_server(bytes.clone()).await;
+            let local_url = Url::parse(&format!("http://127.0.0.1:{port}/{relative}")).unwrap();
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("client builds");
+            let outcome = crate::fetch::run_one_hop(
+                &client,
+                &local_url,
+                reqwest::Method::GET,
+                &[],
+                10_000,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("hop succeeds against the local server");
+            let (body, _truncated) = outcome.body.expect("GET carries a body");
+            assert_eq!(body, bytes, "served bytes match the file on disk");
+            let content_type = outcome
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+
+            let target_url = canonical_origin.join(relative).unwrap();
+            let settled = crate::fetch::settle_content(
+                &runtime,
+                &token,
+                &target_url,
+                content_type.as_deref(),
+                outcome.status,
+                None,
+                None,
+                Some((body, false)),
+            )
+            .await
+            .expect("settle_content mints the HTTP-served row");
+            http_ids.push(settled.id.to_string());
+        }
+        http_ids.sort();
+
+        assert_eq!(
+            disk_ids, http_ids,
+            "the disk ingest and the HTTP-served ingest of the identical tree, \
+             declared under the same origin, mint the identical id set"
+        );
+
+        let site_id = identity::site_id(&canonical_origin);
+        let site_neighbors = runtime
+            .neighbors(
+                &token,
+                site_id,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Contains]),
+            )
+            .await
+            .expect("site neighbors");
+        for id_str in &disk_ids {
+            let id = uuid::Uuid::parse_str(id_str).unwrap();
+            assert!(
+                site_neighbors.iter().any(|n| n.node_id == id),
+                "site contains {id} — same edge whether it arrived via disk or HTTP"
+            );
+        }
     }
 }

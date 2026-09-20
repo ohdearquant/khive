@@ -4421,8 +4421,58 @@ impl PackRegistry {
             .into_iter()
             .map(|r| r.0)
             .collect();
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Like [`Self::register_packs_with_runtimes`], but resolves pack names
+    /// against the link-time `inventory` registry **plus** `extra_factories` —
+    /// pack factories the composition root supplies directly rather than
+    /// discovers through `inventory::iter::<PackRegistration>` (ADR-191 D6,
+    /// ADR-192 S4: "a pack compiled outside this repository ... extends the
+    /// web ontology without any change here" — a host binary that depends on
+    /// a pinned khive revision plus an out-of-tree pack crate, or a
+    /// composition root registering a credential-provider/request-hook
+    /// consumer pack, has no `inventory` presence in *this* binary short of
+    /// its own force-link anchor). An inventory-discovered factory always
+    /// wins a name collision with an `extra_factories` entry — the linked set
+    /// is the trusted default; an extra factory only fills a name inventory
+    /// does not already answer.
+    ///
+    /// This is the seam D6 describes as "kkernel exposes its server
+    /// construction as a library entry point that accepts additional pack
+    /// factories" — the `kkernel` library entry point itself lives in
+    /// `kkernel::compose`, built on this function exactly as
+    /// `khive-mcp/src/serve.rs` builds on [`Self::register_packs_with_runtimes`].
+    pub fn register_packs_with_runtimes_with_extra_factories(
+        extra_factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
+        let mut all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        all.extend(extra_factories.iter().copied());
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Shared body for [`Self::register_packs_with_runtimes`] and
+    /// [`Self::register_packs_with_runtimes_with_extra_factories`]: both
+    /// build a `factories` index (inventory-only, or inventory-plus-extra)
+    /// and delegate here. `factory_for` resolves by first match, so a
+    /// duplicate name earlier in `factories` wins over a later one — the two
+    /// public callers above rely on that for their stated collision rule.
+    fn register_packs_with_runtimes_from(
+        factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
         let factory_for = |name: &str| -> Option<&'static dyn PackFactory> {
-            all.iter().copied().find(|f| f.name() == name)
+            factories.iter().copied().find(|f| f.name() == name)
         };
 
         let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
