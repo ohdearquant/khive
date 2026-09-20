@@ -552,9 +552,18 @@ nothing it does not understand and loses nothing.
 
 Every entity the reader derives from a manifest (`page`, `machine_view`, `agent_tool`,
 `agent_skill`) carries `origin` (the canonical host, as used in its UUIDv5 key) and `site_id` (the
-owning site's id) as properties. This makes "restrict discovery to one origin" and "which site owns
-this hit" answerable by `search(properties={...})` and by reading the hit, with no neighbor walk.
-It is a transcription of a fact the reader already knows, not a derived judgment.
+owning site's id) as properties. The reader also sets the entity tag `origin:<host>` on every derived entity, because
+tag predicates are applied at the SQL level of `search` while property predicates are applied inside
+a bounded candidate window (the `search` help text states the bound); an origin-restricted query
+must not miss a match that ranks below the window. This makes "restrict discovery to one origin" answerable by `search(tags=["origin:<host>"])` and
+"which site owns this hit" answerable from the hit itself, with no neighbor walk. It is a
+transcription of a fact the reader already knows, not a derived judgment.
+
+Identifiers are derivable by any client. The pack's UUIDv5 namespace is published as a constant
+(`WEB_INGEST_NAMESPACE`, value in `docs/packs/web.md`); a site id is UUIDv5(namespace,
+`["site", origin]`), an interface id is UUIDv5(namespace, `["interface", name]`), both over the
+JSON serialization of the array. A client that would rather not compute them reads them from a
+hit's `site_id` property or from `search(entity_type="interface", query=<name>)`.
 
 Protocol presence is transcribed as `site implements interface`. The reader's mapping from manifest
 evidence to protocol name (an `integrations[]` entry of type `mcp`, `a2a` or `agent-comm`; a
@@ -584,6 +593,18 @@ database remains available as a deployment shape through the shipped `[[backends
 `[packs.web] backend=` configuration (ADR-028 Amendment A4), chosen by the operator, never by a verb
 argument.
 
+The runtime the verb writes through is the pack's own: with no `[packs.web]` route that is the
+main runtime and the shared graph; with `[packs.web] backend = "<name>"` it is the per-pack runtime
+the boot path constructs on that backend (ADR-028 A4), so every row lands in that backend and the
+main store is untouched. Isolation by namespace and isolation by backend are therefore both
+available, chosen by configuration, and the verb does not know which it got.
+
+This amendment depends on one change in the kg pack: entity hits returned by `search` gain
+`entity_type` and `tags` beside the fields they carry today (`id`, `kind`, `name`, `score`,
+`source`, `snippet`, timestamps). The search path already loads that metadata per candidate; the
+change is to return it. Properties are not projected onto hits (a page's `chunks` can be large);
+`get(id)` remains the way to read them.
+
 Writing through the runtime's create seam has two consequences that the map-database path could
 not provide. Entities embed with the runtime's configured embedders at write time, so the vector arm
 exists without an operator reindex. And the kind hooks, entity-type validation and edge rules run
@@ -592,16 +613,16 @@ would refuse from anyone else.
 
 ### A2.5 Query shapes, answered by kg verbs
 
-| Question                             | Verb                                                                           |
-| ------------------------------------ | ------------------------------------------------------------------------------ |
-| free-text discovery across origins   | `search(kind="entity", query=...)`; each hit carries `origin` and `site_id`    |
-| discovery restricted to one subtype  | `search(entity_type="agent_tool")`                                             |
-| discovery restricted to one origin   | `search(properties={"origin": "<host>"})`                                      |
-| which origins implement a protocol   | `neighbors(id=<interface id>, direction="incoming", relations=["implements"])` |
-| tag filter                           | `search(tags=[...])`                                                           |
-| property filter on the site block    | `search(entity_type="site", properties={...})`                                 |
-| enumerate origins with freshness     | `list(entity_type="site")`; `ingested_at` and `manifest_digest` are properties |
-| read a block the pack does not model | `get(site)` then `blob.get(manifest_ref)`                                      |
+| Question                             | Verb                                                                                                                                                              |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| free-text discovery across origins   | `search(kind="entity", query=...)`; each hit carries `entity_type` and the `origin:<host>` tag; the owning site id is UUIDv5 of the origin or one `get`           |
+| discovery restricted to one subtype  | `search(entity_type="agent_tool")`                                                                                                                                |
+| discovery restricted to one origin   | `search(tags=["origin:<host>"])` (SQL-level predicate); exhaustive enumeration of one origin = `neighbors(site_id, direction="outgoing", relations=["contains"])` |
+| which origins implement a protocol   | `neighbors(id=UUIDv5(namespace, ["interface", name]), direction="incoming", relations=["implements"])`                                                            |
+| tag filter                           | `search(tags=[...])`                                                                                                                                              |
+| property filter on the site block    | `search(entity_type="site", properties={...})`                                                                                                                    |
+| enumerate origins with freshness     | `list(entity_type="site")`; `ingested_at` and `manifest_digest` are properties                                                                                    |
+| read a block the pack does not model | `get(site)` then `blob.get(manifest_ref)`                                                                                                                         |
 
 ### A2.6 Report
 
@@ -618,9 +639,9 @@ map from key name to count (a bare total told the reader nothing about what was 
 32. **Manifest round-trip.** After ingest, `get(site)` yields `manifest_ref`; `blob.get(manifest_ref)`
     returns bytes whose BLAKE3 equals `manifest_digest`; a one-byte change to the manifest and a
     re-ingest yields a new ref and digest on the same site id.
-33. **Origin stamp.** Every derived entity carries `origin` and `site_id`; `search(properties=
-    {"origin": A})` on a two-origin graph returns rows of A only. Mutation: drop the stamp and the arm
-    goes red.
+33. **Origin stamp.** Every derived entity carries `origin` and `site_id` properties and the
+    `origin:<host>` tag; `search(tags=["origin:A"])` on a two-origin graph returns rows of A only, and
+    each hit carries `entity_type` and its tags. Mutation: drop the tag and the arm goes red.
 34. **Protocol presence.** A fixture declaring `mcp` under integrations, `ucp` and `acp` enabled
     under commerce, and an `oauth` block yields four `implements` edges to four `interface` rows;
     removing the commerce block from the fixture and re-ingesting drops exactly the `ucp` and `acp`
@@ -633,12 +654,18 @@ map from key name to count (a bare total told the reader nothing about what was 
 37. **Create-seam parity.** A fixture page whose declaration would be refused by `create` (an
     invalid tag shape) is quarantined by the reader and absent from the graph; the same page created
     by hand through `create` is refused with the same reason.
+38. **Backend isolation by configuration.** With `[packs.web] backend = \"X\"`, an ingest lands every
+    row in X and the main store's entity count is unchanged; with no route, the rows land in main.
+39. **Below-the-window origin query.** On a graph where origin B's only matching page ranks below
+    the search candidate window globally, `search(query, tags=[\"origin:B\"])` still returns it.
+    Control: the same query with `properties={\"origin\": \"B\"}` is allowed to miss it, which is why
+    the tag exists.
 
 ### A2.8 What this changes in the tree
 
 `db_target.rs` is removed with its tests; `persistence.rs` shrinks to a call into the runtime's create
 and link operations under the caller's token; `manifest.rs` gains the protocol-presence read and
-by-name ignored keys and loses nothing; `extract.rs` stamps `origin` and `site_id`; `handlers.rs`
+by-name ignored keys and loses nothing; `extract.rs` stamps `origin` and `site_id` and the `origin:<host>` tag; the kg pack's `search` handler returns `entity_type` and `tags` on entity hits; `handlers.rs`
 takes `namespace` and drops `db`; `docs/packs/web.md` is rewritten for the new signature and the
 namespace model. Amendment 1's fetch and search are implemented after this amendment lands, on the
 same create-free footing (they write blobs and receipts, never the graph).
