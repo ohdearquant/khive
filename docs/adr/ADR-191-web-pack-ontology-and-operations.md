@@ -1,0 +1,215 @@
+# ADR-191: Web Pack — Web Ontology, Relation Rules, and Operations
+
+- **Status**: Accepted (design)
+- **Governing rule**: pack is ontology, relation rules, and operations on those
+- **Date**: 2026-09-20
+- **Supersedes**: [ADR-175](ADR-175-web-pack.md) and its Amendments 1 and 2 in full
+- **Depends on**: [ADR-001](ADR-001-entity-kind-taxonomy.md) (closed entity kinds; pack subtypes),
+  [ADR-002](ADR-002-edge-ontology.md) (closed relation set, endpoint contract, certificate),
+  [ADR-017](ADR-017-pack-standard.md) (`EDGE_RULES`, `ENTITY_TYPES`), [ADR-028](ADR-028-pack-scoped-backends.md) Amendment 4
+  (pack-scoped backends), [ADR-111](ADR-111-blob-store.md) (bodies by content reference)
+- **Relates to**: [ADR-085](ADR-085-code-pack.md) (domain-ontology pack shape)
+
+## Context
+
+ADR-175 defined the web pack around one application manifest format: its five entity subtypes were
+the manifest's sections, five of its six relation rules connected those sections, its only verb parsed
+the manifest, and a storage fence decided which database file the parse landed in. Two amendments
+generalised the vocabulary but kept the manifest as the entry point. That is a reader for one file
+format, not a web ontology. A pack is an ontology, the relation rules over it, and the operations that
+act on those. This record replaces ADR-175 with a pack that describes the web itself and exposes the
+web's own actions. Application-level vocabulary (declared tools, capabilities, commerce and identity
+protocols, machine-readable manifests) is expressed by consumers on top of this pack through the
+extension seam in D6, never inside it.
+
+The governing test applied to every item below: would this exist if no application protocol existed?
+An item that fails is out.
+
+## Decision
+
+### D1. Ontology: three entity subtypes
+
+| subtype    | base kind | identity                               | notes                                                                                                                            |
+| ---------- | --------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `site`     | Service   | `(scheme, host, port)`; alias `origin` | the web's unit of identity and policy: credentials, allow-list, ceilings key on it                                               |
+| `page`     | Document  | `(site, canonical path+query)`         | a resource whose body is HTML/XHTML                                                                                              |
+| `resource` | Document  | `(site, canonical path+query)`         | any other fetched body: `robots.txt`, sitemaps, feeds, JSON, PDF, well-known files, alternate renderings served at their own URL |
+
+Identities are deterministic (UUIDv5 over the identity tuple under the pack namespace) so repeated
+fetches and independent ingests converge on the same rows. Canonicalisation: scheme and host
+lowercased, default port dropped, path percent-normalised, query kept with keys sorted, fragment
+dropped. `?id=1` and `?id=2` are two resources; `#top` is not.
+
+Bodies never live in an entity. Every fetched body is stored through the blob store (content-addressed,
+idempotent) and the entity carries `url`, `content_type`, `blob_ref`, `content_digest`, `size`,
+`status`, `fetched_at`, and `etag` / `last_modified` when the origin served them. Properties are open:
+a consumer may add its own keys to any web entity.
+
+Considered and rejected:
+
+- `origin` as a separate subtype: already an alias of `site`; a second canonical name for one row.
+- `representation` (one entity per content-negotiated body): a rendering served at its own URL is a
+  `resource`; one served at the same URL under a different `Accept` is a blob plus a receipt (D4).
+  An entity per fetch is an unbounded row class with one edge each. The receipt carries `blob_ref`,
+  `content_type`, `content_digest` and `fetched_at`, so every negotiated body stays retrievable; a
+  consumer that needs a rendering as an entity registers its own Document subtype through D6 and
+  links it `derived_from` the page.
+- `access_policy`: `robots.txt` is a `resource`; its parsed effect is properties on the `site` and a
+  receipt note. An entity cannot be the source of `annotates`.
+- `feed` / `enumeration`: a role a resource plays after parsing, not an identity. Parsing emits edges
+  (D2), not a subtype.
+- `endpoint`: passes the test (forms and REST predate any agent protocol) but collides with the existing
+  `api` alias of `service:api`, and its declared form has no web-observable producer in this pack.
+  A consumer that learns endpoints from an application declaration registers `service:api` rows through D6.
+
+Registry deletions in `crates/khive-types/src/entity_type.rs` at the superseded revision, by
+`(kind, canonical, aliases)`: `(Document, machine_view, [view])`, `(Service, agent_tool, [mcp_tool])`,
+`(Document, agent_skill, [skill_manifest])`. Kept: `(Service, site, [origin])`,
+`(Document, page, [web_page])`. Added: `(Document, resource, [])`. The registry test that enumerates
+web tokens is rewritten as the acceptance witness for exactly this set (A7).
+
+### D2. Relation rules
+
+**One new base relation: `links_to`.** A hyperlink is the web's definitional relation and no existing
+relation expresses it without a false claim (`depends_on` would additionally stamp a
+`dependency_kind` qualifier the runtime infers for Document→Document pairs). Definition:
+
+| relation   | direction       | endpoint contract   | coherence class                            | cascade |
+| ---------- | --------------- | ------------------- | ------------------------------------------ | ------- |
+| `links_to` | source → target | Document → Document | state-like (reciprocal links are ordinary) | none    |
+
+One label. A cross-site "mentions" (a reference without an href) is rejected: it is an attribute of a
+link, not a second relation, and nothing in D3 produces one. The change touches: the relation enum and
+its name list, the `ALL` length assertion (17 → 18), the certificate coverage walk (a disposition entry
+for `links_to`), the endpoint-signature tripwire, the ADR-002 relation, category, endpoint-contract and
+cascade tables, and every in-tree statement that the relation set has 17 members.
+
+**Pack rules (additive over the base contract): two rows.**
+
+| rule                     | emitted by                                                 |
+| ------------------------ | ---------------------------------------------------------- |
+| `site contains page`     | fetch, ingest, refresh                                     |
+| `site contains resource` | fetch, ingest, refresh, extract (sitemap and feed entries) |
+
+**Base rows the pack uses without declaring anything:**
+
+| relation                                        | web meaning                                                                                               | emitted by             |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `page links_to page \| resource` (new base row) | hyperlink                                                                                                 | extract                |
+| `document derived_from document`                | extracted text of a page; an alternate rendering at its own URL; a canonical variant with different bytes | extract                |
+| `document supersedes document`                  | permanent redirect (301/308): the old address stops being authoritative                                   | fetch, refresh         |
+| `note annotates *`                              | fetch/search receipt on the entity it observed                                                            | fetch, search, refresh |
+| `note supersedes note`                          | receipt chain: the history of one resource's fetches                                                      | refresh                |
+| `service implements concept`                    | a site implementing a named interface; base-covered, no pack rule                                         | consumers              |
+
+Identity is by address: two URLs serving byte-identical bodies are two entities sharing one blob
+(deduplication lives in the content-addressed store), and a `derived_from` between them is written only
+when a canonical link or a permanent redirect says so. A temporary redirect (302/307) is receipt data,
+not an edge.
+
+Rows deliberately NOT carried from ADR-175: `site contains agent_tool`, `site contains agent_skill`,
+`agent_skill depends_on agent_tool`, `machine_view derived_from page` — each is an application's
+declaration structure; the first three have no web producer and the fourth is the `derived_from` base
+row above.
+
+### D3. Operations
+
+All network access is GET or HEAD. The egress rules of ADR-175 Amendment 1 carry over on their own
+merits: address classification after resolution (loopback, link-local, private, and metadata ranges
+refused), an operator allow-list, bounded redirect chains, decompressed byte and wall-clock ceilings,
+credentials bound by configuration to host sets (IP literals match exactly), a response-header
+allow-list, and a receipt written after the body's blob is stored.
+
+| verb                                             | contract                                                                                                                                                                                                                 | writes                                                                                                                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web.fetch(url, accept?, persist?, max_bytes?)`  | one request with bounded redirects; `persist` defaults true                                                                                                                                                              | `site` if new, `page` or `resource`, blob, receipt note                                                                                                       |
+| `web.extract(id \| url, kinds?)`                 | parse a stored body; `kinds` ⊆ {`text`, `links`, `sitemap`, `feed`}, default all applicable                                                                                                                              | text `resource` (`derived_from`), `links_to` edges to targets minted as unfetched `resource` rows (`status` null), `contains` edges from sitemap/feed entries |
+| `web.ingest(source, origin?, depth?, limit?)`    | fetch + extract over a URL, a list of URLs, or a served tree on disk (a directory laid out as an origin serves it; `origin` is then required and supplies the `site` identity); `depth` bounds link following, default 0 | as fetch + extract                                                                                                                                            |
+| `web.search(query, provider?, limit?, persist?)` | an operator-configured search provider; `persist` defaults false                                                                                                                                                         | hits; a receipt note; with `persist`, each hit's URL as an unfetched `resource` under its site                                                                |
+| `web.refresh(id)`                                | conditional re-fetch using `etag` / `last_modified`; unchanged digest writes a receipt only                                                                                                                              | receipt; new blob and updated properties when the body changed                                                                                                |
+
+An unfetched target is minted as `resource` with `status` null. When `fetch` (directly, or through
+`ingest` or `refresh`) later retrieves it and the body is HTML, `fetch` updates the row's `entity_type`
+to `page` in place; the id does not change because identity is by address. A2's control covers the
+re-typing: an extracted target fetched afterwards reads as `page`.
+
+Reads are the graph's own verbs: `search`, `neighbors`, `list`, `get`, `blob.get`. There is no
+`web.query`. There is no storage or database parameter on any verb: placement is a configuration
+matter (ADR-028 A4 pack-scoped backends), and every write lands in the caller's namespace through the
+runtime's create seam, subject to the endpoint contract like any other write. A crawl verb is out of
+scope for this record: with `extract` available it is a caller's loop over `fetch`, and its budget and
+politeness semantics deserve their own measurement.
+
+Configuration section `[web]`: allow-list, credential bindings by host set, byte and time ceilings,
+redirect cap, search provider.
+
+### D4. Receipts
+
+Every network action writes one observation note annotating the entity it touched (or standing alone
+for a search): method, final URL, redirect chain, status, content type, negotiated `Accept`, bytes,
+timing, egress classification, blob reference. Receipts chain by `supersedes`, so the fetch history of a
+resource is a note chain, and content that did not change produces a receipt and nothing else.
+
+### D5. Deletions against the superseded revision
+
+Whole files in `crates/khive-pack-web/src/`: `manifest.rs` (the format's key list), `views.rs`,
+`db_target.rs` (storage fence). Rewritten: `extract.rs` (manifest walker, declared-tool and
+declared-capability loops, the report seed naming the deleted vocabulary), `persistence.rs` (a raw-SQL
+staging path below the verb seam; replaced by runtime create/link calls), `vocab.rs` (rules 2–6),
+`handlers.rs`, `pack.rs`. Tests and fixtures under `crates/khive-pack-web/tests/` that carry the
+manifest format are removed with it. `docs/packs/web.md` is rewritten. The three registry rows in D1
+are removed from `crates/khive-types/src/entity_type.rs`.
+
+### D6. Extension seam
+
+A pack compiled outside this repository against a pinned revision extends the web ontology without
+any change here: it implements the pack trait, registers its own entity subtypes (collision-checked
+against the registry at boot), declares additional edge rules over the base and web vocabulary (rules
+are additive; the pack declares its dependence on `web`), attaches bodies as blobs, and annotates web
+entities with its own notes. Its rows carry its own subtype tokens and live in its caller's namespace.
+What is public today, verified at the superseded revision: the pack trait and its vocabulary
+constants (`khive-types` `Pack`, `EdgeEndpointRule`, `EntityTypeDef`, `REQUIRES`), the runtime half
+(`khive-runtime` `PackRuntime`, `PackFactory`, `PackRegistration`), and the boot-time subtype
+collision check; a complete pack needs only `khive-types`, `khive-runtime`, `inventory`,
+`async-trait` and `serde_json`, and `crates/khive-pack-template` is the working scaffold. Nothing a
+pack needs is crate-private.
+
+What is not: pack discovery is a link-time `inventory` registry. A pack is selectable only if it is
+linked into the binary and anchored (`kkernel/src/lib.rs` `_pack_links`); a name absent from the
+binary is `UnknownPack`. So an out-of-tree pack is used by building a host binary: a thin crate that
+depends on the pinned khive crates and the pack, and constructs the server with both. This record adds
+the one piece that makes that possible without editing khive sources: `kkernel` exposes its server
+construction as a library entry point that accepts additional pack factories (the composition path
+`register_packs_with_runtimes` already carries the shape). Dynamic loading (cdylib or WASM) is out of
+scope here; it needs an ABI contract and is a separate record. Two pre-existing properties are recorded,
+not fixed: pack-declared subtypes reach the composed registry but not `EntityTypeRegistry::global()`,
+and channel-ingest grants are hardcoded to the comm pack.
+
+## Acceptance
+
+Controls are stated before the arms run; an arm without its control is not evidence.
+
+- A1 `fetch` of a page mints `site`, `page`, blob, receipt; the same fetch again returns the same blob
+  reference and writes a receipt only. Control: a different body yields a different reference.
+- A2 `extract(links)` on a page with N distinct hrefs yields N `links_to` edges whose targets are
+  resources under their own sites; control: a page with no hrefs yields none.
+- A3 a 301 chain yields `new supersedes old`; a 302 yields no edge and a receipt naming the hop.
+- A4 `refresh` on an unchanged `etag` writes no entity or blob change; control: changed body updates
+  `blob_ref` and `content_digest`.
+- A5 `ingest` of a served tree on disk under a declared `origin` produces the same graph as live
+  ingest of the same tree served under that origin over HTTP: the arm asserts id equality row by row
+  and edge-set equality.
+- A6 the egress arms of ADR-175 Amendment 1, renumbered, unchanged in substance.
+- A7 the registry refuses `machine_view`, `agent_tool`, `agent_skill` and their aliases; accepts
+  `site`, `page`, `resource`.
+- A8 `links_to`: relation count 18; `Document links_to Document` accepted; `Document links_to
+  Service` and `Concept links_to Document` refused with the endpoint-contract error, in one test;
+  certificate disposition present; endpoint-signature tripwire green.
+- A9 with two backends configured, web writes land in the web backend only.
+
+## Consequences
+
+The pack shrinks to what the web is: three subtypes, one new relation, two rules, five operations.
+Every application-level concept previously hosted here is expressible on top of it by a consumer pack
+through D6, and none of it lives in this repository. The runtime gains one relation, which is the cost of
+having a web ontology at all.

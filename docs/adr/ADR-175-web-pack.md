@@ -1,6 +1,6 @@
 # ADR-175: Web Pack — Site Ontology and Manifest Ingest for Agent-Readable Web Origins
 
-- **Status**: Accepted
+- **Status**: Superseded (2026-09-20) by [ADR-191](ADR-191-web-pack-ontology-and-operations.md), including Amendments 1 and 2
 - **Date**: 2026-09-07
 - **Extends**: [ADR-069](ADR-069-subject-model.md) (Subject model: OntologySpec, Scanner, Extractor,
   Layout), [ADR-085](ADR-085-code-pack.md) (the domain-ontology pack shape this record follows)
