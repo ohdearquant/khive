@@ -1,321 +1,710 @@
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+//! `web.extract` (ADR-191 D3, D2).
+//!
+//! Parses an already-fetched body (never fetches one itself — that is
+//! `web.fetch`'s job) into whichever of `text`/`links`/`sitemap`/`feed` the
+//! caller names, default all applicable to the stored content-type. No HTML
+//! or XML parser crate is a workspace dependency and this crate cannot
+//! confirm a new one compiles without `cargo` access (LEG_B.md: no cargo),
+//! so every extraction here is a bounded regex over the raw bytes rather
+//! than a DOM walk — flagged as an open question in LEG_B_REPORT.md.
+//!
+//! - `links`: every `<a href="...">` in an HTML body becomes a
+//!   `page links_to page|resource` edge (D2's new base row) to a target
+//!   minted, if absent, as an unfetched `resource` (`status: null`) — never
+//!   overwritten if the target already exists and has been fetched.
+//! - `sitemap`/`feed`: every `<loc>`/`<link>` entry becomes a `resource`
+//!   under the document's own `site`, linked `site contains resource` (the
+//!   pack's second `EDGE_RULES` row) — a feed/sitemap entry is the site's
+//!   content, not the feed document's.
+//! - `text`: a new `resource` holding the tag-stripped text, linked
+//!   `document derived_from document` (source: the new text resource,
+//!   target: the original) and keyed by [`identity::derived_text_id`] so
+//!   repeated extraction over an unchanged document converges on one row.
 
-use khive_runtime::EntityCreateSpec;
+use std::sync::LazyLock;
+
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::EdgeRelation;
-use serde::Serialize;
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use url::Url;
 use uuid::Uuid;
 
-use crate::manifest::{cross_check_llms, Manifest, QuarantinedDeclaration};
-use crate::persistence::{WebEdge, WebEntity};
-use crate::views::read_view;
+use crate::egress::Refusal;
+use crate::identity;
+use crate::WebPack;
 
-pub const WEB_INGEST_NAMESPACE: Uuid = Uuid::from_u128(0x71c1a6f3_8b91_5c7a_a027_9f8f868644a9);
+const MAX_TEXT_EXCERPT_BYTES: usize = 200_000;
 
-#[derive(Debug, Serialize)]
-pub(crate) struct WebIngestReport {
-    pub entity_counts: BTreeMap<String, usize>,
-    pub relation_counts: BTreeMap<String, usize>,
-    pub views_missing: usize,
-    pub quarantined: Vec<QuarantinedDeclaration>,
-    pub manifest_digest: String,
-    pub source: String,
-    pub include_views: bool,
-    pub ignored_keys: usize,
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\s[^>]*?href\s*=\s*["']([^"'#][^"']*)["']"#).expect("valid regex")
+});
+static LOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<loc>\s*([^<\s][^<]*?)\s*</loc>"#).expect("valid regex"));
+static ATOM_LINK_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<link\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*/?>"#).expect("valid regex")
+});
+static RSS_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<link>\s*([^<\s][^<]*?)\s*</link>"#).expect("valid regex"));
+static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").expect("valid regex"));
+/// `<script>`/`<style>` bodies are never prose: stripped whole (tag and
+/// content) before `TAG_RE`'s generic tag-only strip runs, so their
+/// contents never leak into extracted text. Two alternatives, not a
+/// backreference — the `regex` crate's engine is backtracking-free and
+/// does not support `\1`.
+static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>").expect("valid regex")
+});
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExtractParams {
+    #[serde(default)]
+    id: Option<Uuid>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
+    #[serde(default)]
+    namespace: Option<String>,
 }
 
-pub(crate) struct Extracted {
-    pub entities: Vec<WebEntity>,
-    pub edges: Vec<WebEdge>,
-    pub report: WebIngestReport,
-}
+const ALL_KINDS: &[&str] = &["text", "links", "sitemap", "feed"];
 
-fn identifier(parts: Value) -> Uuid {
-    Uuid::new_v5(&WEB_INGEST_NAMESPACE, parts.to_string().as_bytes())
-}
-
-fn canonical_path(path: &str) -> Result<String, &'static str> {
-    if path.trim().is_empty() || path.contains(['\\', '\0', '?', '#']) || path.contains("://") {
-        return Err("url must be a local declared path");
+fn applicable_kinds(entity_type: &str, content_type: Option<&str>) -> Vec<&'static str> {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    let is_feed_or_sitemap = content_type.contains("xml") || content_type.contains("rss");
+    match entity_type {
+        "page" => vec!["links", "text"],
+        _ if is_feed_or_sitemap => vec!["sitemap", "feed"],
+        _ => vec!["text"],
     }
-    let path = path.trim_matches('/');
-    if path.split('/').any(|part| matches!(part, "." | "..")) {
-        return Err("url must not contain dot path segments");
-    }
-    Ok(format!("/{path}"))
 }
 
-impl Extracted {
-    fn quarantine(&mut self, field: impl Into<String>, reason: impl Into<String>) {
-        self.report.quarantined.push(QuarantinedDeclaration {
-            field: field.into(),
-            reason: reason.into(),
-        });
-    }
-
-    fn entity(
-        &mut self,
-        id: Uuid,
-        kind: &str,
-        entity_type: &str,
-        name: &str,
-        declaration: &Value,
-        field: &str,
-    ) -> bool {
-        if self.entities.iter().any(|entity| entity.id == id) {
-            self.quarantine(
-                field,
-                "duplicate declaration has the same canonical identity",
-            );
-            return false;
+async fn resolve_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: &ExtractParams,
+) -> Result<(Uuid, khive_storage::Entity), RuntimeError> {
+    let id = match (params.id, &params.url) {
+        (Some(id), None) => id,
+        (None, Some(url_str)) => {
+            let url = Url::parse(url_str)
+                .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
+            let canonical = identity::canonicalize(url);
+            let site = identity::site_id(&canonical);
+            identity::document_id(site, &identity::path_and_query(&canonical))
         }
-        let description = match declaration.get("description") {
-            None => None,
-            Some(Value::String(description)) => Some(description.clone()),
-            Some(_) => {
-                self.quarantine(
-                    format!("{field}.description"),
-                    "description must be a string",
-                );
-                return false;
-            }
-        };
-        let tags = match declaration.get("tags") {
-            None => Vec::new(),
-            Some(Value::Array(tags)) if tags.iter().all(Value::is_string) => tags
-                .iter()
-                .map(|tag| tag.as_str().unwrap().to_string())
-                .collect(),
-            Some(_) => {
-                self.quarantine(format!("{field}.tags"), "tags must be an array of strings");
-                return false;
-            }
-        };
-        self.entities.push(WebEntity {
-            id,
-            spec: EntityCreateSpec {
-                kind: kind.to_string(),
-                entity_type: Some(entity_type.to_string()),
-                name: name.to_string(),
-                description,
-                properties: Some(declaration.clone()),
-                tags,
-            },
-        });
-        *self
-            .report
-            .entity_counts
-            .entry(entity_type.to_string())
-            .or_default() += 1;
-        true
-    }
-
-    fn edge(&mut self, source: Uuid, target: Uuid, relation: EdgeRelation) {
-        let id = identifier(json!(["edge", relation.as_str(), source, target]));
-        if self.edges.iter().any(|edge| edge.id == id) {
-            return;
+        (Some(_), Some(_)) => {
+            return Err(RuntimeError::InvalidInput(
+                "web.extract: pass exactly one of id or url, not both".to_string(),
+            ))
         }
-        self.edges.push(WebEdge {
-            id,
-            source,
-            target,
-            relation,
-        });
-        *self
-            .report
-            .relation_counts
-            .entry(relation.as_str().to_string())
-            .or_default() += 1;
-    }
-}
-
-pub(crate) fn extract(
-    source: &Path,
-    manifest: Manifest,
-    include_views: bool,
-) -> Result<Extracted, String> {
-    let mut result = Extracted {
-        entities: Vec::new(),
-        edges: Vec::new(),
-        report: WebIngestReport {
-            entity_counts: ["site", "page", "machine_view", "agent_tool", "agent_skill"]
-                .map(|name| (name.to_string(), 0))
-                .into(),
-            relation_counts: ["contains", "derived_from", "depends_on", "implements"]
-                .map(|name| (name.to_string(), 0))
-                .into(),
-            views_missing: 0,
-            quarantined: cross_check_llms(source, &manifest.raw),
-            manifest_digest: manifest.digest,
-            source: source.display().to_string(),
-            include_views,
-            ignored_keys: manifest.ignored_keys,
-        },
+        (None, None) => {
+            return Err(RuntimeError::InvalidInput(
+                "web.extract: id or url is required".to_string(),
+            ))
+        }
     };
-    let mut site = manifest.raw["site"].clone();
-    for field in ["version", "profile", "content_signals"] {
-        if let Some(value) = manifest.raw.get(field) {
-            site[field] = value.clone();
+    let entity = runtime
+        .entities(token)?
+        .get_entity(id)
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::from(Refusal::new(
+                "not_found",
+                format!("web.extract: no document at id {id}"),
+            ))
+        })?;
+    Ok((id, entity))
+}
+
+fn resolve_against(base: &Url, href: &str) -> Option<Url> {
+    base.join(href).ok()
+}
+
+async fn extract_links(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    document_id: Uuid,
+    base_url: &Url,
+    body: &str,
+) -> Result<u32, RuntimeError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0u32;
+    for capture in HREF_RE.captures_iter(body) {
+        let href = capture[1].trim();
+        if href.is_empty() || href.starts_with("javascript:") || href.starts_with("mailto:") {
+            continue;
         }
-    }
-    let site_id = identifier(json!(["site", manifest.origin]));
-    let name = site["name"].as_str().expect("manifest site name validated");
-    if !result.entity(site_id, "service", "site", name, &site, "site") {
-        return Err("manifest_malformed: unreadable site declaration".to_string());
-    }
-    for collection in ["content", "tools", "skills"] {
-        if manifest
-            .raw
-            .get(collection)
-            .is_some_and(|value| !value.is_array())
-        {
-            result.quarantine(collection, "declarations must be an array");
-        }
-    }
-    for (index, page) in manifest.raw["content"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("content[{index}]");
-        let Some(url) = page.get("url").and_then(Value::as_str) else {
-            result.quarantine(format!("{field}.url"), "page url must be a string");
+        let Some(target_url) = resolve_against(base_url, href) else {
             continue;
         };
-        let path = match canonical_path(url) {
-            Ok(path) => path,
-            Err(reason) => {
-                result.quarantine(format!("{field}.url"), reason);
-                continue;
-            }
-        };
-        let id = identifier(json!(["page", manifest.origin, path]));
-        if !result.entity(id, "document", "page", url, page, &field) {
+        let canonical = identity::canonicalize(target_url);
+        if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
-        result.edge(site_id, id, EdgeRelation::Contains);
-        if !include_views {
+        if !seen.insert(canonical.clone()) {
             continue;
         }
-        let Some(view) = page.get("markdown_url") else {
-            continue;
-        };
-        let Some(view_url) = view.as_str() else {
-            result.quarantine(
-                format!("{field}.markdown_url"),
-                "markdown_url must be a string",
+        let site = identity::site_id(&canonical);
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            site,
+            "service",
+            "site",
+            &identity::site_key(&canonical),
+            json!({
+                "scheme": canonical.scheme(),
+                "host": canonical.host_str(),
+                "port": canonical.port_or_known_default(),
+            }),
+        )
+        .await?;
+        let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            target_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        runtime
+            .link(token, site, target_id, EdgeRelation::Contains, 1.0, None)
+            .await?;
+        runtime
+            .link(
+                token,
+                document_id,
+                target_id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn extract_entries(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    site_id: Uuid,
+    body: &str,
+    kind: &str,
+) -> Result<u32, RuntimeError> {
+    let mut urls: Vec<String> = Vec::new();
+    match kind {
+        "sitemap" => {
+            urls.extend(LOC_RE.captures_iter(body).map(|c| c[1].trim().to_string()));
+        }
+        "feed" => {
+            urls.extend(
+                ATOM_LINK_HREF_RE
+                    .captures_iter(body)
+                    .map(|c| c[1].trim().to_string()),
             );
-            continue;
-        };
-        let view_path = match canonical_path(view_url) {
-            Ok(path) => path,
-            Err(reason) => {
-                result.quarantine(format!("{field}.markdown_url"), reason);
-                continue;
-            }
-        };
-        let view_id = identifier(json!(["machine_view", manifest.origin, view_path]));
-        if result.entities.iter().any(|entity| entity.id == view_id) {
-            // A declared machine view may serve more than one page. Its first
-            // accepted frontmatter is the ingest snapshot for that identity.
-            result.edge(view_id, id, EdgeRelation::DerivedFrom);
+            urls.extend(
+                RSS_LINK_RE
+                    .captures_iter(body)
+                    .map(|c| c[1].trim().to_string()),
+            );
+        }
+        _ => {}
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0u32;
+    for raw in urls {
+        let Ok(url) = Url::parse(&raw) else { continue };
+        let canonical = identity::canonicalize(url);
+        if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
-        match read_view(source, &view_path) {
-            Ok(None) => result.report.views_missing += 1,
-            Err(reason) => result.quarantine(format!("{field}.markdown_url"), reason),
-            Ok(Some(frontmatter)) => {
-                if result.entity(
-                    view_id,
-                    "document",
-                    "machine_view",
-                    view_url,
-                    &frontmatter,
-                    &format!("{field}.markdown_url"),
-                ) {
-                    result.edge(view_id, id, EdgeRelation::DerivedFrom);
-                }
-            }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let entry_site = identity::site_id(&canonical);
+        let target_id = identity::document_id(entry_site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            target_id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await?;
+        // Entries belong to the SITE that published the feed/sitemap, which
+        // is the source document's own site (D2: "site contains resource ...
+        // extract (sitemap and feed entries)") — not necessarily the
+        // entry's own site when the entry points elsewhere, so both edges
+        // are recorded: containment under the publishing site, plus the
+        // entry's own site if it differs.
+        runtime
+            .link(token, site_id, target_id, EdgeRelation::Contains, 1.0, None)
+            .await?;
+        if entry_site != site_id {
+            crate::entities::get_or_create(
+                runtime,
+                token,
+                entry_site,
+                "service",
+                "site",
+                &identity::site_key(&canonical),
+                json!({
+                    "scheme": canonical.scheme(),
+                    "host": canonical.host_str(),
+                    "port": canonical.port_or_known_default(),
+                }),
+            )
+            .await?;
+            runtime
+                .link(
+                    token,
+                    entry_site,
+                    target_id,
+                    EdgeRelation::Contains,
+                    1.0,
+                    None,
+                )
+                .await?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn extract_text(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    original_id: Uuid,
+    original_url: &str,
+    body: &str,
+) -> Result<Uuid, RuntimeError> {
+    let no_script_style = SCRIPT_STYLE_RE.replace_all(body, " ");
+    let stripped = TAG_RE.replace_all(&no_script_style, " ");
+    let collapsed = WHITESPACE_RE.replace_all(stripped.trim(), " ").to_string();
+    let excerpt: String = collapsed.chars().take(MAX_TEXT_EXCERPT_BYTES).collect();
+
+    let store = crate::blob_store(runtime)?;
+    let content_ref = store
+        .put(excerpt.clone().into_bytes())
+        .await
+        .map_err(RuntimeError::from)?;
+
+    let text_id = identity::derived_text_id(original_id);
+    crate::entities::get_or_create(
+        runtime,
+        token,
+        text_id,
+        "document",
+        "resource",
+        &format!("{original_url} (extracted text)"),
+        json!({ "derived_from": original_id.to_string() }),
+    )
+    .await?;
+    crate::entities::patch(
+        runtime,
+        token,
+        text_id,
+        Some("resource"),
+        json!({
+            "derived_from": original_id.to_string(),
+            "content_type": "text/plain",
+            "blob_ref": content_ref.to_string(),
+            "size": excerpt.len() as u64,
+        }),
+    )
+    .await?;
+    runtime
+        .link(
+            token,
+            text_id,
+            original_id,
+            EdgeRelation::DerivedFrom,
+            1.0,
+            None,
+        )
+        .await?;
+    Ok(text_id)
+}
+
+async fn run_extract(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: ExtractParams,
+) -> Result<Value, RuntimeError> {
+    let (target_id, entity) = resolve_target(runtime, token, &params).await?;
+    let properties = entity.properties.clone().unwrap_or(Value::Null);
+    let content_ref = properties
+        .get("blob_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RuntimeError::from(Refusal::new(
+                "not_fetched",
+                format!("web.extract: {target_id} has no stored body; fetch it first"),
+            ))
+        })?;
+    let content_ref = khive_storage::ContentRef::from_hex(content_ref)
+        .map_err(|error| RuntimeError::Internal(format!("stored blob_ref is invalid: {error}")))?;
+    let store = crate::blob_store(runtime)?;
+    let bytes = store
+        .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+        .await
+        .map_err(RuntimeError::from)?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+
+    let url_str = properties
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let base_url = Url::parse(&url_str)
+        .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
+    let site_id = identity::site_id(&identity::canonicalize(base_url.clone()));
+    let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
+    let content_type = properties.get("content_type").and_then(Value::as_str);
+
+    let kinds: Vec<String> = match params.kinds {
+        Some(k) if !k.is_empty() => k,
+        _ => applicable_kinds(entity_type, content_type)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    for kind in &kinds {
+        if !ALL_KINDS.contains(&kind.as_str()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "web.extract: unknown kind {kind:?}; expected one of {ALL_KINDS:?}"
+            )));
         }
     }
-    let mut tools = BTreeMap::new();
-    for (index, tool) in manifest.raw["tools"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("tools[{index}]");
-        let Some(name) = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-        else {
-            result.quarantine(
-                format!("{field}.name"),
-                "tool name must be a non-empty string",
-            );
-            continue;
-        };
-        let id = identifier(json!(["agent_tool", manifest.origin, name]));
-        if result.entity(id, "service", "agent_tool", name, tool, &field) {
-            result.edge(site_id, id, EdgeRelation::Contains);
-            tools.insert(name, id);
+
+    let mut result = serde_json::Map::new();
+    for kind in &kinds {
+        match kind.as_str() {
+            "links" => {
+                let count = extract_links(runtime, token, target_id, &base_url, &body).await?;
+                result.insert("links".to_string(), json!({ "edges_created": count }));
+            }
+            "sitemap" => {
+                let count = extract_entries(runtime, token, site_id, &body, "sitemap").await?;
+                result.insert("sitemap".to_string(), json!({ "entries": count }));
+            }
+            "feed" => {
+                let count = extract_entries(runtime, token, site_id, &body, "feed").await?;
+                result.insert("feed".to_string(), json!({ "entries": count }));
+            }
+            "text" => {
+                let text_id = extract_text(runtime, token, target_id, &url_str, &body).await?;
+                result.insert("text".to_string(), json!({ "id": text_id.to_string() }));
+            }
+            _ => unreachable!("validated above"),
         }
     }
-    for (index, skill) in manifest.raw["skills"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let field = format!("skills[{index}]");
-        let Some(name) = skill
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-        else {
-            result.quarantine(
-                format!("{field}.name"),
-                "skill name must be a non-empty string",
+
+    Ok(json!({
+        "id": target_id.to_string(),
+        "kinds": kinds,
+        "result": Value::Object(result),
+    }))
+}
+
+impl WebPack {
+    pub(crate) async fn handle_extract(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let params: ExtractParams = serde_json::from_value(params).map_err(|error| {
+            RuntimeError::InvalidInput(format!("invalid web.extract arguments: {error}"))
+        })?;
+        let effective_token =
+            crate::fetch::resolve_effective_token(token, params.namespace.as_deref())?;
+        run_extract(&self.runtime, &effective_token, params).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+    use khive_types::Namespace;
+    use std::sync::Arc;
+
+    /// See `fetch::tests::install_web_edge_rules` for why this is needed:
+    /// the in-crate test runtime carries no `VerbRegistry`, so the web
+    /// pack's own `EDGE_RULES` are never installed on it by default.
+    fn install_web_edge_rules(runtime: &KhiveRuntime) {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(runtime.clone()));
+        builder.register(crate::WebPack::new(runtime.clone()));
+        let registry = builder.build().expect("kg+web registry builds");
+        runtime.install_edge_rules(registry.all_edge_rules());
+    }
+
+    async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
+            .expect("fs blob store");
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        install_web_edge_rules(&runtime);
+        runtime
+            .install_blob_store(Arc::new(store))
+            .expect("install blob store");
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        (runtime, token, dir)
+    }
+
+    async fn seed_page(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        url_str: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Uuid {
+        let url = Url::parse(url_str).unwrap();
+        let canonical = identity::canonicalize(url);
+        let site = identity::site_id(&canonical);
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            site,
+            "service",
+            "site",
+            &identity::site_key(&canonical),
+            json!({ "scheme": canonical.scheme(), "host": canonical.host_str() }),
+        )
+        .await
+        .unwrap();
+        let id = identity::document_id(site, &identity::path_and_query(&canonical));
+        let store = crate::blob_store(runtime).unwrap();
+        let content_ref = store.put(body.to_vec()).await.unwrap();
+        let entity_type = if content_type.starts_with("text/html") {
+            "page"
+        } else {
+            "resource"
+        };
+        crate::entities::get_or_create(
+            runtime,
+            token,
+            id,
+            "document",
+            entity_type,
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string() }),
+        )
+        .await
+        .unwrap();
+        crate::entities::patch(
+            runtime,
+            token,
+            id,
+            Some(entity_type),
+            json!({
+                "url": canonical.to_string(),
+                "content_type": content_type,
+                "blob_ref": content_ref.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    // A2: extract(links) on a page with N distinct hrefs yields N links_to
+    // edges whose targets are minted as unfetched resources; a repeated
+    // href is not double-counted (dedup), and a fragment-only href is
+    // skipped as not a distinct resource.
+    #[tokio::test]
+    async fn a2_extract_links_yields_n_edges_to_unfetched_resources_dedup_and_fragment_skip() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let html = br##"<html><body>
+            <a href="/a">A</a>
+            <a href="/b">B</a>
+            <a href="/a">A again</a>
+            <a href="#top">fragment only</a>
+            <a href="https://other.example.test/c">C</a>
+        </body></html>"##;
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/",
+            "text/html",
+            html,
+        )
+        .await;
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .expect("extract succeeds");
+        assert_eq!(
+            reply["result"]["links"]["edges_created"], 3,
+            "a, b, c — deduped, fragment skipped"
+        );
+
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                page_id,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::LinksTo]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 3);
+        for n in &neighbors {
+            let entity = runtime
+                .entities(&token)
+                .unwrap()
+                .get_entity(n.node_id)
+                .await
+                .unwrap()
+                .expect("target minted");
+            assert_eq!(
+                entity.entity_type.as_deref(),
+                Some("resource"),
+                "unfetched target starts as resource"
             );
-            continue;
-        };
-        let id = identifier(json!(["agent_skill", manifest.origin, name]));
-        if !result.entity(id, "document", "agent_skill", name, skill, &field) {
-            continue;
-        }
-        result.edge(site_id, id, EdgeRelation::Contains);
-        let Some(required) = skill.get("tools_required") else {
-            continue;
-        };
-        let Some(required) = required.as_array() else {
-            result.quarantine(
-                format!("{field}.tools_required"),
-                "tools_required must be an array of names",
-            );
-            continue;
-        };
-        let mut seen = HashSet::new();
-        for (index, name) in required.iter().enumerate() {
-            let reference = format!("{field}.tools_required[{index}]");
-            let Some(name) = name.as_str() else {
-                result.quarantine(reference, "tool reference must be a string");
-                continue;
-            };
-            if !seen.insert(name) {
-                continue;
-            }
-            match tools.get(name) {
-                Some(tool) => result.edge(id, *tool, EdgeRelation::DependsOn),
-                None => result.quarantine(
-                    reference,
-                    "tool reference has no readable declaration in this manifest",
-                ),
-            }
+            assert_eq!(entity.properties.unwrap()["status"], Value::Null);
         }
     }
-    Ok(result)
+
+    // extract(text) mints a derived_from resource holding tag-stripped
+    // text, and repeating the call converges on the same id.
+    #[tokio::test]
+    async fn extract_text_mints_derived_from_resource_idempotent_id() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let html = b"<html><body><p>Hello   world</p><script>ignored();</script></body></html>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/page",
+            "text/html",
+            html,
+        )
+        .await;
+
+        let reply1 = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let text_id_1 = reply1["result"]["text"]["id"].as_str().unwrap().to_string();
+
+        let reply2 = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".to_string()]),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let text_id_2 = reply2["result"]["text"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            text_id_1, text_id_2,
+            "repeated extraction converges on one id"
+        );
+
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(uuid::Uuid::parse_str(&text_id_1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = khive_storage::ContentRef::from_hex(
+            entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
+        )
+        .unwrap();
+        let bytes = store
+            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("Hello world"), "{text:?}");
+        assert!(
+            !text.contains("ignored"),
+            "script content is stripped like any other tag body"
+        );
+
+        let neighbors = runtime
+            .neighbors(
+                &token,
+                uuid::Uuid::parse_str(&text_id_1).unwrap(),
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::DerivedFrom]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, page_id);
+    }
+
+    // extract on a document with no stored body refuses `not_fetched`.
+    #[tokio::test]
+    async fn extract_on_unfetched_document_refuses_not_fetched() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://origin.example.test/never-fetched").unwrap();
+        let canonical = identity::canonicalize(url);
+        let site = identity::site_id(&canonical);
+        let id = identity::document_id(site, &identity::path_and_query(&canonical));
+        crate::entities::get_or_create(
+            &runtime,
+            &token,
+            id,
+            "document",
+            "resource",
+            canonical.as_ref(),
+            json!({ "url": canonical.to_string(), "status": Value::Null }),
+        )
+        .await
+        .unwrap();
+
+        let err = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(id),
+                url: None,
+                kinds: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not_fetched"), "{err}");
+    }
 }

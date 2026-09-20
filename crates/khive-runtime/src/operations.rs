@@ -956,6 +956,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("project", EdgeRelation::PartOf, "org"),
     ("*", EdgeRelation::InstanceOf, "concept"),
     ("service", EdgeRelation::InstanceOf, "project"),
+    // ADR-002 amendment (ADR-191): web hyperlink — a document points at
+    // another document it links to. No qualifier inference (unlike
+    // depends_on); the endpoint pair is intentionally narrow (document only,
+    // no service/concept targets — see ADR-191 D2/F10).
+    ("document", EdgeRelation::LinksTo, "document"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -17873,6 +17878,81 @@ mod tests {
             dk,
             Some("normative"),
             "document->document depends_on must infer dependency_kind=normative"
+        );
+    }
+
+    // ── Web hyperlink endpoint pair (ADR-191) ────────────────────────────────
+    // document->document is the only links_to pair: a hyperlink's target is a
+    // URL, which resolves to a document, never to the service that hosts it.
+
+    #[tokio::test]
+    async fn link_document_links_to_document_allowed_service_and_concept_targets_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let page_a = rt
+            .create_entity(&tok, "document", None, "Page A", None, None, vec![])
+            .await
+            .unwrap();
+        let page_b = rt
+            .create_entity(&tok, "document", None, "Page B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, page_a.id, page_b.id, EdgeRelation::LinksTo, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document links_to must be allowed by the ADR-191 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert!(
+            edge.metadata.is_none(),
+            "links_to carries no governed metadata and infers none, unlike \
+             depends_on; got {:?}",
+            edge.metadata
+        );
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Some Site", None, None, vec![])
+            .await
+            .unwrap();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Some Concept", None, None, vec![])
+            .await
+            .unwrap();
+
+        let doc_to_service = rt
+            .link(&tok, page_a.id, svc.id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap_err();
+        assert!(
+            doc_to_service
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "document->service links_to must be refused with the \
+             endpoint-contract error; got {doc_to_service}"
+        );
+
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                concept.id,
+                page_a.id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document links_to must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
         );
     }
 

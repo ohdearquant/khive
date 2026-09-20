@@ -3646,6 +3646,7 @@ mod tests {
 
         let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -4750,6 +4751,7 @@ mod tests {
 
         let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
         let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -4874,6 +4876,7 @@ mod tests {
         ] {
             let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
             let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                web: Default::default(),
                 telemetry: Default::default(),
                 mounts: Vec::new(),
                 brain: Default::default(),

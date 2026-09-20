@@ -104,6 +104,9 @@ pub enum ConfigError {
     #[error("{entry}: {reason}")]
     InvalidTelemetryConfig { entry: String, reason: String },
 
+    #[error("[web] {key}: {reason}")]
+    InvalidWebConfig { key: String, reason: String },
+
     #[error(
         "[runtime] blob_hydration_bytes must be between {min} and {max} bytes inclusive; got {value}"
     )]
@@ -778,6 +781,240 @@ pub struct ExecSectionConfig {
     pub limits: ExecLimitsConfig,
 }
 
+// ---- web fetch/search policy (ADR-175 Amendment 1, carried into ADR-191 D3) ----
+
+/// One `[[web.allowlist]]` entry: an exclusive host the operator has opted
+/// into reachability for `web.fetch`/`web.search`. Presence of ANY entry
+/// makes the allowlist exclusive (ADR-175 A1.2.3); absence leaves the public
+/// internet reachable subject to the other egress rules. Matched by exact,
+/// normalized (lowercase, trailing-dot-stripped) host equality only — no
+/// suffix wildcarding, unlike `[[web.credentials]].hosts` (A1.2.6).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAllowlistEntry {
+    pub host: String,
+}
+
+/// One `[[web.credentials]]` entry: a named secret, read from the process
+/// environment at request time (never accepted as a verb argument), bound to
+/// the set of hosts it may be presented to. Each `hosts` entry is either an
+/// exact IP-literal address (matched exactly, never as a suffix) or a
+/// hostname suffix (`example.com` matches `example.com` and any
+/// `*.example.com` at a DNS label boundary) — ADR-175 A1.2.6.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebCredentialConfig {
+    /// Name the caller passes as `web.fetch`'s `credential` argument.
+    pub name: String,
+    /// Process environment variable holding the secret value.
+    pub env_var: String,
+    /// Non-empty set of hosts (exact IP literals or hostname suffixes) this
+    /// credential may be presented to.
+    pub hosts: Vec<String>,
+}
+
+/// One canned result inside a `kind = "fixture"` `[[web.search_providers]]`
+/// entry — deterministic, non-networked search results (demos, offline
+/// corpora, and the fixture arm of `web.search`'s own test suite).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebFixtureResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// One `[[web.search_providers]]` entry (ADR-175 A1.3). The provider is
+/// operator configuration; `web.search`'s `provider` argument only selects
+/// among entries declared here by `name`. Closed, tagged on `kind`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum WebSearchProviderConfig {
+    /// Deterministic canned results — no outbound request.
+    Fixture {
+        name: String,
+        #[serde(default)]
+        default: bool,
+        results: Vec<WebFixtureResult>,
+    },
+    /// A real HTTP GET search backend. `url_template` must contain the
+    /// literal substring `{query}`, replaced with the percent-encoded query
+    /// at request time; `{limit}` is replaced with the effective limit when
+    /// present. The response body is JSON: an array of `{title, url,
+    /// snippet}` objects. `api_key_env`, when set, is a process environment
+    /// variable sent as `Authorization: Bearer <value>`.
+    Http {
+        name: String,
+        #[serde(default)]
+        default: bool,
+        url_template: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+    },
+}
+
+impl WebSearchProviderConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            WebSearchProviderConfig::Fixture { name, .. } => name,
+            WebSearchProviderConfig::Http { name, .. } => name,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        match self {
+            WebSearchProviderConfig::Fixture { default, .. } => *default,
+            WebSearchProviderConfig::Http { default, .. } => *default,
+        }
+    }
+}
+
+/// `[web]` section (ADR-175 Amendment 1, ADR-191 D3): operator policy for
+/// `web.fetch` and `web.search` — ceilings, the address allowlist, credential
+/// host-set bindings, and configured search providers.
+///
+/// No generic per-pack settings map exists in this file today (`PackConfig`
+/// carries only `backend`/`no_embed`, both storage-routing concerns) so this
+/// follows the established precedent for a pack needing rich operator policy:
+/// a dedicated top-level section threaded through `RuntimeConfig`, the same
+/// shape as `[exec]` and `[git_write]`.
+///
+/// ```toml
+/// [web]
+/// timeout_default_s = 30
+/// timeout_max_s = 120
+/// max_bytes_default = 5242880
+/// max_bytes_max = 52428800
+/// search_limit_default = 10
+/// search_limit_max = 50
+///
+/// [[web.allowlist]]
+/// host = "example.com"
+///
+/// [[web.credentials]]
+/// name = "example-token"
+/// env_var = "EXAMPLE_API_TOKEN"
+/// hosts = ["example.com"]
+///
+/// [[web.search_providers]]
+/// kind = "fixture"
+/// name = "demo"
+/// default = true
+/// results = [{ title = "Example", url = "https://example.com", snippet = "..." }]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WebSectionConfig {
+    #[serde(default)]
+    pub timeout_default_s: Option<u64>,
+    #[serde(default)]
+    pub timeout_max_s: Option<u64>,
+    #[serde(default)]
+    pub max_bytes_default: Option<u64>,
+    #[serde(default)]
+    pub max_bytes_max: Option<u64>,
+    #[serde(default)]
+    pub search_limit_default: Option<u32>,
+    #[serde(default)]
+    pub search_limit_max: Option<u32>,
+    #[serde(default)]
+    pub allowlist: Vec<WebAllowlistEntry>,
+    #[serde(default)]
+    pub credentials: Vec<WebCredentialConfig>,
+    #[serde(default)]
+    pub search_providers: Vec<WebSearchProviderConfig>,
+}
+
+impl WebSectionConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |key: &str, reason: &str| ConfigError::InvalidWebConfig {
+            key: key.to_string(),
+            reason: reason.to_string(),
+        };
+        if let (Some(d), Some(m)) = (self.timeout_default_s, self.timeout_max_s) {
+            if d == 0 || d > m {
+                return Err(invalid(
+                    "timeout_default_s",
+                    "must be positive and not exceed timeout_max_s",
+                ));
+            }
+        }
+        if let (Some(d), Some(m)) = (self.max_bytes_default, self.max_bytes_max) {
+            if d == 0 || d > m {
+                return Err(invalid(
+                    "max_bytes_default",
+                    "must be positive and not exceed max_bytes_max",
+                ));
+            }
+        }
+        if let (Some(d), Some(m)) = (self.search_limit_default, self.search_limit_max) {
+            if d == 0 || d > m {
+                return Err(invalid(
+                    "search_limit_default",
+                    "must be positive and not exceed search_limit_max",
+                ));
+            }
+        }
+        let mut seen_hosts = std::collections::HashSet::new();
+        for entry in &self.allowlist {
+            let normalized = entry.host.trim().trim_end_matches('.').to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Err(invalid("allowlist.host", "must not be empty"));
+            }
+            if !seen_hosts.insert(normalized) {
+                return Err(invalid("allowlist.host", "duplicate host entry"));
+            }
+        }
+        let mut seen_credentials = std::collections::HashSet::new();
+        for credential in &self.credentials {
+            if credential.name.trim().is_empty() {
+                return Err(invalid("credentials.name", "must not be empty"));
+            }
+            if !seen_credentials.insert(credential.name.clone()) {
+                return Err(invalid("credentials.name", "duplicate credential name"));
+            }
+            if credential.env_var.trim().is_empty() {
+                return Err(invalid("credentials.env_var", "must not be empty"));
+            }
+            if credential.hosts.is_empty() {
+                return Err(invalid(
+                    "credentials.hosts",
+                    "must name at least one host or suffix",
+                ));
+            }
+        }
+        let mut seen_providers = std::collections::HashSet::new();
+        let mut default_count = 0;
+        for provider in &self.search_providers {
+            let name = provider.name();
+            if name.trim().is_empty() {
+                return Err(invalid("search_providers.name", "must not be empty"));
+            }
+            if !seen_providers.insert(name.to_string()) {
+                return Err(invalid("search_providers.name", "duplicate provider name"));
+            }
+            if provider.is_default() {
+                default_count += 1;
+            }
+            if let WebSearchProviderConfig::Http { url_template, .. } = provider {
+                if !url_template.contains("{query}") {
+                    return Err(invalid(
+                        "search_providers.url_template",
+                        "must contain the literal substring {query}",
+                    ));
+                }
+            }
+        }
+        if default_count > 1 {
+            return Err(invalid(
+                "search_providers",
+                "at most one provider may set default = true",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
@@ -875,6 +1112,13 @@ pub struct KhiveConfig {
     /// construction time.
     #[serde(default)]
     pub display: DisplaySectionConfig,
+
+    /// `web.fetch`/`web.search` operator policy (ADR-175 Amendment 1).
+    /// Absent is the fail-closed default for search (no provider configured)
+    /// and the permissive-subject-to-address-rules default for fetch (no
+    /// allowlist configured).
+    #[serde(default)]
+    pub web: WebSectionConfig,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -1159,6 +1403,7 @@ impl KhiveConfig {
         crate::mount_config::validate_mounts(&self.mounts)?;
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
+        self.web.validate()?;
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a

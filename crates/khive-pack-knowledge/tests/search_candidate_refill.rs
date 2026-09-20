@@ -142,6 +142,7 @@ impl EmbedderProvider for RefillVectorProvider {
 
 fn runtime_with_embedder() -> KhiveRuntime {
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),

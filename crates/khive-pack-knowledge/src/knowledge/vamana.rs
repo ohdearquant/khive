@@ -4906,6 +4906,7 @@ mod tests {
 
     fn rt_with_embedder(db_path: Option<std::path::PathBuf>) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),

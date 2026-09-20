@@ -9,14 +9,13 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Web ontology pack with typed site vocabulary and local manifest ingest"
+description = "Web pack: site/page/resource ontology and fetch/extract/ingest/search/refresh verbs (ADR-191)"
 
 [dependencies]
 khive-types = { version = "0.8.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.8.0", path = "../khive-runtime" }
 khive-storage = { version = "0.8.0", path = "../khive-storage" }
 khive-db = { version = "0.8.0", path = "../khive-db" }
-khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -25,9 +24,12 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 blake3 = { workspace = true }
-serde_yaml = "0.9"
+regex = { workspace = true }
 url = "2"
+reqwest = { workspace = true, features = ["gzip"] }
 
 [dev-dependencies]
+khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+flate2 = "1"

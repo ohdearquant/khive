@@ -15,6 +15,7 @@ use serde_json::json;
 
 fn file_backed_runtime(db_path: std::path::PathBuf) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
