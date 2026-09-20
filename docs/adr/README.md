@@ -207,6 +207,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-188](ADR-188-entity-version-fence.md)                              | Entities get a version, and then a fence                                                                   |
 | [ADR-189](ADR-189-namespace-move.md)                                    | Moving records between namespaces                                                                          |
 | [ADR-190](ADR-190-adr-to-code-citation-check.md)                        | One code-keyed check for ADR-to-code citations                                                             |
+| [ADR-191](ADR-191-web-pack-ontology-and-operations.md)                  | Web Pack — Web Ontology, Relation Rules, and Operations                                                    |
 
 <!-- END GENERATED ADR CATALOG -->
 
