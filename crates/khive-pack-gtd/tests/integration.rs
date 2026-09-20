@@ -3029,3 +3029,45 @@ async fn tasks_pagination_returns_disjoint_pages() {
         "returned tasks must be exactly the matching set, no filler rows leaked in"
     );
 }
+
+/// Issue #2977. The generic `update` echo of a task is the same projection `get` returns for
+/// that row: the task state at the top level, not the note lifecycle. A caller reads a write's
+/// echo instead of re-querying, so the two must agree on the field a reader takes as the answer.
+#[tokio::test]
+async fn generic_update_echo_reports_the_task_state_that_get_reports() {
+    let pack = pack(rt());
+    let assigned = assign(&pack, json!({"title": "echo must match read"})).await;
+    let full_id = assigned["full_id"].as_str().unwrap().to_string();
+    pack.dispatch("gtd.transition", json!({"id": full_id, "status": "next"}))
+        .await
+        .expect("transition to next");
+
+    let echoed = pack
+        .dispatch(
+            "update",
+            json!({"id": full_id, "properties": {"transition_note": "annotated in place"}}),
+        )
+        .await
+        .expect("generic update of a task's properties is admitted");
+    let read = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("task readable after update");
+
+    assert_eq!(
+        read["status"], "next",
+        "control: the read reports the task state"
+    );
+    assert_eq!(
+        echoed["status"], read["status"],
+        "the update echo's top-level status must equal the get read of the same row"
+    );
+    assert_eq!(
+        echoed["properties"]["transition_note"], "annotated in place",
+        "the update itself landed"
+    );
+    assert_eq!(
+        echoed["display_name"], read["display_name"],
+        "the echo carries the same projected label as the read"
+    );
+}
