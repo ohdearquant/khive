@@ -321,7 +321,7 @@ impl KgPack {
                     .runtime
                     .update_note_from_snapshot_with_embedding_report(token, note, patch)
                     .await?;
-                let mut response = normalize_entity_timestamps(to_json(&note)?);
+                let mut response = remap_note_status(normalize_entity_timestamps(to_json(&note)?));
                 if note.version == original_version {
                     response["unchanged"] = serde_json::json!(true);
                 }
