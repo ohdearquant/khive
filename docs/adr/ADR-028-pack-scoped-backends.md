@@ -762,6 +762,4 @@ on that backend (`crates/khive-mcp/src/serve.rs`, the per-pack runtime map and `
 Amendments A2 and A3 already describe behavior that only exists because these fields are
 parsed. A reader deciding where a new pack's data lives should read the config schema from
 `engine_config.rs` and the examples in Sections 4 through 7, and treat the "deferred" list in
-Section 1 as a record of the original plan. The tuning fields named there (`cache_mb`,
-`journal_mode`, `pragma_synchronous`, `read_only`) keep the A3 position: parsed and rejected,
-or in the case of `read_only`, the A2 snapshot-inspection semantics.
+Section 1 as a record of the original plan. Of the tuning fields named there, `cache_mb` and `journal_mode` keep the A3 position (parsed, rejected at validation), `read_only` carries the A2 snapshot-inspection semantics, and `pragma_synchronous` is not parsed.
