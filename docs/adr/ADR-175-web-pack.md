@@ -664,7 +664,9 @@ map from key name to count (a bare total told the reader nothing about what was 
     its own arm with its own expected result stated before the run: a vector-leg miss (candidates
     taken from the nearest-neighbour top-k before the tag predicate applies) is a finding against
     the search path, recorded as such, not a reason to soften the arm. Control on each leg: the
-    same query with `properties={"origin": "B"}` is allowed to miss, which is why the tag exists.
+    same query with `properties={"origin": "B"}` on a graph where B's page ranks inside the
+    window must hit (a control that may miss certifies nothing); the properties form on the
+    below-the-window graph is recorded as informational, which is the reason the tag exists.
 
 ### A2.8 What this changes in the tree
 
