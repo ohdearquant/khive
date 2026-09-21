@@ -276,12 +276,14 @@ amended below to say exactly that. Because the record and its attachment row liv
 databases, ADR-121's same-transaction delete cascade does not reach across, and
 [ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends and asks handlers
 for idempotent or compensating writes. So hard-deleting a routed `page` or `resource` is one verb
-invocation with two commits in a fixed order: the main backend deletes the attachment rows that
-name the record FIRST, then the record's own backend deletes the record, and the routed delete is
-idempotent on re-run. A crash between the two commits leaves a record with no attachment row,
-whose body is then collectable under ADR-121's grace period: that is the benign side by this
-amendment's own logic (a body nobody roots is reclaimed, a record mid-deletion is finished by the
-re-run), and it is the only order that can never leave an attachment row whose record is gone.
+invocation with two commits in a fixed order: the record's own backend commits the delete first,
+then the main backend deletes the attachment rows that named the record, and that second delete is
+idempotent (deleting rows that are already gone succeeds). A crash between the two commits leaves
+attachment rows whose record is gone; those rows root nothing that matters (the record they would
+keep alive no longer exists) and the attachment sweep reclaims them, so the failure mode is a
+bounded leak until the next sweep. The reverse order is forbidden: a crash after the attachment
+rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
+which is data loss, and this amendment exists to make stored bodies stay alive.
 
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
