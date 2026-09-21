@@ -1,8 +1,8 @@
 //! Keyed note pagination is distinct from the ordinary insertion-sequence walk.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::note::{NoteFilter, NoteKeyCursor};
-use khive_storage::PageRequest;
+use khive_storage::note::{FilterOp, NoteFilter, NoteKeyCursor, PropertyFilter};
+use khive_storage::{PageRequest, SqlValue};
 use serde_json::Value;
 
 use super::common::{
@@ -22,8 +22,47 @@ pub(super) fn note_filter(p: &ListParams, kind: Option<&str>) -> Result<NoteFilt
             })
             .transpose()
     }
+    if let Some(status) = p.status.as_deref() {
+        if !matches!(
+            status,
+            "provisioning" | "pending" | "firing" | "fired" | "cancelled" | "missed" | "failed"
+        ) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unknown scheduled_event status {status:?}; valid: provisioning | pending | firing | fired | cancelled | missed | failed"
+            )));
+        }
+    }
+    if p.created_by_actor
+        .as_deref()
+        .is_some_and(|actor| actor.trim().is_empty())
+    {
+        return Err(RuntimeError::InvalidInput(
+            "created_by_actor must be a non-blank exact metadata value".into(),
+        ));
+    }
+    // These predicates belong in SQL so every pagination mode counts only
+    // matching rows. Creator metadata is a filter, never an authority source.
+    let mut property_filters = Vec::new();
+    for (path, value) in [
+        ("$.status", p.status.as_deref()),
+        ("$.created_by_actor", p.created_by_actor.as_deref()),
+    ] {
+        if let Some(value) = value {
+            property_filters.push(PropertyFilter {
+                json_path: path.into(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("text".into()),
+            });
+            property_filters.push(PropertyFilter {
+                json_path: path.into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(value.into()),
+            });
+        }
+    }
     Ok(NoteFilter {
         kind: kind.map(str::to_owned),
+        property_filters,
         min_created_at: timestamp(p.created_after.as_deref(), "created_after")?,
         min_updated_at: timestamp(p.updated_after.as_deref(), "updated_after")?,
         tags: p.tags.clone().unwrap_or_default(),

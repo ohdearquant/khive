@@ -61,6 +61,26 @@ never stored with schedule intent, so restarting the server resets it instead of
 a predecessor's heartbeat as current liveness. Direct `SchedulePack` registry dispatch has
 no host loop to report and therefore retains the pack-only `{events, count}` result.
 
+To inspect scheduled events by state and creator, use the KG `list` verb:
+
+```text
+list(kind="scheduled_event", status="missed", created_by_actor="lambda:owner", updated_after="2026-09-01T00:00:00Z", after="")
+```
+
+Both filters apply before pagination and combine with existing note filters. Round-trip
+`next_after` with the same filters until it is null. `status` accepts `provisioning`,
+`pending`, `firing`, `fired`, `cancelled`, `missed`, or `failed`. Creator matching is exact
+and case-sensitive; it accepts any non-blank display value, including another actor's,
+without treating it as verified provenance or changing namespace visibility. There is
+no implicit self-filter or wildcard. Omitted/null filters impose no constraint.
+
+These parameters require `kind="scheduled_event"` or
+`kind="note", note_kind="scheduled_event"`; other kinds reject them, apart from the
+existing proposal `status` filter. Ordinary lists use visible namespaces; `key_prefix`
+lists retain their primary-namespace scope. `created_after` and `updated_after` filter
+row timestamps, not `missed_at`. Repeating missed occurrences rearm as `pending`, so
+`status="missed"` selects terminal missed rows rather than all historical misses.
+
 ## Usage
 
 `SchedulePack` requires only the `kg` pack (`REQUIRES = ["kg"]`) for the notes
