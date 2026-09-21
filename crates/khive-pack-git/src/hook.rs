@@ -150,10 +150,7 @@ fn validate_changed_paths_shape(value: &Value) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Read a string-valued property off a stored note, for the one hook check
-/// that needs the CURRENT record rather than only the patch (`short_sha`
-/// must prefix the effective `sha`, which on an update that does not itself
-/// patch `sha` is the value already on record).
+/// Read the retained half of the SHA/short-SHA pair from the stored note.
 fn note_property_str<'a>(note: &'a Note, key: &str) -> Option<&'a str> {
     note.properties.as_ref()?.get(key)?.as_str()
 }
@@ -255,15 +252,19 @@ impl KindHook for CommitHook {
             validate_parents_shape(parents_value)?;
         }
 
-        // short_sha is only checked when it is present as a string, mirroring
-        // `prepare_create`'s own silent bypass for any other JSON shape —
-        // including an explicit `null`, which is how a caller clears it.
-        if let Some(short) = patch.get("short_sha").and_then(Value::as_str) {
+        // A patch to either coordinate must preserve the effective pair. An
+        // explicit short_sha value, including null, overrides the stored value
+        // before the create path's string-only validation is applied.
+        if patch.contains_key("sha") || patch.contains_key("short_sha") {
+            let effective_short = match patch.get("short_sha") {
+                Some(value) => value.as_str(),
+                None => note_property_str(note, "short_sha"),
+            };
             let effective_sha = patch
                 .get("sha")
                 .and_then(Value::as_str)
                 .or_else(|| note_property_str(note, "sha"));
-            if let Some(sha) = effective_sha {
+            if let (Some(short), Some(sha)) = (effective_short, effective_sha) {
                 validate_short_sha_shape(short, sha)?;
             }
         }
@@ -480,6 +481,25 @@ mod tests {
             .expect("create commit ok")
     }
 
+    async fn create_commit_with_short_sha(
+        registry: &VerbRegistry,
+        sha: &str,
+        short_sha: &str,
+    ) -> Value {
+        registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "commit",
+                    "name": sha,
+                    "content": "a commit",
+                    "properties": {"sha": sha, "short_sha": short_sha},
+                }),
+            )
+            .await
+            .expect("create commit with short_sha ok")
+    }
+
     async fn create_issue(registry: &VerbRegistry, project_id: Uuid, number: i64) -> Value {
         registry
             .dispatch(
@@ -630,6 +650,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_commit_refuses_sha_that_conflicts_with_retained_short_sha() {
+        let (_token, registry) = fixture().await;
+        let sha = valid_sha();
+        let short = &sha[..8];
+        let created = create_commit_with_short_sha(&registry, &sha, short).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let before = registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("get before refused update");
+        let new_sha = other_valid_sha();
+
+        let err = registry
+            .dispatch(
+                "update",
+                json!({
+                    "id": id,
+                    "content": "updated commit",
+                    "properties": {"sha": new_sha, "unrelated": "new value"},
+                }),
+            )
+            .await
+            .expect_err("sha-only update must not retain an inconsistent short_sha");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid input: commit properties.short_sha {short:?} must be a non-empty prefix of sha {new_sha:?}"
+            )
+        );
+        let after = registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("get after refused update");
+        assert_eq!(
+            after, before,
+            "a refused patch must leave the note unchanged"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // CommitHook: update still accepts a VALID patch — the easy-to-forget
     // arm that would catch an over-broad refusal.
@@ -638,7 +698,8 @@ mod tests {
     #[tokio::test]
     async fn update_commit_accepts_valid_sha_and_short_sha_together() {
         let (_token, registry) = fixture().await;
-        let created = create_commit(&registry, &valid_sha()).await;
+        let old_sha = valid_sha();
+        let created = create_commit_with_short_sha(&registry, &old_sha, &old_sha[..8]).await;
         let id = created["id"].as_str().unwrap().to_string();
         let new_sha = other_valid_sha();
         let short = new_sha[..8].to_string();
@@ -656,6 +717,87 @@ mod tests {
             .await
             .expect("get after accepted update");
         assert_eq!(after["properties"]["sha"], json!(other_valid_sha()));
+        assert_eq!(after["properties"]["short_sha"], json!(short));
+    }
+
+    #[tokio::test]
+    async fn update_commit_accepts_sha_when_retained_short_sha_still_matches() {
+        let (_token, registry) = fixture().await;
+        let sha = valid_sha();
+        let short = &sha[..8];
+        let created = create_commit_with_short_sha(&registry, &sha, short).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        for new_sha in [sha.clone(), format!("{short}{}", "b".repeat(32))] {
+            registry
+                .dispatch("update", json!({"id": id, "properties": {"sha": new_sha}}))
+                .await
+                .expect("same SHA or a new SHA with the retained prefix must be accepted");
+            let after = registry
+                .dispatch("get", json!({"id": id}))
+                .await
+                .expect("get after accepted SHA-only update");
+            assert_eq!(after["properties"]["sha"], json!(new_sha));
+            assert_eq!(after["properties"]["short_sha"], json!(short));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_commit_accepts_sha_without_a_string_short_sha() {
+        let (_token, registry) = fixture().await;
+        for short in [None, Some(Value::Null), Some(json!(7))] {
+            let mut properties = json!({"sha": valid_sha()});
+            if let Some(value) = &short {
+                properties["short_sha"] = value.clone();
+            }
+            let created = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "commit",
+                        "content": "a commit",
+                        "properties": properties,
+                    }),
+                )
+                .await
+                .expect("create accepts missing or non-string short_sha");
+            let id = created["id"].as_str().unwrap().to_string();
+            registry
+                .dispatch(
+                    "update",
+                    json!({"id": id, "properties": {"sha": other_valid_sha()}}),
+                )
+                .await
+                .expect("no string short_sha is retained to conflict with the new SHA");
+            let after = registry
+                .dispatch("get", json!({"id": id}))
+                .await
+                .expect("get after accepted SHA-only update");
+            assert_eq!(after["properties"]["sha"], json!(other_valid_sha()));
+            assert_eq!(after["properties"].get("short_sha"), short.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn update_commit_accepts_sha_while_clearing_short_sha() {
+        let (_token, registry) = fixture().await;
+        let sha = valid_sha();
+        let created = create_commit_with_short_sha(&registry, &sha, &sha[..8]).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        registry
+            .dispatch(
+                "update",
+                json!({"id": id, "properties": {"sha": other_valid_sha(), "short_sha": null}}),
+            )
+            .await
+            .expect("clearing short_sha must not fall back to the old prefix");
+        let after = registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("get after clearing short_sha and replacing SHA");
+        assert_eq!(after["properties"]["sha"], json!(other_valid_sha()));
+        assert_eq!(after["properties"]["short_sha"], Value::Null);
     }
 
     #[tokio::test]
@@ -765,7 +907,8 @@ mod tests {
     async fn update_commit_unrelated_patch_leaves_validated_fields_untouched() {
         let (_token, registry) = fixture().await;
         let sha = valid_sha();
-        let created = create_commit(&registry, &sha).await;
+        let short = &sha[..8];
+        let created = create_commit_with_short_sha(&registry, &sha, short).await;
         let id = created["id"].as_str().unwrap().to_string();
 
         registry
@@ -781,6 +924,7 @@ mod tests {
             .await
             .expect("get after unrelated update");
         assert_eq!(after["properties"]["sha"], json!(sha));
+        assert_eq!(after["properties"]["short_sha"], json!(short));
         assert_eq!(after["properties"]["unrelated"], json!("note"));
     }
 
