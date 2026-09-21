@@ -9252,7 +9252,7 @@ mod event_counts_tests {
     }
 
     /// #34: `counts_by_signal` (flat) and `by_profile_and_signal` (crossed with
-    /// `served_by_profile_id`) let a caller compute per-seat negative-signal share
+    /// `served_by_profile_id`) let a caller compute per-profile negative-signal share
     /// in one call, mirroring the profile-only split above.
     #[tokio::test]
     async fn feedback_events_split_by_signal_and_crossed_with_profile() {

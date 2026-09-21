@@ -80,7 +80,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             plane; feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
-            with signal (by_profile_and_signal, for per-seat negative-share); events \
+            with signal (by_profile_and_signal, keyed by served_by_profile_id then signal, \
+            for per-profile negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
@@ -1122,7 +1123,7 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         // #34: signal breakdown for `feedback_explicit`, both flat (negative-signal
         // saturation as a first-class metric) and crossed with the profile split
-        // above (negative-share per seat/profile) — same source field
+        // above (negative-share per profile) — same source field
         // (`payload.signal`, stamped by `brain.feedback`/`brain.auto_feedback`) as
         // `by_profile` reads `payload.served_by_profile_id` from.
         let mut counts_by_signal: std::collections::BTreeMap<String, u64> =
