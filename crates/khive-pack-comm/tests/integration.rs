@@ -904,6 +904,107 @@ async fn reply_creates_threaded_message() {
 }
 
 #[tokio::test]
+async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "original",
+                "subject": "下午药 (Lamotrigine 200)"
+            }),
+        )
+        .await
+        .expect("send original succeeds");
+    let root_id = original["full_id"].as_str().expect("full_id").to_string();
+
+    // A later message in the same thread whose subject drifted: extra spaces
+    // at the CJK/ASCII boundary, a doubled reply prefix, and a client-added
+    // suffix. The first two are what whitespace collapsing alone would repair;
+    // the suffix is what only the root rule repairs.
+    let drifted = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "drifted",
+                "subject": "Re: Re: 下午药   (Lamotrigine 200) (2)",
+                "thread_id": root_id
+            }),
+        )
+        .await
+        .expect("send into thread succeeds");
+    let drifted_id = drifted["full_id"].as_str().expect("full_id").to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": drifted_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(
+        reply["subject"].as_str(),
+        Some("Re: 下午药 (Lamotrigine 200)"),
+        "reply subject comes from the thread root, not the drifted message: {reply}"
+    );
+    assert_eq!(reply["thread_id"].as_str(), Some(root_id.as_str()));
+
+    // Replying to a reply keeps a single prefix.
+    let reply_id = reply["full_id"].as_str().expect("full_id").to_string();
+    let second = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": reply_id, "content": "again" }),
+        )
+        .await
+        .expect("second reply succeeds");
+    assert_eq!(
+        second["subject"].as_str(),
+        Some("Re: 下午药 (Lamotrigine 200)")
+    );
+}
+
+#[tokio::test]
+async fn reply_subject_falls_back_to_the_message_when_the_root_has_none() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "no subject here" }),
+        )
+        .await
+        .expect("send original succeeds");
+    let root_id = original["full_id"].as_str().expect("full_id").to_string();
+
+    let titled = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "titled",
+                "subject": "Topic",
+                "thread_id": root_id
+            }),
+        )
+        .await
+        .expect("send into thread succeeds");
+    let titled_id = titled["full_id"].as_str().expect("full_id").to_string();
+
+    let reply = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": titled_id, "content": "answer" }),
+        )
+        .await
+        .expect("reply succeeds");
+    assert_eq!(reply["subject"].as_str(), Some("Re: Topic"));
+}
+
+#[tokio::test]
 async fn unknown_verb_returns_error() {
     let (registry, _rt) = build_registry();
     let err = registry

@@ -525,6 +525,13 @@ pub(crate) fn process_selected_page(
 /// `host` and `uidvalidity` are combined with `uid` to form the stable
 /// `imap_external_id` dedup key. This avoids relying on the `Message-ID`
 /// header, which is optional and could be absent or spoofed.
+/// Subject text with every run of whitespace collapsed to one ASCII space and
+/// the ends trimmed. Subjects are display text, so this loses nothing a client
+/// shows; it removes the boundary whitespace that encoded-word decoding adds.
+pub(crate) fn normalize_subject(subject: &str) -> String {
+    subject.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub(crate) fn parse_raw_bytes(
     uid: u32,
     raw: &[u8],
@@ -568,7 +575,14 @@ pub(crate) fn parse_raw_bytes(
         })
         .unwrap_or_default();
 
-    let subject = msg.subject().map(|s| s.to_string()).unwrap_or_default();
+    // Collapse whitespace runs in the decoded subject. mail-parser's unstructured
+    // header decoder inserts a separator between an encoded-word and the text
+    // that follows it even when the raw header carries none, so a subject sent
+    // as `=?utf-8?Q?...=E8=AE=B0_?=(tail` (the space encoded inside the word, no
+    // separator after it) decodes with two spaces at that boundary. A reply that
+    // echoes the decoded string gains one more space on every round trip, and
+    // mail clients then thread each hop as a new conversation.
+    let subject = normalize_subject(msg.subject().unwrap_or_default());
 
     let date = msg
         .date()
@@ -808,6 +822,33 @@ mod tests {
         assert_eq!(email.from_addrs.len(), 2);
         assert!(email.from_addrs.contains(&"alice@example.com".to_string()));
         assert!(email.from_addrs.contains(&"bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_raw_bytes_collapses_whitespace_at_encoded_word_boundary_in_subject() {
+        // Raw shape captured from a mail client's reply: the folded header puts
+        // the encoded-word on its own line, the space between the CJK run and
+        // the ASCII tail is encoded INSIDE the word (`_`), and no separator
+        // follows `?=`. The intended subject has exactly one space there.
+        // (`\x20` keeps the fold's leading space: a `\` continuation strips
+        // the next line's leading whitespace.)
+        let raw = b"From: alice@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: Re:\r\n\
+                    \x20=?utf-8?Q?=E4=B8=8B=E5=8D=88=E8=8D=AF=E8=BF=98=E6=B2=A1=E8=AE=B0_?=(Lamotrigine\r\n\
+                    \x20200 + Gabapentin 200)\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        assert_eq!(
+            email.subject,
+            "Re: 下午药还没记 (Lamotrigine 200 + Gabapentin 200)"
+        );
+
+        // Control: a plain ASCII subject is untouched.
+        let raw = minimal_rfc822("alice@example.com", "Re: plain (Lamotrigine 200)");
+        let email = parse_raw_bytes(2, &raw, "imap.example.com", 1).unwrap();
+        assert_eq!(email.subject, "Re: plain (Lamotrigine 200)");
     }
 
     #[test]

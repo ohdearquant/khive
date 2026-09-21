@@ -1476,6 +1476,29 @@ fn read_response(
     }
 }
 
+/// `Re: ` + the subject with every leading reply prefix removed and whitespace
+/// runs collapsed; empty stays empty. Idempotent, so replying to a reply keeps
+/// one `Re: ` and a subject that drifted by whitespace maps back to one form.
+pub(crate) fn reply_subject_for(subject: &str) -> String {
+    let mut base = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+    loop {
+        let stripped = base
+            .strip_prefix("Re:")
+            .or_else(|| base.strip_prefix("RE:"))
+            .or_else(|| base.strip_prefix("re:"))
+            .map(|rest| rest.trim_start().to_string());
+        match stripped {
+            Some(rest) => base = rest,
+            None => break,
+        }
+    }
+    if base.is_empty() {
+        String::new()
+    } else {
+        format!("Re: {base}")
+    }
+}
+
 /// `reply` — reply to a message, threading linkage. See
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_reply
 pub(crate) async fn handle_reply(
@@ -1599,11 +1622,32 @@ pub(crate) async fn handle_reply(
         .unwrap_or("")
         .to_string();
 
-    let reply_subject = if original_subject.starts_with("Re: ") || original_subject.is_empty() {
-        original_subject.clone()
-    } else {
-        format!("Re: {original_subject}")
+    // The reply subject derives from the thread ROOT's stored subject, not from
+    // the message being replied to. An inbound subject is a decoded mail header
+    // and can drift (whitespace at encoded-word boundaries, client re-encoding);
+    // echoing it compounds the drift on every round trip until mail clients stop
+    // threading the exchange. The root is the one subject this side authored or
+    // first received. Falls back to the replied-to message's subject when the
+    // root is the message itself, unreadable, or has no subject.
+    let root_subject = match Uuid::parse_str(&thread_id) {
+        Ok(root_id) if root_id != original.id => store
+            .get_note(root_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|root| root.namespace == token.namespace().as_str())
+            .and_then(|root| {
+                root.properties
+                    .as_ref()
+                    .and_then(|props| props.get("subject"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|subject| !subject.trim().is_empty()),
+        _ => None,
     };
+    let base_subject = root_subject.unwrap_or(original_subject);
+    let reply_subject = reply_subject_for(&base_subject);
 
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor_label = token.actor().id.clone();
