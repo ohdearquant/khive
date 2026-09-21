@@ -153,8 +153,7 @@ impl KindHook for MessageHook {
     }
 }
 
-/// Refuses shared creation of `channel_health`, the kind this pack owns and writes by
-/// derived id.
+/// Keeps shared mutations from changing the derived identity of `channel_health` rows.
 #[derive(Debug, Default)]
 struct ChannelHealthHook;
 
@@ -200,6 +199,29 @@ impl KindHook for ChannelHealthHook {
         _id: uuid::Uuid,
         _args: &Value,
     ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(properties) = properties.and_then(Value::as_object) {
+            for key in ["channel_kind", "channel_slug"] {
+                if properties.contains_key(key) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{key}` is not patchable on a `channel_health` note: \
+                         `comm.heartbeat` derives its id from the namespace, channel kind \
+                         and slug; changing a coordinate would detach the row from that \
+                         identity. Omit `{key}` from the patch and use `comm.heartbeat` \
+                         to report a channel's health"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
