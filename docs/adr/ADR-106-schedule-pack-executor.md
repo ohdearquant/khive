@@ -1060,3 +1060,34 @@ anonymous attribution for refused generic rows, terminal pre-invocation refusal 
 multi-op actions across two drains, a committed side effect followed by structured
 `side_effects_unknown` across two drains (one invocation/one visible side effect), and an
 injected expired-row finalization failure that does not wedge later due work.
+
+## Amendment G: Interval and cron recurrence (2026-09-21)
+
+Amendment F stated that creation accepts only `daily`, `weekly`, and `monthly` and that
+five-field cron is rejected as non-executable. That paragraph is superseded. Since #2484
+creation and the drain share one parser, `khive_pack_schedule::repeat`, which also accepts
+`every:<N><s|m|h|d>` intervals and five-field cron expressions evaluated in UTC. The
+accepted grammar is recorded once, in the
+[ADR-040 amendment of the same date](ADR-040-communication-and-schedule-packs.md#amendment-2026-09-21-interval-and-cron-recurrence-through-one-parser);
+this amendment specifies how the executor advances the two new forms.
+
+**Normal advancement.** After a fired occurrence the next occurrence is the parser's
+`next_after(trigger_at)`: an interval adds its duration to the previous trigger; cron
+returns the first pattern match strictly after the previous trigger.
+
+**Missed-occurrence advancement** (Amendment A's no-catch-up-burst rule) uses the parser's
+`first_after(trigger_at, now)`, and the two forms differ deliberately:
+
+- An interval stays phase-locked to its original trigger: the next occurrence is the first
+  multiple of the interval after `now`, counted from the missed trigger, so a row that was
+  offline for a long stretch resumes on its original cadence rather than restarting from the
+  moment the daemon came back.
+- Cron asks the pattern for the first match after `now`. Cron occurrences are absolute
+  positions on the clock, so phase is inherent in the expression and nothing is lost by
+  re-anchoring to `now`.
+- The calendar aliases keep their existing behaviour: step one occurrence at a time until
+  the result is strictly later than `now`.
+
+In every case the missed occurrence itself is recorded as missed and never dispatched, and
+exactly one future occurrence is armed. Legacy rows carrying an expression the parser
+rejects fail closed before invocation, as before.

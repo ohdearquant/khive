@@ -883,3 +883,31 @@ This proposal preserves the actor and legacy-row contracts in
 [ADR-057](ADR-057-comm-actor-addressed-delivery.md) and
 [ADR-063](ADR-063-comm-principal-model.md); it creates no new authorization seam.
 Other verbs' limits and response contracts are unchanged.
+
+## Amendment (2026-09-21): interval and cron recurrence through one parser
+
+This amendment supersedes the 2026-08-07 amendment above, which narrowed `repeat` to
+`daily`, `weekly`, and `monthly` because the executor could advance only those forms.
+That constraint no longer holds: since #2484 schedule creation and the pending-events
+drain share one parser, `khive_pack_schedule::repeat`, and the executor advances every
+form that parser accepts.
+
+`repeat` accepts:
+
+| Value                     | Semantics                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------- |
+| `"daily"`                 | The previous trigger plus one day                                                           |
+| `"weekly"`                | The previous trigger plus seven days                                                        |
+| `"monthly"`               | The previous trigger plus one calendar month, with month-end clamping                       |
+| `"every:<N><s\|m\|h\|d>"` | A fixed interval of `N` seconds, minutes, hours or days from the previous trigger, `N >= 1` |
+| five-field cron           | The next match after the previous trigger, evaluated in UTC                                 |
+
+Any other value is rejected at creation with an error that names the rejected value and
+the accepted forms. A legacy row whose stored `repeat` the parser does not accept still
+fails closed before invocation; the fail-closed rule is unchanged, only the accepted
+grammar widened. The write boundary and the executor cannot disagree about what a
+recurrence means because there is exactly one definition of it; that property, not any
+particular grammar, is what this ADR guarantees.
+
+Missed-occurrence advancement for the new forms is specified in
+[ADR-106 Amendment G](ADR-106-schedule-pack-executor.md#amendment-g-interval-and-cron-recurrence-2026-09-21).
