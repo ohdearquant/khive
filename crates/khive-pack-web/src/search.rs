@@ -7,7 +7,7 @@
 //! that same URL re-types and fills it in place, same as any other
 //! extract-discovered link (D1's "identity is by address").
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use khive_runtime::engine_config::{WebSearchProviderConfig, WebSectionConfig};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
@@ -118,7 +118,7 @@ fn parse_search_response(
 
 /// An `Http` provider's request goes through the same address-class/
 /// DNS-rebinding-safe egress checks as `web.fetch`/`web.refresh`
-/// (`egress::resolve_and_pin` + `egress::pinned_client`) rather than a bare
+/// (`egress::resolve_and_pin_before` + `egress::pinned_client`) rather than a bare
 /// `reqwest::Client` dialing whatever `url_template` names — a provider
 /// pointed at a loopback/private/link-local address by misconfiguration (or
 /// a rewritten template) is refused before any connection is attempted, the
@@ -132,14 +132,9 @@ fn parse_search_response(
 /// enforces that `hosts` is non-empty whenever `api_key_env` is set, so this
 /// is a defense in depth, not the only gate.
 ///
-/// The outer `tokio::time::timeout` inside `run_one_hop` is the sole
-/// deadline authority for this request — this client carries no
-/// `.timeout()` of its own. A client-level timeout captured `remaining` at
-/// build time and `run_one_hop` computed its own remaining duration a moment
-/// later; under scheduler contention the two independently armed timers
-/// could race, and reqwest's own timeout error surfaces as a bare
+/// DNS resolution and `run_one_hop` share the same absolute deadline. The
+/// client carries no independent timeout that could race it and surface a
 /// `transport_error` instead of the deliberate `response_too_slow` refusal.
-/// One timer, one refusal code.
 #[allow(clippy::too_many_arguments)]
 async fn run_http_provider(
     resolver: &dyn Resolver,
@@ -187,13 +182,8 @@ async fn run_http_provider(
     let port = url.port_or_known_default().ok_or_else(|| {
         RuntimeError::InvalidInput("search provider url has no resolvable port".to_string())
     })?;
-    let addr = egress::resolve_and_pin(resolver, &host).await?;
-    let client = egress::pinned_client(
-        &host,
-        addr,
-        port,
-        deadline.saturating_duration_since(Instant::now()),
-    )?;
+    let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
+    let client = egress::pinned_client(&host, addr, port)?;
 
     let outcome = run_one_hop(
         &client,
@@ -219,7 +209,7 @@ async fn run_search(
     cfg: &WebSectionConfig,
     params: SearchParams,
 ) -> Result<Value, RuntimeError> {
-    let ceilings = egress::resolve_ceilings(cfg);
+    let ceilings = egress::resolve_ceilings(cfg)?;
     let max_bytes = egress::check_ceiling(
         params.max_bytes,
         ceilings.max_bytes_default,
@@ -241,7 +231,7 @@ async fn run_search(
 
     let provider = select_provider(cfg, params.provider.as_deref())?;
     let provider_name = provider.name().to_string();
-    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    let deadline = egress::request_deadline(timeout_s)?;
 
     let hits: Vec<SearchHit> = match provider {
         WebSearchProviderConfig::Fixture { results, .. } => results
@@ -354,6 +344,7 @@ mod tests {
     use khive_types::Namespace;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -395,6 +386,73 @@ mod tests {
             max_bytes: None,
             timeout_s: None,
             namespace: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_stall_is_bounded_by_search_total_deadline() {
+        use crate::egress::resolver_fixture::ScriptedResolver;
+        let cfg = WebSectionConfig::default();
+        for phase in [1, 2] {
+            let resolver = ScriptedResolver::new(Some(phase));
+            let start = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_http_provider(
+                    &resolver,
+                    &cfg,
+                    "https://search.example.test/?q={query}",
+                    None,
+                    &[],
+                    "q",
+                    1,
+                    100,
+                    (start + Duration::from_secs(1)).into_std(),
+                ),
+            )
+            .await
+            .expect("provider must finish within its deadline, not the watchdog");
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("response_too_slow"), "{error}");
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), phase);
+            assert!(resolver.cancelled.load(Ordering::SeqCst));
+        }
+        let mut resolver = ScriptedResolver::new(None);
+        resolver.address = "127.0.0.1".parse().unwrap();
+        let error = run_http_provider(
+            &resolver,
+            &cfg,
+            "https://search.example.test/?q={query}",
+            None,
+            &[],
+            "q",
+            1,
+            100,
+            (tokio::time::Instant::now() + Duration::from_secs(1)).into_std(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("address_loopback"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn partial_ceiling_config_refuses_programmatic_search_before_provider_selection() {
+        let (runtime, token, _dir) = test_runtime().await;
+        for cfg in [
+            WebSectionConfig {
+                search_limit_max: Some(1),
+                ..Default::default()
+            },
+            WebSectionConfig {
+                timeout_max_s: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let error = run_search(&runtime, &token, &cfg, params("q", None, None, false))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid_web_config"), "{error}");
         }
     }
 
@@ -504,7 +562,7 @@ mod tests {
                 &token,
                 json!({
                     "query": "anything",
-                    "limit": egress::DEFAULT_SEARCH_LIMIT_MAX + 1,
+                    "limit": khive_runtime::engine_config::WebCeilings::default().search_limit_max + 1,
                 }),
             )
             .await
@@ -519,7 +577,7 @@ mod tests {
                 &token,
                 json!({
                     "query": "anything",
-                    "limit": egress::DEFAULT_SEARCH_LIMIT_MAX,
+                    "limit": khive_runtime::engine_config::WebCeilings::default().search_limit_max,
                 }),
             )
             .await

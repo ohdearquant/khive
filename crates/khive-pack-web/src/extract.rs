@@ -366,12 +366,18 @@ async fn run_extract(
         })?;
     let content_ref = khive_storage::ContentRef::from_hex(content_ref)
         .map_err(|error| RuntimeError::Internal(format!("stored blob_ref is invalid: {error}")))?;
-    let store = crate::blob_store(runtime)?;
-    let bytes = store
-        .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
-        .await
-        .map_err(RuntimeError::from)?;
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let hydrator = runtime.blob_hydrator().ok_or_else(|| {
+        RuntimeError::Unconfigured(
+            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
+                .to_string(),
+        )
+    })?;
+    let verified = hydrator
+        .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+        .await?;
+    // Retain the raw-buffer admission lease through parsing and persistence,
+    // including when lossy decoding needs its own allocation.
+    let body = String::from_utf8_lossy(verified.bytes());
 
     let url_str = properties
         .get("url")
@@ -451,6 +457,8 @@ mod tests {
     use khive_runtime::VerbRegistryBuilder;
     use khive_types::Namespace;
     use std::sync::Arc;
+
+    mod hydration;
 
     /// See `fetch::tests::install_web_edge_rules` for why this is needed:
     /// the in-crate test runtime carries no `VerbRegistry`, so the web

@@ -18,18 +18,22 @@ async fn dispatch_fixture(
     read_root: &std::path::Path,
 ) -> (khive_runtime::pack::VerbRegistry, tempfile::TempDir) {
     let blob_dir = tempfile::tempdir().expect("blob dir");
-    let store = khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+    let store = khive_db::stores::blob::FsBlobStore::new(blob_dir.path().join("blobs"), 0)
         .expect("fs blob store");
     let runtime = KhiveRuntime::new(RuntimeConfig {
-        db_path: None,
+        db_path: Some(blob_dir.path().join("web.db")),
         actor_id: None,
         web: WebSectionConfig {
-            read_roots: vec![read_root.to_string_lossy().into_owned()],
+            read_roots: vec![read_root
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()],
             ..WebSectionConfig::default()
         },
         ..RuntimeConfig::no_embeddings()
     })
-    .expect("in-memory runtime");
+    .expect("file-backed runtime");
     runtime
         .install_blob_store(Arc::new(store))
         .expect("install blob store");
@@ -51,7 +55,7 @@ async fn dispatch_fixture(
 fn write_served_tree(root: &std::path::Path) {
     std::fs::write(
         root.join("index.html"),
-        b"<html><body><a href=\"/about.html\">About</a></body></html>",
+        b"<html><a href=\"/about.html\">About</a><a href=\"/later.html\">Later</a></html>",
     )
     .unwrap();
     std::fs::write(
@@ -77,7 +81,7 @@ async fn a5_ingest_served_tree_via_public_dispatch_mints_one_document_per_file()
         .dispatch(
             "web.ingest",
             json!({
-                "source": tree.path().to_string_lossy(),
+                "source": tree.path().canonicalize().unwrap().to_string_lossy(),
                 "origin": "https://plain-html.example.test",
             }),
         )
@@ -106,4 +110,63 @@ async fn a5_ingest_served_tree_via_public_dispatch_mints_one_document_per_file()
         .await
         .expect("the site entity is readable back");
     assert_eq!(site["entity_type"], "site");
+}
+
+#[tokio::test]
+async fn disk_ingest_extracts_two_links_without_an_extra_origin_resource() {
+    let tree = tempfile::tempdir().unwrap();
+    let (registry, _dir) = dispatch_fixture(tree.path()).await;
+    write_served_tree(tree.path());
+    for _ in 0..2 {
+        let reply = registry
+            .dispatch(
+                "web.ingest",
+                json!({
+                    "source": tree.path().canonicalize().unwrap().to_string_lossy(),
+                    "origin": "https://plain-html.example.test"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["ingested"].as_array().unwrap().len(), 2);
+        let listed = registry
+            .dispatch("list", json!({"kind": "entity", "limit": 100}))
+            .await
+            .unwrap();
+        let entities = listed["items"].as_array().unwrap();
+        assert_eq!(
+            entities.len(),
+            4,
+            "site, two pages, and one linked resource"
+        );
+        let documents: Vec<_> = entities
+            .iter()
+            .filter(|entity| entity["kind"] == "document")
+            .collect();
+        assert_eq!(documents.len(), 3);
+        assert!(!documents
+            .iter()
+            .any(|entity| entity["properties"]["url"] == "https://plain-html.example.test/"));
+        let target = documents
+            .iter()
+            .find(|entity| {
+                entity["properties"]["url"] == "https://plain-html.example.test/later.html"
+            })
+            .unwrap();
+        assert_eq!(target["entity_type"], "resource");
+        assert!(target["properties"]["status"].is_null());
+        let edges = registry
+            .dispatch("list", json!({"kind": "edge", "limit": 100}))
+            .await
+            .unwrap();
+        assert_eq!(
+            edges["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|edge| edge["relation"] == "links_to")
+                .count(),
+            2
+        );
+    }
 }

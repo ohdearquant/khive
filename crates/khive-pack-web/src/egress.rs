@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use async_trait::async_trait;
-use khive_runtime::engine_config::{WebCredentialConfig, WebSectionConfig};
+use khive_runtime::engine_config::{WebCeilings, WebCredentialConfig, WebSectionConfig};
 use url::Url;
 
 /// A policy refusal: a stable machine-readable `code` plus a human message.
@@ -216,6 +216,95 @@ pub async fn resolve_and_pin(resolver: &dyn Resolver, host: &str) -> Result<IpAd
     Ok(chosen)
 }
 
+/// Both DNS answers spend the same absolute budget as every HTTP/redirect hop.
+pub async fn resolve_and_pin_before(
+    resolver: &dyn Resolver,
+    host: &str,
+    deadline: std::time::Instant,
+) -> Result<IpAddr, Refusal> {
+    let deadline = tokio::time::Instant::from_std(deadline);
+    if deadline <= tokio::time::Instant::now() {
+        return Err(Refusal::new(
+            "response_too_slow",
+            "time budget exhausted before DNS resolution",
+        ));
+    }
+    tokio::time::timeout_at(deadline, resolve_and_pin(resolver, host))
+        .await
+        .map_err(|_| {
+            Refusal::new(
+                "response_too_slow",
+                "DNS resolution exceeded the time bound",
+            )
+        })?
+}
+
+pub fn request_deadline(timeout_s: u64) -> Result<std::time::Instant, Refusal> {
+    tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(timeout_s))
+        .map(tokio::time::Instant::into_std)
+        .ok_or_else(|| {
+            Refusal::new(
+                "invalid_web_config",
+                "timeout_s cannot be represented as a request deadline",
+            )
+        })
+}
+
+#[cfg(test)]
+pub(crate) mod resolver_fixture {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    pub(crate) struct ScriptedResolver {
+        pub calls: AtomicUsize,
+        pub cancelled: AtomicBool,
+        pub pending_started: tokio::sync::Notify,
+        pub pending_started_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+        pub pending_on: Option<usize>,
+        pub delay: Duration,
+        pub address: IpAddr,
+    }
+
+    impl ScriptedResolver {
+        pub fn new(pending_on: Option<usize>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                cancelled: AtomicBool::new(false),
+                pending_started: tokio::sync::Notify::new(),
+                pending_started_at: std::sync::Mutex::new(None),
+                pending_on,
+                delay: Duration::ZERO,
+                address: "93.184.216.34".parse().unwrap(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Resolver for ScriptedResolver {
+        async fn resolve(&self, _host: &str) -> Result<Vec<IpAddr>, String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.pending_on == Some(call) {
+                *self.pending_started_at.lock().unwrap() = Some(tokio::time::Instant::now());
+                self.pending_started.notify_one();
+                struct Cancelled<'a>(&'a AtomicBool);
+                impl Drop for Cancelled<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _cancelled = Cancelled(&self.cancelled);
+                std::future::pending::<()>().await;
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(vec![self.address])
+        }
+    }
+}
+
 /// Does `host` fall inside `hosts`? An IP-literal entry matches only that
 /// exact address; a hostname entry matches itself or any name ending in
 /// `.{entry}` at a label boundary. Shared by [`credential_host_allowed`]
@@ -223,19 +312,24 @@ pub async fn resolve_and_pin(resolver: &dyn Resolver, host: &str) -> Result<IpAd
 /// a plain host list — a search provider's own `hosts`, for one.
 pub fn host_in_set(hosts: &[String], host: &str) -> bool {
     let host = normalize_host(host);
-    // An IP-literal host matches only an exact entry, never a suffix — even
-    // when the configured entry happens not to parse as an IP itself (a
-    // fragment like "0.113.9" must not act as a suffix over "203.0.113.9").
-    // A1.2.6: IP literals are exact-address entries only, never suffix
-    // matches.
-    let host_is_ip = host.parse::<IpAddr>().is_ok();
+    let host_ip = parse_literal_address(&host);
     hosts.iter().any(|entry| {
         let entry = normalize_host(entry);
-        if host_is_ip {
-            return host == entry;
+        match (host_ip, parse_literal_address(&entry)) {
+            (Some(host), Some(entry)) => host == entry,
+            (None, None) => host == entry || host.ends_with(&format!(".{entry}")),
+            _ => false,
         }
-        host == entry || host.ends_with(&format!(".{entry}"))
     })
+}
+
+fn parse_literal_address(host: &str) -> Option<IpAddr> {
+    // Url::host_str represents IPv6 with brackets; configuration may omit them.
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
 }
 
 /// A1.2.6: does `host` fall inside `credential.hosts`?
@@ -321,34 +415,9 @@ pub fn check_headers(headers: &BTreeMap<String, String>) -> Result<Vec<(String, 
     Ok(out)
 }
 
-/// Resolved (defaulted) operator ceilings for one `web.fetch`/`web.search` call.
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedCeilings {
-    pub timeout_default_s: u64,
-    pub timeout_max_s: u64,
-    pub max_bytes_default: u64,
-    pub max_bytes_max: u64,
-    pub search_limit_default: u32,
-    pub search_limit_max: u32,
-}
-
-/// Built-in defaults used when the operator leaves a `[web]` ceiling unset.
-pub const DEFAULT_TIMEOUT_S: u64 = 30;
-pub const DEFAULT_TIMEOUT_MAX_S: u64 = 120;
-pub const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
-pub const DEFAULT_MAX_BYTES_MAX: u64 = 50 * 1024 * 1024;
-pub const DEFAULT_SEARCH_LIMIT: u32 = 10;
-pub const DEFAULT_SEARCH_LIMIT_MAX: u32 = 50;
-
-pub fn resolve_ceilings(cfg: &WebSectionConfig) -> ResolvedCeilings {
-    ResolvedCeilings {
-        timeout_default_s: cfg.timeout_default_s.unwrap_or(DEFAULT_TIMEOUT_S),
-        timeout_max_s: cfg.timeout_max_s.unwrap_or(DEFAULT_TIMEOUT_MAX_S),
-        max_bytes_default: cfg.max_bytes_default.unwrap_or(DEFAULT_MAX_BYTES),
-        max_bytes_max: cfg.max_bytes_max.unwrap_or(DEFAULT_MAX_BYTES_MAX),
-        search_limit_default: cfg.search_limit_default.unwrap_or(DEFAULT_SEARCH_LIMIT),
-        search_limit_max: cfg.search_limit_max.unwrap_or(DEFAULT_SEARCH_LIMIT_MAX),
-    }
+pub fn resolve_ceilings(cfg: &WebSectionConfig) -> Result<WebCeilings, Refusal> {
+    cfg.resolved_ceilings()
+        .map_err(|error| Refusal::new("invalid_web_config", error.to_string()))
 }
 
 /// A1.2.5 / A1.3: a caller-supplied bound may lower the effective value but
@@ -359,18 +428,14 @@ pub fn check_ceiling(
     ceiling: u64,
     param: &'static str,
 ) -> Result<u64, Refusal> {
-    match caller {
-        None => Ok(default),
-        Some(value) => {
-            if value > ceiling {
-                Err(Refusal::new(
-                    "ceiling_exceeded",
-                    format!("{param}={value} exceeds the configured ceiling of {ceiling}"),
-                ))
-            } else {
-                Ok(value)
-            }
-        }
+    let value = caller.unwrap_or(default);
+    if value > ceiling {
+        Err(Refusal::new(
+            "ceiling_exceeded",
+            format!("{param}={value} exceeds the configured ceiling of {ceiling}"),
+        ))
+    } else {
+        Ok(value)
     }
 }
 
@@ -379,18 +444,14 @@ pub fn check_limit_ceiling(
     default: u32,
     ceiling: u32,
 ) -> Result<u32, Refusal> {
-    match caller {
-        None => Ok(default),
-        Some(value) => {
-            if value > ceiling {
-                Err(Refusal::new(
-                    "ceiling_exceeded",
-                    format!("limit={value} exceeds the configured ceiling of {ceiling}"),
-                ))
-            } else {
-                Ok(value)
-            }
-        }
+    let value = caller.unwrap_or(default);
+    if value > ceiling {
+        Err(Refusal::new(
+            "ceiling_exceeded",
+            format!("limit={value} exceeds the configured ceiling of {ceiling}"),
+        ))
+    } else {
+        Ok(value)
     }
 }
 
@@ -414,15 +475,10 @@ pub fn check_redirect_cap(redirects: u32, max_redirects: u32) -> Result<(), Refu
 /// Pin a socket address for `host` on a per-request reqwest client, so the
 /// physical connection lands on exactly the address [`resolve_and_pin`]
 /// validated — never a fresh resolution of the name (A1.2.2).
-pub fn pinned_client(
-    host: &str,
-    addr: IpAddr,
-    port: u16,
-    timeout: std::time::Duration,
-) -> Result<reqwest::Client, Refusal> {
+pub fn pinned_client(host: &str, addr: IpAddr, port: u16) -> Result<reqwest::Client, Refusal> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
+        // run_one_hop owns the absolute request deadline and its refusal code.
         // A1.2.5: the byte bound is on decompressed bytes — a small
         // compressed response can expand without limit, so transparent
         // decompression has to happen before the truncation loop ever sees
@@ -603,6 +659,104 @@ mod tests {
         // An IP-literal entry never acts as a suffix.
         let suffixy = credential("suffix-ip", &["0.113.9"]);
         assert!(!credential_host_allowed(&suffixy, "203.0.113.9"));
+    }
+
+    #[test]
+    fn ip_literal_scopes_never_match_hostname_suffixes_and_normalize_ipv6() {
+        let scope = credential("ip-token", &["203.0.113.9"]);
+        assert!(credential_host_allowed(&scope, "203.0.113.9"));
+        assert!(!credential_host_allowed(&scope, "evil.203.0.113.9"));
+        // This is a matcher contract control, not an asserted URL-parser bypass.
+        assert!(Url::parse("https://evil.203.0.113.9/").is_err());
+        let url = Url::parse("https://[2001:4860:4860::8888]/").unwrap();
+        for entry in [
+            "2001:4860:4860::8888",
+            "[2001:4860:4860::8888]",
+            "2001:4860:4860:0:0:0:0:8888",
+        ] {
+            let cfg = credential("v6", &[entry]);
+            assert!(credential_host_allowed(&cfg, url.host_str().unwrap()));
+            assert!(!credential_host_allowed(&cfg, "[2001:4860:4860::8844]"));
+            assert!(!credential_host_allowed(&cfg, "example.com"));
+        }
+        assert!(host_in_set(&["example.com".into()], "sub.example.com"));
+        assert!(!host_in_set(
+            &["example.com".into()],
+            url.host_str().unwrap()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_deadline_bounds_both_resolution_phases_and_cancels_stalled_future() {
+        use resolver_fixture::ScriptedResolver;
+        use std::time::Duration;
+        for phase in [1, 2] {
+            let resolver = ScriptedResolver::new(Some(phase));
+            let start = tokio::time::Instant::now();
+            let error = resolve_and_pin_before(
+                &resolver,
+                "example.test",
+                (start + Duration::from_secs(3)).into_std(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "response_too_slow");
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(3));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), phase);
+            assert!(resolver.cancelled.load(Ordering::SeqCst));
+        }
+        let mut resolver = ScriptedResolver::new(None);
+        resolver.delay = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            resolve_and_pin_before(
+                &resolver,
+                "example.test",
+                (start + Duration::from_secs(3)).into_std()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "response_too_slow"
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(3));
+        let deadline = (tokio::time::Instant::now() + Duration::from_secs(5)).into_std();
+        assert_eq!(
+            resolve_and_pin_before(&resolver, "example.test", deadline)
+                .await
+                .unwrap(),
+            resolver.address
+        );
+        let calls = resolver.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            resolve_and_pin_before(
+                &resolver,
+                "example.test",
+                tokio::time::Instant::now().into_std()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "response_too_slow"
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), calls);
+    }
+
+    #[test]
+    fn omitted_bounds_cannot_exceed_the_operator_ceiling_and_deadlines_do_not_panic() {
+        assert_eq!(
+            check_ceiling(None, 30, 1, "timeout_s").unwrap_err().code,
+            "ceiling_exceeded"
+        );
+        assert_eq!(
+            check_limit_ceiling(None, 10, 1).unwrap_err().code,
+            "ceiling_exceeded"
+        );
+        assert_eq!(check_ceiling(None, 1, 1, "timeout_s").unwrap(), 1);
+        assert_eq!(check_limit_ceiling(None, 1, 1).unwrap(), 1);
+        assert!(request_deadline(u64::MAX).is_err());
+        assert!(request_deadline(30).is_ok());
     }
 
     // arm 22: https required at every hop when a credential is in play.

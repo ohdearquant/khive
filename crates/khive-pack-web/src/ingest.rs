@@ -110,11 +110,33 @@ async fn ingest_disk_file(
     Ok(settled.id)
 }
 
-/// Resolves the symlink-free, absolute form of `path`, refusing rather than
-/// guessing when it cannot be resolved (a dangling symlink, a race, a
-/// permission error) — an unreadable path proves nothing about where it
-/// points, so it is never treated as contained.
+/// Refuse visible symlink components before resolving an absolute path.
+/// This path-based check still races with replacement before a later open;
+/// it is not descriptor-based confinement. Callers retain the checked
+/// canonical path instead of opening the original spelling again.
 fn canonical_or_refuse(path: &Path, what: &str) -> Result<std::path::PathBuf, RuntimeError> {
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&prefix).map_err(|error| {
+            RuntimeError::from(Refusal::new(
+                "ingest_path_unresolvable",
+                format!(
+                    "web.ingest: cannot inspect {what} {}: {error}",
+                    prefix.display()
+                ),
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(RuntimeError::from(Refusal::new(
+                "ingest_symlink_refused",
+                format!(
+                    "web.ingest: {what} contains a symbolic link at {}",
+                    prefix.display()
+                ),
+            )));
+        }
+    }
     std::fs::canonicalize(path).map_err(|error| {
         RuntimeError::from(Refusal::new(
             "ingest_path_unresolvable",
@@ -144,7 +166,7 @@ fn confine_to_read_roots(
     }
     let canonical_root = canonical_or_refuse(root_path, "the ingest source")?;
     let contained = cfg.read_roots.iter().any(|configured| {
-        std::fs::canonicalize(configured)
+        canonical_or_refuse(Path::new(configured), "a configured read root")
             .map(|canonical_configured| canonical_root.starts_with(&canonical_configured))
             .unwrap_or(false)
     });
@@ -160,9 +182,9 @@ fn confine_to_read_roots(
     Ok(canonical_root)
 }
 
-fn walk_files(root: &Path, canonical_root: &Path) -> Result<Vec<std::path::PathBuf>, RuntimeError> {
+fn walk_files(canonical_root: &Path) -> Result<Vec<std::path::PathBuf>, RuntimeError> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![canonical_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|error| {
             RuntimeError::InvalidInput(format!(
@@ -173,9 +195,9 @@ fn walk_files(root: &Path, canonical_root: &Path) -> Result<Vec<std::path::PathB
         for entry in entries {
             let entry = entry.map_err(|error| RuntimeError::Internal(error.to_string()))?;
             let path = entry.path();
-            // A symlink inside an already-confined tree can still point
-            // outside it — canonicalize and re-check every entry, not just
-            // the source root, before descending or reading it.
+            // Check each entry and retain only its canonical path for later
+            // traversal/read. This still has a check/open race, documented
+            // on canonical_or_refuse; no descriptor guarantee is implied.
             let canonical_entry = canonical_or_refuse(&path, "a path under the ingest source")?;
             if !canonical_entry.starts_with(canonical_root) {
                 return Err(RuntimeError::from(Refusal::new(
@@ -187,10 +209,10 @@ fn walk_files(root: &Path, canonical_root: &Path) -> Result<Vec<std::path::PathB
                     ),
                 )));
             }
-            if path.is_dir() {
-                stack.push(path);
+            if canonical_entry.is_dir() {
+                stack.push(canonical_entry);
             } else {
-                out.push(path);
+                out.push(canonical_entry);
             }
         }
     }
@@ -199,32 +221,30 @@ fn walk_files(root: &Path, canonical_root: &Path) -> Result<Vec<std::path::PathB
 }
 
 async fn ingest_disk(
-    runtime: &KhiveRuntime,
+    pack: &WebPack,
     token: &NamespaceToken,
     cfg: &khive_runtime::engine_config::WebSectionConfig,
     root: &str,
     origin: &str,
     limit: u32,
 ) -> Result<Value, RuntimeError> {
+    let runtime = &pack.runtime;
     let origin_url = Url::parse(origin)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid origin: {error}")))?;
     let canonical_origin = identity::canonicalize(origin_url.clone());
-    let site_id = crate::fetch::mint_bare(runtime, token, &canonical_origin)
-        .await?
-        .0;
-
     let root_path = Path::new(root);
-    if !root_path.is_dir() {
+    let canonical_root = confine_to_read_roots(cfg, root_path)?;
+    if !canonical_root.is_dir() {
         return Err(RuntimeError::InvalidInput(format!(
             "web.ingest: {root:?} is not a directory"
         )));
     }
-    let canonical_root = confine_to_read_roots(cfg, root_path)?;
-    let files = walk_files(root_path, &canonical_root)?;
+    let files = walk_files(&canonical_root)?;
+    let site_id = crate::fetch::canonical_site(runtime, token, &canonical_origin).await?;
     let mut minted = Vec::new();
     for path in files.into_iter().take(limit as usize) {
         let relative = path
-            .strip_prefix(root_path)
+            .strip_prefix(&canonical_root)
             .map_err(|error| RuntimeError::Internal(error.to_string()))?
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
@@ -235,6 +255,8 @@ async fn ingest_disk(
             ))
         })?;
         let id = ingest_disk_file(runtime, token, &canonical_origin, &relative, bytes).await?;
+        pack.handle_extract(token, json!({ "id": id, "kinds": ["links"] }))
+            .await?;
         minted.push(id.to_string());
     }
     Ok(json!({ "mode": "disk", "site": site_id.to_string(), "ingested": minted }))
@@ -370,15 +392,7 @@ async fn run_ingest(
                     .to_string(),
             )
         })?;
-        return ingest_disk(
-            &pack.runtime,
-            token,
-            &pack.runtime.config().web,
-            root,
-            origin,
-            limit,
-        )
-        .await;
+        return ingest_disk(pack, token, &pack.runtime.config().web, root, origin, limit).await;
     }
 
     let urls: Vec<String> = match &params.source {
@@ -443,17 +457,17 @@ mod tests {
     }
 
     /// Same as `test_runtime`, but with `[web] read_roots` populated —
-    /// disk ingest refuses unconditionally against the bare in-memory
+    /// disk ingest refuses unconditionally against the bare
     /// runtime `test_runtime` builds, so every disk-mode test needs this
     /// form instead.
     async fn test_runtime_with_read_roots(
         read_roots: Vec<String>,
     ) -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
+        let store = khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0)
             .expect("fs blob store");
         let runtime = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
+            db_path: Some(dir.path().join("web.db")),
             actor_id: None,
             web: WebSectionConfig {
                 read_roots,
@@ -461,13 +475,74 @@ mod tests {
             },
             ..RuntimeConfig::no_embeddings()
         })
-        .expect("in-memory runtime");
+        .expect("file-backed runtime");
         install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
             .expect("install blob store");
         let token = runtime.authorize(Namespace::local()).expect("authorize");
         (runtime, token, dir)
+    }
+
+    // The path policy refuses visible symlink components, including OS aliases
+    // such as /var. Supply the real temporary-directory path in the controls.
+    fn disk_path(path: &Path) -> String {
+        path.canonicalize().unwrap().to_str().unwrap().to_string()
+    }
+
+    async fn graph_snapshot(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+    ) -> (Value, Vec<(Uuid, String, Uuid)>) {
+        let mut entities = runtime
+            .list_entities(token, None, None, 100, 0)
+            .await
+            .unwrap();
+        entities.sort_by_key(|entity| entity.id);
+        let ids: std::collections::HashSet<_> = entities.iter().map(|entity| entity.id).collect();
+        let mut edges: Vec<_> = runtime
+            .list_edges(token, Default::default(), 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|edge| ids.contains(&edge.source_id) && ids.contains(&edge.target_id))
+            .map(|edge| (edge.source_id, edge.relation.to_string(), edge.target_id))
+            .collect();
+        edges.sort();
+        let entities: Vec<_> = entities
+            .into_iter()
+            .map(|entity| {
+                let mut properties = entity.properties.unwrap_or(Value::Null);
+                if let Some(properties) = properties.as_object_mut() {
+                    properties.remove("fetched_at");
+                }
+                json!({"id": entity.id, "kind": entity.kind, "entity_type": entity.entity_type,
+                    "name": entity.name, "properties": properties})
+            })
+            .collect();
+        (json!(entities), edges)
+    }
+
+    async fn assert_no_records(runtime: &KhiveRuntime, token: &NamespaceToken) {
+        assert!(runtime
+            .list_entities(token, None, None, 100, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(runtime
+            .list_edges(token, Default::default(), 100, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            runtime
+                .notes(token)
+                .unwrap()
+                .count_notes(token.namespace().as_str(), None)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     // A5: ingest of a served tree on disk under a declared origin mints one
@@ -481,7 +556,7 @@ mod tests {
     async fn a5_disk_ingest_mints_ids_matching_the_declared_origin() {
         let tree = tempfile::tempdir().expect("tree");
         let (runtime, token, _dir) =
-            test_runtime_with_read_roots(vec![tree.path().to_string_lossy().into_owned()]).await;
+            test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
         let pack = WebPack::new(runtime.clone());
 
         std::fs::write(
@@ -500,7 +575,7 @@ mod tests {
             .handle_ingest(
                 &token,
                 json!({
-                    "source": tree.path().to_string_lossy(),
+                    "source": disk_path(tree.path()),
                     "origin": "https://served.example.test",
                 }),
             )
@@ -656,55 +731,67 @@ mod tests {
         }
     }
 
-    // A5 literal: the disk ingest of a tree under a declared origin and the
-    // URL crawl of the identical tree served over HTTP produce the same rows.
-    // The crawl is the production `crawl` (queue, visited set, `links`
-    // extraction, `links_to` walk); only its per-address fetch is supplied
-    // here, because loopback is a hard egress refusal (`egress.rs`, address
-    // classification) and the served tree lives on a loopback listener. The
-    // supplied fetch reads real bytes off that listener and settles them
-    // through the same `settle_content` path `web.fetch` uses, under the
-    // declared origin.
+    // A5 compares independent databases. Only the HTTP fetch is supplied:
+    // it reads real local HTTP bytes, then settles under the declared origin.
+    // Both arms use the production links extraction, with receipts excluded
+    // from the entity-to-entity graph comparison.
     #[tokio::test]
     async fn a5_literal_http_served_tree_parity_id_and_edge_set_equality_with_disk_ingest() {
         let tree = tempfile::tempdir().expect("tree");
-        let (runtime, token, _dir) =
-            test_runtime_with_read_roots(vec![tree.path().to_string_lossy().into_owned()]).await;
-        let pack = WebPack::new(runtime.clone());
+        let (disk_runtime, disk_token, _disk_dir) =
+            test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
+        let disk_pack = WebPack::new(disk_runtime.clone());
+        let (http_runtime, http_token, _http_dir) = test_runtime().await;
+        let http_pack = WebPack::new(http_runtime.clone());
 
-        let index: &[u8] = b"<html><body><a href=\"sub/page.html\">sub</a></body></html>";
+        let index: &[u8] =
+            b"<html><a href=\"sub/page.html\">sub</a><a href=\"about.html\">about</a></html>";
         let sub: &[u8] = b"<html><body>sub</body></html>";
+        let about: &[u8] = b"<html><body>about</body></html>";
         std::fs::write(tree.path().join("index.html"), index).unwrap();
         std::fs::create_dir(tree.path().join("sub")).unwrap();
         std::fs::write(tree.path().join("sub/page.html"), sub).unwrap();
-
+        std::fs::write(tree.path().join("about.html"), about).unwrap();
         let origin = "https://served.example.test";
-        let disk_reply = pack
+        let disk_reply = disk_pack
             .handle_ingest(
-                &token,
-                json!({ "source": tree.path().to_string_lossy(), "origin": origin }),
+                &disk_token,
+                json!({"source": disk_path(tree.path()), "origin": origin}),
             )
             .await
             .expect("disk ingest succeeds");
-        let mut disk_ids: Vec<String> = disk_reply["ingested"]
+        let disk_graph = graph_snapshot(&disk_runtime, &disk_token).await;
+        assert_eq!(
+            disk_graph.0.as_array().unwrap().len(),
+            4,
+            "site and three pages only"
+        );
+        assert_eq!(disk_graph.1.len(), 5, "three contains edges and two links");
+        assert_eq!(
+            disk_graph
+                .1
+                .iter()
+                .filter(|(_, relation, _)| relation == "links_to")
+                .count(),
+            2
+        );
+        assert!(graph_snapshot(&http_runtime, &http_token)
+            .await
+            .0
             .as_array()
             .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        disk_ids.sort();
-        assert_eq!(disk_ids.len(), 2, "one entity per file on the disk side");
+            .is_empty());
 
-        let mut files = std::collections::HashMap::new();
-        files.insert("/index.html".to_string(), index.to_vec());
-        files.insert("/sub/page.html".to_string(), sub.to_vec());
+        let files = std::collections::HashMap::from([
+            ("/index.html".to_string(), index.to_vec()),
+            ("/sub/page.html".to_string(), sub.to_vec()),
+            ("/about.html".to_string(), about.to_vec()),
+        ]);
         let port = spawn_http_tree_server(files).await;
-
-        let fetch_one = served_fetch(&runtime, &token, port);
-
+        let fetch_one = served_fetch(&http_runtime, &http_token, port);
         let crawl_reply = super::crawl(
-            &pack,
-            &token,
+            &http_pack,
+            &http_token,
             vec![format!("{origin}/index.html")],
             1,
             10,
@@ -712,73 +799,49 @@ mod tests {
         )
         .await
         .expect("crawl succeeds");
+        assert_eq!(crawl_reply["refused"], json!([]));
+        let sorted_ids = |reply: &Value| {
+            let mut ids: Vec<_> = reply["ingested"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(sorted_ids(&disk_reply).len(), 3);
+        assert_eq!(sorted_ids(&disk_reply), sorted_ids(&crawl_reply));
+        assert_eq!(disk_graph, graph_snapshot(&http_runtime, &http_token).await);
         assert_eq!(
-            crawl_reply["refused"].as_array().map(Vec::len),
-            Some(0),
-            "nothing refused: {crawl_reply}"
+            disk_graph,
+            graph_snapshot(&disk_runtime, &disk_token).await,
+            "HTTP ingestion cannot fill missing writes in the disk graph"
         );
-        let mut http_ids: Vec<String> = crawl_reply["ingested"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            http_ids.len(),
-            2,
-            "one seed reaches the second page through its link: {crawl_reply}"
-        );
-        http_ids.sort();
+    }
 
-        assert_eq!(
-            disk_ids, http_ids,
-            "the disk ingest and the crawl of the identical tree, declared under the \
-             same origin, mint the identical id set"
-        );
-
-        let origin_url = Url::parse(origin).unwrap();
-        let canonical_origin = identity::canonicalize(origin_url);
-        let site_id = identity::site_id(&canonical_origin);
-        let site_neighbors = runtime
-            .neighbors(
-                &token,
-                site_id,
-                khive_storage::Direction::Out,
-                None,
-                Some(vec![EdgeRelation::Contains]),
-            )
-            .await
-            .expect("site neighbors");
-        for id_str in &disk_ids {
-            let id = uuid::Uuid::parse_str(id_str).unwrap();
-            assert!(
-                site_neighbors.iter().any(|n| n.node_id == id),
-                "site contains {id} whether it arrived via disk or the crawl"
-            );
+    #[tokio::test]
+    async fn disk_ingest_empty_or_zero_limit_creates_only_the_site() {
+        for limit in [None, Some(0)] {
+            let tree = tempfile::tempdir().unwrap();
+            if limit.is_some() {
+                std::fs::write(tree.path().join("index.html"), b"<p>not ingested</p>").unwrap();
+            }
+            let (runtime, token, _dir) =
+                test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
+            let pack = WebPack::new(runtime.clone());
+            let reply = pack.handle_ingest(&token, json!({
+                "source": disk_path(tree.path()), "origin": "https://empty.example.test", "limit": limit
+            })).await.unwrap();
+            assert_eq!(reply["mode"], "disk");
+            assert_eq!(reply["ingested"], json!([]));
+            let (entities, edges) = graph_snapshot(&runtime, &token).await;
+            let entities = entities.as_array().unwrap();
+            assert_eq!(entities.len(), 1, "no unfetched root-URL resource");
+            assert_eq!(entities[0]["id"], reply["site"]);
+            assert_eq!(entities[0]["entity_type"], "site");
+            assert!(edges.is_empty());
         }
-
-        let index_id = identity::document_id(
-            site_id,
-            &identity::path_and_query(&canonical_origin.join("index.html").unwrap()),
-        );
-        let links = runtime
-            .neighbors(
-                &token,
-                index_id,
-                khive_storage::Direction::Out,
-                None,
-                Some(vec![EdgeRelation::LinksTo]),
-            )
-            .await
-            .expect("links_to neighbors");
-        let sub_id = identity::document_id(
-            site_id,
-            &identity::path_and_query(&canonical_origin.join("sub/page.html").unwrap()),
-        );
-        assert!(
-            links.iter().any(|n| n.node_id == sub_id),
-            "the crawl recorded index links_to sub/page, the edge that carried it there"
-        );
     }
 
     // disk ingest confinement (`[web] read_roots`): a source directory that
@@ -787,14 +850,14 @@ mod tests {
     async fn read_roots_disk_ingest_inside_a_configured_root_succeeds() {
         let tree = tempfile::tempdir().expect("tree");
         let (runtime, token, _dir) =
-            test_runtime_with_read_roots(vec![tree.path().to_string_lossy().into_owned()]).await;
+            test_runtime_with_read_roots(vec![disk_path(tree.path())]).await;
         let pack = WebPack::new(runtime.clone());
         std::fs::write(tree.path().join("a.html"), b"<html>a</html>").unwrap();
 
         let reply = pack
             .handle_ingest(
                 &token,
-                json!({ "source": tree.path().to_string_lossy(), "origin": "https://inside.example.test" }),
+                json!({ "source": disk_path(tree.path()), "origin": "https://inside.example.test" }),
             )
             .await
             .expect("a source directory under a configured read_roots entry is allowed");
@@ -814,7 +877,7 @@ mod tests {
         let err = pack
             .handle_ingest(
                 &token,
-                json!({ "source": tree.path().to_string_lossy(), "origin": "https://x.example.test" }),
+                json!({ "source": disk_path(tree.path()), "origin": "https://x.example.test" }),
             )
             .await
             .unwrap_err();
@@ -822,6 +885,7 @@ mod tests {
             err.to_string().contains("read_roots"),
             "refusal names the setting an operator needs to configure: {err}"
         );
+        assert_no_records(&runtime, &token).await;
     }
 
     // A source directory outside every configured root is refused, even
@@ -833,14 +897,13 @@ mod tests {
         let other_dir = tempfile::tempdir().expect("a real, but non-configured, directory");
         std::fs::write(other_dir.path().join("a.html"), b"<html>a</html>").unwrap();
         let (runtime, token, _dir) =
-            test_runtime_with_read_roots(vec![allowed_root.path().to_string_lossy().into_owned()])
-                .await;
+            test_runtime_with_read_roots(vec![disk_path(allowed_root.path())]).await;
         let pack = WebPack::new(runtime.clone());
 
         let err = pack
             .handle_ingest(
                 &token,
-                json!({ "source": other_dir.path().to_string_lossy(), "origin": "https://x.example.test" }),
+                json!({ "source": disk_path(other_dir.path()), "origin": "https://x.example.test" }),
             )
             .await
             .unwrap_err();
@@ -848,6 +911,7 @@ mod tests {
             err.to_string().contains("outside every configured"),
             "{err}"
         );
+        assert_no_records(&runtime, &token).await;
     }
 
     // A symlink inside an allowed root pointing outside it is refused at
@@ -862,18 +926,116 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), allowed_root.path().join("escape"))
             .expect("symlink");
         let (runtime, token, _dir) =
-            test_runtime_with_read_roots(vec![allowed_root.path().to_string_lossy().into_owned()])
-                .await;
+            test_runtime_with_read_roots(vec![disk_path(allowed_root.path())]).await;
         let pack = WebPack::new(runtime.clone());
 
         let err = pack
             .handle_ingest(
                 &token,
-                json!({ "source": allowed_root.path().to_string_lossy(), "origin": "https://x.example.test" }),
+                json!({ "source": disk_path(allowed_root.path()), "origin": "https://x.example.test" }),
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("outside the ingest root"), "{err}");
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_no_records(&runtime, &token).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disk_ingest_refuses_visible_symlink_components_even_within_read_roots() {
+        for alias_location in ["entry", "source", "ancestor", "configured_root"] {
+            let tree = tempfile::tempdir().unwrap();
+            let root = std::path::PathBuf::from(disk_path(tree.path()));
+            std::fs::create_dir_all(root.join("served/nested")).unwrap();
+            std::fs::write(root.join("served/index.html"), b"<p>inside</p>").unwrap();
+            let mut configured = root.clone();
+            let source = match alias_location {
+                "entry" => {
+                    std::os::unix::fs::symlink(
+                        root.join("served/index.html"),
+                        root.join("served/alias.html"),
+                    )
+                    .unwrap();
+                    root.join("served")
+                }
+                "configured_root" => {
+                    std::os::unix::fs::symlink(root.join("served"), root.join("alias")).unwrap();
+                    configured = root.join("alias");
+                    root.join("served")
+                }
+                _ => {
+                    std::os::unix::fs::symlink(root.join("served"), root.join("alias")).unwrap();
+                    if alias_location == "ancestor" {
+                        root.join("alias/nested")
+                    } else {
+                        root.join("alias")
+                    }
+                }
+            };
+            let (runtime, token, _dir) =
+                test_runtime_with_read_roots(vec![configured.to_str().unwrap().to_string()]).await;
+            let pack = WebPack::new(runtime.clone());
+            let error = pack
+                .handle_ingest(
+                    &token,
+                    json!({
+                        "source": source.to_str().unwrap(), "origin": "https://symlink.example.test"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            let expected = if alias_location == "configured_root" {
+                "outside every configured"
+            } else {
+                "symbolic link"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_no_records(&runtime, &token).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_ingest_refuses_invalid_sources_before_writes() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = std::path::PathBuf::from(disk_path(tree.path()));
+        std::fs::write(root.join("file.html"), b"body").unwrap();
+        let (runtime, token, _dir) =
+            test_runtime_with_read_roots(vec![root.to_str().unwrap().to_string()]).await;
+        let pack = WebPack::new(runtime.clone());
+        for source in [root.join("file.html"), root.join("missing")] {
+            pack.handle_ingest(
+                &token,
+                json!({
+                    "source": source.to_str().unwrap(), "origin": "https://invalid.example.test"
+                }),
+            )
+            .await
+            .expect_err("a disk source must resolve to a directory");
+            assert_no_records(&runtime, &token).await;
+        }
+    }
+
+    #[test]
+    fn disk_walk_retains_canonical_checked_paths() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = std::path::PathBuf::from(disk_path(tree.path()));
+        std::fs::create_dir(root.join("unused")).unwrap();
+        std::fs::create_dir(root.join("served")).unwrap();
+        std::fs::write(root.join("served/page.html"), b"body").unwrap();
+        let supplied = root.join("unused/../served");
+        let canonical = confine_to_read_roots(
+            &WebSectionConfig {
+                read_roots: vec![root.to_str().unwrap().to_string()],
+                ..Default::default()
+            },
+            &supplied,
+        )
+        .unwrap();
+        assert_eq!(canonical, root.join("served"));
+        assert_eq!(
+            walk_files(&canonical).unwrap(),
+            vec![root.join("served/page.html")]
+        );
     }
 
     // A URL that `web.fetch` refuses (loopback is a hard refusal

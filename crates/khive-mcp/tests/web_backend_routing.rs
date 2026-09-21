@@ -42,7 +42,11 @@ fn base_config(read_root: &std::path::Path) -> RuntimeConfig {
         packs: vec!["kg".to_string(), "web".to_string()],
         backend_id: BackendId::main(),
         web: WebSectionConfig {
-            read_roots: vec![read_root.to_string_lossy().into_owned()],
+            read_roots: vec![read_root
+                .canonicalize()
+                .expect("canonical read root")
+                .to_string_lossy()
+                .into_owned()],
             ..WebSectionConfig::default()
         },
         ..RuntimeConfig::default()
@@ -93,7 +97,7 @@ async fn ingest_tree(
         .dispatch(
             "web.ingest",
             json!({
-                "source": tree.to_string_lossy(),
+                "source": tree.canonicalize().expect("canonical tree").to_string_lossy(),
                 "origin": "https://routed.example.test",
             }),
         )

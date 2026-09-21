@@ -48,7 +48,7 @@ fn memory_runtime_with_read_root(root: &std::path::Path) -> KhiveRuntime {
         db_path: None,
         actor_id: None,
         web: WebSectionConfig {
-            read_roots: vec![root.to_string_lossy().into_owned()],
+            read_roots: vec![root.canonicalize().unwrap().to_string_lossy().into_owned()],
             ..Default::default()
         },
         ..RuntimeConfig::no_embeddings()
@@ -107,7 +107,7 @@ async fn a9_web_pack_scoped_backend_routes_writes_to_configured_backend_only() {
         .dispatch(
             "web.ingest",
             json!({
-                "source": tree.path().to_string_lossy(),
+                "source": tree.path().canonicalize().unwrap().to_string_lossy(),
                 "origin": "https://routed.example.test",
             }),
         )
@@ -153,7 +153,7 @@ async fn a9_control_web_pack_without_binding_writes_to_default_backend() {
         .dispatch(
             "web.ingest",
             json!({
-                "source": tree.path().to_string_lossy(),
+                "source": tree.path().canonicalize().unwrap().to_string_lossy(),
                 "origin": "https://default.example.test",
             }),
         )

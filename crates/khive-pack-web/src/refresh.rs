@@ -27,8 +27,6 @@
 //! the content — `id` itself when there was no redirect, the terminal row
 //! otherwise.
 
-use std::time::{Duration, Instant};
-
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{Direction, EdgeRelation};
 use serde::Deserialize;
@@ -147,7 +145,7 @@ async fn run_refresh(
     let url = Url::parse(&url_str)
         .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
 
-    let ceilings = egress::resolve_ceilings(cfg);
+    let ceilings = egress::resolve_ceilings(cfg)?;
     let max_bytes = egress::check_ceiling(
         params.max_bytes,
         ceilings.max_bytes_default,
@@ -160,7 +158,7 @@ async fn run_refresh(
         ceilings.timeout_max_s,
         "timeout_s",
     )?;
-    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    let deadline = egress::request_deadline(timeout_s)?;
 
     let mut headers: Vec<(String, String)> = Vec::new();
     if let Some(etag) = properties.get("etag").and_then(Value::as_str) {
@@ -229,9 +227,36 @@ async fn settle_refresh(
 
     let final_url_str = outcome.final_url.to_string();
 
+    let final_id = if redirect_hops.is_empty() {
+        id
+    } else {
+        let canonical = crate::identity::canonicalize(outcome.final_url.clone());
+        crate::identity::document_id(
+            crate::identity::site_id(&canonical),
+            &crate::identity::path_and_query(&canonical),
+        )
+    };
+    if !entities_touched.contains(&final_id) {
+        entities_touched.push(final_id);
+    }
+    let final_stored_content_ref = if redirect_hops.is_empty() {
+        Some(stored_content_ref.to_owned())
+    } else {
+        runtime
+            .entities(token)?
+            .get_entity(final_id)
+            .await?
+            .and_then(|entity| entity.properties)
+            .and_then(|properties| {
+                properties
+                    .get("blob_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    };
+
     let mut changed = false;
     let mut new_content_ref: Option<String> = None;
-    let mut final_id: Option<Uuid> = None;
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = &outcome.body {
             let store = crate::blob_store(runtime)?;
@@ -240,7 +265,7 @@ async fn settle_refresh(
                 .await
                 .map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
-            if content_ref_str != stored_content_ref {
+            if Some(content_ref_str.as_str()) != final_stored_content_ref.as_deref() {
                 changed = true;
                 let content_type = outcome
                     .headers
@@ -311,10 +336,7 @@ async fn settle_refresh(
                         Some((buffer.clone(), *truncated)),
                     )
                     .await?;
-                    if !entities_touched.contains(&settled.id) {
-                        entities_touched.push(settled.id);
-                    }
-                    final_id = Some(settled.id);
+                    debug_assert_eq!(settled.id, final_id);
                 }
             }
             new_content_ref = Some(content_ref_str);
@@ -389,7 +411,7 @@ async fn settle_refresh(
         "changed": changed,
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
-        "final_id": final_id.map(|value| value.to_string()),
+        "final_id": final_id.to_string(),
     }))
 }
 
@@ -422,6 +444,7 @@ mod tests {
     use khive_types::Namespace;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -577,6 +600,38 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_stall_is_bounded_by_refresh_total_deadline_and_preserves_stored_body() {
+        use crate::egress::resolver_fixture::ScriptedResolver;
+
+        let (runtime, token, _dir) = test_runtime().await;
+        let id = seed(&runtime, &token, 40103, b"stored refresh body").await;
+        let entities = runtime.entities(&token).unwrap();
+        let before = entities.get_entity(id).await.unwrap().unwrap();
+        for phase in [1, 2] {
+            let resolver = ScriptedResolver::new(Some(phase));
+            let params = serde_json::from_value(json!({"id": id, "timeout_s": 1})).unwrap();
+            let cfg = Default::default();
+            // Arm the watchdog after the stored-entity read completes and DNS
+            // begins, so paused time cannot race the database's blocking task.
+            let error = tokio::select! {
+                result = run_refresh(&runtime, &token, &resolver, &cfg, params) => result.unwrap_err(),
+                () = async {
+                    resolver.pending_started.notified().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } => panic!("refresh must enforce its deadline before the watchdog"),
+            };
+            assert!(error.to_string().contains("response_too_slow"), "{error}");
+            let start = resolver.pending_started_at.lock().unwrap().unwrap();
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), phase);
+            assert!(resolver.cancelled.load(Ordering::SeqCst));
+            let after = entities.get_entity(id).await.unwrap().unwrap();
+            assert_eq!(after.properties, before.properties);
+            assert_eq!(after.updated_at, before.updated_at);
+        }
     }
 
     // A4: refresh whose response content-addresses to the SAME bytes
@@ -957,5 +1012,138 @@ mod tests {
         let request2 = receipt2.properties.unwrap()["request"].clone();
         assert_eq!(request2["redirects"], 1);
         assert_eq!(request2["redirect_chain"][0]["status"], 302);
+    }
+    #[tokio::test]
+    async fn redirect_refresh_compares_and_settles_the_terminal_entity_body() {
+        for redirect_status in [301, 302] {
+            for terminal_body in [
+                None,
+                Some(b"same body".as_slice()),
+                Some(b"different body".as_slice()),
+            ] {
+                let (runtime, token, _dir) = test_runtime().await;
+                let old_url = Url::parse("https://refresh.example.test/old").unwrap();
+                let final_url = Url::parse("https://refresh.example.test/new").unwrap();
+                let source = crate::fetch::settle_content(
+                    &runtime,
+                    &token,
+                    &old_url,
+                    Some("text/html"),
+                    200,
+                    Some("source-etag"),
+                    None,
+                    Some((b"same body".to_vec(), false)),
+                )
+                .await
+                .unwrap();
+                let original_ref = source.content_ref.unwrap();
+                if let Some(body) = terminal_body {
+                    crate::fetch::settle_content(
+                        &runtime,
+                        &token,
+                        &final_url,
+                        Some("text/html"),
+                        200,
+                        Some("terminal-etag"),
+                        None,
+                        Some((body.to_vec(), false)),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let canonical = identity::canonicalize(final_url.clone());
+                let final_id = identity::document_id(
+                    identity::site_id(&canonical),
+                    &identity::path_and_query(&canonical),
+                );
+                let before_terminal = runtime
+                    .entities(&token)
+                    .unwrap()
+                    .get_entity(final_id)
+                    .await
+                    .unwrap();
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("content-type", "text/html".parse().unwrap());
+                let reply = settle_refresh(
+                    &runtime,
+                    &token,
+                    source.id,
+                    old_url.as_str(),
+                    &original_ref,
+                    HopOutcome {
+                        status: 200,
+                        final_url: final_url.clone(),
+                        headers,
+                        redirect_to: None,
+                        body: Some((b"same body".to_vec(), false)),
+                    },
+                    &[crate::fetch::RedirectHop {
+                        from: old_url.clone(),
+                        to: final_url.clone(),
+                        status: redirect_status,
+                    }],
+                )
+                .await
+                .unwrap();
+                assert_eq!(reply["final_id"], final_id.to_string());
+                assert_eq!(
+                    reply["changed"],
+                    terminal_body != Some(b"same body".as_slice())
+                );
+                let terminal = runtime
+                    .entities(&token)
+                    .unwrap()
+                    .get_entity(final_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let properties = terminal.properties.as_ref().unwrap();
+                assert_eq!(properties["blob_ref"], original_ref);
+                assert_eq!(properties["content_digest"], original_ref);
+                assert_eq!(properties["url"], final_url.to_string());
+                assert_eq!(properties["status"], 200);
+                assert_eq!(terminal.entity_type.as_deref(), Some("page"));
+                if terminal_body == Some(b"same body".as_slice()) {
+                    let before = before_terminal.unwrap();
+                    assert_eq!(terminal.properties, before.properties);
+                    assert_eq!(terminal.updated_at, before.updated_at);
+                }
+                let roots = runtime
+                    .attachments()
+                    .unwrap()
+                    .list_attachments(final_id)
+                    .await
+                    .unwrap();
+                assert_eq!(roots.len(), 1);
+                assert_eq!(roots[0].content_ref.to_string(), original_ref);
+                let original = runtime
+                    .entities(&token)
+                    .unwrap()
+                    .get_entity(source.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    original.properties.as_ref().unwrap()["blob_ref"],
+                    original_ref
+                );
+                assert_eq!(
+                    original.properties.as_ref().unwrap()["url"],
+                    old_url.to_string()
+                );
+                let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+                let annotated = runtime
+                    .neighbors(
+                        &token,
+                        receipt_id,
+                        Direction::Out,
+                        None,
+                        Some(vec![EdgeRelation::Annotates]),
+                    )
+                    .await
+                    .unwrap();
+                assert!(annotated.iter().any(|edge| edge.node_id == final_id));
+            }
+        }
     }
 }

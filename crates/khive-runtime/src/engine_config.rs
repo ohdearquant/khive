@@ -938,36 +938,90 @@ pub struct WebSectionConfig {
     pub read_roots: Vec<String>,
 }
 
+/// Effective operator bounds shared by file validation and programmatic web dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebCeilings {
+    pub timeout_default_s: u64,
+    pub timeout_max_s: u64,
+    pub max_bytes_default: u64,
+    pub max_bytes_max: u64,
+    pub search_limit_default: u32,
+    pub search_limit_max: u32,
+}
+
+impl Default for WebCeilings {
+    fn default() -> Self {
+        Self {
+            timeout_default_s: 30,
+            timeout_max_s: 120,
+            max_bytes_default: 5 * 1024 * 1024,
+            max_bytes_max: 50 * 1024 * 1024,
+            search_limit_default: 10,
+            search_limit_max: 50,
+        }
+    }
+}
+
 impl WebSectionConfig {
+    pub fn resolved_ceilings(&self) -> Result<WebCeilings, ConfigError> {
+        let defaults = WebCeilings::default();
+        let bounds = WebCeilings {
+            timeout_default_s: self.timeout_default_s.unwrap_or(defaults.timeout_default_s),
+            timeout_max_s: self.timeout_max_s.unwrap_or(defaults.timeout_max_s),
+            max_bytes_default: self.max_bytes_default.unwrap_or(defaults.max_bytes_default),
+            max_bytes_max: self.max_bytes_max.unwrap_or(defaults.max_bytes_max),
+            search_limit_default: self
+                .search_limit_default
+                .unwrap_or(defaults.search_limit_default),
+            search_limit_max: self.search_limit_max.unwrap_or(defaults.search_limit_max),
+        };
+        for (key, default, maximum, maximum_key) in [
+            (
+                "timeout_default_s",
+                bounds.timeout_default_s,
+                bounds.timeout_max_s,
+                "timeout_max_s",
+            ),
+            (
+                "max_bytes_default",
+                bounds.max_bytes_default,
+                bounds.max_bytes_max,
+                "max_bytes_max",
+            ),
+            (
+                "search_limit_default",
+                u64::from(bounds.search_limit_default),
+                u64::from(bounds.search_limit_max),
+                "search_limit_max",
+            ),
+        ] {
+            if default == 0 || default > maximum {
+                return Err(ConfigError::InvalidWebConfig {
+                    key: key.into(),
+                    reason: format!(
+                        "resolved default must be positive and not exceed {maximum_key}={maximum}"
+                    ),
+                });
+            }
+        }
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(bounds.timeout_max_s))
+            .is_none()
+        {
+            return Err(ConfigError::InvalidWebConfig {
+                key: "timeout_max_s".into(),
+                reason: "cannot be represented as a request deadline".into(),
+            });
+        }
+        Ok(bounds)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.resolved_ceilings()?;
         let invalid = |key: &str, reason: &str| ConfigError::InvalidWebConfig {
             key: key.to_string(),
             reason: reason.to_string(),
         };
-        if let (Some(d), Some(m)) = (self.timeout_default_s, self.timeout_max_s) {
-            if d == 0 || d > m {
-                return Err(invalid(
-                    "timeout_default_s",
-                    "must be positive and not exceed timeout_max_s",
-                ));
-            }
-        }
-        if let (Some(d), Some(m)) = (self.max_bytes_default, self.max_bytes_max) {
-            if d == 0 || d > m {
-                return Err(invalid(
-                    "max_bytes_default",
-                    "must be positive and not exceed max_bytes_max",
-                ));
-            }
-        }
-        if let (Some(d), Some(m)) = (self.search_limit_default, self.search_limit_max) {
-            if d == 0 || d > m {
-                return Err(invalid(
-                    "search_limit_default",
-                    "must be positive and not exceed search_limit_max",
-                ));
-            }
-        }
         let mut seen_hosts = std::collections::HashSet::new();
         for entry in &self.allowlist {
             let normalized = entry.host.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -1788,6 +1842,63 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_partial_ceiling_config_rejects_incoherent_effective_bounds_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for (default_key, max_key, default, maximum) in [
+            ("timeout_default_s", "timeout_max_s", 30_u64, 120_u64),
+            (
+                "max_bytes_default",
+                "max_bytes_max",
+                5 * 1024 * 1024,
+                50 * 1024 * 1024,
+            ),
+            ("search_limit_default", "search_limit_max", 10, 50),
+        ] {
+            for invalid in [
+                format!("{max_key}=1"),
+                format!("{max_key}=0"),
+                format!("{default_key}=0"),
+                format!("{default_key}={}", maximum + 1),
+                format!("{default_key}=2\n{max_key}=1"),
+            ] {
+                let path = write_toml(&dir, &format!("[web]\n{invalid}\n"));
+                let error = KhiveConfig::load(Some(&path)).unwrap_err();
+                assert!(
+                    error.to_string().contains(default_key),
+                    "{invalid}: {error}"
+                );
+            }
+            for valid in [
+                String::new(),
+                format!("{max_key}={default}"),
+                format!("{default_key}={maximum}"),
+                format!("{default_key}=1\n{max_key}=1"),
+            ] {
+                let path = write_toml(&dir, &format!("[web]\n{valid}\n"));
+                let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+                config.web.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn web_ceiling_programmatic_validation_rejects_unrepresentable_deadlines() {
+        let config = WebSectionConfig {
+            timeout_max_s: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(
+            matches!(config.resolved_ceilings(), Err(ConfigError::InvalidWebConfig { key, .. }) if key == "timeout_max_s")
+        );
+        assert!(config.validate().is_err());
+        let config = WebSectionConfig {
+            max_bytes_max: Some(1),
+            ..Default::default()
+        };
+        assert!(config.resolved_ceilings().is_err());
+    }
 
     fn write_toml(dir: &tempfile::TempDir, content: &str) -> PathBuf {
         let path = dir.path().join("config.toml");

@@ -30,6 +30,6 @@ reqwest = { workspace = true, features = ["gzip"] }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.8.0", path = "../khive-pack-kg" }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 flate2 = "1"

@@ -20,7 +20,7 @@
 //! `page`/`resource` row.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use khive_runtime::engine_config::WebSectionConfig;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -129,8 +129,8 @@ pub(crate) async fn run_one_hop(
     max_bytes: u64,
     deadline: Instant,
 ) -> Result<HopOutcome, RuntimeError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    let deadline = tokio::time::Instant::from_std(deadline);
+    if deadline <= tokio::time::Instant::now() {
         return Err(Refusal::new(
             "response_too_slow",
             "time budget exhausted before the request",
@@ -191,7 +191,7 @@ pub(crate) async fn run_one_hop(
             body,
         })
     };
-    match tokio::time::timeout(remaining, hop).await {
+    match tokio::time::timeout_at(deadline, hop).await {
         Ok(result) => result,
         Err(_) => Err(Refusal::new("response_too_slow", "response exceeded the time bound").into()),
     }
@@ -265,7 +265,7 @@ async fn run_fetch(
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
     let persist = params.persist.unwrap_or(true);
 
-    let ceilings = egress::resolve_ceilings(cfg);
+    let ceilings = egress::resolve_ceilings(cfg)?;
     let max_bytes = egress::check_ceiling(
         params.max_bytes,
         ceilings.max_bytes_default,
@@ -299,7 +299,7 @@ async fn run_fetch(
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    let deadline = egress::request_deadline(timeout_s)?;
 
     let (outcome, redirect_hops) = run_hop_chain(
         resolver,
@@ -380,13 +380,8 @@ where
         let port = url
             .port_or_known_default()
             .ok_or_else(|| RuntimeError::InvalidInput("url has no resolvable port".to_string()))?;
-        let addr = egress::resolve_and_pin(resolver, &host).await?;
-        let client = egress::pinned_client(
-            &host,
-            addr,
-            port,
-            deadline.saturating_duration_since(Instant::now()),
-        )?;
+        let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
+        let client = egress::pinned_client(&host, addr, port)?;
 
         let outcome = run_one_hop(
             &client,
@@ -443,7 +438,7 @@ pub(crate) async fn mint_bare(
     Ok((site, id))
 }
 
-async fn canonical_site(
+pub(crate) async fn canonical_site(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     canonical: &Url,
@@ -576,7 +571,7 @@ pub(crate) async fn settle_content(
     let path_and_query = identity::path_and_query(&canonical);
     let id = identity::document_id(site, &path_and_query);
     let entity_type = classify_entity_type(content_type);
-    crate::entities::get_or_create(
+    let (existing, _) = crate::entities::get_or_create(
         runtime,
         token,
         id,
@@ -589,6 +584,25 @@ pub(crate) async fn settle_content(
     runtime
         .link(token, site, id, EdgeRelation::Contains, 1.0, None)
         .await?;
+
+    // HEAD describes the remote representation, not the bytes already stored.
+    // Keep their metadata and validators together until a GET replaces them.
+    if body.is_none()
+        && existing
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("blob_ref"))
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        crate::entities::patch(runtime, token, id, None, json!({ "status": status })).await?;
+        return Ok(SettledContent {
+            id,
+            content_ref: None,
+            bytes: 0,
+            truncated: false,
+        });
+    }
 
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
@@ -823,6 +837,7 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -853,6 +868,84 @@ mod tests {
             .expect("install blob store");
         let token = runtime.authorize(Namespace::local()).expect("authorize");
         (runtime, token, dir)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_stall_is_bounded_by_fetch_total_deadline_before_any_body_is_stored() {
+        use crate::egress::resolver_fixture::ScriptedResolver;
+        let (runtime, token, dir) = test_runtime().await;
+        for phase in [1, 2] {
+            let resolver = ScriptedResolver::new(Some(phase));
+            let params =
+                serde_json::from_value(json!({"url":"https://example.test/", "timeout_s":1}))
+                    .unwrap();
+            let start = tokio::time::Instant::now();
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_fetch(
+                    &runtime,
+                    &token,
+                    &resolver,
+                    &WebSectionConfig::default(),
+                    params,
+                ),
+            )
+            .await
+            .expect("fetch must finish within its one-second bound, not the watchdog")
+            .unwrap_err();
+            assert!(error.to_string().contains("response_too_slow"), "{error}");
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), phase);
+            assert!(resolver.cancelled.load(Ordering::SeqCst));
+            assert_eq!(count_blob_files(dir.path()), 0);
+        }
+        // A prompt answer reaches normal address classification rather than timeout.
+        let mut resolver = ScriptedResolver::new(None);
+        resolver.address = "127.0.0.1".parse().unwrap();
+        let params =
+            serde_json::from_value(json!({"url":"https://example.test/", "timeout_s":1})).unwrap();
+        let error = run_fetch(
+            &runtime,
+            &token,
+            &resolver,
+            &WebSectionConfig::default(),
+            params,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("address_loopback"), "{error}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_ceiling_config_refuses_programmatic_fetch_before_resolution() {
+        use crate::egress::resolver_fixture::ScriptedResolver;
+        let (runtime, token, _dir) = test_runtime().await;
+        let mut resolver = ScriptedResolver::new(None);
+        // The baseline reaches DNS; a loopback answer makes that regression
+        // fail without opening an external connection.
+        resolver.address = "127.0.0.1".parse().unwrap();
+        for config in [
+            WebSectionConfig {
+                timeout_max_s: Some(1),
+                ..Default::default()
+            },
+            WebSectionConfig {
+                max_bytes_max: Some(1),
+                ..Default::default()
+            },
+            WebSectionConfig {
+                timeout_max_s: Some(u64::MAX),
+                ..Default::default()
+            },
+        ] {
+            let params = serde_json::from_value(json!({"url":"https://example.test/"})).unwrap();
+            let error = run_fetch(&runtime, &token, &resolver, &config, params)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid_web_config"), "{error}");
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// Counts stored blob objects only — skips the store's own root
@@ -1702,7 +1795,7 @@ mod tests {
                 &token,
                 json!({
                     "url": "https://example.test/",
-                    "max_bytes": egress::DEFAULT_MAX_BYTES_MAX + 1,
+                    "max_bytes": khive_runtime::engine_config::WebCeilings::default().max_bytes_max + 1,
                 }),
             )
             .await
@@ -1717,7 +1810,7 @@ mod tests {
                 &token,
                 json!({
                     "url": "https://example.test/",
-                    "timeout_s": egress::DEFAULT_TIMEOUT_MAX_S + 1,
+                    "timeout_s": khive_runtime::engine_config::WebCeilings::default().timeout_max_s + 1,
                 }),
             )
             .await
@@ -1732,8 +1825,8 @@ mod tests {
                 &token,
                 json!({
                     "url": "ftp://example.test/",
-                    "max_bytes": egress::DEFAULT_MAX_BYTES_MAX,
-                    "timeout_s": egress::DEFAULT_TIMEOUT_MAX_S,
+                    "max_bytes": khive_runtime::engine_config::WebCeilings::default().max_bytes_max,
+                    "timeout_s": khive_runtime::engine_config::WebCeilings::default().timeout_max_s,
                 }),
             )
             .await
@@ -2097,5 +2190,116 @@ mod tests {
             !stored_headers.contains_key("x-powered-by"),
             "disallowed response header must not reach the receipt either"
         );
+    }
+    #[tokio::test]
+    async fn head_preserves_a_previously_fetched_body_and_its_attachment() {
+        let (runtime, token, dir) = test_runtime().await;
+        let url = Url::parse("https://head.example.test/page").unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        headers.insert("etag", "\"body-v1\"".parse().unwrap());
+        let fetched = settle(
+            &runtime,
+            &token,
+            "GET",
+            &url,
+            200,
+            &headers,
+            Some((b"<p>stored body</p>".to_vec(), false)),
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        let id = Uuid::parse_str(fetched["id"].as_str().unwrap()).unwrap();
+        let before = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let attachments = runtime
+            .attachments()
+            .unwrap()
+            .list_attachments(id)
+            .await
+            .unwrap();
+        let blobs_before = count_blob_files(dir.path());
+
+        let mut head_headers = reqwest::header::HeaderMap::new();
+        head_headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        head_headers.insert("etag", "\"remote-v2\"".parse().unwrap());
+        let head = settle(
+            &runtime,
+            &token,
+            "HEAD",
+            &url,
+            204,
+            &head_headers,
+            None,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(head["id"], fetched["id"]);
+        assert!(head["content_ref"].is_null());
+        assert_eq!(head["bytes"], 0);
+        let after = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected_properties = before.properties.unwrap();
+        expected_properties["status"] = json!(204);
+        assert_eq!(after.properties.as_ref().unwrap(), &expected_properties);
+        assert_eq!(after.entity_type, before.entity_type);
+        let after_attachments = runtime
+            .attachments()
+            .unwrap()
+            .list_attachments(id)
+            .await
+            .unwrap();
+        assert_eq!(after_attachments.len(), attachments.len());
+        assert_eq!(after_attachments[0].content_ref, attachments[0].content_ref);
+        assert_eq!(after_attachments[0].size_bytes, attachments[0].size_bytes);
+        assert_eq!(count_blob_files(dir.path()), blobs_before);
+        let head_receipt = Uuid::parse_str(head["receipt_id"].as_str().unwrap()).unwrap();
+        assert!(runtime
+            .attachments()
+            .unwrap()
+            .list_attachments(head_receipt)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let empty_get = settle(
+            &runtime,
+            &token,
+            "GET",
+            &url,
+            200,
+            &head_headers,
+            Some((Vec::new(), false)),
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_ne!(empty_get["content_ref"], fetched["content_ref"]);
+        let emptied = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let properties = emptied.properties.unwrap();
+        assert_eq!(properties["size"], 0);
+        assert_eq!(properties["blob_ref"], empty_get["content_ref"]);
+        assert_eq!(emptied.entity_type.as_deref(), Some("resource"));
     }
 }
