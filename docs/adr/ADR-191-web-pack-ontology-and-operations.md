@@ -147,8 +147,11 @@ redirect cap, search provider.
 
 Every network action writes one observation note annotating the entity it touched (or standing alone
 for a search): method, final URL, redirect chain, status, content type, negotiated `Accept`, bytes,
-timing, egress classification, blob reference. Receipts chain by `supersedes`, so the fetch history of a
-resource is a note chain, and content that did not change produces a receipt and nothing else.
+timing, egress classification, and the blob reference when a body was stored. A request that stores
+no body (`persist` false, or a HEAD) writes a receipt with no blob reference and records the content
+digest, size, final URL and fetch time instead (Amendment 1, A1.2). Receipts chain by `supersedes`,
+so the fetch history of a resource is a note chain, and content that did not change produces a receipt
+and nothing else.
 
 ### D5. Deletions against the superseded revision
 
@@ -240,12 +243,15 @@ stored are read from that same descriptor. A path check followed by a separate o
 nothing here. Acceptance A5 keeps its arm and gains two controls: the identical ingest with the tree
 outside every root is refused, and a tree in which a regular file is swapped for a symbolic link to a
 file outside the root between the listing and the read is refused for that entry and stores no body.
-Enforcement and the symbolic-link swap arm land with the implementation, which cites this clause.
+This clause is the contract, not a description of the tree at the time it merges: the web pack change
+that implements D3 admits disk sources under `read_roots` and reads through the descriptor as stated
+here, and cites A1.1 as its acceptance. Until that change lands, D3 disk ingest is unenforced and is
+not to be relied on.
 
 ### A1.2 D4: bodies are rooted by attachment on the main backend; `persist` false stores no bytes
 
-D4 says every receipt carries a blob reference and D3 says a `page` or `resource` carries `blob_ref`.
-Neither keeps the blob alive: blob reclamation consults the attachments table
+D4 said every receipt carries a blob reference (it now says: when a body was stored) and D3 says a
+`page` or `resource` carries `blob_ref`. Neither keeps the blob alive: blob reclamation consults the attachments table
 ([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property is collectable
 once the grace period passes.
 
@@ -265,9 +271,16 @@ store, whatever backend holds the record. A web pack routed to its own backend (
 therefore writes its entity and receipt rows there and its attachment rows on the main backend
 through the core accessor, which is also how the pack keeps its bodies alive under one sweep. A9 is
 amended below to say exactly that. Because the record and its attachment row live in different
-databases, ADR-121's same-transaction delete cascade does not reach across: hard-deleting a routed
-`page` or `resource` removes its main-backend attachment rows in the same operation, and an
-attachment row whose record is gone is the leak the pack must not leave.
+databases, ADR-121's same-transaction delete cascade does not reach across, and
+[ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends. So hard-deleting a
+routed `page` or `resource` is one verb invocation with two commits in a fixed order: the record's
+own backend commits the delete first, then the main backend deletes the attachment rows that named
+the record, and that second delete is idempotent (deleting rows that are already gone succeeds).
+A crash between the two commits leaves attachment rows whose record is gone; those rows are not a
+liveness claim on anything (the record they would keep alive no longer exists) and the attachment
+sweep reclaims them, so the failure mode is a bounded leak until the next sweep, never a body kept
+alive by a dead record and never a record left without its body. The reverse order is forbidden: it
+would leave a live record whose body can be collected.
 
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
