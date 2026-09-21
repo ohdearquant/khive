@@ -582,6 +582,12 @@ fn build_entity_where(
         conditions.push(format!("kind IN ({})", placeholders.join(", ")));
     }
 
+    let type_expr = if filter.legacy_entity_type_fallback {
+        "COALESCE(entity_type, CASE WHEN json_type(properties, '$.type') = 'text' \
+         THEN json_extract(properties, '$.type') END)"
+    } else {
+        "entity_type"
+    };
     if !filter.entity_types.is_empty() {
         let placeholders: Vec<String> = filter
             .entity_types
@@ -591,13 +597,34 @@ fn build_entity_where(
                 format!("?{}", params.len())
             })
             .collect();
-        let type_expr = if filter.legacy_entity_type_fallback {
-            "COALESCE(entity_type, CASE WHEN json_type(properties, '$.type') = 'text' \
-             THEN json_extract(properties, '$.type') END)"
-        } else {
-            "entity_type"
-        };
         conditions.push(format!("{type_expr} IN ({})", placeholders.join(", ")));
+    }
+
+    if !filter.entity_types_by_kind.is_empty() {
+        let mut groups = Vec::new();
+        for (kind, types) in &filter.entity_types_by_kind {
+            if types.is_empty() {
+                continue;
+            }
+            params.push(Box::new(kind.clone()));
+            let kind_param = params.len();
+            let placeholders = types
+                .iter()
+                .map(|value| {
+                    params.push(Box::new(value.clone()));
+                    format!("?{}", params.len())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            groups.push(format!(
+                "(kind = ?{kind_param} AND {type_expr} IN ({placeholders}))"
+            ));
+        }
+        conditions.push(if groups.is_empty() {
+            "0".to_string()
+        } else {
+            format!("({})", groups.join(" OR "))
+        });
     }
 
     if let Some(ref prefix) = filter.name_prefix {
@@ -681,6 +708,7 @@ fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
+        && filter.entity_types_by_kind.is_empty()
         && filter.name_prefix.is_none()
         && filter.name_exact.is_none()
         && filter.tags_any.is_empty()

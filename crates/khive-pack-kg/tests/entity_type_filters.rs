@@ -259,3 +259,134 @@ async fn entity_type_filters_accept_one_canonical_type_across_multiple_kinds() {
         }
     }
 }
+
+async fn create_property_typed_entity(
+    registry: &VerbRegistry,
+    kind: &str,
+    stored_type: &str,
+    column_type: Option<&str>,
+) -> String {
+    let created = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": kind, "name": format!("EntityFilterWitness legacy {kind} {stored_type}"),
+                "entity_type": column_type, "properties": {"type": stored_type},
+                "tags": ["alias-witness"], "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("create historical property fixture");
+    created["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn list_entity_type_aliases_match_legacy_rows_before_every_pagination_mode() {
+    let registry = registry(false);
+    let canonical =
+        create_property_typed_entity(&registry, "document", "paper", Some("paper")).await;
+    let preprint = create_property_typed_entity(&registry, "document", "preprint", None).await;
+    let article = create_property_typed_entity(&registry, "document", "article", None).await;
+    let patched = create_property_typed_entity(&registry, "document", "report", None).await;
+    registry
+        .dispatch(
+            "update",
+            json!({"id": patched, "properties": {"type": "preprint"}}),
+        )
+        .await
+        .expect("raw property update preserves legacy spelling");
+    create_property_typed_entity(&registry, "document", "preprint", Some("report")).await;
+    create_property_typed_entity(&registry, "concept", "preprint", None).await;
+    let mut expected = vec![canonical.clone(), preprint.clone(), article, patched];
+    expected.sort_unstable();
+
+    for kind in [None, Some("document")] {
+        for raw in ["paper", "preprint", "article", " --PREPRINT__ "] {
+            assert_eq!(filtered_ids(&registry, "list", kind, raw).await, expected);
+            // Search intentionally retains its exact typed-column contract.
+            assert_eq!(
+                filtered_ids(&registry, "search", kind, raw).await,
+                vec![canonical.clone()]
+            );
+            for tags in [None, Some(json!([])), Some(json!(["alias-witness"]))] {
+                let mut params = filter_params("list", kind, raw);
+                params["limit"] = json!(1);
+                if let Some(tags) = tags {
+                    params["tags"] = tags;
+                }
+                let mut offset_ids = Vec::new();
+                for offset in 0..expected.len() {
+                    let mut page_params = params.clone();
+                    page_params["offset"] = json!(offset);
+                    let page = registry.dispatch("list", page_params).await.unwrap();
+                    let items = page["items"].as_array().unwrap();
+                    assert_eq!(items.len(), 1, "{page}");
+                    offset_ids.push(items[0]["id"].as_str().unwrap().to_string());
+                }
+                offset_ids.sort_unstable();
+                assert_eq!(offset_ids, expected);
+
+                let mut cursor_ids = Vec::new();
+                let mut after = json!("");
+                for index in 0..expected.len() {
+                    let mut page_params = params.clone();
+                    page_params["after"] = after;
+                    let page = registry.dispatch("list", page_params).await.unwrap();
+                    let items = page["entities"].as_array().unwrap();
+                    assert_eq!(items.len(), 1, "{page}");
+                    cursor_ids.push(items[0]["id"].as_str().unwrap().to_string());
+                    after = page["next_after"].clone();
+                    assert_eq!(after.is_null(), index + 1 == expected.len(), "{page}");
+                }
+                cursor_ids.sort_unstable();
+                assert_eq!(cursor_ids, expected);
+            }
+        }
+    }
+    let row = registry
+        .dispatch("get", json!({"id":preprint}))
+        .await
+        .unwrap();
+    assert!(row["entity_type"].is_null());
+    assert_eq!(row["properties"]["type"], "preprint");
+}
+
+#[tokio::test]
+async fn list_alias_groups_do_not_cross_kind_when_legacy_spellings_overlap() {
+    let registry = registry(true);
+    let document =
+        create_property_typed_entity(&registry, "document", "filter_shared_alias", None).await;
+    let concept =
+        create_property_typed_entity(&registry, "concept", "filter_shared_alias", None).await;
+    for (kind, canonical, id) in [
+        ("document", "filter_report", &document),
+        ("concept", "filter_concept", &concept),
+    ] {
+        for pinned in [None, Some(kind)] {
+            assert_eq!(
+                filtered_ids(&registry, "list", pinned, canonical).await,
+                vec![id.clone()]
+            );
+        }
+        assert_eq!(
+            filtered_ids(&registry, "list", Some(kind), "filter_shared_alias").await,
+            vec![id.clone()]
+        );
+    }
+    assert!(registry
+        .dispatch("list", filter_params("list", None, "filter_shared_alias"))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous entity_type"));
+
+    let shared_document =
+        create_property_typed_entity(&registry, "document", "filter_shared_type_alias", None).await;
+    let shared_concept =
+        create_property_typed_entity(&registry, "concept", "filter_shared_type_alias", None).await;
+    let mut expected = vec![shared_document, shared_concept];
+    expected.sort_unstable();
+    for raw in ["filter_shared_type", "filter_shared_type_alias"] {
+        assert_eq!(filtered_ids(&registry, "list", None, raw).await, expected);
+    }
+}

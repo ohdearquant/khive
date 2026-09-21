@@ -143,6 +143,38 @@ pub(crate) fn validate_entity_type_filter(
     Ok(Some(canonical.clone()))
 }
 
+/// Keep alias spellings coupled to their registered kind: the same alias may
+/// name a different canonical type in another kind.
+pub(crate) fn entity_type_filter_matches(
+    kind_name: Option<&str>,
+    canonical: Option<&str>,
+    registry: &VerbRegistry,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let Some(canonical) = canonical else {
+        return Default::default();
+    };
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for definition in composed.definitions() {
+        if definition.type_name != canonical
+            || kind_name.is_some_and(|kind| kind != definition.kind.name())
+        {
+            continue;
+        }
+        let values = groups
+            .entry(definition.kind.name().to_string())
+            .or_default();
+        values.push(canonical.to_string());
+        for alias in definition.aliases {
+            values.push((*alias).to_string());
+            values.push(khive_types::to_snake_case(alias));
+        }
+        values.sort_unstable();
+        values.dedup();
+    }
+    groups
+}
+
 /// Collapse case and separator-style differences (space/hyphen/underscore,
 /// including repeated and leading/trailing separators) so cosmetic
 /// formatting doesn't get flagged as an alias substitution below.
