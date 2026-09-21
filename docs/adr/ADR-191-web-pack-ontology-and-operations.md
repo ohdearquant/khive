@@ -280,8 +280,11 @@ invocation with two commits in a fixed order: the record's own backend commits t
 then the main backend deletes the attachment rows that named the record, and that second delete is
 idempotent (deleting rows that are already gone succeeds). A crash between the two commits leaves
 attachment rows whose record is gone; those rows root nothing that matters (the record they would
-keep alive no longer exists) and the attachment sweep reclaims them, so the failure mode is a
-bounded leak until the next sweep. The reverse order is forbidden: a crash after the attachment
+keep alive no longer exists) but they keep the blob alive until something removes them. Today the
+attachment orphan sweep exists as a routine with no production caller, so this leak is unbounded
+in time until that sweep is scheduled; scheduling it, with a stated cadence and a count of rows
+reclaimed as its artifact, is an obligation this amendment records and does not discharge. The
+reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
 
