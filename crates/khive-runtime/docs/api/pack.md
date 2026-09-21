@@ -7,6 +7,22 @@ resolution before reaching a pack handler. Each section below is the extended te
 for one hook or dispatch-path function; the in-source doc-comment on each item carries only the
 concise standalone summary plus a pointer here.
 
+## KindHook::validate_proposal_entity
+
+Approved `AddEntity` changesets resolve the entity owner's hook from the applying
+worker's actual `VerbRegistry`, then call this validation-only method before
+preparing domain SQL. Its immutable `EntityDraft` has a canonical kind. The method
+is synchronous, receives no runtime handle, and defaults to accepting the draft.
+Implementations must not write storage or change the approved content.
+
+Workspace overrides it with the same pure integer `properties.schema_version`
+predicate used by shared create and entity update. Neither `prepare_create` nor
+`after_create` runs on this proposal path. Other kinds retain their default
+admission, and approved `AddNote` is unchanged, including ADR-021's memory
+exception. A validation error follows the existing pre-commit failed-apply audit
+and projection handling; an accepted review is not itself evidence of a
+successful domain apply. Multi-step Compound proposals remain refused.
+
 ## brain_consumer_kinds
 
 Packs that request brain profile resolution declare their exact wire-level consumer values in
