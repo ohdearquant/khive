@@ -19,9 +19,13 @@
 //! rather than a second redirect loop. Every traversed hop gets the same
 //! treatment `fetch::settle` gives it ([`crate::fetch::settle_redirect_hops`]):
 //! a placeholder row per hop and, on a permanent redirect (301/308),
-//! `document supersedes document` (D2). The entity the caller asked to
-//! refresh (`id`) stays the entity patched with the terminal content; only
-//! its recorded `url` follows the chain to the terminal hop's address.
+//! `document supersedes document` (D2). Identity is by address: on a
+//! redirect the terminal address's own row receives the body (minted/patched
+//! via `settle_content`, same as `fetch::settle`'s terminal hop); the entity
+//! the caller asked to refresh (`id`) keeps its own recorded `url`
+//! unchanged. The reply's `final_id` names whichever row actually received
+//! the content — `id` itself when there was no redirect, the terminal row
+//! otherwise.
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +53,27 @@ pub(crate) struct RefreshParams {
     namespace: Option<String>,
 }
 
+/// A note carries [`crate::receipt::RECEIPT_TAG`] in its
+/// `properties["tags"]` array — the only mark distinguishing a receipt from
+/// any other `observation` a caller (or a future feature) might annotate the
+/// same entity with.
+fn is_receipt_note(note: &khive_storage::Note) -> bool {
+    note.kind == "observation"
+        && note
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("tags"))
+            .and_then(Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag.as_str() == Some(crate::receipt::RECEIPT_TAG))
+            })
+}
+
+/// The newest `web.receipt`-tagged `observation` annotating `entity_id` —
+/// never a decoy `annotates` note a caller wrote by hand, since only the
+/// receipt-tag/kind pair identifies a row this function may chain onto or
+/// supersede.
 async fn latest_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -69,14 +94,18 @@ async fn latest_receipt(
     let notes = runtime.notes(token)?;
     let mut latest: Option<(i64, Uuid)> = None;
     for hit in annotators {
-        if let Some(note) = notes.get_note(hit.node_id).await? {
-            if latest
-                .as_ref()
-                .map(|(t, _)| note.created_at > *t)
-                .unwrap_or(true)
-            {
-                latest = Some((note.created_at, note.id));
-            }
+        let Some(note) = notes.get_note(hit.node_id).await? else {
+            continue;
+        };
+        if !is_receipt_note(&note) {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .map(|(t, _)| note.created_at > *t)
+            .unwrap_or(true)
+        {
+            latest = Some((note.created_at, note.id));
         }
     }
     Ok(latest.map(|(_, id)| id))
@@ -179,9 +208,10 @@ async fn run_refresh(
 /// `redirect_hops` gets the exact same treatment `fetch::settle` gives it
 /// (`crate::fetch::settle_redirect_hops`, shared, not duplicated): a
 /// placeholder row per traversed hop and `new supersedes old` on 301/308.
-/// `id` — the entity the caller asked to refresh — stays the entity that is
-/// patched with the terminal content; only its recorded `url` property
-/// follows the chain to `outcome.final_url` when hops were traversed.
+/// `id` — the entity the caller asked to refresh — is patched in place only
+/// when there was no redirect; on a redirect the terminal address's own row
+/// receives the body instead (identity is by address), `id` keeps its own
+/// recorded `url`, and the reply's `final_id` names the terminal row.
 async fn settle_refresh(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -252,6 +282,15 @@ async fn settle_refresh(
                         }),
                     )
                     .await?;
+                    crate::fetch::root_body(
+                        runtime,
+                        id,
+                        khive_storage::AttachmentSubstrate::Entity,
+                        &content_ref,
+                        content_type.as_deref(),
+                        buffer.len() as u64,
+                    )
+                    .await?;
                 } else {
                     // Identity is by address: the body served at the terminal
                     // hop belongs to that address's own row, which
@@ -310,6 +349,26 @@ async fn settle_refresh(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.refresh: receipt write failed: {error}"))
     })?;
+    if let Some(content_ref) = &new_content_ref {
+        crate::fetch::root_body(
+            runtime,
+            receipt_id,
+            khive_storage::AttachmentSubstrate::Note,
+            &khive_storage::ContentRef::from_hex(content_ref.clone()).map_err(|error| {
+                RuntimeError::Internal(format!("content_ref {content_ref:?} unparseable: {error}"))
+            })?,
+            outcome
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            outcome
+                .body
+                .as_ref()
+                .map(|(b, _)| b.len() as u64)
+                .unwrap_or(0),
+        )
+        .await?;
+    }
 
     if let Some(previous) = previous_receipt {
         runtime
@@ -670,9 +729,88 @@ mod tests {
         assert_eq!(second_neighbors[0].node_id, first_receipt);
     }
 
-    // LEG_C item 3 (ADR-191 D2/D6): refresh follows redirects the same way
-    // fetch does and emits `document supersedes document` on 301/308 —
-    // through the shared `crate::fetch::settle_redirect_hops`, exercised
+    // `latest_receipt` filters on kind+tag, not just "newest annotates
+    // neighbour": a decoy `observation` note annotating the same entity
+    // AFTER the real receipt, but carrying no `RECEIPT_TAG`, must never be
+    // mistaken for the previous receipt. The next refresh's receipt
+    // supersedes the real receipt, and the decoy gets no incoming
+    // supersedes edge at all.
+    #[tokio::test]
+    async fn latest_receipt_ignores_a_decoy_annotating_note_without_the_receipt_tag() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"same every time".to_vec();
+        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let id = seed(&runtime, &token, port, &body).await;
+
+        let first = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let first_receipt = uuid::Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap();
+
+        // Written strictly after the real receipt, so a created-at-only sort
+        // would pick it over the real receipt — but it carries no
+        // `RECEIPT_TAG`.
+        let decoy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "a caller's own note about this page",
+                None,
+                None,
+                vec![id],
+            )
+            .await
+            .unwrap()
+            .id;
+
+        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let repointed_url = format!("http://127.0.0.1:{port2}/r");
+        crate::entities::patch(&runtime, &token, id, None, json!({ "url": repointed_url }))
+            .await
+            .unwrap();
+
+        let second = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let second_receipt = uuid::Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap();
+
+        let second_neighbors = runtime
+            .neighbors(
+                &token,
+                second_receipt,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second_neighbors.len(),
+            1,
+            "the second refresh's receipt supersedes exactly one prior note"
+        );
+        assert_eq!(
+            second_neighbors[0].node_id, first_receipt,
+            "it supersedes the real receipt, not the decoy"
+        );
+
+        let decoy_neighbors = runtime
+            .neighbors(
+                &token,
+                decoy,
+                khive_storage::Direction::In,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decoy_neighbors.len(),
+            0,
+            "the decoy is never superseded — it was never treated as a receipt"
+        );
+    }
+
+    // ADR-191 D2/D6: refresh follows redirects the same way fetch does and
+    // emits `document supersedes document` on 301/308 — through the shared
+    // `crate::fetch::settle_redirect_hops`, exercised
     // here exactly the way `fetch.rs`'s own
     // `a3_permanent_redirect_supersedes_temporary_redirect_no_edge` exercises
     // `fetch::settle`: hand-built `RedirectHop`/`HopOutcome` values, no

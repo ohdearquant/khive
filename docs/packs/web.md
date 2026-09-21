@@ -80,6 +80,19 @@ identity for every file in the tree, and no network request is made for the disk
 (default `0`: seeds only). `limit` bounds the total number of documents ingested in one call
 (default 100).
 
+The disk-mode `source` directory is confined to the operator's configured `[web] read_roots`
+(modeled on `[exec] read_roots`): absent or empty refuses every disk ingest outright, and a
+`source` that is not itself one of the configured roots or nested under one is refused before
+anything is read. Every path discovered while walking the tree — including a symlink target —
+is re-canonicalized and re-checked against the same roots, so a symlink planted inside an
+allowed root cannot serve content from outside it.
+
+The URL-crawl mode's reply carries `ingested` (the minted document ids) and `refused` (one
+`{url, error}` entry per URL that `web.fetch` refused — an egress refusal, a transport error, or
+anything else short of a persisted document): a refused URL is named in the reply rather than
+silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
+were refused."
+
 ### `web.search(query, provider?, limit?, persist?)`
 
 Query a configured `[[web.search_providers]]` entry — a `Fixture` (canned results, for tests and
@@ -97,8 +110,10 @@ Conditionally re-fetch an already-fetched document using its stored `etag`/`last
 _same_ reference already stored, writes a receipt only — no entity or blob change. A genuinely
 changed body puts the new blob and patches the entity in place. Every refresh's receipt
 supersedes the immediately prior receipt for the same document, so the note history is the
-resource's refresh timeline. Single-hop: unlike `fetch`, this does not currently follow
-redirects (see the crate's `LEG_B_REPORT.md` for the open question this leaves).
+resource's refresh timeline. Follows the same bounded redirect chain `fetch` does, through the
+same egress checks on every hop: identity is by address, so the terminal address's own row
+receives the body on a redirect, the entity the caller asked to refresh keeps its own recorded
+`url`, and the reply's `final_id` names whichever row actually received the content.
 
 No `db`/`target` parameter exists anywhere on this pack's verb surface — every write lands in
 the caller's own namespace through the runtime's ordinary create/update/link seam, the same seam
@@ -114,6 +129,7 @@ max_bytes_default = 5242880  # 5 MiB
 max_bytes_max = 52428800     # 50 MiB
 search_limit_default = 10
 search_limit_max = 50
+read_roots = ["/srv/ingest-sources"]  # web.ingest disk mode; absent/empty refuses disk ingest entirely
 
 [[web.allowlist]]
 host = "example.com"         # with any [[web.allowlist]] entry present, only listed hosts are reachable
@@ -152,4 +168,4 @@ what looks like a credential, for example) leaves no partial receipt behind — 
 atomic with the entity/blob write that precedes it in the same call: `fetch`/`refresh` mint or
 patch the entity and put the blob first, and only then write the receipt, so a refused receipt
 on an otherwise-successful fetch leaves the entity/blob change in place with no corresponding
-observation note. Flagged as an open question in the crate's `LEG_B_REPORT.md`.
+observation note.

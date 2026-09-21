@@ -38,9 +38,9 @@ fn exactly_two_edge_rules_site_contains_page_and_resource() {
 
 #[test]
 fn pack_declares_no_entity_or_note_kinds_of_its_own() {
-    // ADR-191 D1: site/page/resource are khive-types entity_type SUBTYPES
-    // (leg A's addition to khive-types), not pack-owned ENTITY_KINDS —
-    // the web pack introduces no new base entity kind or note kind.
+    // ADR-191 D1: site/page/resource are khive-types entity_type SUBTYPES,
+    // not pack-owned ENTITY_KINDS — the web pack introduces no new base
+    // entity kind or note kind.
     assert!(<WebPack as Pack>::ENTITY_KINDS.is_empty());
     assert!(<WebPack as Pack>::NOTE_KINDS.is_empty());
 }

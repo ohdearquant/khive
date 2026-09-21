@@ -17,7 +17,7 @@
 //! terminal hop's own mint/blob/patch sequence is [`settle_content`], shared
 //! with `web.ingest`'s disk-tree path (`crate::ingest::ingest_disk_file`) so
 //! there is one row-minting code path for both a fetched and an ingested
-//! `page`/`resource` row (ADR-192 S3).
+//! `page`/`resource` row.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use crate::egress::{self, Refusal, Resolver, SystemResolver};
 use crate::identity;
 use crate::receipt::write_receipt;
 use crate::WebPack;
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 /// Bounded, default five (D3 carries ADR-175 A1.2.4 over unchanged). Not
 /// operator-configurable — a fixed default with no override, unlike the
@@ -83,6 +84,8 @@ fn classify_entity_type(content_type: Option<&str>) -> &'static str {
 #[serde(deny_unknown_fields)]
 pub(crate) struct FetchParams {
     url: String,
+    #[serde(default)]
+    accept: Option<String>,
     #[serde(default)]
     method: Option<String>,
     #[serde(default)]
@@ -209,6 +212,32 @@ pub(crate) struct RedirectHop {
     pub(crate) status: u16,
 }
 
+/// Merge `accept` into `headers` as the Accept header, then validate the
+/// combined set through the exact same allow-list [`egress::check_headers`]
+/// applies to `headers` alone — `accept` is a convenience top-level param,
+/// never a second, unvalidated path to set a request header. Refuses if
+/// `accept` and an explicit `headers["Accept"]` (case-insensitive) both try
+/// to set it, rather than silently picking one.
+pub(crate) fn effective_request_headers(
+    headers: &BTreeMap<String, String>,
+    accept: Option<&str>,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let mut combined = headers.clone();
+    if let Some(accept) = accept {
+        if combined
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("accept"))
+        {
+            return Err(Refusal::new(
+                "header_conflict",
+                "accept and headers[\"Accept\"] both set the Accept header; set it in one place",
+            ));
+        }
+        combined.insert("Accept".to_string(), accept.to_string());
+    }
+    egress::check_headers(&combined)
+}
+
 async fn run_fetch(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -249,7 +278,7 @@ async fn run_fetch(
         ceilings.timeout_max_s,
         "timeout_s",
     )?;
-    let allowed_headers = egress::check_headers(&params.headers)?;
+    let allowed_headers = effective_request_headers(&params.headers, params.accept.as_deref())?;
 
     let credential = match &params.credential {
         None => None,
@@ -371,13 +400,7 @@ where
 
         match &outcome.redirect_to {
             Some(next) => {
-                if redirects >= MAX_REDIRECTS {
-                    return Err(Refusal::new(
-                        "redirect_limit_exceeded",
-                        format!("exceeded the maximum of {MAX_REDIRECTS} redirects"),
-                    )
-                    .into());
-                }
+                egress::check_redirect_cap(redirects, MAX_REDIRECTS)?;
                 redirect_hops.push(RedirectHop {
                     from: url.clone(),
                     to: next.clone(),
@@ -477,6 +500,49 @@ pub(crate) async fn settle_redirect_hops(
     Ok(entities_touched)
 }
 
+/// Root a stored body on the record that holds it. Blob garbage collection
+/// keeps a blob alive through the `attachments` table (ADR-121), not through
+/// a property that names it, so `blob_ref` alone would leave a page's own
+/// body collectable once the grace period passes. Attachments are owned by
+/// the canonical main backend, hence `core()`: a pack routed to another
+/// backend still roots there.
+pub(crate) async fn root_body(
+    runtime: &KhiveRuntime,
+    record: Uuid,
+    substrate: AttachmentSubstrate,
+    content_ref: &ContentRef,
+    media_type: Option<&str>,
+    size_bytes: u64,
+) -> Result<(), RuntimeError> {
+    let attachment = Attachment::from_new(
+        record,
+        substrate,
+        NewAttachment {
+            role: "content".to_string(),
+            content_ref: content_ref.clone(),
+            media_type: media_type.map(str::to_string),
+            size_bytes: Some(size_bytes),
+        },
+        chrono::Utc::now().timestamp_micros(),
+    );
+    attachment
+        .validate()
+        .map_err(|error| RuntimeError::Internal(format!("body attachment invalid: {error}")))?;
+    runtime
+        .core()
+        .attachments()?
+        .upsert_attachment(attachment)
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("body attachment write failed: {error}")))
+}
+
+/// Parse a content reference the way the blob store spells it.
+fn parse_content_ref(value: &str) -> Result<ContentRef, RuntimeError> {
+    ContentRef::from_hex(value).map_err(|error| {
+        RuntimeError::Internal(format!("content_ref {value:?} unparseable: {error}"))
+    })
+}
+
 /// Mint (if absent), blob-store the body, and patch one page/resource
 /// entity's full row: identity resolve, `site contains {page|resource}`
 /// link (arm29: minted before the blob put, so a failing store still leaves
@@ -484,8 +550,9 @@ pub(crate) async fn settle_redirect_hops(
 /// property patch (url/content_type/blob_ref/content_digest/size/status/
 /// fetched_at/etag/last_modified). Shared by [`settle`] (`web.fetch`'s
 /// terminal hop, when `persist` is set) and `ingest::ingest_disk_file`
-/// (`web.ingest`'s disk-tree path, which always persists) — LEG_B_REPORT.md
-/// flagged the two as a partial duplication before this extraction.
+/// (`web.ingest`'s disk-tree path, which always persists), so there is one
+/// row-minting code path for both a fetched and an ingested `page`/
+/// `resource` row rather than two independently maintained ones.
 pub(crate) struct SettledContent {
     pub id: Uuid,
     pub content_ref: Option<String>,
@@ -523,15 +590,16 @@ pub(crate) async fn settle_content(
         .link(token, site, id, EdgeRelation::Contains, 1.0, None)
         .await?;
 
-    let (content_ref, bytes, truncated) = match body {
+    let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
         Some((buffer, truncated)) => {
             let store = crate::blob_store(runtime)?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
-            (Some(content_ref.to_string()), len, truncated)
+            (Some(content_ref), len, truncated)
         }
     };
+    let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
     crate::entities::patch(
         runtime,
@@ -551,6 +619,17 @@ pub(crate) async fn settle_content(
         }),
     )
     .await?;
+    if let Some(typed_ref) = &typed_ref {
+        root_body(
+            runtime,
+            id,
+            AttachmentSubstrate::Entity,
+            typed_ref,
+            content_type,
+            bytes,
+        )
+        .await?;
+    }
 
     Ok(SettledContent {
         id,
@@ -652,6 +731,17 @@ async fn settle(
             content_ref
         ))
     })?;
+    if let Some(content_ref) = &content_ref {
+        root_body(
+            runtime,
+            receipt_id,
+            AttachmentSubstrate::Note,
+            &parse_content_ref(content_ref)?,
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            bytes,
+        )
+        .await?;
+    }
 
     Ok(json!({
         "final_url": final_url.to_string(),
@@ -728,7 +818,9 @@ mod tests {
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebCredentialConfig;
     use khive_runtime::VerbRegistryBuilder;
-    use khive_storage::{BlobStore, ContentRef, Direction, StorageError, StorageResult};
+    use khive_storage::{
+        BlobStore, ContentRef, Direction, EntityFilter, PageRequest, StorageError, StorageResult,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -765,11 +857,9 @@ mod tests {
 
     /// Counts stored blob objects only — skips the store's own root
     /// write-lock file (`.khive-blob-write.lock`, created on the FIRST
-    /// `put` and left behind for the life of the store; not a blob).
-    /// Measured against the ADR-175 A1 reference suite (2 of 57 red,
-    /// `.khive-work/web-a1-host-test4.log`): the old
-    /// `arm28_head_response_...` counted that lock file as a stored
-    /// object and read 2 where it expected 1 after exactly one `put`.
+    /// `put` and left behind for the life of the store; not a blob). A count
+    /// that includes that lock file reads 2 where it should read 1 after
+    /// exactly one `put`.
     fn count_blob_files(path: &std::path::Path) -> usize {
         let mut count = 0;
         if let Ok(entries) = std::fs::read_dir(path) {
@@ -838,6 +928,30 @@ mod tests {
         (port, hits)
     }
 
+    /// Serve `responses` in order across sequential connections on ONE
+    /// listener (one bind, one port): unlike `spawn_once`, a caller can dial
+    /// the SAME address twice and get two different canned responses — the
+    /// shape the repeat-fetch test below needs to hit the identical url on
+    /// both requests.
+    async fn spawn_sequence(responses: Vec<Vec<u8>>) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    hits_task.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        (port, hits)
+    }
+
     async fn spawn_once_delayed(
         response: Vec<u8>,
         delay: std::time::Duration,
@@ -870,6 +984,24 @@ mod tests {
 
     fn local_url(port: u16, path: &str) -> Url {
         Url::parse(&format!("http://127.0.0.1:{port}{path}")).expect("valid local url")
+    }
+
+    async fn entity_count(runtime: &KhiveRuntime, token: &NamespaceToken) -> usize {
+        runtime
+            .entities(token)
+            .expect("entity store capability")
+            .query_entities(
+                "local",
+                EntityFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1_000,
+                },
+            )
+            .await
+            .expect("query entities")
+            .items
+            .len()
     }
 
     async fn run_hop_and_settle(
@@ -908,9 +1040,83 @@ mod tests {
     }
 
     // A1 (+ former arm 11/16/30): fetch mints site+page/resource+blob+receipt;
-    // an identical second fetch returns the same blob reference and writes a
-    // receipt only (no new entity, no new blob write); a different body is
-    // the control that yields a different reference.
+    // an identical second fetch of the SAME address (same listener, second
+    // request) returns the same blob reference, mints no new entity, and
+    // writes a receipt only; a different body is the control that yields a
+    // different reference.
+    // A fetched body is rooted on its entity and on its receipt through the
+    // attachments table, the reference source blob garbage collection reads;
+    // the property naming the blob is not. Control: a HEAD fetch stores no
+    // body and roots nothing.
+    #[tokio::test]
+    async fn fetched_body_is_rooted_as_a_content_attachment_on_entity_and_receipt_head_roots_nothing(
+    ) {
+        let (runtime, token, _dir) = test_runtime().await;
+        let url = Url::parse("https://rooted.example.test/page.html").unwrap();
+        let body = b"<html><body>rooted body</body></html>".to_vec();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let reply = settle(
+            &runtime,
+            &token,
+            "GET",
+            &url,
+            200,
+            &headers,
+            Some((body.clone(), false)),
+            &[],
+            true,
+        )
+        .await
+        .expect("settle persists");
+        let entity_id = Uuid::parse_str(reply["id"].as_str().unwrap()).unwrap();
+        let receipt_id = Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+        let content_ref = reply["content_ref"].as_str().unwrap().to_string();
+
+        let attachments = runtime.attachments().expect("attachment store");
+        let on_entity = attachments
+            .list_attachments(entity_id)
+            .await
+            .expect("list entity attachments");
+        assert_eq!(on_entity.len(), 1, "one content attachment on the page");
+        assert_eq!(on_entity[0].role, "content");
+        assert_eq!(on_entity[0].content_ref.to_string(), content_ref);
+        assert_eq!(on_entity[0].size_bytes, Some(body.len() as u64));
+        let on_receipt = attachments
+            .list_attachments(receipt_id)
+            .await
+            .expect("list receipt attachments");
+        assert_eq!(on_receipt.len(), 1, "the receipt roots the same body");
+        assert_eq!(on_receipt[0].content_ref.to_string(), content_ref);
+
+        let head_url = Url::parse("https://rooted.example.test/other.html").unwrap();
+        let head_reply = settle(
+            &runtime,
+            &token,
+            "HEAD",
+            &head_url,
+            200,
+            &headers,
+            None,
+            &[],
+            true,
+        )
+        .await
+        .expect("HEAD settles");
+        let head_entity = Uuid::parse_str(head_reply["id"].as_str().unwrap()).unwrap();
+        let head_receipt = Uuid::parse_str(head_reply["receipt_id"].as_str().unwrap()).unwrap();
+        assert!(attachments
+            .list_attachments(head_entity)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(attachments
+            .list_attachments(head_receipt)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn a1_fetch_mints_entities_repeat_fetch_reuses_blob_writes_receipt_only() {
         let (runtime, token, dir) = test_runtime().await;
@@ -921,7 +1127,7 @@ mod tests {
             &[("Content-Type", "text/html".to_string())],
             &body,
         );
-        let (port, hits) = spawn_once(response.clone()).await;
+        let (port, hits) = spawn_sequence(vec![response.clone(), response]).await;
         let url = local_url(port, "/page");
         let (_outcome, reply) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
@@ -941,19 +1147,33 @@ mod tests {
         let props = entity.properties.unwrap();
         assert_eq!(props["blob_ref"], content_ref);
 
-        // Repeat fetch of the identical body: same blob ref, no new object,
-        // still exactly one receipt-bearing note beyond the first.
+        // Repeat fetch of the identical url, against the SAME listener/
+        // address: same blob ref, no new object, no new entity, still
+        // exactly one receipt-bearing note beyond the first.
         let before_notes = runtime
             .list_notes(&token, Some("observation"), 100, 0)
             .await
             .unwrap()
             .len();
-        let (port2, _hits2) = spawn_once(response).await;
-        let url2 = local_url(port2, "/page");
+        let before_entities = entity_count(&runtime, &token).await;
         let (_outcome2, reply2) =
-            run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url2, 10_000).await;
+            run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the same address was hit twice"
+        );
+        assert_eq!(
+            reply2["id"], id,
+            "the repeat resolves to the same entity, by address"
+        );
         assert_eq!(reply2["content_ref"], content_ref);
         assert_eq!(count_blob_files(dir.path()), 1, "no new object stored");
+        let after_entities = entity_count(&runtime, &token).await;
+        assert_eq!(
+            after_entities, before_entities,
+            "no new entity minted by the repeat"
+        );
         let after_notes = runtime
             .list_notes(&token, Some("observation"), 100, 0)
             .await
@@ -961,7 +1181,8 @@ mod tests {
             .len();
         assert_eq!(after_notes, before_notes + 1, "exactly one new receipt");
 
-        // Control: a different body yields a different reference.
+        // Control: a different body, at a different address, yields a
+        // different reference.
         let (port3, _hits3) = spawn_once(http_response(200, "OK", &[], b"different body")).await;
         let url3 = local_url(port3, "/other");
         let (_outcome3, reply3) =
@@ -1698,5 +1919,183 @@ mod tests {
         assert_eq!(classify_entity_type(Some("application/json")), "resource");
         assert_eq!(classify_entity_type(Some("text/plain")), "resource");
         assert_eq!(classify_entity_type(None), "resource");
+    }
+
+    // `accept` becomes the Accept request header, through the exact same
+    // allow-list `headers` goes through; an explicit headers["Accept"]
+    // alongside it refuses (naming the conflict) rather than one silently
+    // winning. Control: accept alone, beside an unrelated allowed header,
+    // succeeds and both are present.
+    #[test]
+    fn accept_param_becomes_accept_header_conflicting_with_headers_refuses() {
+        let empty = BTreeMap::new();
+        let out = effective_request_headers(&empty, Some("application/json")).unwrap();
+        assert_eq!(
+            out,
+            vec![("Accept".to_string(), "application/json".to_string())]
+        );
+
+        let mut conflicting = BTreeMap::new();
+        conflicting.insert("Accept".to_string(), "text/plain".to_string());
+        let err = effective_request_headers(&conflicting, Some("application/json")).unwrap_err();
+        assert_eq!(err.code, "header_conflict");
+
+        let mut with_other = BTreeMap::new();
+        with_other.insert("User-Agent".to_string(), "khive".to_string());
+        let ok = effective_request_headers(&with_other, Some("text/html")).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert!(ok.contains(&("User-Agent".to_string(), "khive".to_string())));
+        assert!(ok.contains(&("Accept".to_string(), "text/html".to_string())));
+    }
+
+    // The header `effective_request_headers` computes for `accept` actually
+    // reaches the wire — read back from the raw bytes a real local listener
+    // received, via `run_one_hop` directly (same unguarded pattern every
+    // other mechanics test in this module uses).
+    #[tokio::test]
+    async fn accept_param_header_reaches_the_wire() {
+        let hop_headers =
+            effective_request_headers(&BTreeMap::new(), Some("application/vnd.khive+json"))
+                .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = received.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    received_task.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+                let _ = stream.write_all(&http_response(200, "OK", &[], b"")).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let client = plain_client(Duration::from_secs(5));
+        let url = local_url(port, "/x");
+        run_one_hop(
+            &client,
+            &url,
+            reqwest::Method::GET,
+            &hop_headers,
+            1_000,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("hop succeeds");
+
+        let raw = received.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            text.contains("accept: application/vnd.khive+json"),
+            "{text}"
+        );
+    }
+
+    // The redirect hop cap refuses once already at the cap (the
+    // `max_redirects`+1-th redirect), naming the cap in the message; every
+    // count below the cap is allowed — the boundary is the whole guard, so
+    // it is checked at every step from 0 up to and including the cap.
+    #[test]
+    fn redirect_cap_refuses_at_cap_allows_below() {
+        for redirects in 0..MAX_REDIRECTS {
+            assert!(
+                egress::check_redirect_cap(redirects, MAX_REDIRECTS).is_ok(),
+                "redirects={redirects} must still be allowed"
+            );
+        }
+        let err = egress::check_redirect_cap(MAX_REDIRECTS, MAX_REDIRECTS).unwrap_err();
+        assert_eq!(err.code, "redirect_limit_exceeded");
+        assert!(
+            err.message.contains(&MAX_REDIRECTS.to_string()),
+            "{}",
+            err.message
+        );
+    }
+
+    // Only GET and HEAD are permitted methods. The check runs before
+    // any address is even parsed, so a refusal needs no network; GET/HEAD
+    // pass the method gate specifically and proceed to fail for the
+    // unrelated, deterministic reason that a loopback address always
+    // refuses (proof that method_not_allowed did NOT fire for them).
+    #[tokio::test]
+    async fn post_refuses_get_and_head_pass_the_method_check() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+
+        let post = pack
+            .handle_fetch(
+                &token,
+                json!({"url": "http://127.0.0.1:9/x", "method": "POST"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(post.to_string().contains("method_not_allowed"), "{post}");
+
+        for method in ["GET", "HEAD"] {
+            let err = pack
+                .handle_fetch(
+                    &token,
+                    json!({"url": "http://127.0.0.1:9/x", "method": method}),
+                )
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(!msg.contains("method_not_allowed"), "{method}: {msg}");
+            assert!(
+                msg.contains("address_loopback"),
+                "{method}: expected the method check to pass and the address check to be \
+                 the one that refused: {msg}"
+            );
+        }
+    }
+
+    // Only the allow-listed response headers are ever surfaced — a
+    // disallowed header is dropped even though it was actually present in
+    // the response, both from the reply AND from what the receipt stores;
+    // an allow-listed header alongside it is kept in both places.
+    #[tokio::test]
+    async fn disallowed_response_header_not_persisted_allowed_header_is() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"hi".to_vec();
+        let response = http_response(
+            200,
+            "OK",
+            &[
+                ("Content-Type", "text/plain".to_string()),
+                ("X-Powered-By", "leaked".to_string()),
+            ],
+            &body,
+        );
+        let (port, _hits) = spawn_once(response).await;
+        let url = local_url(port, "/x");
+        let (_outcome, reply) =
+            run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
+
+        let headers = reply["headers"].as_object().unwrap();
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+        assert!(
+            !headers.contains_key("x-powered-by"),
+            "disallowed response header must not reach the reply"
+        );
+
+        let receipt_id = uuid::Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap();
+        let note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let properties = note.properties.unwrap();
+        let request = properties.get("request").unwrap();
+        let stored_headers = request["headers"].as_object().unwrap();
+        assert_eq!(stored_headers.get("content-type").unwrap(), "text/plain");
+        assert!(
+            !stored_headers.contains_key("x-powered-by"),
+            "disallowed response header must not reach the receipt either"
+        );
     }
 }

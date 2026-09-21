@@ -6,16 +6,30 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_web::WebPack;
+use khive_runtime::engine_config::WebSectionConfig;
 use khive_runtime::pack::VerbRegistryBuilder;
-use khive_runtime::KhiveRuntime;
+use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde_json::json;
 use std::sync::Arc;
 
-async fn dispatch_fixture() -> (khive_runtime::pack::VerbRegistry, tempfile::TempDir) {
+/// A registry whose web pack may read `read_root` from disk (`[web] read_roots`);
+/// disk ingest of any other directory is refused.
+async fn dispatch_fixture(
+    read_root: &std::path::Path,
+) -> (khive_runtime::pack::VerbRegistry, tempfile::TempDir) {
     let blob_dir = tempfile::tempdir().expect("blob dir");
     let store = khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
         .expect("fs blob store");
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        actor_id: None,
+        web: WebSectionConfig {
+            read_roots: vec![read_root.to_string_lossy().into_owned()],
+            ..WebSectionConfig::default()
+        },
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime");
     runtime
         .install_blob_store(Arc::new(store))
         .expect("install blob store");
@@ -55,8 +69,8 @@ fn write_served_tree(root: &std::path::Path) {
 // this test checks the same property from outside the crate).
 #[tokio::test]
 async fn a5_ingest_served_tree_via_public_dispatch_mints_one_document_per_file() {
-    let (registry, _blob_dir) = dispatch_fixture().await;
     let tree = tempfile::tempdir().expect("served tree");
+    let (registry, _blob_dir) = dispatch_fixture(tree.path()).await;
     write_served_tree(tree.path());
 
     let reply = registry

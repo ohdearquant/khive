@@ -24,9 +24,7 @@
 //! an empty name on purpose — the immediately following patch always
 //! differs from `""`, so it always reindexes, and FTS+embedding parity with
 //! an ordinary `create` is achieved without touching any crate-private
-//! method. Flagged as an open question in LEG_B_REPORT.md: whether
-//! `operations.rs` should grow an explicit-id create helper so a pack never
-//! needs this two-step form.
+//! method.
 
 use khive_runtime::{EntityPatch, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::Entity;

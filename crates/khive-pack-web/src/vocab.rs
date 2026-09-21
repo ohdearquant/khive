@@ -43,6 +43,47 @@ pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
                               configured maximum, never raise it.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "timeout_s",
+                param_type: "integer",
+                required: false,
+                description: "Caller-supplied time ceiling in seconds; may only lower the \
+                              operator's configured maximum, never raise it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "method",
+                param_type: "string",
+                required: false,
+                description: "Defaults to GET. GET and HEAD are the only permitted methods.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "headers",
+                param_type: "object",
+                required: false,
+                description: "Request headers to send, restricted to the allowed request \
+                              header set (accept, accept-language, if-none-match, \
+                              if-modified-since, user-agent).",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "credential",
+                param_type: "string",
+                required: false,
+                description: "Named [[web.credentials]] entry to send as an \
+                              Authorization: Bearer header. Requires https at every hop, \
+                              and only on a host in the credential's own configured set.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Narrows the write to a namespace; must equal the caller's own \
+                              authorized token namespace, never elevates capability.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     HandlerDef {
@@ -74,6 +115,14 @@ pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Subset of [\"text\", \"links\", \"sitemap\", \"feed\"]; default \
                               all applicable to the stored content-type.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Narrows the write to a namespace; must equal the caller's own \
+                              authorized token namespace, never elevates capability.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -113,6 +162,14 @@ pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
                 param_type: "integer",
                 required: false,
                 description: "Maximum number of documents to ingest in one call.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Narrows the write to a namespace; must equal the caller's own \
+                              authorized token namespace, never elevates capability.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -156,6 +213,30 @@ pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
                               resource under its site.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "max_bytes",
+                param_type: "integer",
+                required: false,
+                description: "Caller-supplied byte ceiling on the provider response; may \
+                              only lower the operator's configured maximum, never raise it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "timeout_s",
+                param_type: "integer",
+                required: false,
+                description: "Caller-supplied time ceiling in seconds; may only lower the \
+                              operator's configured maximum, never raise it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Narrows the write to a namespace; must equal the caller's own \
+                              authorized token namespace, never elevates capability.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     HandlerDef {
@@ -166,13 +247,39 @@ pub(crate) static WEB_HANDLERS: [HandlerDef; 5] = [
                       supersedes the previous one for the same document.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[ParamDef {
-            name: "id",
-            param_type: "uuid",
-            required: true,
-            description: "The document entity to refresh.",
-            resolution_mode: IdResolutionMode::UnscopedById,
-        }],
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "The document entity to refresh.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
+            ParamDef {
+                name: "max_bytes",
+                param_type: "integer",
+                required: false,
+                description: "Caller-supplied byte ceiling; may only lower the operator's \
+                              configured maximum, never raise it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "timeout_s",
+                param_type: "integer",
+                required: false,
+                description: "Caller-supplied time ceiling in seconds; may only lower the \
+                              operator's configured maximum, never raise it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Narrows the write to a namespace; must equal the caller's own \
+                              authorized token namespace, never elevates capability.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
 ];
 
@@ -205,3 +312,78 @@ pub(crate) static WEB_EDGE_RULES: [EdgeEndpointRule; 2] = [
         },
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    /// A value that deserializes successfully for the given declared
+    /// `param_type` — enough to prove the FIELD NAME is accepted by the
+    /// verb's params struct, independent of whatever type/semantic
+    /// validation the verb's own handler applies afterward.
+    fn fixture_for(param_type: &str) -> Value {
+        match param_type {
+            "uuid" => json!(Uuid::new_v4().to_string()),
+            "integer" => json!(1),
+            "boolean" => json!(true),
+            "object" => json!({}),
+            "array of string" => json!(["a"]),
+            "string | array<string>" => json!("https://example.test/"),
+            _ => json!("x"),
+        }
+    }
+
+    fn round_trips(handler: &HandlerDef, value: Value) -> Result<(), String> {
+        match handler.name {
+            "web.fetch" => serde_json::from_value::<crate::fetch::FetchParams>(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "web.extract" => serde_json::from_value::<crate::extract::ExtractParams>(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "web.ingest" => serde_json::from_value::<crate::ingest::IngestParams>(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "web.search" => serde_json::from_value::<crate::search::SearchParams>(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            "web.refresh" => serde_json::from_value::<crate::refresh::RefreshParams>(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            other => panic!("unhandled web verb {other:?} — extend this test alongside it"),
+        }
+    }
+
+    // The HandlerDef params list and the params struct must
+    // be ONE list. Every name declared in a verb's ParamDef set must
+    // deserialize through that verb's params struct (the drift `accept`
+    // shipped with: documented and declared, refused as "unknown field" by
+    // FetchParams); a name never declared must still be refused (the
+    // control — every struct is `deny_unknown_fields`, so the reverse drift
+    // this test would also catch is a struct field with no ParamDef row).
+    #[test]
+    fn every_declared_param_name_round_trips_an_undeclared_name_refuses() {
+        for handler in WEB_HANDLERS.iter() {
+            let mut object = serde_json::Map::new();
+            for param in handler.params {
+                object.insert(param.name.to_string(), fixture_for(param.param_type));
+            }
+            let value = Value::Object(object.clone());
+            assert!(
+                round_trips(handler, value).is_ok(),
+                "{}: every declared param name must deserialize through the params struct",
+                handler.name
+            );
+
+            let mut with_unknown = object;
+            with_unknown.insert("definitely_not_a_declared_param".to_string(), json!(true));
+            assert!(
+                round_trips(handler, Value::Object(with_unknown)).is_err(),
+                "{}: an undeclared param name must be refused",
+                handler.name
+            );
+        }
+    }
+}

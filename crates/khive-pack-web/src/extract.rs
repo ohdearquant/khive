@@ -3,10 +3,8 @@
 //! Parses an already-fetched body (never fetches one itself — that is
 //! `web.fetch`'s job) into whichever of `text`/`links`/`sitemap`/`feed` the
 //! caller names, default all applicable to the stored content-type. No HTML
-//! or XML parser crate is a workspace dependency and this crate cannot
-//! confirm a new one compiles without `cargo` access (LEG_B.md: no cargo),
-//! so every extraction here is a bounded regex over the raw bytes rather
-//! than a DOM walk — flagged as an open question in LEG_B_REPORT.md.
+//! or XML parser crate is a workspace dependency, so every extraction here
+//! is a bounded regex over the raw bytes rather than a DOM walk.
 //!
 //! - `links`: every `<a href="...">` in an HTML body becomes a
 //!   `page links_to page|resource` edge (D2's new base row) to a target
@@ -292,7 +290,20 @@ async fn extract_text(
     let no_script_style = SCRIPT_STYLE_RE.replace_all(body, " ");
     let stripped = TAG_RE.replace_all(&no_script_style, " ");
     let collapsed = WHITESPACE_RE.replace_all(stripped.trim(), " ").to_string();
-    let excerpt: String = collapsed.chars().take(MAX_TEXT_EXCERPT_BYTES).collect();
+    // `MAX_TEXT_EXCERPT_BYTES` bounds BYTES, not chars — `.chars().take(N)`
+    // would cap at N chars and let a multi-byte-heavy document (CJK text is
+    // 3 bytes/char) through at up to 3-4x the intended byte budget. Truncate
+    // by byte length instead, walking back to the nearest char boundary so a
+    // multi-byte character is never split.
+    let excerpt: String = if collapsed.len() <= MAX_TEXT_EXCERPT_BYTES {
+        collapsed
+    } else {
+        let mut end = MAX_TEXT_EXCERPT_BYTES;
+        while !collapsed.is_char_boundary(end) {
+            end -= 1;
+        }
+        collapsed[..end].to_string()
+    };
 
     let store = crate::blob_store(runtime)?;
     let content_ref = store
@@ -671,6 +682,77 @@ mod tests {
             .unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].node_id, page_id);
+    }
+
+    // extract(text)'s excerpt cap is a BYTE bound, and the cut never
+    // splits a multi-byte character even when the raw byte offset lands
+    // mid-character.
+    #[tokio::test]
+    async fn extract_text_caps_excerpt_at_bytes_not_chars_and_never_splits_a_character() {
+        let (runtime, token, _dir) = test_runtime().await;
+        // Every character below is 2 bytes (`\u{00e9}`) except a single
+        // 1-byte `x` prefix, chosen so a raw cut at exactly
+        // `MAX_TEXT_EXCERPT_BYTES` (200_000, even) lands in the middle of
+        // a character: the prefix shifts every character's start to an
+        // odd byte offset, so offset 200_000 sits inside the character at
+        // byte range [199_999, 200_001) rather than on a boundary. A
+        // truncation that slices without walking back to a char boundary
+        // panics on this input; one that truncates by `.chars().take(N)`
+        // instead of bytes would let roughly twice the intended byte
+        // budget through (every char here is 2 bytes) and fail the
+        // length assertion below.
+        let content = format!("x{}", "\u{00e9}".repeat(150_000));
+        let html = format!("<html><body><p>{content}</p></body></html>");
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://origin.example.test/big-multibyte",
+            "text/html",
+            html.as_bytes(),
+        )
+        .await;
+
+        let text_id = extract_text(
+            &runtime,
+            &token,
+            page_id,
+            "https://origin.example.test/big-multibyte",
+            &html,
+        )
+        .await
+        .expect("extract_text does not panic on a non-boundary byte cut");
+
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(text_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let store = crate::blob_store(&runtime).unwrap();
+        let content_ref = khive_storage::ContentRef::from_hex(
+            entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
+        )
+        .unwrap();
+        let excerpt_bytes = store
+            .get_bounded_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+
+        assert!(
+            excerpt_bytes.len() <= MAX_TEXT_EXCERPT_BYTES,
+            "excerpt must respect the byte cap even for an all-multibyte document, got {}",
+            excerpt_bytes.len()
+        );
+        assert_eq!(
+            excerpt_bytes.len(),
+            199_999,
+            "cut walks back exactly one byte from the mid-character offset to the nearest char boundary"
+        );
+        assert!(
+            String::from_utf8(excerpt_bytes).is_ok(),
+            "truncation must never split a multi-byte character"
+        );
     }
 
     // extract on a document with no stored body refuses `not_fetched`.

@@ -850,6 +850,14 @@ pub enum WebSearchProviderConfig {
         url_template: String,
         #[serde(default)]
         api_key_env: Option<String>,
+        /// Hosts (exact IP literals or hostname suffixes) `api_key_env`'s
+        /// value may be presented to, modeled on
+        /// `[[web.credentials]].hosts`. Required non-empty whenever
+        /// `api_key_env` is set (`validate` enforces this) — an unscoped key
+        /// would ride along to whatever host `url_template` resolves to,
+        /// which defeats the point of scoping it at all.
+        #[serde(default)]
+        hosts: Vec<String>,
     },
 }
 
@@ -923,6 +931,11 @@ pub struct WebSectionConfig {
     pub credentials: Vec<WebCredentialConfig>,
     #[serde(default)]
     pub search_providers: Vec<WebSearchProviderConfig>,
+    /// Directories `web.ingest`'s disk mode may read from, modeled on
+    /// `[exec] read_roots`. Absent or empty fails closed: disk ingest is
+    /// refused entirely until the operator names at least one root.
+    #[serde(default)]
+    pub read_roots: Vec<String>,
 }
 
 impl WebSectionConfig {
@@ -996,11 +1009,23 @@ impl WebSectionConfig {
             if provider.is_default() {
                 default_count += 1;
             }
-            if let WebSearchProviderConfig::Http { url_template, .. } = provider {
+            if let WebSearchProviderConfig::Http {
+                url_template,
+                api_key_env,
+                hosts,
+                ..
+            } = provider
+            {
                 if !url_template.contains("{query}") {
                     return Err(invalid(
                         "search_providers.url_template",
                         "must contain the literal substring {query}",
+                    ));
+                }
+                if api_key_env.is_some() && hosts.is_empty() {
+                    return Err(invalid(
+                        "search_providers.hosts",
+                        "an api_key_env-bearing provider must name at least one host or suffix",
                     ));
                 }
             }

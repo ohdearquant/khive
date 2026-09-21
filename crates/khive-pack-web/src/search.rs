@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::egress::{self, Refusal};
+use crate::egress::{self, Refusal, Resolver, SystemResolver};
 use crate::fetch::{mint_bare, resolve_effective_token, run_one_hop};
 use crate::receipt::write_receipt;
 use crate::WebPack;
@@ -89,6 +89,49 @@ fn select_provider<'a>(
     }
 }
 
+/// Parse a provider's raw response bytes into the transcribed hit list.
+/// Pure — no networking, so it is directly unit-testable against a
+/// hand-built `(body, truncated)` pair without a live connection.
+///
+/// A1.3: a byte-bound-exceeding provider response refuses outright — a
+/// truncated payload is never treated as a complete result list, unlike
+/// web.fetch's store-what-was-read behavior.
+fn parse_search_response(
+    body: &[u8],
+    truncated: bool,
+    limit: u32,
+) -> Result<Vec<SearchHit>, RuntimeError> {
+    if truncated {
+        return Err(Refusal::new(
+            "response_too_large",
+            "search provider response exceeded the configured byte bound",
+        )
+        .into());
+    }
+    let raw: Vec<SearchHit> = serde_json::from_slice(body).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "search provider response is not a JSON array of {{title, url, snippet}}: {error}"
+        ))
+    })?;
+    Ok(raw.into_iter().take(limit as usize).collect())
+}
+
+/// An `Http` provider's request goes through the same address-class/
+/// DNS-rebinding-safe egress checks as `web.fetch`/`web.refresh`
+/// (`egress::resolve_and_pin` + `egress::pinned_client`) rather than a bare
+/// `reqwest::Client` dialing whatever `url_template` names — a provider
+/// pointed at a loopback/private/link-local address by misconfiguration (or
+/// a rewritten template) is refused before any connection is attempted, the
+/// same as it would be for `web.fetch`.
+///
+/// `api_key_env`'s value is gated behind TWO checks, both evaluated BEFORE
+/// any DNS resolution or dial: the resolved URL's host must be inside
+/// `provider_hosts` (mirroring `[[web.credentials]].hosts`' scoping), and the
+/// URL must be `https`. A provider with no configured `hosts` therefore never
+/// attaches its key to any host at all — `WebSectionConfig::validate`
+/// enforces that `hosts` is non-empty whenever `api_key_env` is set, so this
+/// is a defense in depth, not the only gate.
+///
 /// The outer `tokio::time::timeout` inside `run_one_hop` is the sole
 /// deadline authority for this request — this client carries no
 /// `.timeout()` of its own. A client-level timeout captured `remaining` at
@@ -96,12 +139,14 @@ fn select_provider<'a>(
 /// later; under scheduler contention the two independently armed timers
 /// could race, and reqwest's own timeout error surfaces as a bare
 /// `transport_error` instead of the deliberate `response_too_slow` refusal.
-/// Measured against the ADR-175 A1 reference suite (2 of 57 red,
-/// `.khive-work/web-a1-host-test4.log`): `arm26_...` failed exactly this way
-/// under load. One timer, one refusal code.
+/// One timer, one refusal code.
+#[allow(clippy::too_many_arguments)]
 async fn run_http_provider(
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
     url_template: &str,
     api_key_env: Option<&str>,
+    provider_hosts: &[String],
     query: &str,
     limit: u32,
     max_bytes: u64,
@@ -114,9 +159,23 @@ async fn run_http_provider(
     let url = url::Url::parse(&url_string).map_err(|error| {
         RuntimeError::InvalidInput(format!("invalid search provider url_template: {error}"))
     })?;
+    egress::check_scheme_and_userinfo(&url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| RuntimeError::InvalidInput("search provider url has no host".to_string()))?
+        .to_string();
+    egress::check_allowlist(&host, cfg)?;
 
     let mut headers: Vec<(String, String)> = Vec::new();
     if let Some(env_var) = api_key_env {
+        if !egress::host_in_set(provider_hosts, &host) {
+            return Err(Refusal::new(
+                "search_provider_key_host_mismatch",
+                format!("search provider's api_key_env is not scoped to host {host:?}"),
+            )
+            .into());
+        }
+        egress::check_credential_scheme(&url)?;
         let value = std::env::var(env_var).map_err(|_| {
             RuntimeError::InvalidInput(format!(
                 "search provider api_key_env {env_var:?} is not set"
@@ -125,11 +184,16 @@ async fn run_http_provider(
         headers.push(("Authorization".to_string(), format!("Bearer {value}")));
     }
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .gzip(true)
-        .build()
-        .map_err(|error| RuntimeError::Internal(format!("search client build failed: {error}")))?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        RuntimeError::InvalidInput("search provider url has no resolvable port".to_string())
+    })?;
+    let addr = egress::resolve_and_pin(resolver, &host).await?;
+    let client = egress::pinned_client(
+        &host,
+        addr,
+        port,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
 
     let outcome = run_one_hop(
         &client,
@@ -146,22 +210,7 @@ async fn run_http_provider(
             "search provider returned no readable body",
         ))
     })?;
-    // A1.3: a byte-bound-exceeding provider response refuses outright — a
-    // truncated payload is never treated as a complete result list, unlike
-    // web.fetch's store-what-was-read behavior.
-    if truncated {
-        return Err(Refusal::new(
-            "response_too_large",
-            "search provider response exceeded the configured byte bound",
-        )
-        .into());
-    }
-    let raw: Vec<SearchHit> = serde_json::from_slice(&body).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "search provider response is not a JSON array of {{title, url, snippet}}: {error}"
-        ))
-    })?;
-    Ok(raw.into_iter().take(limit as usize).collect())
+    parse_search_response(&body, truncated, limit)
 }
 
 async fn run_search(
@@ -207,11 +256,15 @@ async fn run_search(
         WebSearchProviderConfig::Http {
             url_template,
             api_key_env,
+            hosts,
             ..
         } => {
             run_http_provider(
+                &SystemResolver,
+                cfg,
                 url_template,
                 api_key_env.as_deref(),
+                hosts,
                 &params.query,
                 limit,
                 max_bytes,
@@ -483,10 +536,27 @@ mod tests {
         );
     }
 
+    /// A bare, unpinned client — matches `fetch::tests`' own precedent for
+    /// local-listener tests that need to bypass `egress::resolve_and_pin`
+    /// entirely (see that module's test-level doc comment): a fake resolver
+    /// answer and a real successful loopback connect cannot coexist, because
+    /// `resolve_and_pin`'s output address is the exact literal socket
+    /// `pinned_client` dials. Byte/time-bound behavior lives in
+    /// `run_one_hop`/`parse_search_response`, neither of which does any
+    /// address-class checking, so exercising them this way is direct testing
+    /// of the layer that actually implements the behavior, not a weakened
+    /// substitute for `run_http_provider`'s own (address-checked) path.
+    fn bare_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .gzip(true)
+            .build()
+            .expect("bare client builds")
+    }
+
     // arm 26: a provider response over the byte bound or over the time
     // bound refuses outright — never a partial result list. A within-bound
-    // response is the positive control. This is the fixed form of the
-    // failure described above `run_http_provider`.
+    // response is the positive control.
     #[tokio::test]
     async fn arm26_provider_over_bytes_and_over_time_refuse_no_partial_results_in_bound_succeeds() {
         let big_body = serde_json::to_vec(&vec![
@@ -499,17 +569,19 @@ mod tests {
         ])
         .unwrap();
         let (port, _hits) = spawn_once(http_response(200, "OK", &[], &big_body)).await;
-        let url_template = format!("http://127.0.0.1:{port}/?q={{query}}&n={{limit}}");
-        let err = run_http_provider(
-            &url_template,
-            None,
-            "q",
-            5,
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let outcome = run_one_hop(
+            &bare_client(),
+            &url,
+            reqwest::Method::GET,
+            &[],
             50,
             Instant::now() + Duration::from_secs(5),
         )
         .await
-        .unwrap_err();
+        .expect("hop executes");
+        let (body, truncated) = outcome.body.expect("GET carries a body");
+        let err = parse_search_response(&body, truncated, 5).unwrap_err();
         assert!(err.to_string().contains("response_too_large"), "{err}");
 
         let (port2, _hits2) = spawn_once_delayed(
@@ -517,12 +589,12 @@ mod tests {
             Duration::from_millis(300),
         )
         .await;
-        let url_template2 = format!("http://127.0.0.1:{port2}/?q={{query}}&n={{limit}}");
-        let err2 = run_http_provider(
-            &url_template2,
-            None,
-            "q",
-            5,
+        let url2 = url::Url::parse(&format!("http://127.0.0.1:{port2}/")).unwrap();
+        let err2 = run_one_hop(
+            &bare_client(),
+            &url2,
+            reqwest::Method::GET,
+            &[],
             10_000,
             Instant::now() + Duration::from_millis(50),
         )
@@ -537,19 +609,89 @@ mod tests {
         }])
         .unwrap();
         let (port3, _hits3) = spawn_once(http_response(200, "OK", &[], &small)).await;
-        let url_template3 = format!("http://127.0.0.1:{port3}/?q={{query}}&n={{limit}}");
-        let hits = run_http_provider(
-            &url_template3,
+        let url3 = url::Url::parse(&format!("http://127.0.0.1:{port3}/")).unwrap();
+        let outcome3 = run_one_hop(
+            &bare_client(),
+            &url3,
+            reqwest::Method::GET,
+            &[],
+            10_000,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("hop executes");
+        let (body3, truncated3) = outcome3.body.expect("GET carries a body");
+        let hits = parse_search_response(&body3, truncated3, 5).expect("in-bound response parses");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "ok");
+    }
+
+    // An `Http` provider pointed at a loopback address is refused
+    // before any connection is attempted — the same address-class check
+    // `web.fetch` applies, now also covering `web.search`'s own network
+    // path rather than bypassing it via a bare, unpinned client.
+    #[tokio::test]
+    async fn http_provider_loopback_address_refuses_before_any_dial() {
+        let (port, hits) = spawn_once(http_response(200, "OK", &[], b"[]")).await;
+        let url_template = format!("http://127.0.0.1:{port}/?q={{query}}&n={{limit}}");
+        let cfg = WebSectionConfig::default();
+        let err = run_http_provider(
+            &SystemResolver,
+            &cfg,
+            &url_template,
             None,
+            &[],
             "q",
             5,
             10_000,
             Instant::now() + Duration::from_secs(5),
         )
         .await
-        .expect("in-bound provider succeeds");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].title, "ok");
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("loopback"),
+            "loopback address classification refuses before any dial: {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the refusal happens before resolve_and_pin ever dials the listener"
+        );
+    }
+
+    // `api_key_env`'s value never leaves for a host outside the
+    // provider's own `hosts` — the mismatch check runs before
+    // `egress::resolve_and_pin` is ever called, so no DNS resolution or dial
+    // is attempted for the wrong host either. `provider_hosts` empty is the
+    // production-shape refusal (`WebSectionConfig::validate` additionally
+    // refuses this combination at config-load time; this is the runtime
+    // enforcement of the same rule).
+    #[tokio::test]
+    async fn http_provider_key_never_leaves_for_a_host_outside_provider_hosts() {
+        let cfg = WebSectionConfig::default();
+        let url_template = "https://not-in-the-allowed-set.example.invalid/?q={query}&n={limit}";
+        let err = run_http_provider(
+            &SystemResolver,
+            &cfg,
+            url_template,
+            Some("UNUSED_TEST_ENV_VAR_NEVER_READ"),
+            &["allowed.example.test".to_string()],
+            "q",
+            5,
+            10_000,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        // A `resolution_failed`/`resolution_unstable` code here would mean
+        // `resolve_and_pin` ran against a real, unmocked DNS lookup for a
+        // host that was never supposed to be dialed — the host-scope
+        // mismatch has to be the FIRST refusal, before any network call.
+        assert!(
+            err.to_string()
+                .contains("search_provider_key_host_mismatch"),
+            "{err}"
+        );
     }
 
     // arm 27: the search receipt preserves query/provider/effective-limit
@@ -635,10 +777,9 @@ mod tests {
     }
 
     // D3 persist half (not an ADR-191 acceptance arm — A9 is the two-backend
-    // routing arm, which this pack does not yet implement; see
-    // LEG_B_REPORT.md): persist=false mints nothing; persist=true mints
-    // each hit's URL as an unfetched `resource` under its `site`, and the
-    // receipt annotates every minted id.
+    // routing arm, which this pack does not yet implement): persist=false
+    // mints nothing; persist=true mints each hit's URL as an unfetched
+    // `resource` under its `site`, and the receipt annotates every minted id.
     #[tokio::test]
     async fn d3_persist_false_mints_nothing_persist_true_mints_unfetched_resources() {
         let (runtime, token, _dir) = test_runtime().await;

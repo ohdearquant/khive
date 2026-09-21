@@ -216,10 +216,12 @@ pub async fn resolve_and_pin(resolver: &dyn Resolver, host: &str) -> Result<IpAd
     Ok(chosen)
 }
 
-/// A1.2.6: does `host` fall inside `credential.hosts`? An IP-literal entry
-/// matches only that exact address; a hostname entry matches itself or any
-/// name ending in `.{entry}` at a label boundary.
-pub fn credential_host_allowed(credential: &WebCredentialConfig, host: &str) -> bool {
+/// Does `host` fall inside `hosts`? An IP-literal entry matches only that
+/// exact address; a hostname entry matches itself or any name ending in
+/// `.{entry}` at a label boundary. Shared by [`credential_host_allowed`]
+/// (a `[[web.credentials]]` entry) and any other caller scoping a secret to
+/// a plain host list — a search provider's own `hosts`, for one.
+pub fn host_in_set(hosts: &[String], host: &str) -> bool {
     let host = normalize_host(host);
     // An IP-literal host matches only an exact entry, never a suffix — even
     // when the configured entry happens not to parse as an IP itself (a
@@ -227,13 +229,18 @@ pub fn credential_host_allowed(credential: &WebCredentialConfig, host: &str) -> 
     // A1.2.6: IP literals are exact-address entries only, never suffix
     // matches.
     let host_is_ip = host.parse::<IpAddr>().is_ok();
-    credential.hosts.iter().any(|entry| {
+    hosts.iter().any(|entry| {
         let entry = normalize_host(entry);
         if host_is_ip {
             return host == entry;
         }
         host == entry || host.ends_with(&format!(".{entry}"))
     })
+}
+
+/// A1.2.6: does `host` fall inside `credential.hosts`?
+pub fn credential_host_allowed(credential: &WebCredentialConfig, host: &str) -> bool {
+    host_in_set(&credential.hosts, host)
 }
 
 /// Resolve the named credential and validate it against `host`, per A1.2.6:
@@ -384,6 +391,23 @@ pub fn check_limit_ceiling(
                 Ok(value)
             }
         }
+    }
+}
+
+/// D2: the redirect hop cap. Refuses once `redirects` already equals
+/// `max_redirects` — the (`max_redirects`+1)-th redirect is refused, not
+/// made; a chain of exactly `max_redirects` redirects never trips this
+/// check. Pure and address-safety-independent on purpose, matching every
+/// other policy decision in this module — no live chain of real HTTP hops
+/// is needed to exercise the boundary between "at cap" and "over cap".
+pub fn check_redirect_cap(redirects: u32, max_redirects: u32) -> Result<(), Refusal> {
+    if redirects >= max_redirects {
+        Err(Refusal::new(
+            "redirect_limit_exceeded",
+            format!("exceeded the maximum of {max_redirects} redirects"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
