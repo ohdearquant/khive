@@ -81,15 +81,18 @@ including verified `anonymous:local` creators, keep their normal recurrence.
 
 **Recurrence specification.** `repeat` accepts:
 
-| Value       | Semantics                                  |
-| ----------- | ------------------------------------------ |
-| `"daily"`   | Repeat every 24 hours from `trigger_at`    |
-| `"weekly"`  | Repeat every 7 days                        |
-| `"monthly"` | Repeat on the same day-of-month each month |
+| Value                     | Semantics                                                                                          |
+| ------------------------- | -------------------------------------------------------------------------------------------------- |
+| `"daily"`                 | Repeat every 24 hours from `trigger_at`                                                            |
+| `"weekly"`                | Repeat every 7 days                                                                                |
+| `"monthly"`               | Repeat on the same day-of-month each month                                                         |
+| `"every:<N><s\|m\|h\|d>"` | Repeat after `N` seconds, minutes, hours, or days from `trigger_at` (`N >= 1`, e.g. `"every:15m"`) |
+| Five-field cron           | Next match after `trigger_at`, evaluated in UTC (e.g. `"0 9 * * 1"` for 09:00 UTC on Mondays)      |
 
-Five-field cron is rejected at creation because the pending-events runner does
-not compute cron next-fire times. The write boundary never accepts recurrence
-syntax that would degrade to a one-shot at execution time.
+Creation and the pending-events runner share `khive_pack_schedule::repeat` to
+parse and advance these forms. Unsupported expressions are rejected at creation;
+legacy rows carrying unsupported recurrence fail closed before invocation instead
+of degrading to a one-shot at execution time.
 
 **`action` payload security and replayability (issue #461).** The `action`
 string accepted by `schedule` is validated at write time in two stages, not
