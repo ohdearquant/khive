@@ -538,6 +538,15 @@ pub enum FilterOp {
     /// as included (e.g. comm inbox excludes `outbound`). `PropertyFilter.value` is
     /// unused for this op; the set lives in the variant itself.
     NotInOrMissing(Vec<SqlValue>),
+    /// Matches rows whose JSON text field starts with the supplied prefix.
+    /// Rendered as an index-seekable half-open range over the plain
+    /// `json_extract` expression (`expr >= prefix AND expr < next(prefix)`,
+    /// where `next` increments the prefix's last code point), so an index
+    /// keyed on that expression serves the seek instead of a scan. SQLite
+    /// sorts non-text values outside the text range, so a missing, null or
+    /// numeric field never matches. `PropertyFilter.value` is the prefix and
+    /// must be `SqlValue::Text`; an empty prefix matches every text value.
+    TextStartsWithIndexed,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.

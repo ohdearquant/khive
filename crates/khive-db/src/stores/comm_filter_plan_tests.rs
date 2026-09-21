@@ -25,6 +25,10 @@ CREATE INDEX idx_comm_message_to_actor
 CREATE INDEX idx_comm_message_outbound_ref
  ON notes(namespace, kind, json_extract(properties, '$.direction'),
  json_extract(properties, '$.from_actor'), json_extract(properties, '$.outbound_ref'))
+ WHERE deleted_at IS NULL;
+CREATE INDEX idx_comm_message_outbound_recipient
+ ON notes(namespace, kind, json_extract(properties, '$.direction'),
+ json_extract(properties, '$.to_actor'), created_at DESC, id ASC)
  WHERE deleted_at IS NULL;";
 
 const RECIPIENT_ONLY: &str = "CREATE INDEX idx_candidate_recipient_only
@@ -42,7 +46,8 @@ fn register_comm_indexes(conn: &Connection) {
         "DROP INDEX IF EXISTS idx_comm_message_direction;
          DROP INDEX IF EXISTS idx_comm_message_thread;
          DROP INDEX IF EXISTS idx_comm_message_to_actor;
-         DROP INDEX IF EXISTS idx_comm_message_outbound_ref;",
+         DROP INDEX IF EXISTS idx_comm_message_outbound_ref;
+         DROP INDEX IF EXISTS idx_comm_message_outbound_recipient;",
     )
     .unwrap();
     conn.execute_batch(COMM_INDEXES).unwrap();
@@ -178,10 +183,12 @@ fn sent_filter() -> NoteFilter {
     }
 }
 
+/// The channel delivery loops' scan: pending predicate plus the channel
+/// prefix on the recipient, all in the statement, newest-first. The prefix
+/// selects the caller-owned `test:target` rows and excludes `test:other`.
 fn outbox_filter() -> NoteFilter {
     NoteFilter {
         kind: Some("message".into()),
-        unordered: true,
         property_filters: vec![
             PropertyFilter {
                 json_path: "$.direction".into(),
@@ -200,6 +207,11 @@ fn outbox_filter() -> NoteFilter {
                     SqlValue::Text("failed".into()),
                 ]),
                 value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".into(),
+                op: FilterOp::TextStartsWithIndexed,
+                value: SqlValue::Text("test:t".into()),
             },
         ],
         ..Default::default()
@@ -246,8 +258,12 @@ fn measure_with_pin(conn: &Connection, filter: &NoteFilter, pinned: bool) -> Val
            "vm_steps":statement.get_status(StatementStatus::VmStep)})
 }
 
+/// The scan seeks the outbound-recipient index on (direction, recipient
+/// prefix range). Ordering by `created_at` after a range seek needs a sort,
+/// but that sort covers only the channel's own pending rows, never the
+/// actor-to-actor backlog the prefix excludes.
 #[test]
-fn outbox_filter_plan_has_no_temporary_ordering_btree() {
+fn outbox_filter_plan_seeks_the_outbound_recipient_index() {
     let result = measure(&fixture(0, 10_000), &outbox_filter());
     let plan = result["plan"]
         .as_array()
@@ -258,27 +274,30 @@ fn outbox_filter_plan_has_no_temporary_ordering_btree() {
 
     assert!(
         plan.iter()
-            .any(|detail| detail.contains("idx_comm_message_direction")
-                || detail.contains("idx_comm_message_outbound_ref")),
-        "outbox filter must use a comm outbound candidate index, got plan: {plan:?}"
+            .any(|detail| detail.contains("idx_comm_message_outbound_recipient")),
+        "outbox filter must seek the outbound recipient index, got plan: {plan:?}"
     );
-    assert!(
-        plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-        "outbox filter must not materialize a temporary ordering b-tree, got plan: {plan:?}"
+    assert_eq!(
+        result["ids"].as_array().unwrap().len(),
+        21,
+        "the page holds only caller-owned outbound rows"
     );
 }
 
+/// Pending rows addressed to other recipients (every actor-to-actor message
+/// stays pending forever) must not add work to a channel's scan: 10,000
+/// foreign outbound rows leave the ids and the VM step count unchanged.
 #[test]
-fn outbox_filter_work_is_bounded_by_outbound_candidates() {
+fn outbox_filter_work_is_bounded_by_the_channels_own_rows() {
     let small = measure(&fixture(0, 0), &outbox_filter());
-    let large = measure(&fixture(0, 10_000), &outbox_filter());
+    let large = measure(&fixture(10_000, 0), &outbox_filter());
 
     assert_eq!(large["ids"], small["ids"]);
     let small_steps = small["vm_steps"].as_i64().unwrap();
     let large_steps = large["vm_steps"].as_i64().unwrap();
     assert!(
         large_steps <= small_steps + 128,
-        "inbound message growth must not add row-proportional outbox work: {small_steps} -> {large_steps}"
+        "foreign outbound growth must not add row-proportional outbox work: {small_steps} -> {large_steps}"
     );
 }
 
