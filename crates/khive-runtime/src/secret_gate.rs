@@ -97,6 +97,11 @@ impl std::fmt::Display for SecretMatch {
 /// reference for a source hash.
 fn block_guidance(detector: &'static str) -> &'static str {
     match detector {
+        "url-userinfo" => {
+            "Placeholders in URL credential positions still match this pattern. \
+             Replace the whole URL with an environment-variable name or config key, \
+             or remove the entire user/password segment before writing."
+        }
         "high-entropy-token"
         | "uuid-near-trigger"
         | "content-hash-near-trigger"
@@ -4159,6 +4164,49 @@ mod tests {
         let fake = "postgresql://dbuser:S3cr3tP4ss@db.example.com:5432/mydb";
         assert!(scan(fake).is_some(), "URL userinfo must be caught");
         assert_eq!(scan(fake).unwrap().detector, "url-userinfo");
+    }
+
+    #[test]
+    fn url_userinfo_placeholder_refusal_explains_effective_remedies() {
+        for content in [
+            "postgresql://dbuser:<PASSWORD>@db.example.com:5432/mydb",
+            "postgresql://<USER>:<PASSWORD>@db.example.com:5432/mydb",
+            "redis://:<PASSWORD>@cache.example.com:6379",
+        ] {
+            let error = check(content).expect_err("URL credential placeholders still match");
+            let RuntimeError::SecretDetected(matched) = &error else {
+                panic!("expected a secret refusal, got {error}");
+            };
+            assert_eq!(matched.detector, "url-userinfo");
+            let rendered = error.to_string();
+            for guidance in [
+                "Placeholders in URL credential positions still match",
+                "Replace the whole URL",
+                "environment-variable name or config key",
+                "remove the entire user/password segment",
+            ] {
+                assert!(
+                    rendered.contains(guidance),
+                    "missing {guidance:?}: {rendered}"
+                );
+            }
+            assert!(!rendered.contains(content), "refusal must not echo the URL");
+        }
+    }
+
+    #[test]
+    fn url_userinfo_guidance_remedies_are_accepted() {
+        for content in [
+            "Use the DATABASE_URL environment variable.",
+            "Use the database.connection_url config key.",
+            "postgresql://db.example.com:5432/mydb",
+            "redis://cache.example.com:6379",
+        ] {
+            assert!(
+                check(content).is_ok(),
+                "URL reference or URL without credentials must be accepted: {content:?}"
+            );
+        }
     }
 
     #[test]
