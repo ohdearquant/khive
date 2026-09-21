@@ -219,25 +219,53 @@ having a web ontology at all.
 Two normative additions found during implementation review. Both narrow the record; neither changes
 the ontology, the relation rules, or a verb signature.
 
-### A1.1 D3: `web.ingest` reads disk only under `[web] read_roots`
+### A1.1 D3: `web.ingest` reads disk only under `[web] read_roots`, decided on the opened descriptor
 
 D3 lets `web.ingest` take a served tree on disk. As written it bounds nothing about which directories
 that may be, so the verb would read any file the daemon can read and store it as a `resource` under a
 caller-chosen origin. The configuration section `[web]` gains `read_roots`, a list of directory paths.
-A disk source is admitted only when its canonical path lies under one of them; a path that leaves a
-root through a symlink is refused; an absent or empty list refuses every disk source with a message
-naming the setting. This mirrors `[exec] read_roots`, the same shape for the same reason. URL sources
-are unaffected. Acceptance A5 keeps its arm and gains a control: the served tree is a configured root,
-and the identical ingest with the tree outside every root is refused.
+A disk source is admitted only when it lies under one of them; an absent or empty list refuses every
+disk source with a message naming the setting. This mirrors `[exec] read_roots`, the same shape for the
+same reason. URL sources are unaffected.
 
-### A1.2 D4: bodies are rooted by attachment, not by the property that names them
+Confinement is a property of the bytes that are read, not of a path that was checked earlier. A check
+that canonicalizes a path and then opens it by name again is racy: between the check and the open, a
+writer with access to a configured root can replace the checked file with a symbolic link to any file
+the daemon can read, and the daemon would store those bytes as a `resource`. So the rule is stated on
+the descriptor: the file is opened with symbolic links refused at every path component, the confinement
+check is made against the identity of the file as opened (its resolved path read back from the
+descriptor, or its device and inode numbers compared with the entry that was checked), and the bytes
+stored are read from that same descriptor. A path check followed by a separate open by name satisfies
+nothing here. Acceptance A5 keeps its arm and gains two controls: the identical ingest with the tree
+outside every root is refused, and a tree in which a regular file is swapped for a symbolic link to a
+file outside the root between the listing and the read is refused for that entry and stores no body.
+Enforcement and the symbolic-link swap arm land with the implementation, which cites this clause.
+
+### A1.2 D4: bodies are rooted by attachment, on the record that owns them
 
 D4 says every receipt carries a blob reference and D3 says a `page` or `resource` carries `blob_ref`.
-Neither keeps the blob alive: blob garbage collection consults the attachments table
-([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property or a receipt field
-is collectable once the grace period passes. Every stored body is therefore also recorded as an
-attachment with role `content` on the row that holds it (the `page` or `resource`, and the receipt
-note of the request that stored it), written on the canonical main backend whatever backend the pack
-is routed to. A body stored without a persisted row (`persist` false) is rooted by its receipt alone.
-Acceptance gains an arm: after a fetch the entity and its receipt each carry one `content` attachment
-naming the stored reference; a HEAD request stores no body and roots nothing.
+Neither keeps the blob alive: blob reclamation consults the attachments table
+([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property is collectable
+once the grace period passes.
+
+The body of a fetched page or resource is that entity's own content in another modality, which is
+exactly what ADR-121 makes an attachment. So a persisted `page` or `resource` carries one attachment
+with role `content` naming the stored reference, and the receipt note of the request that stored it
+annotates the entity (D4) and carries no attachment: the receipt is the utterance, the body is the
+thing, and ADR-121's note boundary keeps the two apart. When the caller asks for no persisted row
+(`persist` false) there is no entity to own the body and the receipt is the only record of it; it then
+carries the `content` attachment itself, the way a payload that arrives through a message does, and a
+later promotion to an entity attaches the same reference without a copy (ADR-121 §7). A HEAD request
+stores no body and roots nothing.
+
+Placement follows the record. An attachment row lives on the backend that holds the record it attaches
+to, so a web pack routed to its own backend (ADR-028 Amendment 4) writes the entity, the receipt and
+their attachment rows there and nothing on the main backend; A9 stands as written, and delete-cascade
+reclamation (ADR-121) runs on the row's own backend. The blob store is one store across backends, so a
+sweep that reads the attachments table to decide what is live must consult that table on every
+configured backend, never the main backend alone. At this revision no production path runs the sweep;
+the requirement binds it when it is wired, and is stated here so that the placement above is never
+read as a leak. Acceptance gains two arms: after a fetch with `persist` true the entity carries one
+`content` attachment and its receipt carries none; after a fetch with `persist` false the receipt
+carries the one `content` attachment. A9 gains the assertion that the attachment rows of a routed web
+pack are absent from the main backend.
