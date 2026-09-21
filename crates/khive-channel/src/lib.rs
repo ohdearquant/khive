@@ -238,6 +238,166 @@ impl ChannelPollPage {
     }
 }
 
+/// Transport identity covered by a recipient's signature (ADR-105).
+///
+/// Agent identifiers are immutable service identities, distinct from local actor
+/// labels. They come from authenticated routing authority, never asserted envelope
+/// fields. This is a value to sign or verify, not proof of authenticity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryReceiptBinding {
+    pub protocol_version: u32,
+    pub logical_message_id: Uuid,
+    pub sender_agent_id: String,
+    pub recipient_agent_id: String,
+    pub recipient_device_id: Uuid,
+    pub recipient_key_epoch: u64,
+    pub contact_generation: u64,
+    pub delivery_attempt_id: Uuid,
+}
+
+/// The recipient's durable ingest outcome; this says nothing about read state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptDisposition {
+    Stored,
+    Quarantined,
+}
+
+/// A signed recipient commit receipt, containing no message content or local note id.
+///
+/// The signature covers both `binding` and `disposition`. Signature bytes are
+/// opaque here: the node protocol defines their encoding, the canonical signed
+/// bytes, and verification against the pinned recipient key. Deserializing this
+/// type does not verify its signature or authorize a delivery-state transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryReceipt {
+    pub binding: DeliveryReceiptBinding,
+    pub disposition: ReceiptDisposition,
+    pub signature: Vec<u8>,
+}
+
+/// Result of a receipt-aware outbound submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The legacy adapter accepted the send; not a recipient commit receipt.
+    LegacyAccepted,
+    /// The sender retains the message until a verified recipient receipt arrives.
+    Pending,
+    RecipientStored(DeliveryReceipt),
+    RecipientQuarantined(DeliveryReceipt),
+}
+
+impl SendOutcome {
+    /// Reject an outcome whose variant contradicts its receipt disposition.
+    ///
+    /// The node adapter must additionally authenticate the receipt, check its
+    /// binding against the pending submission, and refuse `LegacyAccepted` as
+    /// proof of delivery. This check performs none of those protocol operations.
+    pub fn validate_receipt(&self) -> Result<(), ChannelError> {
+        match self {
+            Self::RecipientStored(receipt) if receipt.disposition != ReceiptDisposition::Stored => {
+                Err(ChannelError::InvalidEnvelope(
+                    "recipient_stored outcome requires a stored receipt".into(),
+                ))
+            }
+            Self::RecipientQuarantined(receipt)
+                if receipt.disposition != ReceiptDisposition::Quarantined =>
+            {
+                Err(ChannelError::InvalidEnvelope(
+                    "recipient_quarantined outcome requires a quarantined receipt".into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// In-memory receipt authority accompanying one authenticated inbound envelope.
+///
+/// Tickets are moved with their envelope, never cloned or deserialized from wire
+/// input. The node adapter supplies authenticated routing identity; the runtime
+/// must reject a mismatched or duplicated ticket before verified-recipient ingest.
+/// Non-clonability alone does not authenticate a ticket or prevent protocol replay.
+///
+/// ```compile_fail
+/// use khive_channel::InboundReceiptTicket;
+/// fn duplicate(ticket: InboundReceiptTicket) {
+///     let _duplicate = ticket.clone();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct InboundReceiptTicket {
+    binding: DeliveryReceiptBinding,
+    sender_key_epoch: u64,
+}
+
+impl InboundReceiptTicket {
+    /// Create a ticket at the trusted adapter boundary after authenticating the
+    /// envelope and its routing identity. This constructor performs no verification.
+    pub fn new(binding: DeliveryReceiptBinding, sender_key_epoch: u64) -> Self {
+        Self {
+            binding,
+            sender_key_epoch,
+        }
+    }
+
+    pub fn binding(&self) -> &DeliveryReceiptBinding {
+        &self.binding
+    }
+
+    pub fn sender_key_epoch(&self) -> u64 {
+        self.sender_key_epoch
+    }
+}
+
+/// A poll page with one receipt-ticket slot per envelope, in the same order.
+///
+/// Private fields preserve the checked count for the lifetime of the page.
+/// Construction checks cardinality only; the runtime still validates the ticket
+/// binding and rejects duplicates. Polling does not acknowledge a delivery.
+#[derive(Debug)]
+pub struct DeliveryPage {
+    page: ChannelPollPage,
+    tickets: Vec<Option<InboundReceiptTicket>>,
+}
+
+impl DeliveryPage {
+    pub fn new(
+        page: ChannelPollPage,
+        tickets: Vec<Option<InboundReceiptTicket>>,
+    ) -> Result<Self, ChannelError> {
+        if page.envelopes.len() != tickets.len() {
+            return Err(ChannelError::InvalidEnvelope(format!(
+                "delivery page has {} envelopes but {} receipt ticket slots",
+                page.envelopes.len(),
+                tickets.len(),
+            )));
+        }
+        Ok(Self { page, tickets })
+    }
+
+    /// Preserve a legacy page, including its checkpoint, with no receipt tickets.
+    pub fn legacy(page: ChannelPollPage) -> Self {
+        let tickets = (0..page.envelopes.len()).map(|_| None).collect();
+        Self { page, tickets }
+    }
+
+    pub fn page(&self) -> &ChannelPollPage {
+        &self.page
+    }
+
+    pub fn tickets(&self) -> &[Option<InboundReceiptTicket>] {
+        &self.tickets
+    }
+
+    /// Consume the page to transfer its envelopes and their aligned ticket slots.
+    /// The consumer owns preserving that pairing and validating binding/replay
+    /// before ingest; the page can no longer enforce alignment after consumption.
+    pub fn into_parts(self) -> (ChannelPollPage, Vec<Option<InboundReceiptTicket>>) {
+        (self.page, self.tickets)
+    }
+}
+
 /// Errors produced by channel operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
@@ -325,6 +485,20 @@ pub trait Channel: Send + Sync + 'static {
     /// to a future release; `send` exists so the trait surface is complete.
     async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError>;
 
+    /// Submit an outbound message and report recipient-commit progress (ADR-105).
+    ///
+    /// The default delegates to [`Channel::send`] unchanged and returns
+    /// [`SendOutcome::LegacyAccepted`]. The node adapter overrides this to return
+    /// `Pending`, `RecipientStored`, or `RecipientQuarantined`, and never treats
+    /// legacy acceptance as proof of delivery.
+    async fn send_with_receipt(
+        &self,
+        envelope: ChannelEnvelope,
+    ) -> Result<SendOutcome, ChannelError> {
+        self.send(envelope).await?;
+        Ok(SendOutcome::LegacyAccepted)
+    }
+
     /// Poll for new inbound messages since `since`.
     ///
     /// Returns envelopes ready to be forwarded to `comm.ingest`.  Deduplication
@@ -349,6 +523,33 @@ pub trait Channel: Send + Sync + 'static {
     ) -> Result<ChannelPollPage, ChannelError> {
         let _ = checkpoint;
         Ok(ChannelPollPage::stateless(self.poll(since).await?))
+    }
+
+    /// Poll envelopes with receipt tickets while preserving checkpoint semantics.
+    ///
+    /// The default wraps [`Channel::poll_page`] with all-`None` ticket slots.
+    /// The node adapter overrides this to attach authenticated, envelope-bound
+    /// tickets. Polling itself never acknowledges or deletes a delivery.
+    async fn poll_deliveries(
+        &self,
+        since: DateTime<Utc>,
+        checkpoint: Option<&StoredChannelCheckpoint>,
+    ) -> Result<DeliveryPage, ChannelError> {
+        Ok(DeliveryPage::legacy(
+            self.poll_page(since, checkpoint).await?,
+        ))
+    }
+
+    /// Forward a signed receipt after durable recipient ingest has committed.
+    ///
+    /// The default returns a permanent unsupported configuration error. The node
+    /// adapter must override this; the runtime drives it from a durable
+    /// acknowledgement journal so failed acknowledgements retry after restart.
+    async fn acknowledge_receipt(&self, _receipt: &DeliveryReceipt) -> Result<(), ChannelError> {
+        Err(ChannelError::Config(format!(
+            "receipts unsupported by {}",
+            self.kind()
+        )))
     }
 }
 
@@ -435,6 +636,245 @@ pub fn new_thread_correlation_id() -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    struct LegacyChannel {
+        sent: Mutex<Vec<ChannelEnvelope>>,
+        inbound: Vec<ChannelEnvelope>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Channel for LegacyChannel {
+        fn kind(&self) -> &'static str {
+            "legacy"
+        }
+
+        async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+            if self.fail {
+                return Err(ChannelError::Transport("send unavailable".into()));
+            }
+            self.sent.lock().unwrap().push(envelope);
+            Ok(())
+        }
+
+        async fn poll(&self, _since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+            if self.fail {
+                return Err(ChannelError::UnauthorizedSender("poll denied".into()));
+            }
+            Ok(self.inbound.clone())
+        }
+    }
+
+    fn receipt(disposition: ReceiptDisposition) -> DeliveryReceipt {
+        DeliveryReceipt {
+            binding: DeliveryReceiptBinding {
+                protocol_version: 1,
+                logical_message_id: Uuid::new_v4(),
+                sender_agent_id: "sender-agent".into(),
+                recipient_agent_id: "recipient-agent".into(),
+                recipient_device_id: Uuid::new_v4(),
+                recipient_key_epoch: 2,
+                contact_generation: 3,
+                delivery_attempt_id: Uuid::new_v4(),
+            },
+            disposition,
+            signature: vec![1, 2, 3],
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_defaults_preserve_legacy_send_and_poll() {
+        let envelope = ChannelEnvelope::new("legacy:sender", "legacy:recipient", "body")
+            .with_subject("subject")
+            .with_sent_at(Utc::now())
+            .with_external_id("external-id")
+            .with_correlation("thread-id")
+            .with_quarantine_replay(vec![0, 255, 13, 10], "legacy:sender");
+        let expected_bytes = serde_json::to_vec(&envelope).unwrap();
+        let adapter = LegacyChannel {
+            sent: Mutex::new(Vec::new()),
+            inbound: vec![envelope.clone()],
+            fail: false,
+        };
+        let channel: &dyn Channel = &adapter;
+        assert_eq!(
+            channel.send_with_receipt(envelope).await.unwrap(),
+            SendOutcome::LegacyAccepted
+        );
+        {
+            let sent = adapter.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(serde_json::to_vec(&sent[0]).unwrap(), expected_bytes);
+            assert_eq!(
+                sent[0].quarantine_replay.as_ref().unwrap().bytes,
+                [0, 255, 13, 10]
+            );
+        }
+        let deliveries = channel.poll_deliveries(Utc::now(), None).await.unwrap();
+        assert_eq!(deliveries.tickets().len(), 1);
+        assert!(deliveries.tickets().iter().all(Option::is_none));
+        let (page, tickets) = deliveries.into_parts();
+        assert_eq!(page.envelopes.len(), tickets.len());
+        assert_eq!(
+            serde_json::to_vec(&page.envelopes[0]).unwrap(),
+            expected_bytes
+        );
+        assert_eq!(
+            page.envelopes[0].quarantine_replay.as_ref().unwrap().bytes,
+            [0, 255, 13, 10]
+        );
+        assert!(page.next_checkpoint.is_none());
+
+        let error = channel
+            .acknowledge_receipt(&receipt(ReceiptDisposition::Stored))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.delivery_failure_class(),
+            DeliveryFailureClass::Permanent
+        );
+        assert!(
+            matches!(error, ChannelError::Config(message) if message == "receipts unsupported by legacy")
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_defaults_propagate_legacy_errors() {
+        let channel = LegacyChannel {
+            sent: Mutex::new(Vec::new()),
+            inbound: vec![],
+            fail: true,
+        };
+        assert!(matches!(
+            channel.send_with_receipt(ChannelEnvelope::new("a", "b", "c")).await,
+            Err(ChannelError::Transport(message)) if message == "send unavailable"
+        ));
+        assert!(matches!(
+            channel.poll_deliveries(Utc::now(), None).await,
+            Err(ChannelError::UnauthorizedSender(message)) if message == "poll denied"
+        ));
+        assert!(channel.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_deliveries_preserves_overridden_page_and_checkpoint() {
+        struct CheckpointChannel {
+            since: DateTime<Utc>,
+            checkpoint: StoredChannelCheckpoint,
+        }
+
+        #[async_trait]
+        impl Channel for CheckpointChannel {
+            fn kind(&self) -> &'static str {
+                "checkpoint"
+            }
+
+            async fn send(&self, _: ChannelEnvelope) -> Result<(), ChannelError> {
+                panic!("poll_deliveries must not send");
+            }
+
+            async fn poll(&self, _: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("poll_deliveries must use the poll_page override");
+            }
+
+            async fn poll_page(
+                &self,
+                since: DateTime<Utc>,
+                checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                assert_eq!(since, self.since);
+                assert_eq!(checkpoint, Some(&self.checkpoint));
+                Ok(ChannelPollPage {
+                    envelopes: vec![ChannelEnvelope::new("a", "b", "checkpointed")],
+                    next_checkpoint: Some(ChannelCheckpoint {
+                        high_water: Some(43),
+                        ..self.checkpoint.checkpoint.clone()
+                    }),
+                })
+            }
+        }
+
+        let channel = CheckpointChannel {
+            since: Utc::now(),
+            checkpoint: StoredChannelCheckpoint {
+                checkpoint: ChannelCheckpoint {
+                    source: "source".into(),
+                    generation: 7,
+                    high_water: Some(42),
+                },
+                committed_at: Utc::now(),
+            },
+        };
+        let page = channel
+            .poll_deliveries(channel.since, Some(&channel.checkpoint))
+            .await
+            .unwrap();
+        assert_eq!(page.page().envelopes[0].content, "checkpointed");
+        assert_eq!(
+            page.page().next_checkpoint,
+            Some(ChannelCheckpoint {
+                high_water: Some(43),
+                ..channel.checkpoint.checkpoint.clone()
+            })
+        );
+        assert!(page.tickets()[0].is_none());
+    }
+
+    #[test]
+    fn delivery_page_checks_counts_and_retains_ticket_order() {
+        let make_page = || {
+            ChannelPollPage::stateless(vec![
+                ChannelEnvelope::new("a", "b", "first"),
+                ChannelEnvelope::new("a", "b", "second"),
+            ])
+        };
+        for count in [0, 1, 3] {
+            let tickets = (0..count).map(|_| None).collect();
+            let error = DeliveryPage::new(make_page(), tickets).unwrap_err();
+            assert!(matches!(error, ChannelError::InvalidEnvelope(_)));
+            assert_eq!(
+                error.delivery_failure_class(),
+                DeliveryFailureClass::Permanent
+            );
+        }
+        let binding = receipt(ReceiptDisposition::Stored).binding;
+        let ticket = InboundReceiptTicket::new(binding.clone(), 9);
+        let page = DeliveryPage::new(make_page(), vec![None, Some(ticket)]).unwrap();
+        assert_eq!(page.page().envelopes.len(), 2);
+        assert!(page.tickets()[0].is_none());
+        let ticket = page.tickets()[1].as_ref().unwrap();
+        assert_eq!(ticket.binding(), &binding);
+        assert_eq!(ticket.sender_key_epoch(), 9);
+        assert!(DeliveryPage::new(ChannelPollPage::stateless(vec![]), vec![]).is_ok());
+    }
+
+    #[test]
+    fn receipt_disposition_is_closed_and_outcomes_must_agree() {
+        let stored = receipt(ReceiptDisposition::Stored);
+        let quarantined = receipt(ReceiptDisposition::Quarantined);
+        assert!(SendOutcome::LegacyAccepted.validate_receipt().is_ok());
+        assert!(SendOutcome::Pending.validate_receipt().is_ok());
+        assert!(SendOutcome::RecipientStored(stored.clone())
+            .validate_receipt()
+            .is_ok());
+        assert!(SendOutcome::RecipientQuarantined(quarantined.clone())
+            .validate_receipt()
+            .is_ok());
+        assert!(SendOutcome::RecipientStored(quarantined)
+            .validate_receipt()
+            .is_err());
+        assert!(SendOutcome::RecipientQuarantined(stored.clone())
+            .validate_receipt()
+            .is_err());
+        let mut value = serde_json::to_value(&stored).unwrap();
+        assert_eq!(value["disposition"], "stored");
+        assert_eq!(
+            serde_json::from_value::<DeliveryReceipt>(value.clone()).unwrap(),
+            stored
+        );
+        value["disposition"] = serde_json::json!("pending");
+        assert!(serde_json::from_value::<DeliveryReceipt>(value).is_err());
+    }
 
     struct MockChannel {
         sent: Arc<Mutex<Vec<ChannelEnvelope>>>,
