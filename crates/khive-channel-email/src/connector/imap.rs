@@ -835,20 +835,17 @@ mod tests {
         let raw = b"From: alice@example.com\r\n\
                     To: me@example.com\r\n\
                     Subject: Re:\r\n\
-                    \x20=?utf-8?Q?=E4=B8=8B=E5=8D=88=E8=8D=AF=E8=BF=98=E6=B2=A1=E8=AE=B0_?=(Lamotrigine\r\n\
-                    \x20200 + Gabapentin 200)\r\n\
+                    \x20=?utf-8?Q?=E4=BC=9A=E8=AE=AE=E7=BA=AA=E8=A6=81_?=(Q3\r\n\
+                    \x20planning + budget)\r\n\
                     \r\n\
                     body";
         let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
-        assert_eq!(
-            email.subject,
-            "Re: 下午药还没记 (Lamotrigine 200 + Gabapentin 200)"
-        );
+        assert_eq!(email.subject, "Re: 会议纪要 (Q3 planning + budget)");
 
         // Control: a plain ASCII subject is untouched.
-        let raw = minimal_rfc822("alice@example.com", "Re: plain (Lamotrigine 200)");
+        let raw = minimal_rfc822("alice@example.com", "Re: plain (Q3 planning + budget)");
         let email = parse_raw_bytes(2, &raw, "imap.example.com", 1).unwrap();
-        assert_eq!(email.subject, "Re: plain (Lamotrigine 200)");
+        assert_eq!(email.subject, "Re: plain (Q3 planning + budget)");
     }
 
     #[test]

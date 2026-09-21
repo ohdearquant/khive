@@ -913,7 +913,7 @@ async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
             serde_json::json!({
                 "to": "local",
                 "content": "original",
-                "subject": "下午药 (Lamotrigine 200)"
+                "subject": "会议纪要 (Q3 planning)"
             }),
         )
         .await
@@ -930,7 +930,7 @@ async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
             serde_json::json!({
                 "to": "local",
                 "content": "drifted",
-                "subject": "Re: Re: 下午药   (Lamotrigine 200) (2)",
+                "subject": "Re: Re: 会议纪要   (Q3 planning) (2)",
                 "thread_id": root_id
             }),
         )
@@ -947,7 +947,7 @@ async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
         .expect("reply succeeds");
     assert_eq!(
         reply["subject"].as_str(),
-        Some("Re: 下午药 (Lamotrigine 200)"),
+        Some("Re: 会议纪要 (Q3 planning)"),
         "reply subject comes from the thread root, not the drifted message: {reply}"
     );
     assert_eq!(reply["thread_id"].as_str(), Some(root_id.as_str()));
@@ -963,7 +963,7 @@ async fn reply_subject_derives_from_thread_root_not_from_drifted_reply() {
         .expect("second reply succeeds");
     assert_eq!(
         second["subject"].as_str(),
-        Some("Re: 下午药 (Lamotrigine 200)")
+        Some("Re: 会议纪要 (Q3 planning)")
     );
 }
 
