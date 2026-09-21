@@ -786,6 +786,28 @@ fn json_type_literal(value: &SqlValue) -> Result<&str, rusqlite::Error> {
     }
 }
 
+/// Exclusive upper bound of the set of strings starting with `prefix`, in
+/// SQLite's BINARY (UTF-8 byte) order: the prefix with its last code point
+/// incremented, after dropping any trailing `char::MAX` (which has no
+/// successor). `None` when every string starting with `prefix` is also
+/// `>= prefix` without an upper bound (empty prefix, or all `char::MAX`).
+/// UTF-8 preserves code point order byte-wise, so every string with the
+/// prefix sorts strictly below the returned bound.
+fn text_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = u32::from(last) + 1;
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
 fn sql_value_param(value: &SqlValue) -> Result<Box<dyn rusqlite::types::ToSql>, rusqlite::Error> {
     Ok(match value {
         SqlValue::Null => Box::new(Option::<String>::None),
@@ -957,6 +979,29 @@ fn build_note_filter_where(
                 }
                 conditions.push(format!("{expr} IN ({})", placeholders.join(", ")));
             }
+            FilterOp::TextStartsWithIndexed => {
+                let expr = json_extract_expr(&pf.json_path);
+                let SqlValue::Text(prefix) = &pf.value else {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "TextStartsWithIndexed takes a text prefix in PropertyFilter.value".into(),
+                    ));
+                };
+                params.push(Box::new(prefix.clone()));
+                let lower = params.len();
+                match text_prefix_upper_bound(prefix) {
+                    Some(upper) => {
+                        params.push(Box::new(upper));
+                        conditions.push(format!(
+                            "({expr} >= ?{lower} AND {expr} < ?{})",
+                            params.len()
+                        ));
+                    }
+                    None => {
+                        let type_expr = json_type_expr(&pf.json_path);
+                        conditions.push(format!("({type_expr} = 'text' AND {expr} >= ?{lower})"));
+                    }
+                }
+            }
             FilterOp::NotInOrMissing(values) => {
                 let expr = json_extract_expr(&pf.json_path);
                 if values.is_empty() {
@@ -992,7 +1037,8 @@ fn build_note_filter_where(
                     | FilterOp::EqOrLegacyIndexed
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
-                    | FilterOp::NotInOrMissing(_) => {
+                    | FilterOp::NotInOrMissing(_)
+                    | FilterOp::TextStartsWithIndexed => {
                         unreachable!()
                     }
                 };

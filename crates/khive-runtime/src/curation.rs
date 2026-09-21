@@ -2055,19 +2055,25 @@ impl KhiveRuntime {
 
     /// Non-wire outbox scan for the channel delivery loops.
     ///
-    /// Fetches live `message` notes matching the SQL-side pending predicate,
-    /// sorts that bounded candidate set newest-first, and returns those that
-    /// are still pending delivery, capped at `limit`.
-    /// Direction, `delivered_at`, and terminal `delivery` state are filtered
-    /// by SQLite; a valid `next_attempt_at` and the optional `to_actor`
-    /// channel prefix remain Rust checks. Pending means `delivered_at` is
-    /// absent or null, `properties.delivery` carries no terminal state
+    /// Fetches live `message` notes matching the SQL-side pending predicate
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// cap, and returns those that are still due, capped at `limit`.
+    /// Direction, `delivered_at`, terminal `delivery` state and the optional
+    /// `to_actor` channel prefix are all filtered by SQLite; only a valid
+    /// `next_attempt_at` remains a Rust check. Pending means `delivered_at`
+    /// is absent or null, `properties.delivery` carries no terminal state
     /// (`"delivered"` / `"failed"`), and a valid `next_attempt_at` is absent
     /// or due (ADR-122 §1). Malformed legacy deadlines fail open so a bad
-    /// property cannot strand mail forever. When `to_prefix` is given,
-    /// only rows whose `properties.to_actor` starts with it are counted —
-    /// the channel predicate must run BEFORE the limit, otherwise a backlog
-    /// of another channel's pending rows starves this channel indefinitely.
+    /// property cannot strand mail forever.
+    ///
+    /// The channel prefix has to be in the statement, not applied to the
+    /// fetched page: every actor-to-actor outbound row matches the pending
+    /// predicate forever (nothing marks those delivered), so that population
+    /// outgrows any scan cap and a page-then-filter scan never reaches a
+    /// channel's rows once enough other rows sort ahead of them. The prefix
+    /// renders as an index range served by
+    /// `idx_comm_message_outbound_recipient`, and the newest-first order
+    /// means a future predicate miss still surfaces new rows first.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2085,32 +2091,39 @@ impl KhiveRuntime {
             return Ok(Vec::new());
         }
         let now_micros = chrono::Utc::now().timestamp_micros();
+        let mut property_filters = vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.delivered_at".to_string(),
+                op: FilterOp::JsonTypeMissingOrNullIndexed,
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.delivery".to_string(),
+                op: FilterOp::NotInOrMissing(vec![
+                    SqlValue::Text("delivered".to_string()),
+                    SqlValue::Text("failed".to_string()),
+                ]),
+                value: SqlValue::Null,
+            },
+        ];
+        if let Some(prefix) = to_prefix {
+            property_filters.push(PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::TextStartsWithIndexed,
+                value: SqlValue::Text(prefix.to_string()),
+            });
+        }
         let filter = NoteFilter {
             kind: Some("message".to_string()),
-            unordered: true,
-            property_filters: vec![
-                PropertyFilter {
-                    json_path: "$.direction".to_string(),
-                    op: FilterOp::Eq,
-                    value: SqlValue::Text("outbound".to_string()),
-                },
-                PropertyFilter {
-                    json_path: "$.delivered_at".to_string(),
-                    op: FilterOp::JsonTypeMissingOrNullIndexed,
-                    value: SqlValue::Null,
-                },
-                PropertyFilter {
-                    json_path: "$.delivery".to_string(),
-                    op: FilterOp::NotInOrMissing(vec![
-                        SqlValue::Text("delivered".to_string()),
-                        SqlValue::Text("failed".to_string()),
-                    ]),
-                    value: SqlValue::Null,
-                },
-            ],
+            property_filters,
             ..Default::default()
         };
-        let mut candidates = self
+        let candidates = self
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
@@ -2122,25 +2135,10 @@ impl KhiveRuntime {
             )
             .await?
             .items;
-        candidates.sort_unstable_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
 
         let mut collected: Vec<khive_storage::note::Note> = Vec::new();
         for note in candidates {
             let props = note.properties.as_ref().and_then(|v| v.as_object());
-            if let Some(prefix) = to_prefix {
-                let to_matches = props
-                    .and_then(|p| p.get("to_actor"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|actor| actor.starts_with(prefix));
-                if !to_matches {
-                    continue;
-                }
-            }
             let retry_deferred = props
                 .and_then(|p| p.get("next_attempt_at"))
                 .and_then(|v| v.as_str())
@@ -4569,6 +4567,69 @@ mod tests {
             .await
             .expect("zero-limit scan succeeds");
         assert!(zero.is_empty(), "limit=0 returns no rows, not one");
+    }
+
+    /// Regression guard for the scan window (#1859). The pending predicate
+    /// admits every actor-to-actor outbound row forever (nothing marks them
+    /// delivered), so the pending population outgrows any scan cap. With
+    /// more such rows than the cap, an email row that sorts past the cap in
+    /// every candidate index order (older `created_at`, later rowid, a
+    /// `to_actor` that collates after the fillers') must still be returned:
+    /// the channel prefix has to bound the SQL candidate set, not trim it
+    /// afterwards. `list_undelivered_outbound_messages_matches_legacy_predicate`
+    /// is the under-cap control.
+    #[tokio::test]
+    async fn list_undelivered_outbound_messages_email_row_past_the_scan_window() {
+        const FILLERS: usize = 10_050;
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let tok = NamespaceToken::local();
+        let store = rt.notes(&tok).expect("note store");
+
+        let mut email = outbound_message_note();
+        email.created_at -= 1_000_000;
+        email.updated_at = email.created_at;
+        email.properties = Some(
+            serde_json::json!({"direction": "outbound", "to_actor": "email:ocean@example.test"}),
+        );
+        let email_id = email.id;
+
+        let mut fillers = Vec::with_capacity(FILLERS);
+        for i in 0..FILLERS {
+            let mut filler = outbound_message_note();
+            filler.created_at += i as i64;
+            filler.updated_at = filler.created_at;
+            filler.properties =
+                Some(serde_json::json!({"direction": "outbound", "to_actor": "daemon:filler"}));
+            fillers.push(filler);
+        }
+        // Fillers first so the email row also takes the later rowid.
+        let summary = store.upsert_notes(fillers).await.expect("seed fillers");
+        assert_eq!(
+            summary.affected as usize, FILLERS,
+            "every filler row seeded"
+        );
+        store.upsert_note(email).await.expect("seed email row");
+
+        let hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("email:"), 200)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![email_id],
+            "the email row is found behind {FILLERS} pending actor-to-actor rows"
+        );
+
+        let daemon_hits = rt
+            .list_undelivered_outbound_messages(&tok, Some("daemon:"), 3)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(
+            daemon_hits.len(),
+            3,
+            "the other prefix still sees its own rows"
+        );
     }
 
     fn legacy_outbox_pending(note: &Note, to_prefix: Option<&str>, now_micros: i64) -> bool {

@@ -662,6 +662,14 @@ idempotent (`CREATE INDEX IF NOT EXISTS`).
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
+`idx_comm_message_outbound_recipient` serves the channel delivery loops' outbox
+scan: a seek on direction plus a range on `properties.to_actor` (the channel
+prefix, `email:` or `telegram:`, rendered by `FilterOp::TextStartsWithIndexed`),
+then `created_at DESC, id ASC`. The prefix is in the statement because every
+actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
+scan that pages first and filters the recipient afterwards stops reaching a
+channel's rows once enough other rows sort ahead of them.
+
 The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
 created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
 is the sole durable authority for that index.
