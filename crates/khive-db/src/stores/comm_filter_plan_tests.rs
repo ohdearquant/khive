@@ -530,8 +530,8 @@ fn comm_filter_preanalyzed_upgrade_preserves_existing_comm_indexes() {
     conn.execute_batch("ANALYZE").unwrap();
     let catalog_before = comm_catalog(&conn);
     let stats_before = comm_stats(&conn);
-    assert_eq!(catalog_before.len(), 4);
-    assert_eq!(stats_before.len(), 4);
+    assert_eq!(catalog_before.len(), 5);
+    assert_eq!(stats_before.len(), 5);
     let filters: Vec<_> = ["unread", "read", "all", "sent"]
         .iter()
         .map(|status| {
