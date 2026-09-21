@@ -147,9 +147,9 @@ redirect cap, search provider.
 
 Every network action writes one observation note annotating the entity it touched (or standing alone
 for a search): method, final URL, redirect chain, status, content type, negotiated `Accept`, bytes,
-timing, egress classification, and the blob reference when a body was stored. A request that stores
-no body (`persist` false, or a HEAD) writes a receipt with no blob reference and records the content
-digest, size, final URL and fetch time instead (Amendment 1, A1.2). Receipts chain by `supersedes`,
+timing, egress classification, and the stored reference when `persist` is true, else the content
+digest and size (amended by A1.2: a request that stores no body, `persist` false or a HEAD, writes a
+receipt with no blob reference and records the content digest, size, final URL and fetch time). Receipts chain by `supersedes`,
 so the fetch history of a resource is a note chain, and content that did not change produces a receipt
 and nothing else.
 
@@ -250,8 +250,10 @@ not to be relied on.
 
 ### A1.2 D4: bodies are rooted by attachment on the main backend; `persist` false stores no bytes
 
-D4 said every receipt carries a blob reference (it now says: when a body was stored) and D3 says a
-`page` or `resource` carries `blob_ref`. Neither keeps the blob alive: blob reclamation consults the attachments table
+D4 said every receipt carries a blob reference; this amendment rewrites that sentence of D4 to read
+"the stored reference when `persist` is true, else the content digest and size" (the D4 text above
+carries the amended wording). D3 says a `page` or `resource` carries `blob_ref`. Neither keeps the
+blob alive: blob reclamation consults the attachments table
 ([ADR-121](ADR-121-attachments-first-class.md)), so a body named only by a property is collectable
 once the grace period passes.
 
@@ -272,15 +274,14 @@ therefore writes its entity and receipt rows there and its attachment rows on th
 through the core accessor, which is also how the pack keeps its bodies alive under one sweep. A9 is
 amended below to say exactly that. Because the record and its attachment row live in different
 databases, ADR-121's same-transaction delete cascade does not reach across, and
-[ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends. So hard-deleting a
-routed `page` or `resource` is one verb invocation with two commits in a fixed order: the record's
-own backend commits the delete first, then the main backend deletes the attachment rows that named
-the record, and that second delete is idempotent (deleting rows that are already gone succeeds).
-A crash between the two commits leaves attachment rows whose record is gone; those rows are not a
-liveness claim on anything (the record they would keep alive no longer exists) and the attachment
-sweep reclaims them, so the failure mode is a bounded leak until the next sweep, never a body kept
-alive by a dead record and never a record left without its body. The reverse order is forbidden: it
-would leave a live record whose body can be collected.
+[ADR-073](ADR-073-multi-backend-storage.md) grants no atomicity across backends and asks handlers
+for idempotent or compensating writes. So hard-deleting a routed `page` or `resource` is one verb
+invocation with two commits in a fixed order: the main backend deletes the attachment rows that
+name the record FIRST, then the record's own backend deletes the record, and the routed delete is
+idempotent on re-run. A crash between the two commits leaves a record with no attachment row,
+whose body is then collectable under ADR-121's grace period: that is the benign side by this
+amendment's own logic (a body nobody roots is reclaimed, a record mid-deletion is finished by the
+re-run), and it is the only order that can never leave an attachment row whose record is gone.
 
 Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
 attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
