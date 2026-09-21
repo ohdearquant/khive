@@ -14,7 +14,7 @@ use super::common::{
     normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_specific,
     remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any, to_json,
-    validate_entity_type, KindSpec, ListParams,
+    validate_entity_type_filter, KindSpec, ListParams,
 };
 use crate::sql::sql;
 use crate::KgPack;
@@ -350,16 +350,11 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
-                let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
-                    if let Some(ref kf) = kind_filter {
-                        validate_entity_type(kf, Some(raw_et), registry)?
-                    } else {
-                        let norm = raw_et.trim().to_ascii_lowercase();
-                        Some(norm)
-                    }
-                } else {
-                    None
-                };
+                let validated_et = validate_entity_type_filter(
+                    kind_filter.as_deref(),
+                    p.entity_type.as_deref(),
+                    registry,
+                )?;
                 let requested = p.limit.unwrap_or(50);
                 let limit = effective_list_limit(requested, ENTITY_LIST_CAP);
                 if let Some(after_raw) = p.after.as_deref() {

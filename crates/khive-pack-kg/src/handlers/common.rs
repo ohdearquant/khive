@@ -91,6 +91,58 @@ pub(crate) fn validate_entity_type(
     Ok(resolved.entity_type)
 }
 
+/// An unpinned filter can represent only one canonical type string. Resolve
+/// through every base kind to avoid choosing an arbitrary cross-kind alias;
+/// different canonical results require the caller to supply `entity_kind`.
+pub(crate) fn validate_entity_type_filter(
+    kind_name: Option<&str>,
+    entity_type: Option<&str>,
+    registry: &VerbRegistry,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(raw) = entity_type else {
+        return Ok(None);
+    };
+    if let Some(kind) = kind_name {
+        return validate_entity_type(kind, Some(raw), registry);
+    }
+
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let matches: Vec<_> = EntityKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            composed
+                .resolve(kind, Some(raw))
+                .ok()?
+                .entity_type
+                .map(|canonical| (kind, canonical))
+        })
+        .collect();
+    let Some((_, canonical)) = matches.first() else {
+        let mut valid: Vec<_> = composed
+            .definitions()
+            .iter()
+            .map(|definition| definition.type_name)
+            .collect();
+        valid.sort_unstable();
+        valid.dedup();
+        return Err(RuntimeError::InvalidInput(format!(
+            "unknown entity_type {raw:?}; valid: {}",
+            valid.join(" | ")
+        )));
+    };
+    if matches.iter().any(|(_, candidate)| candidate != canonical) {
+        let choices = matches
+            .iter()
+            .map(|(kind, entity_type)| format!("{}:{entity_type}", kind.name()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(RuntimeError::InvalidInput(format!(
+            "ambiguous entity_type {raw:?}; specify entity_kind to select: {choices}"
+        )));
+    }
+    Ok(Some(canonical.clone()))
+}
+
 /// Collapse case and separator-style differences (space/hyphen/underscore,
 /// including repeated and leading/trailing separators) so cosmetic
 /// formatting doesn't get flagged as an alias substitution below.
