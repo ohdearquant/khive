@@ -704,7 +704,8 @@ async fn issue_2678_tags_any_all_nocase_and_unfiltered_controls() {
 
 #[tokio::test]
 async fn issue_2678_context_compares_canonical_uuid_without_requiring_live_anchor() {
-    let fixture = pack(rt());
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
     let alpha = issue_2678_context(&fixture, "context-alpha", "local").await;
     let beta = issue_2678_context(&fixture, "context-beta", "local").await;
     let anchored = assign(
@@ -732,14 +733,25 @@ async fn issue_2678_context_compares_canonical_uuid_without_requiring_live_ancho
     assert_ne!(noncanonical, alpha);
     assert_eq!(uuid::Uuid::parse_str(&noncanonical).unwrap(), parsed);
     let legacy_stored = assign(&fixture, json!({"title": "noncanonical stored context"})).await;
-    fixture
-        .dispatch(
-            "update",
-            json!({"id": legacy_stored["full_id"],
-                   "properties": {"context_entity_id": noncanonical}}),
+    // Public updates now canonicalize context references. Seed the historical
+    // shape below that boundary so this remains a legacy read-path control.
+    let legacy_patch = khive_runtime::NotePatch::new(
+        None,
+        None,
+        None,
+        None,
+        Some(json!({"context_entity_id": noncanonical})),
+    );
+    runtime
+        .update_note(
+            &runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap(),
+            uuid::Uuid::parse_str(legacy_stored["full_id"].as_str().unwrap()).unwrap(),
+            legacy_patch,
         )
         .await
-        .expect("store the literal context property through the public update path");
+        .expect("seed a legacy noncanonical context property");
     let stored = fixture
         .dispatch("get", json!({"id": legacy_stored["full_id"]}))
         .await
