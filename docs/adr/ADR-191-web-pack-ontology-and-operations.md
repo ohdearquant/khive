@@ -205,7 +205,8 @@ Controls are stated before the arms run; an arm without its control is not evide
 - A8 `links_to`: relation count 18; `Document links_to Document` accepted; `Document links_to
   Service` and `Concept links_to Document` refused with the endpoint-contract error, in one test;
   certificate disposition present; endpoint-signature tripwire green.
-- A9 with two backends configured, web writes land in the web backend only.
+- A9 with two backends configured, web writes land in the web backend only. Amended by A1.3: attachment rows are the
+  exception and land on the main backend.
 
 ## Consequences
 
@@ -241,7 +242,7 @@ outside every root is refused, and a tree in which a regular file is swapped for
 file outside the root between the listing and the read is refused for that entry and stores no body.
 Enforcement and the symbolic-link swap arm land with the implementation, which cites this clause.
 
-### A1.2 D4: bodies are rooted by attachment, on the record that owns them
+### A1.2 D4: bodies are rooted by attachment on the main backend; `persist` false stores no bytes
 
 D4 says every receipt carries a blob reference and D3 says a `page` or `resource` carries `blob_ref`.
 Neither keeps the blob alive: blob reclamation consults the attachments table
@@ -252,20 +253,30 @@ The body of a fetched page or resource is that entity's own content in another m
 exactly what ADR-121 makes an attachment. So a persisted `page` or `resource` carries one attachment
 with role `content` naming the stored reference, and the receipt note of the request that stored it
 annotates the entity (D4) and carries no attachment: the receipt is the utterance, the body is the
-thing, and ADR-121's note boundary keeps the two apart. When the caller asks for no persisted row
-(`persist` false) there is no entity to own the body and the receipt is the only record of it; it then
-carries the `content` attachment itself, the way a payload that arrives through a message does, and a
-later promotion to an entity attaches the same reference without a copy (ADR-121 §7). A HEAD request
-stores no body and roots nothing.
+thing, and ADR-121's note boundary keeps the two apart. A fetched page is never a note's own content,
+so a receipt never carries a body. When the caller asks for no persisted row (`persist` false) no
+bytes are stored at all: the body is returned in the response, the receipt records the final URL,
+content digest, size and fetch time as properties, and a caller who wants the bytes kept asks for an
+entity. A HEAD request stores no body and roots nothing.
 
-Placement follows the record. An attachment row lives on the backend that holds the record it attaches
-to, so a web pack routed to its own backend (ADR-028 Amendment 4) writes the entity, the receipt and
-their attachment rows there and nothing on the main backend; A9 stands as written, and delete-cascade
-reclamation (ADR-121) runs on the row's own backend. The blob store is one store across backends, so a
-sweep that reads the attachments table to decide what is live must consult that table on every
-configured backend, never the main backend alone. At this revision no production path runs the sweep;
-the requirement binds it when it is wired, and is stated here so that the placement above is never
-read as a leak. Acceptance gains two arms: after a fetch with `persist` true the entity carries one
-`content` attachment and its receipt carries none; after a fetch with `persist` false the receipt
-carries the one `content` attachment. A9 gains the assertion that the attachment rows of a routed web
-pack are absent from the main backend.
+Placement follows [ADR-160](ADR-160-shared-pack-infrastructure.md) and ADR-121: the canonical main
+backend is the sole owner of attachment rows and the sole liveness authority for the shared blob
+store, whatever backend holds the record. A web pack routed to its own backend (ADR-028 Amendment 4)
+therefore writes its entity and receipt rows there and its attachment rows on the main backend
+through the core accessor, which is also how the pack keeps its bodies alive under one sweep. A9 is
+amended below to say exactly that. Because the record and its attachment row live in different
+databases, ADR-121's same-transaction delete cascade does not reach across: hard-deleting a routed
+`page` or `resource` removes its main-backend attachment rows in the same operation, and an
+attachment row whose record is gone is the leak the pack must not leave.
+
+Acceptance gains three arms: after a fetch with `persist` true the entity carries one `content`
+attachment and its receipt carries none; after a fetch with `persist` false no blob is stored, the
+receipt carries digest and size, and neither record carries an attachment; hard-deleting a routed
+entity leaves no attachment row for it on the main backend.
+
+### A1.3 A9: attachment rows are the one web write that lands on the main backend
+
+A9 reads "with two backends configured, web writes land in the web backend only". Under ADR-160
+that is true of entity, note and edge rows and false of attachment rows by design, so A9 is amended
+to: with two backends configured, a web pack's entity, note and edge rows land in the web backend
+only, and its attachment rows land on the main backend only (ADR-160); the arm asserts both halves.
