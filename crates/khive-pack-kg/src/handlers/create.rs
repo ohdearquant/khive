@@ -1,8 +1,11 @@
 //! `create` verb handler.
 
 use serde_json::{json, Value};
+use std::sync::Arc;
 
-use khive_runtime::{EntityCreateSpec, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry,
+};
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
@@ -50,7 +53,75 @@ fn optional_singleton_kind_alias(
     }
 }
 
+struct PreparedBulkEntity {
+    spec: EntityCreateSpec,
+    args: Value,
+    hook: Option<Arc<dyn KindHook>>,
+}
+
+impl PreparedBulkEntity {
+    async fn after_create(&self, runtime: &KhiveRuntime, id: uuid::Uuid) {
+        if let Some(hook) = &self.hook {
+            if let Err(error) = hook.after_create(runtime, id, &self.args).await {
+                tracing::warn!(
+                    kind = %self.spec.kind,
+                    %id,
+                    %error,
+                    "kind hook after_create failed (storage write already committed)"
+                );
+            }
+        }
+    }
+}
+
 impl KgPack {
+    async fn prepare_bulk_entity(
+        &self,
+        kind: String,
+        mut args: Value,
+        registry: &VerbRegistry,
+    ) -> Result<(PreparedBulkEntity, Option<Value>), RuntimeError> {
+        let hook = registry.find_kind_hook(&kind);
+        if let Some(hook) = &hook {
+            hook.prepare_create(&self.runtime, &mut args).await?;
+        }
+        let fields: CreateParams = deser(args.clone())?;
+        super::common::require_object_param(fields.properties.as_ref(), "properties")?;
+        if fields.kind != "entity"
+            || fields.key.is_some()
+            || fields.embed.is_some()
+            || fields.fence.is_some()
+            || fields.embedding_content.is_some()
+        {
+            return Err(RuntimeError::InvalidInput(
+                "bulk create requires entity fields after kind-hook preparation".into(),
+            ));
+        }
+        let name = fields
+            .name
+            .ok_or_else(|| RuntimeError::InvalidInput("kind=entity requires 'name'".into()))?;
+        let entity_type = validate_entity_type(&kind, fields.entity_type.as_deref(), registry)?;
+        let normalized = describe_entity_type_normalization(
+            fields.entity_type.as_deref(),
+            entity_type.as_deref(),
+        );
+        Ok((
+            PreparedBulkEntity {
+                spec: EntityCreateSpec {
+                    kind,
+                    entity_type,
+                    name,
+                    description: fields.description,
+                    properties: fields.properties,
+                    tags: fields.tags.unwrap_or_default(),
+                },
+                args,
+                hook,
+            },
+            normalized,
+        ))
+    }
+
     pub(crate) async fn handle_create(
         &self,
         token: &NamespaceToken,
@@ -150,9 +221,9 @@ impl KgPack {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                // Build EntityCreateSpec for every entry, resolving kind/entity_type at
-                // the handler layer (same helpers used by the single-entity path).
-                let mut specs: Vec<EntityCreateSpec> = Vec::with_capacity(attempted);
+                // Preserve the bulk shape/kind/type preflight. Owner preparation uses
+                // this dispatch's registry, not the optional runtime update-hook map.
+                let mut inputs = Vec::with_capacity(attempted);
                 let mut entity_type_normalized: Vec<Value> = Vec::new();
                 for (idx, entry) in entries.into_iter().enumerate() {
                     super::common::require_object_param(
@@ -186,33 +257,49 @@ impl KgPack {
                             )));
                         }
                     };
-                    let validated_type =
-                        validate_entity_type(&canonical, entry.entity_type.as_deref(), registry)
-                            .map_err(|e| {
-                                RuntimeError::InvalidInput(format!("items[{idx}]: {e}"))
-                            })?;
-                    if let Some(applied) = describe_entity_type_normalization(
-                        entry.entity_type.as_deref(),
-                        validated_type.as_deref(),
-                    ) {
-                        let mut applied = applied;
+                    validate_entity_type(&canonical, entry.entity_type.as_deref(), registry)
+                        .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
+                    let mut args = json!({
+                        "kind": "entity",
+                        "entity_kind": canonical,
+                        "name": entry.name,
+                        "namespace": token.namespace().as_str(),
+                    });
+                    if let Some(value) = entry.entity_type {
+                        args["entity_type"] = json!(value);
+                    }
+                    if let Some(value) = entry.description {
+                        args["description"] = json!(value);
+                    }
+                    if let Some(value) = entry.properties {
+                        args["properties"] = value;
+                    }
+                    if let Some(value) = entry.tags {
+                        args["tags"] = json!(value);
+                    }
+                    inputs.push((canonical, args));
+                }
+
+                let mut prepared = Vec::with_capacity(attempted);
+                for (idx, (kind, args)) in inputs.into_iter().enumerate() {
+                    let result = self.prepare_bulk_entity(kind, args, registry).await;
+                    if let Ok((_, Some(applied))) = &result {
+                        let mut applied = applied.clone();
                         if let Some(obj) = applied.as_object_mut() {
                             obj.insert("index".to_string(), serde_json::json!(idx));
                         }
                         entity_type_normalized.push(applied);
                     }
-                    specs.push(EntityCreateSpec {
-                        kind: canonical,
-                        entity_type: validated_type,
-                        name: entry.name,
-                        description: entry.description,
-                        properties: entry.properties,
-                        tags: entry.tags.unwrap_or_default(),
-                    });
+                    prepared.push(result.map(|(entity, _)| entity));
                 }
 
                 if atomic {
+                    let prepared = prepared.into_iter().collect::<Result<Vec<_>, _>>()?;
+                    let specs = prepared.iter().map(|entry| entry.spec.clone()).collect();
                     let entities = self.runtime.create_many(token, specs).await?;
+                    for (entry, entity) in prepared.iter().zip(&entities) {
+                        entry.after_create(&self.runtime, entity.id).await;
+                    }
                     let created = entities.len();
                     let mut resp = serde_json::json!({
                         "attempted": attempted,
@@ -235,8 +322,20 @@ impl KgPack {
                     let mut error_list: Vec<serde_json::Value> = Vec::new();
                     let mut failed_indices: std::collections::HashSet<usize> =
                         std::collections::HashSet::new();
-                    for (idx, spec) in specs.into_iter().enumerate() {
-                        match self.runtime.create_many(token, vec![spec]).await {
+                    for (idx, entry) in prepared.into_iter().enumerate() {
+                        let result: Result<_, RuntimeError> = async {
+                            let entry = entry?;
+                            let entities = self
+                                .runtime
+                                .create_many(token, vec![entry.spec.clone()])
+                                .await?;
+                            for entity in &entities {
+                                entry.after_create(&self.runtime, entity.id).await;
+                            }
+                            Ok(entities)
+                        }
+                        .await;
+                        match result {
                             Ok(mut v) => {
                                 if verbose {
                                     if let Some(e) = v.pop() {
