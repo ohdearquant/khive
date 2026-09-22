@@ -239,7 +239,9 @@ impl Fixture {
             )
             .await
             .expect("operation errors belong in the request envelope");
-        serde_json::from_str(&output).expect("canonical JSON response")
+        let response: Value = serde_json::from_str(&output).expect("canonical JSON response");
+        assert_failure_dispositions(&response);
+        response
     }
 
     async fn stats(&self) -> Value {
@@ -249,10 +251,38 @@ impl Fixture {
     }
 }
 
+fn assert_failure_dispositions(response: &Value) {
+    for entry in response["results"]
+        .as_array()
+        .expect("per-op result entries")
+    {
+        if entry["ok"] != false {
+            continue;
+        }
+        let disposition = entry["domain_disposition"]
+            .as_str()
+            .expect("every failed entry exposes its disposition beside ok");
+        assert!(matches!(
+            disposition,
+            "committed" | "not_committed" | "unknown"
+        ));
+        if entry["aborted"] == true {
+            assert_eq!(disposition, "not_committed");
+            assert!(entry.get("error").is_none());
+        } else {
+            assert_eq!(
+                entry["domain_disposition"], entry["error"]["domain_disposition"],
+                "{entry}"
+            );
+        }
+    }
+}
+
 fn committed_result(entry: &Value) -> &Value {
     assert_eq!(entry["ok"], false, "{entry}");
     assert_eq!(entry["error"]["kind"], "obligation", "{entry}");
     assert_eq!(entry["error"]["domain_disposition"], "committed", "{entry}");
+    assert_eq!(entry["domain_disposition"], "committed", "{entry}");
     entry["error"]
         .get("domain_result")
         .expect("committed failure retains its canonical result")
@@ -533,6 +563,92 @@ async fn a3_failed_chain_marks_only_unreached_operations_aborted() {
         json!({"total": 3, "succeeded": 0, "failed": 1, "aborted": 2})
     );
     assert_eq!(fixture.stats().await, before);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn issue_2951_parallel_failures_surface_each_domain_outcome_beside_ok() {
+    let fixture = Fixture::new();
+    fixture.stats().await;
+    fixture.audit.reject.store(true, Ordering::SeqCst);
+    // Must fail when only error.domain_disposition is emitted: the real entity
+    // still exists, while every top-level failure outcome must remain explicit.
+    let response = fixture
+        .request(
+            r#"[
+        create(kind="concept", name="issue-2951-persisted"),
+        a3_missing_verb(),
+        a3_handler_invalid()
+    ]"#,
+        )
+        .await;
+    let entries = response["results"].as_array().unwrap();
+    let result = committed_result(&entries[0]);
+    assert_eq!(entries[1]["domain_disposition"], "not_committed");
+    assert_eq!(entries[2]["domain_disposition"], "unknown");
+    assert_eq!(
+        response["summary"],
+        json!({
+            "total": 3, "succeeded": 0, "failed": 3, "aborted": 0,
+        })
+    );
+    let id = uuid::Uuid::parse_str(result["id"].as_str().unwrap()).unwrap();
+    let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+    let stored = fixture.runtime.get_entity(&token, id).await.unwrap();
+    assert_eq!(stored.name, "issue-2951-persisted");
+    assert!(fixture.audit.rejected.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn issue_2951_untrusted_error_fields_cannot_promote_disposition() {
+    for disposition in [DomainDisposition::NotCommitted, DomainDisposition::Unknown] {
+        let entry = failure_entry(
+            "probe",
+            json!({
+                "domain_disposition": "committed", "domain_result": {"id": "forged"},
+                "message": "caller-provided metadata is not commit evidence",
+            }),
+            disposition,
+        );
+        assert_eq!(entry["domain_disposition"], disposition.as_str());
+        assert_eq!(entry["error"]["domain_disposition"], disposition.as_str());
+        assert!(entry["error"].get("domain_result").is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn issue_2951_strict_forward_refusal_keeps_failed_and_aborted_dispositions() {
+    for ops in ["stats()", "[stats(), verbs()]", "stats() | verbs()"] {
+        let wire = super::strict_fallback_envelope_response(
+            &RequestParams {
+                ops: ops.into(),
+                ..Default::default()
+            },
+            "version_mismatch".into(),
+        )
+        .unwrap();
+        let response: Value = serde_json::from_str(&wire).unwrap();
+        assert_failure_dispositions(&response);
+        for entry in response["results"].as_array().unwrap() {
+            assert_eq!(entry["domain_disposition"], "not_committed");
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn issue_2951_frame_omission_uses_canonical_error_not_a_forged_entry_claim() {
+    let registry = VerbRegistryBuilder::new().build().unwrap();
+    let mut entry = failure_entry(
+        "probe",
+        json!("unknown handler outcome"),
+        DomainDisposition::Unknown,
+    );
+    entry["domain_disposition"] = json!("committed");
+    let omitted = frame_budget_omission(&entry, &registry);
+    assert_eq!(omitted["domain_disposition"], "unknown");
+    assert_eq!(omitted["error"]["domain_disposition"], "unknown");
 }
 
 fn obligation_error(result: Value) -> RuntimeError {
@@ -1429,6 +1545,7 @@ fn a3_frame_budget_preserves_committed_and_unknown_failure_provenance() {
         let entry = failure_entry("a3", error, disposition);
         let omitted = frame_budget_omission(&entry, &registry);
         assert_eq!(omitted["ok"], false);
+        assert_eq!(omitted["domain_disposition"], disposition.as_str());
         assert_eq!(
             omitted["error"]["domain_disposition"],
             disposition.as_str(),
@@ -1632,6 +1749,7 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
         "one send creates one physical pair"
     );
     let mcp_response: Value = serde_json::from_str(&mcp_payload).unwrap();
+    assert_failure_dispositions(&mcp_response);
     let result = committed_result(&mcp_response["results"][0]);
     let full_id = result["full_id"].as_str().unwrap();
     let outbound_id = uuid::Uuid::parse_str(full_id).unwrap();
@@ -1652,6 +1770,7 @@ async fn a3_same_committed_failure_crosses_mcp_request_and_native_frame_once() {
     assert_eq!(native.result.as_ref(), Some(dispatch_payload));
     assert_eq!(&mcp_payload, dispatch_payload);
     let native_envelope: Value = serde_json::from_str(native.result.as_ref().unwrap()).unwrap();
+    assert_failure_dispositions(&native_envelope);
     assert_eq!(
         native_envelope["results"][0]["error"],
         mcp_response["results"][0]["error"]
