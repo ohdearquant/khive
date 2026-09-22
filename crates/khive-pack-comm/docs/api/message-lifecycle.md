@@ -193,6 +193,33 @@ future caller-supplied idempotency/correlation contract and is out of scope.
 Agent presentation keeps this response's `id` canonical, so the returned exact
 correlation key can be submitted to `comm.delivered` again unchanged.
 
+## Delegated read selection
+
+Only `comm.inbox` and `comm.thread` accept optional `mailbox_actor`. Omission
+selects the real caller; an explicit non-local self selector preserves own-view
+compatibility. Another actor requires an exact reader/owner pair from the
+serving host's immutable mailbox policy, composed with its existing gate. Missing
+pairs return `PermissionDenied` reason `mailbox_read_not_granted` before any
+count, empty page or thread-root lookup. Direct pack calls and unconfigured
+`AllowAllGate` runtimes also deny cross-actor selection. Policy failures propagate.
+The token and all gate/audit attribution retain the real caller.
+
+Delegated inboxes use strict recipient equality, and unread counts omit the
+legacy missing/null-recipient partition, including `limit=0`. The same selection
+applies to every long-poll query. Delegated thread rows must have a valid non-local
+recipient and name the owner as sender or recipient; this filter runs before
+logical-message deduplication and read-state folding. Explicit `local` selection
+and delegated `box="sent"` refuse. Own views retain the legacy rules below.
+
+Both views leave owner read flags unchanged. Read-mark and reply handlers continue
+to check the real caller and accept no mailbox selector. Namespace selection,
+visibility and raw actor request fields do not create a grant. This is the
+trusted-local, restart-bound exception in
+[ADR-143 Amendment 1](../../../../docs/adr/ADR-143-store-held-caller-grants.md#amendment-1-2026-09-21-trusted-local-mailbox-views),
+not an authenticated or live-revocable grant. Saving a file alone changes no active
+policy; replace the server epoch and drain/stop the old process, cancelling pending
+long polls, before acknowledging revocation.
+
 ## `handlers.rs::handle_inbox`
 
 Lists inbound messages for the caller's actor label by default (ADR-057).
@@ -204,21 +231,22 @@ exact recipient filter for the sent box. Read `status` and sender filters are
 inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
 the default inbox, so a misplaced filter cannot silently return the wrong box.
 The existing envelope fields remain stable. For the default inbox,
-`unread_count` is the caller's mailbox-wide unread count — independent of the
+`unread_count` is the selected mailbox's unread count — independent of the
 page window and of `status` and sender filters — and is exact below
 `unread_count_cap` (1,000). `unread_count_saturated=false` means the number is
 exact, including when it equals the cap; `true` means the value is the lower
-bound "at least 1,000". The addressed and legacy-recipient partitions are
-counted through cap-limited subqueries in one storage snapshot, served by
+bound "at least 1,000". In an own view, the addressed and legacy-recipient
+partitions are counted through cap-limited subqueries in one storage snapshot, served by
 `idx_notes_unread_probe_recipient_direction` (recipient AND direction are both
 index key columns), so the work is bounded by the cap and the caller's own
 unread inbound population — never by the recipient's own outbound send
 history, which every `comm.send` durably extends but which the direction key
 excludes from the scan. The sent box reports zero and
 `unread_count_saturated=false` because outbound rows have no recipient read
-state.
+state. Delegated counts use one exact string-recipient partition and exclude
+legacy rows.
 
-Every caller is filtered by `to_actor = caller OR to_actor IS NULL`, expressed
+In an own-mailbox view, the caller is filtered by `to_actor = caller OR to_actor IS NULL`, expressed
 as one `FilterOp::EqOrLegacyIndexed` predicate over the recipient-scoped
 `ifnull(json_extract(properties, '$.to_actor'), '')` expression rather than
 the two-branch `OR` form — see `FilterOp::EqOrLegacyIndexed` in
@@ -481,8 +509,9 @@ matching ADR-040: a target with no `thread_id` becomes the root for its chain.
 The SQL filter only matches `properties.thread_id == canonical_thread_id`,
 which misses a root note lacking a `thread_id` property at all, so the
 already-validated root note is explicitly appended when the query didn't
-already return it — `comm.thread(id=root)` never reports an empty/incomplete
-thread for a root that predates the canonical `thread_id` field.
+already return it. The root then passes through the same view filter as every
+other row. Own views retain legacy roots; a delegated view excludes a root with
+an unattributed recipient even when its id resolves successfully.
 
 `order` (#494, `ThreadParams::order`) is a closed set: `"asc"` (default) |
 `"desc"`. `after` (#494, `ThreadParams::after`) is either a message id (short
@@ -669,6 +698,15 @@ then `created_at DESC, id ASC`. The prefix is in the statement because every
 actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
 scan that pages first and filters the recipient afterwards stops reaching a
 channel's rows once enough other rows sort ahead of them.
+
+`idx_notes_unread_probe_recipient_type_direction` is a base-store index serving
+delegated unread counts (ADR-187); migration
+`035-notes-unread-probe-recipient-type-direction.sql` installs it, with matching
+fresh-store DDL. It is not a pack schema statement. Its
+seek keys include `json_type(properties, '$.to_actor')`, the normalized recipient
+value, and direction; its partial predicate matches the unread filter. The type
+key excludes malformed object/array recipients before the cap-limited scan, even
+when their JSON text equals an allowed actor label.
 
 The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
 created by the V5 schema migration (`005-unique-comm-external-id.sql`), which

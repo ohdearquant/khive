@@ -48,6 +48,9 @@ pub enum ConfigError {
     #[error("actor.id {id:?} is not a valid namespace: {reason}")]
     InvalidActorId { id: String, reason: String },
 
+    #[error("[actor].mailbox_readers: {reason}")]
+    InvalidMailboxReaders { reason: String },
+
     #[error("[gate].granted_actors entry {id:?} is not a valid actor id: {reason}")]
     InvalidGrantedActorId { id: String, reason: String },
     #[error("[gate].deny_writes_for is invalid: {reason}")]
@@ -235,6 +238,16 @@ pub struct ActorConfig {
     /// surfaced in introspection and log output only.
     #[serde(default)]
     pub display_name: Option<String>,
+
+    /// Exact actor labels permitted to inspect this explicit actor's mailbox.
+    ///
+    /// A nonempty list requires an explicit non-local `id`. Labels are bounded
+    /// to 255 bytes, nonblank, and contain no control characters; `local` is
+    /// forbidden. At most 256 entries are accepted before deduplication. This
+    /// is trusted serving-host policy, never inferred from environment identity
+    /// or supplied by a request. Changes take effect in a new server epoch.
+    #[serde(default)]
+    pub mailbox_readers: Vec<String>,
 
     /// Additional namespaces that widen the DEFAULT multi-record read scope
     /// to `['local'] ∪ visible_namespaces` (ADR-007 Rev 4 Rule 3b). Each string
@@ -1229,6 +1242,12 @@ impl KhiveConfig {
             })?;
         }
 
+        self.actor
+            .mailbox_gate(std::sync::Arc::new(khive_gate::AllowAllGate))
+            .map_err(|error| ConfigError::InvalidMailboxReaders {
+                reason: error.to_string(),
+            })?;
+
         if let Some(ref vis) = self.actor.visible_namespaces {
             for ns_str in vis {
                 if ns_str.is_empty() {
@@ -1970,6 +1989,63 @@ display_name = "example actor"
         assert_eq!(cfg.actor.id.as_deref(), Some("lambda:khive"));
         assert_eq!(cfg.actor.display_name.as_deref(), Some("example actor"));
         assert!(cfg.engines.is_empty());
+    }
+
+    #[test]
+    fn gate_mailbox_reader_config_loads_exact_labels_and_rejects_bad_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[actor]\nid = \"lambda:owner\"\nmailbox_readers = [\"lambda:helper\", \"助手/审阅者\", \"lambda:helper\"]\n",
+        );
+        let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        assert_eq!(
+            config.actor.mailbox_readers,
+            ["lambda:helper", "助手/审阅者", "lambda:helper"]
+        );
+
+        for (owner, readers) in [
+            (None, vec!["reader".to_string()]),
+            (Some("local"), vec!["reader".to_string()]),
+            (Some("lambda:owner"), vec!["local".to_string()]),
+            (Some("lambda:owner"), vec![String::new()]),
+            (Some("lambda:owner"), vec![" \t".to_string()]),
+            (Some("lambda:owner"), vec!["bad\nactor".to_string()]),
+            (Some("lambda:owner"), vec!["x".repeat(256)]),
+            (Some("lambda:owner"), vec!["reader".to_string(); 257]),
+        ] {
+            let config = KhiveConfig {
+                actor: ActorConfig {
+                    id: owner.map(str::to_string),
+                    mailbox_readers: readers,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidMailboxReaders { .. })
+            ));
+        }
+        for source in [
+            "[actor]\nmailbox_readers = [\"reader\"]\n",
+            "[actor]\nid = \"local\"\nmailbox_readers = [\"reader\"]\n",
+            "[actor]\nid = \"lambda:owner\"\nmailbox_readers = [\"\"]\n",
+            "[actor]\nid = \"lambda:owner\"\nmailbox_readers = \"reader\"\n",
+        ] {
+            let path = write_toml(&dir, source);
+            assert!(KhiveConfig::load(Some(&path)).is_err());
+        }
+        let boundary = KhiveConfig {
+            actor: ActorConfig {
+                id: Some("lambda:owner".into()),
+                mailbox_readers: vec!["x".repeat(255); 256],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        boundary.validate().unwrap();
+        KhiveConfig::default().validate().unwrap();
     }
 
     #[test]
