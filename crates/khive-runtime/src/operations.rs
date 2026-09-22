@@ -9899,7 +9899,7 @@ mod tests {
                 &tok,
                 "observation",
                 None,
-                &format!("ref khive-ai#93 decoy {i}"),
+                &format!("ref needle-93 decoy {i}"),
                 Some(0.5),
                 None,
                 vec![],
@@ -9916,8 +9916,8 @@ mod tests {
                     "task",
                     Some(&format!("task {i} tracking the review")),
                     &format!(
-                        "Long description number {i}: the fix lane for khive-ai#93 waits on the \
-                         gate, the verdict artifact, the merge, and the follow-up sweep of every \
+                        "Long description number {i}: the work item needle-93 waits on the \
+                         build, the test report, the release, and the follow-up sweep of every \
                          row that cited it; none of that shortens the row."
                     ),
                     Some(0.5),
@@ -9930,7 +9930,7 @@ mod tests {
         }
 
         let hits = rt
-            .search_notes(&tok, "khive-ai#93", None, 8, Some("task"), false, &[], None)
+            .search_notes(&tok, "needle-93", None, 8, Some("task"), false, &[], None)
             .await
             .unwrap();
 
