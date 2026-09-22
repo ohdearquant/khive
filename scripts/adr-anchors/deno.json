@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "markdown-it": "npm:markdown-it@15.0.2",
+    "github-slugger": "npm:github-slugger@2.0.0",
+    "htmlparser2": "npm:htmlparser2@10.0.0"
+  },
+  "lock": "deno.lock"
+}
