@@ -1,6 +1,6 @@
 # ADR-191: Web Pack — Web Ontology, Relation Rules, and Operations
 
-- **Status**: Accepted (design)
+- **Status**: Accepted (2026-09-22, implemented by the web pack)
 - **Governing rule**: pack is ontology, relation rules, and operations on those
 - **Date**: 2026-09-20
 - **Supersedes**: [ADR-175](ADR-175-web-pack.md) and its Amendments 1 and 2 in full
