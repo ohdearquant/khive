@@ -244,7 +244,7 @@ nothing here. Acceptance A5 keeps its arm and gains two controls: the identical 
 outside every root is refused, and a tree in which a regular file is swapped for a symbolic link to a
 file outside the root between the listing and the read is refused for that entry and stores no body.
 This clause is the contract, not a description of the tree at the time it merges: the web pack change
-that implements D3 admits disk sources under `read_roots` and reads through the descriptor as stated
+that implements D3 (pull request #3000) admits disk sources under `read_roots` and reads through the descriptor as stated
 here, and cites A1.1 as its acceptance. Until that change lands, D3 disk ingest is unenforced and is
 not to be relied on.
 
@@ -283,7 +283,8 @@ attachment rows whose record is gone; those rows root nothing that matters (the 
 keep alive no longer exists) but they keep the blob alive until something removes them. Today the
 attachment orphan sweep exists as a routine with no production caller, so this leak is unbounded
 in time until that sweep is scheduled; scheduling it, with a stated cadence and a count of rows
-reclaimed as its artifact, is an obligation this amendment records and does not discharge. The
+reclaimed as its artifact, is an obligation this amendment records and does not discharge (tracked
+as issue #3038). The
 reverse order is forbidden: a crash after the attachment
 rows are gone leaves a live record whose body becomes collectable under ADR-121's grace period,
 which is data loss, and this amendment exists to make stored bodies stay alive.
