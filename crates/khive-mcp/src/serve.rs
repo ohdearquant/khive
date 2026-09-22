@@ -1484,6 +1484,59 @@ async fn record_outbound_send_failure(
     }
 }
 
+#[cfg(feature = "channel-email")]
+fn outbound_claim_failure_is_permanent(error: &khive_runtime::RuntimeError) -> bool {
+    fn invalid_storage_input(error: &khive_storage::StorageError) -> bool {
+        match error {
+            khive_storage::StorageError::InvalidInput { .. } => true,
+            khive_storage::StorageError::WriterTaskRequestFailed { source, .. } => {
+                invalid_storage_input(source)
+            }
+            _ => false,
+        }
+    }
+    match error {
+        khive_runtime::RuntimeError::InvalidInput(_) => true,
+        khive_runtime::RuntimeError::Khive(error) => {
+            error.kind() == khive_types::ErrorKind::InvalidInput
+        }
+        khive_runtime::RuntimeError::Storage(error) => invalid_storage_input(error),
+        // Pressure, conflicts, and unclassified backend failures can recover;
+        // they get the existing bounded backoff, never a per-note terminal mark.
+        _ => false,
+    }
+}
+
+#[cfg(feature = "channel-email")]
+async fn record_outbound_claim_failure(
+    runtime: &khive_runtime::KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    note_id: uuid::Uuid,
+    error: &khive_runtime::RuntimeError,
+) -> khive_runtime::RuntimeResult<khive_storage::note::Note> {
+    if outbound_claim_failure_is_permanent(error) {
+        runtime
+            .mark_outbound_message_claim_failed(
+                token,
+                note_id,
+                chrono::Utc::now().to_rfc3339(),
+                error.to_string(),
+            )
+            .await
+    } else {
+        runtime
+            .mark_outbound_message_claim_transient_failure(
+                token,
+                note_id,
+                chrono::Utc::now(),
+                error.to_string(),
+                OUTBOUND_RETRY_BASE,
+                OUTBOUND_RETRY_CEILING,
+            )
+            .await
+    }
+}
+
 /// Background task that delivers undelivered outbound email notes every 5 seconds.
 ///
 /// Implements AT-LEAST-ONCE delivery: the `external_id` (= RFC 822 Message-ID) is
@@ -1687,11 +1740,29 @@ async fn channel_outbox_once(
                     ))),
                 };
                 if let Err(error) = claim_result {
-                    tracing::warn!(
-                        note_id = %note_id,
-                        error = %error,
-                        "outbox loop: failed to claim external_id; skipping"
-                    );
+                    let mark_result = match uuid::Uuid::parse_str(&note_id) {
+                        Ok(uuid) => {
+                            record_outbound_claim_failure(runtime, &token, uuid, &error).await
+                        }
+                        Err(parse_error) => Err(khive_runtime::RuntimeError::InvalidInput(
+                            format!("note id {note_id} is not a valid UUID: {parse_error}"),
+                        )),
+                    };
+                    match mark_result {
+                        Ok(note) => tracing::warn!(
+                            note_id = %note_id,
+                            error = %error,
+                            permanent = outbound_claim_failure_is_permanent(&error),
+                            delivery = ?note.properties.as_ref().and_then(|p| p.get("delivery")).and_then(|v| v.as_str()),
+                            "outbox loop: claim failure handled; existing claim or terminal state preserved"
+                        ),
+                        Err(mark_error) => tracing::warn!(
+                            note_id = %note_id,
+                            error = %error,
+                            mark_error = %mark_error,
+                            "outbox loop: claim failed and failure state could not be recorded"
+                        ),
+                    }
                     continue;
                 }
                 message_id
@@ -14131,3 +14202,7 @@ mod poll_cancellation_tests;
 #[cfg(all(test, any(feature = "channel-email", feature = "test-channel-timing")))]
 #[path = "serve_poll_timing_tests.rs"]
 mod poll_timing_tests;
+
+#[cfg(all(test, feature = "channel-email"))]
+#[path = "serve_outbox_claim_tests.rs"]
+mod outbox_claim_tests;
