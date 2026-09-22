@@ -8,10 +8,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 
 
@@ -822,6 +826,9 @@ class RecipeRun:
         staging_file_left_behind: bool,
         codesign_invocations: int,
         signed_probe_invocations: int,
+        replacement_started: bool = False,
+        marker_after: bytes | None = None,
+        old_daemon_returncode: int | None = None,
     ) -> None:
         self.rc = rc
         self.output = output
@@ -831,6 +838,9 @@ class RecipeRun:
         self.staging_file_left_behind = staging_file_left_behind
         self.codesign_invocations = codesign_invocations
         self.signed_probe_invocations = signed_probe_invocations
+        self.replacement_started = replacement_started
+        self.marker_after = marker_after
+        self.old_daemon_returncode = old_daemon_returncode
 
 
 PRE_EXISTING_INSTALL = b"#!/bin/sh\necho PRE-EXISTING\n"
@@ -906,6 +916,9 @@ class MakefileGateContractTests(unittest.TestCase):
         codesign_exit: int = 0,
         makefile_text: str | None = None,
         fixture_shape: str = "bare",
+        supervisor_marker: bytes | None = None,
+        live_daemon: bool = False,
+        observe_start: bool = False,
     ) -> RecipeRun:
         recipe_makefile = makefile_text or self.makefile
         commands = self._extract_local_recipe(recipe_makefile)
@@ -1013,6 +1026,48 @@ class MakefileGateContractTests(unittest.TestCase):
             env["SIGNED_PROBE_RECORD"] = str(signed_probe_record)
             env.pop("MAKEFLAGS", None)
             env.pop("MAKELEVEL", None)
+            # The recipe resolves its PID file, socket and supervisor marker
+            # from these when they are set. One inherited from the caller's
+            # shell would aim the run at a real daemon instead of the sandbox.
+            for inherited in (
+                "KHIVE_PID",
+                "KHIVE_SOCKET",
+                "KHIVE_SUPERVISOR_MARKER",
+                "KHIVE_LOCAL_NO_START",
+                "KHIVE_LOCAL_START_CWD",
+            ):
+                env.pop(inherited, None)
+            if observe_start:
+                # The default start directory does not exist in the sandbox, so
+                # the start would fail at its `cd` and read as no start at all.
+                env["KHIVE_LOCAL_START_CWD"] = str(root)
+
+            khive_dir = home / ".khive"
+            khive_dir.mkdir()
+            marker = khive_dir / "khived.supervisor"
+            if supervisor_marker is not None:
+                marker.write_bytes(supervisor_marker)
+            daemon: subprocess.Popen[bytes] | None = None
+            reaper: threading.Thread | None = None
+            if live_daemon:
+                # The recipe stops only a process whose executable name is the
+                # installed binary's, so the stand-in runs as `kkernel`. It is a
+                # symlink to `sleep` because macOS refuses to run a copied
+                # system binary.
+                sleep_bin = shutil.which("sleep")
+                self.assertIsNotNone(sleep_bin, "no sleep binary on PATH")
+                stand_in = root / "outgoing" / "kkernel"
+                stand_in.parent.mkdir()
+                stand_in.symlink_to(sleep_bin)
+                daemon = subprocess.Popen([str(stand_in), "300"])
+                self.addCleanup(daemon.kill)
+                # Reap it the moment it exits: the recipe polls `ps -p`, which
+                # still lists an unreaped child, and would escalate to SIGKILL.
+                reaper = threading.Thread(target=daemon.wait, daemon=True)
+                reaper.start()
+                (khive_dir / "khived.pid").write_text(
+                    f"{daemon.pid}\n", encoding="utf-8"
+                )
 
             rc = 0
             chunks: list[str] = []
@@ -1047,6 +1102,25 @@ class MakefileGateContractTests(unittest.TestCase):
                     if rc != 0:
                         break
 
+            replacement_started = False
+            if observe_start:
+                # The start is backgrounded, so give the installed stand-in time
+                # to write the line it prints into that start's daemon log.
+                logs = khive_dir / "logs"
+                deadline = time.monotonic() + 3
+                while not replacement_started and time.monotonic() < deadline:
+                    replacement_started = any(
+                        b"FRESH-BUILD" in log.read_bytes()
+                        for log in logs.glob("kkernel-daemon-make-local-*.log")
+                    )
+                    if not replacement_started:
+                        time.sleep(0.05)
+            old_daemon_returncode: int | None = None
+            if daemon is not None and reaper is not None:
+                reaper.join(timeout=2)
+                old_daemon_returncode = daemon.returncode
+            marker_after = marker.read_bytes() if marker.exists() else None
+
             staged = dest_dir / "kkernel.new"
             installed_bytes = dest.read_bytes() if dest.exists() else None
             # What SHOULD have landed: the source with the signature appended.
@@ -1073,6 +1147,9 @@ class MakefileGateContractTests(unittest.TestCase):
                 staging_file_left_behind=staged.exists(),
                 codesign_invocations=codesign_invocations,
                 signed_probe_invocations=signed_probe_invocations,
+                replacement_started=replacement_started,
+                marker_after=marker_after,
+                old_daemon_returncode=old_daemon_returncode,
             )
 
     @staticmethod
@@ -1728,6 +1805,72 @@ class MakefileGateContractTests(unittest.TestCase):
                     "the harness did not reproduce the original defect, so a green "
                     "result from it is not evidence\n" + reverted.output,
                 )
+
+    FOREIGN_MARKER = b"launchd\n4242\n"
+
+    def test_a_supervisor_marker_means_the_recipe_starts_no_daemon(self) -> None:
+        """A marker this recipe did not write says a supervisor starts the
+        daemon for this socket. A daemon started here as well is one the
+        supervisor does not own, so the recipe installs, stops the outgoing
+        daemon for the supervisor to restart on the new binary, and starts
+        nothing itself."""
+        control = self._run_local_recipe(observe_start=True)
+        self.assertEqual(control.rc, 0, control.output)
+        self.assertTrue(
+            control.replacement_started,
+            "positive control failed: with no marker the recipe must start a "
+            "replacement, or a missing start below proves nothing\n" + control.output,
+        )
+        self.assertIsNone(control.marker_after, control.output)
+
+        for live_daemon in (False, True):
+            with self.subTest(live_daemon=live_daemon):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    supervisor_marker=self.FOREIGN_MARKER,
+                    live_daemon=live_daemon,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertTrue(run.installed, run.output)
+                self.assertFalse(
+                    run.replacement_started,
+                    "a supervisor marker was present and the recipe started a "
+                    "daemon of its own anyway\n" + run.output,
+                )
+                self.assertEqual(
+                    run.marker_after,
+                    self.FOREIGN_MARKER,
+                    "the recipe must leave a supervisor's marker exactly as it "
+                    "found it\n" + run.output,
+                )
+                if live_daemon:
+                    self.assertEqual(
+                        run.old_daemon_returncode,
+                        -signal.SIGTERM,
+                        "the outgoing daemon must be stopped with SIGTERM so the "
+                        "supervisor restarts it on the new binary\n" + run.output,
+                    )
+
+    def test_the_supervisor_marker_harness_can_detect_a_reverted_fix(self) -> None:
+        """Mutation control: without the marker check the recipe starts its own
+        daemon beside the supervisor's, and the harness must see that start."""
+        pre_fix = self.makefile.replace(
+            'if [ -z "$$KHIVE_LOCAL_NO_START" ] && [ -z "$$MARKER_FOREIGN" ]; then',
+            'if [ -z "$$KHIVE_LOCAL_NO_START" ]; then',
+        )
+        self.assertNotEqual(
+            pre_fix, self.makefile, "the fix text was not found; update this control"
+        )
+        reverted = self._run_local_recipe(
+            observe_start=True,
+            supervisor_marker=self.FOREIGN_MARKER,
+            makefile_text=pre_fix,
+        )
+        self.assertTrue(
+            reverted.replacement_started,
+            "the harness did not reproduce the original defect, so a green "
+            "result from it is not evidence\n" + reverted.output,
+        )
 
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)

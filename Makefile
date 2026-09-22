@@ -250,11 +250,13 @@ local: verify-local-artifact
 	mv "$$DEST.new" "$$DEST"; \
 	MARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \
 	MARKER_OWNED=""; \
+	MARKER_FOREIGN=""; \
 	if [ -n "$$OLD_PID" ] && [ ! -e "$$MARKER" ]; then \
 	  printf 'make-local\n%s\n' "$$OLD_PID" > "$$MARKER" && MARKER_OWNED=1; \
 	  trap '[ -n "$$MARKER_OWNED" ] && rm -f "$$MARKER"' EXIT INT TERM; \
 	  echo "==> Claimed the daemon rendezvous with $$MARKER so client requests wait for the replacement instead of spawning a competing daemon"; \
 	elif [ -e "$$MARKER" ]; then \
+	  MARKER_FOREIGN=1; \
 	  echo "==> $$MARKER already exists; a supervisor owns this rendezvous. Leaving it untouched."; \
 	fi; \
 	if [ -n "$$OLD_PID" ]; then \
@@ -273,7 +275,7 @@ local: verify-local-artifact
 	else \
 	  echo "==> $$KHIVE_PID_FILE names no live process; nothing to stop."; \
 	fi; \
-	if [ -z "$$KHIVE_LOCAL_NO_START" ]; then \
+	if [ -z "$$KHIVE_LOCAL_NO_START" ] && [ -z "$$MARKER_FOREIGN" ]; then \
 	  START_CWD=$${KHIVE_LOCAL_START_CWD:-$$HOME/projects}; \
 	  DLOG="$$HOME/.khive/logs/kkernel-daemon-make-local-$$(date +%Y%m%d-%H%M%S).log"; \
 	  mkdir -p "$$HOME/.khive/logs"; \
@@ -299,6 +301,8 @@ local: verify-local-artifact
 	      exit 1; \
 	    fi; \
 	  fi; \
+	elif [ -n "$$MARKER_FOREIGN" ]; then \
+	  echo "==> Not starting a replacement daemon: the supervisor named by $$MARKER starts the daemon for this socket, and a second one started here would be a daemon it does not own."; \
 	else \
 	  if [ -n "$$MARKER_OWNED" ]; then rm -f "$$MARKER"; MARKER_OWNED=""; fi; \
 	  echo "==> KHIVE_LOCAL_NO_START set: not starting a replacement daemon; released $$MARKER so clients may spawn."; \
