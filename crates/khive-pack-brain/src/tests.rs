@@ -11437,9 +11437,9 @@ mod anonymous_feedback_admission_tests {
 
     #[tokio::test]
     async fn attributed_explicit_feedback_without_profile_keeps_default_routing() {
-        // The explicitly configured actor named "local" is attributed; only
-        // ActorRef's anonymous kind triggers refusal, not its displayed ID.
-        for actor in ["brain-test", "local"] {
+        // A configured actor id other than the unattributed pool name is
+        // attributed; the pool name "local" is refused (see the test above).
+        for actor in ["brain-test", "agent-x"] {
             let (pack, rt) = make_pack_with_actor(actor);
             let token = rt.authorize(Namespace::local()).expect("attributed token");
             assert!(!token.actor().is_anonymous());
