@@ -1733,6 +1733,21 @@ impl BrainPack {
             Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
         );
 
+        // Caller identity and serve attribution are separate: omitting the
+        // profile may resolve a shared default, but cannot authorize an
+        // anonymous caller to train it with an explicit judgment (#2282).
+        // Keep implicit anonymous controls on their existing admission path.
+        // A configured actor id of "local" is the unattributed pool, not a
+        // caller, so it is refused by the same rule as the anonymous actor.
+        let unattributed =
+            token.actor().is_anonymous() || khive_runtime::actor_is_unattributed(token.actor());
+        if unattributed && !is_gated_implicit {
+            return Err(khive_types::KhiveError::invalid_input(
+                "explicit or correction feedback requires an attributed caller; configure actor.id",
+            )
+            .into());
+        }
+
         // Resolve the target by UUID with no namespace filter (ADR-007 Rule 2 /
         // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
         // not a post-fetch namespace check). Rule 3b recall fans out actor-stamped

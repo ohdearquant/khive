@@ -1071,6 +1071,8 @@ def brain_smoke():
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
             "--pack", "kg", "--pack", "brain",
+            # Explicit feedback requires an attributed caller.
+            "--actor", "smoke-brain-actor",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

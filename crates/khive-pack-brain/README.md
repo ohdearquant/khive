@@ -67,6 +67,14 @@ profiles or interpret role aliases. An unknown ID with no matching binding is
 profile. Events record the resolved profile ID and `profile_resolution=binding`
 when this fallback applies. A known archived profile is still refused.
 
+Explicit and correction feedback requires an attributed caller. An anonymous
+caller receives a typed `invalid_input` error before feedback writes, even when
+the profile would resolve through the default. Configure `actor.id` to submit
+these judgments. Implicit anonymous signals keep their existing admission rules;
+omitting the signal from `brain.auto_feedback` still abstains. This admission
+change applies to new writes: historical anonymous events and their existing
+posterior effects are retained, with no automatic deletion or retraining.
+
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:
 
