@@ -23,6 +23,9 @@ use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 fn build_registry() -> VerbRegistry {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
+    // Explicit and correction feedback is refused from an unattributed caller,
+    // so the benchmarks dispatch as a configured actor.
+    builder.with_actor_id(Some("brain-bench".to_string()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
