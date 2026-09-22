@@ -518,3 +518,19 @@ acceptance support modules, but observers need no additional serialization.
 - `ensure_clone_refuses_a_symlink_at_the_cache_key_path`: same guard,
   symlink variant — `is_owned_entry` requires the cache-key path itself to
   be a real directory, not a symlink to one.
+
+### Subprocess diagnostics (#1854)
+
+Clone, fetch and refetch pass `--no-progress` and retain the existing bounded,
+concurrently drained per-operation stderr capture. Status-only cache commands
+(`remote set-head`, `update-ref`) discard stderr rather than inheriting the
+serving process's structured log stream. Output-consuming callers continue to
+capture stdout. The history-ingest ancestry predicate also discards both streams
+because its only result is the exit status.
+
+The Unix regression runs a real local fixture clone, fetch/refetch and ref update
+through the production cache functions in a subprocess. A Git wrapper emits
+carriage-return progress even with `--no-progress`; the parent requires the
+subprocess log to contain only its two structured markers. It also requires the
+successful HEAD and the deliberately failed update result, so quiet logs cannot
+be achieved by skipping operations or hiding failures.

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -2440,6 +2440,9 @@ fn is_ancestor_of_head(repo: &Path, sha: &str) -> bool {
         .arg("-C")
         .arg(repo)
         .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        // This predicate consumes only status; diagnostics have no reader.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
