@@ -405,6 +405,9 @@ pub struct RuntimeConfig {
     /// hosts (khive-mcp serve, kkernel exec); tests and in-memory runtimes
     /// leave it `None`.
     pub events_split: Option<crate::events_split::EventsSplitConfig>,
+    /// Resolved `[web]` policy (ADR-175 Amendment 1), threaded through like
+    /// `exec`/`git_write` so `khive-pack-web` reads an already-resolved config.
+    pub web: crate::engine_config::WebSectionConfig,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -495,6 +498,7 @@ impl Default for RuntimeConfig {
             mounts: Vec::new(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
+            web: crate::engine_config::WebSectionConfig::default(),
         }
     }
 }
@@ -846,6 +850,7 @@ pub fn runtime_config_from_khive_config(
     let git_write = khive_cfg.git_write.clone();
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
+    let web = khive_cfg.web.clone();
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -877,6 +882,7 @@ pub fn runtime_config_from_khive_config(
             mounts,
             blob_hydration_bytes,
             display_timezone,
+            web,
             ..base
         };
     }
@@ -919,6 +925,7 @@ pub fn runtime_config_from_khive_config(
         mounts,
         blob_hydration_bytes,
         display_timezone,
+        web,
         ..base
     }
 }

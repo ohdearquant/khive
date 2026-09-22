@@ -6661,6 +6661,7 @@ mod tests {
 
         let texts = Arc::new(Mutex::new(Vec::new()));
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -6840,6 +6841,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(RoleAwareRecordingCalls::default()));
         let fail_query = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),

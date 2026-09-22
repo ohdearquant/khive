@@ -2183,6 +2183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2220,6 +2221,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar_path = dir.path().join("main.db.events.db");
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2282,6 +2284,7 @@ mod tests {
     fn backend_data_dir_returns_none_for_from_backend_with_memory() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2311,6 +2314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2344,6 +2348,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_runtime.db");
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2408,6 +2413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("explicit_read_only_runtime.db");
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2559,6 +2565,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read_only_blob_seam.db");
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -2797,6 +2804,7 @@ mod tests {
             );
 
             let make_config = |db_path: std::path::PathBuf| RuntimeConfig {
+                web: Default::default(),
                 telemetry: Default::default(),
                 mounts: Vec::new(),
                 brain: Default::default(),
@@ -2849,6 +2857,7 @@ mod tests {
     fn from_backend_uses_provided_backend() {
         let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
         let config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3107,6 +3116,7 @@ mod tests {
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3139,6 +3149,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3179,6 +3190,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3211,6 +3223,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_actor_id_with_engines() {
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3261,6 +3274,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_display_timezone_overrides_base() {
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3298,6 +3312,7 @@ mod tests {
     #[test]
     fn runtime_config_from_khive_config_absent_display_timezone_keeps_base() {
         let base = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3449,6 +3464,7 @@ mod tests {
 
     fn secondary_config() -> RuntimeConfig {
         RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3533,6 +3549,7 @@ mod tests {
         let secondary_arc = migrated_memory_backend();
 
         let main_config = RuntimeConfig {
+            web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
             brain: Default::default(),
@@ -3677,6 +3694,7 @@ mod tests {
         let rt_from = KhiveRuntime::from_backend(
             backend,
             RuntimeConfig {
+                web: Default::default(),
                 telemetry: Default::default(),
                 mounts: Vec::new(),
                 brain: Default::default(),

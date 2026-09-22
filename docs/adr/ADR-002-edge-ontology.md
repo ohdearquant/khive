@@ -30,6 +30,11 @@ contract" below.
 **Amended 2026-09-14**: base endpoint contract gains `Project introduced_by Document`
 for the specification, design record or paper that first described a project.
 See "Project origin documents" below.
+**Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: adds one new
+base relation, `links_to` (Structure category, state-like coherence class), and one base
+endpoint pair, `Document links_to Document`, expanding the closed set from 17 → 18. The web's
+hyperlink is a first-class relation because no existing relation expresses it without a false
+claim — see ADR-191 D2 for the rationale and the ADR-076 certificate disposition.
 
 ## Context
 
@@ -51,18 +56,21 @@ classification ambiguity.
 
 ## Decision
 
-**17 canonical relations, grouped into 9 categories. No others.**
+**18 canonical relations, grouped into 9 categories. No others.**
 
 > **Amended 2026-06-14 ([ADR-055](ADR-055-epistemic-edge-relations.md))**: added Category 9
 > (Epistemic / Evidential) with `supports` and `refutes`, expanding the closed set from 15 → 17.
+> **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added `links_to`
+> to Category 1 (Structure), expanding the closed set from 17 → 18.
 
-### Category 1: Structure (composition and classification)
+### Category 1: Structure (composition, classification, and reference)
 
-| Relation      | Direction          | When                                             |
-| ------------- | ------------------ | ------------------------------------------------ |
-| `contains`    | parent → child     | Crate contains module, system contains component |
-| `part_of`     | child → parent     | Member/constitution; distinct from `contains`    |
-| `instance_of` | specific → general | One is a case of the other (GPT-4 → Transformer) |
+| Relation      | Direction          | When                                                        |
+| ------------- | ------------------ | ----------------------------------------------------------- |
+| `contains`    | parent → child     | Crate contains module, system contains component            |
+| `part_of`     | child → parent     | Member/constitution; distinct from `contains`               |
+| `instance_of` | specific → general | One is a case of the other (GPT-4 → Transformer)            |
+| `links_to`    | source → target    | Hyperlink: a document references another document (ADR-191) |
 
 ### Category 2: Derivation (intellectual lineage)
 
@@ -229,10 +237,10 @@ non-symmetric — is legal at the storage layer for every relation. Three reason
 semantically coherent. For curation and validation-pipeline use (advisory — never
 write-time enforcement):
 
-| Class                                   | Relations                                                                                                                              | Reciprocal pair means                                                                                                                                           |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                          |
-| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`                                                                                         | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other). Not findings. |
+| Class                                   | Relations                                                                                                                              | Reciprocal pair means                                                                                                                                                                                          |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                         |
+| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`                                                                             | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other). Not findings (ADR-191). |
 
 `annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
 sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
@@ -392,6 +400,14 @@ allowlist but cannot remove base rules.
 | `Project`  | `part_of`     | `Org`      |
 | any entity | `instance_of` | `Concept`  |
 | `Service`  | `instance_of` | `Project`  |
+| `Document` | `links_to`    | `Document` |
+
+> **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added
+> `Document links_to Document` for the web's hyperlink. Deliberately one row: a link's target is
+> a URL, which resolves to a document (a page or another fetched resource), never to the service
+> that hosts it — `Document links_to Service` and `Service links_to Document` are both out (see
+> ADR-191 D2/F10 for the reasoning). No qualifier inference: unlike `depends_on`, `links_to`
+> carries no governed metadata and the runtime does not infer one for it.
 
 #### Derivation relations
 
@@ -679,6 +695,17 @@ The second expansion (→ 17, [ADR-055](ADR-055-epistemic-edge-relations.md)) ad
   does not connect two entities. The relation choice carries polarity; the weight carries
   strength. This is the signal a confidence model consumes.
 
+The third expansion (→ 18, [ADR-191](ADR-191-web-pack-ontology-and-operations.md)) adds
+`links_to` to the **Structure** category:
+
+- **Reference queries** ("what does this document link to", "what links to this document") need
+  `links_to`. No existing relation expresses a hyperlink without a false claim: `depends_on` is
+  the nearest fit by endpoints, but the runtime's `dependency_kind` inference stamps every
+  `Document depends_on Document` pair lacking an explicit qualifier with `normative` — a
+  hard-requirement claim (ADR-002 governed metadata, above) that the caller cannot opt out of and
+  that is simply wrong for an ordinary hyperlink. See [ADR-191](ADR-191-web-pack-ontology-and-operations.md)
+  D2 for the full analysis, including why a second `mentions` label was considered and rejected.
+
 ### How is the closed set calculable and auditable?
 
 [ADR-076](ADR-076-relation-calculability-and-system-role.md) records why there is no
@@ -825,7 +852,7 @@ pub enum EdgeCategory {
 
 pub enum EdgeRelation {
     // Structure
-    Contains, PartOf, InstanceOf,
+    Contains, PartOf, InstanceOf, LinksTo,
     // Derivation
     Extends, VariantOf, IntroducedBy, Supersedes,
     // Provenance

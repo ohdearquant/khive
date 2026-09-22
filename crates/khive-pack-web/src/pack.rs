@@ -7,7 +7,9 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
 use crate::vocab::{WEB_EDGE_RULES, WEB_HANDLERS};
 
-/// Opt-in site vocabulary and local manifest ingest into a dedicated map database.
+/// Web pack (ADR-191): `site`/`page`/`resource` ontology plus five verbs —
+/// `fetch`/`extract`/`ingest`/`search`/`refresh` — over HTTP(S) egress
+/// policy, the blob store, and the runtime's create/update/link seam.
 pub struct WebPack {
     pub(crate) runtime: KhiveRuntime,
 }
@@ -85,10 +87,14 @@ impl PackRuntime for WebPack {
         verb: &str,
         params: Value,
         _registry: &VerbRegistry,
-        _token: &NamespaceToken,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "web.ingest" => self.handle_ingest(params).await,
+            "web.fetch" => self.handle_fetch(token, params).await,
+            "web.extract" => self.handle_extract(token, params).await,
+            "web.ingest" => self.handle_ingest(token, params).await,
+            "web.search" => self.handle_search(token, params).await,
+            "web.refresh" => self.handle_refresh(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "web pack does not handle verb {verb:?}"
             ))),

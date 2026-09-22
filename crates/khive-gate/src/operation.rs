@@ -186,7 +186,11 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("traverse", OperationAccess::Read),
     ("update", OperationAccess::Write),
     ("verbs", OperationAccess::Read),
+    ("web.extract", OperationAccess::Write),
+    ("web.fetch", OperationAccess::Write),
     ("web.ingest", OperationAccess::Write),
+    ("web.refresh", OperationAccess::Write),
+    ("web.search", OperationAccess::Write),
     ("whoami", OperationAccess::Read),
     ("withdraw", OperationAccess::Write),
 ];
