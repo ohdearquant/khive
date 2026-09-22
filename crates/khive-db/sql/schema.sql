@@ -242,6 +242,17 @@ CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_direction
            OR json_type(properties, '$.read') != 'true')
       AND deleted_at IS NULL;
 
+-- Fresh-store counterpart of V35: typed exact delegated unread recipients.
+CREATE INDEX IF NOT EXISTS idx_notes_unread_probe_recipient_type_direction
+    ON notes(namespace, kind,
+             json_type(properties, '$.to_actor'),
+             ifnull(json_extract(properties, '$.to_actor'), ''),
+             json_extract(properties, '$.direction'),
+             created_at DESC, id ASC)
+    WHERE (json_type(properties, '$.read') IS NULL
+           OR json_type(properties, '$.read') != 'true')
+      AND deleted_at IS NULL;
+
 -- Kept in sync with notes-ddl.sql: hot property-path indexes for GTD task
 -- listing (status/assignee) (sql/027-notes-hot-property-indexes.sql).
 CREATE INDEX IF NOT EXISTS idx_notes_task_status

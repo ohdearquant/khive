@@ -6642,6 +6642,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_id_tracks_mailbox_read_policy_and_preserves_pair_order_equivalence() {
+        let base = RuntimeConfig::no_embeddings();
+        let configured =
+            |owner: &str, readers: &[&str], inner: Arc<dyn khive_runtime::Gate>| RuntimeConfig {
+                gate: Arc::new(
+                    khive_runtime::MailboxReadGate::new(
+                        inner,
+                        khive_runtime::ActorRef::new("actor", owner),
+                        readers
+                            .iter()
+                            .map(|reader| khive_runtime::ActorRef::new("actor", *reader))
+                            .collect(),
+                    )
+                    .expect("valid exact mailbox policy"),
+                ),
+                ..base.clone()
+            };
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        let initial = configured(
+            "agent:owner",
+            &["agent:one", "agent:two"],
+            Arc::new(khive_runtime::AllowAllGate),
+        );
+        let equivalent = configured(
+            "agent:owner",
+            &["agent:two", "agent:one", "agent:one"],
+            Arc::new(khive_runtime::AllowAllGate),
+        );
+        assert_eq!(fingerprint(&initial), fingerprint(&equivalent));
+        for changed in [
+            configured(
+                "agent:owner",
+                &["agent:one"],
+                Arc::new(khive_runtime::AllowAllGate),
+            ),
+            configured("agent:owner", &[], Arc::new(khive_runtime::AllowAllGate)),
+            configured(
+                "agent:other-owner",
+                &["agent:one", "agent:two"],
+                Arc::new(khive_runtime::AllowAllGate),
+            ),
+            configured(
+                "agent:owner",
+                &["agent:one", "agent:two"],
+                Arc::new(khive_runtime::CallerEnrollmentGate::new(
+                    vec!["agent:one".into()],
+                    false,
+                )),
+            ),
+        ] {
+            assert_ne!(
+                fingerprint(&initial),
+                fingerprint(&changed),
+                "a changed owner, reader set or inner policy must select a different daemon"
+            );
+        }
+        assert_ne!(fingerprint(&initial), fingerprint(&base));
+    }
+
     /// `gtd.assign` anchors a date-only `due` through `display_timezone` and
     /// PERSISTS the resulting instant, so a warm daemon reused across two
     /// runtimes differing only in that field writes an instant wrong by the

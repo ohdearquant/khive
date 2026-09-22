@@ -10,7 +10,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    is_valid_mailbox_actor_label, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
+};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
@@ -490,7 +492,9 @@ pub(crate) async fn handle_inbox(
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let p: InboxParams = deser(params)?;
+    let p: InboxParams = deser(params.clone())?;
+    let view =
+        runtime.authorize_mailbox_view(token, "comm.inbox", p.mailbox_actor.as_deref(), &params)?;
     let thread_id = p
         .thread_id
         .as_deref()
@@ -522,6 +526,11 @@ pub(crate) async fn handle_inbox(
     };
 
     if mailbox == "sent" {
+        if view.delegated {
+            return Err(RuntimeError::InvalidInput(
+                "inbox: delegated mailbox reads do not support box=\"sent\"".into(),
+            ));
+        }
         if p.status.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "inbox: `status` applies only to box=\"inbox\"; omit it for box=\"sent\"".into(),
@@ -586,12 +595,7 @@ pub(crate) async fn handle_inbox(
     if raw_limit == 0 {
         let unread = if mailbox == "inbox" {
             let store = runtime.notes(token)?;
-            count_unread_messages(
-                store.as_ref(),
-                token.namespace().as_str(),
-                &token.actor().id,
-            )
-            .await?
+            count_unread_messages(store.as_ref(), token.namespace().as_str(), &view).await?
         } else {
             UnreadCount::zero()
         };
@@ -607,8 +611,6 @@ pub(crate) async fn handle_inbox(
         }));
     }
     let limit = raw_limit.clamp(1, 200) as usize;
-
-    let caller_actor = token.actor().id.clone();
 
     // Push direction + read-status into SQL for idx_comm_message_direction; json_type
     // read-check keeps only JSON boolean `true` as read (matches prior as_bool semantics).
@@ -641,17 +643,29 @@ pub(crate) async fn handle_inbox(
     }
 
     if mailbox == "inbox" {
-        // ADR-057 Q3: to_actor filter, legacy to_actor-less messages stay visible;
+        // ADR-057 Q3: own views keep legacy to_actor-less messages visible;
         // closes the #199 multi-actor read leak for non-"local" callers.
         // EqOrLegacyIndexed (not EqOrMissing) so this seeks
         // idx_notes_unread_probe_recipient_direction on status="unread" instead of
         // falling back to a namespace-wide direction-only scan; both partitions match
         // the same rows EqOrMissing would (khive-storage/src/note.rs FilterOp docs).
+        // Delegated views use only the exact non-empty recipient index partition.
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
-            op: FilterOp::EqOrLegacyIndexed,
-            value: SqlValue::Text(caller_actor.clone()),
+            op: if view.delegated {
+                FilterOp::EqOrMissingIndexed
+            } else {
+                FilterOp::EqOrLegacyIndexed
+            },
+            value: SqlValue::Text(view.actor_id.clone()),
         });
+        if view.delegated {
+            property_filters.push(PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("text".to_string()),
+            });
+        }
         if let Some(from_actor) = p.from_actor.as_ref() {
             property_filters.push(PropertyFilter {
                 json_path: "$.from_actor".to_string(),
@@ -662,12 +676,12 @@ pub(crate) async fn handle_inbox(
     } else {
         property_filters.push(PropertyFilter {
             json_path: "$.from_actor".to_string(),
-            op: if caller_actor == "local" {
+            op: if view.actor_id == "local" {
                 FilterOp::EqOrMissing
             } else {
                 FilterOp::Eq
             },
-            value: SqlValue::Text(caller_actor.clone()),
+            value: SqlValue::Text(view.actor_id.clone()),
         });
         if let Some(to_actor) = p.to_actor.as_ref() {
             property_filters.push(PropertyFilter {
@@ -711,7 +725,7 @@ pub(crate) async fn handle_inbox(
         query_inbox_response(
             store,
             namespace,
-            &caller_actor,
+            &view,
             &filter,
             &p,
             before_micros,
@@ -778,7 +792,7 @@ where
 async fn query_inbox_response(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
-    caller_actor: &str,
+    view: &MailboxView,
     filter: &NoteFilter,
     params: &InboxParams,
     before_micros: Option<i64>,
@@ -871,7 +885,7 @@ async fn query_inbox_response(
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
-        count_unread_messages(store, namespace, caller_actor).await?
+        count_unread_messages(store, namespace, view).await?
     } else {
         UnreadCount::zero()
     };
@@ -908,8 +922,11 @@ pub(crate) async fn handle_unread(
     let _: UnreadParams = deser(params)?;
     let caller_actor = token.actor().id.clone();
     let store = runtime.notes(token)?;
-    let unread =
-        count_unread_messages(store.as_ref(), token.namespace().as_str(), &caller_actor).await?;
+    let view = MailboxView {
+        actor_id: caller_actor.clone(),
+        delegated: false,
+    };
+    let unread = count_unread_messages(store.as_ref(), token.namespace().as_str(), &view).await?;
 
     Ok(json!({
         "count": unread.count,
@@ -941,9 +958,9 @@ impl UnreadCount {
 async fn count_unread_messages(
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
-    caller_actor: &str,
+    view: &MailboxView,
 ) -> Result<UnreadCount, RuntimeError> {
-    let base_filters = vec![
+    let mut base_filters = vec![
         PropertyFilter {
             json_path: "$.direction".to_string(),
             op: FilterOp::Eq,
@@ -955,12 +972,21 @@ async fn count_unread_messages(
             value: SqlValue::Text("true".to_string()),
         },
     ];
+    if view.delegated {
+        // json_extract also returns object/array JSON as text; only string labels
+        // may match an attributed recipient, even if an actor label looks like JSON.
+        base_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::JsonTypeEq,
+            value: SqlValue::Text("text".to_string()),
+        });
+    }
     let count_filter = |op| {
         let mut property_filters = base_filters.clone();
         property_filters.push(PropertyFilter {
             json_path: "$.to_actor".to_string(),
             op,
-            value: SqlValue::Text(caller_actor.to_string()),
+            value: SqlValue::Text(view.actor_id.clone()),
         });
         NoteFilter {
             kind: Some("message".to_string()),
@@ -969,7 +995,7 @@ async fn count_unread_messages(
             ..Default::default()
         }
     };
-    // Count the disjoint addressed and legacy-recipient partitions in one
+    // Own views count the disjoint addressed and legacy-recipient partitions in one
     // storage snapshot. Both predicates retain the recipient key expression
     // required by idx_notes_unread_probe_recipient_direction, and the
     // leading `direction = 'inbound'` filter in base_filters retains that
@@ -978,33 +1004,34 @@ async fn count_unread_messages(
     // copy addressed to the recipient that is never marked read). Each
     // limited subquery stops after cap + 1 matches; together they retain the
     // exact value below the public cap and make saturation explicit above
-    // it.
+    // it. A delegated view includes only the exact string-recipient partition:
+    // idx_notes_unread_probe_recipient_type_direction also seeks the JSON type so
+    // malformed rows sharing a JSON-text key cannot expand the count scan.
+    let mut filters = vec![count_filter(FilterOp::EqOrMissingIndexed)];
+    if !view.delegated {
+        filters.push(count_filter(FilterOp::JsonTypeMissingOrNullIndexed));
+    }
     let counts = store
-        .count_notes_filtered_bounded_in_snapshot(
-            namespace,
-            &[
-                count_filter(FilterOp::EqOrMissingIndexed),
-                count_filter(FilterOp::JsonTypeMissingOrNullIndexed),
-            ],
-            UNREAD_COUNT_CAP,
-        )
+        .count_notes_filtered_bounded_in_snapshot(namespace, &filters, UNREAD_COUNT_CAP)
         .await?;
-    let [exact, legacy] = counts.as_slice() else {
+    if counts.len() != filters.len() {
         return Err(RuntimeError::Internal(
             "comm.unread: storage returned an invalid partition count vector".into(),
         ));
-    };
+    }
     let cap = u64::from(UNREAD_COUNT_CAP);
-    if exact.cap != cap || legacy.cap != cap {
+    if counts.iter().any(|count| count.cap != cap) {
         return Err(RuntimeError::Internal(
             "comm.unread: storage returned an invalid bounded-count cap".into(),
         ));
     }
-    let observed = exact.count.saturating_add(legacy.count);
+    let observed = counts
+        .iter()
+        .fold(0_u64, |sum, count| sum.saturating_add(count.count));
     Ok(UnreadCount {
         count: observed.min(cap),
         cap,
-        saturated: exact.saturated || legacy.saturated || observed > cap,
+        saturated: counts.iter().any(|count| count.saturated) || observed > cap,
     })
 }
 
@@ -1729,7 +1756,13 @@ pub(crate) async fn handle_thread(
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let p: ThreadParams = deser(params)?;
+    let p: ThreadParams = deser(params.clone())?;
+    let view = runtime.authorize_mailbox_view(
+        token,
+        "comm.thread",
+        p.mailbox_actor.as_deref(),
+        &params,
+    )?;
     validate_message_projection_fields("thread", p.fields.as_deref())?;
     let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
 
@@ -1857,14 +1890,14 @@ pub(crate) async fn handle_thread(
 
     // #94 fix 1/2 — actor visibility: mirror `handle_inbox`'s EqOrMissing model
     // (ADR-057 Q3) instead of the unfiltered namespace-wide read `thread` had
-    // before. A caller may see a row iff they are a party to it (its sender or
-    // its addressee) or the row predates actor labeling (`to_actor` absent,
+    // before. In an own view, a caller may see a row iff they are a party to it
+    // (its sender or its addressee) or the row predates actor labeling (`to_actor` absent,
     // back-compat visible-to-all — same rule `inbox` already applies). Before
     // this filter, any caller who could resolve a thread id saw every actor's
     // copies in that thread, including another actor's unread inbound state
     // (issue #94 symptom 1/2: thread crossed the caller boundary that inbox
-    // already enforced).
-    let caller_actor = token.actor().id.clone();
+    // already enforced). Delegated views exclude the unattributed pool before
+    // deduplication so an excluded twin cannot contribute its body or read flag.
     rows.retain(|r| {
         let props = r.json.get("properties");
         let to_actor = props
@@ -1873,9 +1906,17 @@ pub(crate) async fn handle_thread(
         let from_actor = props
             .and_then(|p| p.get("from_actor"))
             .and_then(Value::as_str);
-        from_actor == Some(caller_actor.as_str())
-            || to_actor.is_none()
-            || to_actor == Some(caller_actor.as_str())
+        if view.delegated {
+            to_actor.is_some_and(|recipient| {
+                is_valid_mailbox_actor_label(recipient)
+                    && (from_actor == Some(view.actor_id.as_str())
+                        || recipient == view.actor_id.as_str())
+            })
+        } else {
+            from_actor == Some(view.actor_id.as_str())
+                || to_actor.is_none()
+                || to_actor == Some(view.actor_id.as_str())
+        }
     });
 
     // #94 fix 2/2 — collapse the ADR-057 dual-write pair (outbound copy +

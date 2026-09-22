@@ -210,7 +210,8 @@ outside-gate constructor.
 - **Configuration text never carries caller grant content again.** From this
   amendment forward, the only writer of caller authority is the grant surface
   plus the one-time import in §5, and every write either performs is
-  attributed and recorded per §4a.
+  attributed and recorded per §4a. Amendment 1 below names the sole temporary
+  exception: trusted-local mailbox views while store-held grants are unshipped.
 
 ### 3. Hierarchical subactor identity
 
@@ -368,7 +369,8 @@ the Context section promises:
 ### 5. Configuration transition: one import epoch
 
 Both legacy `[gate]` keys become inputs to a single import epoch and are inert
-afterward.
+afterward. Amendment 1 explicitly permits a temporary `actor.mailbox_readers`
+carrier for two read views; it does not change this section's durable grant destination.
 
 > **Implementation status (2026-08-30):** The current runtime enforces these
 > two keys as a live static caller-enrollment policy on every boot. That closes
@@ -522,3 +524,109 @@ All conditions are executed tests, not review assertions:
 - ADR-018's `ActorRef` and audit shape change additively (the optional `leg`
   field); readers of existing records are unaffected, and writers that
   predate this amendment emit valid records with the field absent.
+
+## Amendment 1 (2026-09-21): Trusted-local mailbox views
+
+Status: Accepted. This is the named **trusted-local mailbox view exception** to
+§2's ban on authoritative configuration text and §5's one-import transition.
+It permits only `comm.inbox(mailbox_actor=...)` and
+`comm.thread(mailbox_actor=...)` while the store-held grants above remain
+unshipped. It introduces no authenticated principal or durable grant record.
+
+### Authority and scope
+
+The serving host's operator-selected configuration may declare one explicit,
+non-local owner and an exact reader list:
+
+```toml
+[actor]
+id = "agent:owner"
+mailbox_readers = ["agent:reader"]
+```
+
+A nonempty list requires that explicit owner; environment-derived caller labels
+cannot supply it. At most 256 input entries are accepted. Labels are nonblank,
+at most 255 UTF-8 bytes, contain no control characters, and are non-local;
+malformed or anonymous entries refuse startup. Entries are deduplicated into
+exact structural `(owner ActorRef, reader ActorRef)` pairs. No label prefix,
+suffix, namespace visibility, request field or inferred hierarchy grants a view.
+A label remains the complete actor id; delimiters do not encode new principal fields.
+The list comes from the serving host, never a forwarded client configuration.
+
+Assurance is the existing trusted-local host/IPC boundary. Configuration and
+environment labels do **not** establish an authenticated principal;
+[ADR-127 §1](ADR-127-authenticated-actor-and-grant-primitive.md#1-authenticated-principal-at-the-gate)
+remains unchanged. This exception supplies neither `ActorSignature` nor
+`DaemonBearer` assurance and grants no remote-broker authority. A process able
+to alter the trusted configuration or open the store is outside this boundary.
+
+The mailbox policy composes with the configured gate, including enrollment and
+write restrictions. `AllowAllGate` does not imply mailbox delegation. Missing
+pairs, including an embedding host without an installed mailbox policy, refuse
+with `PermissionDenied` reason `mailbox_read_not_granted` before thread-root
+lookup, inbox counts, or an empty page. Policy errors remain errors. The real
+caller remains the gate, token and audit actor; selecting a mailbox never mints
+an owner token.
+
+Delegated inboxes require exactly `to_actor = owner`, including unread counts,
+`limit=0`, projection and every long-poll query. Delegated thread views include
+only rows with a valid non-local recipient and owner participation as sender or
+recipient, filtered before deduplication and read-state folding. Missing, null,
+malformed and `local` recipient rows are excluded. An unattributed sender
+explicitly addressing the owner remains eligible. Explicit `mailbox_actor=local`
+and delegated `box=sent` refuse. Omitted selectors and explicit non-local self
+selectors preserve existing own-view behavior.
+
+The base-store `idx_notes_unread_probe_recipient_type_direction` index includes the
+recipient JSON type as a seek key: the existing recipient index leaves type
+checking as a residual filter, so malformed object/array recipients that alias
+a string label can otherwise make bounded unread counts scan unbounded rows.
+Migration `035-notes-unread-probe-recipient-type-direction.sql` installs it,
+with matching fresh-store DDL. Following
+[ADR-187](ADR-187-comm-seek-plan-pinning.md), the typed query shape pins this
+index; existing untyped query shapes retain their existing pins.
+
+These two views do not change message read flags. `comm.read`, `comm.mark_read`
+and `comm.reply` retain the real caller's existing ownership checks; none accepts
+`mailbox_actor`. This exception does not change `comm.probe`, generic record
+privacy, namespace authorization or mutation rights.
+
+### Revocation and sunset
+
+The pair set is immutable for a server epoch. **Saving the configuration file is
+not revocation.** To remove a reader, replace the serving epoch and stop or drain
+the old server; cancel its unresolved long polls before acknowledging replacement.
+Already admitted bounded reads may finish during drain. Once replacement is
+acknowledged, the old epoch must no longer return bodies. Already returned bytes
+cannot be retracted. Independently running processes do not share live revocation.
+
+The daemon fingerprint includes a policy version and sorted exact pairs, together
+with the composed policy identity, so a changed list cannot silently select a
+warm daemon with the old policy. Fingerprinting does not itself stop an old process.
+
+When store-held grants ship, `mailbox_readers` becomes a one-shot migration source
+or is removed; it cannot remain a parallel source of authority. No new consumer
+of this key may be added after this amendment is accepted. The authenticated,
+store-held model and its live transitive revocation requirements remain the
+permanent design.
+
+### Acceptance for this exception
+
+- Granted views succeed; an ungranted cross-actor selector refuses under
+  `AllowAllGate`, direct pack invocation, empty data, `limit=0`, and existing or
+  missing thread roots. A failing composed policy never becomes an allow.
+- An explicit namespace cannot grant an absent pair. Configured, per-request and
+  embedding caller identities remain exact and attributable; request arguments
+  cannot impersonate the owner.
+- Strict delegated inbox/count/thread filtering excludes the unattributed pool
+  before paging, projection and deduplication, including long-poll re-queries.
+  Own-view compatibility controls remain unchanged.
+- Snapshot owner unread counts and original row flags before and after both
+  delegated views, projection, long poll and helper read-mark/reply attempts;
+  the owner snapshots remain equal.
+- Invalid owners/readers refuse configuration load. Reordering or duplicating
+  readers preserves the fingerprint; adding or removing a reader changes it.
+
+The first two refusal controls must fail if cross-actor selection merely trusts
+`AllowAllGate` or promotes explicit namespace visibility into a grant. Passing
+these local-policy tests does not satisfy the store-held grant acceptance above.

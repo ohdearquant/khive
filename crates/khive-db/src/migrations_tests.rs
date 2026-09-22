@@ -1410,6 +1410,83 @@ fn v34_note_order_index_matches_fresh_schema_and_preserves_notes() {
 }
 
 #[test]
+fn v35_typed_recipient_index_matches_bootstrap_and_preserves_notes() {
+    const NOTES_DDL: &str = include_str!("../sql/notes-ddl.sql");
+    let fresh = open_memory();
+    fresh.execute_batch(NOTES_DDL).unwrap();
+    let schema = open_memory();
+    schema.execute_batch(V1_UP).unwrap();
+    let upgraded = open_memory();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    upgraded
+        .execute_batch("DROP INDEX idx_notes_unread_probe_recipient_type_direction")
+        .unwrap();
+    for (id, properties, deleted_at) in [
+        ("string", r#"{"to_actor":"{}","read":false}"#, None),
+        ("object", r#"{"to_actor":{},"read":false}"#, None),
+        ("deleted", r#"{"to_actor":"{}","read":true}"#, Some(2_i64)),
+    ] {
+        upgraded.execute(
+            "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at, deleted_at) VALUES (?1, 'default', 'message', 'kept', ?2, 1, 1, ?3)",
+            rusqlite::params![id, properties, deleted_at],
+        ).unwrap();
+    }
+    let snapshot = |conn: &Connection| -> Vec<(String, String, String, i64, Option<i64>)> {
+        conn.prepare("SELECT id, content, properties, version, deleted_at FROM notes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = snapshot(&upgraded);
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 35)
+        .unwrap();
+    assert_eq!(
+        migration.name,
+        "notes_unread_probe_recipient_type_direction"
+    );
+    upgraded.execute_batch(migration.up).unwrap();
+    let schema_version: i64 = upgraded
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    upgraded.execute_batch(migration.up).unwrap();
+    upgraded.execute_batch(NOTES_DDL).unwrap();
+    assert_eq!(
+        upgraded
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        schema_version
+    );
+    assert_eq!(snapshot(&upgraded), before);
+    for name in [
+        "idx_notes_unread_probe_recipient_type_direction",
+        "idx_notes_unread_probe_recipient_direction",
+    ] {
+        let definition = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(definition(&upgraded), definition(&fresh), "{name}");
+        assert_eq!(definition(&upgraded), definition(&schema), "{name}");
+    }
+}
+
+#[test]
 fn migration_versions_advance_by_exactly_one() {
     for pair in MIGRATIONS.windows(2) {
         assert_eq!(

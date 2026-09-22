@@ -453,7 +453,7 @@ mod help_tests {
     #[test]
     fn list_reads_declare_sent_box_and_shared_projection_contract() {
         let inbox = find_handler("comm.inbox");
-        for name in ["box", "to_actor", "fields"] {
+        for name in ["box", "to_actor", "fields", "mailbox_actor"] {
             let param = inbox
                 .params
                 .iter()
@@ -471,6 +471,22 @@ mod help_tests {
         assert_eq!(fields.param_type, "array of string");
         assert!(!fields.required);
         assert!(fields.description.contains("comm.inbox"));
+
+        let mailbox_actor = thread
+            .params
+            .iter()
+            .find(|param| param.name == "mailbox_actor")
+            .expect("comm.thread help must declare mailbox_actor");
+        assert_eq!(mailbox_actor.param_type, "string");
+        assert!(!mailbox_actor.required);
+        for handler in &COMM_HANDLERS {
+            if !matches!(handler.name, "comm.inbox" | "comm.thread") {
+                assert!(handler
+                    .params
+                    .iter()
+                    .all(|param| param.name != "mailbox_actor"));
+            }
+        }
     }
 
     #[test]

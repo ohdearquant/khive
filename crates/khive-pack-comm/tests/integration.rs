@@ -13682,3 +13682,968 @@ async fn stream_batch_refuses_a_channel_health_write_member_before_any_sibling_c
         "no channel row may be created through the batch path: {health}"
     );
 }
+
+// Delegated mailbox reads share the real comm registry and its wake signal. Raw
+// note writes below are reserved for malformed/legacy physical-row fixtures.
+mod mailbox_views {
+    use super::*;
+    use khive_runtime::{
+        ActorRef, Gate, GateDecision, GateError, GateRef, GateRequest, MailboxReadGate,
+        PackRuntime, RuntimeError,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    const OWNER: &str = "lambda:mailbox-owner";
+    const HELPER: &str = "lambda:mailbox-owner:reader";
+    const SENDER: &str = "lambda:mailbox-sender";
+    const OTHER: &str = "lambda:other-reader";
+
+    struct Fixture {
+        registry: VerbRegistry,
+        runtime: KhiveRuntime,
+    }
+
+    fn policy(inner: GateRef) -> GateRef {
+        Arc::new(
+            MailboxReadGate::new(
+                inner,
+                ActorRef::new("actor", OWNER),
+                vec![ActorRef::new("actor", HELPER)],
+            )
+            .expect("exact trusted-local mailbox pair"),
+        )
+    }
+
+    impl Fixture {
+        fn new(granted: bool, baked_actor: &str) -> Self {
+            let inner: GateRef = Arc::new(AllowAllGate);
+            Self::with_gate(if granted { policy(inner) } else { inner }, baked_actor)
+        }
+
+        fn with_gate(gate: GateRef, baked_actor: &str) -> Self {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                brain_profile: None,
+                actor_id: Some(baked_actor.into()),
+                gate: gate.clone(),
+                packs: vec!["kg".into(), "comm".into()],
+                ..RuntimeConfig::no_embeddings()
+            })
+            .expect("isolated writable mailbox runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".into(), "comm".into()],
+                runtime.clone(),
+                &mut builder,
+            )
+            .expect("real pack factory registration");
+            builder.with_gate(gate);
+            builder.with_actor_id(Some(baked_actor.into()));
+            let registry = builder.build().expect("mailbox registry");
+            registry
+                .apply_schema_plans_with_map(&Default::default(), runtime.backend())
+                .expect("real synchronous comm schema bootstrap");
+            Self { registry, runtime }
+        }
+
+        async fn call(&self, actor: &str, verb: &str, args: Value) -> Result<Value, RuntimeError> {
+            call(&self.registry, actor, verb, args).await
+        }
+
+        async fn seed(&self, id: Uuid, content: &str, properties: Value) {
+            let token = self.runtime.authorize(Namespace::local()).unwrap();
+            let mut note = Note::new("local", "message", content);
+            note.id = id;
+            note.created_at = 1_700_000_000_000_000;
+            note.updated_at = note.created_at;
+            note.properties = Some(properties);
+            self.runtime
+                .notes(&token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+        }
+
+        async fn stored(&self, id: Uuid) -> Note {
+            let token = self.runtime.authorize(Namespace::local()).unwrap();
+            self.runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn owner_state(&self) -> Value {
+            let token = self.runtime.authorize(Namespace::local()).unwrap();
+            let mut rows: Vec<_> = self.runtime.list_notes(&token, Some("message"), 200, 0)
+                .await.unwrap().into_iter()
+                .filter(|note| match note.properties.as_ref().and_then(|p| p.get("to_actor")) {
+                    None | Some(Value::Null) => true,
+                    Some(recipient) => recipient == OWNER,
+                })
+                .map(|note| json!({"id": note.id, "read": note.properties.unwrap().get("read").cloned()}))
+                .collect();
+            rows.sort_by_key(|row| row["id"].to_string());
+            json!({"unread": self.call(OWNER, "comm.unread", json!({})).await.unwrap(), "rows": rows})
+        }
+    }
+
+    async fn call(
+        registry: &VerbRegistry,
+        actor: &str,
+        verb: &str,
+        args: Value,
+    ) -> Result<Value, RuntimeError> {
+        registry
+            .dispatch_with_identity(
+                verb,
+                args,
+                Some(RequestIdentity {
+                    namespace: "local".into(),
+                    actor_id: (actor != "local").then(|| actor.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+    }
+
+    fn props(to: Option<Value>, from: Option<&str>, direction: &str, read: bool) -> Value {
+        let mut p = json!({"direction": direction, "read": read});
+        if let Some(to) = to {
+            p["to_actor"] = to;
+        }
+        if let Some(from) = from {
+            p["from_actor"] = json!(from);
+        }
+        p
+    }
+
+    fn denied(error: RuntimeError, expected_verb: &str) {
+        assert!(
+            matches!(&error, RuntimeError::PermissionDenied { verb, reason, .. }
+            if verb == expected_verb && reason == "mailbox_read_not_granted"),
+            "{error:?}"
+        );
+    }
+
+    fn contents(response: &Value) -> BTreeSet<String> {
+        response["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["content"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    // MUST-FAIL control: replacing mailbox authorization with an allow/no-op
+    // returns data, an empty count, or NotFound for the missing root, not this
+    // exact PermissionDenied. These controls are stated before host execution.
+    #[tokio::test]
+    async fn ungranted_selector_refuses_before_roots_counts_and_direct_pack_lookup() {
+        let fixture = Fixture::new(false, HELPER);
+        let root = Uuid::new_v4();
+        fixture
+            .seed(
+                root,
+                "owner root",
+                props(Some(json!(OWNER)), Some(SENDER), "inbound", false),
+            )
+            .await;
+        let pack = CommPack::new(fixture.runtime.clone());
+        let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+        for (verb, args) in [
+            ("comm.inbox", json!({"mailbox_actor": OWNER})),
+            ("comm.inbox", json!({"mailbox_actor": OWNER, "limit": 0})),
+            (
+                "comm.inbox",
+                json!({"mailbox_actor": OWNER, "content_contains": "no match", "wait_ms": 1}),
+            ),
+            ("comm.thread", json!({"mailbox_actor": OWNER, "id": root})),
+            (
+                "comm.thread",
+                json!({"mailbox_actor": OWNER, "id": Uuid::new_v4()}),
+            ),
+        ] {
+            denied(
+                fixture
+                    .call(HELPER, verb, args.clone())
+                    .await
+                    .expect_err("no installed grant"),
+                verb,
+            );
+            denied(
+                PackRuntime::dispatch(&pack, verb, args, &fixture.registry, &token)
+                    .await
+                    .expect_err("direct pack calls cannot bypass the policy"),
+                verb,
+            );
+        }
+        assert_eq!(
+            fixture
+                .call(HELPER, "comm.inbox", json!({"status":"all"}))
+                .await
+                .unwrap()["count"],
+            0
+        );
+        assert_eq!(
+            fixture
+                .call(OWNER, "comm.inbox", json!({"status":"all"}))
+                .await
+                .unwrap()["count"],
+            1
+        );
+        let empty = Fixture::new(false, HELPER);
+        denied(
+            empty
+                .call(
+                    HELPER,
+                    "comm.inbox",
+                    json!({"mailbox_actor": OWNER, "limit":0}),
+                )
+                .await
+                .unwrap_err(),
+            "comm.inbox",
+        );
+    }
+
+    // MUST-FAIL control: using explicit namespace or visible_namespaces as a
+    // grant would turn these PermissionDenied results into successful pages.
+    #[tokio::test]
+    async fn explicit_namespace_and_similar_actor_labels_cannot_create_a_pair() {
+        let fixture = Fixture::new(false, OWNER);
+        for namespace in ["local", OWNER] {
+            let error = fixture
+                .registry
+                .dispatch_with_identity(
+                    "comm.inbox",
+                    json!({"mailbox_actor": OWNER, "namespace": namespace, "limit":0}),
+                    Some(RequestIdentity {
+                        namespace: OWNER.into(),
+                        actor_id: Some(HELPER.into()),
+                        visible_namespaces: vec!["local".into(), OWNER.into()],
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect_err("namespace selection is not authorization");
+            denied(error, "comm.inbox");
+        }
+        let granted = Fixture::new(true, OWNER);
+        assert_eq!(
+            granted
+                .call(HELPER, "comm.inbox", json!({"mailbox_actor": OWNER}))
+                .await
+                .unwrap()["count"],
+            0
+        );
+        for actor in [
+            OTHER,
+            "lambda:mailbox-owner:reader:child",
+            "lambda:mailbox-owner:reader-extra",
+        ] {
+            denied(
+                granted
+                    .call(actor, "comm.inbox", json!({"mailbox_actor": OWNER}))
+                    .await
+                    .unwrap_err(),
+                "comm.inbox",
+            );
+        }
+        denied(
+            granted
+                .call(
+                    OTHER,
+                    "comm.inbox",
+                    json!({"mailbox_actor": OWNER, "actor": HELPER}),
+                )
+                .await
+                .unwrap_err(),
+            "comm.inbox",
+        );
+        denied(
+            granted
+                .call(HELPER, "comm.inbox", json!({"mailbox_actor": SENDER}))
+                .await
+                .unwrap_err(),
+            "comm.inbox",
+        );
+        assert!(granted
+            .call("local", "comm.inbox", json!({"mailbox_actor": OWNER}))
+            .await
+            .is_err());
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingGate(Mutex<Vec<(String, ActorRef)>>);
+    impl Gate for RecordingGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((request.verb.clone(), request.actor.clone()));
+            Ok(GateDecision::allow())
+        }
+    }
+
+    #[tokio::test]
+    async fn granted_dispatch_keeps_request_actor_and_owner_delivery_state() {
+        let recorded = Arc::new(RecordingGate::default());
+        let fixture = Fixture::with_gate(policy(recorded.clone()), OWNER);
+        let sent = fixture
+            .call(
+                SENDER,
+                "comm.send",
+                json!({"to":OWNER, "content":"real dual-write", "subject":"view"}),
+            )
+            .await
+            .unwrap();
+        let before = fixture.owner_state().await;
+        recorded.0.lock().unwrap().clear();
+        let inbox = fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER, "status":"all"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbox["count"], 1);
+        assert_eq!(inbox["messages"][0]["from"], SENDER);
+        assert_eq!(inbox["messages"][0]["to"], OWNER);
+        let thread = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER, "id":sent["full_id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thread["count"], 1, "dual copies still collapse");
+        let observed = recorded.0.lock().unwrap().clone();
+        assert!(!observed.is_empty());
+        for (verb, actor) in observed {
+            if matches!(verb.as_str(), "comm.inbox" | "comm.thread") {
+                assert_eq!(actor, ActorRef::new("actor", HELPER));
+            }
+        }
+        assert_eq!(fixture.owner_state().await, before);
+        assert_eq!(
+            fixture
+                .call(HELPER, "comm.unread", json!({}))
+                .await
+                .unwrap()["count"],
+            0
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .dispatch("comm.inbox", json!({"status":"all"}))
+                .await
+                .unwrap()["count"],
+            1,
+            "baked owner identity remains the default only without RequestIdentity"
+        );
+    }
+
+    #[derive(Debug)]
+    struct UnavailableReads;
+    impl Gate for UnavailableReads {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if matches!(request.verb.as_str(), "comm.inbox" | "comm.thread") {
+                Err(GateError::Internal("fixture policy unavailable".into()))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn granted_pair_does_not_swallow_an_underlying_policy_failure() {
+        let fixture = Fixture::with_gate(policy(Arc::new(UnavailableReads)), HELPER);
+        let pack = CommPack::new(fixture.runtime.clone());
+        let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+        for (verb, args) in [
+            ("comm.inbox", json!({"mailbox_actor":OWNER,"limit":0})),
+            (
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":Uuid::new_v4()}),
+            ),
+        ] {
+            for result in [
+                fixture.call(HELPER, verb, args.clone()).await,
+                PackRuntime::dispatch(&pack, verb, args, &fixture.registry, &token).await,
+            ] {
+                assert!(
+                    matches!(result, Err(RuntimeError::GateUnavailable { .. })),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_inbox_counts_pages_and_projection_exclude_the_legacy_pool() {
+        let fixture = Fixture::new(true, OWNER);
+        for (n, content, to, from, read) in [
+            (1, "owner unread", Some(json!(OWNER)), Some(SENDER), false),
+            (2, "owner read", Some(json!(OWNER)), Some(SENDER), true),
+            (3, "unattributed sender", Some(json!(OWNER)), None, false),
+            (4, "helper", Some(json!(HELPER)), Some(SENDER), false),
+            (5, "third party", Some(json!(OTHER)), Some(SENDER), false),
+            (6, "missing recipient", None, Some(SENDER), false),
+            (7, "null recipient", Some(Value::Null), Some(SENDER), false),
+            (
+                8,
+                "local recipient",
+                Some(json!("local")),
+                Some(SENDER),
+                false,
+            ),
+            (9, "empty recipient", Some(json!("")), Some(SENDER), false),
+            (
+                10,
+                "invalid recipient",
+                Some(json!("bad\nactor")),
+                Some(SENDER),
+                false,
+            ),
+            (
+                11,
+                "numeric recipient",
+                Some(json!(23)),
+                Some(SENDER),
+                false,
+            ),
+        ] {
+            fixture
+                .seed(
+                    Uuid::from_u128(n),
+                    content,
+                    props(to, from, "inbound", read),
+                )
+                .await;
+        }
+        let before = fixture.owner_state().await;
+        let args = json!({"mailbox_actor":OWNER,"status":"all","limit":100});
+        let full = fixture
+            .call(HELPER, "comm.inbox", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&full),
+            BTreeSet::from([
+                "owner unread".into(),
+                "owner read".into(),
+                "unattributed sender".into()
+            ])
+        );
+        assert_eq!(full["unread_count"], 2);
+        assert_eq!(full["unread_count_saturated"], false);
+        let count = fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER,"limit":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count["count"], 0);
+        assert_eq!(count["unread_count"], 2);
+        assert!(count["messages"].as_array().unwrap().is_empty());
+        let filtered = fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER,"status":"read","content_contains":"owner read"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(contents(&filtered), BTreeSet::from(["owner read".into()]));
+        assert_eq!(
+            filtered["unread_count"], 2,
+            "mailbox count ignores page filters"
+        );
+        let page = fixture.call(HELPER, "comm.inbox", json!({"mailbox_actor":OWNER,"status":"all","limit":1,"offset":1,"fields":["full_id","content","read"]})).await.unwrap();
+        assert_eq!(
+            page["messages"][0]["full_id"],
+            full["messages"][1]["full_id"]
+        );
+        assert_eq!(page["next_offset"], 2);
+        assert_eq!(page["messages"][0].as_object().unwrap().len(), 3);
+        let own = fixture
+            .call(OWNER, "comm.inbox", json!({"status":"all","limit":100}))
+            .await
+            .unwrap();
+        let own_explicit = fixture.call(OWNER, "comm.inbox", args).await.unwrap();
+        assert_eq!(own, own_explicit);
+        assert!(contents(&own).contains("missing recipient"));
+        assert!(contents(&own).contains("null recipient"));
+        let anonymous = fixture
+            .call("local", "comm.inbox", json!({"status":"all"}))
+            .await
+            .unwrap();
+        assert!(contents(&anonymous).contains("local recipient"));
+        assert!(contents(&anonymous).contains("missing recipient"));
+        assert!(!contents(&anonymous).contains("owner unread"));
+        assert!(fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER,"box":"sent"})
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .call(
+                    OWNER,
+                    "comm.inbox",
+                    json!({"mailbox_actor":OWNER,"box":"sent"})
+                )
+                .await
+                .unwrap()["count"],
+            0
+        );
+        for selector in [
+            json!("local"),
+            json!(""),
+            json!("bad\nactor"),
+            Value::Null,
+            json!(17),
+        ] {
+            assert!(fixture
+                .call(HELPER, "comm.inbox", json!({"mailbox_actor":selector}))
+                .await
+                .is_err());
+            assert!(fixture
+                .call(
+                    HELPER,
+                    "comm.thread",
+                    json!({"mailbox_actor":selector,"id":Uuid::from_u128(1)})
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(fixture.owner_state().await, before);
+    }
+
+    #[tokio::test]
+    async fn delegated_thread_filters_physical_rows_before_dedup_and_cursor_projection() {
+        let fixture = Fixture::new(true, OWNER);
+        let root = Uuid::from_u128(100);
+        // Root insertion itself must pass strict filtering, even without thread_id.
+        fixture
+            .seed(
+                root,
+                "legacy root",
+                props(None, Some(OWNER), "inbound", false),
+            )
+            .await;
+        let outbound = Uuid::from_u128(101);
+        let mut p = props(Some(json!(SENDER)), Some(OWNER), "outbound", false);
+        p["thread_id"] = json!(root);
+        fixture.seed(outbound, "retained outbound", p).await;
+        let mut invalid_twin = props(Some(json!("local")), Some(OWNER), "inbound", true);
+        invalid_twin["thread_id"] = json!(root);
+        invalid_twin["outbound_ref"] = json!(outbound);
+        fixture
+            .seed(Uuid::from_u128(102), "excluded read twin", invalid_twin)
+            .await;
+        let valid_out = Uuid::from_u128(103);
+        let mut p = props(Some(json!(OWNER)), Some(SENDER), "outbound", false);
+        p["thread_id"] = json!(root);
+        fixture.seed(valid_out, "valid pair", p).await;
+        let mut p = props(Some(json!(OWNER)), Some(SENDER), "inbound", true);
+        p["thread_id"] = json!(root);
+        p["outbound_ref"] = json!(valid_out);
+        fixture.seed(Uuid::from_u128(104), "valid pair", p).await;
+        let mut p = props(Some(json!(OWNER)), None, "inbound", false);
+        p["thread_id"] = json!(root);
+        fixture
+            .seed(Uuid::from_u128(105), "unattributed sender", p)
+            .await;
+        for (n, recipient) in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("bad\nactor")),
+            Some(json!(9)),
+            Some(json!("local")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut p = props(recipient, Some(OWNER), "inbound", true);
+            p["thread_id"] = json!(root);
+            fixture
+                .seed(Uuid::from_u128(110 + n as u128), "excluded pool", p)
+                .await;
+        }
+        let mut p = props(Some(json!(OTHER)), Some(SENDER), "inbound", true);
+        p["thread_id"] = json!(root);
+        fixture
+            .seed(Uuid::from_u128(120), "unrelated attributed", p)
+            .await;
+        let before = fixture.owner_state().await;
+        let full = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":root}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&full),
+            BTreeSet::from([
+                "retained outbound".into(),
+                "valid pair".into(),
+                "unattributed sender".into()
+            ])
+        );
+        assert_eq!(full["count"], 3);
+        let rows = full["messages"].as_array().unwrap();
+        assert_eq!(rows[0]["full_id"], json!(outbound));
+        assert_eq!(
+            rows[0]["read"], false,
+            "excluded twin must not influence read folding"
+        );
+        assert_eq!(rows[1]["full_id"], json!(valid_out));
+        assert_eq!(rows[1]["read"], true, "eligible twins still fold normally");
+        // Descending `after` advances to a smaller (created_at, UUID) tuple.
+        // All fixture timestamps are equal, so the oldest retained row has no successor.
+        let empty = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        assert_eq!(empty["count"], 0);
+        assert_eq!(empty["messages"], json!([]));
+        let page = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":Uuid::from_u128(105),"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        assert_eq!(page["count"], 1, "the projection control must have a row");
+        assert_eq!(page["messages"][0]["full_id"], json!(valid_out));
+        assert_eq!(page["messages"][0]["read"], true);
+        assert_eq!(page["messages"][0].as_object().unwrap().len(), 2);
+        let asc = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"limit":1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            asc["messages"][0]["full_id"],
+            json!(valid_out),
+            "equal-timestamp UUID cursor remains stable"
+        );
+        let own = fixture
+            .call(OWNER, "comm.thread", json!({"id":root}))
+            .await
+            .unwrap();
+        let explicit = fixture
+            .call(
+                OWNER,
+                "comm.thread",
+                json!({"id":root,"mailbox_actor":OWNER}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(own, explicit);
+        assert!(contents(&own).contains("legacy root"));
+        assert_eq!(fixture.owner_state().await, before);
+    }
+
+    #[tokio::test]
+    async fn delegated_long_poll_keeps_strict_filters_and_never_marks_owner_rows() {
+        let fixture = Fixture::new(true, OWNER);
+        let legacy = Uuid::new_v4();
+        fixture
+            .seed(
+                legacy,
+                "matching legacy pool",
+                props(None, Some(SENDER), "inbound", false),
+            )
+            .await;
+        let before = fixture.owner_state().await;
+        let timeout_page = fixture.call(HELPER,"comm.inbox",json!({"mailbox_actor":OWNER,"content_contains":"matching","wait_ms":10,"fields":["id","read"]})).await.unwrap();
+        assert_eq!(timeout_page["count"], 0);
+        assert_eq!(timeout_page["unread_count"], 0);
+        assert_eq!(fixture.owner_state().await, before);
+        let registry = fixture.registry.clone();
+        let mut waiter = tokio::spawn(async move {
+            call(&registry,HELPER,"comm.inbox",json!({"mailbox_actor":OWNER,"content_contains":"matching","offset":1,"wait_ms":5000,"fields":["content","read"]})).await
+        });
+        fixture
+            .call(
+                SENDER,
+                "comm.send",
+                json!({"to":OTHER,"content":"matching unrelated"}),
+            )
+            .await
+            .unwrap();
+        fixture
+            .call(
+                SENDER,
+                "comm.send",
+                json!({"to":OWNER,"content":"matching first"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "offset and unrelated/pool rows cannot satisfy the wait"
+        );
+        fixture
+            .call(
+                SENDER,
+                "comm.send",
+                json!({"to":OWNER,"content":"matching second"}),
+            )
+            .await
+            .unwrap();
+        let after_arrival = fixture.owner_state().await;
+        let response = match tokio::time::timeout(Duration::from_secs(2), &mut waiter).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                waiter.abort();
+                panic!("matching owner arrival did not wake the shared registry");
+            }
+        };
+        assert_eq!(response["count"], 1);
+        assert_eq!(response["unread_count"], 2);
+        assert_eq!(response["messages"][0]["content"], "matching first");
+        assert_eq!(response["messages"][0]["read"], false);
+        assert_eq!(response["messages"][0].as_object().unwrap().len(), 2);
+        assert_eq!(fixture.owner_state().await, after_arrival);
+        assert_eq!(
+            fixture.stored(legacy).await.properties.unwrap()["read"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_reads_do_not_authorize_marking_reply_or_mutation_selectors() {
+        let fixture = Fixture::new(true, OWNER);
+        let owner_id = Uuid::new_v4();
+        let helper_id = Uuid::new_v4();
+        fixture
+            .seed(
+                owner_id,
+                "owner delivery",
+                props(Some(json!(OWNER)), Some(SENDER), "inbound", false),
+            )
+            .await;
+        fixture
+            .seed(
+                helper_id,
+                "helper delivery",
+                props(Some(json!(HELPER)), Some(SENDER), "inbound", false),
+            )
+            .await;
+        let before = fixture.owner_state().await;
+        fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER,"fields":["id","read"],"wait_ms":1}),
+            )
+            .await
+            .unwrap();
+        fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":owner_id,"fields":["id","read"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixture.owner_state().await, before);
+        for (verb, args) in [
+            ("comm.read", json!({"id":owner_id})),
+            ("comm.read", json!({"ids":[helper_id,owner_id]})),
+            ("comm.mark_read", json!({"ids":[owner_id]})),
+            (
+                "comm.mark_read",
+                json!({"ids":[helper_id,owner_id],"atomic":false}),
+            ),
+            (
+                "comm.mark_read",
+                json!({"ids":[helper_id,owner_id],"atomic":true}),
+            ),
+            (
+                "comm.reply",
+                json!({"id":owner_id,"content":"unauthorized reply"}),
+            ),
+        ] {
+            fixture
+                .call(HELPER, verb, args)
+                .await
+                .expect_err("read delegation never transfers mutation authority");
+            assert_eq!(fixture.owner_state().await, before);
+        }
+        assert_eq!(
+            fixture.stored(helper_id).await.properties.unwrap()["read"],
+            false,
+            "bulk addressee prevalidation precedes mutation"
+        );
+        for (verb, args) in [
+            ("comm.read", json!({"id":owner_id,"mailbox_actor":OWNER})),
+            (
+                "comm.mark_read",
+                json!({"ids":[owner_id],"mailbox_actor":OWNER}),
+            ),
+            (
+                "comm.reply",
+                json!({"id":owner_id,"content":"no selector","mailbox_actor":OWNER}),
+            ),
+            (
+                "comm.send",
+                json!({"to":SENDER,"content":"no selector","mailbox_actor":OWNER}),
+            ),
+            ("comm.unread", json!({"mailbox_actor":OWNER})),
+        ] {
+            let error = fixture
+                .call(OWNER, verb, args)
+                .await
+                .expect_err("selector is absent from mutation/other parameter structs");
+            assert!(
+                error.to_string().contains("unknown field `mailbox_actor`"),
+                "{error}"
+            );
+        }
+        assert_eq!(fixture.owner_state().await, before);
+        let own = fixture
+            .call(HELPER, "comm.read", json!({"id":helper_id}))
+            .await
+            .unwrap();
+        assert_eq!(own["read"], true, "own marking remains available");
+        assert_eq!(fixture.owner_state().await, before);
+    }
+
+    #[tokio::test]
+    async fn non_string_recipients_cannot_alias_json_shaped_owner_labels() {
+        for (owner, malformed) in [("{}", json!({})), ("[]", json!([]))] {
+            let gate = Arc::new(
+                MailboxReadGate::new(
+                    Arc::new(AllowAllGate),
+                    ActorRef::new("actor", owner),
+                    vec![ActorRef::new("actor", HELPER)],
+                )
+                .unwrap(),
+            );
+            let fixture = Fixture::with_gate(gate, owner);
+            fixture
+                .seed(
+                    Uuid::from_u128(1),
+                    "valid string recipient",
+                    props(Some(json!(owner)), Some(SENDER), "inbound", false),
+                )
+                .await;
+            let malformed_id = Uuid::from_u128(2);
+            fixture
+                .seed(
+                    malformed_id,
+                    "malformed recipient aliases JSON text",
+                    props(Some(malformed), Some(SENDER), "inbound", false),
+                )
+                .await;
+            let before = fixture.stored(malformed_id).await;
+            for limit in [0, 10] {
+                let view = fixture
+                    .call(
+                        HELPER,
+                        "comm.inbox",
+                        json!({"mailbox_actor":owner, "limit":limit}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    view["unread_count"], 1,
+                    "only string recipients count: {view}"
+                );
+                assert_eq!(view["count"], u64::from(limit != 0));
+                if limit != 0 {
+                    assert_eq!(
+                        contents(&view),
+                        BTreeSet::from(["valid string recipient".into()])
+                    );
+                }
+            }
+            assert_eq!(fixture.stored(malformed_id).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_unread_cap_does_not_count_legacy_pool_toward_saturation() {
+        let fixture = Fixture::new(true, OWNER);
+        let token = fixture.runtime.authorize(Namespace::local()).unwrap();
+        let store = fixture.runtime.notes(&token).unwrap();
+        let mut notes: Vec<_> = (0..1000)
+            .map(|_| {
+                Note::new("local", "message", "addressed").with_properties(props(
+                    Some(json!(OWNER)),
+                    Some(SENDER),
+                    "inbound",
+                    false,
+                ))
+            })
+            .collect();
+        notes.push(
+            Note::new("local", "message", "legacy missing")
+                .with_properties(props(None, None, "inbound", false)),
+        );
+        notes.push(
+            Note::new("local", "message", "legacy null").with_properties(props(
+                Some(Value::Null),
+                None,
+                "inbound",
+                false,
+            )),
+        );
+        let summary = store.upsert_notes(notes).await.unwrap();
+        assert_eq!(summary.failed, 0);
+        for limit in [0, 1] {
+            let count = fixture
+                .call(
+                    HELPER,
+                    "comm.inbox",
+                    json!({"mailbox_actor":OWNER,"limit":limit}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count["unread_count"], 1000);
+            assert_eq!(count["unread_count_cap"], 1000);
+            assert_eq!(
+                count["unread_count_saturated"], false,
+                "legacy pool must not cross the cap"
+            );
+        }
+        store
+            .upsert_note(
+                Note::new("local", "message", "addressed beyond cap").with_properties(props(
+                    Some(json!(OWNER)),
+                    Some(SENDER),
+                    "inbound",
+                    false,
+                )),
+            )
+            .await
+            .unwrap();
+        let count = fixture
+            .call(
+                HELPER,
+                "comm.inbox",
+                json!({"mailbox_actor":OWNER,"limit":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count["unread_count"], 1000);
+        assert_eq!(count["unread_count_saturated"], true);
+    }
+}

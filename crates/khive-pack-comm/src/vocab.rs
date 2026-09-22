@@ -131,6 +131,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         category: khive_types::VerbCategory::Assertive,
         params: &[
             ParamDef {
+                name: "mailbox_actor",
+                param_type: "string",
+                required: false,
+                description: "Exact actor mailbox to read. Omit for the caller's own view. A different actor requires an explicit mailbox-read grant and supports only box=\"inbox\"; unattributed messages are excluded. Explicit \"local\" is refused.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
@@ -344,6 +351,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "mailbox_actor",
+                param_type: "string",
+                required: false,
+                description: "Exact actor whose conversation view to read. Omit for the caller's own view. A different actor requires an explicit mailbox-read grant; rows with missing, invalid or local recipients are excluded. Explicit \"local\" is refused.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "id",
                 param_type: "string",

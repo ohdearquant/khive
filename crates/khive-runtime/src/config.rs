@@ -839,6 +839,7 @@ pub fn runtime_config_from_khive_config(
             )) as GateRef
         })
         .unwrap_or_else(|| base.gate.clone());
+    let gate = crate::mailbox_view::configured_mailbox_gate(&khive_cfg.actor, gate);
 
     let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();

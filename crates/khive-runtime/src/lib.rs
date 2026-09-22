@@ -32,6 +32,7 @@ pub mod keyed_memory;
 mod keyed_memory_tests;
 pub mod keyed_message;
 mod live_until;
+mod mailbox_view;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -124,12 +125,14 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
-    GateDecision, GateError, GateRef, GateRequest, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
+    is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision, AuditEvent,
+    CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef, GateRequest,
+    MailboxPolicyError, MailboxReadGate, Obligation, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
+pub use mailbox_view::MailboxView;
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
     MemoryRecallPipeline, NoteCandidate, RerankerObjective, RetrievalCandidate, RrfFusionObjective,
