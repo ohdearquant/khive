@@ -11366,6 +11366,40 @@ mod anonymous_feedback_admission_tests {
     }
 
     #[tokio::test]
+    async fn configured_local_actor_explicit_feedback_is_refused_like_anonymous() {
+        // `actor.id = "local"` names the unattributed pool, not a caller.
+        let (pack, rt) = make_pack_with_actor("local");
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        assert!(
+            !token.actor().is_anonymous(),
+            "test setup: configured actor"
+        );
+        assert!(khive_runtime::actor_is_unattributed(token.actor()));
+        let registry = empty_registry();
+        let target = create_test_entity(&rt, &token).await;
+        let before = feedback_state(&pack, &rt, &token).await;
+        for verb in ["brain.feedback", "brain.auto_feedback"] {
+            for signal in EXPLICIT_SIGNALS {
+                let error = pack
+                    .dispatch(
+                        verb,
+                        feedback_args(verb, &target, signal),
+                        &registry,
+                        &token,
+                    )
+                    .await
+                    .expect_err("unattributed explicit feedback must be refused");
+                assert_anonymous_feedback_refusal(error);
+                assert_eq!(
+                    feedback_state(&pack, &rt, &token).await,
+                    before,
+                    "{verb} {signal}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn anonymous_implicit_feedback_still_emits_and_trains_the_default_profile() {
         for verb in ["brain.feedback", "brain.auto_feedback"] {
             for signal in ["implicit_positive", "implicit_negative"] {
