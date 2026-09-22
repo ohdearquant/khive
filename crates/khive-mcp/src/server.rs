@@ -6640,6 +6640,36 @@ mod tests {
             compute_config_id_with_runtime_policies(&revoked, None, true, false),
             "different caller-enrollment policies must not share one warm daemon"
         );
+        let restricted = |patterns: Vec<String>| RuntimeConfig {
+            gate: Arc::new(khive_runtime::CallerEnrollmentGate::with_write_denials(
+                vec!["lambda:enrolled".into()],
+                false,
+                patterns,
+            )),
+            ..enrolled.clone()
+        };
+        let fingerprint = |config: &RuntimeConfig| {
+            compute_config_id_with_runtime_policies(config, None, true, false)
+        };
+        assert_eq!(fingerprint(&enrolled), fingerprint(&restricted(vec![])));
+        let limited = restricted(vec!["*:duty".into(), "lambda:enrolled".into()]);
+        assert_ne!(
+            fingerprint(&enrolled),
+            fingerprint(&limited),
+            "an unrestricted daemon must not serve a restricted config"
+        );
+        assert_eq!(
+            fingerprint(&limited),
+            fingerprint(&restricted(vec![
+                "lambda:enrolled".into(),
+                "*:duty".into(),
+                "*:duty".into()
+            ]))
+        );
+        assert_ne!(
+            fingerprint(&limited),
+            fingerprint(&restricted(vec!["*".into()]))
+        );
     }
 
     #[test]

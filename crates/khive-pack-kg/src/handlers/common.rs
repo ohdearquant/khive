@@ -91,6 +91,93 @@ pub(crate) fn validate_entity_type(
     Ok(resolved.entity_type)
 }
 
+/// An unpinned filter can represent only one canonical type string. Resolve
+/// through every base kind to avoid choosing an arbitrary cross-kind alias;
+/// different canonical results require the caller to supply `entity_kind`.
+pub(crate) fn validate_entity_type_filter(
+    kind_name: Option<&str>,
+    entity_type: Option<&str>,
+    registry: &VerbRegistry,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(raw) = entity_type else {
+        return Ok(None);
+    };
+    if let Some(kind) = kind_name {
+        return validate_entity_type(kind, Some(raw), registry);
+    }
+
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let matches: Vec<_> = EntityKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            composed
+                .resolve(kind, Some(raw))
+                .ok()?
+                .entity_type
+                .map(|canonical| (kind, canonical))
+        })
+        .collect();
+    let Some((_, canonical)) = matches.first() else {
+        let mut valid: Vec<_> = composed
+            .definitions()
+            .iter()
+            .map(|definition| definition.type_name)
+            .collect();
+        valid.sort_unstable();
+        valid.dedup();
+        return Err(RuntimeError::InvalidInput(format!(
+            "unknown entity_type {raw:?}; valid: {}",
+            valid.join(" | ")
+        )));
+    };
+    if matches.iter().any(|(_, candidate)| candidate != canonical) {
+        let choices = matches
+            .iter()
+            .map(|(kind, entity_type)| format!("{}:{entity_type}", kind.name()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(RuntimeError::InvalidInput(format!(
+            "ambiguous entity_type {raw:?}; specify entity_kind to select: {choices}"
+        )));
+    }
+    Ok(Some(canonical.clone()))
+}
+
+/// Keep alias spellings coupled to their registered kind: the same alias may
+/// name a different canonical type in another kind.
+pub(crate) fn entity_type_filter_matches(
+    kind_name: Option<&str>,
+    canonical: Option<&str>,
+    registry: &VerbRegistry,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let Some(canonical) = canonical else {
+        return Default::default();
+    };
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for definition in composed.definitions() {
+        if definition.type_name != canonical
+            || kind_name.is_some_and(|kind| kind != definition.kind.name())
+        {
+            continue;
+        }
+        let values = groups
+            .entry(definition.kind.name().to_string())
+            .or_default();
+        for spelling in
+            std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
+        {
+            let snake = khive_types::to_snake_case(spelling);
+            values.push(spelling.to_string());
+            values.push(snake.replace('_', "-"));
+            values.push(snake);
+        }
+        values.sort_unstable();
+        values.dedup();
+    }
+    groups
+}
+
 /// Collapse case and separator-style differences (space/hyphen/underscore,
 /// including repeated and leading/trailing separators) so cosmetic
 /// formatting doesn't get flagged as an alias substitution below.

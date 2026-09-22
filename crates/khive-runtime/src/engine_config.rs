@@ -53,6 +53,8 @@ pub enum ConfigError {
 
     #[error("[gate].granted_actors entry {id:?} is not a valid actor id: {reason}")]
     InvalidGrantedActorId { id: String, reason: String },
+    #[error("[gate].deny_writes_for is invalid: {reason}")]
+    InvalidWriteDenyPatterns { reason: String },
 
     #[error("duplicate backend name: {name:?}")]
     DuplicateBackendName { name: String },
@@ -286,6 +288,11 @@ pub struct GateSectionConfig {
     /// Whether the implicit anonymous/local caller is admitted.
     #[serde(default)]
     pub grant_unattributed: bool,
+
+    /// Whole actor-ID patterns denying all but explicitly reviewed reads.
+    /// Case-sensitive; only `*` is a wildcard. Does not enroll a caller.
+    #[serde(default)]
+    pub deny_writes_for: Vec<String>,
 }
 
 // ---- Per-pack backend config (ADR-028) ----
@@ -1257,6 +1264,10 @@ impl KhiveConfig {
         }
 
         if let Some(gate) = &self.gate {
+            khive_gate::CallerEnrollmentGate::validate_write_denials(&gate.deny_writes_for)
+                .map_err(|error| ConfigError::InvalidWriteDenyPatterns {
+                    reason: error.to_string(),
+                })?;
             for id in &gate.granted_actors {
                 if id.is_empty() {
                     return Err(ConfigError::InvalidGrantedActorId {
@@ -2098,17 +2109,16 @@ default = true
         std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
         std::fs::write(
             home_dir.path().join(".khive/config.toml"),
-            "[gate]\ngranted_actors = [\"lambda:enrolled\"]\n",
+            "[gate]\ngranted_actors = [\"lambda:enrolled\"]\ndeny_writes_for = [\"*:duty\"]\n",
         )
         .unwrap();
 
         let loaded = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
             .expect("supported home gate policy loads")
             .expect("home config exists");
-        assert_eq!(
-            loaded.gate.expect("gate table").granted_actors,
-            vec!["lambda:enrolled"]
-        );
+        let gate = loaded.gate.expect("gate table");
+        assert_eq!(gate.granted_actors, vec!["lambda:enrolled"]);
+        assert_eq!(gate.deny_writes_for, vec!["*:duty"]);
 
         let empty = project_dir.path().join("empty-khive-config.toml");
         std::fs::write(&empty, "").unwrap();
@@ -3049,6 +3059,91 @@ grant_unattributed = false
         let err = KhiveConfig::load(Some(&path)).expect_err("unknown gate key must fail");
         assert!(matches!(err, ConfigError::Parse { .. }));
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn write_denials_survive_both_runtime_config_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for engines in [
+            "",
+            "\n[[engines]]\nname = 'main'\nmodel = 'all-minilm-l6-v2'\ndefault = true\n",
+        ] {
+            let path = write_toml(&dir, &format!(
+                "[actor]\nid='seat:duty'\n[gate]\ngranted_actors=['seat:duty','seat:writer']\ndeny_writes_for=['*:duty']\n{engines}"
+            ));
+            let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+            let runtime =
+                crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+            for (actor, verb, allowed) in [
+                ("seat:duty", "list", true),
+                ("seat:duty", "create", false),
+                ("seat:writer", "create", true),
+                ("unlisted", "list", false),
+            ] {
+                let req = crate::GateRequest::new(
+                    crate::ActorRef::new("actor", actor),
+                    Namespace::local(),
+                    verb,
+                    serde_json::Value::Null,
+                );
+                assert_eq!(
+                    runtime.gate.check(&req).unwrap().is_allow(),
+                    allowed,
+                    "{actor} {verb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_write_denials_fail_config_load_and_direct_config_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in [
+            "['']".to_string(),
+            "['   ']".into(),
+            format!("['{}']", "é".repeat(129)),
+            format!("[{}]", vec!["'*'"; 257].join(",")),
+        ] {
+            let path = write_toml(&dir, &format!("[gate]\ndeny_writes_for={value}\n"));
+            let error = KhiveConfig::load(Some(&path)).unwrap_err();
+            assert!(
+                matches!(
+                    config_error_root(&error),
+                    ConfigError::InvalidWriteDenyPatterns { .. }
+                ),
+                "{error}"
+            );
+        }
+        for field in ["deny_write_for=['*']", "deny_writes_for=[17]"] {
+            let path = write_toml(&dir, &format!("[gate]\n{field}\n"));
+            assert!(KhiveConfig::load(Some(&path)).is_err());
+        }
+        let path = write_toml(
+            &dir,
+            "[gate]\ngranted_actors=['writer']\ndeny_writes_for=['用户@*/[?]']\n",
+        );
+        let mut config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        config.gate.as_mut().unwrap().deny_writes_for = vec![String::new()];
+        let runtime = crate::runtime_config_from_khive_config(&config, in_memory_runtime_config());
+        let req = crate::GateRequest::new(
+            crate::ActorRef::new("actor", "writer"),
+            Namespace::local(),
+            "list",
+            serde_json::Value::Null,
+        );
+        assert!(matches!(
+            runtime.gate.check(&req),
+            Err(crate::GateError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn absent_gate_preserves_the_programmatic_gate() {
+        let mut base = in_memory_runtime_config();
+        base.gate = std::sync::Arc::new(crate::CallerEnrollmentGate::new(vec![], false));
+        let configured =
+            crate::runtime_config_from_khive_config(&KhiveConfig::default(), base.clone());
+        assert!(std::sync::Arc::ptr_eq(&base.gate, &configured.gate));
     }
 
     #[test]
