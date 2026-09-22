@@ -4,7 +4,14 @@
 //! supplied at construction time from environment variables; they are never
 //! logged or embedded in source.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use khive_channel::ChannelError;
@@ -393,13 +400,24 @@ impl LettreSmtp {
                 )
             }
         };
+        // A permanent failure while connecting (greeting, EHLO, STARTTLS) is
+        // classified `Auth` too, because it stops the account, but the bearer
+        // has not been offered yet. Only a permanent refusal once the
+        // connection is up, at AUTH, drops the token; a transient failure
+        // leaves it cached.
+        let connect_failed = AtomicBool::new(false);
+        let connect_failed_flag = &connect_failed;
         let result = self
-            .send_message_with_connect(msg, credentials, mechanisms, connect)
+            .send_message_with_connect(msg, credentials, mechanisms, move || async move {
+                let connection = connect().await;
+                connect_failed_flag.store(connection.is_err(), Ordering::Relaxed);
+                connection
+            })
             .await;
-        // `Auth` is the permanent connect/AUTH-stage refusal; a transient
-        // failure leaves the token cached.
         if let (Err(ChannelError::Auth(_)), Some((token_provider, token))) = (&result, oauth) {
-            token_provider.invalidate(&token).await;
+            if !connect_failed.load(Ordering::Relaxed) {
+                token_provider.invalidate(&token).await;
+            }
         }
         result
     }
@@ -840,6 +858,45 @@ mod tests {
             drop(connector);
             assert_eq!(server.finish().await.messages, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn smtp_permanent_refusal_before_auth_keeps_the_cached_token() {
+        let provider = Arc::new(TokenProvider::new("t".into(), "c".into(), "s".into()));
+        provider.cache_for_test("oauth-token").await;
+        let connector = LettreSmtp::new_oauth(
+            "unused.invalid",
+            587,
+            "sender@example.com",
+            Arc::clone(&provider),
+        );
+        let message = build_message(
+            "sender@example.com",
+            "recipient@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // What `connect` returns for a 5xx greeting, EHLO or STARTTLS reply.
+        let err = connector
+            .deliver_message_with_connect(message, || async {
+                Err::<AsyncSmtpConnection, _>(ChannelError::Auth(
+                    "SMTP connection/authentication failed: permanent error (554): no service"
+                        .into(),
+                ))
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChannelError::Auth(_)), "{err:?}");
+        assert_eq!(
+            provider.cached_token_for_test().await.as_deref(),
+            Some("oauth-token"),
+            "the bearer is never offered before AUTH, so a refusal there must not drop it"
+        );
     }
 
     #[tokio::test]

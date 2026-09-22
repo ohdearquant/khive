@@ -255,7 +255,12 @@ impl LiveImap {
                         // poll fetches a new one instead of repeating the
                         // refusal until the cached deadline passes. A lost
                         // connection or an unparsable reply says nothing about
-                        // the token, so it stays cached.
+                        // the token, so it stays cached. Any tagged `NO` to
+                        // AUTHENTICATE counts, a temporary `[UNAVAILABLE]`
+                        // included: providers differ in whether a refused
+                        // bearer carries a response code, and dropping a good
+                        // token costs one refresh where keeping a refused one
+                        // repeats the refusal on every poll.
                         if matches!(e, async_imap::error::Error::No(_)) {
                             token_provider.invalidate(&token).await;
                         }
