@@ -28,6 +28,30 @@ pub type AtomicUnitOp = Box<
         + Send,
 >;
 
+/// Closed set of parameter-free maintenance statements executed outside the
+/// writer's per-request transaction wrapper.
+///
+/// Every variant renders a static SQL literal. Commands that require a caller
+/// value, such as a destination path, need a separate parameter-bound primitive;
+/// this set deliberately has no raw SQL variant or string conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopLevelMaintenance {
+    /// Reclaim unused database pages with `VACUUM`.
+    Vacuum,
+    /// Checkpoint the write-ahead log and truncate it to zero bytes.
+    WalCheckpointTruncate,
+}
+
+impl TopLevelMaintenance {
+    /// Render the reviewed, parameter-free SQL literal for this operation.
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Vacuum => "VACUUM;",
+            Self::WalCheckpointTruncate => "PRAGMA wal_checkpoint(TRUNCATE);",
+        }
+    }
+}
+
 /// Read-capable SQL connection.
 #[async_trait]
 pub trait SqlReader: Send + 'static {
@@ -93,9 +117,9 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     /// not inherit `execute_batch`'s transaction-control rejection.
     async fn execute_script(&mut self, script: String) -> StorageResult<()>;
 
-    /// Execute a raw SQL script that MUST run outside any open transaction
-    /// (ADR-067 Component A, Fork C slice 2) — e.g.
-    /// `VACUUM`, which SQLite rejects if issued inside `BEGIN`/`COMMIT`.
+    /// Execute one closed-set maintenance operation that MUST run outside any
+    /// open transaction (ADR-067 Component A, Fork C slice 2). `VACUUM`, for
+    /// example, is rejected by SQLite inside `BEGIN`/`COMMIT`.
     ///
     /// Default implementation delegates to [`Self::execute_script`]: every
     /// writer implementation in this codebase except khive-db's
@@ -107,10 +131,35 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     /// IMMEDIATE` specifically for this call, while still serializing
     /// through the single writer owner.
     ///
-    /// This is an internal maintenance boundary (for example `VACUUM` or a
-    /// checkpoint script), not an `execute_batch` transaction-control guard.
-    async fn execute_script_top_level(&mut self, script: String) -> StorageResult<()> {
-        self.execute_script(script).await
+    /// SQL is rendered only from [`TopLevelMaintenance`]'s static literals;
+    /// this API does not accept caller-supplied or formatted SQL. It is an
+    /// internal maintenance boundary, not an `execute_batch` transaction-control
+    /// guard. The separate migration-only [`Self::execute_script`] is unchanged.
+    ///
+    /// ```no_run
+    /// use khive_storage::{SqlWriter, StorageResult, TopLevelMaintenance};
+    ///
+    /// async fn maintain(writer: &mut dyn SqlWriter) -> StorageResult<()> {
+    ///     writer.execute_script_top_level(TopLevelMaintenance::Vacuum).await?;
+    ///     writer.execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate).await
+    /// }
+    /// ```
+    ///
+    /// A runtime string cannot cross this boundary, even if its current contents
+    /// happen to be a supported maintenance statement:
+    ///
+    /// ```compile_fail,E0308
+    /// use khive_storage::{SqlWriter, StorageResult};
+    ///
+    /// async fn reject_script(writer: &mut dyn SqlWriter, script: String) -> StorageResult<()> {
+    ///     writer.execute_script_top_level(script).await
+    /// }
+    /// ```
+    async fn execute_script_top_level(
+        &mut self,
+        maintenance: TopLevelMaintenance,
+    ) -> StorageResult<()> {
+        self.execute_script(maintenance.as_sql().to_owned()).await
     }
 }
 
