@@ -174,7 +174,16 @@ its siblings (chain failures do abort the remainder of the chain):
 {
   "results": [
     { "ok": true, "tool": "search", "result": { "...": "..." } },
-    { "ok": false, "tool": "get", "error": "not found: ..." }
+    {
+      "ok": false,
+      "tool": "get",
+      "domain_disposition": "unknown",
+      "error": {
+        "kind": "runtime_error",
+        "message": "not found: ...",
+        "domain_disposition": "unknown"
+      }
+    }
   ],
   "summary": { "total": 2, "succeeded": 1, "failed": 1, "aborted": 0 }
 }
@@ -182,6 +191,22 @@ its siblings (chain failures do abort the remainder of the chain):
 
 `aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
 parallel batches, since parallel failures do not cascade.
+
+Every `ok: false` entry has a required top-level `domain_disposition`. Inspect it
+before retrying: `ok: false` alone does not mean that a write failed to commit.
+
+| `domain_disposition` | Meaning and response                                                                                                                                                                                                                           |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `committed`          | The domain operation completed before a later audit or response failure. Read `error.domain_result` for its canonical result; if the result was omitted for a size/depth limit, read the stored outcome back. Do not repeat the write blindly. |
+| `not_committed`      | This operation has a proven pre-dispatch refusal or another explicitly proven no-write outcome. Aborted chain operations always have this value.                                                                                               |
+| `unknown`            | The operation's effects are not established. Reconcile by a known operation/record identity before deciding whether to retry.                                                                                                                  |
+
+Non-aborted failures retain an `error` object, whose `domain_disposition` matches
+the entry-level field. Aborted entries have no `error` object. A required audit
+append failure after a committed write still counts as failed and keeps `ok: false`;
+the new entry-level field makes that committed outcome visible beside `ok`.
+Presentation and daemon frame-budget omission preserve this disposition. See
+[ADR-133 Amendment 3](../adr/ADR-133-incidental-writes-off-the-request-hot-path.md#a31-the-error-carries-a-machine-readable-domain-disposition).
 
 A successful entry can also carry a transport-owned `advisories` array beside `result`.
 These warnings describe execution context without changing the verb's canonical result or
