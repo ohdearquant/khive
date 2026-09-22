@@ -215,6 +215,30 @@ pub(crate) struct StoreParams {
     pub tags: Option<Vec<String>>,
 }
 
+impl StoreParams {
+    /// Shared pure creation validator for the specialized and generic writers.
+    pub(crate) fn validate(&self, verb: &str) -> Result<(), RuntimeError> {
+        if self.content.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{verb}: content must not be empty"
+            )));
+        }
+        require_non_empty_if_present(&self.title, "title", verb)?;
+        require_non_empty_if_present(&self.provider, "provider", verb)?;
+        require_non_empty_if_present(&self.provider_session_id, "provider_session_id", verb)?;
+        if self
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.iter().any(|tag| tag.trim().is_empty()))
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{verb}: tags entries must be non-empty strings"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListParams {

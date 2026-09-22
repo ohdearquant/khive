@@ -13882,6 +13882,148 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
     );
 }
 
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn channel_health_update_refuses_coordinate_patches_and_preserves_heartbeat_identity() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "identity@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "failure",
+        "error_class": "transient",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed health through its owning writer");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read seeded health row");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+
+    for (key, original, replacement) in [
+        ("channel_kind", "email", "telegram"),
+        ("channel_slug", "identity@example.com", "other@example.com"),
+    ] {
+        for value in [
+            serde_json::json!(replacement),
+            serde_json::Value::Null,
+            serde_json::json!(original),
+        ] {
+            let error = registry
+                .dispatch(
+                    "update",
+                    serde_json::json!({
+                        "id": before.id.to_string(),
+                        "properties": {key: value, "operator_note": "must not commit"},
+                    }),
+                )
+                .await
+                .expect_err("naming a health coordinate must be refused");
+            let message = error.to_string();
+            assert!(message.contains(key), "refusal must name {key}: {message}");
+            assert!(message.contains("comm.heartbeat"), "{message}");
+            assert_eq!(
+                runtime
+                    .get_note_including_deleted(&token, before.id)
+                    .await
+                    .expect("read after refused update")
+                    .as_ref(),
+                Some(before),
+                "a refused patch must leave the entire stored row unchanged"
+            );
+        }
+    }
+
+    // Namespace selects dispatch attribution; it cannot relocate this by-id target.
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({
+                "id": before.id.to_string(),
+                "namespace": "other-namespace",
+                "properties": {"operator_note": "checked"},
+            }),
+        )
+        .await
+        .expect("a non-coordinate property remains editable");
+    let updated = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read positive control")
+        .expect("health row remains present");
+    assert_eq!(updated.namespace, before.namespace);
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["operator_note"],
+        "checked"
+    );
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["channel_kind"],
+        "email"
+    );
+    assert_eq!(
+        updated.properties.as_ref().unwrap()["channel_slug"],
+        "identity@example.com"
+    );
+
+    registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect("the owning writer still updates the same row");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read health after another heartbeat");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, before.id);
+    assert_eq!(rows[0].created_at, before.created_at);
+    assert_eq!(
+        rows[0].properties.as_ref().unwrap()["consecutive_failures"],
+        2
+    );
+    assert_eq!(
+        rows[0].properties.as_ref().unwrap()["operator_note"],
+        "checked"
+    );
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("public health projection remains coherent");
+    let channels = health["channels"].as_array().expect("channel array");
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0]["channel_kind"], "email");
+    assert_eq!(channels[0]["channel_slug"], "identity@example.com");
+}
+
+#[tokio::test]
+async fn channel_health_update_coordinate_names_remain_editable_on_ordinary_notes() {
+    let (registry, _runtime) = build_registry_for_ns("local");
+    let note = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "coordinate name control"}),
+        )
+        .await
+        .expect("create ordinary note");
+    let updated = registry
+        .dispatch(
+            "update",
+            serde_json::json!({
+                "id": note["id"],
+                "properties": {"channel_kind": "custom", "channel_slug": "custom-slug"},
+            }),
+        )
+        .await
+        .expect("health coordinates are ordinary metadata on other note kinds");
+    assert_eq!(updated["properties"]["channel_kind"], "custom");
+    assert_eq!(updated["properties"]["channel_slug"], "custom-slug");
+}
+
 /// Issue #2974. Standalone `stream.append` is another creation route that accepts a
 /// caller-selected note kind, so it must consult the owning hook before writing. The ordinary
 /// observation control remains admitted, and two heartbeats for one channel still address one
