@@ -123,10 +123,15 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "remote": remote,
             "message": message,
         }),
+        missing @ RuntimeError::NotFound(_) => json!({
+            "kind": "not_found",
+            "code": null,
+            "details": null,
+            "message": missing.to_string(),
+        }),
         other @ (RuntimeError::Storage(_)
         | RuntimeError::Sqlite(_)
         | RuntimeError::Query(_)
-        | RuntimeError::NotFound(_)
         | RuntimeError::InvalidInput(_)
         | RuntimeError::UnknownVerb(_)
         | RuntimeError::Unconfigured(_)
@@ -201,6 +206,27 @@ mod tests {
     use khive_storage::StorageCapability;
     use khive_types::{Details, ErrorCode, ErrorDomain, KhiveError};
     use serde_json::json;
+
+    #[test]
+    fn missing_subject_projection_is_typed_without_matching_error_text() {
+        for disposition in [DomainDisposition::Unknown, DomainDisposition::NotCommitted] {
+            let error = RuntimeError::NotFound("subject missing".into());
+            let message = error.to_string();
+            let value = runtime_error_value(error, disposition);
+            assert_eq!(value["kind"], "not_found");
+            assert_eq!(value.get("code"), Some(&serde_json::Value::Null));
+            assert_eq!(value.get("details"), Some(&serde_json::Value::Null));
+            assert_eq!(value["message"], message);
+            assert_eq!(value["domain_disposition"], disposition.as_str());
+        }
+        for error in [
+            RuntimeError::Internal("not found: damaged store index".into()),
+            RuntimeError::InvalidInput("not found: malformed reference".into()),
+        ] {
+            let value = runtime_error_value(error, DomainDisposition::Unknown);
+            assert_eq!(value["kind"], "runtime_error");
+        }
+    }
 
     #[test]
     fn projection_preserves_structured_source_fields_and_serialized_bytes() {

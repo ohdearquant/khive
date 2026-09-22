@@ -2381,7 +2381,8 @@ impl VerbRegistry {
         let gate_req = self
             .gate_request_with_identity(verb, params, identity)
             .map_err(DispatchError::before_dispatch)?;
-        let mut deferred_audit = match self.gate.check(&gate_req) {
+        let gate_decision = khive_gate::check_with_mailbox_policy(self.gate.as_ref(), &gate_req);
+        let mut deferred_audit = match gate_decision {
             Ok(decision) => {
                 let audit = masked_audit_event(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
@@ -2610,7 +2611,9 @@ impl VerbRegistry {
         // GateRequest.args deliberately captures submitted dispatch arguments.
         // The handler's canonicalization and kind hooks have not run; a policy
         // requiring their effective values belongs after that handler work.
-        Ok(GateRequest::new(actor, namespace, verb, params.clone()))
+        let req = GateRequest::new(actor, namespace, verb, params.clone());
+        crate::mailbox_view::validate_mailbox_request(&req)?;
+        Ok(req)
     }
 
     async fn gate_unavailable_error(
@@ -2746,7 +2749,8 @@ impl VerbRegistry {
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
         // - Err(_) → emit an outage audit and return GateUnavailable.
-        let (gate_blocked, mut deferred_audit) = match self.gate.check(&gate_req) {
+        let gate_decision = khive_gate::check_with_mailbox_policy(self.gate.as_ref(), &gate_req);
+        let (gate_blocked, mut deferred_audit) = match gate_decision {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
@@ -4577,11 +4581,8 @@ pub(crate) fn audit_append_failure_count() -> u64 {
 static AUDIT_OBLIGATION_APPEND_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Test-only reader: no production caller needs this counter today (unlike
-/// [`audit_append_failure_count`], which `KhiveRuntime::db_diagnostics`
-/// surfaces), but the mechanism tests need to observe it directly to prove
-/// obligation and swallowed failures land on disjoint counters.
-#[cfg(test)]
+/// Runtime diagnostics exposes this process-wide counter separately from
+/// swallowed audit errors and batch-generation failures (#2784).
 pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -9865,6 +9866,27 @@ pub(crate) mod tests {
             audit_obligation_append_failure_count(),
             before_obligation + 1
         );
+        // #2784: the same real sink failure must be discoverable through the
+        // public diagnostics report, not only this private counter accessor.
+        let runtime = crate::KhiveRuntime::memory().expect("diagnostics runtime");
+        let report = runtime
+            .db_diagnostics()
+            .await
+            .expect("diagnostics after audit failure");
+        assert_eq!(
+            report.writer_contention.audit_obligation_append_failures,
+            Some(before_obligation + 1)
+        );
+        assert_eq!(report.writer_contention.audit_append_failures, Some(before));
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_none());
+        let json = serde_json::to_value(report).expect("serialized diagnostics");
+        assert_eq!(
+            json["writer_contention"]["audit_obligation_append_failures"],
+            before_obligation + 1
+        );
     }
 
     #[tokio::test]
@@ -11313,6 +11335,257 @@ pub(crate) mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.verb, "list");
         assert_eq!(ev.outcome, EventOutcome::Denied);
+    }
+
+    #[derive(Debug)]
+    struct MailboxTrackingPack {
+        invoked: Arc<AtomicUsize>,
+    }
+
+    impl Pack for MailboxTrackingPack {
+        const NAME: &'static str = "mailbox_tracking";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
+                name: "comm.inbox",
+                description: "mailbox admission probe",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "comm.thread",
+                description: "mailbox admission probe",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+    }
+
+    #[async_trait]
+    impl PackRuntime for MailboxTrackingPack {
+        fn name(&self) -> &str {
+            "mailbox_tracking"
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.invoked.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"actor":token.actor().id}))
+        }
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn gate_mailbox_normal_and_intercepted_default_deny_audit_real_caller() {
+        let store = Arc::new(MemoryEventStore::default());
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(MailboxTrackingPack {
+            invoked: invoked.clone(),
+        });
+        builder.with_event_store(store.clone());
+        builder.with_actor_id(Some("lambda:owner".into()));
+        let registry = builder.build().unwrap();
+        let identity = RequestIdentity {
+            actor_id: Some("lambda:reader".into()),
+            namespace: "local".into(),
+            ..Default::default()
+        };
+        for verb in ["comm.inbox", "comm.thread"] {
+            for namespace in ["local", "lambda:owner"] {
+                let args = serde_json::json!({"mailbox_actor":"lambda:owner", "namespace":namespace, "actor":"lambda:owner"});
+                let error = registry
+                    .dispatch_with_identity(verb, args.clone(), Some(identity.clone()))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, RuntimeError::PermissionDenied { reason, .. } if reason == "mailbox_read_not_granted")
+                );
+                let error = registry
+                    .dispatch_intercepted_with_metadata_and_disposition(
+                        verb,
+                        &args,
+                        Some(&identity),
+                        |_| async {
+                            invoked.fetch_add(1, Ordering::SeqCst);
+                            Ok(InterceptedDispatchResult::new(Value::Null, ()))
+                        },
+                    )
+                    .await
+                    .unwrap_err()
+                    .into_source();
+                assert!(
+                    matches!(error, RuntimeError::PermissionDenied { reason, .. } if reason == "mailbox_read_not_granted")
+                );
+            }
+        }
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        let events = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 20,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(events.len(), 8);
+        for event in events {
+            assert_eq!(event.actor, "actor:lambda:reader");
+            assert_eq!(event.outcome, EventOutcome::Denied);
+            assert_eq!(event.payload["actor"]["id"], "lambda:reader");
+            assert_eq!(event.payload["deny_reason"], "mailbox_read_not_granted");
+        }
+        // A positive own-view control proves the ordinary handler is present.
+        let value = registry
+            .dispatch_with_identity("comm.inbox", serde_json::json!({}), Some(identity.clone()))
+            .await
+            .unwrap();
+        assert_eq!(value["actor"], "lambda:reader");
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+        for args in [
+            serde_json::json!({"mailbox_actor":null}),
+            serde_json::json!({"mailbox_actor":"local"}),
+        ] {
+            assert!(matches!(
+                registry
+                    .dispatch_with_identity("comm.inbox", args.clone(), Some(identity.clone()))
+                    .await,
+                Err(RuntimeError::InvalidInput(_))
+            ));
+            let error = registry
+                .dispatch_intercepted_with_metadata_and_disposition(
+                    "comm.inbox",
+                    &args,
+                    Some(&identity),
+                    |_| async {
+                        invoked.fetch_add(1, Ordering::SeqCst);
+                        Ok(InterceptedDispatchResult::new(Value::Null, ()))
+                    },
+                )
+                .await
+                .unwrap_err()
+                .into_source();
+            assert!(matches!(error, RuntimeError::InvalidInput(_)));
+        }
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial(config_ledger)]
+    async fn gate_mailbox_granted_dispatch_keeps_caller_and_backend_error_fails_closed() {
+        #[derive(Debug)]
+        struct BrokenMailboxGate;
+        impl Gate for BrokenMailboxGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::allow())
+            }
+            fn check_mailbox_read(
+                &self,
+                _req: &GateRequest,
+                _owner: &khive_gate::ActorRef,
+            ) -> Result<GateDecision, GateError> {
+                Err(GateError::Internal("private policy outage".into()))
+            }
+        }
+        let identity = RequestIdentity {
+            actor_id: Some("lambda:reader".into()),
+            namespace: "local".into(),
+            ..Default::default()
+        };
+        let args = serde_json::json!({"mailbox_actor":"lambda:owner"});
+        let gate: GateRef = Arc::new(
+            khive_gate::MailboxReadGate::new(
+                Arc::new(AllowAllGate),
+                khive_gate::ActorRef::new("actor", "lambda:owner"),
+                vec![khive_gate::ActorRef::new("actor", "lambda:reader")],
+            )
+            .unwrap(),
+        );
+        for (gate, allowed) in [
+            (gate, true),
+            (Arc::new(BrokenMailboxGate) as GateRef, false),
+        ] {
+            let store = Arc::new(MemoryEventStore::default());
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(MailboxTrackingPack {
+                invoked: invoked.clone(),
+            });
+            builder.with_actor_id(Some("lambda:owner".into()));
+            builder.with_gate(gate);
+            builder.with_event_store(store.clone());
+            let registry = builder.build().unwrap();
+            let normal = registry
+                .dispatch_with_identity("comm.inbox", args.clone(), Some(identity.clone()))
+                .await;
+            let intercepted = registry
+                .dispatch_intercepted_with_metadata_and_disposition(
+                    "comm.thread",
+                    &args,
+                    Some(&identity),
+                    |_| async {
+                        invoked.fetch_add(1, Ordering::SeqCst);
+                        Ok(InterceptedDispatchResult::new(Value::Null, ()))
+                    },
+                )
+                .await
+                .map_err(DispatchError::into_source);
+            if allowed {
+                assert_eq!(normal.unwrap()["actor"], "lambda:reader");
+                intercepted.unwrap();
+                assert_eq!(invoked.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(
+                    matches!(normal.unwrap_err(), RuntimeError::GateUnavailable { reason, .. } if reason == "gate backend unavailable")
+                );
+                assert!(
+                    matches!(intercepted.unwrap_err(), RuntimeError::GateUnavailable { reason, .. } if reason == "gate backend unavailable")
+                );
+                assert_eq!(invoked.load(Ordering::SeqCst), 0);
+            }
+            let events = store
+                .query_events(
+                    EventFilter::default(),
+                    PageRequest {
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
+            assert_eq!(events.len(), 2);
+            for event in events {
+                assert_eq!(event.actor, "actor:lambda:reader");
+                assert_eq!(
+                    event.outcome,
+                    if allowed {
+                        EventOutcome::Success
+                    } else {
+                        EventOutcome::Error
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]
