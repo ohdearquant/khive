@@ -164,10 +164,13 @@ pub(crate) fn entity_type_filter_matches(
         let values = groups
             .entry(definition.kind.name().to_string())
             .or_default();
-        values.push(canonical.to_string());
-        for alias in definition.aliases {
-            values.push((*alias).to_string());
-            values.push(khive_types::to_snake_case(alias));
+        for spelling in
+            std::iter::once(definition.type_name).chain(definition.aliases.iter().copied())
+        {
+            let snake = khive_types::to_snake_case(spelling);
+            values.push(spelling.to_string());
+            values.push(snake.replace('_', "-"));
+            values.push(snake);
         }
         values.sort_unstable();
         values.dedup();

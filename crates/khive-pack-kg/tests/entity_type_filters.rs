@@ -352,6 +352,55 @@ async fn list_entity_type_aliases_match_legacy_rows_before_every_pagination_mode
 }
 
 #[tokio::test]
+async fn list_aliasless_kebab_property_type_matches_before_every_pagination_mode() {
+    let registry = registry(false);
+    let report = create_property_typed_entity(&registry, "document", "research-report", None).await;
+    // Must-FAIL control: remove canonical kebab expansion while retaining this
+    // legacy row; both canonical selectors then return zero instead of one.
+    for kind in [None, Some("document")] {
+        for raw in ["research-report", "research_report"] {
+            assert_eq!(
+                filtered_ids(&registry, "list", kind, raw).await,
+                vec![report.clone()]
+            );
+            for tags in [None, Some(json!([])), Some(json!(["alias-witness"]))] {
+                for cursor in [false, true] {
+                    let mut params = filter_params("list", kind, raw);
+                    params["limit"] = json!(1);
+                    if let Some(tags) = &tags {
+                        params["tags"] = tags.clone();
+                    }
+                    if cursor {
+                        params["after"] = json!("");
+                    } else {
+                        params["offset"] = json!(0);
+                    }
+                    let page = registry.dispatch("list", params).await.unwrap();
+                    let items = page[if cursor { "entities" } else { "items" }]
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(items.len(), 1, "{page}");
+                    assert_eq!(items[0]["id"], report);
+                    if cursor {
+                        assert!(page["next_after"].is_null(), "{page}");
+                    }
+                }
+            }
+            // This repair retains search's exact typed-column contract.
+            assert!(filtered_ids(&registry, "search", kind, raw)
+                .await
+                .is_empty());
+        }
+    }
+    let row = registry
+        .dispatch("get", json!({"id": report}))
+        .await
+        .unwrap();
+    assert!(row["entity_type"].is_null());
+    assert_eq!(row["properties"]["type"], "research-report");
+}
+
+#[tokio::test]
 async fn list_alias_groups_do_not_cross_kind_when_legacy_spellings_overlap() {
     let registry = registry(true);
     let document =
