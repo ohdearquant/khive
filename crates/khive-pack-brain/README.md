@@ -51,6 +51,14 @@ event counts additionally require `all_actors=true` and a serving-runtime
 [API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
 for the exact actor filters and anonymous-caller behavior.
 
+Explicit and correction feedback requires an attributed caller. An anonymous
+caller receives a typed `invalid_input` error before feedback writes, even when
+the profile would resolve through the default. Configure `actor.id` to submit
+these judgments. Implicit anonymous signals keep their existing admission rules;
+omitting the signal from `brain.auto_feedback` still abstains. This admission
+change applies to new writes: historical anonymous events and their existing
+posterior effects are retained, with no automatic deletion or retraining.
+
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:
 
