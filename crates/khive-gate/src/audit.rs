@@ -30,6 +30,13 @@ pub struct AuditEvent {
     /// Correlation token — `GateContext::session_id` when present, else `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Original request parser position, not completion order. Unknown outside
+    /// a composed-request scope and in historical envelopes.
+    #[serde(default)]
+    pub op_index: Option<u32>,
+    /// Reference provenance; absent together with `op_index` when unknown.
+    #[serde(default)]
+    pub ref_resolution: Option<khive_types::RefResolution>,
 }
 
 /// The outcome field of an [`AuditEvent`].
@@ -42,6 +49,17 @@ pub enum AuditDecision {
 }
 
 impl AuditEvent {
+    /// Attach provenance established by a request runner. A direct gate
+    /// consultation without that scope explicitly remains unattributed.
+    pub fn with_operation_attribution(
+        mut self,
+        operation: Option<khive_types::OperationAttribution>,
+    ) -> Self {
+        self.op_index = operation.map(|operation| operation.op_index);
+        self.ref_resolution = operation.map(|operation| operation.ref_resolution);
+        self
+    }
+
     /// Project one request/decision pair into a timestamped stable audit envelope.
     ///
     /// See `crates/khive-gate/docs/api/audit-events.md`.
@@ -64,6 +82,8 @@ impl AuditEvent {
             obligations,
             gate_impl: gate_impl.to_string(),
             session_id: req.context.session_id.clone(),
+            op_index: None,
+            ref_resolution: None,
         }
     }
 
@@ -79,6 +99,47 @@ impl AuditEvent {
             obligations: Vec::new(),
             gate_impl: gate_impl.to_string(),
             session_id: req.context.session_id.clone(),
+            op_index: None,
+            ref_resolution: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use khive_types::{OperationAttribution, RefResolution};
+
+    #[test]
+    fn audit_operation_fields_are_closed_and_legacy_absence_stays_unknown() {
+        let request = crate::GateRequest::new(
+            crate::ActorRef::anonymous(),
+            khive_types::Namespace::local(),
+            "get",
+            serde_json::json!({}),
+        );
+        let direct = AuditEvent::from_check(
+            &request,
+            &GateDecision::Allow {
+                obligations: vec![],
+            },
+            "test",
+        );
+        assert_eq!((direct.op_index, direct.ref_resolution), (None, None));
+        let mut old = serde_json::to_value(&direct).unwrap();
+        old.as_object_mut().unwrap().remove("op_index");
+        old.as_object_mut().unwrap().remove("ref_resolution");
+        let legacy: AuditEvent = serde_json::from_value(old).unwrap();
+        assert_eq!((legacy.op_index, legacy.ref_resolution), (None, None));
+
+        let attributed = direct.with_operation_attribution(Some(OperationAttribution {
+            op_index: 3,
+            ref_resolution: RefResolution::Resolved,
+        }));
+        let mut value = serde_json::to_value(attributed).unwrap();
+        assert_eq!(value["op_index"], 3);
+        assert_eq!(value["ref_resolution"], "resolved");
+        value["ref_resolution"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<AuditEvent>(value).is_err());
     }
 }

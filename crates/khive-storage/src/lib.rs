@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod graph;
 pub mod note;
+pub mod operation_context;
 pub mod request_context;
 pub mod sparse;
 pub mod sql;

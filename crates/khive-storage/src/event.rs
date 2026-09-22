@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_types::{EventKind, EventOutcome, SubstrateKind};
+use khive_types::{EventKind, EventOutcome, RefResolution, SubstrateKind};
 
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
@@ -31,6 +31,12 @@ pub struct Event {
     pub aggregate_kind: Option<String>,
     pub aggregate_id: Option<Uuid>,
     pub created_at: i64,
+    /// Original request parser position; absent for legacy/non-request events.
+    #[serde(default)]
+    pub op_index: Option<u32>,
+    /// Reference provenance, present exactly when `op_index` is present.
+    #[serde(default)]
+    pub ref_resolution: Option<RefResolution>,
 }
 
 impl Event {
@@ -42,6 +48,7 @@ impl Event {
         substrate: SubstrateKind,
         actor: impl Into<String>,
     ) -> Self {
+        let operation = crate::operation_context::current_operation_attribution();
         Self {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
@@ -59,6 +66,8 @@ impl Event {
             aggregate_kind: None,
             aggregate_id: None,
             created_at: chrono::Utc::now().timestamp_micros(),
+            op_index: operation.map(|operation| operation.op_index),
+            ref_resolution: operation.map(|operation| operation.ref_resolution),
         }
     }
 

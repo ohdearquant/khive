@@ -45,6 +45,14 @@ pub(crate) fn build_conditional_event_insert(event: &Event) -> SqlStatement {
             None => SqlValue::Null,
         },
         SqlValue::Integer(event.created_at),
+        event
+            .op_index
+            .map(|value| SqlValue::Integer(i64::from(value)))
+            .unwrap_or(SqlValue::Null),
+        event
+            .ref_resolution
+            .map(|value| SqlValue::Text(value.name().into()))
+            .unwrap_or(SqlValue::Null),
     ];
     SqlStatement {
         sql: sql!("events_insert_if_changed").to_string(),

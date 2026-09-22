@@ -4425,3 +4425,39 @@ fn event_store_ddl_upgrades_existing_event_indexes_idempotently() {
     ).unwrap();
     assert!(exists);
 }
+
+#[test]
+fn event_operation_attribution_upgrade_keeps_legacy_rows_unknown() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 35);
+    conn.execute(
+        r#"INSERT INTO events (id, namespace, verb, substrate, actor, outcome, payload, created_at)
+         VALUES ('legacy-operation', 'local', 'search', 'entity', 'test', 'success', '{"legacy":true}', 123)"#,
+        [],
+    ).unwrap();
+    run_migrations(&mut conn).unwrap();
+    let row: (String, i64, Option<u32>, Option<String>) = conn.query_row(
+        "SELECT payload, created_at, op_index, ref_resolution FROM events WHERE id = 'legacy-operation'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(row, (r#"{"legacy":true}"#.to_string(), 123, None, None));
+    for (index, resolution) in [
+        (Some(-1_i64), Some("literal")),
+        (Some(4_294_967_296), Some("literal")),
+        (Some(0), Some("unknown")),
+        (Some(0), None),
+        (None, Some("literal")),
+    ] {
+        assert!(conn.execute(
+            "UPDATE events SET op_index = ?1, ref_resolution = ?2 WHERE id = 'legacy-operation'",
+            rusqlite::params![index, resolution],
+        ).is_err());
+    }
+    conn.execute(
+        "UPDATE events SET op_index = 0, ref_resolution = 'literal' WHERE id = 'legacy-operation'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}

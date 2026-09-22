@@ -2356,7 +2356,13 @@ impl KhiveMcpServer {
                         // per op; the entry is stamped with the frozen usage
                         // snapshot after dispatch resolves.
                         let usage_ctx = khive_runtime::usage::UsageContext::new();
-                        let mut entry = khive_runtime::usage::scope(usage_ctx.clone(), async {
+                        let operation = khive_types::OperationAttribution {
+                            op_index: u32::try_from(i).expect("parser bounds operation count"),
+                            ref_resolution: khive_types::RefResolution::Literal,
+                        };
+                        let mut entry = khive_storage::operation_context::scope_operation_attribution(
+                            operation,
+                            khive_runtime::usage::scope(usage_ctx.clone(), async {
                         let tool = op.tool.clone();
                         // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
@@ -2472,7 +2478,7 @@ impl KhiveMcpServer {
                                 DispatchFailure::from_dispatch(&tool, error).into_entry()
                             }
                         }
-                        })
+                        }))
                         .await;
                         stamp_usage(&mut entry, &usage_ctx);
                         entry
@@ -2523,9 +2529,24 @@ impl KhiveMcpServer {
                             op_mode
                         };
                     let usage_ctx = khive_runtime::usage::UsageContext::new();
-                    match khive_runtime::usage::scope(
-                        usage_ctx.clone(),
-                        self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                    let operation = khive_types::OperationAttribution {
+                        op_index: u32::try_from(i).expect("parser bounds operation count"),
+                        ref_resolution: if op
+                            .args
+                            .values()
+                            .any(|arg| !matches!(arg, ArgValue::Value(_)))
+                        {
+                            khive_types::RefResolution::Resolved
+                        } else {
+                            khive_types::RefResolution::Literal
+                        },
+                    };
+                    match khive_storage::operation_context::scope_operation_attribution(
+                        operation,
+                        khive_runtime::usage::scope(
+                            usage_ctx.clone(),
+                            self.dispatch_op(op, prev_result.as_ref(), from_wire, identity),
+                        ),
                     )
                     .await
                     {
@@ -12757,3 +12778,7 @@ mod issue_2537_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server_operation_attribution_tests.rs"]
+mod operation_attribution_tests;

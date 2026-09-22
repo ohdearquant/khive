@@ -29,6 +29,64 @@ fn make_event(namespace: &str) -> Event {
 }
 
 #[tokio::test]
+async fn operation_attribution_round_trips_and_changes_idempotent_identity() {
+    use khive_storage::operation_context::scope_operation_attribution;
+    use khive_types::{OperationAttribution, RefResolution};
+
+    let store = setup_memory_store();
+    let direct = make_event("default");
+    assert_eq!((direct.op_index, direct.ref_resolution), (None, None));
+    store.append_event(direct.clone()).await.unwrap();
+
+    let attributed = scope_operation_attribution(
+        OperationAttribution {
+            op_index: u32::MAX,
+            ref_resolution: RefResolution::Resolved,
+        },
+        async { make_event("default") },
+    )
+    .await;
+    store.append_event(attributed.clone()).await.unwrap();
+    for expected in [&direct, &attributed] {
+        let stored = store.get_event(expected.id).await.unwrap().unwrap();
+        assert_eq!(&stored, expected);
+    }
+    let page = store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.items.contains(&direct));
+    assert!(page.items.contains(&attributed));
+
+    let mut changed = attributed;
+    changed.op_index = Some(0);
+    let result = store.append_events_idempotent(vec![changed]).await.unwrap();
+    assert_eq!(result.rows[0], EventAppendDisposition::IdentityConflict);
+}
+
+#[tokio::test]
+async fn operation_attribution_rejects_unpaired_values_before_append() {
+    let store = setup_memory_store();
+    for (op_index, ref_resolution) in [
+        (Some(0), None),
+        (None, Some(khive_types::RefResolution::Literal)),
+    ] {
+        let mut event = make_event("default");
+        event.op_index = op_index;
+        event.ref_resolution = ref_resolution;
+        assert!(store.preflight_event(&event).is_err());
+        assert!(store.append_event(event).await.is_err());
+    }
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn test_append_and_get_event() {
     let store = setup_memory_store();
 

@@ -461,7 +461,19 @@ pub(crate) async fn execute_atomic_ops_file(
     // without re-parsing the ops file.
     let mut resolved_args_list: Vec<Value> = Vec::with_capacity(ops.len());
     for (op_index, op) in ops.iter().enumerate() {
-        match prepare_one(&runtime, &token, &verb_registry, &op.tool, &op.args).await {
+        // Prepared event statements keep parser provenance when the atomic
+        // writer later executes outside this request scope. Ops-file values are
+        // literal; reference-bearing inputs are rejected by its parser.
+        let operation = khive_types::OperationAttribution {
+            op_index: u32::try_from(op_index).expect("ops-file bounds operation count"),
+            ref_resolution: khive_types::RefResolution::Literal,
+        };
+        match khive_storage::operation_context::scope_operation_attribution(
+            operation,
+            prepare_one(&runtime, &token, &verb_registry, &op.tool, &op.args),
+        )
+        .await
+        {
             Ok((plan, resolved_args)) => {
                 plans.push(plan);
                 resolved_args_list.push(resolved_args);

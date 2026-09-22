@@ -164,6 +164,7 @@ const V32_UP: &str = include_str!("../sql/032-knowledge-count-indexes.sql");
 const V33_UP: &str = include_str!("../sql/033-notes-message-recipient-direction.sql");
 const V34_UP: &str = include_str!("../sql/034-notes-namespace-created.sql");
 const V35_UP: &str = include_str!("../sql/035-notes-unread-probe-recipient-type-direction.sql");
+const V36_UP: &str = include_str!("../sql/036-events-operation-attribution.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -394,6 +395,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 35,
         name: "notes_unread_probe_recipient_type_direction",
         up: V35_UP,
+    },
+    VersionedMigration {
+        version: 36,
+        name: "events_operation_attribution",
+        up: V36_UP,
     },
 ];
 
