@@ -84,7 +84,24 @@ impl KgPack {
         // rows — required both for `include_deleted=true` and for the
         // merged_into disclosure below (absorbed entities are soft-deleted, so
         // a live-only prefix scan would miss them before the hint could fire).
-        let id = match resolve_id_through_arms(id_ref, &self.runtime, graph_token, token).await? {
+        let resolved_id = if let Ok(id) = Uuid::parse_str(id_ref) {
+            Some(id)
+        } else if id_ref.len() >= 8 && id_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+            match registry
+                .resolve_kg_read_prefix(&self.runtime, token, id_ref, false)
+                .await?
+            {
+                Some(id) => Some(id),
+                None => {
+                    registry
+                        .resolve_kg_read_prefix(&self.runtime, token, id_ref, true)
+                        .await?
+                }
+            }
+        } else {
+            resolve_id_through_arms(id_ref, &self.runtime, graph_token, token).await?
+        };
+        let id = match resolved_id {
             Some(id) => id,
             None => {
                 if let Some(payload_val) = self.try_get_proposal_payload(token, id_ref).await? {
@@ -95,6 +112,42 @@ impl KgPack {
         };
 
         let include_deleted = p.include_deleted.unwrap_or(false);
+
+        // Search fan-out can return a KG record from another configured pack
+        // backend. Resolve only this read across that inventory; the runtime's
+        // local mutation APIs and pack-private resolver arms stay unchanged.
+        let live = registry
+            .resolve_kg_read_by_id(&self.runtime, token, id, false)
+            .await?;
+        let resolved = if live.is_none() && include_deleted {
+            registry
+                .resolve_kg_read_by_id(&self.runtime, token, id, true)
+                .await?
+                .filter(|record| match record {
+                    Resolved::Entity(entity) => {
+                        entity.namespace == graph_token.namespace().as_str()
+                    }
+                    Resolved::Note(note) => note.namespace == token.namespace().as_str(),
+                    _ => false,
+                })
+        } else {
+            live
+        };
+        match resolved {
+            Some(Resolved::Entity(entity)) => {
+                return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?))
+            }
+            Some(Resolved::Note(note)) => {
+                return flatten_get_result(
+                    "note",
+                    parse_note_content(
+                        remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
+                        p.parse_content,
+                    )?,
+                )
+            }
+            _ => {}
+        }
 
         // Interim merged_into disclosure (data-integrity, precedes the full
         // ADR-113 redirect chase): `get_entity` names the kept id in its

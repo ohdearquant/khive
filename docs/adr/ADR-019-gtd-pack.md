@@ -794,7 +794,8 @@ a replacement `created_at`/`updated_at` from `archived_at` or rewrite dates duri
 reads or lifecycle validation. Any manual repair requires independently verified
 source timestamps/units, an operator-reviewed correction, and preserved original
 values; this amendment supplies neither an automatic repair nor speculative
-timestamp diagnostics.
+timestamp diagnostics. The later Amendment 4 permits only an evidence census;
+the repair deferral remains in force.
 
 ## Amendment 3 (proposed, 2026-09-14): additive task-query filters (#2678)
 
@@ -830,3 +831,55 @@ the status predicate. Unrelated terminal tasks must not cause `filter_excluded`
 to appear. Ordinary results remain arrays; the existing special empty-result
 object remains limited to a matching excluded task. No response-envelope
 migration or storage migration is part of this amendment.
+
+## Amendment 4 (2026-09-22): read-only timestamp evidence census (#2394)
+
+The status boundaries in Amendment 2 stand unchanged. Historical timestamp
+conversion and repair remain deferred. This amendment permits only a read-only
+`gtd.census` verb that counts raw value shapes on the bound runtime notes backend.
+It does not close the outstanding timestamp repair question.
+
+The verb takes no business parameters; the shared `namespace` routing argument
+retains its existing meaning. It counts live (`deleted_at IS NULL`) task notes in
+the caller-visible namespaces, regardless of their lifecycle status. Explicit
+namespace routing restricts that query scope. It returns counts, not row IDs,
+payloads, candidate replacement dates, or a selected unit.
+
+Both `created_at` and `properties.archived_at` use the following mutually exclusive
+buckets, with `m` denoting the absolute numeric magnitude:
+
+| Bucket                | Exact predicate                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `null`                | SQL NULL, JSON null, or missing archived_at                                           |
+| `nonnumeric`          | Any other nonnumeric SQL/JSON type; numeric strings and JSON booleans stay nonnumeric |
+| `epoch_zero`          | Numeric value equals zero                                                             |
+| `magnitude_10_digits` | `10^9 <= m < 10^10`                                                                   |
+| `magnitude_13_digits` | `10^12 <= m < 10^13`                                                                  |
+| `magnitude_16_digits` | `10^15 <= m < 10^16`                                                                  |
+| `other`               | All remaining numeric values                                                          |
+
+Integer and real values use the same ranges, including negative values by
+magnitude. The implementation uses signed comparisons rather than integer ABS
+so the smallest i64 does not overflow. The familiar 10/13/16-digit epoch
+magnitudes may inform investigation of seconds/milliseconds/microseconds;
+**magnitude never establishes the actual unit or a correct historical instant**.
+Current notes storage requires a non-null created_at, but the shared classifier
+retains a null bucket for diagnostic compatibility.
+
+`created_at_gt_archived_at_raw` counts rows where both values are numeric and the
+raw created_at number is greater. It is explicitly **NOT temporal ordering**: no
+unit is selected, inferred, converted, or echoed. The response states this
+limitation. No unit parameter is accepted.
+
+The response contains `schema_version: 1`, a `scope` object (`kind: task`,
+`rows: live_only`, sorted `namespaces`), `total_tasks`, both seven-bucket count
+objects, the raw comparison count, and the interpretation sentence. Empty
+counts are zero. Each histogram sums to total_tasks. A single aggregate query
+provides one snapshot with at most 15 grouped result rows; it may scan all
+matching tasks and does not promise bounded scan cost or an index seek. SQL or
+backend failures remain failures rather than successful zero populations.
+
+The handler acquires only a SQL reader. Existing dispatch audit behavior is
+unchanged. Gate classification is explicit Read, with a classifier-version bump
+so installed policy identity reflects the added operation. No schema migration,
+status mutation, history rewrite, or fleet database access is part of this change.

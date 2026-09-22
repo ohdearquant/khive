@@ -20,6 +20,7 @@ fn fixture_with_runtime() -> (TempDir, KhiveRuntime, VerbRegistry) {
     let dir = TempDir::new().expect("tempdir");
     let runtime = KhiveRuntime::new(RuntimeConfig {
         telemetry: Default::default(),
+        web: Default::default(),
         mounts: Vec::new(),
         brain: Default::default(),
         git_write: Default::default(),

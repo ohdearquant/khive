@@ -801,6 +801,7 @@ pub struct VerbRegistryBuilder {
     /// `pack.name()` alone cannot be trusted for this decision.
     pack_trusted: Vec<bool>,
     resolvers: Vec<(String, Box<dyn PackByIdResolver>)>,
+    kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
     default_namespace: String,
     /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -845,6 +846,7 @@ impl VerbRegistryBuilder {
             packs: Vec::new(),
             pack_trusted: Vec::new(),
             resolvers: Vec::new(),
+            kg_read_resolver: None,
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
@@ -1231,12 +1233,23 @@ impl VerbRegistryBuilder {
         // this question, and none does (`VerbRegistry::admission_degrade_safe`
         // is a single hash-set lookup with no per-call pack/handler scan).
         let mut degrade_safe_verbs: HashSet<&'static str> = HashSet::new();
+        let mut read_replay_safe_verbs = HashSet::new();
         for (pack, &trusted) in ordered_packs.iter().zip(ordered_trusted.iter()) {
             if !trusted {
                 continue;
             }
             let pack_name = pack.name();
             for handler in pack.handlers() {
+                let canonical_owner = handler
+                    .name
+                    .split_once('.')
+                    .map_or("kg", |(owner, _)| owner);
+                if matches!(handler.visibility, Visibility::Verb)
+                    && pack_name == canonical_owner
+                    && crate::classify_operation(handler.name) == Some(crate::OperationAccess::Read)
+                {
+                    read_replay_safe_verbs.insert(handler.name);
+                }
                 if !matches!(handler.visibility, Visibility::Verb)
                     || handler.category != VerbCategory::Assertive
                 {
@@ -1290,6 +1303,7 @@ impl VerbRegistryBuilder {
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             resolvers: Arc::new(self.resolvers),
+            kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
@@ -1299,6 +1313,7 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
+            read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
             audit_batch,
         })
@@ -1523,6 +1538,8 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     /// Pack-level by-ID resolvers, in registration order.
     resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
+    /// Read-only KG lookup topology; never used to redirect a pack write.
+    kg_read_resolver: Option<Arc<crate::kg_read::KgReadResolver>>,
     gate: GateRef,
     default_namespace: String,
     /// Operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
@@ -1554,6 +1571,8 @@ pub struct VerbRegistry {
     /// [`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`]. See
     /// [`VerbRegistry::admission_degrade_safe`].
     degrade_safe_verbs: Arc<HashSet<&'static str>>,
+    /// Trusted canonical public handlers classified Read by the shared effects table.
+    read_replay_safe_verbs: Arc<HashSet<&'static str>>,
     /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,
     /// actor-scoped, never persisted — see `crate::reference_ring`. Shared
     /// across every clone of this registry via the `Arc`, so admissions made
@@ -1853,6 +1872,49 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 }
 
 impl VerbRegistry {
+    /// Resolve a KG entity/note handle across the configured backend inventory.
+    ///
+    /// The caller must supply its dispatch-authorized token. By-ID reads do not
+    /// filter the stored namespace (ADR-007); no new token is minted here. With
+    /// ordinary single-runtime registration, retain the supplied runtime's
+    /// existing behavior. This does not route mutations or pack-private records.
+    pub async fn resolve_kg_read_by_id(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        id: uuid::Uuid,
+        include_deleted: bool,
+    ) -> Result<Option<crate::Resolved>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.by_id(token, id, include_deleted).await,
+            None if include_deleted => runtime.resolve_by_id_including_deleted(token, id).await,
+            None => runtime.resolve_by_id(token, id).await,
+        }
+    }
+
+    /// Resolve a prefix across the same inventory, rejecting distinct UUIDs.
+    ///
+    /// Retains the local prefix scanner's entity/note/event/edge collision domain,
+    /// including sidecar events. The returned UUID is not a substrate assertion:
+    /// consumers must still fetch/type-check it. All backend failures propagate.
+    pub async fn resolve_kg_read_prefix(
+        &self,
+        runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        prefix: &str,
+        include_deleted: bool,
+    ) -> Result<Option<uuid::Uuid>, RuntimeError> {
+        match &self.kg_read_resolver {
+            Some(resolver) => resolver.prefix(prefix, include_deleted).await,
+            None if include_deleted => {
+                runtime
+                    .resolve_prefix_unfiltered_including_deleted(prefix)
+                    .await
+            }
+            None => runtime.resolve_prefix_unfiltered(prefix).await,
+        }
+    }
+
     /// This registry's construction-baked default namespace.
     ///
     /// Used as the fallback when a request carries no [`RequestIdentity`]
@@ -2053,6 +2115,7 @@ impl VerbRegistry {
         ("comm", "comm.health"),
         ("comm", "comm.probe"),
         // gtd
+        ("gtd", "gtd.census"),
         ("gtd", "gtd.next"),
         ("gtd", "gtd.tasks"),
         // kg
@@ -2158,16 +2221,12 @@ impl VerbRegistry {
         self.degrade_safe_verbs.contains(verb)
     }
 
-    /// Narrow transport replay opt-in. These trusted built-in handlers have no
-    /// domain mutations for any arguments. A repeated dispatch may append a new
-    /// ordinary audit row; its request id remains correlation, not deduplication.
-    /// Unknown and custom handlers cannot inherit safety from a name/category.
+    /// Transport replay eligibility from the shared operation-effects table,
+    /// restricted to trusted canonical public handlers. Read permits incidental
+    /// audit/cache effects; the request id is correlation, not deduplication.
+    /// Custom and mounted handlers cannot inherit safety from a name/category.
     pub fn is_read_replay_safe(&self, verb: &str) -> bool {
-        self.degrade_safe_verbs.contains(verb)
-            && matches!(
-                verb,
-                "stats" | "comm.thread" | "comm.inbox" | "comm.unread" | "comm.delivered"
-            )
+        self.read_replay_safe_verbs.contains(verb)
     }
 
     /// White-box accessor for [`Self::admission_degrade_safe`], needed
@@ -4499,8 +4558,58 @@ impl PackRegistry {
             .into_iter()
             .map(|r| r.0)
             .collect();
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Like [`Self::register_packs_with_runtimes`], but resolves pack names
+    /// against the link-time `inventory` registry **plus** `extra_factories` —
+    /// pack factories the composition root supplies directly rather than
+    /// discovers through `inventory::iter::<PackRegistration>` (ADR-191 D6,
+    /// ADR-192 S4: "a pack compiled outside this repository ... extends the
+    /// web ontology without any change here" — a host binary that depends on
+    /// a pinned khive revision plus an out-of-tree pack crate, or a
+    /// composition root registering a credential-provider/request-hook
+    /// consumer pack, has no `inventory` presence in *this* binary short of
+    /// its own force-link anchor). An inventory-discovered factory always
+    /// wins a name collision with an `extra_factories` entry — the linked set
+    /// is the trusted default; an extra factory only fills a name inventory
+    /// does not already answer.
+    ///
+    /// This is the seam D6 describes as "kkernel exposes its server
+    /// construction as a library entry point that accepts additional pack
+    /// factories" — the `kkernel` library entry point itself lives in
+    /// `kkernel::compose`, built on this function exactly as
+    /// `khive-mcp/src/serve.rs` builds on [`Self::register_packs_with_runtimes`].
+    pub fn register_packs_with_runtimes_with_extra_factories(
+        extra_factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
+        let mut all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        all.extend(extra_factories.iter().copied());
+        Self::register_packs_with_runtimes_from(&all, names, runtimes, default_runtime, builder)
+    }
+
+    /// Shared body for [`Self::register_packs_with_runtimes`] and
+    /// [`Self::register_packs_with_runtimes_with_extra_factories`]: both
+    /// build a `factories` index (inventory-only, or inventory-plus-extra)
+    /// and delegate here. `factory_for` resolves by first match, so a
+    /// duplicate name earlier in `factories` wins over a later one — the two
+    /// public callers above rely on that for their stated collision rule.
+    fn register_packs_with_runtimes_from(
+        factories: &[&'static dyn PackFactory],
+        names: &[String],
+        runtimes: &HashMap<String, KhiveRuntime>,
+        default_runtime: &KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), PackLoadError> {
         let factory_for = |name: &str| -> Option<&'static dyn PackFactory> {
-            all.iter().copied().find(|f| f.name() == name)
+            factories.iter().copied().find(|f| f.name() == name)
         };
 
         let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -4519,6 +4628,11 @@ impl PackRegistry {
                 }
             }
         }
+
+        builder.kg_read_resolver = Some(Arc::new(crate::kg_read::KgReadResolver::new(
+            default_runtime,
+            runtimes,
+        )));
 
         for name in names {
             let factory = factory_for(name.as_str()).unwrap();
@@ -5892,14 +6006,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn read_replay_rejects_a_trusted_opted_in_name_with_mutating_category() {
-        static HANDLERS: [HandlerDef; 1] = [HandlerDef {
-            name: "stats",
-            description: "same name with a state-changing contract",
-            visibility: Visibility::Verb,
-            category: VerbCategory::Commissive,
-            params: &[],
-        }];
+    fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
+        static HANDLERS: [HandlerDef; 3] = [
+            HandlerDef {
+                name: "stats",
+                description: "category cannot override the reviewed operation effects",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "create",
+                description: "an Assertive category cannot make a Write replayable",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "unclassified_read",
+                description: "an unknown operation remains ineligible",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
         let mut builder = VerbRegistryBuilder::new();
         builder.register_trusted(CountingHandlersPack {
             name: "kg",
@@ -5907,7 +6037,9 @@ pub(crate) mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let registry = builder.build().expect("mutating fixture registry");
-        assert!(!registry.is_read_replay_safe("stats"));
+        assert!(registry.is_read_replay_safe("stats"));
+        assert!(!registry.is_read_replay_safe("create"));
+        assert!(!registry.is_read_replay_safe("unclassified_read"));
     }
 
     /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's

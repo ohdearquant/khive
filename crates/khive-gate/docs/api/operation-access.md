@@ -7,6 +7,9 @@ maintenance effects. `Write` covers caller-requested domain mutations, lifecycle
 and control changes, ingestion, external effects, generated persistent artifacts,
 and explicit maintenance. Speech-act categories do not determine access.
 
+`gtd.census` performs an aggregate SQL read on the bound notes backend and does
+not acquire a writer, repair timestamps, or infer their units.
+
 Only an explicit `Read` permits an enrolled, pattern-matched caller. Unknown,
 unloaded, dynamically mounted, or third-party names without a classification are
 denied. Internal subhandlers and aliases receive no exemption. Handler additions
@@ -98,6 +101,7 @@ version is part of every nonempty restriction's policy fingerprint.
 | `git.reconcile`              | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)   |
 | `git.status`                 | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L72)   |
 | `gtd.assign`                 | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
+| `gtd.census`                 | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)               |
 | `gtd.complete`               | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)              |
 | `gtd.next`                   | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L191)              |
 | `gtd.tasks`                  | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L271)              |
@@ -183,7 +187,11 @@ version is part of every nonempty restriction's policy fingerprint.
 | `traverse`                   | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1017) |
 | `update`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L495)  |
 | `verbs`                      | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1473) |
-| `web.ingest`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L6)                |
+| `web.extract`                | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L90)               |
+| `web.fetch`                  | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L8)                |
+| `web.ingest`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L131)              |
+| `web.refresh`                | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L243)              |
+| `web.search`                 | Write  | Verb       | [khive-pack-web/src/vocab.rs](../../../khive-pack-web/src/vocab.rs#L178)              |
 | `whoami`                     | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1387) |
 | `withdraw`                   | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1304) |
 

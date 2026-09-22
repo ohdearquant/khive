@@ -1,141 +1,171 @@
 # Web pack
 
-The optional `web` pack maps a local site's ARW manifest and markdown machine views to a dedicated
-knowledge graph database. It reads declarations as supplied; it does not fetch URLs, parse HTML,
-infer protocols, or calculate quality scores.
+The optional `web` pack fetches, extracts, ingests, searches, and refreshes web content into the
+knowledge graph under an egress policy (address-class checks, an optional host allowlist,
+scoped credentials, a bounded request-header set, and byte/time/result-count ceilings). It never
+depends on a manifest declared by the target site — anything a plain HTTP(S) fetch can read is
+in scope.
 
-Load it with `KHIVE_PACKS=kg,web` or pass `--pack kg --pack web` when starting the MCP server. The pack
-requires `kg` and is outside the default pack set. Its only verb is `web.ingest`.
+Load it with `KHIVE_PACKS=kg,web` or pass `--pack kg --pack web` when starting the MCP server.
+The pack requires `kg` and is outside the default pack set.
 
-## Vocabulary
+## Ontology
 
-| Entity type    | Base kind  | Alias            | Represents                                  |
-| -------------- | ---------- | ---------------- | ------------------------------------------- |
-| `site`         | `service`  | `origin`         | An origin and its declared site metadata    |
-| `page`         | `document` | `web_page`       | A declared content entry                    |
-| `machine_view` | `document` | `view`           | A page's markdown rendering and frontmatter |
-| `agent_tool`   | `service`  | `mcp_tool`       | A declared callable tool                    |
-| `agent_skill`  | `document` | `skill_manifest` | A declared skill and its required tools     |
+| Entity type | Base kind  | Identity                                        | Represents                                       |
+| ----------- | ---------- | ----------------------------------------------- | ------------------------------------------------ |
+| `site`      | `service`  | `(scheme, host, port)`                          | An origin — the alias `origin` also validates    |
+| `page`      | `document` | `(site, canonical path+query)`                  | A fetched document whose body is HTML/XHTML      |
+| `resource`  | `document` | `(site, canonical path+query)` — same as `page` | A fetched, or discovered-but-unfetched, document |
 
-These subtype tokens validate through `create`, including aliases, even when the web pack is not
-loaded. For example, `create(kind="service", entity_type="site", name="Meadow Archive")` creates a
-site. The existing `tool` subtype belongs to `project`; it is not a service subtype.
+`page` and `resource` share one identity formula on purpose: a `resource` discovered as a link
+target (`status: null`, unfetched) re-types to `page` **in place**, at the same id, the moment
+`fetch`/`ingest`/`refresh` retrieves it and finds an HTML body. Identity is by address, never by
+subtype — nothing about a document's id encodes whether it has been fetched yet or what kind of
+body it turned out to have.
 
-| Source                  | Relation       | Target                 |
-| ----------------------- | -------------- | ---------------------- |
-| `service/site`          | `contains`     | `document/page`        |
-| `service/site`          | `contains`     | `service/agent_tool`   |
-| `service/site`          | `contains`     | `document/agent_skill` |
-| `document/machine_view` | `derived_from` | `document/page`        |
-| `document/agent_skill`  | `depends_on`   | `service/agent_tool`   |
-| `service/site`          | `implements`   | `concept/interface`    |
+Canonicalization (applied before any identity computation): scheme and host are lowercased, the
+default port for the scheme is dropped, the path is percent-normalized, query keys are sorted,
+and the fragment is dropped entirely — `https://Example.com/a?b=1&a=2#x` and
+`https://example.com/a?a=2&b=1` are the same resource.
 
-The rules appear in `link(help=true)` when the web pack is loaded. Derivation between documents and
-implementation from services to concepts are already permitted by the base contract; these two rows
-also describe the web vocabulary. Pack rules add permissions and cannot narrow the base contract.
-Consequently, a caller can link a page as derived from a view, while ingestion emits only the
-view-to-page direction. `site contains site` has no matching rule.
+### Edge rules
 
-## Ingest a site tree
+Two pack-declared rows — everything else this pack's verbs produce is already legal under the
+base 17-relation contract and needs no addition:
 
-```text
-web.ingest(source="./sites/meadow")
-web.ingest(source="./sites/meadow", db="./maps/meadow.db", include_views=false)
-web.ingest(help=true)
+| Source         | Relation   | Target              | Written by                                             |
+| -------------- | ---------- | ------------------- | ------------------------------------------------------ |
+| `service/site` | `contains` | `document/page`     | fetch, ingest, refresh                                 |
+| `service/site` | `contains` | `document/resource` | fetch, ingest, refresh, extract (sitemap/feed entries) |
+
+Base rows this pack's verbs also produce, needing no pack declaration:
+
+| Source               | Relation       | Target                    | Meaning                                                                   |
+| -------------------- | -------------- | ------------------------- | ------------------------------------------------------------------------- |
+| `document/page`      | `links_to`     | `document/page\|resource` | a hyperlink found by `extract`                                            |
+| `document/resource`  | `derived_from` | `document/page`           | text extracted from a page (`extract`'s `text` kind)                      |
+| `document`           | `supersedes`   | `document`                | a permanent redirect (301/308): the old address stops being authoritative |
+| `note` (observation) | `annotates`    | any                       | a fetch/search/refresh receipt                                            |
+| `note` (observation) | `supersedes`   | `note`                    | the receipt chain: the history of one resource's fetches                  |
+
+## Verbs
+
+### `web.fetch(url, accept?, persist?, max_bytes?, timeout_s?, method?, headers?, credential?, namespace?)`
+
+Fetch one URL under egress policy. Follows up to 5 redirects; a 301/308 hop mints both ends of
+the hop and links `new supersedes old`, a 302/307 hop mints nothing beyond a receipt entry naming
+it. The terminal hop's body (if `GET`; `HEAD` carries none) is stored via the runtime's blob
+store, content-addressed; storing byte-identical content again is a no-op. `persist` defaults to
+`true`; `false` fetches and returns the result without minting entities or writing a receipt.
+`entity_type` is decided from the response `content-type`: `text/html`/`application/xhtml+xml`
+(ignoring `; charset=...` and case) is `page`, everything else is `resource`.
+
+### `web.extract(id | url, kinds?)`
+
+Parse an already-fetched body — never fetches one itself. `kinds` is a subset of
+`{text, links, sitemap, feed}`, defaulting to whatever applies to the stored content-type.
+`links` yields `page links_to page|resource` edges to targets minted (if absent) as unfetched
+`resource` rows. `sitemap`/`feed` yield `site contains resource` edges for each entry, under the
+_publishing_ site. `text` mints a `resource` holding the tag-stripped body, linked
+`derived_from` back to the original — keyed by the original document's id, so repeated
+extraction converges on one row rather than minting duplicates. Refuses `not_fetched` on a
+document with no stored body.
+
+### `web.ingest(source, origin?, depth?, limit?)`
+
+Fetch and extract over a single URL, a JSON array of URLs, or — with `origin` given — a
+directory on disk laid out as `origin` would serve it (`origin` then supplies the `site`
+identity for every file in the tree, and no network request is made for the disk case).
+`depth` bounds how many hops of `links`-extracted targets are followed beyond the seed URLs
+(default `0`: seeds only). `limit` bounds the total number of documents ingested in one call
+(default 100).
+
+The disk-mode `source` directory is confined to the operator's configured `[web] read_roots`
+(modeled on `[exec] read_roots`): absent or empty refuses every disk ingest outright, and a
+`source` that is not itself one of the configured roots or nested under one is refused before
+anything is read. Every path discovered while walking the tree — including a symlink target —
+is re-canonicalized and re-checked against the same roots, so a symlink planted inside an
+allowed root cannot serve content from outside it.
+
+The URL-crawl mode's reply carries `ingested` (the minted document ids) and `refused` (one
+`{url, error}` entry per URL that `web.fetch` refused — an egress refusal, a transport error, or
+anything else short of a persisted document): a refused URL is named in the reply rather than
+silently dropped from the crawl, so a caller can tell "nothing matched" apart from "some targets
+were refused."
+
+### `web.search(query, provider?, limit?, persist?)`
+
+Query a configured `[[web.search_providers]]` entry — a `Fixture` (canned results, for tests and
+offline configurations) or an `Http` provider (a templated URL plus an optional bearer-token
+environment variable). No provider configured, or an ambiguous unnamed selection among several
+non-default providers, refuses `no_search_provider_configured`/`search_provider_not_configured`
+rather than returning an empty list. The receipt preserves the exact ordered result array and a
+BLAKE3 digest over it. `persist` defaults to `false`; `true` mints each hit's URL as an unfetched
+`resource` under its site, same as an unvisited `extract(links)` target.
+
+### `web.refresh(id)`
+
+Conditionally re-fetch an already-fetched document using its stored `etag`/`last_modified` as
+`If-None-Match`/`If-Modified-Since`. A `304`, or a `200` whose body content-addresses to the
+_same_ reference already stored, writes a receipt only — no entity or blob change. A genuinely
+changed body puts the new blob and patches the entity in place. Every refresh's receipt
+supersedes the immediately prior receipt for the same document, so the note history is the
+resource's refresh timeline. Follows the same bounded redirect chain `fetch` does, through the
+same egress checks on every hop: identity is by address, so the terminal address's own row
+receives the body on a redirect, the entity the caller asked to refresh keeps its own recorded
+`url`, and the reply's `final_id` names whichever row actually received the content.
+
+No `db`/`target` parameter exists anywhere on this pack's verb surface — every write lands in
+the caller's own namespace through the runtime's ordinary create/update/link seam, the same seam
+every other pack's handlers use.
+
+## Egress policy (`[web]` config section)
+
+```toml
+[web]
+timeout_default_s = 30       # optional; built-in default shown
+timeout_max_s = 120
+max_bytes_default = 5242880  # 5 MiB
+max_bytes_max = 52428800     # 50 MiB
+search_limit_default = 10
+search_limit_max = 50
+read_roots = ["/srv/ingest-sources"]  # web.ingest disk mode; absent/empty refuses disk ingest entirely
+
+[[web.allowlist]]
+host = "example.com"         # with any [[web.allowlist]] entry present, only listed hosts are reachable
+
+[[web.credentials]]
+name = "example-api"
+env_var = "EXAMPLE_API_TOKEN"
+hosts = ["api.example.com"]  # exact match or a subdomain of the entry; IP-literal entries match only that exact address
+
+[[web.search_providers]]
+name = "canned"
+default = true
+[[web.search_providers.results]]
+title = "..."
+url = "..."
+snippet = "..."
 ```
 
-| Parameter       | Required | Default                      | Meaning                                                    |
-| --------------- | -------- | ---------------------------- | ---------------------------------------------------------- |
-| `source`        | Yes      | —                            | Local directory containing one origin's served tree        |
-| `db`            | No       | `<source>/.khive/web-map.db` | Dedicated target map database                              |
-| `include_views` | No       | `true`                       | Read the declared markdown views and create their entities |
+Refused unconditionally, regardless of configuration: any scheme other than `http`/`https`; any
+URL carrying `user:password@` userinfo; loopback, link-local, private, CGNAT
+(`100.64.0.0/10`), multicast, broadcast, and unspecified addresses (checked against the
+_resolved_ address, re-resolved and re-checked immediately before connecting, refusing on any
+disagreement between the two — a DNS-rebinding defense); the `Authorization`/`Cookie`/
+`Proxy-Authorization` request headers (send a scoped `credential` instead); a caller-supplied
+`max_bytes`/`timeout_s`/search `limit` above the operator's configured ceiling. A credential
+requires `https` at every hop.
 
-Unknown parameters are rejected. The target cannot be the shared production database or the
-calling runtime's database, including a configured non-default production location. There is no
-override for this refusal.
-Database targets use filesystem paths; SQLite `file:` URI spellings are rejected before opening.
+## Receipts
 
-The scanner reads `.well-known/arw.json` first. An absent manifest returns `manifest_missing`;
-malformed manifest JSON returns `manifest_malformed`. Both refuse the whole site before writing map
-records. Version, profile, site, content signals, content entries, tools, and skills are read from the
-manifest's `version`, `profile`, `site`, `content_signals`, `content`, `tools`, and `skills` keys.
-Other top-level keys are ignored and counted in `ignored_keys`. In particular, `integrations` does
-not create protocol entities or `implements` edges in v0. The scanner reads the supported fields
-without running full JSON Schema validation; unreadable declarations are quarantined with a reason.
-
-If `llms.txt` exists, its embedded YAML declarations are checked against the manifest. Each
-disagreement records the affected field and a reason in `quarantined`; the manifest value wins.
-Each content entry's optional `markdown_url` names a local markdown view. Its frontmatter supplies
-properties such as `page_type`, `schema_org_type`, and `aeo`. A missing view leaves its page in the
-map and increments `views_missing`, without quarantine. Setting `include_views=false` skips view
-files entirely and produces no machine-view entities or derivation edges for that ingest.
-
-Ingestion preserves declared descriptions, tags, chunks, content signals, and frontmatter values.
-The view's declared `aeo.domain` supplies its discipline and page tags supply subdiscipline.
-Scores and reading-ease values remain publisher declarations. Tool and skill declarations come from
-the manifest; endpoint URLs and skill documents are not fetched.
-
-Identifiers use UUIDv5 with separate keys for each subtype. Origin identity is the lowercased host
-from `site.homepage`, with scheme and port removed. Page and view paths have one leading slash and
-no trailing slash. Tool and skill names remain as declared. Re-ingesting unchanged declarations
-preserves the map rows; changed descriptions update the existing identities.
-An ingest accepts at most 10,000 entities and 50,000 edges. Validation and statement preparation
-finish before the atomic map write begins.
-
-## Result
-
-The verb returns a report, without writing a report side file. For a site with two pages, two views,
-two tools, and one skill requiring both tools, the counts are:
-
-```json
-{
-  "entity_counts": {
-    "site": 1,
-    "page": 2,
-    "machine_view": 2,
-    "agent_tool": 2,
-    "agent_skill": 1
-  },
-  "relation_counts": {
-    "contains": 5,
-    "derived_from": 2,
-    "depends_on": 2,
-    "implements": 0
-  },
-  "views_missing": 0,
-  "quarantined": [],
-  "manifest_digest": "<64 lowercase hexadecimal characters>",
-  "source": "/srv/sites/meadow",
-  "db_path": "/srv/sites/meadow/.khive/web-map.db",
-  "include_views": true,
-  "ignored_keys": 0
-}
-```
-
-All five subtype keys and all four relation keys are present, including zero counts.
-`manifest_digest` is BLAKE3 over the raw manifest file bytes, rendered as lowercase hexadecimal;
-the placeholder above represents that value. `quarantined` entries have the shape
-`{"field":"site.name","reason":"…"}`. `ignored_keys` counts unconsumed top-level manifest keys,
-not their nested declarations.
-
-## Multiple sites
-
-Place the served trees at `./sites/meadow` and `./sites/fern`. This ten-line shell example ingests
-each into its own default map database. Python encodes the operation so paths remain correctly
-quoted.
-
-```sh
-set -eu
-command -v kkernel >/dev/null
-command -v python3 >/dev/null
-export KHIVE_PACKS=kg,web
-site_root=./sites
-for site_source in "$site_root/meadow" "$site_root/fern"; do
-  test -d "$site_source"
-  ops=$(python3 -c 'import json,sys; print(json.dumps([{"tool":"web.ingest","args":{"source":sys.argv[1]}}]))' "$site_source")
-  kkernel exec "$ops"
-done
-```
-
-The domain vocabulary and ingest contract are described in
-[ADR-175](../adr/ADR-175-web-pack.md).
+Every `fetch`/`refresh`, and every `search` with `persist=true` or a hit, writes one
+`observation` note annotating the entity (or entities) it touched, carrying the request record
+(method, final URL, status, allow-listed response headers, byte count, redirect chain) or
+(for `search`) the query, provider, effective limit, and the ordered result array plus its
+BLAKE3 digest. A note write that the secret-detection gate refuses (a result title containing
+what looks like a credential, for example) leaves no partial receipt behind — but is not itself
+atomic with the entity/blob write that precedes it in the same call: `fetch`/`refresh` mint or
+patch the entity and put the blob first, and only then write the receipt, so a refused receipt
+on an otherwise-successful fetch leaves the entity/blob change in place with no corresponding
+observation note.

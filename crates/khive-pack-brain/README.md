@@ -44,12 +44,39 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 request(ops="brain.auto_feedback(query=\"why\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
 
+`brain.feedback` and `brain.auto_feedback` can target a live KG entity or note
+on another configured pack backend, including a message returned by
+`search(kind="message", query="handoff")`. Copy its full UUID into `target_id`;
+`get(id="<uuid>")` uses the same shared entity/note read resolver. For
+`auto_feedback`, the selected ID must still match exactly one supplied result.
+Normal Gate checks apply, and target lookup by ID does not filter the stored
+namespace. A short hex prefix must resolve to one distinct UUID across the
+backends; existing entity/note/edge/event collision checks remain, and backend
+errors propagate. Feedback then requires an entity or note, so an edge or event
+candidate is not an eligible target.
+
+Only target reads cross backends. Feedback events, private event-log entries,
+profiles and snapshots stay on brain's configured home runtime; the target is
+not moved or rewritten. Knowledge-private atom/domain targets remain outside
+this API and use `knowledge.feedback`. The shared resolver is installed by
+`PackRegistry::register_packs_with_runtimes`; single-runtime registration keeps
+its existing local lookup. See
+[ADR-028](../../docs/adr/ADR-028-pack-scoped-backends.md#amendment-a5-shared-kg-handle-reads-across-pack-backends-2026-09-22).
+
 Event counts, profile resolution, and binding listing default to the authorized
 caller's actor scope. An explicit foreign actor requires visibility; aggregate
 event counts additionally require `all_actors=true` and a serving-runtime
 `[brain] fleet_readers` entry. See the
 [API reference](../../docs/guide/api-reference.md#brainevent_counts--assertive)
 for the exact actor filters and anonymous-caller behavior.
+
+For a verb-by-caller dispatch-audit census, add
+`group_by=["verb","actor"]` and `kind="audit"` to `brain.event_counts`.
+The requested cross is nested by verb, then actor; omission or null preserves the
+existing response. Sampled windows expose the cross only as
+`counts_by_verb_and_actor_page_scoped`. `exhaustive=true` uses the existing
+full-window walk and safety bound. Grouping adds no separate cell-count budget
+or authorization path. See the [grouping contract](docs/api/event-count-groups.md).
 
 Feedback uses a known `served_by_profile_id` as supplied. If that ID is unknown
 (including a bare role name), it resolves through the caller's actor, namespace,
@@ -58,6 +85,14 @@ profiles or interpret role aliases. An unknown ID with no matching binding is
 `not_found`, naming the requested ID; only an omitted ID may use the default
 profile. Events record the resolved profile ID and `profile_resolution=binding`
 when this fallback applies. A known archived profile is still refused.
+
+Explicit and correction feedback requires an attributed caller. An anonymous
+caller receives a typed `invalid_input` error before feedback writes, even when
+the profile would resolve through the default. Configure `actor.id` to submit
+these judgments. Implicit anonymous signals keep their existing admission rules;
+omitting the signal from `brain.auto_feedback` still abstains. This admission
+change applies to new writes: historical anonymous events and their existing
+posterior effects are retained, with no automatic deletion or retraining.
 
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
 reduction logic in another crate:

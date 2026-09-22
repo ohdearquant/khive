@@ -16,6 +16,7 @@ export const EDGE_RELATIONS = [
   "contains",
   "part_of",
   "instance_of",
+  "links_to",
   "extends",
   "variant_of",
   "introduced_by",
@@ -59,7 +60,7 @@ export type NoteKind = (typeof NOTE_KINDS)[number];
 export type EdgeRelationFamily = (typeof EDGE_RELATION_FAMILY_NAMES)[number];
 
 export const EDGE_RELATION_FAMILIES = {
-  structure: ["contains", "part_of", "instance_of"],
+  structure: ["contains", "part_of", "instance_of", "links_to"],
   derivation: ["extends", "variant_of", "introduced_by", "supersedes"],
   provenance: ["derived_from"],
   temporal: ["precedes"],
@@ -213,6 +214,15 @@ export const EDGE_RELATION_LEGEND = {
     glyph: "I",
     treatment: "quiet-solid",
     variant: "tertiary",
+    hue: neutralEdge,
+    directed: true,
+  },
+  links_to: {
+    label: "Links to",
+    family: "structure",
+    glyph: "L",
+    treatment: "quiet-solid",
+    variant: "quaternary",
     hue: neutralEdge,
     directed: true,
   },

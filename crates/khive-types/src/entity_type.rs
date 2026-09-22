@@ -98,15 +98,13 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "page",
         aliases: &["web_page"],
     },
+    // ADR-191: any fetched body other than an HTML page — robots.txt, a
+    // sitemap, a feed, a JSON body, a PDF, an alternate rendering served at
+    // its own URL.
     EntityTypeDef {
         kind: EntityKind::Document,
-        type_name: "machine_view",
-        aliases: &["view"],
-    },
-    EntityTypeDef {
-        kind: EntityKind::Document,
-        type_name: "agent_skill",
-        aliases: &["skill_manifest"],
+        type_name: "resource",
+        aliases: &[],
     },
     EntityTypeDef {
         kind: EntityKind::Document,
@@ -351,7 +349,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     // ── Service ──────────────────────────────────────────────────────────────
     // Service subtypes: inference_engine, retrieval_engine,
-    // embedding_engine, api, database, search_engine, mcp_server, site, agent_tool.
+    // embedding_engine, api, database, search_engine, mcp_server, site.
     EntityTypeDef {
         kind: EntityKind::Service,
         type_name: "inference_engine",
@@ -391,11 +389,6 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         kind: EntityKind::Service,
         type_name: "site",
         aliases: &["origin"],
-    },
-    EntityTypeDef {
-        kind: EntityKind::Service,
-        type_name: "agent_tool",
-        aliases: &["mcp_tool"],
     },
     // Person  — no standard subtypes (roles are metadata, not subtypes).
 ];
@@ -1053,15 +1046,16 @@ mod tests {
         );
     }
 
+    // ADR-191: the web pack's registry footprint shrank from five ARW-shaped
+    // tokens to three web-native ones. This test is the acceptance witness
+    // for that deletion — it accepts the surviving tokens under their kinds
+    // and refuses the deleted ones under every kind, not just their former one.
     #[test]
     fn entity_type_registry_accepts_web_tokens_and_aliases() {
         let r = reg();
         for (kind, canonical, alias) in [
             (EntityKind::Service, "site", "origin"),
             (EntityKind::Document, "page", "web_page"),
-            (EntityKind::Document, "machine_view", "view"),
-            (EntityKind::Service, "agent_tool", "mcp_tool"),
-            (EntityKind::Document, "agent_skill", "skill_manifest"),
         ] {
             for raw in [canonical, alias] {
                 let resolved = r
@@ -1077,15 +1071,24 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[test]
-    fn web_tokens_and_aliases_have_unique_registry_owners() {
-        for token in [
-            "site",
-            "origin",
-            "page",
-            "web_page",
+        // `resource` has no alias.
+        let resolved = r
+            .resolve(EntityKind::Document, Some("resource"))
+            .expect("resource must resolve for Document");
+        assert_eq!(resolved.kind, EntityKind::Document);
+        assert_eq!(resolved.entity_type.as_deref(), Some("resource"));
+        for other_kind in EntityKind::ALL {
+            if other_kind != EntityKind::Document {
+                r.resolve(other_kind, Some("resource"))
+                    .expect_err("resource belongs to exactly one base kind");
+            }
+        }
+
+        // Deleted ARW-shaped tokens (and their aliases) must be refused under
+        // every kind, not just their former one — a partial deletion that
+        // left one arm registered would otherwise pass silently.
+        for gone in [
             "machine_view",
             "view",
             "agent_tool",
@@ -1093,6 +1096,17 @@ mod tests {
             "agent_skill",
             "skill_manifest",
         ] {
+            for kind in EntityKind::ALL {
+                r.resolve(kind, Some(gone)).expect_err(
+                    "deleted web token must be refused for every kind, not just its former one",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_tokens_and_aliases_have_unique_registry_owners() {
+        for token in ["site", "origin", "page", "web_page", "resource"] {
             let owners: Vec<_> = BUILTIN_DEFS
                 .iter()
                 .filter(|def| {

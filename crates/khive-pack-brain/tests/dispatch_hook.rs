@@ -215,7 +215,14 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
 async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     use khive_runtime::Namespace;
 
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        brain_profile: None,
+        actor_id: Some("brain-feedback-test".to_string()),
+        packs: vec!["kg".to_string()],
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime with attributed feedback caller");
 
     // --- Step 1: create a real entity for feedback target validation ---
     // A separate brain/kg registry creates the entity; the entity UUID is used
@@ -339,7 +346,14 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
 /// paragraph, unrelated to targeting foreign records).
 #[tokio::test]
 async fn brain_feedback_accepts_foreign_namespace_target_id() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        brain_profile: None,
+        actor_id: Some("brain-feedback-test".to_string()),
+        packs: vec!["kg".to_string()],
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("in-memory runtime with attributed feedback caller");
 
     let ns_primary = Namespace::parse("brain-primary-ns").unwrap();
     let ns_foreign = Namespace::parse("brain-foreign-ns").unwrap();

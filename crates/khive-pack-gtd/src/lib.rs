@@ -1,8 +1,9 @@
 //! pack-gtd — GTD (Getting Things Done) verb pack for khive.
 //!
-//! Adds the `task` note kind and five verbs (`assign`, `next`, `complete`, `tasks`,
-//! `transition`) with GTD lifecycle semantics over the notes substrate.
+//! Adds the `task` note kind, five task-management verbs, and a read-only
+//! timestamp census over the notes substrate.
 
+mod census;
 pub(crate) mod dependency;
 pub mod handlers;
 pub mod hook;

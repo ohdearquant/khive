@@ -20,7 +20,7 @@ An always-machine-readable copy of this page is at
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
 | `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `gtd`       | 6     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
@@ -1210,7 +1210,7 @@ was not loaded.
 
 ---
 
-## `gtd` pack — 5 verbs
+## `gtd` pack — 6 verbs
 
 GTD task lifecycle over notes (`kind="task"`). Optional; load with
 `KHIVE_PACKS=kg,gtd`.
@@ -1309,6 +1309,22 @@ audit row is written, and a `note` passed with the request is not persisted, rep
 
 ```
 request(ops="gtd.transition(id=\"<task-id>\", status=\"active\")")
+```
+
+### `gtd.census` — Assertive
+
+Read-only count of live task timestamps by raw numeric magnitude, for `created_at` and
+`properties.archived_at`. Every bucket (`null`, `nonnumeric`, `epoch_zero`, 10-, 13- and
+16-digit magnitudes, `other`) is returned, zeros included. No unit is inferred and nothing is
+repaired; `created_at_gt_archived_at_raw` compares raw numbers and is not temporal ordering.
+See [task-timestamp-census.md](../../crates/khive-pack-gtd/docs/api/task-timestamp-census.md).
+
+| Param       | Type   | Required | Notes                                       |
+| ----------- | ------ | -------- | ------------------------------------------- |
+| `namespace` | string | no       | Count one visible namespace instead of all. |
+
+```
+request(ops="gtd.census()")
 ```
 
 ---
@@ -1449,6 +1465,8 @@ zero-filled, when no event in the window carries `cost_unit`. Events without a `
 | `actor`      | string | no       | Defaults to the authorized caller. A filter prefixed with `actor:`, `anonymous:`, or `agent:` matches a stored label exactly. Self access compares kind and id; foreign access checks the raw id for `actor:` and the full label for other reserved kinds against the caller's visible set. Other filters match bare and canonical labels. |
 | `all_actors` | bool   | no       | Default false. True requests all actors and requires the caller's exact actor id in the serving runtime's `[brain] fleet_readers`. Cannot be combined with an explicit `actor`.                                                                                                                                                            |
 | `kind`       | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                                                                                                                                                                                                     |
+| `group_by`   | array  | no       | Only `["verb", "actor"]`, in that order. Omission or null adds no cross; duplicates, reversed/other pairs and unknown dimensions are rejected.                                                                                                                                                                                             |
+| `exhaustive` | bool   | no       | Default false. Use the existing full-window cursor walk; windows above 2,000,000 events are refused. The live view is best-effort, not a transactional snapshot.                                                                                                                                                                           |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
@@ -1484,6 +1502,29 @@ historical-alias separation guarantee. A new runtime-stamped kind must be added
 to the shared list and covered by per-kind event-count tests. See
 [configuration](../configuration.md#brain-read-scope) and
 [ADR-103 Amendment 5](../adr/ADR-103-resource-attribution-model.md#amendment-5-2026-09-10-caller-scoped-brain-reads).
+
+Optional `group_by=["verb","actor"]` returns
+`counts_by_verb_and_actor: {<verb>: {<actor>: <count>}}`. The map contains only
+observed cells, with no delimiter joining the keys. A requested empty cross is
+`{}`. Omission or null leaves both cross keys absent. Actor keys use precisely
+the existing `counts_by_actor` rules: default caller aliases coalesce, while an
+explicit actor or `all_actors=true` preserves stored labels.
+
+The cross uses the same filtered events as the marginals. When `truncated=true`,
+only `counts_by_verb_and_actor_page_scoped` is emitted; the complete-looking
+cross key is absent. Existing marginal field names are unchanged. Limits count
+event rows, not distinct group cells, so a denser cross cannot trigger a separate
+cap. An occupied-cell count cannot exceed the number of events aggregated.
+
+For a dispatch-audit census, request `kind="audit"` with the cross. That filter
+is applied before the existing event cap; the special unfiltered audit/non-audit
+budget split is unnecessary on this single-kind path. Use `exhaustive=true`
+when a sampled answer is insufficient, retaining the existing safety bound and
+best-effort live-window caveat. `window_event_total` remains independently read.
+
+```text
+request(ops='brain.event_counts(since="2026-09-01T00:00:00Z", until="2026-09-02T00:00:00Z", kind="audit", group_by=["verb","actor"], exhaustive=true)')
+```
 
 ### `brain.profiles` — Assertive
 

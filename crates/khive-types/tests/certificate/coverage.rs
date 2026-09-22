@@ -76,10 +76,13 @@ const CERTIFIED_RELATIONS: &[CertifiedRelation] = &[];
 
 /// Relations in EdgeRelation::ALL kept by declared system role (ADR-076 §D1/§D3).
 ///
-/// All 17 current relations are grandfathered at ADR-076 adoption.  The
-/// `disposition` field records the certificate analysis: 15 relations use
-/// `SurvivesAll` (no eliminator defeats them); `supports` and `refutes` use
-/// `FailsEliminator { family: "Po", … }` — the load-bearing §D3 case showing
+/// The original 17 ADR-002/ADR-055 relations are grandfathered at ADR-076
+/// adoption. `links_to` (ADR-191) is a later addition admitted through the same
+/// system-role path — ADR-076 §D1/§D3 treats this as a legitimate route for
+/// a new relation, not only a grandfathering mechanism.  The `disposition`
+/// field records the certificate analysis: 15 relations use `SurvivesAll`
+/// (no eliminator defeats them); `supports`, `refutes`, and `links_to` use
+/// `FailsEliminator { family: … }` — the load-bearing §D3 case showing
 /// a relation may fail the certificate and still be kept by system role.
 const SYSTEM_ROLE_EXCEPTIONS: &[SystemRoleException] = &[
     SystemRoleException {
@@ -207,6 +210,31 @@ const SYSTEM_ROLE_EXCEPTIONS: &[SystemRoleException] = &[
                            can branch on directly, not a value buried in an \
                            open metadata blob that 3.3% of edges populate \
                            (ADR-055; ADR-076 §D3)",
+        },
+    },
+    SystemRoleException {
+        relation: "links_to",
+        adr: "ADR-191",
+        role: "web hyperlink reference role",
+        // ADR-076 §D3: `links_to` fails the Sr (typed sub-relation)
+        // eliminator — the only existing relation whose endpoints
+        // (Document -> Document) could in principle absorb a hyperlink as a
+        // typed sub-relation is `depends_on`. It is kept as its own relation
+        // rather than a `depends_on` sub-type because the runtime's
+        // dependency_kind inference stamps every Document -> Document pair
+        // lacking an explicit qualifier with "normative" (a hard-requirement
+        // claim, ADR-002 governed metadata) — a false assertion for an
+        // ordinary hyperlink, and one the caller cannot opt out of (ADR-191).
+        disposition: CertDisposition::FailsEliminator {
+            family: "Sr",
+            kept_because: "the only existing relation whose endpoints could \
+                           absorb a hyperlink as a typed sub-relation is \
+                           depends_on, and depends_on's runtime metadata \
+                           inference stamps every Document -> Document pair \
+                           with dependency_kind: normative (a hard-requirement \
+                           claim) whenever the caller supplies none — a false \
+                           assertion for an ordinary hyperlink that the \
+                           caller cannot opt out of (ADR-191)",
         },
     },
 ];

@@ -93,7 +93,14 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
 ///   Directive  — attempts to get hearer to do something
 ///   Assertive  — retrieves/presents state of affairs
 ///   Declaration — changes institutional status by fiat
-pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
+pub(crate) static GTD_HANDLERS: [HandlerDef; 6] = [
+    HandlerDef {
+        name: "gtd.census",
+        description: "Count live task created_at and archived_at values by numeric magnitude in the visible namespaces. Reports null, nonnumeric, zero, 10/13/16-digit magnitude, and other buckets. Magnitude does not establish timestamp units; the raw greater-than count is NOT temporal ordering. Read-only: no repair, conversion, or record payloads.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
     // Directive: directs an actor to perform work
     HandlerDef {
         name: "gtd.assign",

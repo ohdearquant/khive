@@ -462,6 +462,8 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+        builder.with_actor_id(Some("memory-feedback-caller".to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(crate::MemoryPack::new(rt.clone()));
         builder.register(brain);
@@ -589,6 +591,8 @@ mod tests {
 
         let brain = BrainPack::new(rt.clone());
         let mut builder = VerbRegistryBuilder::new();
+        // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+        builder.with_actor_id(Some("memory-feedback-caller".to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(crate::MemoryPack::new(rt.clone()));
         builder.register(brain);
@@ -803,6 +807,8 @@ mod tests {
         let canonical = note_id.id.as_hyphenated().to_string();
 
         let mut builder = VerbRegistryBuilder::new();
+        // Explicit brain feedback needs a named caller; bindings remain namespace-wide.
+        builder.with_actor_id(Some("memory-feedback-caller".to_string()));
         builder.register(KgPack::new(rt.clone()));
         builder.register(crate::MemoryPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));

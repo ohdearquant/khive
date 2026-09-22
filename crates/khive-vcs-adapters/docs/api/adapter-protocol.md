@@ -31,7 +31,7 @@ The current modules divide responsibilities as follows: `adapter` defines the tr
   aliases) via `khive_types::EntityKind::from_str` at parse time. Pack-defined kinds, including
   the ADR-048 `resource` kind, are accepted only when the caller supplies the installed kind
   registry through `new_with_valid_kinds`. Unknown kinds return `AdapterError::UnknownKind`.
-- `EdgeRecord.relation` — must be one of the 17 canonical relations (ADR-002 base 15 plus the ADR-055 epistemic pair `supports`/`refutes`); validated via
+- `EdgeRecord.relation` — must be one of the 18 canonical relations (ADR-002 base 16, including `links_to` via ADR-191, plus the ADR-055 epistemic pair `supports`/`refutes`); validated via
   `khive_types::EdgeRelation::from_str` at parse time. Unknown relations return `AdapterError::UnknownRelation`.
 - `EdgeRecord.weight` — must be finite and in `[0.0, 1.0]`. Out-of-range values return
   `AdapterError::InvalidField`. Default when absent: `0.7`.

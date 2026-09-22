@@ -77,7 +77,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     HandlerDef {
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
-            plane; feedback_explicit events additionally split by \
+            plane. Optional group_by=[\"verb\",\"actor\"] emits a nested counts_by_verb_and_actor \
+            map over the same events; when truncated it is named counts_by_verb_and_actor_page_scoped. \
+            Only that ordered pair is supported; omission/null adds no cross. Grouping reuses the \
+            existing actor scope and event-row caps, with no distinct-cell budget. Use kind=\"audit\" \
+            for a dispatch-audit census and exhaustive=true when the complete window is needed. \
+            feedback_explicit events additionally split by \
             served_by_profile_id (by_profile), originating verb \
             (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
             with signal (by_profile_and_signal, keyed by served_by_profile_id then signal, \
@@ -157,6 +162,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Filter to a single EventKind (e.g. \"recall_executed\", \"feedback_explicit\"). Omit for all kinds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "group_by",
+                param_type: "array",
+                required: false,
+                description: "Optional ordered pair [\"verb\", \"actor\"] only. Returns a nested verb→actor count map over the same authorized event window; uses the _page_scoped key when truncated. Omission or null emits no cross. Reversed, repeated, unknown, or other dimensions are rejected.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -972,6 +984,7 @@ impl BrainPack {
             actor: Option<String>,
             all_actors: Option<bool>,
             kind: Option<String>,
+            group_by: Option<crate::event_counts_grouping::EventCountGroupBy>,
             // `Option`, not a required `String`: a bare-missing `since` must go through
             // the same named-field-plus-example-format error as a malformed one, not
             // serde's generic "missing field `since`" message.
@@ -1210,6 +1223,14 @@ impl BrainPack {
             },
         });
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
+        if let Some(group_by) = p.group_by {
+            group_by.add_to_result(
+                &mut result,
+                &items,
+                default_scope.then_some(caller.as_str()),
+                truncated,
+            );
+        }
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
         }
@@ -1639,8 +1660,9 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        self.handle_feedback_from(token, params, "brain.feedback")
+        self.handle_feedback_from(token, params, "brain.feedback", registry)
             .await
     }
 
@@ -1649,6 +1671,7 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
         originating_verb: &'static str,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let feedback_start = Instant::now();
 
@@ -1687,7 +1710,8 @@ impl BrainPack {
             ));
         }
 
-        let target: uuid::Uuid = resolve_auto_feedback_target(&self.runtime, &p.target_id).await?;
+        let target: uuid::Uuid =
+            resolve_auto_feedback_target(&self.runtime, token, registry, &p.target_id).await?;
 
         let signal = match p.signal.as_str() {
             "useful" => "useful",
@@ -1712,6 +1736,21 @@ impl BrainPack {
             Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
         );
 
+        // Caller identity and serve attribution are separate: omitting the
+        // profile may resolve a shared default, but cannot authorize an
+        // anonymous caller to train it with an explicit judgment (#2282).
+        // Keep implicit anonymous controls on their existing admission path.
+        // A configured actor id of "local" is the unattributed pool, not a
+        // caller, so it is refused by the same rule as the anonymous actor.
+        let unattributed =
+            token.actor().is_anonymous() || khive_runtime::actor_is_unattributed(token.actor());
+        if unattributed && !is_gated_implicit {
+            return Err(khive_types::KhiveError::invalid_input(
+                "explicit or correction feedback requires an attributed caller; configure actor.id",
+            )
+            .into());
+        }
+
         // Resolve the target by UUID with no namespace filter (ADR-007 Rule 2 /
         // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
         // not a post-fetch namespace check). Rule 3b recall fans out actor-stamped
@@ -1722,11 +1761,9 @@ impl BrainPack {
         // ADR-041 permits both entity and note signal targets; the resolved
         // substrate is threaded onto the emitted event below (#831) so the decoder can tell entity and
         // note signal observations apart instead of hard-coding entity.
-        let target_substrate = match self
-            .runtime
-            .resolve_by_id(token, target)
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        let target_substrate = match registry
+            .resolve_kg_read_by_id(&self.runtime, token, target, false)
+            .await?
         {
             Some(Resolved::Entity(_)) => khive_types::SubstrateKind::Entity,
             Some(Resolved::Note(_)) => khive_types::SubstrateKind::Note,
@@ -2182,6 +2219,7 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2331,7 +2369,9 @@ impl BrainPack {
                     "auto_feedback: invalid full_id {full_id:?}; expected full UUID"
                 ))
             })?,
-            None => resolve_auto_feedback_target(&self.runtime, &selected.id).await?,
+            None => {
+                resolve_auto_feedback_target(&self.runtime, token, registry, &selected.id).await?
+            }
         };
 
         let mut feedback_params = json!({
@@ -2370,7 +2410,7 @@ impl BrainPack {
             json!(p.results.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
         let mut out = self
-            .handle_feedback_from(token, feedback_params, "brain.auto_feedback")
+            .handle_feedback_from(token, feedback_params, "brain.auto_feedback", registry)
             .await?;
         out["verb"] = json!("brain.auto_feedback");
         out["feedback_verb"] = json!("brain.feedback");
@@ -2507,8 +2547,10 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        self.handle_feedback_from(token, params, "brain.emit").await
+        self.handle_feedback_from(token, params, "brain.emit", registry)
+            .await
     }
 
     // ── brain.bind ────────────────────────────────────────────────────────
@@ -3475,36 +3517,25 @@ fn route_via_fann(context: &[f32]) -> Vec<f32> {
 
 // ── brain.auto_feedback helpers ───────────────────────────────────────────────
 
-/// Resolve an `id` from `memory.recall` output to a full UUID.
+/// Resolve a recall/search handle to a full UUID under the dispatch token.
 ///
-/// Accepts a 36-char UUID directly, or an 8-char hex prefix (Agent-mode short
-/// form). Returns `InvalidInput` if neither form matches or the prefix is
-/// ambiguous.
-///
-/// #38: the full-UUID path above is already namespace-agnostic (ADR-007 Rev 6
-/// — by-ID resolution has no namespace check; the Gate, not storage-layer
-/// filtering, is the authz seam). The prefix path used to be scoped to the
-/// caller's own namespace via `resolve_prefix`, which broke the documented
-/// `memory.recall` -> `brain.auto_feedback` chain whenever the recalled
-/// record lived outside that scope: recall itself fans out cross-namespace by
-/// design (root CLAUDE.md "Rule 3b"), so a namespace-scoped prefix resolution
-/// could fail on an id recall had just served, with
-/// `"no record matches id prefix"`. `resolve_prefix_unfiltered` closes that
-/// asymmetry — same by-ID contract as the four CRUD-by-ID verbs
-/// (get/update/delete/merge) already use, no namespace filter, no `token`
-/// needed (there is no namespace to derive from one).
+/// UUID parsing is namespace-blind. Prefix lookup spans the registry's configured
+/// backends, preserves distinct-UUID ambiguity and propagates backend errors.
+/// The feedback handler subsequently admits only live KG entities and notes;
+/// event, edge, and private-table targets remain ineligible.
 pub(crate) async fn resolve_auto_feedback_target(
     runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
     raw: &str,
 ) -> Result<uuid::Uuid, RuntimeError> {
     if let Ok(uuid) = raw.parse::<uuid::Uuid>() {
         return Ok(uuid);
     }
     if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return runtime
-            .resolve_prefix_unfiltered(raw)
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+        return registry
+            .resolve_kg_read_prefix(runtime, token, raw, false)
+            .await?
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
                     "auto_feedback: no record matches id prefix: {raw:?}"
@@ -3627,8 +3658,8 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.deactivate" => self.handle_deactivate(token, params).await,
             "brain.archive" => self.handle_archive(token, params).await,
             "brain.reset" => self.handle_reset(token, params).await,
-            "brain.feedback" => self.handle_feedback(token, params).await,
-            "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
+            "brain.feedback" => self.handle_feedback(token, params, registry).await,
+            "brain.auto_feedback" => self.handle_auto_feedback(token, params, registry).await,
             "brain.record_serve" => self.handle_record_serve(token, params).await,
             "brain.mark_turn" => self.handle_mark_turn(token, params).await,
             // Declaration
@@ -3637,7 +3668,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.create_profile" => self.handle_create_profile(token, params).await,
             "brain.register_adapter" => self.handle_register_adapter(token, params).await,
             // Legacy
-            "brain.emit" => self.handle_emit(token, params).await,
+            "brain.emit" => self.handle_emit(token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "brain pack does not handle verb {verb:?}"
             ))),

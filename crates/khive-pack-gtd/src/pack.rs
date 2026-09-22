@@ -15,7 +15,7 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 use crate::hook::TaskHook;
 use crate::vocab::{GTD_EDGE_RULES, GTD_HANDLERS, GTD_NOTE_KIND_SPECS, GTD_SCHEMA_PLAN_STMTS};
 
-/// GTD pack — registers the `task` note kind plus five lifecycle verbs.
+/// GTD pack — task lifecycle verbs and a read-only timestamp census.
 pub struct GtdPack {
     runtime: KhiveRuntime,
 }
@@ -118,6 +118,7 @@ impl PackRuntime for GtdPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "gtd.assign" => self.handle_assign(token, params).await,
+            "gtd.census" => self.handle_census(token, params).await,
             "gtd.next" => self.handle_next(token, params).await,
             "gtd.complete" => self.handle_complete(token, params).await,
             "gtd.tasks" => self.handle_tasks(token, params).await,

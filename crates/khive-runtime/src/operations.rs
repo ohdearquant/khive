@@ -956,6 +956,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("project", EdgeRelation::PartOf, "org"),
     ("*", EdgeRelation::InstanceOf, "concept"),
     ("service", EdgeRelation::InstanceOf, "project"),
+    // ADR-002 amendment (ADR-191): web hyperlink — a document points at
+    // another document it links to. No qualifier inference (unlike
+    // depends_on); the endpoint pair is intentionally narrow (document only,
+    // no service/concept targets — see ADR-191 D2/F10).
+    ("document", EdgeRelation::LinksTo, "document"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -4533,7 +4538,7 @@ impl KhiveRuntime {
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
         let namespaces = [token.namespace().as_str().to_owned()];
-        self.resolve_prefix_inner(Some(&namespaces), prefix, false)
+        self.resolve_prefix_inner(Some(&namespaces), prefix, false, false)
             .await
     }
 
@@ -4543,7 +4548,7 @@ impl KhiveRuntime {
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
         let namespaces = [token.namespace().as_str().to_owned()];
-        self.resolve_prefix_inner(Some(&namespaces), prefix, true)
+        self.resolve_prefix_inner(Some(&namespaces), prefix, true, false)
             .await
     }
 
@@ -4555,7 +4560,7 @@ impl KhiveRuntime {
     /// their already-unfiltered full-UUID path. No token param: unlike
     /// `resolve_prefix`, there is no namespace to derive from one.
     pub async fn resolve_prefix_unfiltered(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(None, prefix, false).await
+        self.resolve_prefix_inner(None, prefix, false, false).await
     }
 
     /// `resolve_prefix_unfiltered`, including soft-deleted rows — used by the
@@ -4564,7 +4569,18 @@ impl KhiveRuntime {
         &self,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
-        self.resolve_prefix_inner(None, prefix, true).await
+        self.resolve_prefix_inner(None, prefix, true, false).await
+    }
+
+    /// The configured multi-backend read inventory has completed base schema
+    /// bootstrap. A missing table is a backend failure there, not an absent ID.
+    pub(crate) async fn resolve_prefix_for_kg_read(
+        &self,
+        prefix: &str,
+        include_deleted: bool,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.resolve_prefix_inner(None, prefix, include_deleted, true)
+            .await
     }
 
     /// Shared indexed prefix-range lookup over an explicit namespace set.
@@ -4583,6 +4599,7 @@ impl KhiveRuntime {
         namespaces: Option<&[String]>,
         prefix: &str,
         include_deleted: bool,
+        require_tables: bool,
     ) -> RuntimeResult<Option<Uuid>> {
         // Every caller is expected to pre-validate hex-only input, but this is
         // the single choke point every `resolve_prefix*` variant funnels
@@ -4652,7 +4669,7 @@ impl KhiveRuntime {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("no such table") {
+                    if !require_tables && msg.contains("no such table") {
                         continue;
                     }
                     return Err(RuntimeError::Storage(e));
@@ -4704,7 +4721,7 @@ impl KhiveRuntime {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        if !msg.contains("no such table") {
+                        if require_tables || !msg.contains("no such table") {
                             return Err(RuntimeError::Storage(e));
                         }
                     }
@@ -18065,6 +18082,81 @@ mod tests {
             dk,
             Some("normative"),
             "document->document depends_on must infer dependency_kind=normative"
+        );
+    }
+
+    // ── Web hyperlink endpoint pair (ADR-191) ────────────────────────────────
+    // document->document is the only links_to pair: a hyperlink's target is a
+    // URL, which resolves to a document, never to the service that hosts it.
+
+    #[tokio::test]
+    async fn link_document_links_to_document_allowed_service_and_concept_targets_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let page_a = rt
+            .create_entity(&tok, "document", None, "Page A", None, None, vec![])
+            .await
+            .unwrap();
+        let page_b = rt
+            .create_entity(&tok, "document", None, "Page B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, page_a.id, page_b.id, EdgeRelation::LinksTo, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document links_to must be allowed by the ADR-191 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert!(
+            edge.metadata.is_none(),
+            "links_to carries no governed metadata and infers none, unlike \
+             depends_on; got {:?}",
+            edge.metadata
+        );
+
+        let svc = rt
+            .create_entity(&tok, "service", None, "Some Site", None, None, vec![])
+            .await
+            .unwrap();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Some Concept", None, None, vec![])
+            .await
+            .unwrap();
+
+        let doc_to_service = rt
+            .link(&tok, page_a.id, svc.id, EdgeRelation::LinksTo, 1.0, None)
+            .await
+            .unwrap_err();
+        assert!(
+            doc_to_service
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "document->service links_to must be refused with the \
+             endpoint-contract error; got {doc_to_service}"
+        );
+
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                concept.id,
+                page_a.id,
+                EdgeRelation::LinksTo,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document links_to must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
         );
     }
 
