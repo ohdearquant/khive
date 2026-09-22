@@ -660,7 +660,7 @@ impl KhiveRuntime {
             build_hash,
         );
 
-        khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
+        let mut report = khive_db::diagnostics::collect_with_runtime_audit_metrics_interruptibly(
             pool,
             build,
             legacy_sweep_interval,
@@ -668,7 +668,13 @@ impl KhiveRuntime {
             runtime_audit_batch_metrics,
         )
         .await
-        .map_err(RuntimeError::from)
+        .map_err(RuntimeError::from)?;
+        report.writer_contention.audit_obligation_append_failures =
+            Some(crate::pack::audit_obligation_append_failure_count());
+        report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason = None;
+        Ok(report)
     }
 
     // ---- Store accessors (token-scoped) ----
@@ -2152,6 +2158,14 @@ mod tests {
             report.writer_contention.audit_append_failures.is_some(),
             "the runtime path must supply its process-wide swallowed-audit counter"
         );
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures
+            .is_some());
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_none());
         assert!(report
             .writer_contention
             .audit_append_failures_unavailable_reason

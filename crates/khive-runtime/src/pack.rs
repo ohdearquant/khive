@@ -4574,11 +4574,8 @@ pub(crate) fn audit_append_failure_count() -> u64 {
 static AUDIT_OBLIGATION_APPEND_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Test-only reader: no production caller needs this counter today (unlike
-/// [`audit_append_failure_count`], which `KhiveRuntime::db_diagnostics`
-/// surfaces), but the mechanism tests need to observe it directly to prove
-/// obligation and swallowed failures land on disjoint counters.
-#[cfg(test)]
+/// Runtime diagnostics exposes this process-wide counter separately from
+/// swallowed audit errors and batch-generation failures (#2784).
 pub(crate) fn audit_obligation_append_failure_count() -> u64 {
     AUDIT_OBLIGATION_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -9860,6 +9857,27 @@ pub(crate) mod tests {
         assert_eq!(audit_append_failure_count(), before);
         assert_eq!(
             audit_obligation_append_failure_count(),
+            before_obligation + 1
+        );
+        // #2784: the same real sink failure must be discoverable through the
+        // public diagnostics report, not only this private counter accessor.
+        let runtime = crate::KhiveRuntime::memory().expect("diagnostics runtime");
+        let report = runtime
+            .db_diagnostics()
+            .await
+            .expect("diagnostics after audit failure");
+        assert_eq!(
+            report.writer_contention.audit_obligation_append_failures,
+            Some(before_obligation + 1)
+        );
+        assert_eq!(report.writer_contention.audit_append_failures, Some(before));
+        assert!(report
+            .writer_contention
+            .audit_obligation_append_failures_unavailable_reason
+            .is_none());
+        let json = serde_json::to_value(report).expect("serialized diagnostics");
+        assert_eq!(
+            json["writer_contention"]["audit_obligation_append_failures"],
             before_obligation + 1
         );
     }
